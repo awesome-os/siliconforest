@@ -279,3 +279,10 @@ How to contribute, and the licence rules for contributions:
 
 The first README of this repository (7 to 9 November 2026, when it was called `darwin-lab`)
 is kept as [`docs/history/README-2026-11-09.md`](docs/history/README-2026-11-09.md).
+
+## Quick Start (Windows / Linux / macOS)
+
+```sh
+# Clone & enter repository (all platforms)
+git clone https://github.com/awesome-os/siliconforest.git && cd siliconforest
+```
