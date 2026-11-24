@@ -1,0 +1,170 @@
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -84,6 +84,7 @@
+ -(CGAffineTransform)transformToWindow;
+ -(CGAffineTransform)transformToLayer;
+ -(void)_trackingAreasChanged;
++-(void)_sfSFRTStop;
+ @end
+ 
+ void _NSAppearanceDrawView(NSView *view, void (^draw)(void));
+@@ -123,7 +124,9 @@
+  sfSFFXSetGPULayerFn set=sfSFFXGPUPresenter();
+  return set&&window?set((int)[window windowNumber],(uintptr_t)view,(void *)surface,sx,sy,sw,sh,dx,dy,dw,dh):0;
+ }
+-static void sfSFFXClearGPULayer(NSView *view,NSWindow *window){sfSFFXSetGPULayer(view,window,NULL,0,0,0,0,0,0,0,0);}
++// (TERM12) the render thread no longer presents this view's layers before they are taken off the window
++static void sfSFFXClearGPULayer(NSView *view,NSWindow *window){[view _sfSFRTStop];sfSFFXSetGPULayer(view,window,NULL,0,0,0,0,0,0,0,0);}
++
+ // (FXPERF2) with the rectangle of the surface that differs from the one registered before (x0,y0,x1,y1, surface pixels,
+ // rows top-down), so the window server composes and commits only that; the plain call when it does not know it
+ typedef int (*sfSFFXSetGPULayerDamagedFn)(int,uintptr_t,void *,double,double,double,double,double,double,double,double,const int *);
+@@ -145,6 +148,60 @@
+  return takes==NULL||(window!=nil&&takes((int)[window windowNumber]));
+ }
+ 
++/* (TERM12, SFFX_GPU_RENDER_THREAD=1) After the main thread has presented a view's layers through the GPU presenter,
++ * QuartzCore renders the next frames of that view on its render thread when Firefox's compositor thread commits, and
++ * calls this there (with the frame lock held and the layer context's GL context current): the frame is exported and
++ * registered as the main thread would, with the geometry the main thread had then, and the window server presents
++ * the window (no backing store compare: AppKit drew nothing). 0: the main thread does this frame (the window server
++ * found the window resized, re-roled, hidden or not yet shown: its geometry is the main thread's to work out). */
++@interface NSObject(PDSFRT)
++-(BOOL)_sfrtEnabled;
++-(void)_sfrtBeginFrame;
++-(void)_sfrtEndFrame;
++-(void)_sfrtSetPresent:(int (*)(id,const void *))present info:(const void *)info length:(size_t)length;
++-(BOOL)_sfcaTakeNewFrame;
++-(BOOL)_sfcaHasNewFrame;
++@end
++// (TERM12) the frame being drawn was asked for by a commit (not by the view's display, which paints over the layers)
++static BOOL sfSFRTCommitFrame;
++struct sfSFRTInfo { int window; uintptr_t key; uint64_t geometry; double sx,sy,sw,sh,dx,dy,dw,dh; };
++static int sfSFRTPresent(id context,const void *data){
++ static int (*present)(int,uint64_t);
++ static sfSFFXSetGPULayerDamagedFn set;
++ static int looked;
++ const struct sfSFRTInfo *info=data;
++ if(!__atomic_load_n(&looked,__ATOMIC_ACQUIRE)){
++  present=(int (*)(int,uint64_t))dlsym(RTLD_DEFAULT,"_windowServerSFFXPresentLayers");
++  set=(sfSFFXSetGPULayerDamagedFn)dlsym(RTLD_DEFAULT,"_windowServerSFFXSetGPULayerDamaged");
++  __atomic_store_n(&looked,1,__ATOMIC_RELEASE);
++ }
++ if(present==NULL||set==NULL||info==NULL)
++  return 0;
++ CFTypeRef surface=[context copySFFXRenderedSurface];
++ if(surface==NULL)
++  return 0;
++ int damage[4];
++ BOOL partial=[context respondsToSelector:@selector(_sffxExportDamage:)] && [context _sffxExportDamage:damage];
++ int registered=set(info->window,info->key,(void *)surface,info->sx,info->sy,info->sw,info->sh,info->dx,info->dy,info->dw,info->dh,
++                    partial?damage:NULL);
++ CFRelease(surface);
++ if(!registered)
++  return 0;
++ // a render that made no new frame (no layer's picture changed) has nothing to present
++ if(![context _sfcaHasNewFrame])
++  return 2;
++ if(!present(info->window,info->geometry))
++  return 0;
++ [context _sfcaTakeNewFrame];
++ return 1;
++}
++static int sfSFRTAvailable(void){
++ static int available=-1;
++ if(available<0)
++  available=dlsym(RTLD_DEFAULT,"_windowServerSFFXPresentLayers")!=NULL&&dlsym(RTLD_DEFAULT,"_windowServerSFFXGeometrySerial")!=NULL;
++ return available;
++}
++
+ // (FXPERF2) whether anything was drawn into a window's own backing store since its last layer-only flush: when not,
+ // that flush tells the window server so (it skips comparing the whole backing store with what it uploaded last)
+ static char sfSFFXBaseDrawnKey;
+@@ -1982,7 +2039,14 @@
+     [self setNeedsDisplay:YES];
+     return;
+    }
++   /* (TERM12) a window off the screen is not drawn (it is displayed whole when it is ordered in): its layers were read
++    * back at every commit of the application's other windows (Firefox's hidden popups: two readbacks a frame, each
++    * waiting for the GPU on the main thread) */
++   if(![_window isVisible] && [context respondsToSelector:@selector(_sfrtEnabled)] && [(id)context _sfrtEnabled])
++    return;
++   sfSFRTCommitFrame=YES;
+    [self _drawLayerContext];
++   sfSFRTCommitFrame=NO;
+    // (TERM10) a render that made no new frame (the layers and their contents as last time: SFFX_GPU_SKIP_UNCHANGED)
+    // has nothing to present
+    if(_layerContext!=nil && [_layerContext respondsToSelector:@selector(_sfcaTakeNewFrame)] &&
+@@ -2007,9 +2071,6 @@
+ 
+ // the layer tree renders offscreen, its pixels go into the window over what the views drew
+ -(void)_drawLayerContext {
+-   CGImageRef image;
+-
+-
+    if(_layerContext==nil || ![self canDraw]){
+     if(getenv("SF_WIN_TRACE")!=NULL && [_window level]>=3)
+      fprintf(stderr,"SFWIN layers of window %d: view %s layer %p context %p canDraw %d\n",(int)[_window windowNumber],object_getClassName(self),(void *)_layer,(void *)_layerContext,(int)[self canDraw]);
+@@ -2024,6 +2085,19 @@
+    }
+    if([_layerContext respondsToSelector:@selector(setBackingScale:)])
+     [_layerContext setBackingScale:[[self window] backingScaleFactor]];
++   BOOL threads=[_layerContext respondsToSelector:@selector(_sfrtEnabled)] && [(id)_layerContext _sfrtEnabled] && sfSFRTAvailable();
++   CALayerContext *frameContext=[_layerContext retain];
++   if(threads)
++    [(id)frameContext _sfrtBeginFrame];
++   [self _sfDrawLayerContextLocked:threads];
++   if(threads)
++    [(id)frameContext _sfrtEndFrame];
++   [frameContext release];
++}
++
++-(void)_sfDrawLayerContextLocked:(BOOL)threads {
++   CGImageRef image;
++
+    [_layerContext render];
+    if(sfSFFXGPUPresenter()!=NULL&&sfSFFXWindowTakesGPULayers(_window)&&[_layerContext respondsToSelector:@selector(copySFFXRenderedSurface)]){
+     CGAffineTransform transform=[self transformToWindow];
+@@ -2039,11 +2113,30 @@
+        (NSMinX(visible)-NSMinX(bounds))*scale,sy*scale,NSWidth(visible)*scale,NSHeight(visible)*scale,
+        NSMinX(target)*scale,(NSHeight([_window frame])-NSMaxY(target))*scale,NSWidth(target)*scale,NSHeight(target)*scale);
+       CFRelease(surface);
++      if(registered && threads){
++       // the next frames on the render thread, with this geometry, while the window server's geometry of the window
++       // stays the one it has now (a window at a normal level only: popups and panels stay with the main thread)
++       static uint64_t (*geometry)(int);
++       if(geometry==NULL)geometry=(uint64_t (*)(int))dlsym(RTLD_DEFAULT,"_windowServerSFFXGeometrySerial");
++       uint64_t serial=geometry?geometry((int)[_window windowNumber]):0;
++       if(serial!=0 && [_window level]==NSNormalWindowLevel && [_window isVisible] && ![self isHiddenOrHasHiddenAncestor]){
++        struct sfSFRTInfo info={(int)[_window windowNumber],(uintptr_t)self,serial,
++         (NSMinX(visible)-NSMinX(bounds))*scale,sy*scale,NSWidth(visible)*scale,NSHeight(visible)*scale,
++         NSMinX(target)*scale,(NSHeight([_window frame])-NSMaxY(target))*scale,NSWidth(target)*scale,NSHeight(target)*scale};
++        [(id)_layerContext _sfrtSetPresent:sfSFRTPresent info:&info length:sizeof(info)];
++       }
++       else
++        [(id)_layerContext _sfrtSetPresent:NULL info:NULL length:0];
++      }
+       if(registered)return;
+      }
+     }
+    }
+    sfSFFXClearGPULayer(self,_window);
++   /* (TERM12) a commit's frame that made no new picture (no layer changed: damage frames) leaves the layers read back
++    * last in the backing store as they are: no readback (a whole-drawable glReadPixels waiting for the GPU) */
++   if(sfSFRTCommitFrame && threads && [_layerContext respondsToSelector:@selector(_sfcaHasNewFrame)] && ![(id)_layerContext _sfcaHasNewFrame])
++    return;
+    image=[_layerContext createImage];
+    if(getenv("SF_WIN_TRACE")!=NULL && [_window level]>=3){
+     size_t nonzero=0,count=0;
+@@ -2089,6 +2182,11 @@
+    CGImageRelease(image);
+ }
+ 
++-(void)_sfSFRTStop {
++   if(_layerContext!=nil && [_layerContext respondsToSelector:@selector(_sfrtSetPresent:info:length:)])
++    [(id)_layerContext _sfrtSetPresent:NULL info:NULL length:0];
++}
++
+ -(void)_addLayerToSuperlayer {
+    if(_layer==nil)
+     return;

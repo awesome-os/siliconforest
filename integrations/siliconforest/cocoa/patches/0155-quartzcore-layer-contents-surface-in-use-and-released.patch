@@ -1,0 +1,72 @@
+--- a/src/Frameworks/QuartzCore/CALayer.m
++++ b/src/Frameworks/QuartzCore/CALayer.m
+@@ -6,6 +6,7 @@
+ #include <stdio.h>
+ #include <os/lock.h>
+ #include <dlfcn.h>
++#include <pthread.h>
+ #include <string.h>
+ #include <math.h>
+ #import <objc/runtime.h>
+@@ -92,6 +93,34 @@
+    return old;
+ }
+ 
++// (FXLEAD) an IOSurface shown as a layer's contents is in use, as the window server marks the surfaces it shows on
++// macOS: a producer that recycles surfaces it believes unused (Firefox's tile surface pool asks IOSurfaceIsInUse)
++// must not draw into one this process still shows. Taken when the surface becomes contents, given back when it
++// stops being contents or the layer goes. IOSurface is found at run time; QuartzCore keeps no link to it.
++static struct { CFTypeID (*typeID)(void); void (*increment)(CFTypeRef),(*decrement)(CFTypeRef); Class cf; } layerSurfaces;
++static void loadLayerSurfaces(void){
++   layerSurfaces.typeID=dlsym(RTLD_DEFAULT,"IOSurfaceGetTypeID");
++   layerSurfaces.increment=dlsym(RTLD_DEFAULT,"IOSurfaceIncrementUseCount");
++   layerSurfaces.decrement=dlsym(RTLD_DEFAULT,"IOSurfaceDecrementUseCount");
++   layerSurfaces.cf=objc_getClass("__NSCFType");
++}
++static BOOL contentsIsUsedSurface(id value){
++   static pthread_once_t once=PTHREAD_ONCE_INIT;
++   if(value==nil)
++    return NO;
++   pthread_once(&once,loadLayerSurfaces);
++   return layerSurfaces.typeID!=NULL && layerSurfaces.increment!=NULL && layerSurfaces.decrement!=NULL &&
++          layerSurfaces.cf!=Nil && [value isKindOfClass:layerSurfaces.cf] && CFGetTypeID((CFTypeRef)value)==layerSurfaces.typeID();
++}
++static void swapContents(id *slot,id value){
++   if(contentsIsUsedSurface(value))
++    layerSurfaces.increment((CFTypeRef)value);
++   id old=lockedSwap(slot,[value retain]);
++   if(contentsIsUsedSurface(old))
++    layerSurfaces.decrement((CFTypeRef)old);
++   [old release];
++}
++
+ static id lockedRead(id *slot) {
+    id value;
+ 
+@@ -349,7 +378,7 @@
+ -(void)setContents:(id)value {
+    if(caTrace())
+     fprintf(stderr,"PD-CA %p setContents: %s %p from %s\n",self,value ? object_getClassName(value) : "nil",value,caCaller(__builtin_return_address(0)));
+-   [lockedSwap(&_contents,[value retain]) release];
++   swapContents(&_contents,value);
+    __atomic_add_fetch(&_contentsSeed,1,__ATOMIC_RELEASE);
+    [self _setNeedsRender];
+ }
+@@ -655,6 +684,8 @@
+    CGColorRelease(_borderColor);
+    CGColorRelease(_shadowColor);
+    CGPathRelease(_shadowPath);
++   // (FXLEAD) the last contents were never released: a tile's IOSurface (and its dma-buf) outlived every layer
++   swapContents(&_contents,nil);
+    [super dealloc];
+ }
+ 
+@@ -810,7 +841,7 @@
+ // for AppKit putting a view's own drawing into its backing layer during display, which must
+ // not ask for another display
+ -(void)_setContentsWithoutRender:(id)value {
+-   [lockedSwap(&_contents,[value retain]) release];
++   swapContents(&_contents,value);
+    [_context _sffxMarkMutation];
+ }
+ 

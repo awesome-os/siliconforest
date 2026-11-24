@@ -1,0 +1,55 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Guest side of the Cocoa stream's QEMU runs (cocoa_run.py): the SiliconForest desktop as in
+# ../qemu-dev/guest/qemu-desktop-session.in (same compositor, state directory, SFHID input, CPU
+# renderer), without the autopilot, plus Mac applications started as ordinary Wayland clients
+# of the compositor once its socket exists. Lines starting with COCOA_ are for the host driver.
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin; export PATH
+session=000000000000000000000000000000000000000000000001
+runtime=/private/var/run/qemu-desktop
+mkdir -p "$runtime" && chmod 0700 "$runtime"
+state=/private/var/db/desktop-state
+mkdir -p "$state" /private/tmp /private/var/log /Users/sf/Library/Preferences
+export XDG_STATE_HOME="$state" HOME=/Users/sf USER=root LOGNAME=root
+export XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=wayland-0
+export XKB_CONFIG_ROOT=/usr/share/X11/xkb TMPDIR=/private/tmp
+export CHONKSTEP_DARWIN_FRAME_STATS=3600
+[ -d /usr/share/backgrounds/siliconforest ] && export CHONKSTEP_BACKGROUND_DIR=/usr/share/backgrounds/siliconforest
+exec < /dev/null
+printf '\nQDDESK_BEGIN cocoa seconds=@SECONDS@ scale=%s\n' "@SCALE@"
+count=0
+while [ ! -c /dev/usb_hid_kbd ] || [ ! -c /dev/usb_hid_mouse ]; do
+    count=$((count + 1)); [ "$count" -le 240 ] || break; sleep 0.25
+done
+printf 'QDDESK_INPUT kbd=%s mouse=%s\n' "$([ -c /dev/usb_hid_kbd ] && echo yes || echo no)" "$([ -c /dev/usb_hid_mouse ] && echo yes || echo no)"
+[ -n "@SCALE@" ] && export CHONKSTEP_SCALE="@SCALE@"
+[ -n "@THEME@" ] && export CHONKSTEP_THEME="@THEME@"
+@ENV@
+records=$runtime/session-$session
+rm -rf "$records"; mkdir -m 0700 "$records"
+rm -f "$runtime/desktop.rc"
+# The applications: each line of /etc/cocoa-apps is a command, started in order once the
+# compositor's socket is there. Their output goes to the console with the compositor's.
+(
+    n=0
+    while [ ! -S "$runtime/wayland-0" ]; do n=$((n + 1)); [ "$n" -le 600 ] || exit 1; sleep 0.25; done
+    printf 'COCOA_SOCKET_READY\n'
+    sleep @APPDELAY@
+    i=0
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        i=$((i + 1))
+        printf 'COCOA_APP_START %s %s\n' "$i" "$line"
+        ( sh -c "$line" 2>&1; printf 'COCOA_APP_EXIT %s rc=%s\n' "$i" "$?" ) &
+        sleep @APPGAP@
+    done < /etc/cocoa-apps
+) &
+printf 'QDDESK_DESKTOP_START renderer=cpu seconds=@SECONDS@ start=%s\n' "$(date +%s)"
+{
+    /usr/bin/chonkstep-darwin-desktop --run --socket "$runtime/wayland-0" --records "$records" --session "$session" --terminal /usr/bin/chonk-terminal-darwin --seconds @SECONDS@ --font-regular /usr/share/darwin-desktop/DejaVuSans.ttf --font-bold /usr/share/darwin-desktop/DejaVuSans-Bold.ttf --input sfhid --startup-terminals @TERMINALS@ --renderer cpu 2>&1
+    echo "$?" > "$runtime/desktop.rc"
+} | grep -v 'chonkstep-gl: step:'
+rc=$(cat "$runtime/desktop.rc" 2>/dev/null || echo unknown)
+printf 'QDDESK_DESKTOP_RC=%s end=%s\n' "$rc" "$(date +%s)"
+[ "$rc" = 0 ] && printf 'QDDESK_PASS\n'
+printf 'QDDESK_END\n'

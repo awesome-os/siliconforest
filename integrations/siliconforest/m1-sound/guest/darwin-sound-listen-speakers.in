@@ -1,0 +1,63 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Listening script for the built-in speakers. A PERSON MUST BE AT THE M1: this is the first
+# time the speakers make more than a faint test tone under this system. Nothing but the
+# kernel sets their volume (the temperature model in sf_speaker_model.c); this script only
+# plays, starting very quietly.
+# Run: SD_GUEST=guest/darwin-sound-listen-speakers.in SD_RUNTIME=300 tools/sd_boot.sh sd<NN>
+# What happens, and what to check:
+#   1. 5 s of silence: no hiss or hum that was not there before, no pop when the
+#      amplifiers start or stop.
+#   2. A 440 Hz tone, 3 s, 50 dB below full scale, with the volume held 20 dB down
+#      (hold_probe=1): at the edge of audibility, from both sides.
+#   3. The hold is released. The same tone at -50, -40 and -30 dB, 4 s each: each starts
+#      20 dB down and, if the log says "sense data follows the signal", rises within a
+#      second to its level; each step clearly louder than the one before, clean (no
+#      buzz, no rattle). The -50 dB one may stay 20 dB down: it is too quiet to confirm.
+#   4. 1 kHz left only, then right only, at -30 dB: the sides must be right.
+#   5. 10 s of a 200 Hz tone at -20 dB: louder, still clean. The log shows the model's
+#      coil temperatures; they must stay far below 110 C (the limit starts there).
+# After each step the log shows the model and the sense readings: with a tone, the
+# current and voltage of the playing speakers must be well above the idle ones (peaks of
+# about 30-60 of 32768) and the voltage must grow with each level step; a silent side
+# must stay at the idle level. Any line "SHUT DOWN" means the kernel stopped the
+# amplifiers: note its reason. If anything sounds wrong, close the lid or hold the power
+# button.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nSD_BEGIN_%s\n' "$nonce"
+get() { sysctl -n "$1" 2>/dev/null; }
+mon() {
+    printf 'SD_LISTEN %s playing=%s trips=%s volume_steps=%s trusted=%s | %s | %s | %s\n' "$1" "$(get kern.sf_speaker.playing)" \
+        "$(get kern.sf_speaker.trips)" "$(get kern.sf_speaker.volume_steps)" "$(get kern.sf_speaker.sense_trusted)" \
+        "$(get kern.sf_speaker.model)" "$(get kern.sf_speaker.sense)" "$(get kern.sf_speaker.state)"
+}
+play() {        # tag, sfplay arguments
+    tag=$1; shift
+    sfplay -o speakers "$@" 2>&1 &
+    sleep 2; mon "$tag"
+    wait $!
+    sleep 2
+}
+case "$(get kern.sf_speaker.model)" in
+"in charge"*) ;;
+*)  printf 'SD_LISTEN the model is not in charge of the volume (%s): the speakers stay at -100 dB, nothing to hear\n' "$(get kern.sf_speaker.model)";;
+esac
+dd if=/dev/zero bs=4096 count=235 2>/dev/null > /dev/sfspeaker; mon silence
+sleep 2
+sysctl -w kern.sf_speaker.hold_probe=1 2>&1
+play held-50 -t 440 -s 3 -d 50
+sysctl -w kern.sf_speaker.hold_probe=0 2>&1
+play tone-50 -t 440 -s 4 -d 50
+play tone-40 -t 440 -s 4 -d 40
+play tone-30 -t 440 -s 4 -d 30
+play left-30 -t 1000 -s 4 -d 30 -c l
+play right-30 -t 1000 -s 4 -d 30 -c r
+sfplay -o speakers -t 200 -s 10 -d 20 2>&1 &
+for t in 2 4 6 8; do sleep 2; mon low-20-$t; done
+wait
+mon end
+sysctl kern.sf_speaker 2>&1
+printf 'SD_END_%s\n' "$nonce"
+printf '\nPD_BENCH_DONE\n'

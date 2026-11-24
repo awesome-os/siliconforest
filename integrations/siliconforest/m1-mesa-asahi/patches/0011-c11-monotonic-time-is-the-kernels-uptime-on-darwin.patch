@@ -1,0 +1,29 @@
+c11: TIME_MONOTONIC is CLOCK_UPTIME_RAW on Darwin (the kernel's DRM deadline clock)
+
+Mesa computes absolute DRM deadlines (DRM_IOCTL_SYNCOBJ_WAIT, timeline waits) from
+os_time_get_nano() = timespec_get(TIME_MONOTONIC). The kernel's DRM layer (LinuxKPI ktime_get)
+counts mach_absolute_time, i.e. CLOCK_UPTIME_RAW. On the M1 Darwin's CLOCK_MONOTONIC was 10.06 s
+behind it (m1-vulkan/test/wait-probe: a 300 ms wait took 0.0 ms with CLOCK_MONOTONIC, 302 ms with
+CLOCK_UPTIME_RAW), so every finite vkWaitForFences returned VK_TIMEOUT at once.
+cnd_monotonic.c converts its deadlines with the same timespec_get, so it stays consistent.
+Upstream: no (a SiliconForest kernel property).
+
+--- a/src/c11/impl/time.c
++++ b/src/c11/impl/time.c
+@@ -106,7 +106,16 @@
+         break;
+ #ifdef CLOCK_MONOTONIC
+     case TIME_MONOTONIC:
++#if defined(__APPLE__) && defined(CLOCK_UPTIME_RAW)
++        /* SiliconForest: the kernel's DRM layer compares absolute deadlines
++         * (DRM_IOCTL_SYNCOBJ_WAIT and friends) with its uptime, which is
++         * CLOCK_UPTIME_RAW (mach_absolute_time); Darwin's CLOCK_MONOTONIC is
++         * another clock (about 10 s behind it on the M1), and every finite wait
++         * returned at once. Mesa's monotonic time is the kernel's. */
++        if (clock_gettime(CLOCK_UPTIME_RAW, ts) == 0)
++#else
+         if (clock_gettime(CLOCK_MONOTONIC, ts) == 0)
++#endif
+             return base;
+         break;
+ #endif

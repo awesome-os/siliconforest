@@ -1,0 +1,95 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Robustness of SFAppleSound on all processors, one boot:
+#   load      a @SECONDS@ s tone while every processor hashes: the DMA ring must never run dry
+#   cycles    @CYCLES@ one-second sessions alternating 48 and 44.1 kHz (start, PLL lock, stop)
+#   writers   a second writer is refused; a writer killed in mid-stream ends the session;
+#             the next one plays
+#   volume    the attenuation changes while a tone plays
+# Everything is quiet: codec attenuation @VOLUME@ dB, tones @TONEDB@ dB below full scale.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nSD_BEGIN_%s\n' "$nonce"
+ncpu=$(sysctl -n hw.ncpu 2>/dev/null); ncpu=${ncpu:-1}
+t0=$(date +%s)
+now() { echo $(( $(date +%s) - t0 )); }
+phase() { printf 'SD_PHASE %s t=%s\n' "$1" "$(now)"; }
+get() { sysctl -n "$1" 2>/dev/null; }
+mon() {
+    printf 'SD_MON %s t=%s playing=%s sessions=%s periods=%s rate_mhz=%s late=%s ring_errors=%s dart_faults=%s i2c_errors=%s\n' \
+        "$1" "$(now)" "$(get kern.sf_sound.playing)" "$(get kern.sf_sound.sessions)" "$(get kern.sf_sound.periods)" \
+        "$(get kern.sf_sound.rate_mhz)" "$(get kern.sf_sound.late)" "$(get kern.sf_sound.ring_errors)" \
+        "$(get kern.sf_sound.dart_faults)" "$(get kern.sf_sound.i2c_errors)"
+}
+idle() {
+    n=0
+    while [ "$(get kern.sf_sound.playing)" = 1 ] && [ "$n" -lt "$1" ]; do sleep 1; n=$((n+1)); done
+    [ "$(get kern.sf_sound.playing)" = 1 ] && printf 'SD_FAIL still playing after %s s\n' "$1"
+}
+n=0
+while [ "$n" -lt 40 ]; do
+    case "$(get kern.sf_sound.state)" in idle*|failed*|codec-only*) break;; esac
+    sleep 1; n=$((n+1))
+done
+printf 'SD_STATE %s\n' "$(get kern.sf_sound.state)"
+case "$(get kern.sf_sound.state)" in
+idle*) ;;
+*)  printf 'SD_FAIL the driver is not ready for playback\n'
+    printf 'SD_END_%s\n' "$nonce"; printf '\nPD_BENCH_DONE\n'; exit 0;;
+esac
+sysctl -w kern.sf_sound.volume_db=@VOLUME@ kern.sf_sound.tone_db=@TONEDB@ kern.sf_sound.rate=48000 2>&1
+
+phase load
+worker() {
+    end=$(( $(date +%s) + @SECONDS@ + 2 )); i=0
+    while [ "$(date +%s)" -lt "$end" ]; do
+        dd if=/dev/zero bs=1048576 count=8 2>/dev/null | sha256sum > /dev/null
+        i=$((i+1))
+    done
+    printf 'SD_WORKER id=%s megabytes=%s\n' "$1" "$((i*8))"
+}
+w=0; while [ "$w" -lt "$ncpu" ]; do worker "$w" & w=$((w+1)); done
+sleep 1
+sysctl -w kern.sf_sound.tone=@SECONDS@ 2>&1
+n=0; while [ "$n" -lt @SECONDS@ ]; do sleep 3; n=$((n+3)); mon load; done
+wait
+idle 10; mon load-end
+printf 'SD_CODEC load %s\n' "$(get kern.sf_sound.codec)"
+
+phase cycles
+c=0
+while [ "$c" -lt @CYCLES@ ]; do
+    if [ $((c % 2)) = 0 ]; then r=44100; else r=48000; fi
+    sysctl -w kern.sf_sound.rate=$r > /dev/null 2>&1 || printf 'SD_FAIL rate %s refused in cycle %s\n' "$r" "$c"
+    sysctl -w kern.sf_sound.tone=1 > /dev/null 2>&1
+    sleep 1; idle 10
+    c=$((c+1))
+done
+mon cycles-end
+
+phase writers
+if [ -x /usr/bin/sfplay ]; then
+    sfplay -t 1000 -s 30 -d @TONEDB@ -r 48000 > /dev/null 2>&1 &
+    first=$!
+    sleep 2; mon writer-playing
+    printf 'SD_SECOND_WRITER %s\n' "$(sfplay -t 500 -s 1 -d @TONEDB@ -r 48000 2>&1 | tail -1)"
+    kill -9 "$first"; wait "$first" 2>/dev/null
+    sleep 2; mon writer-killed
+    sfplay -t 1000 -s 2 -d @TONEDB@ -r 44100 2>&1; idle 10; mon writer-next
+else
+    printf 'SD_SKIP no /usr/bin/sfplay\n'
+fi
+
+phase volume
+sysctl -w kern.sf_sound.rate=48000 kern.sf_sound.tone=6 2>&1
+sleep 2; printf 'SD_CODEC volume-before %s\n' "$(get kern.sf_sound.codec)"
+sysctl -w kern.sf_sound.volume_db=45 2>&1
+sleep 2; printf 'SD_CODEC volume-after %s\n' "$(get kern.sf_sound.codec)"
+sysctl -w kern.sf_sound.volume_db=@VOLUME@ 2>&1
+idle 12; mon volume-end
+
+phase end
+sysctl kern.sf_sound 2>&1
+printf 'SD_END_%s\n' "$nonce"
+printf '\nPD_BENCH_DONE\n'

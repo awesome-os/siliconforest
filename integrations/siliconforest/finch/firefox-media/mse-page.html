@@ -1,0 +1,106 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: MIT -->
+<meta charset="utf-8">
+<title>SF-FX local MSE representation changes</title>
+<style>body{font:18px system-ui;background:#101a20;color:#eef8f1;margin:20px}video{width:960px;max-width:90vw;max-height:70vh}pre{white-space:pre-wrap}</style>
+<h1>Local H.264/AAC MSE representation changes</h1>
+<video id="video" controls playsinline></video><pre id="result"></pre>
+<script>
+const video=document.querySelector('#video'),output=document.querySelector('#result');
+const scrollActivity=new URLSearchParams(location.search).get('activity')==='scroll';
+// Identical content/geometry in both arms; only the scrolling timer differs.
+{
+  video.style.position='sticky';video.style.top='0';video.style.zIndex='2';
+  const content=document.createElement('section');
+  for(let i=0;i<60;i++){
+    const row=document.createElement('p');row.textContent=`Owned programmatic-scroll row ${i}: media representation switching`;
+    row.style.cssText=`padding:12px;background:${i%2?'#254050':'#152530'}`;content.append(row);
+  }
+  document.body.append(content);
+}
+video.volume=.05;video.muted=false;
+window.fxVideoResult={source:'local-mse-representations',timeOrigin:performance.timeOrigin,
+  events:[],presented:[],quality:[],representations:[],appendEvents:[],requestedPlaybackRate:1};
+function update(){
+  Object.assign(fxVideoResult,{currentTime:video.currentTime,duration:Number.isFinite(video.duration)?video.duration:null,
+    muted:video.muted,volume:video.volume,readyState:video.readyState,ended:video.ended,actualPlaybackRate:video.playbackRate,
+    error:video.error?{code:video.error.code,message:video.error.message}:null});
+  const q=video.getVideoPlaybackQuality();
+  fxVideoResult.quality.push({wall:performance.now(),mediaTime:video.currentTime,total:q.totalVideoFrames,dropped:q.droppedVideoFrames,corrupted:q.corruptedVideoFrames});
+  document.title=`SF-FX MSE t=${video.currentTime.toFixed(2)} frames=${q.totalVideoFrames} dropped=${q.droppedVideoFrames}`;
+  output.textContent=JSON.stringify({...fxVideoResult,presented:fxVideoResult.presented.length},null,2);
+}
+for(const name of ['loadedmetadata','canplay','playing','waiting','stalled','ended','error'])
+  video.addEventListener(name,()=>{fxVideoResult.events.push({name,wall:performance.now(),mediaTime:video.currentTime});update()});
+if(video.requestVideoFrameCallback){
+  const callback=(now,metadata)=>{
+    fxVideoResult.presented.push({wall:now,mediaTime:metadata.mediaTime,presentedFrames:metadata.presentedFrames,
+      expectedDisplayTime:metadata.expectedDisplayTime,presentationTime:metadata.presentationTime,
+      processingDuration:metadata.processingDuration,width:video.videoWidth,height:video.videoHeight});
+    const last=fxVideoResult.representations.at(-1);
+    if(!last||last.width!==video.videoWidth||last.height!==video.videoHeight)
+      fxVideoResult.representations.push({wall:now,mediaTime:metadata.mediaTime,width:video.videoWidth,height:video.videoHeight});
+    video.requestVideoFrameCallback(callback);
+  };
+  video.requestVideoFrameCallback(callback);
+}
+function event(target,name,timeout=5000){
+  return new Promise((resolve,reject)=>{
+    let timer;
+    const cleanup=()=>{clearTimeout(timer);target.removeEventListener(name,done);target.removeEventListener('error',error);target.removeEventListener('abort',error)};
+    const done=()=>{cleanup();resolve()};const error=()=>{cleanup();reject(new Error(name+' failed'))};
+    target.addEventListener(name,done,{once:true});target.addEventListener('error',error,{once:true});target.addEventListener('abort',error,{once:true});
+    timer=setTimeout(()=>{cleanup();reject(new Error(name+' timed out'))},timeout);
+  });
+}
+window.fxMeasureVideo=async()=>{
+  const initial=video.getVideoPlaybackQuality();
+  fxVideoResult.initialQuality={total:initial.totalVideoFrames,dropped:initial.droppedVideoFrames};
+  fxVideoResult.measureStart=performance.now();
+  fxVideoResult.activity={kind:scrollActivity?'programmatic-scroll':'none',inputInjected:false,scrolls:[]};
+  let url,scrollTimer;
+  try{
+    const response=await fetch('manifest.json');if(!response.ok)throw new Error('Manifest fetch failed');
+    const manifest=await response.json();fxVideoResult.expectedFrames=manifest.expected_video_frames;
+    fxVideoResult.mime=manifest.mime;
+    if(!MediaSource.isTypeSupported(manifest.mime))throw new Error('MSE declared unsupported');
+    const source=new MediaSource();url=URL.createObjectURL(source);
+    const opened=event(source,'sourceopen');video.src=url;await opened;
+    const buffer=source.addSourceBuffer(manifest.mime);buffer.mode='sequence';
+    for(const segment of manifest.segments){
+      const reply=await fetch(segment.file);if(!reply.ok)throw new Error('Segment fetch failed');
+      const data=await reply.arrayBuffer();if(data.byteLength!==segment.bytes)throw new Error('Segment length changed');
+      const appended=event(buffer,'updateend');buffer.appendBuffer(data);await appended;
+      fxVideoResult.appendEvents.push({file:segment.file,wall:performance.now(),width:segment.width,height:segment.height,
+        ranges:Array.from({length:buffer.buffered.length},(_,i)=>[buffer.buffered.start(i),buffer.buffered.end(i)])});
+    }
+    source.endOfStream();const completion=event(video,'ended',20000);
+    const playing=video.play();
+    if(scrollActivity){
+      let direction=1;
+      scrollTimer=setInterval(()=>{
+        const now=performance.now();if(scrollY>=400)direction=-1;else if(scrollY<=0)direction=1;
+        scrollBy({top:direction*32,behavior:'instant'});
+        fxVideoResult.activity.scrolls.push({wall:now,y:scrollY,mediaTime:video.currentTime});
+      },50);
+    }
+    await Promise.all([playing,completion]);
+    const canvas=document.createElement('canvas');canvas.width=64;canvas.height=36;
+    const ctx=canvas.getContext('2d',{willReadFrequently:true});ctx.drawImage(video,0,0,64,36);
+    const pixels=ctx.getImageData(0,0,64,36).data;let hash=2166136261,nonBlack=0;
+    for(let i=0;i<pixels.length;i++){const value=pixels[i];hash=Math.imul(hash^value,16777619);if(i%4!==3&&value)nonBlack++}
+    fxVideoResult.finalPixels={hash:(hash>>>0).toString(16),width:64,height:36,nonBlack,videoWidth:video.videoWidth,videoHeight:video.videoHeight};
+  }catch(error){fxVideoResult.playError=String(error)}
+  finally{
+    if(scrollTimer)clearInterval(scrollTimer);
+    fxVideoResult.measureEnd=performance.now();
+    const rect=video.getBoundingClientRect();
+    fxVideoResult.documentState={visibility:document.visibilityState,focused:document.hasFocus(),
+      innerWidth,innerHeight,outerWidth,outerHeight,devicePixelRatio,
+      videoRect:{x:rect.x,y:rect.y,width:rect.width,height:rect.height}};
+    update();if(url)URL.revokeObjectURL(url);
+  }
+  return fxVideoResult;
+};
+setInterval(update,1000);update();
+</script>

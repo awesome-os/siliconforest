@@ -1,0 +1,22 @@
+--- a/ccdrbg/src/ccdrbg_nistctr.c	2026-11-11 08:31:33.922894325 -0800
++++ b/ccdrbg/src/ccdrbg_nistctr.c	2026-11-11 08:31:33.930303601 -0800
+@@ -49,10 +49,15 @@
+ #define DRBG_BCC_STORAGE_BLOCKS_NUM(x) cc_ceiling(DRBG_STATE_SEEDLEN(x)+DRBG_STATE_OUTLEN(x),DRBG_STATE_OUTLEN(x))
+ #define DRBG_BCC_STORAGE_SIZE(x) (DRBG_BCC_STORAGE_BLOCKS_NUM(x) * DRBG_STATE_OUTLEN(x))
+ 
+-#define DRBG_STATE_SIZE(custom) (ccn_sizeof_size(sizeof(struct ccdrbg_nistctr_state))) +            \
+-                                (2 * ccn_sizeof_size(custom->ctr->size)) +                          \
+-                                (ccn_sizeof_size(custom->key_length)) +                             \
+-                                (2 * ccn_sizeof_size((cc_ceiling((custom->key_length + custom->ctr->ecb_block_size), custom->ctr->ecb_block_size) * 8)))
++// The state is the struct followed by the cc_unit region that ccdrbg_nistctr_init lays out:
++// bcc_scratch (one block), bcc_initial_state and bcc_tmp (DRBG_BCC_STORAGE_SIZE each), then
++// the two ctr contexts, each placed at a cc_unit boundary. The size must cover all of it:
++// callers pack states back to back (cckprng: one per cpu), so a short size lets one
++// generator's init clear the next one's key and the last one write past the allocation.
++#define DRBG_CUSTOM_BCC_STORAGE_SIZE(custom) (cc_ceiling((custom)->key_length + 2 * (custom)->ctr->ecb_block_size, (custom)->ctr->ecb_block_size) * (custom)->ctr->ecb_block_size)
++#define DRBG_STATE_SIZE(custom) ((ccn_sizeof_size(sizeof(struct ccdrbg_nistctr_state))) +                               \
++                                 (ccn_sizeof_size((custom)->ctr->ecb_block_size + 2 * DRBG_CUSTOM_BCC_STORAGE_SIZE(custom))) + \
++                                 (2 * ccn_sizeof_size((custom)->ctr->size)))
+ 
+ #define MAX_KEY_SIZE            CCAES_KEY_SIZE_256
+ #define MAX_BLOCK_SIZE          CCAES_BLOCK_SIZE

@@ -1,0 +1,163 @@
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -120,8 +120,14 @@
+     int ignoresMouse, inputDirty;
+     // AppKit's -[NSWindow isOpaque]: the compositor is told that the whole surface is opaque (a toplevel)
+     int opaque, opaqueDirty, opaqueW, opaqueH;
++    /* (TERM8) the role the wl_surface was first given (WS_ROLE_*): a surface keeps its role for life, so a window that
++     * must come back as another kind (a popup whose parent is gone shown as a toplevel, a level change between a layer
++     * and an ordinary window) gets a new wl_surface; giving the old one another role ended the connection
++     * ("Surface already has a role", xdg_wm_base error 0: Firefox left running with no window) */
++    int surfaceRole;
+     struct wsWindow *next;
+ };
++enum { WS_ROLE_NONE, WS_ROLE_TOPLEVEL, WS_ROLE_POPUP, WS_ROLE_LAYER };
+ 
+ static struct {
+     struct wl_display *display;
+@@ -2423,30 +2429,69 @@
+  * having to poll. */
+ static void *dispatchThreadMain(void *unused) {
+     struct pollfd pfd = { .fd = wl_display_get_fd(ws.display), .events = POLLIN };
++    int lost = 0;
+ 
+     // wl_display_dispatch by hand, so the wait can end in time for a key repeat
+     while (ws.dispatchRunning) {
+-        while (wl_display_prepare_read(ws.display) != 0)
+-            wl_display_dispatch_pending(ws.display);
++        while (wl_display_prepare_read(ws.display) != 0) {
++            if (wl_display_dispatch_pending(ws.display) < 0) {
++                lost = 1;
++                break;
++            }
++        }
++        if (lost)
++            break;
+         wl_display_flush(ws.display);
+ 
+         int ready = poll(&pfd, 1, keyRepeatTimeout());
+         if (ready > 0) {
+-            if (wl_display_read_events(ws.display) < 0)
++            if (wl_display_read_events(ws.display) < 0) {
++                lost = 1;
+                 break;
++            }
+         } else {
+             wl_display_cancel_read(ws.display);
+         }
+ 
+         if (wl_display_dispatch_pending(ws.display) < 0) {
+-            fprintf(stderr,"WindowServer: Wayland dispatch stopped with error %d\n",
+-                    wl_display_get_error(ws.display));
++            lost = 1;
+             break;
+         }
+         keyRepeatFire();
+     }
+     ws.dispatchRunning = 0;
+ 
++    /* (TERM8) The connection is gone (the compositor ended it on a protocol error, or it went away). A Mac application
++     * whose window server goes ends with it; staying alive left a process with no window, no menu and no way to be
++     * reached (Firefox went on playing sound). It says why, then ends. SF_WS_SURVIVE_DISCONNECT=1 keeps the old
++     * behaviour (the process goes on with no connection) for tests. */
++    if (lost) {
++        int err = wl_display_get_error(ws.display);
++        const struct wl_interface *interface = NULL;
++        uint32_t id = 0, code = 0;
++
++        if (err == EPROTO)
++            code = wl_display_get_protocol_error(ws.display, &interface, &id);
++        if (err == EPROTO)
++            fprintf(stderr, "WindowServer: the compositor ended the connection: protocol error %u on %s#%u\n", code,
++                    interface != NULL ? interface->name : "?", id);
++        else
++            fprintf(stderr, "WindowServer: the connection to the compositor is gone (%s)\n", strerror(err));
++        if (getenv("SF_WS_SURVIVE_DISCONNECT") == NULL) {
++            const char *runtime = getenv("XDG_RUNTIME_DIR");
++            char menuSocket[256];
++
++            fprintf(stderr, "WindowServer: this application ends with its window server, as on macOS\n");
++            fflush(stderr);
++            // AppKit's app-menu socket (NSWindowMenuStrip.m) would outlive the process: _exit runs no atexit handler
++            if (runtime != NULL && runtime[0] != 0) {
++                snprintf(menuSocket, sizeof menuSocket, "%s/app-menu/%d", runtime, (int)getpid());
++                unlink(menuSocket);
++            }
++            _exit(70);
++        }
++    }
++
+     /* Unblock a waiter so it can see the connection is gone. */
+     pthread_mutex_lock(&ws.queueLock);
+     pthread_cond_broadcast(&ws.queueReady);
+@@ -2791,6 +2836,8 @@
+                 parent->windowID, window->w, window->h);
+ }
+ 
++static void windowSurfaceForRole(struct wsWindow *window, int kind);
++
+ static int windowCreatePopupRole(struct wsWindow *window) {
+     struct wsWindow *parent = popupParentFor(window);
+     struct xdg_positioner *positioner;
+@@ -2798,6 +2845,7 @@
+ 
+     if (parent == NULL)
+         return 0;
++    windowSurfaceForRole(window, WS_ROLE_POPUP);
+     positioner = popupPositioner(window, parent, &x, &y);
+     window->xdgSurface = xdg_wm_base_get_xdg_surface(ws.wmBase, window->surface);
+     xdg_surface_add_listener(window->xdgSurface, &xdgSurfaceListener, window);
+@@ -2817,6 +2865,37 @@
+     return 1;
+ }
+ 
++// (TERM8) a fresh wl_surface for a window whose next role differs from the one its surface has
++static void windowRenewSurface(struct wsWindow *window) {
++    if (getenv("SF_WS_TRACE") != NULL)
++        fprintf(stderr, "WindowServer: window %d gets a new surface (its role changes kind)\n", window->windowID);
++    if (window->blurEffect != NULL) {
++        ext_background_effect_surface_v1_destroy(window->blurEffect);
++        window->blurEffect = NULL;
++        window->blurDirty = 1;
++    }
++    if (window->fractional != NULL) { wp_fractional_scale_v1_destroy(window->fractional); window->fractional = NULL; }
++    if (window->viewport != NULL)   { wp_viewport_destroy(window->viewport); window->viewport = NULL; }
++    wl_surface_destroy(window->surface);
++    window->surface = wl_compositor_create_surface(ws.compositor);
++    if (ws.fractionalManager != NULL && ws.viewporter != NULL) {
++        window->fractional = wp_fractional_scale_manager_v1_get_fractional_scale(ws.fractionalManager, window->surface);
++        wp_fractional_scale_v1_add_listener(window->fractional, &fractionalListener, window);
++        window->viewport = wp_viewporter_get_viewport(ws.viewporter, window->surface);
++    }
++    window->attached = 0;
++    window->opaqueDirty = 1;
++    window->inputDirty = 1;
++    window->surfaceRole = WS_ROLE_NONE;
++}
++
++// (TERM8) before a role of `kind` goes on the window's surface: a surface that had another kind is replaced
++static void windowSurfaceForRole(struct wsWindow *window, int kind) {
++    if (window->surfaceRole != WS_ROLE_NONE && window->surfaceRole != kind)
++        windowRenewSurface(window);
++    window->surfaceRole = kind;
++}
++
+ static void windowCreateRole(struct wsWindow *window, const char *title) {
+     uint32_t layer;
+ 
+@@ -2830,6 +2909,7 @@
+     }
+ 
+     if (layerForWindowLevel(window->level, &layer)) {
++        windowSurfaceForRole(window, WS_ROLE_LAYER);
+         window->layerSurface = zwlr_layer_shell_v1_get_layer_surface(
+             ws.layerShell, window->surface, NULL, layer,
+             title != NULL && title[0] != '\0' ? title : "siliconforest");
+@@ -2856,6 +2936,7 @@
+     if (windowCreatePopupRole(window))
+         return;
+ 
++    windowSurfaceForRole(window, WS_ROLE_TOPLEVEL);
+     window->xdgSurface = xdg_wm_base_get_xdg_surface(ws.wmBase, window->surface);
+     xdg_surface_add_listener(window->xdgSurface, &xdgSurfaceListener, window);
+     window->toplevel = xdg_surface_get_toplevel(window->xdgSurface);

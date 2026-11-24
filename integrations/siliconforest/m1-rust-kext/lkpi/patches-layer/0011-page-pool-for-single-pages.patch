@@ -1,0 +1,386 @@
+fbsdkpi: single pages come from a pool of 1 MiB wired chunks; M_NOWAIT waits when it can
+
+Boot ag03: alloc_page() failed after 66 pages (and the Asahi driver's third 1 MiB GEM object
+with it) on a machine with 16 GiB. Each page was one physically-contiguous
+IOBufferMemoryDescriptor plus a record allocated M_NOWAIT, and since patch 0002 a M_NOWAIT
+allocation really is Z_NOWAIT, which fails whenever the kalloc zone has to grow.
+- sf_linux_page.c: order-0 pages without GFP_DMA32 are taken from chunks of 64 pages
+  (sfos_pages_alloc: one ordinary wired xnu allocation, per-page physical addresses, no
+  contiguity or mask), with a free bitmap per chunk; a fully free, unmapped chunk goes back
+  to xnu above a 4 MiB reserve. Higher orders and GFP_DMA32 are unchanged. The page hash
+  grows to 16384 buckets. sf_linux_page_stats() for diagnostics.
+- vmap() of pool pages maps sub-ranges of the buffer descriptors that own them
+  (sfos_map_owned_pages) instead of a physical-address descriptor over xnu-managed pages
+  (boot ag05: "IOMemoryDescriptor physical with managed page" on a DEBUG kernel); the
+  physical path stays as the fallback and for pages that are not from the pool.
+- xnu seam (in patch 0002's files): sfos_pages_alloc/free; sfos_malloc(canwait=0) retries
+  blocking when the calling thread may block (not interrupt context, interrupts and
+  preemption enabled), counted by sfos_malloc_nowait_retried().
+UPSTREAM: yes.
+
+--- a/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_page.c
++++ b/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_page.c
+@@ -8,10 +8,13 @@
+ #include <linux/vmalloc.h>
+ #include <linux/device.h>
+ #include <linux/page.h>
++#include <linux/compat.h>
+ 
+ #include "../../sf_fbsd_os.h"
+ 
+-#define SF_PAGE_HASH	1024
++_Static_assert(PAGE_SIZE == (1UL << PAGE_SHIFT), "PAGE_SIZE and PAGE_SHIFT disagree");
++
++#define SF_PAGE_HASH	16384
+ // the offset bits in a page. linux/page.h makes PAGE_MASK the linux one, the page bits
+ #define SF_PAGE_OFFSET	((vm_paddr_t)PAGE_SIZE - 1)
+ 
+@@ -23,9 +26,25 @@
+ 	// joined kernel mappings still reaching these pages, and a free that waits for them
+ 	int vmaps;
+ 	bool freed;
++	// a sf_pool chunk: its pages are handed out one by one, bit i set = pages[i] is free
++	bool pooled;
++	void *cookie;
++	uint64_t freemask;
++	struct sf_page_run *pnext, **pprevp;
+ 	struct vm_page pages[];
+ };
+ 
++// sf_pool: single pages (alloc_page, every shmem/GEM page, page tables) come from chunks of
++// SF_CHUNK_PAGES wired pages, one xnu allocation each (sfos_pages_alloc). Before this every
++// page was its own physically-contiguous IOBufferMemoryDescriptor with its own records.
++// A chunk goes back to xnu when all its pages are free, nothing maps it and the pool still
++// holds SF_POOL_KEEP free pages elsewhere.
++#define SF_CHUNK_PAGES	64
++#define SF_POOL_KEEP	(4 * SF_CHUNK_PAGES)
++static struct sf_page_run *sf_pool_partial;	// chunks with a free page
++static unsigned long sf_pool_free, sf_pool_chunks, sf_pool_chunk_allocs, sf_pool_chunk_frees;
++static unsigned long sf_page_fail_xnu, sf_page_fail_record;
++
+ // a joined mapping and the page runs it keeps alive
+ struct sf_vmap {
+ 	struct sf_vmap *next;
+@@ -38,7 +57,8 @@
+ 
+ static void sf_page_flush(struct page *page);
+ 
+-static struct vm_page *sf_page_hash[SF_PAGE_HASH];
++// allocated by lkpi_page_init(), not part of the image (128 KiB)
++static struct vm_page **sf_page_hash;
+ static struct mtx sf_page_lock;
+ 
+ static inline unsigned
+@@ -81,8 +101,10 @@
+ 	unsigned long i;
+ 
+ 	run = malloc(sizeof(*run) + npages * sizeof(struct vm_page), M_DEVBUF, M_NOWAIT | M_ZERO);
+-	if (run == NULL)
++	if (run == NULL) {
++		sf_page_fail_record++;
+ 		return NULL;
++	}
+ 
+ 	run->phys = phys;
+ 	run->kva = kva;
+@@ -147,6 +169,206 @@
+ 	return page->sf_kva;
+ }
+ 
++static void
++sf_pool_link(struct sf_page_run *run)
++{
++	run->pnext = sf_pool_partial;
++	run->pprevp = &sf_pool_partial;
++	if (sf_pool_partial != NULL)
++		sf_pool_partial->pprevp = &run->pnext;
++	sf_pool_partial = run;
++}
++
++static void
++sf_pool_unlink(struct sf_page_run *run)
++{
++	*run->pprevp = run->pnext;
++	if (run->pnext != NULL)
++		run->pnext->pprevp = run->pprevp;
++	run->pnext = NULL;
++	run->pprevp = NULL;
++}
++
++// one more chunk into the pool; false when xnu has no memory
++static bool
++sf_pool_grow(void)
++{
++	uint64_t phys[SF_CHUNK_PAGES];
++	struct sf_page_run *run;
++	void *cookie = NULL, *kva;
++	unsigned long i;
++
++	kva = sfos_pages_alloc(SF_CHUNK_PAGES, phys, &cookie);
++	if (kva == NULL) {
++		sf_page_fail_xnu++;
++		return false;
++	}
++	run = malloc(sizeof(*run) + SF_CHUNK_PAGES * sizeof(struct vm_page), M_DEVBUF, M_WAITOK | M_ZERO);
++	if (run == NULL) {
++		sf_page_fail_record++;
++		sfos_pages_free(cookie);
++		return false;
++	}
++	run->phys = phys[0];
++	run->kva = kva;
++	run->npages = SF_CHUNK_PAGES;
++	run->pooled = true;
++	run->cookie = cookie;
++	run->freemask = ~0ULL;
++
++	mtx_lock(&sf_page_lock);
++	for (i = 0; i < SF_CHUNK_PAGES; i++) {
++		vm_page_t m = &run->pages[i];
++		unsigned b;
++
++		m->phys_addr = phys[i];
++		m->sf_kva = (char *)kva + (i << PAGE_SHIFT);
++		m->sf_run = run;
++		b = sf_page_bucket(m->phys_addr);
++		m->sf_hnext = sf_page_hash[b];
++		sf_page_hash[b] = m;
++	}
++	sf_pool_link(run);
++	sf_pool_free += SF_CHUNK_PAGES;
++	sf_pool_chunks++;
++	sf_pool_chunk_allocs++;
++	mtx_unlock(&sf_page_lock);
++	return true;
++}
++
++static struct page *
++sf_pool_alloc(gfp_t flags)
++{
++	struct sf_page_run *run;
++	vm_page_t m;
++	int i;
++
++	for (;;) {
++		mtx_lock(&sf_page_lock);
++		run = sf_pool_partial;
++		if (run != NULL)
++			break;
++		mtx_unlock(&sf_page_lock);
++		if (!sf_pool_grow())
++			return NULL;
++	}
++	i = __builtin_ctzll(run->freemask);
++	run->freemask &= ~(1ULL << i);
++	if (run->freemask == 0)
++		sf_pool_unlink(run);
++	sf_pool_free--;
++	m = &run->pages[i];
++	m->ref_count = 1;
++	mtx_unlock(&sf_page_lock);
++	if ((flags & M_ZERO) != 0)
++		memset(m->sf_kva, 0, PAGE_SIZE);
++	return m;
++}
++
++static void
++sf_pool_free_page(struct page *page)
++{
++	struct sf_page_run *run = page->sf_run;
++	int i = (int)(page - run->pages);
++	bool release;
++
++	if (page->sf_kva_cached != NULL) {
++		sfos_unmap_pages(page->sf_kva);
++		page->sf_kva = page->sf_kva_cached;
++		page->sf_kva_cached = NULL;
++	}
++	mtx_lock(&sf_page_lock);
++	page->ref_count = 0;
++	page->flags = 0;
++	page->object = NULL;
++	if (run->freemask == 0)
++		sf_pool_link(run);
++	run->freemask |= 1ULL << i;
++	sf_pool_free++;
++	release = run->freemask == ~0ULL && run->vmaps == 0 &&
++	    sf_pool_free >= SF_POOL_KEEP + SF_CHUNK_PAGES;
++	if (release) {
++		sf_pool_unlink(run);
++		sf_page_run_unhash(run);
++		sf_pool_free -= SF_CHUNK_PAGES;
++		sf_pool_chunks--;
++		sf_pool_chunk_frees++;
++	}
++	mtx_unlock(&sf_page_lock);
++	if (release) {
++		sfos_pages_free(run->cookie);
++		free(run, M_DEVBUF);
++	}
++}
++
++// sf_pool under memory pressure: every fully free, unmapped chunk goes back to xnu, the
++// reserve included. Returns the number of chunks released.
++unsigned long
++sf_linux_page_trim(void)
++{
++	struct sf_page_run *run, *next, *victims = NULL;
++	unsigned long n = 0;
++
++	mtx_lock(&sf_page_lock);
++	for (run = sf_pool_partial; run != NULL; run = next) {
++		next = run->pnext;
++		if (run->freemask != ~0ULL || run->vmaps != 0)
++			continue;
++		sf_pool_unlink(run);
++		sf_page_run_unhash(run);
++		sf_pool_free -= SF_CHUNK_PAGES;
++		sf_pool_chunks--;
++		sf_pool_chunk_frees++;
++		run->pnext = victims;
++		victims = run;
++	}
++	mtx_unlock(&sf_page_lock);
++	for (run = victims; run != NULL; run = next) {
++		next = run->pnext;
++		sfos_pages_free(run->cookie);
++		free(run, M_DEVBUF);
++		n++;
++	}
++	return n;
++}
++
++// what the seam's pressure thread calls (and a kext's diagnostics may): Linux shrinkers
++// first, so that what they free can leave with the trim
++void sf_lkpi_lowmem(void);
++static unsigned long sf_pool_pressure_runs, sf_pool_pressure_trimmed;
++
++void
++sf_linux_page_pressure(void)
++{
++	linux_set_current(curthread);
++	sf_lkpi_lowmem();
++	sf_pool_pressure_trimmed += sf_linux_page_trim();
++	sf_pool_pressure_runs++;
++}
++
++void
++sf_linux_page_pressure_stats(unsigned long *runs, unsigned long *trimmed, long long *xnu_events)
++{
++	*runs = sf_pool_pressure_runs;
++	*trimmed = sf_pool_pressure_trimmed;
++	*xnu_events = sfos_pressure_events();
++}
++
++// for a kext's diagnostics: pool state and why allocations failed
++void
++sf_linux_page_stats(unsigned long *chunks, unsigned long *free_pages, unsigned long *chunk_allocs,
++    unsigned long *chunk_frees, unsigned long *fail_xnu, unsigned long *fail_record)
++{
++	mtx_lock(&sf_page_lock);
++	*chunks = sf_pool_chunks;
++	*free_pages = sf_pool_free;
++	*chunk_allocs = sf_pool_chunk_allocs;
++	*chunk_frees = sf_pool_chunk_frees;
++	*fail_xnu = sf_page_fail_xnu;
++	*fail_record = sf_page_fail_record;
++	mtx_unlock(&sf_page_lock);
++}
++
+ struct page *
+ linux_alloc_pages(gfp_t flags, unsigned int order)
+ {
+@@ -155,10 +377,16 @@
+ 	uint64_t phys;
+ 	void *kva;
+ 
++	// single pages without an address limit: the sf_pool
++	if (order == 0 && (flags & GFP_DMA32) == 0)
++		return sf_pool_alloc(flags);
++
+ 	kva = sfos_malloc_contig(size, PAGE_SIZE,
+ 		(flags & GFP_DMA32) != 0 ? 0xffffffffULL : ~0ULL, &phys);
+-	if (kva == NULL)
++	if (kva == NULL) {
++		sf_page_fail_xnu++;
+ 		return NULL;
++	}
+ 	if ((flags & M_ZERO) != 0)
+ 		memset(kva, 0, size);
+ 
+@@ -184,6 +412,10 @@
+ 	}
+ 
+ 	run = page->sf_run;
++	if (run->pooled) {
++		sf_pool_free_page(page);
++		return;
++	}
+ 	for (unsigned long i = 0; i < run->npages; i++) {
+ 		if (run->pages[i].sf_kva_cached != NULL) {
+ 			sfos_unmap_pages(run->pages[i].sf_kva);
+@@ -279,17 +511,43 @@
+ 	if (i == count)
+ 		return pages[0]->sf_kva;
+ 
+-	phys = malloc(count * sizeof(*phys), M_DEVBUF, M_WAITOK);
+-	if (phys == NULL)
+-		return NULL;
+-	for (i = 0; i < count; i++)
+-		phys[i] = pages[i]->phys_addr;
+-	if (uncached) {
++	// sf_pool pages are mapped through the xnu allocations that own them; anything else
++	// (and a refusal by xnu) takes the physical ranges
++	va = NULL;
++	for (i = 0; i < count; i++) {
++		if (!((struct sf_page_run *)pages[i]->sf_run)->pooled)
++			break;
++	}
++	if (i == count) {
++		void **cookies = malloc(count * (sizeof(void *) + sizeof(uint32_t)), M_DEVBUF, M_WAITOK);
++		uint32_t *index = (uint32_t *)(cookies + count);
++
++		for (i = 0; i < count; i++) {
++			struct sf_page_run *run = pages[i]->sf_run;
++
++			cookies[i] = run->cookie;
++			index[i] = (uint32_t)(pages[i] - run->pages);
++		}
++		if (uncached) {
++			for (i = 0; i < count; i++)
++				sf_page_flush(pages[i]);
++		}
++		va = sfos_map_owned_pages(cookies, index, count, uncached);
++		free(cookies, M_DEVBUF);
++	}
++	if (va == NULL) {
++		phys = malloc(count * sizeof(*phys), M_DEVBUF, M_WAITOK);
++		if (phys == NULL)
++			return NULL;
+ 		for (i = 0; i < count; i++)
+-			sf_page_flush(pages[i]);
++			phys[i] = pages[i]->phys_addr;
++		if (uncached) {
++			for (i = 0; i < count; i++)
++				sf_page_flush(pages[i]);
++		}
++		va = sfos_map_pages(phys, count, uncached);
++		free(phys, M_DEVBUF);
+ 	}
+-	va = sfos_map_pages(phys, count, uncached);
+-	free(phys, M_DEVBUF);
+ 	if (va == NULL)
+ 		return NULL;
+ 
+@@ -427,6 +685,11 @@
+ lkpi_page_init(void *arg)
+ {
+ 	mtx_init(&sf_page_lock, "lkpi pages", NULL, MTX_DEF);
++	sf_page_hash = sfos_malloc(sizeof(*sf_page_hash) * SF_PAGE_HASH, 1, 1);
++	if (sf_page_hash == NULL)
++		panic("lkpi: no memory for the page hash");
++	if (sfos_pressure_start(sf_linux_page_pressure) != 0)
++		printf("lkpi: no memory-pressure thread, shrinkers will not run\n");
+ }
+ SYSINIT(lkpi_page, SI_SUB_LOCK, SI_ORDER_ANY, lkpi_page_init, NULL);
+ 

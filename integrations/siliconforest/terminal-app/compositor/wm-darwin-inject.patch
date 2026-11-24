@@ -1,0 +1,230 @@
+diff -ruN a/crates/wm-darwin/src/desktop_entry.rs b/crates/wm-darwin/src/desktop_entry.rs
+--- a/crates/wm-darwin/src/desktop_entry.rs	2026-11-12 22:22:37.195959983 -0800
++++ b/crates/wm-darwin/src/desktop_entry.rs	2026-11-13 14:39:39.789877475 -0800
+@@ -163,6 +163,8 @@
+     wait_error: Option<String>,
+     /// Scripted synthetic input for unattended tests (CHONKSTEP_DARWIN_AUTOPILOT=1).
+     autopilot: Option<crate::autopilot::Autopilot>,
++    /// Requested synthetic input and captures for tests (CHONKSTEP_DARWIN_INJECT_DIR).
++    inject: Option<crate::inject::Inject>,
+     result: &'a mut File,
+     started: Instant,
+     shutdown: bool,
+@@ -196,7 +198,13 @@
+         if let Some(autopilot) = &mut self.autopilot {
+             autopilot.step(self.server, ms)?;
+         }
++        if let Some(inject) = &mut self.inject {
++            inject.step(self.server, ms)?;
++        }
+         self.server.repaint(self.presenter, ms)?;
++        if let Some(inject) = &mut self.inject {
++            inject.after_repaint(self.server)?;
++        }
+         if let Some(autopilot) = &mut self.autopilot {
+             autopilot.after_repaint(self.server)?;
+         }
+@@ -379,6 +387,7 @@
+             presenter: &mut presenter,
+             wait_error: None,
+             autopilot: crate::autopilot::Autopilot::from_env().map(|a| a.with_records(records_path.clone())),
++            inject: crate::inject::Inject::from_env(),
+             result: &mut result,
+             started: Instant::now(),
+             shutdown: false,
+diff -ruN a/crates/wm-darwin/src/inject.rs b/crates/wm-darwin/src/inject.rs
+--- a/crates/wm-darwin/src/inject.rs	1969-12-31 16:00:00.000000000 -0800
++++ b/crates/wm-darwin/src/inject.rs	2026-11-13 14:55:11.104050912 -0800
+@@ -0,0 +1,180 @@
++//! Requested synthetic input and screen capture on a running desktop, for tests.
++//!
++//! `CHONKSTEP_DARWIN_INJECT_DIR=<absolute directory>` (the session sets it to a directory only
++//! its own user can write) makes the compositor look, twenty times a second, for a file
++//! `request` in that directory. The file is taken (renamed to `request.taken`) and its lines
++//! are carried out in order, one per frame:
++//!
++//! ```text
++//! key <HID usage, hex> down|up     a keyboard record, as the keyboard's device node gives it
++//! abs <x> <y>                      the pointer to that place, 0..65535 of the screen each way
++//! rel <dx> <dy>                    the pointer moved, -127..127
++//! buttons <mask>                   the pointer's buttons (1 left, 2 right, 4 middle)
++//! wheel <n>                        the wheel, -127..127
++//! wait <milliseconds>              nothing for that long (at most 10 s)
++//! capture <name>                   the frame as it was last rendered, to <name>.ppm in the directory
++//!                                  (an error after 2 s without one: the display sleeps until a key)
++//! ```
++//!
++//! Events enter where the device nodes' events do (`Server::deliver_hid`), so a client sees
++//! them through the seat exactly as it sees the keyboard and the trackpad. When the request is
++//! finished a file `done` holds one line: the number of lines carried out and the errors.
++//! Everything here is synthetic and labelled so (`WMINJECT ... input=synthetic-inject`);
++//! nothing of it is evidence of a physical keyboard or trackpad. Without the variable the
++//! compositor does none of this.
++use crate::hid::{usage_to_evdev, Event, Motion};
++use crate::server::Server;
++use std::collections::VecDeque;
++use std::path::PathBuf;
++use std::time::{Duration, Instant};
++use wm_core::Backend;
++
++pub const ENV: &str = "CHONKSTEP_DARWIN_INJECT_DIR";
++
++enum Step {
++    Event(Event),
++    Wait(Duration),
++    Capture(String),
++}
++
++pub struct Inject {
++    dir: PathBuf,
++    queue: VecDeque<Step>,
++    poll_at: Instant,
++    wait_until: Option<Instant>,
++    buttons: u8,
++    capture_since: Option<Instant>,
++    done: usize,
++    errors: Vec<String>,
++    active: bool,
++}
++
++impl Inject {
++    pub fn from_env() -> Option<Self> {
++        let dir = PathBuf::from(std::env::var_os(ENV)?);
++        if !dir.is_absolute() || !dir.is_dir() {
++            eprintln!("WMINJECT disabled: {ENV} is not an existing absolute directory");
++            return None;
++        }
++        eprintln!("WMINJECT armed dir={} input=synthetic-inject (requested events; not physical input)", dir.display());
++        Some(Self { dir, queue: VecDeque::new(), poll_at: Instant::now(), wait_until: None, buttons: 0, capture_since: None, done: 0, errors: Vec::new(), active: false })
++    }
++    fn parse(&mut self, text: &str) {
++        for (number, line) in text.lines().enumerate() {
++            let words: Vec<&str> = line.split_whitespace().collect();
++            let step = match words.as_slice() {
++                [] => continue,
++                [first, ..] if first.starts_with('#') => continue,
++                ["key", usage, state @ ("down" | "up")] => u8::from_str_radix(usage, 16).ok().and_then(usage_to_evdev).map(|evdev| Step::Event(Event::Key { evdev, down: *state == "down" })),
++                ["abs", x, y] => x.parse::<u16>().ok().zip(y.parse::<u16>().ok()).map(|(x, y)| Step::Event(Event::Pointer { motion: Motion::Absolute(x, y), buttons: self.buttons, wheel: 0 })),
++                ["rel", x, y] => x.parse::<i8>().ok().zip(y.parse::<i8>().ok()).map(|(x, y)| Step::Event(Event::Pointer { motion: Motion::Relative(x, y), buttons: self.buttons, wheel: 0 })),
++                ["buttons", mask] => mask.parse::<u8>().ok().filter(|m| m & !7 == 0).map(|mask| {
++                    self.buttons = mask;
++                    Step::Event(Event::Pointer { motion: Motion::Relative(0, 0), buttons: mask, wheel: 0 })
++                }),
++                ["wheel", n] => n.parse::<i8>().ok().map(|wheel| Step::Event(Event::Pointer { motion: Motion::Relative(0, 0), buttons: self.buttons, wheel })),
++                ["wait", ms] => ms.parse::<u64>().ok().filter(|ms| *ms <= 10_000).map(|ms| Step::Wait(Duration::from_millis(ms))),
++                ["capture", name] if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => Some(Step::Capture((*name).to_string())),
++                _ => None,
++            };
++            match step {
++                Some(step) => self.queue.push_back(step),
++                None => self.errors.push(format!("line {}: not understood: {line:?}", number + 1)),
++            }
++        }
++    }
++    /// Before the repaint: take a new request, deliver the next event.
++    pub fn step(&mut self, server: &mut Server, ms: u32) -> Result<(), String> {
++        let now = Instant::now();
++        if !self.active {
++            if now < self.poll_at {
++                return Ok(());
++            }
++            self.poll_at = now + Duration::from_millis(50);
++            let request = self.dir.join("request");
++            let taken = self.dir.join("request.taken");
++            if std::fs::rename(&request, &taken).is_err() {
++                return Ok(());
++            }
++            let _ = std::fs::remove_file(self.dir.join("done"));
++            self.done = 0;
++            self.errors.clear();
++            match std::fs::read_to_string(&taken) {
++                Ok(text) => self.parse(&text),
++                Err(error) => self.errors.push(format!("request not readable: {error}")),
++            }
++            self.active = true;
++            eprintln!("WMINJECT request steps={} input=synthetic-inject", self.queue.len());
++        }
++        if self.wait_until.is_some_and(|until| now < until) {
++            return Ok(());
++        }
++        self.wait_until = None;
++        match self.queue.front() {
++            Some(Step::Event(event)) => {
++                server.deliver_hid(*event, ms)?;
++                self.queue.pop_front();
++                self.done += 1;
++            }
++            Some(Step::Wait(time)) => {
++                self.wait_until = Some(now + *time);
++                self.queue.pop_front();
++                self.done += 1;
++            }
++            // a capture is of a rendered frame: after the repaint
++            Some(Step::Capture(_)) => {}
++            None => self.finish(),
++        }
++        Ok(())
++    }
++    /// After the repaint: a capture waits for a frame of the scene as it is now.
++    pub fn after_repaint(&mut self, server: &mut Server) -> Result<(), String> {
++        let Some(Step::Capture(name)) = self.queue.front() else {
++            return Ok(());
++        };
++        if self.wait_until.is_some() {
++            return Ok(());
++        }
++        // The scene stays unrendered while the display sleeps (and for a moment while a frame is
++        // on its way): a capture does not wait for that longer than two seconds.
++        if server.wm.backend().dirty {
++            let since = *self.capture_since.get_or_insert_with(Instant::now);
++            if since.elapsed() < Duration::from_secs(2) {
++                return Ok(());
++            }
++            self.errors.push(format!("capture {name}: no frame of the current scene within 2 s (is the display asleep? a key wakes it)"));
++            self.capture_since = None;
++            self.queue.pop_front();
++            self.done += 1;
++            return Ok(());
++        }
++        self.capture_since = None;
++        let size = server.wm.backend().screen_size();
++        let (pixels, source) = match server.read_back()? {
++            Some(frame) => (frame, "renderer"),
++            None => (server.wm.backend().render()?.data().to_vec(), "cpu-render"),
++        };
++        let mut file = format!("P6\n{} {}\n255\n", size.w, size.h).into_bytes();
++        file.reserve(size.w as usize * size.h as usize * 3);
++        for pixel in pixels.chunks_exact(4).take(size.w as usize * size.h as usize) {
++            // frames are red, green, blue, alpha, as the renderer reads them back
++            file.extend_from_slice(&pixel[..3]);
++        }
++        let path = self.dir.join(format!("{name}.ppm"));
++        match std::fs::write(&path, file) {
++            Ok(()) => eprintln!("WMINJECT capture={} size={}x{} source={source}", path.display(), size.w, size.h),
++            Err(error) => self.errors.push(format!("capture {name}: {error}")),
++        }
++        self.queue.pop_front();
++        self.done += 1;
++        Ok(())
++    }
++    fn finish(&mut self) {
++        self.active = false;
++        let line = format!("done steps={} errors={} {}\n", self.done, self.errors.len(), self.errors.join("; "));
++        if let Err(error) = std::fs::write(self.dir.join("done"), &line) {
++            eprintln!("WMINJECT done-file error={error}");
++        }
++        eprintln!("WMINJECT {}", line.trim_end());
++    }
++}
+diff -ruN a/crates/wm-darwin/src/lib.rs b/crates/wm-darwin/src/lib.rs
+--- a/crates/wm-darwin/src/lib.rs	2026-11-11 17:10:55.976124160 -0800
++++ b/crates/wm-darwin/src/lib.rs	2026-11-13 14:39:39.789461823 -0800
+@@ -13,6 +13,8 @@
+ pub mod glrender;
+ pub mod gpu;
+ pub mod hid;
++#[cfg(feature = "desktop-shell")]
++pub mod inject;
+ mod input;
+ pub mod kms;
+ pub mod launch_audit;

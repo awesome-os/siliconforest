@@ -1,0 +1,67 @@
+--- public001/host/backend.py
++++ public002/host/backend.py
+@@ -1,5 +1,5 @@
+ #!/usr/bin/env python3
+-"""Separate opt-in example-http-v1 egress backend, Linux only.
++"""Separate opt-in example-http-ack-v2 egress backend, Linux only.
+ 
+ Adapted original transport001 backend0ec32b3e; that frozen file is unchanged.
+ No echo listener, arbitrary destination, SSH, host route, firewall, TAP or target.
+@@ -28,6 +28,9 @@
+ GUEST_IP, HOST_IP = socket.inet_aton("10.0.2.15"), socket.inet_aton("10.0.2.2")
+ GUEST_MAC = bytes.fromhex("525400123456")
+ MAX_QUEUE, MAX_FRAMES, MAX_BYTES = 8, 4096, 4 * 1024 * 1024
++PROFILE = "example-http-ack-v2"
++CLOSE_EOF_SECONDS = 15
++ACTIVE_IDLE_SECONDS = 30
+ STOP_REQUESTED = 0
+ 
+ 
+@@ -336,7 +339,7 @@
+                     raise TimeoutError("whole active backend lifetime")
+                 if not ready and now - self.started > 5:
+                     raise TimeoutError("gateway readiness")
+-                if self.active_started is not None and now - self.last_activity > 10:
++                if self.eof_since is None and self.active_started is not None and now - self.last_activity > ACTIVE_IDLE_SECONDS:
+                     raise TimeoutError("idle channel")
+                 for queue in (self.client_out, self.qemu_out):
+                     if queue.since is not None and now - queue.since > 2:
+@@ -351,7 +354,8 @@
+                         raise RuntimeError("actual child libslirp binding missing/ambiguous")
+                     self.slirp_binding = {path:hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in slirp}
+                     self.write_json("ready.json", {"schema":1,"nonce":self.nonce,
+-                        "profile":"example-http-v1","listen_host":"127.0.0.1","listen_port":self.port,
++                        "profile":PROFILE,"listen_host":"127.0.0.1","listen_port":self.port,
++                        "close_eof_seconds":CLOSE_EOF_SECONDS,"active_idle_seconds":ACTIVE_IDLE_SECONDS,
+                         "dns_server":"10.0.2.3","dns_port":53,"dns_question":"example.com A IN",
+                         "tcp_endpoint":"unresolved_until_correlated_dns_reply","tcp_port":80,
+                         "guest_ipv4":"10.0.2.15","host_alias":"10.0.2.2","mtu":1500,
+@@ -368,7 +372,7 @@
+                     if not self.policy.complete():
+                         raise RuntimeError("closed without correlated DNS/exact HTTP200/server FIN")
+                     normal = True; break
+-                if self.eof_since is not None and now - self.eof_since > 2:
++                if self.eof_since is not None and now - self.eof_since > CLOSE_EOF_SECONDS:
+                     raise TimeoutError("closed peer EOF")
+                 with selectors.DefaultSelector() as sel:
+                     def reg(sock, events, name):
+@@ -421,7 +425,9 @@
+                 if (self.records/name).is_file()}
+             self.write_json("result.json", {"schema":1,"nonce":self.nonce,
+                 "complete":complete,"closed_records":record_hashes,
+-                "profile":"example-http-v1","first_error":self.first_error,"cleanup":self.cleanup,
++                "profile":PROFILE,"first_error":self.first_error,"cleanup":self.cleanup,
++                "close_eof_seconds":CLOSE_EOF_SECONDS,"active_idle_seconds":ACTIVE_IDLE_SECONDS,
++                "active_seconds":self.seconds,"accept_seconds":self.accept_seconds,
+                 "egress":self.policy.summary(),
+                 "frame_counts_guest_host":self.frame_counts,"packet_bytes_guest_host":self.byte_counts,
+                 "guest_packets_accepted":self.accepted,"host_packets_forwarded":self.forwarded,
+@@ -483,7 +489,7 @@
+     p = argparse.ArgumentParser(description=__doc__)
+     for name in ("nonce", "codec-library", "codec-sha256", "records"):
+         p.add_argument("--" + name, required=True)
+-    p.add_argument("--profile", required=True, choices=["example-http-v1"])
++    p.add_argument("--profile", required=True, choices=[PROFILE])
+     for name in ("listen-port", "seconds", "accept-seconds"):
+         p.add_argument("--" + name, required=True, type=int)
+     a = p.parse_args()

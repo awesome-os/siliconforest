@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SOURCE_REVIEW_NO_HARDWARE",
+  "reviewed": {
+    "terminal-records.c": "0bd086e955488ed0",
+    "build.nix": "a0e4275fa8aa61b5",
+    "test_records.py": "52e634e97f9b082b"
+  },
+  "verdict": "APPROVE as a read-only bounded evidence exporter. It cannot modify, follow links, block on special files or exceed its caps. R1 (a per-record digest) is recommended before relying on it for qualification, because the serial console can interleave or drop bytes.",
+  "verified": [
+    "Arguments: exactly '--directory D --nonce HEX48 --phase live|closed'. The nonce must be lowercase hex of length 48, otherwise exit 2. The directory is opened O_DIRECTORY|O_NOFOLLOW, then fstat requires a directory owned by euid with no group/other bits.",
+    "Fixed record set only: pty-rx.bin (256 KiB), pty-tx.bin (16 KiB), child.json (4 KiB) and child-ready.json (4 KiB), all required in both phases, plus grid-final.txt (16 KiB) and result.json (16 KiB), required when closed. Each is opened with openat(O_RDONLY|O_NOFOLLOW|O_NONBLOCK), so a FIFO or device cannot block. fstat on the fd (no path race) requires S_ISREG, nlink 1, uid == euid, mode & 077 == 0 and size <= cap; anything else is REFUSED and the run fails.",
+    "Export: exactly st_size bytes, as 64-byte hex lines framed by 'DL11_RECORD_BEGIN <nonce> <name> bytes=N' and 'DL11_RECORD_END ... bytes=N file_bytes_after=M'. A short read fails. A second fstat requires the same dev/ino and no shrink, and in the closed phase an unchanged size. A live-phase export is explicitly a prefix (growth is reported, not judged). Missing files: only ENOENT for a non-required record in the live phase is tolerated. Exit 1 on any failure or stdout error.",
+    "Build: arm64 executable linked only against the page-size libSystem (build-libsystem-pagesize.nix, the 8ff49e0c line), which matches the candidate-006/007 RAM. The recipe asserts ARM64 EXECUTE and exactly one dependency, libSystem.",
+    "Tests re-run here: 6/6 OK (host build in a temp dir). They cover exact hex export, optional-missing only in live, closed requiring grid and result, symlink/hardlink/public-mode/size-cap refusals, directory-as-file without blocking, and bad arguments."
+  ],
+  "findings": [
+    {"id": "R1", "severity": "recommended before qualification", "text": "The hex travels through the shared serial console, where kernel log lines can be interleaved (even inside a line) and bytes can be lost. Line-length checks alone cannot prove a byte-exact transfer. Add a per-record SHA-256 of the exported bytes to the END line (libSystem 8ff49e0c exports CC_SHA256 and CC_SHA256_Init), and optionally a line index. The host parser should then require exactly ceil(N/64) lines of the exact hex lengths, the digest match and the nonce-tagged framing, and fail on anything else."},
+    {"id": "R2", "severity": "runtime unknown", "text": "A maximal export is about 312 KiB raw, roughly 630 KB as hex plus newlines. That fits the host's 32 MiB console bound, but the throughput of guest userspace through the console tty and the m1n1 VUART is unmeasured. The closed-phase export must finish before the host runtime stop; a missing END is correctly a failure. Measure the bytes/s in the first run and size the runtime or caps from that."},
+    {"id": "R3", "severity": "note", "text": "uid == euid binds the collector to the terminal's uid (root in the single-user RAM root). Running it under a different uid refuses every record, which is fail-closed."}
+  ],
+  "not_claimed": ["terminal runtime", "PTY evidence", "transfer integrity without R1"],
+  "scope": "Read-only source review plus host tests in temporary directories. No SDK build or hardware."
+}

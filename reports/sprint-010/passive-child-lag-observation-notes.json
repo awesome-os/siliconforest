@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "OBSERVATION_ONLY_INVESTIGATION_STOPPED_BY_USER_NO_CAUSE_CLAIMED",
+  "context": "The user reported Chonkstep window lag during passive-child attempt 001, with the returned text console not laggy. A read-only source look was started and then stopped at the user's direction; lag is a testing observation, not a priority or milestone. Nothing here was measured.",
+  "correction": "configure_serial=720 in the observer result is s.ssd.serial(), the last acked configure serial from Smithay's global SERIAL_COUNTER, which key and pointer events also advance (input.rs:79, :107). It is a serial value, not a configure count. My earlier chat description of '720 configure events' was wrong. The only direct evidence of a size change is the 80x17 final grid.",
+  "source_observations_unmeasured": [
+    "The compositor loop is single-threaded: accept/dispatch, drain up to 64 HID records per kind, repaint only if dirty, flush clients, sleep 8 ms (main.rs:59-71). Drained input reaches clients only after that iteration's repaint.",
+    "A dirty repaint is a full-screen CPU pass with no damage tracking: a new 2560x1600 pixmap, background fill, layer and window draws (scene.rs:153+), a per-pixel conversion into a new ~16 MB buffer (pixels.rs:118-133), and a per-pixel volatile store to the WC framebuffer (presenter.rs:106-114). Every pointer event sets dirty (input.rs:100).",
+    "The observer keeps at most one frame in flight (released buffer plus no pending callback; protocol.rs:20-36). Each draw reallocates a full surface buffer and rerenders the whole grid (main.rs:715-742). Callbacks fire only after the compositor's present (server.rs:97-118).",
+    "Kernel queues are 64-slot rings that overwrite the oldest on overflow, with sequence numbers (PDHIDEventQueue.cpp:735-749). Relative motion arrives as raw report counts (integer path, exact via <<16 and >>16), and Chonkstep adds it 1:1 to screen pixels with no gain (input.rs:95-97). That may feel slow, which is separate from latency.",
+    "The text console path renders in-kernel and is not the compositor path."
+  ],
+  "unknowns": ["repaint and present duration", "client draw duration", "HID arrival rate versus drain rate", "whether any queue overflow occurred", "how many configures were actually sent"],
+  "instrumentation_if_ever_prioritized": "Per-iteration monotonic timestamps around drain, repaint (render, convert, present) and flush, plus counts of drained records, dirty repaints and configures sent, in the compositor. In the observer: key-event-to-PTY-write and PTY-read-to-commit times. Kernel queue overflow counters (write minus read beyond 64). Export as bounded nonce-bound counters, not per-event logs.",
+  "not_claimed": ["any lag cause", "a configure storm", "latency values"]
+}

@@ -1,0 +1,65 @@
+# Native resolver example.com backend
+
+This separate opt-in Linux backend uses profile `native-resolver-example-http-v1`.
+It observes network packets; native daemon execution, libc getaddrinfo results,
+owned-default-route evidence and Linux recovery must be established separately.
+No synthetic guest result qualifies any of those facts.
+
+The original backend and policy are copied from frozen egress revision002,
+whose hashes are recorded in `source-validation.json`. Their old profiles and
+records are unchanged. All new changes are original lab code; no GPL code copied.
+
+The exact pinned POSIX mDNS unicast A path sends a 29-byte question: nonzero
+observed transaction ID, RD=0x0100, qd=1, an/ns/ar=0 and lowercase example.com
+A IN. Its ordinary retries retain the question ID and shared ephemeral port.
+The profile accepts at most three byte-identical queries on that same port;
+no nonce-derived DNS ID is required. EDNS/OPT, AAAA, another question, endpoint,
+ID/port change or unexpected local/multicast traffic fails closed without
+forwarding that packet. The source-facts file records why this narrow scope is
+appropriate. It does not assert that a real daemon cannot encounter other paths.
+
+A reply must arrive from 10.0.2.3:53 to the observed query port within ten seconds,
+match its transaction/question and validate a bounded CNAME/global-A chain.
+The first validated response supplies a lease capped at 60 seconds. Up to two
+identical reply duplicates do not refresh it. Raw answer TTLs and RDATA remain
+in the result. An unsolicited OPT response is unsupported. A non-global chain
+address, zero TTL, malformed response or changed duplicate fails closed.
+
+The first SYN may choose any global A in that first response, because libc can
+reorder the wire answers. The chosen address, wire-answer index and source port
+then lock one TCP connection to port80. No fallback to a second flow/address is
+permitted. HTTP remains exactly the inherited 186-byte GET with Host example.com,
+User-Agent darwin-lab-egress/1, identity encoding, fresh 48-hex nonce, and close.
+Response bytes, full request coverage, contiguous response and actual server FIN
+are required; TLS/DNSSEC/server identity is not claimed.
+
+Runtime limits: active at most90s, idle30s, post-CLOSE EOF15s, accept at most300s.
+DLNET001 codec is pinned to SHA256 698a007fb9dbc63fd5eabac46163f7a7ce6a7ff3056a37ed62185f8e9a6d2885.
+The backend uses a child QEMU machine-none libslirp network and loopback relay,
+not a CPU guest, TAP, firewall rule, host route, target or hardware adapter.
+
+The ready/result APIs retain the inherited shape and use the new exact profile.
+`egress.dns_query_events` and `dns_reply_events` include raw bytes, IDs, ports,
+relative monotonic times, retry/duplicate state. `dns_answer_records` preserves
+answer owner/type/class/TTL/raw RDATA; selected_answer_index is null before the
+first SYN. DNS and HTTP binary records plus full relay/Ethernet transcripts are
+saved and hashed, including on failure. An unsupported packet remains in the raw
+transcript even when it never reaches the accepted-event arrays.
+
+Offline checks:
+
+```
+python3 -I -m unittest discover -s integrations/puredarwin/m1-network-resolver-egress/host -p 'test_p*.py' -q
+python3 -I integrations/puredarwin/m1-network-resolver-egress/host/test_mutations.py
+python3 -I integrations/puredarwin/m1-network-resolver-egress/host/verify.py
+```
+
+`test_backend.py` runs real local QEMU lifecycle/refusal cases without public
+packets; `test_idle_bound.py` measures the real30s idle bound. The explicit-opt-in
+`test_public_pipeline.py` sends source-fact synthetic query bytes through the
+immutable production DL28 helper and actual Linux libslirp/DNS/HTTP. It selects
+the last validated answer to exercise libc answer reordering. Its old DL28
+public/backend semantic labels are transport-fixture compatibility only; the
+actual backend ready/result profile is the new profile. It does not run mdnsd,
+Darwin, getaddrinfo, create an interface/default route or emit a fake RESULT.
+The future target integration uses its own distinct helper namespace.

@@ -1,0 +1,41 @@
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -2291,6 +2291,7 @@
+     int started, window, axis, momentum;
+     double x, y, velocity;
+     double pts[16]; uint64_t ns[16]; unsigned count;   // the gesture's last moving frames
++    uint64_t lastNs;
+ } sfMomentum = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER };
+ 
+ static uint64_t sfMonoNs(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000000000ull+(uint64_t)t.tv_nsec;}
+@@ -2314,9 +2315,14 @@
+     pthread_mutex_lock(&sfMomentum.lock);
+     for(;;){
+         if(!sfMomentum.momentum){pthread_cond_wait(&sfMomentum.wake,&sfMomentum.lock);continue;}
+-        sfMomentum.velocity*=0.95;
++        /* (TERM11) the decay by the time that really passed (a late wake-up moved by a fixed 1/60 s and slowed the
++         * glide), 0.95 per 16.7 ms as before */
++        uint64_t tick=sfMonoNs();double dt=sfMomentum.lastNs?(double)(tick-sfMomentum.lastNs)/1e9:1/60.0;
++        if(dt>0.1)dt=0.1;
++        sfMomentum.lastNs=tick;
++        sfMomentum.velocity*=pow(0.95,dt*60);
+         if(fabs(sfMomentum.velocity)<25)sfMomentumStop();
+-        else sfMomentumPush(sfMomentum.velocity/60,0);
++        else sfMomentumPush(sfMomentum.velocity*dt,0);
+         struct timespec until;clock_gettime(CLOCK_REALTIME,&until);
+         uint64_t n=(uint64_t)until.tv_nsec+16666667ull;until.tv_sec+=n/1000000000ull;until.tv_nsec=n%1000000000ull;
+         pthread_cond_timedwait(&sfMomentum.wake,&sfMomentum.lock,&until);
+@@ -2344,7 +2350,12 @@
+         sfMomentum.velocity=span>0.004?sum/span:0;
+         sfMomentum.count=0;
+         if(getenv("SF_WS_SCROLL_TRACE"))fprintf(stderr,"WSSCROLL end frames=%u velocity=%.0f momentum=%d\n",n,sfMomentum.velocity,fabs(sfMomentum.velocity)>300);
+-        if(fabs(sfMomentum.velocity)>300){sfMomentum.momentum=1;sfMomentumPush(sfMomentum.velocity/60,2u);pthread_cond_signal(&sfMomentum.wake);}
++        /* (TERM11) a release speed capped at 6000 points/s: a hard flick (the desk's 3.5x acceleration, ~21000 points/s
++         * at 440 mm/s) coasted about seven screens; capped it glides at most ~1900 points (1.8 screens of 1067) after
++         * the fingers' own travel, as a hard flick on a Mac */
++        if(sfMomentum.velocity>6000)sfMomentum.velocity=6000;
++        if(sfMomentum.velocity<-6000)sfMomentum.velocity=-6000;
++        if(fabs(sfMomentum.velocity)>300){sfMomentum.momentum=1;sfMomentum.lastNs=sfMonoNs();sfMomentumPush(sfMomentum.velocity/60,2u);pthread_cond_signal(&sfMomentum.wake);}
+     }
+     pthread_mutex_unlock(&sfMomentum.lock);
+ }

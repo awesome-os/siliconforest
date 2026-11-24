@@ -1,0 +1,520 @@
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -2303,7 +2303,11 @@
+ }
+ 
+ static NSGraphicsContext *graphicsContextForView(NSView *view){
+-   if(view->_layer!=nil){
++   // (TERM7) a view's own bitmap is what the layer renderer composites; without one (no OpenGL) a view
++   // with a layer draws into its window like any other view, and its hosted layer is drawn over that
++   // (sfDrawHostedLayer). Its own bitmap was drawn and never shown: a movie's frames, the hosted-layer
++   // probe's window stayed the window's grey.
++   if(view->_layer!=nil && sfLayerRenderingAvailable()){
+     NSRect             frame=[view frame];
+ 
+     traceBackingDisplay(view,frame);
+@@ -2346,7 +2350,7 @@
+     CGContextSaveGState(graphicsPort);
+     CGContextResetClip(graphicsPort);
+ 
+-    if(_layer!=nil)
++    if(_layer!=nil && sfLayerRenderingAvailable())
+      CGContextSetCTM(graphicsPort,[self transformToLayer]);
+     else
+      CGContextSetCTM(graphicsPort,[self transformToWindow]);
+@@ -2383,7 +2387,7 @@
+ 
+    // only a backing layer shows what the view drew, a hosted layer belongs to the app.
+    // an NSOpenGLContext that flushed into the layer owns its contents
+-   if([_layer isKindOfClass:[NSViewBackingLayer class]] && objc_getAssociatedObject(_layer,@selector(flushBuffer))==nil){
++   if(sfLayerRenderingAvailable() && [_layer isKindOfClass:[NSViewBackingLayer class]] && objc_getAssociatedObject(_layer,@selector(flushBuffer))==nil){
+     CGImageRef image=CGBitmapContextCreateImage(context);
+ 
+     [(id)_layer _setContentsWithoutRender:(id)image];
+@@ -2597,6 +2601,15 @@
+    return h;
+ }
+ 
++// (TERM7) what CoreAnimation does before it draws a tree: each layer marked with -setNeedsDisplay fills its
++// contents (-display: -drawInContext:, a CAOpenGLLayer's OpenGL drawing)
++static void sfDisplayLayersIfNeeded(CALayer *layer,int depth) {
++   [layer displayIfNeeded];
++   if(depth<32)
++    for(CALayer *sub in [layer sublayers])
++     sfDisplayLayersIfNeeded(sub,depth+1);
++}
++
+ static void sfCPULayerTick(CFRunLoopTimerRef timer,void *info) {
+    for(unsigned i=0;i<sfCPULayerCount;i++){
+     NSView *view=sfCPULayerViews[i].view;
+@@ -2605,6 +2618,7 @@
+ 
+     if(window==nil || ![window isVisible] || layer==nil)
+      continue;
++    sfDisplayLayersIfNeeded(layer,0);
+     uint64_t sig=sfLayerSignature(layer,0);
+ 
+     if(!sfCPULayerViews[i].have || sfCPULayerViews[i].sig!=sig){
+@@ -2731,6 +2745,7 @@
+ static void sfDrawLayerCPU(CALayer *layer,CGContextRef ctx,CGFloat alpha,int depth) {
+    if([layer isHidden] || alpha*[layer opacity]<=0.001 || depth>32)
+     return;
++   [layer displayIfNeeded];
+    alpha*=[layer opacity];
+ 
+    CGRect b=[layer bounds];
+@@ -2773,7 +2788,8 @@
+      [image drawInRect:NSRectFromCGRect(r) fromRect:NSZeroRect operation:NSCompositeSourceOver fraction:1];
+      [NSGraphicsContext restoreGraphicsState];
+     }
+-    else if(cls==Nil){
++    else {
++     // a CVPixelBuffer (a CF object: its class is the bridge's, not Nil)
+      void *unlock=NULL;
+      CGImageRef image=sfImageOfPixelBuffer(contents,&unlock);
+ 
+@@ -2861,6 +2877,15 @@
+        [(id)self displayLayer:_layer];
+       else
+        [self updateLayer];
++      // (TERM7) without OpenGL what it put in its layer is drawn into the window here
++      if(!sfLayerRenderingAvailable()){
++       [self lockFocus];
++       CGContextRef port=[[NSGraphicsContext currentContext] graphicsPort];
++
++       CGContextClipToRect(port,rect);
++       sfDrawHostedLayer(self,_layer,port);
++       [self unlockFocus];
++      }
+ 
+        NSEnumerator *viewEnumerator = [self _subviewsInDisplayOrderEnumerator];
+        NSView *child = nil;
+--- a/src/Frameworks/AppKit/NSViewController.m
++++ b/src/Frameworks/AppKit/NSViewController.m
+@@ -30,7 +30,29 @@
+    return self;
+ }
+ 
++// (TERM7) as on macOS 10.10 and later: a controller made without a nib name uses the nib named after its class
++// (without a Swift module prefix) when its bundle has one. Activity Monitor's CPU Usage and CPU History items
++// (SMCPUUsageCollectionViewItem, SMCPUHistoryCollectionViewItem) are made that way: their views were empty
++static NSString *sfClassNamedNib(NSViewController *self, NSBundle *bundle) {
++   NSString *name=NSStringFromClass([self class]);
++   NSRange   dot=[name rangeOfString:@"." options:NSBackwardsSearch];
++
++   if(dot.location!=NSNotFound)
++    name=[name substringFromIndex:dot.location+1];
++   if([name hasPrefix:@"NS"])
++    return nil;
++   if(bundle==nil)
++    bundle=[NSBundle bundleForClass:[self class]];
++   if([bundle pathForResource:name ofType:@"nib"]!=nil)
++    return name;
++   if(bundle!=[NSBundle mainBundle] && [[NSBundle mainBundle] pathForResource:name ofType:@"nib"]!=nil)
++    return name;
++   return nil;
++}
++
+ -(NSString *)nibName {
++   if(_nibName==nil && [self storyboard]==nil)
++    _nibName=[sfClassNamedNib(self,_nibBundle) copy];
+    return _nibName;
+ }
+ 
+@@ -109,6 +131,11 @@
+ 
+    // a storyboard's view controller loads its view from the compiled storyboard's nibs
+    NSString     *path=[self storyboard] ? [[self storyboard] _pathForNibNamed:name] : [bundle pathForResource:name ofType:@"nib"];
++
++   if(path==nil && [self storyboard]==nil && [self nibBundle]==nil && [NSBundle bundleForClass:[self class]]!=bundle){
++    bundle=[NSBundle bundleForClass:[self class]];
++    path=[bundle pathForResource:name ofType:@"nib"];
++   }
+    NSDictionary *nameTable=[NSDictionary dictionaryWithObject:self forKey:NSNibOwner];
+ 
+    if(path==nil)
+--- a/src/Frameworks/AppKit/NSSplitView.h
++++ b/src/Frameworks/AppKit/NSSplitView.h
+@@ -46,6 +46,14 @@
+ /** Set the position of a divider */
+ - (void)setPosition:(CGFloat)position ofDividerAtIndex:(int)index;
+ 
++// macOS 10.11
++- (BOOL)arrangesAllSubviews;
++- (void)setArrangesAllSubviews:(BOOL)value;
++- (NSArray *)arrangedSubviews;
++- (void)addArrangedSubview:(NSView *)view;
++- (void)insertArrangedSubview:(NSView *)view atIndex:(NSInteger)index;
++- (void)removeArrangedSubview:(NSView *)view;
++
+ @end
+ 
+ // nb. it looks like the API for this is changed in MacOS X, replacing splitView:constrainMix:max:ofSubviewAt
+--- a/src/Frameworks/AppKit/NSSplitView.m
++++ b/src/Frameworks/AppKit/NSSplitView.m
+@@ -417,6 +417,66 @@
+    [self _sfSplitNeedsAdjust];
+ }
+ 
++// (TERM7) the arranged-subviews API of macOS 10.11 (Activity Monitor's GPU History asks -arrangedSubviews). With
++// arrangesAllSubviews (the default) the arranged subviews are the subviews; without it a list of its own, kept in
++// subview order
++static char sfSplitArrangesSomeKey, sfSplitArrangedKey;
++
++-(BOOL)arrangesAllSubviews {
++   return objc_getAssociatedObject(self, &sfSplitArrangesSomeKey)==nil;
++}
++
++-(void)setArrangesAllSubviews:(BOOL)value {
++   if(value==[self arrangesAllSubviews])
++    return;
++   objc_setAssociatedObject(self, &sfSplitArrangesSomeKey, value ? nil : (id)kCFBooleanTrue, OBJC_ASSOCIATION_RETAIN);
++   objc_setAssociatedObject(self, &sfSplitArrangedKey, value ? nil : [NSMutableArray arrayWithArray:[self subviews]], OBJC_ASSOCIATION_RETAIN);
++   [self _sfSplitNeedsAdjust];
++}
++
++-(NSArray *)arrangedSubviews {
++   NSMutableArray *list=objc_getAssociatedObject(self, &sfSplitArrangedKey);
++
++   if([self arrangesAllSubviews] || list==nil)
++    return [self subviews];
++   return [[list copy] autorelease];
++}
++
++-(void)addArrangedSubview:(NSView *)view {
++   [self insertArrangedSubview:view atIndex:[[self arrangedSubviews] count]];
++}
++
++-(void)insertArrangedSubview:(NSView *)view atIndex:(NSInteger)index {
++   NSMutableArray *list=objc_getAssociatedObject(self, &sfSplitArrangedKey);
++
++   if([self arrangesAllSubviews] || list==nil){
++    NSArray *subviews=[self subviews];
++
++    if([view superview]==self)
++     [view removeFromSuperview];
++    if(index>=0 && (NSUInteger)index<[subviews count])
++     [self addSubview:view positioned:NSWindowBelow relativeTo:[subviews objectAtIndex:index]];
++    else
++     [self addSubview:view];
++    return;
++   }
++   if([view superview]!=self)
++    [self addSubview:view];
++   [list removeObjectIdenticalTo:view];
++   [list insertObject:view atIndex:MIN((NSUInteger)MAX(index,0),[list count])];
++   [self _sfSplitNeedsAdjust];
++}
++
++-(void)removeArrangedSubview:(NSView *)view {
++   NSMutableArray *list=objc_getAssociatedObject(self, &sfSplitArrangedKey);
++
++   // as on macOS the view stays a subview; with arrangesAllSubviews there is no separate list to leave
++   if(list!=nil && ![self arrangesAllSubviews]){
++    [list removeObjectIdenticalTo:view];
++    [self _sfSplitNeedsAdjust];
++   }
++}
++
+ -(void)didAddSubview:(NSView *)view {
+    [super didAddSubview:view];
+    sfSplitLog(self, "didAddSubview", 0);
+@@ -424,6 +484,7 @@
+ 
+ -(void)willRemoveSubview:(NSView *)view {
+    [super willRemoveSubview:view];
++   [objc_getAssociatedObject(self, &sfSplitArrangedKey) removeObjectIdenticalTo:view];
+    sfSplitLog(self, "willRemoveSubview", 6);
+    [self _sfSplitNeedsAdjust];
+ }
+--- a/src/Frameworks/AppKit/NSSystemNamesAdditions.m
++++ b/src/Frameworks/AppKit/NSSystemNamesAdditions.m
+@@ -0,0 +1,71 @@
++/* SPDX-License-Identifier: MIT */
++/* (TERM7) names applications import from AppKit that this AppKit lacked:
++     the standard image names (NSImageName...) an application passes to +[NSImage imageNamed:]: macOS's values;
++       an image of that name is found when the catalog or a bundle has one, otherwise -imageNamed: answers nil
++       as it does for any unknown name (VLC's bundled Growl imports NSImageNameNetwork);
++     VLC 3's interface (libmacosx_plugin): NSAccessibilityFullScreenButtonAttribute,
++       NSCharacterEncodingDocumentOption, NSWorkspaceApplicationKey,
++       NSWorkspaceDidActivateApplicationNotification, NSWorkspaceWillSleepNotification. Nothing posts the
++       sleep notification (the session has no sleep); activation is posted by NSWorkspace where it knows of it. */
++#import <Foundation/Foundation.h>
++
++#define EXPORT __attribute__((visibility("default")))
++
++EXPORT NSString *const NSImageNameNetwork = @"NSNetwork";
++EXPORT NSString *const NSImageNameBonjour = @"NSBonjour";
++EXPORT NSString *const NSImageNameDotMac = @"NSDotMac";
++EXPORT NSString *const NSImageNameMobileMe = @"NSMobileMe";
++EXPORT NSString *const NSImageNameFolderBurnable = @"NSFolderBurnable";
++EXPORT NSString *const NSImageNameFolderSmart = @"NSFolderSmart";
++EXPORT NSString *const NSImageNameUserAccounts = @"NSUserAccounts";
++EXPORT NSString *const NSImageNamePreferencesGeneral = @"NSPreferencesGeneral";
++EXPORT NSString *const NSImageNameAdvanced = @"NSAdvanced";
++EXPORT NSString *const NSImageNameEveryone = @"NSEveryone";
++EXPORT NSString *const NSImageNameUserGroup = @"NSUserGroup";
++EXPORT NSString *const NSImageNameUserGuest = @"NSUserGuest";
++EXPORT NSString *const NSImageNameColorPanel = @"NSColorPanel";
++EXPORT NSString *const NSImageNameFontPanel = @"NSFontPanel";
++EXPORT NSString *const NSImageNameStatusAvailable = @"NSStatusAvailable";
++EXPORT NSString *const NSImageNameStatusPartiallyAvailable = @"NSStatusPartiallyAvailable";
++EXPORT NSString *const NSImageNameStatusUnavailable = @"NSStatusUnavailable";
++EXPORT NSString *const NSImageNameStatusNone = @"NSStatusNone";
++EXPORT NSString *const NSImageNameBluetoothTemplate = @"NSBluetoothTemplate";
++EXPORT NSString *const NSImageNameIChatTheaterTemplate = @"NSIChatTheaterTemplate";
++EXPORT NSString *const NSImageNameSlideshowTemplate = @"NSSlideshowTemplate";
++EXPORT NSString *const NSImageNameActionTemplate = @"NSActionTemplate";
++EXPORT NSString *const NSImageNameSmartBadgeTemplate = @"NSSmartBadgeTemplate";
++EXPORT NSString *const NSImageNameIconViewTemplate = @"NSIconViewTemplate";
++EXPORT NSString *const NSImageNameListViewTemplate = @"NSListViewTemplate";
++EXPORT NSString *const NSImageNameColumnViewTemplate = @"NSColumnViewTemplate";
++EXPORT NSString *const NSImageNameFlowViewTemplate = @"NSFlowViewTemplate";
++EXPORT NSString *const NSImageNamePathTemplate = @"NSPathTemplate";
++EXPORT NSString *const NSImageNameInvalidDataFreestandingTemplate = @"NSInvalidDataFreestandingTemplate";
++EXPORT NSString *const NSImageNameLockLockedTemplate = @"NSLockLockedTemplate";
++EXPORT NSString *const NSImageNameLockUnlockedTemplate = @"NSLockUnlockedTemplate";
++EXPORT NSString *const NSImageNameGoForwardTemplate = @"NSGoForwardTemplate";
++EXPORT NSString *const NSImageNameGoBackTemplate = @"NSGoBackTemplate";
++EXPORT NSString *const NSImageNameGoRightTemplate = @"NSGoRightTemplate";
++EXPORT NSString *const NSImageNameGoLeftTemplate = @"NSGoLeftTemplate";
++EXPORT NSString *const NSImageNameRightFacingTriangleTemplate = @"NSRightFacingTriangleTemplate";
++EXPORT NSString *const NSImageNameLeftFacingTriangleTemplate = @"NSLeftFacingTriangleTemplate";
++EXPORT NSString *const NSImageNameAddTemplate = @"NSAddTemplate";
++EXPORT NSString *const NSImageNameRemoveTemplate = @"NSRemoveTemplate";
++EXPORT NSString *const NSImageNameRevealFreestandingTemplate = @"NSRevealFreestandingTemplate";
++EXPORT NSString *const NSImageNameFollowLinkFreestandingTemplate = @"NSFollowLinkFreestandingTemplate";
++EXPORT NSString *const NSImageNameEnterFullScreenTemplate = @"NSEnterFullScreenTemplate";
++EXPORT NSString *const NSImageNameExitFullScreenTemplate = @"NSExitFullScreenTemplate";
++EXPORT NSString *const NSImageNameStopProgressTemplate = @"NSStopProgressTemplate";
++EXPORT NSString *const NSImageNameStopProgressFreestandingTemplate = @"NSStopProgressFreestandingTemplate";
++EXPORT NSString *const NSImageNameRefreshTemplate = @"NSRefreshTemplate";
++EXPORT NSString *const NSImageNameRefreshFreestandingTemplate = @"NSRefreshFreestandingTemplate";
++EXPORT NSString *const NSImageNameQuickLookTemplate = @"NSQuickLookTemplate";
++EXPORT NSString *const NSImageNameHomeTemplate = @"NSHomeTemplate";
++EXPORT NSString *const NSImageNameBookmarksTemplate = @"NSBookmarksTemplate";
++EXPORT NSString *const NSImageNameShareTemplate = @"NSShareTemplate";
++EXPORT NSString *const NSImageNameMenuMixedStateTemplate = @"NSMenuMixedStateTemplate";
++
++EXPORT NSString *const NSAccessibilityFullScreenButtonAttribute = @"AXFullScreenButton";
++EXPORT NSString *const NSCharacterEncodingDocumentOption = @"CharacterEncoding";
++EXPORT NSString *const NSWorkspaceApplicationKey = @"NSWorkspaceApplicationKey";
++EXPORT NSString *const NSWorkspaceDidActivateApplicationNotification = @"NSWorkspaceDidActivateApplicationNotification";
++EXPORT NSString *const NSWorkspaceWillSleepNotification = @"NSWorkspaceWillSleepNotification";
+--- a/src/Frameworks/AppKit/NSTextView.subproj/NSTypesetter_concrete.m
++++ b/src/Frameworks/AppKit/NSTextView.subproj/NSTypesetter_concrete.m
+@@ -96,6 +96,23 @@
+ 
+         _scanRect = [_container lineFragmentRectForProposedRect:_scanRect sweepDirection:NSLineSweepRight movementDirection:NSLineMovesDown remainingRect:remainingRect];
+ 
++        // (TERM7) a container lower than one line still holds its first line, drawn clipped by its view: one-line
++        // text views in nibs are sized for the macOS system font's line, and this system's lines are taller
++        // (Activity Monitor's inspector showed no Executable Path). The line is raised by what it is too tall, up to
++        // the space above the capitals, so the clip takes the empty top of the line before the letters; every
++        // fragment of that line gets the same rect (the raise is not added again).
++        // Only for a text view's container: the string drawing of cells and labels keeps its own way of placing a
++        // line its rect is too low for (with it, radio button titles in Terminal's Preferences moved up 2 pixels).
++        if (_scanRect.size.height > 0 && _scanRect.size.height < wantedHeight && proposedRect.origin.y <= 0 &&
++            [_container containerSize].height < wantedHeight && [_container textView] != nil) {
++                // only what the glyphs' extent (ascender to descender) lacks: a label a little lower than the line,
++                // its leading, stays where it was (Terminal's Preferences moved up a pixel)
++                CGFloat room = _font != nil ? MAX(0, [_font ascender] - [_font capHeight]) : 0;
++                CGFloat need = _font != nil ? ceil([_font ascender] - [_font descender]) - [_container containerSize].height : 0;
++                _scanRect.origin.y = -MIN(MAX(0, need), room);
++                _scanRect.size.height = wantedHeight;
++        }
++
+         if ([_glyphRangesInLine count] != 0 && _scanRect.origin.y > proposedRect.origin.y) {
+ #if DEBUG_GETLINEFRAGMENTRECT
+         NSLog(@"don't move the rects down");
+--- a/src/Frameworks/AppKit/NSImage.m
++++ b/src/Frameworks/AppKit/NSImage.m
+@@ -20,6 +20,8 @@
+ #import <AppKit/NSGraphicsContextFunctions.h>
+ #import <Foundation/NSKeyedArchiver.h>
+ #import <AppKit/NSRaise.h>
++#import <Onyx2D/O2Context.h>
++#import <Onyx2D/O2GraphicsState.h>
+ 
+ #define ABS(x) ((x)>=0 ? (x) : -(x))
+ 
+@@ -929,8 +931,10 @@
+ 
+         CGContextSaveGState(context);
+ 
+-        // Onyx2D fades images by the state's alpha, the old 1x1 clip mask was never applied
+-        CGContextSetAlpha(context, fraction);
++        // Onyx2D fades images by the state's alpha, the old 1x1 clip mask was never applied. (TERM7) The fraction
++        // multiplies the alpha already set (a faded view's, without layers: Activity Monitor's CPU Usage segments are
++        // image views whose alphaValue it sets; replaced, every segment was drawn lit)
++        CGContextSetAlpha(context, fraction*O2GStateAlpha(O2ContextCurrentGState((O2ContextRef)context)));
+         [[NSGraphicsContext currentContext] setCompositingOperation:operation];
+ 
+         [self drawRepresentation: cachedRep inRect:rect];
+--- a/src/Frameworks/AppKit/NSActivityMonitorAdditions.m
++++ b/src/Frameworks/AppKit/NSActivityMonitorAdditions.m
+@@ -202,15 +202,95 @@
+ - (id)copyWithZone:(NSZone *)zone { return [self retain]; }
+ @end
+ 
+-/* (cocoa 0110) a layout, so that a collection view takes it; it places no items (the compositional
+- * layout itself is not here) */
++/* (TERM7) the compositional layout, for vertical scrolling: each section's group (from the section, or from the
++ * section provider, asked with an environment whose container is the collection view's size) is repeated down the
++ * section until its items are placed. A group's size is resolved against the section's width and the view's height
++ * (fractionalWidth/fractionalHeight/absolute/estimated); a horizontal or vertical group of a subitem with a count
++ * divides itself into count equal items, a group of subitems places each at its own resolved size, in turn.
++ * Activity Monitor's CPU History is such a grid (one item per core): it showed nothing. Insets and spacing other than
++ * what the section and group are given are not supported (none are asked for). */
+ EXPORT
+ @interface NSCollectionViewCompositionalLayout : NSCollectionViewLayout {
+     NSCollectionLayoutSection *_section;
+     id _provider;
++    NSMutableArray *_sfAttributes;
++    NSSize _sfContent;
+ }
+ @end
+ 
++@interface NSCollectionViewLayout (SFCompositionalPrepared)
++- (void)_finchEnsurePrepared;
++@end
++
++@interface SFCompositionalEnvironment : NSObject {
++@public
++    NSSize _size;
++}
++@end
++
++@implementation SFCompositionalEnvironment
++- (id)container { return self; }
++- (NSSize)contentSize { return _size; }
++- (NSSize)effectiveContentSize { return _size; }
++- (NSEdgeInsets)contentInsets { return NSEdgeInsetsMake(0, 0, 0, 0); }
++- (NSEdgeInsets)effectiveContentInsets { return NSEdgeInsetsMake(0, 0, 0, 0); }
++@end
++
++static CGFloat sfResolve(NSCollectionLayoutDimension *d, NSSize container, CGFloat fallback) {
++    if (d == nil)
++        return fallback;
++    if ([d isFractionalWidth]) return [d dimension] * container.width;
++    if ([d isFractionalHeight]) return [d dimension] * container.height;
++    return [d dimension];
++}
++
++/* places one item or group at origin within container; advances *index for each item placed; the size it took */
++static NSSize sfPlace(NSCollectionLayoutItem *item, NSPoint origin, NSSize container, NSInteger section, NSInteger *index,
++                      NSInteger count, NSMutableArray *out) {
++    NSSize size = NSMakeSize(sfResolve([[item layoutSize] widthDimension], container, container.width),
++                             sfResolve([[item layoutSize] heightDimension], container, container.height));
++    if (![item isKindOfClass:[NSCollectionLayoutGroup class]]) {
++        if (*index >= count)
++            return size;
++        NSCollectionViewLayoutAttributes *a = [NSCollectionViewLayoutAttributes
++            layoutAttributesForItemWithIndexPath:[NSIndexPath indexPathForItem:*index inSection:section]];
++        [a setFrame:NSMakeRect(origin.x, origin.y, size.width, size.height)];
++        [out addObject:a];
++        (*index)++;
++        return size;
++    }
++    NSArray *subitems = [item subitems];
++    BOOL vertical = item->_vertical;
++    CGFloat at = 0;
++    if (item->_count > 0 && [subitems count] > 0) {
++        NSInteger n = item->_count;
++        NSSize each = vertical ? NSMakeSize(size.width, size.height / n) : NSMakeSize(size.width / n, size.height);
++        for (NSInteger k = 0; k < n && *index < count; k++) {
++            NSPoint p = vertical ? NSMakePoint(origin.x, origin.y + k * each.height) : NSMakePoint(origin.x + k * each.width, origin.y);
++            NSCollectionLayoutItem *sub = [subitems objectAtIndex:0];
++            // the subitem's own dimensions are taken against its share of the group
++            if ([sub isKindOfClass:[NSCollectionLayoutGroup class]])
++                sfPlace(sub, p, each, section, index, count, out);
++            else {
++                NSCollectionViewLayoutAttributes *a = [NSCollectionViewLayoutAttributes
++                    layoutAttributesForItemWithIndexPath:[NSIndexPath indexPathForItem:*index inSection:section]];
++                [a setFrame:NSMakeRect(p.x, p.y, each.width, each.height)];
++                [out addObject:a];
++                (*index)++;
++            }
++        }
++        return size;
++    }
++    for (NSCollectionLayoutItem *sub in subitems) {
++        if (*index >= count)
++            break;
++        NSPoint p = vertical ? NSMakePoint(origin.x, origin.y + at) : NSMakePoint(origin.x + at, origin.y);
++        NSSize used = sfPlace(sub, p, size, section, index, count, out);
++        at += vertical ? used.height : used.width;
++    }
++    return size;
++}
++
+ @implementation NSCollectionViewCompositionalLayout
+ - (id)initWithSection:(NSCollectionLayoutSection *)section {
+     if ((self = [super init]) != nil)
+@@ -222,8 +302,64 @@
+         _provider = [provider copy];
+     return self;
+ }
+-- (void)dealloc { [_section release]; [_provider release]; [super dealloc]; }
+-- (void)invalidateLayout {}
++- (void)dealloc { [_section release]; [_provider release]; [_sfAttributes release]; [super dealloc]; }
++
++- (void)prepareLayout {
++    [_sfAttributes release];
++    _sfAttributes = [[NSMutableArray alloc] init];
++    _sfContent = NSZeroSize;
++    NSCollectionView *cv = [self collectionView];
++    if (cv == nil)
++        return;
++    NSClipView *clip = (NSClipView *)[cv superview];
++    NSSize view = [clip isKindOfClass:[NSClipView class]] ? [clip bounds].size : [cv bounds].size;
++    SFCompositionalEnvironment *env = [[[SFCompositionalEnvironment alloc] init] autorelease];
++    env->_size = view;
++    CGFloat y = 0;
++    for (NSInteger s = 0; s < [cv numberOfSections]; s++) {
++        NSCollectionLayoutSection *section = _section;
++        if (_provider != nil)
++            section = ((NSCollectionLayoutSection * (^)(NSInteger, id))_provider)(s, env);
++        NSCollectionLayoutGroup *group = [section group];
++        NSInteger count = [cv numberOfItemsInSection:s], index = 0;
++        if (group == nil)
++            continue;
++        while (index < count) {
++            NSInteger before = index;
++            NSSize used = sfPlace(group, NSMakePoint(0, y), view, s, &index, count, _sfAttributes);
++            y += MAX(1, used.height);
++            if (index == before)
++                break;   // a group that takes no items: nothing more can be placed
++        }
++    }
++    _sfContent = NSMakeSize(view.width, y);
++}
++
++- (NSSize)collectionViewContentSize {
++    [self _finchEnsurePrepared];
++    return _sfContent;
++}
++
++- (NSArray *)layoutAttributesForElementsInRect:(NSRect)rect {
++    [self _finchEnsurePrepared];
++    NSMutableArray *out = [NSMutableArray array];
++    for (NSCollectionViewLayoutAttributes *a in _sfAttributes)
++        if (NSIntersectsRect([a frame], rect))
++            [out addObject:a];
++    return out;
++}
++
++- (NSCollectionViewLayoutAttributes *)layoutAttributesForItemAtIndexPath:(NSIndexPath *)indexPath {
++    [self _finchEnsurePrepared];
++    for (NSCollectionViewLayoutAttributes *a in _sfAttributes)
++        if ([[a indexPath] isEqual:indexPath])
++            return a;
++    return nil;
++}
++
++- (BOOL)shouldInvalidateLayoutForBoundsChange:(NSRect)newBounds {
++    return YES;
++}
+ @end
+ 
+ /* (cocoa 0110: the collection view keeps its own layout now, NSCollectionView/NSCollectionView.m) */

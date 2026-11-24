@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SOURCE_REVIEW_NO_HARDWARE",
+  "reviewed": {
+    "integrations/puredarwin/m1-bringup/terminal_input_progress.py": "2b8901e7c29357a3",
+    "integrations/puredarwin/m1-bringup/test_terminal_input_progress.py": "f5796ab3610dc983",
+    "unwired_check": "Neither host_progress.py (78c25815) nor tools/m1_bringup_cycle.py (1a6d716c) references it; virtual_input_progress.py is still 689a8fb0. Nothing qualified changed."
+  },
+  "verdict": "APPROVE AS UNWIRED SOURCE. A finite, fixed-command typing schedule built on the H1/H2-fixed VirtualInput base. Guest lines only open barriers, every key is released, and nothing is retried or guessed. Wiring it into the host needs its own review (K3).",
+  "verified": [
+    "command(nonce): the input text is \"printf '\\nDLT_%s%s\\n' '<half1>' '<half2>'; /bin/uname -s; /bin/uname -m; /bin/uname -r\" followed by Enter. It is refused if the joined nonce appears in the input or if it exceeds 180 bytes (it is 121). Echo and line-editor redraws of the typed text cannot form 'DLT_<joined 48>'; only printf's output can.",
+    "us_key / key_report: a closed alphabet. Lowercase letters (a-z, covering the hex nonce), uppercase letters with Shift (mods 2), digits, space, - _ \\ ; ' % / and Enter. Anything else raises. Reports are '\\x01k {0|2} {usage<=0x38} 0 0 0 0 0\\n'. reports() emits press then all-release per character (242 reports, 4206 bytes; budget 360 reports / 8192 bytes). Enter is the last press, so repeated characters still produce distinct transitions.",
+    "TerminalInput: PRIME (exact) queues the same Shift/mouse priming as the qualified input run, with a 30 s deadline. READY (exact 'pty=ready keymap=xkb_v1 focus=own_surface frame=ready') queues typing with a 55 s deadline; at about 80-200 ms per report the typing takes about 19-48 s. RESPONSE (exact 'origin=pty_shell system=Darwin machine=arm64 release=25.5.0') is accepted only once, only after at least len-1 typing actions (Enter-down) have been sent, and the final neutral release is still sent before 'complete'. An early, uncaused or repeated response, or a 'darwin-wayland-terminal:' line, fails. Deadline and cancel send no suffix; the action cap is 400 / 8192 bytes. Line framing comes from the inherited, fixed feed(): each completed line and the remaining tail are capped at 8192.",
+    "Tests re-run here: 11/11 OK, including the XKB reference test (not skipped). That test maps each usage to evdev with the frozen hid.rs table and translates through host libxkbcommon evdev/pc105/us back to exactly the command text. This is host reference evidence, not the guest keymap."
+  ],
+  "findings": [
+    {
+      "id": "K1",
+      "severity": "low (flakiness)",
+      "text": "Chonkstep's seat repeat is delay 500 ms, rate 25 (wm-darwin input.rs:47). Normal press-to-release gaps (80 ms plus serial-read tick granularity) are well below that, but a host stall of 500 ms or more between a press and its release (for example a slow VUART write; write_timeout is 2 s) would let a client-side repeat duplicate a character. The run then fails safe on the response, but flakily. Either have the terminal client ignore repeat_info for qualification runs, or have the host report the maximum press-to-release gap from the recorded action times and invalidate any run at or above 400 ms."
+    },
+    {
+      "id": "K2",
+      "severity": "evidence rule",
+      "text": "DL11_TERMINAL_RESPONSE is a self-report by the guest terminal. Qualification must still rest on the terminal's exact bounded PTY RX/TX (hex with digest, via terminal-records), the rendered grid in the paused framebuffer, the fresh nonce and Linux recovery. Child-exit rule (revision 2 clarification): the finite PTY smoke requires the actual sh to exit normally with status 0. The interactive terminal's shell is legitimately ended by the owned TERM/KILL cleanup, so a later UI clean exit requires terminal app exit 0, cleanup.complete, the child reaped and the raw child wait status recorded (which may show a signal), not a child normal exit 0. A first live capture cannot claim cleanup; that needs the separate bounded close cycle."
+    },
+    {
+      "id": "K3",
+      "severity": "wiring prerequisite",
+      "text": "Before any use: an exact new build-record experiment key, mutual exclusion with virtual_input_experiment and keyboard, controller pin and snapshot, same-owner ConsoleSession integration with the H1 semantics (observation failure cancels and the reader continues; write failure stops), and the hardware PTY smoke qualified first. Not reviewed here because it is not wired."
+    },
+    {
+      "id": "K4",
+      "severity": "note",
+      "text": "RESPONSE hard-codes release=25.5.0, matching the current kernel. A kernel version change correctly fails closed until the constant is updated."
+    }
+  ],
+  "not_claimed": [
+    "any typing",
+    "terminal",
+    "PTY runtime",
+    "physical keyboard"
+  ],
+  "scope": "Read-only source review plus the module's unit tests (no bytecode). No hardware, staging or host-controller changes.",
+  "revision": 2,
+  "revision_note": "K2 corrected after root clarification: the earlier zero-child-exit wording applies to the finite PTY smoke only, not to the interactive terminal."
+}

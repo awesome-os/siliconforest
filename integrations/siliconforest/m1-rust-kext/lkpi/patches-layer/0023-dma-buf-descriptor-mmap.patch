@@ -1,0 +1,253 @@
+fbsdkpi: drm: mmap of a dma-buf descriptor
+
+mmap() of a dma-buf descriptor failed with EINVAL in xnu itself. With the kernel side
+(integrations/siliconforest/m1-dcp/kernel-patches/0003: sf_lfile_ops.mmap_pages) a shared
+mapping is made the way the DRM device nodes' are: xnu asks once for the physical pages.
+
+- linux/mm.h: struct sf_vma_pages and vm_area_struct.sf_pages, the page question carried
+  down an mmap op in the vma.
+- sf_lfile_lkpi.c: the mmap_pages op. For a dma-buf file it builds the vma and calls
+  dma_buf_mmap_internal(); the vma lives as long as the mapping, holds the file reference
+  linux's vma->vm_file holds, and vm_ops->close() runs (from a work item) when xnu drops
+  the last mapping. An exporter whose mmap op succeeds without answering is refused.
+- sf_dma_buf_mmap.c: dma_buf_mmap_range_check() and dma_buf_mmap_internal() of the pin's
+  drivers/dma-buf/dma-buf.c (GPL-2.0-only, own file, as 0021 and 0022). The exporter is
+  reached through dmabuf->ops->mmap, so the file may belong to another DRM kext.
+
+The exporters: drm_gem_dmabuf_mmap() and drm_gem_prime_mmap() are the DRM core's,
+unchanged. shmem objects (SFAgx) answer in drm_gem_shmem_mmap() (m1-drm72 patch 0009), DMA
+objects (SFDcp) in the dma_mmap_wc() that drm_gem_dma_mmap() calls (m1-dcp).
+
+DMA_BUF_IOCTL_SYNC (in 0021's file) is now the pin's: flags validated, and
+dma_buf_begin/end_cpu_access called. Neither exporter has cpu-access ops, so it changes
+nothing for them but the validation.
+Not done: MAP_PRIVATE (EINVAL), and a mapping is never revoked.
+UPSTREAM: yes, with the kernel patch.
+
+--- a/src/Kernel/fbsdkpi/drm/drm.cmake
++++ b/src/Kernel/fbsdkpi/drm/drm.cmake
+@@ -132,3 +139,7 @@
+         "${drmkmod}/drivers/gpu/drm/radeon"
+         "${drmkmod}/drivers/gpu/drm/amd/include" PARENT_SCOPE)
+ endfunction()
++
++# From linux drivers/dma-buf/dma-buf.c, GPL-2.0-only like the two lists above: mmap of a
++# dma-buf descriptor
++list(APPEND SF_DRM_PD_SOURCES sf_dma_buf_mmap.c)
+--- a/src/Kernel/fbsdkpi/drm/src/sf_dma_buf_mmap.c
++++ b/src/Kernel/fbsdkpi/drm/src/sf_dma_buf_mmap.c
+@@ -0,0 +1,65 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * mmap of a dma-buf descriptor: dma_buf_mmap_range_check() and dma_buf_mmap_internal()
++ * (lines 228-263 there).
++ *
++ * From drivers/dma-buf/dma-buf.c of linux-aurora (Omacom, integration/aurora) at 6a08a08e:
++ *
++ * Framework for buffer objects that can be shared across devices/subsystems.
++ *
++ * Copyright(C) 2011 Linaro Limited. All rights reserved.
++ * Author: Sumit Semwal <sumit.semwal@ti.com>
++ *
++ * Many thanks to linaro-mm-sig list, and specially
++ * Arnd Bergmann <arnd@arndb.de>, Rob Clark <rob@ti.com> and
++ * Daniel Vetter <daniel@ffwll.ch> for their support in creation and
++ * refining of this idea.
++ */
++#include <linux/uaccess.h>
++#include <linux/fs.h>
++#include <linux/file.h>
++#include <linux/dma-buf.h>
++#include <linux/kernel.h>
++#include <linux/mm.h>
++#include <linux/overflow.h>
++
++int sf_dma_buf_mmap_internal(struct linux_file *file, struct vm_area_struct *vma);
++
++static int
++dma_buf_mmap_range_check(struct dma_buf *dmabuf, struct vm_area_struct *vma,
++    unsigned long pgoff, unsigned int suboffset)
++{
++	unsigned long offset;
++
++	if (check_mul_overflow(pgoff, PAGE_SIZE, &offset) ||
++	    check_add_overflow(offset, (unsigned long)suboffset, &offset))
++		return -EOVERFLOW;
++	if (offset > dmabuf->size || vma->vm_end - vma->vm_start > dmabuf->size - offset)
++		return -EINVAL;
++	return 0;
++}
++
++// file_operations.mmap of a dma-buf on linux; here called by sf_lfile_lkpi.c, which is not
++// necessarily the copy of this layer that made the file (is_dma_buf_file() knows both)
++int
++sf_dma_buf_mmap_internal(struct linux_file *file, struct vm_area_struct *vma)
++{
++	struct dma_buf *dmabuf;
++	int ret;
++
++	if (!is_dma_buf_file(file))
++		return -EINVAL;
++
++	dmabuf = file->private_data;
++
++	/* check if buffer supports mmap */
++	if (!dmabuf->ops->mmap)
++		return -EINVAL;
++
++	/* check for overflowing the buffer's size (this layer has no sub-page offset) */
++	ret = dma_buf_mmap_range_check(dmabuf, vma, vma->vm_pgoff, 0);
++	if (ret)
++		return ret;
++
++	return dmabuf->ops->mmap(dmabuf, vma);
++}
+--- a/src/Kernel/fbsdkpi/drm/src/sf_lfile_lkpi.c
++++ b/src/Kernel/fbsdkpi/drm/src/sf_lfile_lkpi.c
+@@ -18,13 +18,18 @@
+ 	long (*read)(void *obj, void *buffer, size_t size, int nonblock);
+ 	// the new offset or a negative errno, like linux llseek
+ 	long long (*seek)(void *obj, long long offset, int whence);
++	// mmap: the physical pages behind a range, their cache mode, a release callback
++	int (*mmap_pages)(void *obj, off_t offset, size_t size, int prot, uint32_t *pages,
++	    unsigned int *wimg, void (**release)(void *), void **release_arg);
+ };
+ 
++
+ int sf_lfile_register(const struct sf_lfile_ops *ops);
+ int sf_lfile_reserve(int cloexec, int *fdp);
+ void sf_lfile_unreserve(int fd);
+ void sf_lfile_install(int fd, void *obj);
+ void *sf_lfile_get(int fd);
++void sf_lfile_wakeup(void *obj);
+ 
+ void
+ sf_lkpi_fput(struct linux_file *filp)
+@@ -122,17 +122,102 @@
+ {
+ 	struct linux_file *filp = obj;
+ 
++
+ 	if (filp->f_op->llseek == NULL)
+ 		return -ESPIPE;
+ 	return filp->f_op->llseek(filp, offset, whence);
+ }
+ 
++// mmap of a linux file. Only a dma-buf has one: dma_buf_mmap_internal() and, through the
++// exporter's dma_buf_ops.mmap, the GEM object's mmap op, asked for its pages (struct
++// sf_vma_pages in linux/mm.h). The vma is kept for the life of the mapping, with the file
++// reference linux's mmap holds through vma->vm_file, and vm_ops->close() ends it.
++int sf_dma_buf_mmap_internal(struct linux_file *file, struct vm_area_struct *vma);
++
++struct sf_lfile_mapping {
++	struct vm_area_struct vma;
++	struct work_struct work;
++};
++
++static void
++sf_lfile_mapping_end(struct sf_lfile_mapping *m)
++{
++	if (m->vma.vm_ops != NULL && m->vma.vm_ops->close != NULL)
++		m->vma.vm_ops->close(&m->vma);
++	kfree(m);
++}
++
++// close takes sleeping locks and may free the object: not on the pager's teardown path
++static void
++sf_lfile_mapping_release_work(struct work_struct *work)
++{
++	struct sf_lfile_mapping *m = container_of(work, struct sf_lfile_mapping, work);
++	struct linux_file *filp = m->vma.vm_file;
++
++	linux_set_current(curthread);
++	sf_lfile_mapping_end(m);
++	fput(filp);
++}
++
++static void
++sf_lfile_mapping_release(void *arg)
++{
++	struct sf_lfile_mapping *m = arg;
++
++	schedule_work(&m->work);
++}
++
++static int
++sf_lfile_mmap_pages(void *obj, off_t offset, size_t size, int prot, uint32_t *pages,
++    unsigned int *wimg, void (**release)(void *), void **release_arg)
++{
++	struct linux_file *filp = obj;
++	struct sf_lfile_mapping *m;
++	struct sf_vma_pages rq = { .pages = pages, .wimg = *wimg, .filled = false };
++	int ret;
++
++
++	if (size == 0 || (size & (PAGE_SIZE - 1)) != 0 || offset < 0 ||
++	    (offset & (PAGE_SIZE - 1)) != 0)
++		return EINVAL;
++	if (!is_dma_buf_file(filp))
++		return ENODEV;
++	m = kzalloc(sizeof(*m), GFP_KERNEL);
++	if (m == NULL)
++		return ENOMEM;
++	m->vma.vm_start = 0;
++	m->vma.vm_end = size;
++	m->vma.vm_pgoff = offset >> PAGE_SHIFT;
++	m->vma.vm_flags = VM_SHARED | VM_READ | ((prot & VM_PROT_WRITE) != 0 ? VM_WRITE : 0);
++	m->vma.vm_file = filp;
++	m->vma.sf_pages = &rq;
++	linux_set_current(curthread);
++	ret = sf_dma_buf_mmap_internal(filp, &m->vma);
++	m->vma.sf_pages = NULL;
++	if (ret != 0) {
++		kfree(m);
++		return ret < 0 ? -ret : ret;
++	}
++	if (!rq.filled) {
++		// an exporter whose mmap op does not answer the page question
++		sf_lfile_mapping_end(m);
++		return ENODEV;
++	}
++	get_file(filp);
++	INIT_WORK(&m->work, sf_lfile_mapping_release_work);
++	*wimg = rq.wimg;
++	*release = sf_lfile_mapping_release;
++	*release_arg = m;
++	return 0;
++}
++
+ static const struct sf_lfile_ops sf_lfile_lkpi_ops = {
+ 	.hold = sf_lfile_hold,
+ 	.release = sf_lfile_release,
+ 	.poll = sf_lfile_poll,
+ 	.ioctl = sf_lfile_ioctl,
+ 	.seek = sf_lfile_seek,
++	.mmap_pages = sf_lfile_mmap_pages,
+ };
+ 
+ void sf_lfile_lkpi_init(void);
+--- a/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/include/linux/mm.h
++++ b/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/include/linux/mm.h
+@@ -126,6 +126,22 @@
+ 	vm_object_t vm_obj;
+ 	vm_map_t vm_cached_map;
+ 	TAILQ_ENTRY(vm_area_struct) vm_entry;
++
++	/* SiliconForest: set while an mmap op is asked for its pages, see below */
++	struct sf_vma_pages *sf_pages;
++};
++
++/*
++ * SiliconForest: xnu asks for the physical pages behind an mmap once, when the mapping is
++ * made, and no fault handler runs later. For a linux file (a dma-buf descriptor,
++ * drm/src/sf_lfile_lkpi.c) the question travels down the file's mmap op in the vma: an op
++ * that on linux would insert the pages or leave them to the fault handler writes the page
++ * numbers here and sets `filled`. vma->vm_ops->close() runs when the last mapping is gone.
++ */
++struct sf_vma_pages {
++	uint32_t *pages;	/* one per page of the vma, in PAGE_SHIFT units */
++	unsigned int wimg;	/* xnu cache mode of the mapping */
++	bool filled;
+ };
+ 
+ struct vm_fault {

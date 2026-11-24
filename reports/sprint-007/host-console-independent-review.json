@@ -1,0 +1,103 @@
+{
+  "status": "SOURCE_REVIEW_ONLY",
+  "claim_class": "independent_source_review",
+  "hardware_boot_observed": false,
+  "device_contacted": false,
+  "launcher_executed": false,
+  "parked_checkpoint_observed": false,
+  "boot_proof": false,
+  "reviewed": [
+    "integrations/puredarwin/m1-firstboot/host_console.py",
+    "integrations/puredarwin/m1-firstboot/test_host_console.py",
+    "integrations/puredarwin/m1-firstboot/HOST_CONSOLE.md"
+  ],
+  "compared_with": "sources/m1n1-baseline detached 121fcbf35d4501814b58ca5347926a4173b6a512",
+  "missing_parked_pc_x19_capture": {
+    "severity": "evidence_blocker",
+    "finding": "The launcher has no bounded way to regain HV control and record the parked guest PC and x19 before the worker stops.",
+    "why": [
+      "The reviewed park is an unconditional branch with DAIF masked, so HV.start/P_HV_START does not return.",
+      "Worker stdin is /dev/null and os.setsid() keeps parent Ctrl-C off the worker.",
+      "Parent timeout or Ctrl-C uses Process.kill (SIGKILL of that host PID only). That skips HV._handle_sigint, so the proxy never receives the '!' byte that would enter handle_exception.",
+      "run_shell, start_secondary, and reboot are replaced by BoundedStop, so the pinned path that prints ExcInfo (ELR and x0-x30, including x19) cannot run.",
+      "hv_vuart.c may printf an HVLOG line to the proxy console while reply() is blocked. UartInterface.unkhandler can copy those bytes to worker stdout as TTY text. The parent does not read worker.log and does not sample PC or x19.",
+      "host-result.json on that path is HOST_WORKER_TIMEOUT or HOST_OPERATOR_INTERRUPTED, hardware_boot_observed false, target_state unknown."
+    ],
+    "contract": "CONTRACT.md requires a full captured line plus the expected parked PC and x19. A line in a loader log, or x19 alone, is not that checkpoint.",
+    "needed": "A separate qualification step that records guest PC and x19 while the guest is parked, before the worker is destroyed. A console line plus a timeout is partial evidence only."
+  },
+  "blockers": [
+    {
+      "id": "no_parked_context",
+      "summary": "Same gap as missing_parked_pc_x19_capture. Do not treat a received marker, worker.log line, or timeout as a reached checkpoint or hardware PASS."
+    }
+  ],
+  "false_refusals": [
+    {
+      "id": "memcpy8_alignment",
+      "summary": "validate_layout rejects a SEPFW, TrustCache, or preoslog range unless address and size are both multiples of 8, claiming the pinned memcpy8 loader cannot use it.",
+      "source": "Pinned memcpy8 is ldrb/strb with no alignment mask (src/utils_asm.S). proxy.py memcpy8 does not check alignment. load_raw copies the raw SEPFW and TrustCache lengths.",
+      "effect": "An odd live address or length is rejected before HV.init even though load_raw would copy every byte. Fail-closed, and not part of the load_raw address formula."
+    }
+  ],
+  "stricter_launcher_selections_not_stock_requirements": [
+    {
+      "id": "bootargs_16k",
+      "summary": "preoslog size must be a multiple of 16K or collection fails, so predicted BootArgs stay 16K-aligned.",
+      "stock_loader": "load_raw adds the raw preoslog size and does not require that alignment. When the launcher check passes, bootargs_off still uses the raw size, matching the pin.",
+      "disposition": "Keep as this launcher's BootArgs rule. Do not describe it as a memcpy8 or stock load_raw requirement."
+    },
+    {
+      "id": "guest_16k",
+      "summary": "The proxy heap cursor must be 16K-aligned, and (guest_base - vmin) must be 16K-aligned.",
+      "stock_loader": "heapblock_alloc aligns to 64 bytes. load_raw does not reject a heap_top that is not 16K-aligned.",
+      "disposition": "Keep. These are launcher placement checks, together with the RAM-bound and heap-overlap checks."
+    }
+  ],
+  "layout_formula_holds": {
+    "summary": "The four fields compared after load_macho match pinned load_raw when heap_top is the alloc(0) cursor plus 128MiB plus 1GiB, the image has no PYLD segment, and len(prepare_image) equals vmax-vmin.",
+    "fields": {
+      "phys_base": "u.heap_top",
+      "guest_base": "phys_base + 16MiB + align(devtree_size) + align(TrustCache size)",
+      "bootargs_off": "align(image length) + align(SEPFW size) + raw preoslog size",
+      "entry": "guest_base + (LC_UNIXTHREAD pc - vmin)"
+    },
+    "note": "The equality check runs after load_raw has already copied the image and firmware. A mismatch skips start. A second heapblock_alloc(0) returns the same cursor when the size is 0."
+  },
+  "guest_register_timing": {
+    "summary": "SCTLR_EL12 and VPIDR_EL2 are read three times, all before hv.start: after ProxyUtils, after init and set_bootargs, and after load_macho.",
+    "pin": "hv_init, HV.init, and load_raw do not write those two registers. hv_start writes VMPIDR_EL2 from MPIDR_EL1 only after the last sample, inside the call the park does not return from.",
+    "meaning": "With HCR_EL2.E2H already set at proxy boot, SCTLR_EL12 is the guest EL1 register. m1n1 enables its own MMU through the SCTLR_EL1 encoding, which is SCTLR_EL2 in that mode. VPIDR_EL2 here is the current CPU reset value, not a sample from the parked guest."
+  },
+  "admission_that_holds": [
+    "A device path other than /dev/cu.usbmodem with no extra slash or colon is rejected before open.",
+    "Live BUILD_TAG mismatch, CPUFeatures size other than 20, BootArgs revision outside {1,2,3}, and BootArgs version outside {1,2} are rejected before HV.init.",
+    "Live target-type, model, chip 0x8103, UART 0x235200000, or a running-CPU count other than one is rejected before heap allocation and HV.init.",
+    "stage1 and stage2 are bounded inventory strings and are not required to equal the pin. build_tag is set to the pin only after the live tag bytes match. live_image_verification_observed stays false.",
+    "product.compatible sent to preflight is the saved Linux inventory, not the live ADT compatible list.",
+    "Original BootArgs and ADT bytes are written before HV.init. load_adt parses; setup_adt mutates HV's later tree.",
+    "No PMU.reset_panic_counter and no m1n1.setup. HV.init and HV.start, once reached, still perform pinned hv_init, PMGR hooks, and fb_shutdown.",
+    "UartInterface.nop sends REQ_NOP with host feature flags after the path check and before whoami and board checks.",
+    "Parent kill is that worker PID only. --execute returns 1. No status string is a hardware PASS."
+  ],
+  "source_references": [
+    "integrations/puredarwin/m1-firstboot/host_console.py validate_layout, collect, run_worker, worker_entry, supervise",
+    "integrations/puredarwin/m1-firstboot/HOST_CONSOLE.md checks 1-7 and the timeout paragraph",
+    "integrations/puredarwin/m1-firstboot/CONTRACT.md reached-checkpoint paragraph and host capture limit",
+    "integrations/puredarwin/m1-firstboot/m1_first_entry.inc park loop and HVLOG string",
+    "sources/m1n1-baseline/proxyclient/m1n1/hv/__init__.py load_raw, load_macho, init, start, handle_exception",
+    "sources/m1n1-baseline/src/utils_asm.S memcpy8",
+    "sources/m1n1-baseline/src/heapblock.c heapblock_alloc_aligned",
+    "sources/m1n1-baseline/src/hv/hv_vuart.c HVLOG passthrough",
+    "sources/m1n1-baseline/src/hv/hv.c hv_init HCR_E2H and hv_start VMPIDR_EL2",
+    "sources/m1n1-baseline/src/exception.c EL2 HCR_E2H at proxy boot",
+    "sources/m1n1-baseline/proxyclient/m1n1/proxy.py UartInterface.nop, unkhandler, memcpy8",
+    "sources/m1n1-baseline/proxyclient/m1n1/proxyutils.py heap_top and mrs",
+    "sources/m1n1-baseline/proxyclient/m1n1/macho.py prepare_image"
+  ],
+  "limits": [
+    "This record is a source comparison. It is not a proxy session, hardware boot, parked checkpoint, or normal-boot result.",
+    "Tests under test_host_console.py use fakes and do not exercise pinned HV.load_raw or a live UART.",
+    "No build, SSH, or launcher execution was performed for this review."
+  ]
+}

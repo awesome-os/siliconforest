@@ -1,0 +1,103 @@
+{
+  "schema_version": 1,
+  "record": "recovery-validation-review",
+  "recorded_at": "2026-11-08T01:45:01Z",
+  "reviewer": "Claude (independent, read-only design review)",
+  "status": "READ_ONLY_STAGED_QUALIFICATION_PROPOSAL_NOT_EXECUTED",
+  "scope": {
+    "files_written": ["reports/sprint-008/recovery-validation-review.json"],
+    "commands_run_on_target_or_controller": false,
+    "ssh_used": false,
+    "device_or_usb_opened": false,
+    "maclab_server_contacted": false,
+    "hardware_accessed": false
+  },
+  "inputs_and_claim_classes": {
+    "macvdmtool_facts": "Inherited from root's reports/sprint-008/controller-recovery-source-review.json (source at M5 commit b22ae51e, not independently re-read here because it is only on the M5).",
+    "target_preflight": "User/root relayed, not observed here: kernel.panic=10, systemd RuntimeWatchdogUSec=30s, RebootWatchdogUSec=2min, kernel 7.2.11-6-1-ARCH.",
+    "prior_live_evidence": "Root reports: serial-mode VDM rc 0 (serial-mode-command.json), bidirectional serial shell (serial-bidirectional.json), orderly SSH reboot and return in about 34 s (orderly-reboot-001.json).",
+    "local_source_fact": "Pinned m1n1 calls wdt_disable() during startup (sources/m1n1-baseline/src/main.c:245,285; src/wdt.c:14).",
+    "linux_systemd_semantics": "General upstream Linux/systemd behavior (SysRq s/u/c, kernel.panic, runtime/reboot watchdog). Not verified against the target kernel or systemd build; each stage verifies the effect on the target."
+  },
+  "key_findings": [
+    {"id": "R1", "finding": "macvdmtool is a reset/mode tool, not a recovery oracle. reboot sends one VDM and returns; exit 0 means the local ACE/VDM calls succeeded, not that the target reset or booted. There is no OS detection, liveness check, boot selection, power control or retry."},
+    {"id": "R2", "finding": "The tool sends nothing unless the M5's local AppleHPM register 0x3f bit 0 shows a connection. Whether a hard-hung target keeps that bit set is unknown, so hang-state resets must be proven, not assumed."},
+    {"id": "R3", "finding": "nop is not read-only: every recognized command unlocks the local ACE and enters/exits DBMa. The DBMa exit runs only in the destructor (no signal handler), so a killed macvdmtool may leave the M5 port controller in DBMa. Bound it with a timeout, but record a forced kill as 'ACE state unknown' rather than killing silently."},
+    {"id": "R4", "finding": "reboot serial = reboot VDM, wait about 1 s plus up to 3 s for the connected bit, then serial mode. A nonzero return after the reboot VDM was sent (e.g. 'Timed out') means the reset request was sent but serial re-enable failed, not that the reset failed. Use reboot serial so boot output is captured, and classify by stage of failure."},
+    {"id": "R5", "finding": "Healthy-Linux-first ordering is correct. While Linux runs and pets the watchdog, neither the 30 s runtime watchdog nor kernel.panic=10 can fire, so a reset at the VDM moment is attributable to the VDM. The watchdog stays a safety net for the orderly fallback."},
+    {"id": "R6", "finding": "Watchdog and panic settings make a naive hang test unprovable: panic=10 reboots 10 s after a panic, the 30 s runtime watchdog resets a dead kernel, and the 2 min reboot watchdog stays armed through a halt. Any hang test needs runtime-only panic=0, the watchdog verifiably inactive, and a hold window longer than every watchdog timeout before the VDM is sent."},
+    {"id": "R7", "finding": "The hardware watchdog does not cover the target use case: m1n1 disables it at startup, so a hung m1n1/HV/XNU experiment has no watchdog recovery. The VDM reset is the only independent path for those runs, which is why it must be qualified from a genuinely hung state."},
+    {"id": "R8", "finding": "An abrupt SoC reset with writable block filesystems risks journal replay or a dirty-bit EFI. SysRq s then u, waiting for completion and verifying root, /boot and the EFI system partition are read-only (or unmounted), reduces that to an expected clean-RO reset."}
+  ],
+  "stages": [
+    {
+      "stage": "S0_preflight_read_only",
+      "actions": "No resets. Record M1 boot_id, uname -r, /proc/cmdline hash, findmnt (all block filesystems, automount units for /boot or /efi), swapon, watchdog sysfs (state, timeout, nowayout if present), kernel.panic*, the SSH host key, macvdmtool binary SHA-256 against the build record, and a running M5 serial reader logging to a private file. Confirm the M1 Linux root is not the user's filesystem under repair and that the boot default and recovery copies are unchanged, with no pending one-shot boot override.",
+      "gate": "Any identity, hash, ownership or filesystem-under-repair doubt stops the qualification."
+    },
+    {
+      "stage": "S1_vdm_reboot_from_healthy_quiesced_linux",
+      "actions": "sync; SysRq s; SysRq u; wait for the kernel's emergency sync and remount completion messages; verify root, /boot and EFI are ro or not mounted, and avoid touching automount paths. Leave the watchdog and panic settings unchanged (safety net). Then M5: sudo macvdmtool reboot serial with a bounded timeout.",
+      "acceptance": [
+        "Pre-reset verification shows every block-backed filesystem read-only (tmpfs may stay rw).",
+        "macvdmtool reached the reboot VDM; rc and stdout are recorded and classified per R4.",
+        "The serial log (M5 timestamps) shows boot output beginning only after the VDM time, with no orderly 'reboot:' shutdown message before it.",
+        "SSH returns with the pinned host key, a new boot_id, the same kernel and /proc/cmdline as baseline, within a budget well above the 34 s orderly figure (e.g. 180 s).",
+        "The current boot's kernel log shows no filesystem recovery, replay, corruption or error messages and no EFI dirty-bit warning; filesystems are rw again.",
+        "Repeated independently at least 3 times with identical outcomes."
+      ],
+      "abort_and_fallback": "If any filesystem is still rw after u, do not send the VDM; run an orderly systemctl reboot. If macvdmtool fails before the reboot VDM (no connection, no reply, VDM failed), boot_id is unchanged and SSH works: perform the orderly reboot to restore rw. If SSH does not return within budget, stop and require operator recovery; record the 2 min reboot watchdog as possibly active."
+    },
+    {
+      "stage": "S2_deliberate_hang_storage_quiesced_watchdog_off",
+      "precondition": "S1 passed at least 3 times. A human-reachable physical recovery is available for the first runs, because a failed VDM leaves a halted target without SSH.",
+      "actions": "Runtime-only, reverting at reboot, no boot configuration edits: kernel.panic=0, the systemd runtime and reboot watchdog set to off, then verify every /sys/class/watchdog device is inactive, nowayout is 0 where exposed, and no process holds /dev/watchdog*. Preferred hang: systemctl halt (orderly unmount, CPUs stopped with interrupts off, power on). Optional later: SysRq s and u, verify RO, then SysRq c with panic=0.",
+      "acceptance": [
+        "The serial log shows the halt or panic message, then silence; SSH is unreachable.",
+        "A hold window longer than every watchdog timeout (at least 3 min, above the 2 min reboot watchdog) passes with no reset or boot output. This is the discriminator proving no autonomous reset.",
+        "Only then sudo macvdmtool reboot serial; boot output starts after the VDM time; SSH returns with a new boot_id, the same kernel and cmdline, and a clean filesystem log.",
+        "Repeated at least 3 times before declaring unattended hang recovery."
+      ],
+      "confounder_rule": "If any watchdog cannot be shown inactive (nowayout=1, unknown driver, or the state attribute missing), or the target resets during the hold window, label the result WDT_CONFOUNDED_NOT_VDM_PROOF.",
+      "panic_test_assessment": "SysRq c with panic=0 adds an unclean crashed-kernel state but little reset-path information beyond halt (both stop CPUs with interrupts off). Run it only after halt-based S2 passes, only with verified RO block filesystems, and with the same watchdog-off proof and hold window."
+    },
+    {
+      "stage": "S3_target_use_case",
+      "actions": "Later: an m1n1-hosted parked experiment (the watchdog is disabled by m1n1), then VDM reboot serial and return to the preserved Linux default.",
+      "note": "m1n1's exception-proxy disconnect path can reboot the target by itself (src/uartproxy.c:285-291, src/hv/hv_exc.c:69-88). Record whether the host stream closed before the VDM so an autonomous reboot is not mistaken for a VDM reset."
+    }
+  ],
+  "addendum_halt_based_external_reset": {
+    "recorded_at": "2026-11-08T01:52:00Z",
+    "relayed_preflight": "CONFIG_WATCHDOG_NOWAYOUT unset, CONFIG_WATCHDOG_SYSFS unset, APPLE_WATCHDOG=y. SysRq s/u completed with /boot and EFI read-only but the Btrfs root still rw; explicit remount ro returned busy. Root correctly aborted the external reset under the S1 abort rule. No panic test was run.",
+    "verdict": "SOUND_REPLACEMENT_FOR_S1_WITH_TWO_TIMING_SAFEGUARDS",
+    "why_sound": [
+      "An orderly systemctl halt unmounts or remounts storage through systemd-shutdown before the CPUs stop, avoiding an abrupt reset of a busy rw Btrfs root. Expected kernel behavior: machine_halt stops CPUs with interrupts off and leaves power on.",
+      "With NOWAYOUT unset, a manager-side watchdog disarm can actually stop the timer. Apple's built-in driver is expected to implement stop, but that is not verified against the target source.",
+      "Upstream systemd applies RebootWatchdogUSec only to reboot/kexec and disarms on other shutdown verbs, so halt should not re-arm it. Setting it to 0 is still correct defense in depth (from memory of upstream source; target version not verified)."
+    ],
+    "required_safeguards": [
+      "Prove the disarm while Linux is still healthy, because CONFIG_WATCHDOG_SYSFS is unset and there is no state file. After RuntimeWatchdogUSec=0 and RebootWatchdogUSec=0 read back as 0 and /proc/1/fd shows no /dev/watchdog* (and no other process holds it), keep Linux up with SSH reachable for at least 45-60 s. Nothing pets the timer then, so surviving that window shows the 30 s hardware watchdog is stopped.",
+      "Never open /dev/watchdog* (wdctl or ioctl probes) to check state: opening can arm the timer and a close without magic close can leave it running.",
+      "Attribute the reset by onset time, not just eventual return: boot output on the M5 serial log (or the first SSH reachability) must start within a short window after the VDM (e.g. 15 s). If no onset follows the VDM promptly, classify VDM_NO_RESET even if the target returns later; a return near 120 s after halt could come from a still-armed 2 min reboot watchdog. A hold of at least 130 s instead of 40 s removes that ambiguity at only a time cost."
+    ],
+    "acceptance": [
+      "Watchdog properties read back as 0, PID1 holds no watchdog fd, and the healthy-Linux no-pet window passes with no reset.",
+      "After systemctl halt: SSH down; serial shows the halt message if the kernel console is on serial, then silence through the hold window with no autonomous boot output.",
+      "macvdmtool reboot serial reaches the reboot VDM (rc and stdout recorded and classified per R4); boot onset follows promptly.",
+      "SSH returns with the pinned host key, a new boot_id, and the same kernel and /proc/cmdline as baseline; the current boot shows no Btrfs log replay or errors and no EFI dirty-bit warning; watchdog properties are back to 30 s / 2 min after boot.",
+      "Repeat at least 3 times before treating halted-CPU VDM recovery as qualified."
+    ],
+    "fallback_and_risk": "A halted target has no SSH. If the VDM does not reset it (unproven: AppleHPM connected bit or SoC acceptance from a halted AP), recovery requires a physical power-button cycle, so the first runs need an operator. No poweroff: macvdmtool has no power-on.",
+    "what_it_does_not_qualify": "Recovery from a panicked or crashed kernel, from an m1n1/HV/XNU park (m1n1 disables the watchdog and owns the USB-C proxy port; ACE/port interplay unknown), or from a target whose connected bit drops. Those remain S2 (optional panic) and S3."
+  },
+  "non_goals": "No DFU VDM, partitioning, boot-policy or firmware changes, persistent watchdog/panic configuration edits, power-off tests (macvdmtool has no power-on), or Maclab use. No large framework: one per-target lock, one serial reader, one macvdmtool invocation per reset, and SSH/boot_id checks suffice.",
+  "limits": [
+    "No live observation by this reviewer; all target facts are relayed or inherited.",
+    "Whether the AppleHPM connected bit survives a hard hang, and whether the SoC accepts the reset VDM from a halted or panicked state, are unproven until S2.",
+    "Linux/systemd behavior is stated from general upstream semantics and must be verified on the target in each stage.",
+    "The kernel console may be on tty0 rather than serial; if so, attribution relies on M5 timestamps, boot_id and SSH timing."
+  ],
+  "hardware_boot_observed": false,
+  "recovery_qualified": false
+}

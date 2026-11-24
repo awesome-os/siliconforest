@@ -1,0 +1,110 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# The end of a boot whose ROOT is the SiliconForest partition READ-WRITE and which is ended by
+# the system's OWN command (@HALT_COMMAND@: system/sf-command -> /sbin/sf-halt), not by this
+# script: the storage facts as guest/darwin-diskroot-rw.in gathers them, then the command a
+# person would type. sf-halt stops the processes (this script among them), syncs, downgrades
+# the root, seals the fence, stops the controller and restarts the machine through the SMC;
+# with SF_HALT_REPORT=1 it prints the counters around each step in the lines the verdict
+# reads, and SF_HALT_MARKER is the bench's "the guest restarts the machine itself" marker.
+# This script is in the RAM root image, mounted read-only on /private/ram.
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/private/ram/usr/bin; export PATH
+printf '\nNV_BEGIN_%s\n' "$nonce"
+get() { sysctl -n "$1" 2>/dev/null; }
+t0=$(date +%s)
+phase() { printf 'NV_PHASE %s t=%s\n' "$1" "$(( $(date +%s) - t0 ))"; }
+wstats() { ws_now=$(get kern.sf_nvme.wstats); printf 'NV_WSTATS %s %s\n' "$1" "$ws_now"; printf 'NV_WSTATS %s %s\n' "$1" "$ws_now"; printf 'NV_GATE_REJECTED %s\n' "$(get kern.sf_nvme.gate_rejected)"; }
+phase root
+printf 'NV_STATE %s\n' "$(get kern.sf_nvme.state)"
+printf 'NV_NCPU %s\n' "$(get hw.ncpu)"
+printf 'NV_GATE_SELFTEST %s\n' "$(get kern.sf_nvme.gate_selftest)"
+printf 'NV_WGATE_SELFTEST start %s\n' "$(get kern.sf_nvme.wgate_selftest)"
+printf 'NV_BOOTARGS %s\n' "$(get kern.bootargs | sed 's/[0-9A-Fa-f]\{8\}-[0-9A-Fa-f-]\{27\}/GUID/g')"
+mount 2>&1 | sed 's/^/NV_MOUNT /'
+printf 'NV_PART %s\n' "$(get kern.sf_nvme.part)"
+printf 'NV_MEDIA %s\n' "$(get kern.sf_nvme.media)"
+printf 'NV_FENCE %s\n' "$(get kern.sf_nvme.fence)"
+wstats start
+ls -ld / /var /tmp /private/var /private/tmp /private/ram /etc/resolv.conf 2>&1 | sed 's/^/NV_LS /'
+rootdev=$(dmesg 2>/dev/null | sed -n 's/.*BSD root: \(disk[0-9s]*\).*/\1/p' | head -1)
+fenced=$(get kern.sf_nvme.wstats | sed 's/.* device=\([a-z0-9]*\) .*/\1/')
+printf 'NV_ROOTDEV %s fenced=%s\n' "$rootdev" "$fenced"
+if mount | grep '^root_device on / (ext4' | grep -qv 'read-only' && [ -n "$rootdev" ] && [ "$rootdev" = "$fenced" ]; then
+    printf 'NV_ROOT disk read-write: %s on %s\n' "$(mount | grep ' on / ')" "$rootdev"
+else
+    printf 'NV_FAIL the root is not the fenced device read-write: %s (%s, fenced %s)\n' "$(mount | grep ' on / ')" "$rootdev" "$fenced"
+fi
+for d in /dev/rdisk[0-9]; do [ "$d" != "/dev/r$fenced" ] && gpt -r show "$d" 2>/dev/null | awk '{print "NV_GPT", $1, $2, $3, $4, $5, $6, $7, $8}'; done
+ps -ax 2>/dev/null | wc -l | sed 's/^ */NV_PROCESSES /'
+
+# the range check at the fence's ends, by absolute block (kern.sf_nvme.wprobe: nothing is written, whatever
+# the answer). The 741,417 blocks after the partition are unallocated (41 always were; 610,304 were given up
+# for the startup-picker volume, 131,072 more for the boot partition): the first of them, the partition's
+# last block before the second shrink (+131,072) and before the first (+741,376) and the last of them
+# (+741,417) must all be refused.
+phase fence
+probe() { sysctl -w kern.sf_nvme.wprobe="$2 $3" > /dev/null 2>&1; printf 'NV_WPROBE %s lba=%s blocks=%s rc=%s\n' "$1" "$2" "$3" "$?"; }
+F=@PART_LBA@; L=$((@PART_LBA@ + @PART_BLOCKS@ - 1))
+probe in-first $F 1
+probe in-last $L 1
+probe in-last-256 $((L - 255)) 256
+probe out-before $((F - 1)) 1
+probe out-after $((L + 1)) 1
+probe out-across-end $L 2
+probe out-old-last $((L + 131072)) 1
+probe out-older-last $((L + 741376)) 1
+probe out-freed-last $((L + 741417)) 1
+probe out-block0 0 1
+printf 'NV_WPROBE_TOTAL %s\n' "$(get kern.sf_nvme.wprobe)"
+wstats probed
+
+phase identify
+printf 'NV_IDCTRL %s\n' "$(get kern.sf_nvme.idctrl)"
+printf 'NV_IDNS %s\n' "$(get kern.sf_nvme.idns)"
+printf 'NV_SMART start %s\n' "$(get kern.sf_nvme.smart)"
+printf 'NV_SMARTRAW start %s\n' "$(get kern.sf_nvme.smart_raw)"
+
+phase persist
+for f in /var/run/dr-x /tmp/dr-x /private/var/tmp/dr-x /etc/dr-x /usr/dr-x; do
+    sh -c "echo hello >> $f" 2>/dev/null; printf 'NV_STATEWRITE %s rc=%s\n' "$f" "$?"; rm -f "$f" < /dev/null
+done
+printf 'second line, written at the end of @NAME@\n' >> /private/var/sf-persist/@NAME@.txt
+(cd /private/var/sf-persist && find . -type f | sort | sed 's|^\./||' | while read f; do sha256sum "$f"; done) 2>&1 | sed 's/^/NV_PSHA written /'
+# what the desktop's own menu stored (theme, display scale, wallpaper: one file each)
+for f in theme scale wallpaper; do [ -e /private/var/db/desktop-state/chonkstep/$f ] && printf 'NV_DESKSTATE end %s=%s\n' "$f" "$(cat /private/var/db/desktop-state/chonkstep/$f)"; done
+(cd /private/var/db/desktop-state && find . -type f | sort | sed 's|^\./||' | while read f; do sha256sum "$f"; done) 2>&1 | sed 's/^/NV_DSHA written /'
+# the libSystem in use reads back with bytes changed in the cache; on disk it must stay as it is (Linux compares)
+printf 'NV_LIBSYSTEM in use %s; memory-disk copy %s\n' "$(sha256sum /usr/lib/libSystem.B.dylib | cut -c1-64)" "$(sha256sum /private/ram/usr/lib/libSystem.B.dylib | cut -c1-64)"
+
+phase hash
+sfnvme-test hash /dev/sfnvme0 /private/ram/etc/sfnvme-ranges 2>&1
+dmesg 2>/dev/null | grep -i 'ext4\|Waiting on\|BSD root\|Got boot\|boot-uuid' | sed 's/[0-9A-Fa-f]\{8\}-[0-9A-Fa-f-]\{27\}/GUID/g' | tail -24 | sed 's/^/NV_DMESG /'
+
+phase halt
+sync; sleep 1; sync
+out=$(sysctl -w kern.sf_nvme.stop=1 2>&1); printf 'NV_STOP_WHILE_MOUNTED rc=%s state=%s\n' "$?" "$(get kern.sf_nvme.state)"
+sfnvme-test hash /dev/sfnvme0 /private/ram/etc/sfnvme-ranges 2>&1 | sed 's/^NVT_HASH/NVT_AFTER_WRITE_HASH/'
+sysctl -w kern.sf_nvme.smart=1 > /dev/null 2>&1
+printf 'NV_SMART end %s\n' "$(get kern.sf_nvme.smart)"
+printf 'NV_SMARTRAW end %s\n' "$(get kern.sf_nvme.smart_raw)"
+printf 'NV_MEDIA %s\n' "$(get kern.sf_nvme.media)"
+printf 'NV_CLOCK end epoch=%s utc=%s\n' "$(date -u +%s)" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+printf 'NV_HALTGATE end %s | %s\n' "$(get kern.sf_smc_halt_writes)" "$(get kern.sf_pmu_writes)"
+ls -l /bin/reboot /bin/shutdown /sbin/sf-halt 2>&1 | sed 's/^/NV_LS /'
+# how the session was asked to end: the desktop menu's Session rows leave the word in the session's runtime directory
+req=$(cat /private/var/run/gpu-desktop/session-end-request 2>/dev/null)
+printf 'NV_SESSION_END request=%s\n' "${req:-none}"
+# the networks wifiutil remembers on this root (sf-netd joins these in a boot where nothing is typed); names and keys are not printed
+nk=$(grep -c . /Library/Preferences/SystemConfiguration/org.siliconforest.wifi.known 2>/dev/null)
+printf 'NV_NETKNOWN remembered_networks=%s directory=%s\n' "${nk:-0}" "$([ -d /Library/Preferences/SystemConfiguration ] && echo there || echo MISSING)"
+cmd='@HALT_COMMAND@'
+if [ "$cmd" = menu ]; then
+    case "$req" in
+        restart) cmd='shutdown -r now';;
+        *) printf 'NV_FAIL the desktop menu left no restart request (%s); restarting all the same\n' "${req:-none}"; cmd=reboot;;
+    esac
+fi
+printf 'NV_HALT the command of the system now: %s\n' "$cmd"
+SF_HALT_REPORT=1 SF_HALT_MARKER=SF_BENCH_REBOOT exec $cmd
+printf 'NV_FAIL the halt command could not be run\n'

@@ -1,0 +1,249 @@
+--- a/src/Frameworks/OpenGL/CGL.c
++++ b/src/Frameworks/OpenGL/CGL.c
+@@ -18,6 +18,8 @@
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <unistd.h>
++#include <stdint.h>
+ #include <string.h>
+ #include <sys/sysctl.h>
+ #include <time.h>
+@@ -976,6 +978,8 @@
+ 	size_t (*rowBytes)(IOSurfaceRef, size_t);
+ 	size_t (*planeCount)(IOSurfaceRef);
+ 	size_t (*elementBytes)(IOSurfaceRef, size_t);
++	int (*gpuCopyFD)(IOSurfaceRef);
++	size_t (*gpuOffset)(IOSurfaceRef);
+ } sf_iosurface;
+ 
+ static void sf_cgl_load_iosurface(void)
+@@ -990,6 +994,8 @@
+ 	sf_iosurface.rowBytes = dlsym(lib, "IOSurfaceGetBytesPerRowOfPlane");
+ 	sf_iosurface.planeCount = dlsym(lib, "IOSurfaceGetPlaneCount");
+ 	sf_iosurface.elementBytes = dlsym(lib, "IOSurfaceGetBytesPerElementOfPlane");
++	sf_iosurface.gpuCopyFD = dlsym(lib, "IOSurfaceSFGPUCopyFD");
++	sf_iosurface.gpuOffset = dlsym(lib, "IOSurfaceSFGPUGetOffset");
+ }
+ 
+ #ifdef SF_CGL_USE_EGL
+@@ -1007,6 +1013,9 @@
+ 	int           dirty;
+ 	// the pixel buffer a batched write-back copies through, 0 until first used
+ 	GLuint        pbo;
++	EGLImage      gpu_image;
++	GLuint        gpu_texture;
++	int           gpu_direct_bound;
+ };
+ 
+ struct sf_cgl_fbo {
+@@ -1285,11 +1294,101 @@
+ 	return -1;
+ }
+ 
++// Optional GPU IOSurface bridge. A 2D texture aliases the imported EGLImage
++// directly. Rectangle targets use GPU blits because EGL image storage cannot
++// bind a rectangle target; neither path reads pixels through the CPU.
++static uint64_t sf_gpu_stats[4]; // CPU upload/readback bytes, GPU blit bytes, direct alias commits
++void CGLSFFXTransferStats(uint64_t values[4]) {
++    pthread_mutex_lock(&sf_cgl_track_lock);
++    memcpy(values,sf_gpu_stats,sizeof(sf_gpu_stats));
++    pthread_mutex_unlock(&sf_cgl_track_lock);
++}
++static void sf_cgl_drop_gpu(struct sf_cgl_surftex *t) {
++    void (*deleteTextures)(GLsizei,const GLuint *)=(void *)eglGetProcAddress("glDeleteTextures");
++    if(t->gpu_texture&&deleteTextures)deleteTextures(1,&t->gpu_texture);
++    if(t->gpu_image&&sf_present.destroyImage)sf_present.destroyImage(sf_cgl_get_display(),t->gpu_image);
++    t->gpu_texture=0;t->gpu_image=EGL_NO_IMAGE_KHR;
++}
++static int sf_cgl_ensure_gpu(struct sf_cgl_surftex *t) {
++    if(!sf_iosurface.gpuCopyFD||!sf_iosurface.gpuOffset||t->plane||
++       !sf_iosurface.gpuOffset(t->surface)||t->format!=GL_BGRA||
++       t->type!=GL_UNSIGNED_INT_8_8_8_8_REV||t->element_bytes!=4)
++        return 0;
++    pthread_once(&sf_cgl_present_once,sf_cgl_load_present);
++    if(!sf_present.createImage||!sf_present.destroyImage||!sf_present.targetTexture)return 0;
++    if(t->gpu_image)return 1;
++    int fd=sf_iosurface.gpuCopyFD(t->surface);
++    if(fd<0)return 0;
++    size_t offset=sf_iosurface.gpuOffset(t->surface);
++    if(offset>INT32_MAX||t->row_bytes>INT32_MAX){close(fd);return 0;}
++    EGLint attributes[]={EGL_WIDTH,t->width,EGL_HEIGHT,t->height,
++        EGL_LINUX_DRM_FOURCC_EXT,0x34325241, // DRM_FORMAT_ARGB8888: native BGRA bytes
++        EGL_DMA_BUF_PLANE0_FD_EXT,fd,EGL_DMA_BUF_PLANE0_OFFSET_EXT,(EGLint)offset,
++        EGL_DMA_BUF_PLANE0_PITCH_EXT,(EGLint)t->row_bytes,
++        EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,0,EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,0,EGL_NONE};
++    t->gpu_image=sf_present.createImage(sf_cgl_get_display(),EGL_NO_CONTEXT,EGL_LINUX_DMA_BUF_EXT,NULL,attributes);
++    close(fd);
++    return t->gpu_image!=EGL_NO_IMAGE_KHR;
++}
++static int sf_cgl_gpu_transfer(struct sf_cgl_surftex *t,int to_surface) {
++    if(!sf_cgl_ensure_gpu(t))return 0;
++    void (*finish)(void)=(void *)eglGetProcAddress("glFinish");
++    if(!finish)return 0;
++    if(t->target==GL_TEXTURE_2D){
++        if(to_surface){if(!t->gpu_direct_bound)return 0;finish();sf_gpu_stats[3]++;return 1;}
++        sf_present.targetTexture(GL_TEXTURE_2D,t->gpu_image);
++        t->gpu_direct_bound=glGetError()==GL_NO_ERROR;
++        return t->gpu_direct_bound;
++    }
++    if(t->target!=GL_TEXTURE_RECTANGLE)return 0;
++    void (*attach)(GLenum,GLenum,GLenum,GLuint,GLint)=(void *)eglGetProcAddress("glFramebufferTexture2D");
++    void (*deleteFBOs)(GLsizei,const GLuint *)=(void *)eglGetProcAddress("glDeleteFramebuffers");
++    void (*blit)(GLint,GLint,GLint,GLint,GLint,GLint,GLint,GLint,GLbitfield,GLenum)=(void *)eglGetProcAddress("glBlitFramebuffer");
++    if(!attach||!deleteFBOs||!blit)return 0;
++    GLint saved_texture=0,read_fbo=0,draw_fbo=0;
++    glGetIntegerv(GL_TEXTURE_BINDING_2D,&saved_texture);
++    if(!t->gpu_texture){
++        glGenTextures(1,&t->gpu_texture);glBindTexture(GL_TEXTURE_2D,t->gpu_texture);
++        sf_present.targetTexture(GL_TEXTURE_2D,t->gpu_image);
++        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
++        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
++    }
++    glBindTexture(GL_TEXTURE_2D,(GLuint)saved_texture);
++    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING,&read_fbo);
++    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING,&draw_fbo);
++    GLboolean scissor=glIsEnabled(GL_SCISSOR_TEST),srgb=glIsEnabled(GL_FRAMEBUFFER_SRGB);
++    GLuint framebuffers[2]={0};glGenFramebuffers(2,framebuffers);
++    // FBO names belong to the current context; texture/image storage may be shared.
++    glBindFramebuffer(GL_READ_FRAMEBUFFER,framebuffers[0]);
++    attach(GL_READ_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,to_surface?t->target:GL_TEXTURE_2D,
++           to_surface?t->texture:t->gpu_texture,0);
++    int good=glCheckFramebufferStatus(GL_READ_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE;
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER,framebuffers[1]);
++    attach(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,to_surface?GL_TEXTURE_2D:t->target,
++           to_surface?t->gpu_texture:t->texture,0);
++    good=good&&glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE;
++    if(good){
++        glDisable(GL_SCISSOR_TEST);glDisable(GL_FRAMEBUFFER_SRGB);
++        blit(0,0,t->width,t->height,0,0,t->width,t->height,GL_COLOR_BUFFER_BIT,GL_NEAREST);
++        good=glGetError()==GL_NO_ERROR;
++        if(to_surface)finish(); // publish only after the writer is complete
++        if(good)sf_gpu_stats[2]+=(uint64_t)t->width*t->height*4;
++    }
++    if(scissor)glEnable(GL_SCISSOR_TEST);if(srgb)glEnable(GL_FRAMEBUFFER_SRGB);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER,(GLuint)read_fbo);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER,(GLuint)draw_fbo);
++    deleteFBOs(2,framebuffers);
++    return good;
++}
++static int sf_cgl_try_gpu_binding(CGLContextObj ctx,GLenum target,IOSurfaceRef surface,GLuint plane,
++    GLsizei width,GLsizei height,GLenum internal_format,GLenum format,GLenum type,size_t row_bytes,size_t element_bytes);
++
+ static void
+ sf_cgl_drop_surftex(int i)
+ {
+ 	int j;
+ 
++    sf_cgl_drop_gpu(&sf_cgl_surftexs[i]);
+ 	if (sf_cf_release != NULL)
+ 		sf_cf_release(sf_cgl_surftexs[i].surface);
+ 	if (sf_cgl_surftexs[i].pbo != 0)
+@@ -1324,6 +1423,13 @@
+ 	pthread_mutex_lock(&sf_cgl_track_lock);
+ 	i = sf_cgl_find_surftex(ctx->share_root, (GLuint)texture);
+ 	GLuint pbo = i >= 0 ? sf_cgl_surftexs[i].pbo : 0;
++    EGLImage gpu_image=EGL_NO_IMAGE_KHR;GLuint gpu_texture=0;
++    if(i>=0){
++        struct sf_cgl_surftex *old=&sf_cgl_surftexs[i];
++        if(old->surface==surface&&old->width==width&&old->height==height&&old->target==target){
++            gpu_image=old->gpu_image;gpu_texture=old->gpu_texture;
++        }else sf_cgl_drop_gpu(old);
++    }
+ 
+ 	if (i >= 0 && sf_cf_release != NULL)
+ 		sf_cf_release(sf_cgl_surftexs[i].surface);
+@@ -1344,11 +1450,37 @@
+ 	if (sf_cf_retain != NULL)
+ 		sf_cf_retain(surface);
+ 	sf_cgl_surftexs[i] = (struct sf_cgl_surftex){ ctx->share_root, target, (GLuint)texture, surface, plane,
+-		width, height, format, type, row_bytes, element_bytes, 0, pbo };
++		width, height, format, type, row_bytes, element_bytes, 0, pbo, gpu_image, gpu_texture, 0 };
+ 	if (getenv("SF_CGL_TRACE") != NULL && sf_cgl_surftex_count <= 8)
+ 		fprintf(stderr, "CGL: surface texture %u %dx%d target %x format %x type %x\n", (unsigned)texture, width, height,
+ 		    target, format, type);
+ 	pthread_mutex_unlock(&sf_cgl_track_lock);
++}
++
++static int sf_cgl_try_gpu_binding(CGLContextObj ctx,GLenum target,IOSurfaceRef surface,GLuint plane,
++    GLsizei width,GLsizei height,GLenum internal_format,GLenum format,GLenum type,size_t row_bytes,size_t element_bytes) {
++    if(!sf_iosurface.gpuOffset||!sf_iosurface.gpuOffset(surface)||plane||
++       (target!=GL_TEXTURE_2D&&target!=GL_TEXTURE_RECTANGLE)||format!=GL_BGRA||
++       type!=GL_UNSIGNED_INT_8_8_8_8_REV||element_bytes!=4||
++       (internal_format!=GL_RGBA&&internal_format!=GL_RGBA8))return 0;
++    sf_cgl_track_surface(ctx,target,surface,plane,width,height,format,type,row_bytes,element_bytes);
++    GLint texture=0;
++    glGetIntegerv(target==GL_TEXTURE_RECTANGLE?GL_TEXTURE_BINDING_RECTANGLE:GL_TEXTURE_BINDING_2D,&texture);
++    pthread_mutex_lock(&sf_cgl_track_lock);
++    int index=sf_cgl_find_surftex(ctx->share_root,(GLuint)texture),good=0;
++    if(index>=0){
++        if(target==GL_TEXTURE_RECTANGLE){
++            GLint tw=0,th=0,tf=0;
++            glGetTexLevelParameteriv(target,0,GL_TEXTURE_WIDTH,&tw);
++            glGetTexLevelParameteriv(target,0,GL_TEXTURE_HEIGHT,&th);
++            glGetTexLevelParameteriv(target,0,GL_TEXTURE_INTERNAL_FORMAT,&tf);
++            if(tw!=width||th!=height||tf!=GL_RGBA8)
++                glTexImage2D(target,0,GL_RGBA8,width,height,0,format,type,NULL);
++        }
++        good=sf_cgl_gpu_transfer(&sf_cgl_surftexs[index],0);
++    }
++    pthread_mutex_unlock(&sf_cgl_track_lock);
++    return good;
+ }
+ 
+ // marks the IOSurface texture the current draw framebuffer renders into
+@@ -1409,6 +1541,7 @@
+ 		glBindTexture(t->target, t->texture);
+ 		glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(t->row_bytes / t->element_bytes));
+ 		glGetTexImage(t->target, 0, t->format, t->type, NULL);
++        sf_gpu_stats[1]+=(uint64_t)t->row_bytes*t->height;
+ 		glBindTexture(t->target, (GLuint)saved_texture);
+ 		t->dirty = 2;
+ 		count++;
+@@ -1470,6 +1603,15 @@
+ 		trace = getenv("SF_CGL_TRACE") != NULL;
+ 	start = trace ? sf_cgl_now() : 0;
+ 	pthread_mutex_lock(&sf_cgl_track_lock);
++    for(i=0;i<sf_cgl_surftex_count;i++){
++        struct sf_cgl_surftex *t=&sf_cgl_surftexs[i];
++        if(!t->dirty||t->group!=group)continue;
++        if(sf_cgl_gpu_transfer(t,1)){
++            sf_iosurface.lock(t->surface,0,NULL);
++            sf_iosurface.unlock(t->surface,0,NULL);
++            t->dirty=0;
++        }
++    }
+ 	if (batch < 0) {
+ 		const char *mode = getenv("SF_CGL_WRITEBACK");
+ 
+@@ -1498,6 +1640,7 @@
+ 		glPixelStorei(GL_PACK_ROW_LENGTH, (GLint)(t->row_bytes / t->element_bytes));
+ 		sf_iosurface.lock(t->surface, 0, NULL);
+ 		glGetTexImage(t->target, 0, t->format, t->type, sf_iosurface.base(t->surface, t->plane));
++        sf_gpu_stats[1]+=(uint64_t)t->row_bytes*t->height;
+ 		sf_iosurface.unlock(t->surface, 0, NULL);
+ 		glBindTexture(t->target, (GLuint)saved_texture);
+ 		t->dirty = 0;
+@@ -1743,6 +1886,10 @@
+ 	if (elementBytes == 0)
+ 		elementBytes = 1;
+ 
++#ifdef SF_CGL_USE_EGL
++    if(sf_cgl_try_gpu_binding(ctx,target,ioSurface,plane,width,height,internal_format,format,type,rowBytes,elementBytes))
++        return kCGLNoError;
++#endif
+ 	sf_iosurface.lock(ioSurface, 1, NULL);
+ 	pixels = sf_iosurface.base(ioSurface, plane);
+ 	glGetIntegerv(GL_UNPACK_ROW_LENGTH, &row_length);
+@@ -1750,6 +1897,11 @@
+ 	glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(rowBytes / elementBytes));
+ 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+ 	glTexImage2D(target, 0, (GLint)internal_format, width, height, 0, format, type, pixels);
++#ifdef SF_CGL_USE_EGL
++    pthread_mutex_lock(&sf_cgl_track_lock);
++    sf_gpu_stats[0]+=(uint64_t)width*height*elementBytes;
++    pthread_mutex_unlock(&sf_cgl_track_lock);
++#endif
+ 	glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
+ 	glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+ 	sf_iosurface.unlock(ioSurface, 1, NULL);

@@ -1,0 +1,561 @@
+--- a/src/Frameworks/AppKit/SFFilePanel.m
++++ b/src/Frameworks/AppKit/SFFilePanel.m
+@@ -0,0 +1,440 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * The save and open panels' contents, drawn by AppKit.
++ *
++ * NSSavePanel and NSOpenPanel handed their work to the display (NSDisplay -savePanel:...), which
++ * on Windows showed the system's dialog; here there is no such dialog and the methods were not
++ * implemented, so Terminal's Export Text As, Export Settings and Open did nothing. The panel is
++ * its own window: a name field (saving), the folder it is in with its parent reachable, the
++ * folder's items (folders first, a double click opens a folder or chooses a file), the
++ * application's accessory view, Cancel and the default button (Return; Escape cancels).
++ * -beginSheetModalForWindow:completionHandler: runs the panel modally and then calls the handler,
++ * as the sheet's end would.
++ */
++#import <AppKit/NSSavePanel.h>
++#import <AppKit/NSOpenPanel.h>
++#import <AppKit/NSApplication.h>
++#import <AppKit/NSTextField.h>
++#import <AppKit/NSButton.h>
++#import <AppKit/NSScrollView.h>
++#import <AppKit/NSClipView.h>
++#import <AppKit/NSColor.h>
++#import <AppKit/NSFont.h>
++#import <AppKit/NSEvent.h>
++#import <AppKit/NSGraphics.h>
++#import <AppKit/NSStringDrawing.h>
++#import <AppKit/NSAttributedString.h>
++#import <Foundation/Foundation.h>
++#include <objc/runtime.h>
++
++@interface NSSavePanel (SFFilePanelPrivate)
++- (void)_setFilename:(NSString *)filename;
++@end
++
++@interface SFFileList : NSView {
++@public
++    NSArray *_entries;      // names; a name ending in "/" is a folder
++    NSInteger _selected;
++    NSSavePanel *_panel;    // not retained
++}
++@end
++
++@interface NSSavePanel (SFFilePanel)
++- (void)_sfListChoose:(NSInteger)row;
++- (void)_sfListSelect:(NSInteger)row;
++@end
++
++static const CGFloat SFRow = 20;
++
++@implementation SFFileList
++
++- (BOOL)isFlipped { return YES; }
++- (BOOL)acceptsFirstResponder { return YES; }
++- (void)dealloc { [_entries release]; [super dealloc]; }
++
++- (void)drawRect:(NSRect)rect
++{
++    NSDictionary *plain = @{ NSFontAttributeName: [NSFont systemFontOfSize:13], NSForegroundColorAttributeName: [NSColor textColor] };
++    NSDictionary *chosen = @{ NSFontAttributeName: [NSFont systemFontOfSize:13], NSForegroundColorAttributeName: [NSColor alternateSelectedControlTextColor] };
++
++    [[NSColor textBackgroundColor] setFill];
++    NSRectFill(rect);
++    for (NSUInteger i = 0; i < [_entries count]; i++) {
++        NSRect row = NSMakeRect(0, i * SFRow, NSWidth([self bounds]), SFRow);
++        NSString *name = [_entries objectAtIndex:i];
++        BOOL folder = [name hasSuffix:@"/"];
++
++        if (!NSIntersectsRect(row, rect))
++            continue;
++        if ((NSInteger)i == _selected) {
++            [[NSColor alternateSelectedControlColor] setFill];
++            NSRectFill(row);
++        }
++        if (folder)
++            name = [[name substringToIndex:[name length] - 1] stringByAppendingString:@"  ▸"];
++        [name drawAtPoint:NSMakePoint(8, NSMinY(row) + 2) withAttributes:(NSInteger)i == _selected ? chosen : plain];
++    }
++}
++
++- (void)_sfScrollToSelection
++{
++    if (_selected >= 0)
++        [self scrollRectToVisible:NSMakeRect(0, _selected * SFRow, 1, SFRow)];
++}
++
++- (void)mouseDown:(NSEvent *)event
++{
++    NSPoint at = [self convertPoint:[event locationInWindow] fromView:nil];
++    NSInteger row = (NSInteger)(at.y / SFRow);
++
++    if (row < 0 || row >= (NSInteger)[_entries count])
++        return;
++    _selected = row;
++    [self setNeedsDisplay:YES];
++    [_panel _sfListSelect:row];
++    if ([event clickCount] >= 2)
++        [_panel _sfListChoose:row];
++}
++
++- (void)keyDown:(NSEvent *)event
++{
++    NSString *chars = [event charactersIgnoringModifiers];
++    unichar c = [chars length] ? [chars characterAtIndex:0] : 0;
++    NSInteger count = (NSInteger)[_entries count];
++
++    if (c == NSUpArrowFunctionKey || c == NSDownArrowFunctionKey) {
++        if (count == 0)
++            return;
++        _selected = c == NSUpArrowFunctionKey ? MAX(0, _selected - 1) : MIN(count - 1, _selected + 1);
++        [self setNeedsDisplay:YES];
++        [self _sfScrollToSelection];
++        [_panel _sfListSelect:_selected];
++    }
++    else if (c == NSRightArrowFunctionKey && _selected >= 0 && [[_entries objectAtIndex:_selected] hasSuffix:@"/"])
++        [_panel _sfListChoose:_selected];
++    else if (c == NSLeftArrowFunctionKey && count > 0 && [[_entries objectAtIndex:0] isEqualToString:@"../"])
++        [_panel _sfListChoose:0];
++    else
++        [super keyDown:event];
++}
++
++@end
++
++static char SFListKey, SFNameKey, SFWhereKey, SFOKKey, SFNameValueKey, SFDirectoryKey, SFTypesKey;
++
++@implementation NSSavePanel (SFFilePanel)
++
++- (BOOL)_sfIsOpen { return [self isKindOfClass:[NSOpenPanel class]]; }
++
++- (NSString *)_sfDirectory
++{
++    NSString *d = objc_getAssociatedObject(self, &SFDirectoryKey);
++
++    if ([d length] == 0)
++        d = [self directory];
++    if ([d length] == 0)
++        d = NSHomeDirectory();
++    return [d stringByStandardizingPath];
++}
++
++- (void)_sfSetDirectory:(NSString *)directory
++{
++    objc_setAssociatedObject(self, &SFDirectoryKey, [directory stringByStandardizingPath], OBJC_ASSOCIATION_COPY);
++    [self setDirectory:[directory stringByStandardizingPath]];
++}
++
++// the folder's items: "../" first unless at the root, folders, then files, each sorted by name
++- (void)_sfLoad
++{
++    SFFileList *list = objc_getAssociatedObject(self, &SFListKey);
++    NSString *dir = [self _sfDirectory];
++    NSMutableArray *folders = [NSMutableArray array], *files = [NSMutableArray array];
++    NSFileManager *fm = [NSFileManager defaultManager];
++    NSArray *types = objc_getAssociatedObject(self, &SFTypesKey);
++    BOOL open = [self _sfIsOpen];
++
++    for (NSString *name in [fm contentsOfDirectoryAtPath:dir error:NULL]) {
++        BOOL isDir = NO;
++
++        if ([name hasPrefix:@"."])
++            continue;
++        if (![fm fileExistsAtPath:[dir stringByAppendingPathComponent:name] isDirectory:&isDir])
++            continue;
++        if (isDir && ![[name pathExtension] isEqualToString:@"app"])
++            [folders addObject:[name stringByAppendingString:@"/"]];
++        else if (!open || [types count] == 0 || [types containsObject:[name pathExtension]])
++            [files addObject:name];
++    }
++    [folders sortUsingSelector:@selector(caseInsensitiveCompare:)];
++    [files sortUsingSelector:@selector(caseInsensitiveCompare:)];
++    NSMutableArray *all = [NSMutableArray array];
++    if (![dir isEqualToString:@"/"])
++        [all addObject:@"../"];
++    [all addObjectsFromArray:folders];
++    [all addObjectsFromArray:files];
++    [list->_entries release];
++    list->_entries = [all copy];
++    list->_selected = -1;
++    [list setFrameSize:NSMakeSize(NSWidth([[list superview] bounds]), MAX(NSHeight([[list superview] bounds]), [all count] * SFRow))];
++    [list setNeedsDisplay:YES];
++    [list scrollPoint:NSZeroPoint];
++    [(NSTextField *)objc_getAssociatedObject(self, &SFWhereKey) setStringValue:dir];
++}
++
++- (void)_sfListSelect:(NSInteger)row
++{
++    SFFileList *list = objc_getAssociatedObject(self, &SFListKey);
++    NSString *name = [list->_entries objectAtIndex:row];
++
++    if (![self _sfIsOpen] && ![name hasSuffix:@"/"])
++        [(NSTextField *)objc_getAssociatedObject(self, &SFNameKey) setStringValue:name];
++}
++
++- (void)_sfListChoose:(NSInteger)row
++{
++    SFFileList *list = objc_getAssociatedObject(self, &SFListKey);
++    NSString *name = [list->_entries objectAtIndex:row];
++
++    if ([name hasSuffix:@"/"]) {
++        NSString *dir = [name isEqualToString:@"../"] ? [[self _sfDirectory] stringByDeletingLastPathComponent]
++                                                      : [[self _sfDirectory] stringByAppendingPathComponent:[name substringToIndex:[name length] - 1]];
++        [self _sfSetDirectory:dir];
++        [self _sfLoad];
++        return;
++    }
++    [self _pdOK:nil];
++}
++
++- (void)_sfCancel:(id)sender
++{
++    [NSApp stopModalWithCode:NSFileHandlingPanelCancelButton];
++}
++
++- (void)_pdOK:(id)sender
++{
++    SFFileList *list = objc_getAssociatedObject(self, &SFListKey);
++    NSString *dir = [self _sfDirectory];
++
++    if ([self _sfIsOpen]) {
++        NSInteger row = list->_selected;
++        NSString *name = row >= 0 ? [list->_entries objectAtIndex:row] : nil;
++        BOOL folder = [name hasSuffix:@"/"];
++        NSOpenPanel *open = (NSOpenPanel *)self;
++
++        if (name == nil && [open canChooseDirectories])
++            name = @"", folder = YES;
++        if (name == nil || (folder && ![open canChooseDirectories]) || (!folder && ![open canChooseFiles])) {
++            if (folder && name != nil)
++                [self _sfListChoose:row];
++            else
++                NSBeep();
++            return;
++        }
++        NSString *path = [name isEqualToString:@"../"] ? [dir stringByDeletingLastPathComponent]
++                         : [dir stringByAppendingPathComponent:folder ? [name stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/"]] : name];
++        [self _setFilename:path];
++        [self _sfSetFilenames:@[ path ]];
++    }
++    else {
++        NSString *name = [(NSTextField *)objc_getAssociatedObject(self, &SFNameKey) stringValue];
++        NSArray *types = objc_getAssociatedObject(self, &SFTypesKey);
++
++        if ([name length] == 0) {
++            NSBeep();
++            return;
++        }
++        if ([types count] > 0 && ![types containsObject:[name pathExtension]])
++            name = [name stringByAppendingPathExtension:[types objectAtIndex:0]];
++        objc_setAssociatedObject(self, &SFNameValueKey, name, OBJC_ASSOCIATION_COPY);
++        [self _setFilename:[dir stringByAppendingPathComponent:name]];
++    }
++    [NSApp stopModalWithCode:NSFileHandlingPanelOKButton];
++}
++
++- (void)_sfSetFilenames:(NSArray *)paths
++{
++    if ([self isKindOfClass:[NSOpenPanel class]]) {
++        Ivar ivar = class_getInstanceVariable([NSOpenPanel class], "_filenames");
++        NSArray **slot = (NSArray **)((char *)self + ivar_getOffset(ivar));
++
++        [*slot release];
++        *slot = [paths copy];
++    }
++}
++
++static NSTextField *sfLabel(NSString *text, NSRect frame)
++{
++    NSTextField *label = [[[NSTextField alloc] initWithFrame:frame] autorelease];
++
++    [label setStringValue:text];
++    [label setEditable:NO];
++    [label setSelectable:NO];
++    [label setBezeled:NO];
++    [label setDrawsBackground:NO];
++    [label setAlignment:NSRightTextAlignment];
++    return label;
++}
++
++// lays the panel out afresh each time it runs (the accessory view may have changed)
++- (void)_sfBuild
++{
++    BOOL open = [self _sfIsOpen];
++    NSView *accessory = [self accessoryView];
++    CGFloat width = 560, listHeight = 260, accessoryHeight = accessory ? NSHeight([accessory frame]) + 12 : 0;
++    CGFloat height = 20 + (open ? 0 : 34) + 28 + listHeight + accessoryHeight + 56;
++    NSView *content = [[[NSView alloc] initWithFrame:NSMakeRect(0, 0, width, height)] autorelease];
++    CGFloat y = height - 20;
++
++    if (!open) {
++        y -= 24;
++        NSString *label = objc_getAssociatedObject(self, @selector(nameFieldLabel)) ?: @"Save As:";
++        [content addSubview:sfLabel(label, NSMakeRect(10, y + 2, 90, 20))];
++        NSTextField *name = [[[NSTextField alloc] initWithFrame:NSMakeRect(108, y, width - 128, 24)] autorelease];
++        [name setStringValue:objc_getAssociatedObject(self, &SFNameValueKey) ?: ([[self filename] lastPathComponent] ?: @"")];
++        [name setTarget:self];
++        [name setAction:@selector(_pdOK:)];
++        [content addSubview:name];
++        objc_setAssociatedObject(self, &SFNameKey, name, OBJC_ASSOCIATION_RETAIN);
++        y -= 10;
++    }
++    y -= 24;
++    [content addSubview:sfLabel(@"Where:", NSMakeRect(10, y + 2, 90, 20))];
++    NSTextField *where = sfLabel(@"", NSMakeRect(108, y + 2, width - 128, 20));
++    [where setAlignment:NSLeftTextAlignment];
++    [where setSelectable:YES];
++    [content addSubview:where];
++    objc_setAssociatedObject(self, &SFWhereKey, where, OBJC_ASSOCIATION_RETAIN);
++    y -= 6 + listHeight;
++
++    NSScrollView *scroll = [[[NSScrollView alloc] initWithFrame:NSMakeRect(20, y, width - 40, listHeight)] autorelease];
++    [scroll setHasVerticalScroller:YES];
++    [scroll setBorderType:NSBezelBorder];
++    SFFileList *list = [[[SFFileList alloc] initWithFrame:NSMakeRect(0, 0, NSWidth([[scroll contentView] bounds]), listHeight)] autorelease];
++    list->_panel = self;
++    list->_selected = -1;
++    [scroll setDocumentView:list];
++    [content addSubview:scroll];
++    objc_setAssociatedObject(self, &SFListKey, list, OBJC_ASSOCIATION_RETAIN);
++
++    if (accessory != nil) {
++        y -= accessoryHeight;
++        [accessory setFrameOrigin:NSMakePoint(floor((width - NSWidth([accessory frame])) / 2), y + 6)];
++        [content addSubview:accessory];
++    }
++    NSString *prompt = [self prompt];
++    if ([prompt length] == 0)
++        prompt = open ? @"Open" : @"Save";
++    NSButton *ok = [[[NSButton alloc] initWithFrame:NSMakeRect(width - 120, 14, 100, 30)] autorelease];
++    [ok setTitle:prompt];
++    [ok setBezelStyle:NSRoundedBezelStyle];
++    [ok setKeyEquivalent:@"\r"];
++    [ok setTarget:self];
++    [ok setAction:@selector(_pdOK:)];
++    [content addSubview:ok];
++    objc_setAssociatedObject(self, &SFOKKey, ok, OBJC_ASSOCIATION_RETAIN);
++    NSButton *cancel = [[[NSButton alloc] initWithFrame:NSMakeRect(width - 228, 14, 100, 30)] autorelease];
++    [cancel setTitle:@"Cancel"];
++    [cancel setBezelStyle:NSRoundedBezelStyle];
++    [cancel setKeyEquivalent:@"\033"];
++    [cancel setTarget:self];
++    [cancel setAction:@selector(_sfCancel:)];
++    [content addSubview:cancel];
++
++    [self setContentView:content];
++    [self setContentSize:NSMakeSize(width, height)];
++    [super setTitle:[self _sfTitle]];
++    [self _sfLoad];
++    [self center];
++    if (!open)
++        [self makeFirstResponder:objc_getAssociatedObject(self, &SFNameKey)];
++    else
++        [self makeFirstResponder:list];
++}
++
++- (NSString *)_sfTitle
++{
++    Ivar ivar = class_getInstanceVariable([NSSavePanel class], "_dialogTitle");
++    NSString *title = ivar ? object_getIvar(self, ivar) : nil;
++
++    return [title length] ? title : ([self _sfIsOpen] ? @"Open" : @"Save");
++}
++
++- (NSInteger)_sfRun
++{
++    [self _sfBuild];
++    [self makeKeyAndOrderFront:nil];
++    NSInteger result = [NSApp runModalForWindow:self];
++    [self orderOut:nil];
++    // the accessory view goes back to the application with the panel
++    [[self accessoryView] removeFromSuperview];
++    return result;
++}
++
++@end
++
++/* The panels' API, macOS's names; the old -runModalForDirectory: forms land here too. */
++@implementation NSSavePanel (SFFilePanelAPI)
++
++- (void)setNameFieldStringValue:(NSString *)value { objc_setAssociatedObject(self, &SFNameValueKey, value, OBJC_ASSOCIATION_COPY); }
++- (NSString *)nameFieldStringValue { return objc_getAssociatedObject(self, &SFNameValueKey) ?: [[self filename] lastPathComponent]; }
++- (void)setNameFieldLabel:(NSString *)value { objc_setAssociatedObject(self, @selector(nameFieldLabel), value, OBJC_ASSOCIATION_COPY); }
++- (NSString *)nameFieldLabel { return objc_getAssociatedObject(self, @selector(nameFieldLabel)) ?: @"Save As:"; }
++- (void)setDirectoryURL:(NSURL *)url { if ([url isFileURL]) [self _sfSetDirectory:[url path]]; }
++- (NSURL *)directoryURL { return [NSURL fileURLWithPath:[self _sfDirectory] isDirectory:YES]; }
++- (void)setAllowedFileTypes:(NSArray *)types { objc_setAssociatedObject(self, &SFTypesKey, types, OBJC_ASSOCIATION_COPY); }
++- (NSArray *)allowedFileTypes { return objc_getAssociatedObject(self, &SFTypesKey); }
++- (void)setAllowsOtherFileTypes:(BOOL)value { }
++- (BOOL)allowsOtherFileTypes { return NO; }
++- (void)setCanCreateDirectories:(BOOL)value { }
++- (BOOL)canCreateDirectories { return NO; }
++- (void)setExtensionHidden:(BOOL)value { }
++- (BOOL)isExtensionHidden { return NO; }
++- (void)setCanSelectHiddenExtension:(BOOL)value { }
++- (void)setShowsHiddenFiles:(BOOL)value { }
++- (void)setShowsTagField:(BOOL)value { }
++- (void)setTagNames:(NSArray *)value { }
++
++- (NSInteger)runModal { return [self _sfRun]; }
++
++- (int)runModalForDirectory:(NSString *)directory file:(NSString *)file
++{
++    if ([directory length])
++        [self _sfSetDirectory:directory];
++    if ([file length])
++        [self setNameFieldStringValue:file];
++    return (int)[self _sfRun];
++}
++
++- (void)beginSheetModalForWindow:(NSWindow *)window completionHandler:(void (^)(NSInteger result))handler
++{
++    NSInteger result = [self _sfRun];
++
++    if (handler)
++        handler(result);
++}
++
++- (void)beginWithCompletionHandler:(void (^)(NSInteger result))handler
++{
++    [self beginSheetModalForWindow:nil completionHandler:handler];
++}
++
++@end
++
++@implementation NSOpenPanel (SFFilePanelAPI)
++
++- (NSInteger)runModal { return [self _sfRun]; }
++
++- (int)runModalForDirectory:(NSString *)directory file:(NSString *)file types:(NSArray *)types
++{
++    if ([directory length])
++        [self _sfSetDirectory:directory];
++    [self setAllowedFileTypes:types];
++    return (int)[self _sfRun];
++}
++
++- (int)runModalForTypes:(NSArray *)types
++{
++    return [self runModalForDirectory:nil file:nil types:types];
++}
++
++@end
+--- a/src/Frameworks/AppKit/NSSavePanel.m
++++ b/src/Frameworks/AppKit/NSSavePanel.m
+@@ -63,16 +63,6 @@
+    return ret;
+ }
+ 
+--(int)runModalForDirectory:(NSString *)directory file:(NSString *)file {
+-   [self _setFilename:file];
+-   [self setDirectory:directory];
+-   return [[NSDisplay currentDisplay] savePanel:self runModalForDirectory:directory file:file];
+-}
+-
+--(int)runModal {
+-   return [[NSDisplay currentDisplay] savePanel:self runModalForDirectory:[self directory] file:@""];
+-}
+-
+ -(NSString *)directory {
+    return _directory;
+ }
+@@ -171,36 +161,15 @@
+    _accessoryView=view;
+ }
+ 
+--(void)setCanCreateDirectories:(BOOL)value {
+-   NSUnimplementedMethod();
+-}
+-
+--(void)setAllowedFileTypes:(NSArray *)value {
+-   NSUnimplementedMethod();
+-}
+-
+--(void)setAllowsOtherFileTypes:(BOOL)value {
+-   NSUnimplementedMethod();
+-}
+-
++// the panel runs modally on the main thread (SFFilePanel.m), then the delegate hears the result
+ - (void)beginSheetForDirectory:(NSString *)path
+-						  file:(NSString *)name 
+-				modalForWindow:(NSWindow *)docWindow
+-				 modalDelegate:(id)modalDelegate 
+-				didEndSelector:(SEL)didEndSelector 
+-				   contextInfo:(void *)contextInfo
+-{
+-	id inv=[NSInvocation invocationWithMethodSignature:[self methodSignatureForSelector:@selector(_background_beginSheetForDirectory:file:modalForWindow:modalDelegate:didEndSelector:contextInfo:)]];
+-	[inv setTarget:self];
+-	[inv setSelector:@selector(_background_beginSheetForDirectory:file:modalForWindow:modalDelegate:didEndSelector:contextInfo:)];
+-	[inv setArgument:&path atIndex:2];
+-	[inv setArgument:&name atIndex:3];
+-	[inv setArgument:&docWindow atIndex:4];
+-	[inv setArgument:&modalDelegate atIndex:5];
+-	[inv setArgument:&didEndSelector atIndex:6];
+-	[inv setArgument:&contextInfo atIndex:7];
+-	[inv retainArguments];
+-	[inv performSelectorInBackground:@selector(invoke) withObject:nil];
++                          file:(NSString *)name
++                modalForWindow:(NSWindow *)docWindow
++                 modalDelegate:(id)modalDelegate
++                didEndSelector:(SEL)didEndSelector
++                   contextInfo:(void *)contextInfo
++{
++	[self _background_beginSheetForDirectory:path file:name modalForWindow:docWindow modalDelegate:modalDelegate didEndSelector:didEndSelector contextInfo:contextInfo];
+ }
+ 
+ - (void)_selector_savePanelDidEnd:(NSSavePanel *)sheet returnCode:(int)returnCode  contextInfo:(void  *)contextInfo;
+@@ -217,6 +186,7 @@
+ {
+ 	id pool=[NSAutoreleasePool new];
+ 	int ret=[self runModalForDirectory:path file:name];
++	if(modalDelegate==nil || didEndSelector==NULL) { [pool release]; return; }
+    
+ 	id inv=[NSInvocation invocationWithMethodSignature:[self methodSignatureForSelector:@selector(_selector_savePanelDidEnd:returnCode:contextInfo:)]];
+ 	
+@@ -227,7 +197,7 @@
+ 	[inv setArgument:&contextInfo atIndex:4];
+ 	[inv retainArguments];
+ 	
+-	[inv performSelectorOnMainThread:@selector(invoke) withObject:nil waitUntilDone:YES];
++	[inv invoke];
+    [pool release];
+ }
+ 
+--- a/src/Frameworks/AppKit/NSOpenPanel.m
++++ b/src/Frameworks/AppKit/NSOpenPanel.m
+@@ -57,24 +57,6 @@
+    return result;
+ }
+ 
+--(int)runModalForDirectory:(NSString *)directory file:(NSString *)file types:(NSArray *)types {
+-   [self _setFilename:file];
+-   [self setDirectory:directory];
+-   return [[NSDisplay currentDisplay] openPanel:self runModalForDirectory:directory file:file types:types];
+-}
+-
+--(int)runModalForTypes:(NSArray *)types {
+-   return [self runModalForDirectory:[self directory] file:nil types:types];
+-}
+-
+--(int)runModalForDirectory:(NSString *)directory file:(NSString *)file {
+-   return [self runModalForDirectory:directory file:file types:nil];
+-}
+-
+--(int)runModal {
+-   return [self runModalForDirectory:nil file:nil types:nil];
+-}
+-
+ -(BOOL)allowsMultipleSelection {
+    return _allowsMultipleSelection;
+ }
+@@ -128,7 +110,8 @@
+ 	[inv setArgument:&didEndSelector atIndex:7];
+ 	[inv setArgument:&contextInfo atIndex:8];
+ 	[inv retainArguments];
+-	[inv performSelectorInBackground:@selector(invoke) withObject:nil];
++	// on the main thread: the panel is a window of the application (SFFilePanel.m)
++	[inv invoke];
+ }
+ 
+ - (void)_background_beginSheetForDirectory:(NSString *)path

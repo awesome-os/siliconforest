@@ -1,0 +1,1187 @@
+--- head/src/Kernel/Extensions/SFDcp/CMakeLists.txt
++++ kernel48/src/Kernel/Extensions/SFDcp/CMakeLists.txt
+@@ -85,8 +85,7 @@
+ set_source_files_properties("${RTKIT}/rtkit.c" PROPERTIES
+     COMPILE_DEFINITIONS "linux_create_workqueue_common=linux_create_workqueue_highpri")
+ _fbsdkpi_objects(SFDcp_drv SOURCES ${drv} ${pin}
+-        "${HERE}/sf_dcp_linux.c" "${HERE}/sf_dcp_mmap.c" "${HERE}/sf_dcp_prime.c" "${HERE}/sf_dcp_backlight.c" "${HERE}/sf_dcp_hotplug.c"
+-        "${HERE}/sf_dcp_tunnel_bridge.c"
++        "${HERE}/sf_dcp_linux.c" "${HERE}/sf_dcp_mmap.c" "${HERE}/sf_dcp_prime.c" "${HERE}/sf_dcp_backlight.c"
+         "${DART}/src/sf_dcp_iommu.c" "${DART}/src/sf_dart_table.c"
+         "${RTKIT}/mailbox.c" "${RTKIT}/rtkit.c" "${RTKIT}/rtkit-crashlog.c" "${RTKIT}/sf_rtkit_compat.c"
+     INCLUDES "${HERE}/pininc" "${HERE}/driver" "${HERE}/include" "${DART}/include"
+--- head/src/Kernel/Extensions/SFDcp/SFDcpSysctl.cpp
++++ kernel48/src/Kernel/Extensions/SFDcp/SFDcpSysctl.cpp
+@@ -22,8 +22,6 @@
+ int sf_dcp_backlight_set(int what, int value);
+ const char *sf_dcp_backlight_name(void);
+ void sf_dcp_sysctl_register(void);
+-uint64_t sf_dcp_hotplug_seq(void);
+-void sf_dcp_hotplug_connectors(char *, size_t);
+ }
+ 
+ static int
+@@ -65,26 +63,6 @@
+ SYSCTL_PROC(_kern_sf_backlight, OID_AUTO, bl_power, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
+     0, SF_DCP_BL_POWER, bl_sysctl_int, "I", "0 on, 4 off");
+ 
+-static int
+-hotplug_sequence(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+-{
+-    if (req->newptr != USER_ADDR_NULL) return EPERM;
+-    uint64_t value=sf_dcp_hotplug_seq();
+-    return SYSCTL_OUT(req,&value,sizeof(value));
+-}
+-static int
+-hotplug_connectors(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+-{
+-    if (req->newptr != USER_ADDR_NULL) return EPERM;
+-    char text[1024];sf_dcp_hotplug_connectors(text,sizeof(text));
+-    return SYSCTL_OUT(req,text,strlen(text)+1);
+-}
+-SYSCTL_NODE(_kern, OID_AUTO, sf_dcp, CTLFLAG_RD | CTLFLAG_LOCKED, 0, "DCP cached connector changes");
+-SYSCTL_PROC(_kern_sf_dcp, OID_AUTO, hotplug_seq, CTLTYPE_QUAD | CTLFLAG_RD | CTLFLAG_LOCKED,
+-    0, 0, hotplug_sequence, "Q", "generation after cached connector status/mode updates");
+-SYSCTL_PROC(_kern_sf_dcp, OID_AUTO, connectors, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+-    0, 0, hotplug_connectors, "A", "cached connector status and preferred mode");
+-
+ void
+ sf_dcp_sysctl_register(void)
+ {
+@@ -93,9 +71,6 @@
+ 	if (done)
+ 		return;
+ 	done = true;
+-	sysctl_register_oid(&sysctl__kern_sf_dcp);
+-	sysctl_register_oid(&sysctl__kern_sf_dcp_hotplug_seq);
+-	sysctl_register_oid(&sysctl__kern_sf_dcp_connectors);
+ 	sysctl_register_oid(&sysctl__kern_sf_backlight);
+ 	sysctl_register_oid(&sysctl__kern_sf_backlight_name);
+ 	sysctl_register_oid(&sysctl__kern_sf_backlight_max_brightness);
+--- head/src/Kernel/Extensions/SFDcp/dart/include/sf_dart.h
++++ kernel48/src/Kernel/Extensions/SFDcp/dart/include/sf_dart.h
+@@ -62,13 +62,8 @@
+  */
+ int sf_dart_map_deferred(struct sf_dart_stream *s, uint64_t iova, uint64_t phys, uint64_t size, unsigned int prot);
+ int sf_dart_flush(struct sf_dart_stream *s);
+-/* Clears the range and invalidates. Zero on an invalidate failure. Callers
+- * freeing backing MUST use unmap_checked and retain backing on failure. */
++/* Clears the range and invalidates. Returns the number of bytes that were mapped. */
+ uint64_t sf_dart_unmap(struct sf_dart_stream *s, uint64_t iova, uint64_t size);
+-/* Output unchanged on failure; poisoned streams cannot allocate/map/reclaim. */
+-int sf_dart_unmap_checked(struct sf_dart_stream *,uint64_t iova,uint64_t size,uint64_t *unmapped);
+-/* Conservative across this DCP copy: PIODMA may share any buffer. */
+-int sf_dart_poisoned(struct sf_dart_stream *);
+ 
+ /*
+  * Reserves `size` bytes of iova in the stream's window (first fit, page granular) without
+@@ -76,10 +71,6 @@
+  */
+ int sf_dart_iova_alloc(struct sf_dart_stream *s, uint64_t size, uint64_t *iova);
+ void sf_dart_iova_free(struct sf_dart_stream *s, uint64_t iova, uint64_t size);
+-/* Atomic reservation/reclamation of the same IOVA in two native streams;
+- * second may be NULL. Both allocations stay reserved on any poisoned DART. */
+-int sf_dart_iova_alloc_pair(struct sf_dart_stream *,struct sf_dart_stream *,uint64_t size,uint64_t *iova);
+-void sf_dart_iova_free_pair(struct sf_dart_stream *,struct sf_dart_stream *,uint64_t iova,uint64_t size);
+ 
+ /* The DART's error register (read, never cleared); a flagged fault is logged with `when`. */
+ uint32_t sf_dart_check(struct sf_dart_stream *s, const char *when);
+--- head/src/Kernel/Extensions/SFDcp/dart/include/sf_dcp_iommu.h
++++ kernel48/src/Kernel/Extensions/SFDcp/dart/include/sf_dcp_iommu.h
+@@ -57,7 +57,6 @@
+ 	unsigned int		type;		/* IOMMU_DOMAIN_DMA */
+ 	unsigned long		pgsize_bitmap;	/* SZ_16K */
+ 	struct sf_dart_stream	*sf_stream;
+-	struct sf_dart_stream	*sf_mirror; /* display-subsystem second IOMMU, optional */
+ 	u64			sf_mask;	/* input-size mask applied to addresses */
+ };
+ 
+@@ -87,8 +86,7 @@
+ int sf_iommu_group_for_each_dev(struct iommu_group *group, void *data,
+ 				int (*fn)(struct device *, void *));
+ 
+-/* of_dma_configure(): binds one or two T8103 `iommus` specs as one domain;
+- * malformed/unavailable specs fail closed, never as physical DMA. */
++/* of_dma_configure(): binds from np's `iommus`. 0, or -ENODEV when np names no DART. */
+ int sf_of_dma_configure(struct device *dev, struct device_node *np, bool force_dma);
+ 
+ /* ---- DMA API ---- */
+@@ -123,11 +121,8 @@
+ 
+ /* Counters and the last error of the DART behind a device, one line to the kernel log. */
+ /* a list of physical pages at one contiguous device address (SFDcp's cross-kext import) */
+-/* Map failure -EBUSY means backing may remain reachable: dma_handle names
+- * its quarantined range; caller MUST retain exporter ref/pin until reboot.
+- * Any nonzero unmap result likewise forbids backing/pin release. */
+ int sf_dma_map_phys_pages(struct device *dev, const u64 *phys, unsigned int n, dma_addr_t *dma_handle);
+-int sf_dma_unmap_phys_pages(struct device *dev, dma_addr_t dma_handle, unsigned int n);
++void sf_dma_unmap_phys_pages(struct device *dev, dma_addr_t dma_handle, unsigned int n);
+ void sf_dcp_iommu_report(struct device *dev, const char *when);
+ 
+ #ifndef SF_DCP_IOMMU_NO_REDIRECT
+--- head/src/Kernel/Extensions/SFDcp/dart/src/sf_dart.cpp
++++ kernel48/src/Kernel/Extensions/SFDcp/dart/src/sf_dart.cpp
+@@ -40,9 +40,6 @@
+ 
+ #include "sf_dart.h"
+ #include "sf_dart_table.h"
+-#include "sf_dart_retire.h"
+-#include "sf_dart_pair.h"
+-#include "sf_dart_spec.h"
+ 
+ /* apple-dart.c, T8020 */
+ #define DART_PARAMS1                   0x00
+@@ -72,12 +69,12 @@
+  * (vm-size / Linux's iommus window 0xfc000000). A slot that is not empty when the stream
+  * is opened is left alone entirely.
+  */
+-#define WINDOW_LO      SF_DART_WINDOW_LO
+-#define WINDOW_HI      SF_DART_WINDOW_HI
++#define WINDOW_LO      0x10000000ULL
++#define WINDOW_HI      0x90000000ULL
+ #define WINDOW_PAGES   ((WINDOW_HI - WINDOW_LO) >> SF_DART_PAGE_SHIFT)
+ 
+-#define MAX_DARTS      4
+-#define MAX_STREAMS    8
++#define MAX_DARTS      2
++#define MAX_STREAMS    4
+ #define MAX_FOREIGN    24 /* table pages that were there before us, mapped by physical address */
+ #define MAX_OWNED      80 /* table pages of ours: one per first-level slot we fill */
+ 
+@@ -110,7 +107,6 @@
+     TablePage owned[MAX_OWNED];
+     uint8_t *busy; /* one bit per page of the window */
+     uint32_t invalidates;
+-    bool poisoned; // failed invalidate: no new mappings or IOVA reclamation
+ };
+ 
+ namespace {
+@@ -118,14 +114,6 @@
+ IOLock *gLock;
+ Dart gDarts[MAX_DARTS];
+ sf_dart_stream gStreams[MAX_STREAMS];
+-// PIODMA and RTKit/display streams can reach the same backing. Failure in
+-// any stream therefore closes allocation/retirement across this DCP copy.
+-bool anyPoisoned()
+-{
+-    for (unsigned i=0;i<MAX_STREAMS;++i)
+-        if (gStreams[i].used && gStreams[i].poisoned) return true;
+-    return false;
+-}
+ const char *gPrefix = "SFDcpDart: ";
+ 
+ void dlog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+@@ -238,7 +226,6 @@
+             return 0;
+         IODelay(100);
+     }
+-    s->poisoned=true;
+     dlog("dart %s stream %u: TLB invalidate BUSY did not clear in 100 ms", s->dart->path, (unsigned)s->sid);
+     return -ETIMEDOUT;
+ }
+@@ -294,6 +281,7 @@
+     return free;
+ }
+ 
++inline bool busyGet(sf_dart_stream *s, uint64_t page) { return s->busy[page >> 3] & (1u << (page & 7)); }
+ inline void busySet(sf_dart_stream *s, uint64_t page, bool v)
+ {
+     if (v)
+@@ -459,12 +447,11 @@
+     if (!s)
+         return -EINVAL;
+     IOLockLock(gLock);
+-    if (anyPoisoned()) { IOLockUnlock(gLock); return -EIO; }
+     int ret = sf_dart_table_map(&s->tables, iova, phys, size, prot);
+     /* also after a failure that took entries back: the DART must not keep what it may have fetched */
+     int inv = invalidate(s);
+     IOLockUnlock(gLock);
+-    return inv ? inv : ret;
++    return ret ? ret : inv;
+ }
+ 
+ int sf_dart_map_deferred(struct sf_dart_stream *s, uint64_t iova, uint64_t phys, uint64_t size, unsigned int prot)
+@@ -472,7 +459,6 @@
+     if (!s)
+         return -EINVAL;
+     IOLockLock(gLock);
+-    if (anyPoisoned()) { IOLockUnlock(gLock); return -EIO; }
+     int ret = sf_dart_table_map(&s->tables, iova, phys, size, prot);
+     IOLockUnlock(gLock);
+     return ret;
+@@ -483,65 +469,56 @@
+     if (!s)
+         return -EINVAL;
+     IOLockLock(gLock);
+-    int ret = anyPoisoned() ? -EIO : invalidate(s);
++    int ret = invalidate(s);
+     IOLockUnlock(gLock);
+     return ret;
+ }
+ 
+-static int retireInvalidate(void *ctx) { return invalidate((sf_dart_stream*)ctx); }
+-int sf_dart_unmap_checked(struct sf_dart_stream *s,uint64_t iova,uint64_t size,uint64_t *unmapped)
++uint64_t sf_dart_unmap(struct sf_dart_stream *s, uint64_t iova, uint64_t size)
+ {
+-    if (!s || !unmapped) return -EINVAL;
++    if (!s)
++        return 0;
+     IOLockLock(gLock);
+-    int ret=anyPoisoned() ? -EIO : sf_dart_retire(&s->tables,&s->poisoned,iova,size,s,retireInvalidate,unmapped);
++    uint64_t done = sf_dart_table_unmap(&s->tables, iova, size);
++    invalidate(s);
+     IOLockUnlock(gLock);
+-    return ret;
+-}
+-uint64_t sf_dart_unmap(struct sf_dart_stream *s,uint64_t iova,uint64_t size)
+-{
+-    uint64_t unmapped=0;
+-    return sf_dart_unmap_checked(s,iova,size,&unmapped)?0:unmapped;
+-}
+-int sf_dart_poisoned(struct sf_dart_stream *s)
+-{
+-    if (!s) return 1;
+-    IOLockLock(gLock);bool value=anyPoisoned();IOLockUnlock(gLock);
+-    return value;
++    return done;
+ }
+ 
+-int sf_dart_iova_alloc_pair(struct sf_dart_stream *a,struct sf_dart_stream *b,uint64_t size,uint64_t *iova)
++int sf_dart_iova_alloc(struct sf_dart_stream *s, uint64_t size, uint64_t *iova)
+ {
+-    if (!a || a==b || !iova || !size || size>WINDOW_HI-WINDOW_LO)return -EINVAL;
+-    uint64_t pages=(size+SF_DART_PAGE-1)>>SF_DART_PAGE_SHIFT,first=0;
++    uint64_t pages = (size + SF_DART_PAGE - 1) >> SF_DART_PAGE_SHIFT, run = 0;
++    int ret = -ENOSPC;
++
++    if (!s || !iova || !pages || pages > WINDOW_PAGES)
++        return -EINVAL;
+     IOLockLock(gLock);
+-    if (anyPoisoned()) { IOLockUnlock(gLock); return -EIO; }
+-    int ret=sf_dart_pair_find(a->busy,b?b->busy:NULL,WINDOW_PAGES,pages,&first);
+-    if (!ret) {
+-        for (uint64_t q=first;q<first+pages;++q) {
+-            busySet(a,q,true);if(b)busySet(b,q,true);
++    for (uint64_t p = 0; p < WINDOW_PAGES; p++) {
++        run = busyGet(s, p) ? 0 : run + 1;
++        if (run == pages) {
++            uint64_t first = p + 1 - pages;
++            for (uint64_t q = first; q <= p; q++)
++                busySet(s, q, true);
++            *iova = WINDOW_LO + (first << SF_DART_PAGE_SHIFT);
++            ret = 0;
++            break;
+         }
+-        *iova=WINDOW_LO+(first<<SF_DART_PAGE_SHIFT);
+     }
+-    IOLockUnlock(gLock);return ret;
++    IOLockUnlock(gLock);
++    return ret;
+ }
+-int sf_dart_iova_alloc(struct sf_dart_stream *s,uint64_t size,uint64_t *iova)
+-{ return sf_dart_iova_alloc_pair(s,NULL,size,iova); }
+-void sf_dart_iova_free_pair(struct sf_dart_stream *a,struct sf_dart_stream *b,uint64_t iova,uint64_t size)
+-{
+-    if (!a || a==b || !size || size>WINDOW_HI-WINDOW_LO || iova<WINDOW_LO ||
+-        iova>WINDOW_HI || (iova&(SF_DART_PAGE-1)))return;
+-    uint64_t pages=(size+SF_DART_PAGE-1)>>SF_DART_PAGE_SHIFT;
+-    if ((pages<<SF_DART_PAGE_SHIFT)>WINDOW_HI-iova)return;
++
++void sf_dart_iova_free(struct sf_dart_stream *s, uint64_t iova, uint64_t size)
++{
++    uint64_t pages = (size + SF_DART_PAGE - 1) >> SF_DART_PAGE_SHIFT;
++
++    if (!s || iova < WINDOW_LO || iova + (pages << SF_DART_PAGE_SHIFT) > WINDOW_HI)
++        return;
+     IOLockLock(gLock);
+-    if (anyPoisoned()) { IOLockUnlock(gLock); return; }
+-    uint64_t first=(iova-WINDOW_LO)>>SF_DART_PAGE_SHIFT;
+-    for (uint64_t q=first;q<first+pages;++q) {
+-        busySet(a,q,false);if(b)busySet(b,q,false);
+-    }
++    for (uint64_t q = 0; q < pages; q++)
++        busySet(s, ((iova - WINDOW_LO) >> SF_DART_PAGE_SHIFT) + q, false);
+     IOLockUnlock(gLock);
+ }
+-void sf_dart_iova_free(struct sf_dart_stream *s,uint64_t iova,uint64_t size)
+-{ sf_dart_iova_free_pair(s,NULL,iova,size); }
+ 
+ uint32_t sf_dart_check(struct sf_dart_stream *s, const char *when)
+ {
+--- head/src/Kernel/Extensions/SFDcp/dart/src/sf_dcp_iommu.c
++++ kernel48/src/Kernel/Extensions/SFDcp/dart/src/sf_dcp_iommu.c
+@@ -31,8 +31,6 @@
+ 
+ #include "sf_dcp_iommu.h"
+ #include "sf_dart.h"
+-#include "sf_dart_group.h"
+-#include "sf_dart_spec.h"
+ #include "sf_dart_table.h"
+ 
+ #define SF_MAX_BOUND	8
+@@ -45,7 +43,7 @@
+ 
+ struct sf_binding {
+ 	struct device *dev;
+-	int state;	/* 0 free, 1 bound, 2 no DART declared, 3 declared but unavailable */
++	int state;	/* 0 free, 1 bound, 2 looked at: not behind a DART */
+ 	struct sf_iommu_domain dom;
+ };
+ 
+@@ -60,11 +58,7 @@
+ };
+ 
+ static struct sf_binding sf_bound[SF_MAX_BOUND];
+-// A declared IOMMU that failed to bind must never fall through to physical
+-// DMA. A blocked domain routes all calls to fail-closed native operations.
+-static struct sf_iommu_domain sf_blocked_domain;
+ static LIST_HEAD(sf_allocs);
+-static LIST_HEAD(sf_quarantines); // retained backing/device refs until reboot
+ /* 0: no lock yet, 1: being set up, 2: ready */
+ static int sf_lock_state;
+ static struct mutex sf_lock;
+@@ -96,26 +90,22 @@
+ 	return make ? free : NULL;
+ }
+ 
+-static int sf_bind_streams(struct device *dev, struct sf_dart_stream *s,struct sf_dart_stream *mirror)
++static int sf_bind_stream(struct device *dev, struct sf_dart_stream *s)
+ {
+ 	struct mutex *lock = sf_lock_get();
+ 	struct sf_binding *b;
+ 	int ret = 0;
+ 
+-	if (!s || s==mirror)
++	if (!s)
+ 		return -ENODEV;
+ 	mutex_lock(lock);
+ 	b = sf_slot(dev, true);
+ 	if (!b) {
+ 		ret = -ENOSPC;
+-	} else if (b->state==1) {
+-		// A live device cannot change domains underneath published DMA.
+-		ret=b->dom.sf_stream==s && b->dom.sf_mirror==mirror?0:-EBUSY;
+ 	} else {
+ 		b->dom.type = IOMMU_DOMAIN_DMA;
+ 		b->dom.pgsize_bitmap = SF_DART_PAGE;
+ 		b->dom.sf_stream = s;
+-		b->dom.sf_mirror = mirror;
+ 		b->dom.sf_mask = SF_IOVA_MASK;
+ 		b->state = 1;
+ 	}
+@@ -127,48 +117,23 @@
+ {
+ 	if (!dev || !dart_path)
+ 		return -EINVAL;
+-	return sf_bind_streams(dev, sf_dart_open(dart_path, 0, sid),NULL);
++	return sf_bind_stream(dev, sf_dart_open(dart_path, 0, sid));
+ }
+ 
+ /* `iommus = <&dart sid ...>` of np, the DART found by its node's reg (of_dma_configure) */
+-int sf_of_dma_configure(struct device *dev,struct device_node *np,bool force_dma)
++int sf_of_dma_configure(struct device *dev, struct device_node *np, bool force_dma)
+ {
+-    if(!dev || !np)return -ENODEV;
+-    int cells=of_property_count_u32_elems(np,"iommus"),consumed=0;
+-    int specs=of_count_phandle_with_args(np,"iommus","#iommu-cells");
+-    if(specs<=0)return specs?specs:-ENODEV;
+-    if(specs>2)return -E2BIG;
+-    u64 consumer_window[2];const u64 *window=NULL;
+-    if(of_find_property(np,"apple,dma-range",NULL)) {
+-        u32 range[4];
+-        if(of_property_count_u32_elems(np,"apple,dma-range")!=4 ||
+-           of_property_read_u32_array(np,"apple,dma-range",range,4))return -EINVAL;
+-        consumer_window[0]=(u64)range[0]<<32|range[1];
+-        consumer_window[1]=(u64)range[2]<<32|range[3];
+-        window=consumer_window;
+-    }
+-    struct sf_dart_stream *streams[2]={NULL,NULL};
+-    struct resource resources[2];uint32_t sids[2];
+-    for(unsigned i=0;i<(unsigned)specs;++i) {
+-        struct of_phandle_args args={0};struct resource res;
+-        int ret=of_parse_phandle_with_args(np,"iommus","#iommu-cells",i,&args);
+-        if(ret || !args.np)return ret?ret:-ENODEV;
+-        uint32_t sid=0;
+-        ret=sf_dart_spec(args.args,args.args_count,window,&sid);
+-        if(!ret)ret=of_address_to_resource(args.np,0,&res);
+-        consumed+=1+args.args_count;
+-        of_node_put(args.np);
+-        if(ret)return ret;
+-        resources[i]=res;sids[i]=sid;
+-    }
+-    // LinuxKPI's count helper stops at a malformed tail. Account for every
+-    // property cell so it cannot silently omit an incomplete second spec.
+-    if(consumed!=cells)return -EINVAL;
+-    for(unsigned i=0;i<(unsigned)specs;++i) {
+-        streams[i]=sf_dart_open(NULL,resources[i].start,sids[i]);
+-        if(!streams[i])return -ENODEV;
+-    }
+-    return sf_bind_streams(dev,streams[0],streams[1]);
++	struct of_phandle_args args;
++	struct resource res;
++
++	if (!dev || !np)
++		return -ENODEV;
++	if (of_parse_phandle_with_args(np, "iommus", "#iommu-cells", 0, &args) || !args.np ||
++	    args.args_count < 1)
++		return -ENODEV;
++	if (of_address_to_resource(args.np, 0, &res))
++		return -ENODEV;
++	return sf_bind_stream(dev, sf_dart_open(NULL, res.start, args.args[0]));
+ }
+ 
+ /* The device's domain; binds from the device's node on the first call. NULL: not behind a DART. */
+@@ -188,8 +153,6 @@
+ 		return &b->dom;
+ 	if (state == 2)
+ 		return NULL;
+-	if (state == 3)
+-		return &sf_blocked_domain;
+ 
+ 	if (dev->of_node && sf_of_dma_configure(dev, dev->of_node, true) == 0) {
+ 		mutex_lock(lock);
+@@ -197,24 +160,18 @@
+ 		mutex_unlock(lock);
+ 		return b && b->state == 1 ? &b->dom : NULL;
+ 	}
+-	/* No IOMMU property permits the layer's normal DMA API. An existing
+-	 * property with malformed/unpowered/unavailable resources does not. */
+-	bool declared=dev->of_node && of_find_property(dev->of_node,"iommus",NULL);
++	/* remember the answer; devices that are not ours come by often */
+ 	mutex_lock(lock);
+ 	b = sf_slot(dev, true);
+-	// Another first caller may have completed the binding while we looked.
+-	if (b && b->state==1) {
+-		mutex_unlock(lock);return &b->dom;
+-	}
+-	if (b)b->state = declared?3:2;
++	if (b)
++		b->state = 2;
+ 	mutex_unlock(lock);
+-	return declared?&sf_blocked_domain:NULL;
++	return NULL;
+ }
+ 
+ int sf_dcp_iommu_bound(struct device *dev)
+ {
+-	struct sf_iommu_domain *dom=sf_domain(dev);
+-	return dom && dom->sf_stream;
++	return sf_domain(dev) != NULL;
+ }
+ 
+ /* the address a device or its firmware is given for a stream address */
+@@ -223,23 +180,6 @@
+ 	return sf_dcp_iommu_dva_mask ? (iova | SF_DCP_DRAM_MASK) : iova;
+ }
+ 
+-// One display DMA address may be visible through both internal and
+-// external scanout DARTs. Complete all mappings/invalidates before publish.
+-static int sf_map_deferred(struct sf_iommu_domain *d,u64 iova,u64 phys,u64 bytes,unsigned prot)
+-{ return sf_dart_group_map_deferred(d->sf_stream,d->sf_mirror,iova,phys,bytes,prot); }
+-static int sf_flush(struct sf_iommu_domain *d)
+-{ return sf_dart_group_flush(d->sf_stream,d->sf_mirror); }
+-static int sf_unmap_checked(struct sf_iommu_domain *d,u64 iova,u64 bytes,u64 *done)
+-{ return sf_dart_group_unmap_checked(d->sf_stream,d->sf_mirror,iova,bytes,done); }
+-static u64 sf_unmap(struct sf_iommu_domain *d,u64 iova,u64 bytes)
+-{ u64 done=0;return sf_unmap_checked(d,iova,bytes,&done)?0:done; }
+-static int sf_map(struct sf_iommu_domain *d,u64 iova,u64 phys,u64 bytes,unsigned prot)
+-{ int ret=sf_map_deferred(d,iova,phys,bytes,prot);return ret?ret:sf_flush(d); }
+-static int sf_iova_alloc(struct sf_iommu_domain *d,u64 bytes,u64 *iova)
+-{ return sf_dart_iova_alloc_pair(d->sf_stream,d->sf_mirror,bytes,iova); }
+-static void sf_iova_free(struct sf_iommu_domain *d,u64 iova,u64 bytes)
+-{ sf_dart_iova_free_pair(d->sf_stream,d->sf_mirror,iova,bytes); }
+-
+ /* ---- IOMMU API ---- */
+ 
+ struct sf_iommu_domain *sf_iommu_get_domain_for_dev(struct device *dev)
+@@ -251,9 +191,7 @@
+ {
+ 	if (!domain || !domain->sf_stream)
+ 		return 0;
+-	u64 phys=sf_dart_translate(domain->sf_stream,iova & domain->sf_mask);
+-	if(domain->sf_mirror && sf_dart_translate(domain->sf_mirror,iova & domain->sf_mask)!=phys)return 0;
+-	return phys;
++	return sf_dart_translate(domain->sf_stream, iova & domain->sf_mask);
+ }
+ 
+ static unsigned int sf_prot(int prot)
+@@ -266,14 +204,14 @@
+ {
+ 	if (!domain || !domain->sf_stream)
+ 		return -ENODEV;
+-	return sf_map(domain, iova & domain->sf_mask, paddr, size, sf_prot(prot));
++	return sf_dart_map(domain->sf_stream, iova & domain->sf_mask, paddr, size, sf_prot(prot));
+ }
+ 
+ size_t sf_iommu_unmap(struct sf_iommu_domain *domain, unsigned long iova, size_t size)
+ {
+ 	if (!domain || !domain->sf_stream)
+ 		return 0;
+-	return sf_unmap(domain, iova & domain->sf_mask, size);
++	return sf_dart_unmap(domain->sf_stream, iova & domain->sf_mask, size);
+ }
+ 
+ ssize_t sf_iommu_map_sgtable(struct sf_iommu_domain *domain, unsigned long iova,
+@@ -282,7 +220,6 @@
+ 	struct scatterlist *sg;
+ 	size_t mapped = 0;
+ 	int i, ret;
+-	bool touched=false;
+ 
+ 	if (!domain || !domain->sf_stream || !sgt)
+ 		return -ENODEV;
+@@ -295,22 +232,19 @@
+ 			ret = -EINVAL;
+ 			goto undo;
+ 		}
+-		touched=true;
+-		ret = sf_map_deferred(domain, iova + mapped, phys, len, sf_prot(prot));
++		ret = sf_dart_map_deferred(domain->sf_stream, iova + mapped, phys, len, sf_prot(prot));
+ 		if (ret)
+ 			goto undo;
+ 		mapped += len;
+ 	}
+ 	/* one invalidate for the whole table */
+-	ret = sf_flush(domain);
++	ret = sf_dart_flush(domain->sf_stream);
+ 	if (ret)
+ 		goto undo;
+ 	return mapped;
+ undo:
+ 	if (mapped)
+-		sf_unmap(domain, iova, mapped);
+-	else if (touched)
+-		sf_flush(domain); // even a failed first map can roll back PTEs
++		sf_dart_unmap(domain->sf_stream, iova, mapped);
+ 	return ret;
+ }
+ 
+@@ -322,8 +256,7 @@
+ int sf_iommu_device_use_default_domain(struct device *dev)
+ {
+ 	/* Linux pins the default DMA domain; here the binding is that domain and never changes */
+-	struct sf_iommu_domain *dom=sf_domain(dev);
+-	return dom && dom->sf_stream ? 0 : -ENODEV;
++	return sf_domain(dev) ? 0 : -ENODEV;
+ }
+ 
+ void sf_iommu_device_unuse_default_domain(struct device *dev)
+@@ -350,9 +283,8 @@
+ int sf_dma_set_mask_and_coherent(struct device *dev, u64 mask)
+ {
+ 	/* the stream's 32-bit address range is inside any mask the driver asks for (42 bits) */
+-	struct sf_iommu_domain *dom=sf_domain(dev);
+-	if (dom)
+-		return !dom->sf_stream ? -ENODEV : mask >= SF_IOVA_MASK ? 0 : -EIO;
++	if (sf_domain(dev))
++		return mask >= SF_IOVA_MASK ? 0 : -EIO;
+ 	return dma_set_mask_and_coherent(dev, mask);
+ }
+ 
+@@ -376,14 +308,6 @@
+ 	kfree(a);
+ }
+ 
+-static void sf_alloc_quarantine(struct sf_alloc *a)
+-{
+-    struct mutex *lock=sf_lock_get();
+-    get_device(a->dev);
+-    mutex_lock(lock);list_add(&a->link,&sf_quarantines);mutex_unlock(lock);
+-    pr_err("SFDcpDart: failed DMA retirement; retaining %u pages and IOVA until reboot\n",a->npages);
+-}
+-
+ void *sf_dma_alloc_attrs(struct device *dev, size_t size, dma_addr_t *dma_handle, gfp_t gfp,
+ 			 unsigned long attrs)
+ {
+@@ -395,8 +319,7 @@
+ 
+ 	if (!dom)
+ 		return dma_alloc_attrs(dev, size, dma_handle, gfp, attrs);
+-	if (!size || size>UINT32_MAX || !dma_handle || sf_dart_poisoned(dom->sf_stream) ||
+-	    size>SIZE_MAX-(SF_DART_PAGE-1))
++	if (!size || !dma_handle)
+ 		return NULL;
+ 	n = ALIGN(size, SF_DART_PAGE) >> SF_DART_PAGE_SHIFT;
+ 	a = kzalloc(sizeof(*a), GFP_KERNEL);
+@@ -415,33 +338,26 @@
+ 			return NULL;
+ 		}
+ 	}
+-	if (sf_iova_alloc(dom, (u64)n << SF_DART_PAGE_SHIFT, &iova)) {
++	if (sf_dart_iova_alloc(dom->sf_stream, (u64)n << SF_DART_PAGE_SHIFT, &iova)) {
+ 		sf_alloc_drop(a, n);
+ 		return NULL;
+ 	}
+-	a->dev=dev;a->npages=n;a->iova=iova;
+ 	for (i = 0; i < n; i++) {
+-		if (sf_map_deferred(dom, iova + ((u64)i << SF_DART_PAGE_SHIFT),
++		if (sf_dart_map_deferred(dom->sf_stream, iova + ((u64)i << SF_DART_PAGE_SHIFT),
+ 					 page_to_phys(a->pages[i]), SF_DART_PAGE,
+ 					 SF_DART_PROT_READ | SF_DART_PROT_WRITE))
+ 			break;
+ 	}
+ 	/* one invalidate for the whole buffer; a failed one counts as a failed mapping */
+-	int flush_error=sf_flush(dom);
+-	if (i == n && !flush_error) {
++	if (sf_dart_flush(dom->sf_stream))
++		i = min(i, n - 1);
++	if (i == n) {
+ 		a->cpu = n == 1 ? page_address(a->pages[0]) : vmap(a->pages, n, VM_MAP, PAGE_KERNEL);
+ 		a->vmapped = n != 1;
+ 	}
+-	if (i < n || flush_error || !a->cpu) {
+-		uint64_t unmapped=0;
+-		// Only complete successful group maps belong to us. The failed
+-		// peer map may have encountered a foreign PTE; never clear it.
+-		if (sf_dart_poisoned(dom->sf_stream) ||
+-		    (i && sf_unmap_checked(dom,iova,(u64)i << SF_DART_PAGE_SHIFT,&unmapped))) {
+-			sf_alloc_quarantine(a);
+-			return NULL;
+-		}
+-		sf_iova_free(dom, iova, (u64)n << SF_DART_PAGE_SHIFT);
++	if (i < n || !a->cpu) {
++		sf_dart_unmap(dom->sf_stream, iova, (u64)n << SF_DART_PAGE_SHIFT);
++		sf_dart_iova_free(dom->sf_stream, iova, (u64)n << SF_DART_PAGE_SHIFT);
+ 		sf_alloc_drop(a, n);
+ 		return NULL;
+ 	}
+@@ -476,12 +392,8 @@
+ 	if (!a)
+ 		return;
+ 	/* unmap and invalidate first: the device must not reach pages that are being freed */
+-	uint64_t unmapped=0;
+-	if (sf_unmap_checked(dom,a->iova,(u64)a->npages << SF_DART_PAGE_SHIFT,&unmapped)) {
+-		sf_alloc_quarantine(a);
+-		return;
+-	}
+-	sf_iova_free(dom, a->iova, (u64)a->npages << SF_DART_PAGE_SHIFT);
++	sf_dart_unmap(dom->sf_stream, a->iova, (u64)a->npages << SF_DART_PAGE_SHIFT);
++	sf_dart_iova_free(dom->sf_stream, a->iova, (u64)a->npages << SF_DART_PAGE_SHIFT);
+ 	if (a->vmapped)
+ 		vunmap(a->cpu);
+ 	sf_alloc_drop(a, a->npages);
+@@ -506,21 +418,16 @@
+ 	for (i = 0; i < n; i++)
+ 		if (phys[i] & (SF_DART_PAGE - 1))
+ 			return -EINVAL;
+-	int allocated=sf_iova_alloc(dom, (u64)n << SF_DART_PAGE_SHIFT, &iova);
+-	if (allocated)return allocated;
++	if (sf_dart_iova_alloc(dom->sf_stream, (u64)n << SF_DART_PAGE_SHIFT, &iova))
++		return -ENOMEM;
+ 	for (i = 0; i < n; i++) {
+-		if (sf_map_deferred(dom, iova + ((u64)i << SF_DART_PAGE_SHIFT), phys[i],
++		if (sf_dart_map_deferred(dom->sf_stream, iova + ((u64)i << SF_DART_PAGE_SHIFT), phys[i],
+ 					 SF_DART_PAGE, SF_DART_PROT_READ | SF_DART_PROT_WRITE))
+ 			break;
+ 	}
+-	if (sf_flush(dom) || i < n) {
+-		uint64_t unmapped=0;
+-		if (sf_dart_poisoned(dom->sf_stream) ||
+-		    (i && sf_unmap_checked(dom,iova,(u64)i << SF_DART_PAGE_SHIFT,&unmapped))) {
+-			*dma_handle=sf_to_dma(iova);
+-			return -EBUSY; // caller MUST retain its exporter ref and pin
+-		}
+-		sf_iova_free(dom, iova, (u64)n << SF_DART_PAGE_SHIFT);
++	if (sf_dart_flush(dom->sf_stream) || i < n) {
++		sf_dart_unmap(dom->sf_stream, iova, (u64)n << SF_DART_PAGE_SHIFT);
++		sf_dart_iova_free(dom->sf_stream, iova, (u64)n << SF_DART_PAGE_SHIFT);
+ 		return -EIO;
+ 	}
+ 	*dma_handle = sf_to_dma(iova);
+@@ -528,18 +435,16 @@
+ }
+ 
+ /* Undo sf_dma_map_phys_pages(): unmap, invalidate, give the address range back. */
+-int sf_dma_unmap_phys_pages(struct device *dev, dma_addr_t dma_handle, unsigned int n)
++void sf_dma_unmap_phys_pages(struct device *dev, dma_addr_t dma_handle, unsigned int n)
+ {
+ 	struct sf_iommu_domain *dom = sf_domain(dev);
+ 	u64 iova;
+ 
+-	if (!dom || !n)return -EINVAL;
++	if (!dom || !n)
++		return;
+ 	iova = dma_handle & dom->sf_mask;
+-	uint64_t unmapped=0;
+-	int ret=sf_unmap_checked(dom,iova,(u64)n << SF_DART_PAGE_SHIFT,&unmapped);
+-	if(ret)return ret;
+-	sf_iova_free(dom, iova, (u64)n << SF_DART_PAGE_SHIFT);
+-	return 0;
++	sf_dart_unmap(dom->sf_stream, iova, (u64)n << SF_DART_PAGE_SHIFT);
++	sf_dart_iova_free(dom->sf_stream, iova, (u64)n << SF_DART_PAGE_SHIFT);
+ }
+ 
+ void *sf_dma_alloc_coherent(struct device *dev, size_t size, dma_addr_t *dma_handle, gfp_t gfp)
+@@ -586,10 +491,10 @@
+ 
+ 	if (!dom)
+ 		return dma_map_resource(dev, phys, size, dir, attrs);
+-	if (!size || sf_iova_alloc(dom, len, &iova))
++	if (!size || sf_dart_iova_alloc(dom->sf_stream, len, &iova))
+ 		return DMA_MAPPING_ERROR;
+-	if (sf_map(dom, iova, phys - off, len, SF_DART_PROT_READ | SF_DART_PROT_WRITE)) {
+-		sf_iova_free(dom, iova, len);
++	if (sf_dart_map(dom->sf_stream, iova, phys - off, len, SF_DART_PROT_READ | SF_DART_PROT_WRITE)) {
++		sf_dart_iova_free(dom->sf_stream, iova, len);
+ 		return DMA_MAPPING_ERROR;
+ 	}
+ 	return sf_to_dma(iova + off);
+@@ -608,8 +513,8 @@
+ 	iova = dma & dom->sf_mask;
+ 	off = iova & (SF_DART_PAGE - 1);
+ 	len = ALIGN(off + size, SF_DART_PAGE);
+-	sf_unmap(dom, iova - off, len);
+-	sf_iova_free(dom, iova - off, len);
++	sf_dart_unmap(dom->sf_stream, iova - off, len);
++	sf_dart_iova_free(dom->sf_stream, iova - off, len);
+ }
+ 
+ int sf_dma_mapping_error(struct device *dev, dma_addr_t dma)
+@@ -635,23 +540,22 @@
+ 			return -EINVAL;
+ 		total += sg->length;
+ 	}
+-	if (!total || sf_iova_alloc(dom, total, &iova))
++	if (!total || sf_dart_iova_alloc(dom->sf_stream, total, &iova))
+ 		return -ENOMEM;
+ 	for_each_sgtable_sg(sgt, sg, i) {
+-		if (sf_map_deferred(dom, iova + at, sg_phys(sg), sg->length,
++		if (sf_dart_map_deferred(dom->sf_stream, iova + at, sg_phys(sg), sg->length,
+ 					 SF_DART_PROT_READ | SF_DART_PROT_WRITE)) {
+-			if (at)sf_unmap(dom, iova, at);
+-			else sf_flush(dom);
+-			sf_iova_free(dom, iova, total);
++			sf_dart_unmap(dom->sf_stream, iova, at);
++			sf_dart_iova_free(dom->sf_stream, iova, total);
+ 			return -EIO;
+ 		}
+ 		sg_dma_address(sg) = sf_to_dma(iova + at);
+ 		sg_dma_len(sg) = sg->length;
+ 		at += sg->length;
+ 	}
+-	if (sf_flush(dom)) {
+-		sf_unmap(dom, iova, total);
+-		sf_iova_free(dom, iova, total);
++	if (sf_dart_flush(dom->sf_stream)) {
++		sf_dart_unmap(dom->sf_stream, iova, total);
++		sf_dart_iova_free(dom->sf_stream, iova, total);
+ 		return -EIO;
+ 	}
+ 	sgt->nents = sgt->orig_nents;
+@@ -675,8 +579,8 @@
+ 	iova = sg_dma_address(sgt->sgl) & dom->sf_mask;
+ 	for_each_sgtable_sg(sgt, sg, i)
+ 		total += sg->length;
+-	sf_unmap(dom, iova, total);
+-	sf_iova_free(dom, iova, total);
++	sf_dart_unmap(dom->sf_stream, iova, total);
++	sf_dart_iova_free(dom->sf_stream, iova, total);
+ }
+ 
+ int sf_dma_buffer_pages(struct device *dev, void *cpu_addr, size_t size, uint32_t *pages)
+@@ -705,8 +609,6 @@
+ {
+ 	struct sf_iommu_domain *dom = sf_domain(dev);
+ 
+-	if (dom) {
++	if (dom)
+ 		sf_dart_check(dom->sf_stream, when);
+-		if(dom->sf_mirror)sf_dart_check(dom->sf_mirror,when);
+-	}
+ }
+--- head/src/Kernel/Extensions/SFDcp/driver/iomfb.c
++++ kernel48/src/Kernel/Extensions/SFDcp/driver/iomfb.c
+@@ -1158,7 +1158,6 @@
+ 			}
+ 		}
+ 		dcp_notify_hotplug(connector);
+-		sf_dcp_note_hotplug(&connector->base);
+ 		apple_connector_backlight_sync(connector);
+ 		return;
+ 	}
+@@ -1233,7 +1232,6 @@
+ 		drm_kms_helper_connector_hotplug_event(&connector->base);
+ 	else
+ 		dcp_notify_hotplug(connector);
+-	sf_dcp_note_hotplug(&connector->base);
+ 	/* after the event, so registering a backlight cannot delay it */
+ 	apple_connector_backlight_sync(connector);
+ }
+--- head/src/Kernel/Extensions/SFDcp/driver/iomfb_template.c
++++ kernel48/src/Kernel/Extensions/SFDcp/driver/iomfb_template.c
+@@ -582,9 +582,8 @@
+ 		goto reject;
+ 	}
+ 
+-	memdesc->piodma_mapped = true;
+-
+ #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
++	memdesc->piodma_mapped = true;
+ 
+ 	/* the H17P reply echoes the buffer index */
+ 	*resp = (struct DCP_FW_NAME(dcp_map_buf_resp)) {
+@@ -635,8 +634,10 @@
+ 	if (!test_bit(request->buffer, dcp->memdesc_map) || !memdesc->buf ||
+ 	    !dcp->iommu_dom)
+ 		goto not_mapped;
++#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+ 	if (!memdesc->piodma_mapped)
+ 		goto not_mapped;
++#endif
+ 
+ 	if (memdesc->dva != request->dva) {
+ 		dev_warn(dcp->dev,
+@@ -758,8 +759,8 @@
+ 	 * the allocator.  The firmware is expected to unmap piodma first, but
+ 	 * if it releases a descriptor without doing so we would hand the pages
+ 	 * back while the DART still resolves them -- the display engine would
+-	 * then read whoever owns them next. Native mapping tracks every firmware
+-	 * version so a failed T8103 unmap cannot be hidden from buffer release.
++	 * then read whoever owns them next.  Only the H17P map_piodma handler
++	 * sets piodma_mapped, so older firmware is unaffected.
+ 	 */
+ 	if (memdesc->piodma_mapped) {
+ 		dev_warn(dcp->dev,
+--- head/src/Kernel/Extensions/SFDcp/include/sf_dcp_compat.h
++++ kernel48/src/Kernel/Extensions/SFDcp/include/sf_dcp_compat.h
+@@ -7,9 +7,6 @@
+ #ifndef SF_DCP_COMPAT_H
+ #define SF_DCP_COMPAT_H
+ 
+-struct drm_connector;
+-void sf_dcp_note_hotplug(struct drm_connector *connector);
+-
+ /* Linux 7.2 renamed struct drm_atomic_state to struct drm_atomic_commit; same object */
+ #define drm_atomic_commit drm_atomic_state
+ 
+--- head/src/Kernel/Extensions/SFDcp/rtkit/SFRtkitPlatform.cpp
++++ kernel48/src/Kernel/Extensions/SFDcp/rtkit/SFRtkitPlatform.cpp
+@@ -34,7 +34,6 @@
+ #include <sys/errno.h>
+ 
+ #include "sf_rtkit_platform.h"
+-#include "sf_rtkit_layout.h"
+ 
+ #define SOC_PAGE 0x4000ULL
+ 
+@@ -88,7 +87,6 @@
+ };
+ 
+ IOService *gHost;
+-int gInitState; // 0 uninitialized, 1 allocating, 2 release-published
+ IOWorkLoop *gLoop;
+ IOLock *gLock; /* gIrqs[].depth/registered/fn, gMbox, gMaps; thread context only */
+ const char *gPrefix = "sf_rtkit: ";
+@@ -307,33 +305,18 @@
+ 
+ int sf_rtkit_platform_init(void *host)
+ {
++    if (gHost)
++        return 0;
+     if (!host)
+         return -EINVAL;
+-    for (;;) {
+-        if (__atomic_load_n(&gInitState,__ATOMIC_ACQUIRE)==2)
+-            return 0;
+-        int expected=0;
+-        if (__atomic_compare_exchange_n(&gInitState,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))
+-            break;
+-        IOSleep(1);
+-    }
+-    IOLock *lock=IOLockAlloc();
+-    IOWorkLoop *loop=IOWorkLoop::workLoop();
+-    if (!lock || !loop) {
+-        if (lock) IOLockFree(lock);
+-        OSSafeReleaseNULL(loop);
+-        __atomic_store_n(&gInitState,0,__ATOMIC_RELEASE);
++    gLock = IOLockAlloc();
++    gLoop = IOWorkLoop::workLoop();
++    if (!gLock || !gLoop)
+         return -ENOMEM;
+-    }
+-    gLock=lock;gLoop=loop;
+-    gHost=(IOService*)host;
+-    // IRQ/timer nubs use this anchor for the lifetime of this port's copy.
+-    // Per-mailbox clients retain their own native teardown responsibilities.
+-    gHost->retain();
++    gHost = (IOService *)host;
+     gIrqMode = sf_rtkit_platform_bootarg("sfrtkit_irq", kIrqModeReregister);
+     if (gIrqMode < kIrqModePoll || gIrqMode > kIrqModeReregister)
+         gIrqMode = kIrqModeReregister;
+-    __atomic_store_n(&gInitState,2,__ATOMIC_RELEASE);
+     return 0;
+ }
+ 
+@@ -362,7 +345,7 @@
+     Mbox *m = NULL;
+     int ret = 0;
+ 
+-    if (__atomic_load_n(&gInitState,__ATOMIC_ACQUIRE)!=2 || !path || !res || !fullPath(path, full, sizeof(full)))
++    if (!gHost || !path || !res || !fullPath(path, full, sizeof(full)))
+         return -EINVAL;
+ 
+     IOLockLock(gLock);
+@@ -389,13 +372,7 @@
+             break;
+         }
+         /* iop,ascwrap-v8 and later are a different mailbox (Linux apple,asc-mailbox-v4 does not cover them) */
+-        bool m3=nodeIsCompatible(node,"iop,m3wrap-v2-acio");
+-        // Port0 is the reserved bench path. Only ACIO1 is qualified here.
+-        if (m3 && strcmp(full,"/arm-io/acio-cpu1")) {
+-            ret=-ENODEV;
+-            break;
+-        }
+-        if (!m3 && !nodeIsCompatible(node, "iop,ascwrap-v4")) {
++        if (!nodeIsCompatible(node, "iop,ascwrap-v4")) {
+             logf("%s: not an iop,ascwrap-v4 node", full);
+             ret = -ENODEV;
+             break;
+@@ -404,6 +381,7 @@
+         bzero(&m->res, sizeof(m->res));
+         strlcpy(m->res.path, full, sizeof(m->res.path));
+         strlcpy(m->res.name, node->getName(gIODTPlane) ? node->getName(gIODTPlane) : "asc", sizeof(m->res.name));
++        m->res.linux_compatible = "apple,asc-mailbox-v4";
+ 
+         /* registry-owned array: used here, never released, asked for once per node */
+         OSArray *regs = IODTResolveAddressing(node, "reg", NULL);
+@@ -412,18 +390,47 @@
+             m->res.asc_phys = d->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+             m->res.asc_size = d->getLength();
+         }
++        if (!d || !m->res.asc_phys || m->res.asc_size < SF_RTKIT_ASC_MBOX_OFFSET + SF_RTKIT_ASC_MBOX_SIZE) {
++            logf("%s: reg 0 not resolved or too small (0x%llx len 0x%llx)", full,
++                 (unsigned long long)m->res.asc_phys, (unsigned long long)m->res.asc_size);
++            ret = -EINVAL;
++            break;
++        }
++        m->res.mbox_phys = m->res.asc_phys + SF_RTKIT_ASC_MBOX_OFFSET;
++        m->res.mbox_size = SF_RTKIT_ASC_MBOX_SIZE;
++
+         OSData *ints = OSDynamicCast(OSData, node->getProperty("interrupts"));
+-        UInt32 listed[4];
+-        if (!d || !ints || ints->getLength()!=sizeof(listed)) {
+-            ret=-EINVAL;
++        if (!ints || ints->getLength() != 4 * sizeof(UInt32)) {
++            logf("%s: expected 4 interrupts, property is %u bytes", full, ints ? ints->getLength() : 0);
++            ret = -EINVAL;
+             break;
+         }
+-        memcpy(listed,ints->getBytesNoCopy(),sizeof(listed));
+-        ret=sf_rtkit_mbox_layout(m3,m->res.asc_phys,m->res.asc_size,listed,&m->res);
+-        if (ret) {
+-            logf("%s: invalid %s mailbox registers or IRQ layout",full,m3?"M3v2":"ASCv4");
++        UInt32 sorted[4];
++        memcpy(m->res.aic_listed, ints->getBytesNoCopy(), sizeof(m->res.aic_listed));
++        memcpy(sorted, m->res.aic_listed, sizeof(sorted));
++        for (int i = 1; i < 4; i++)
++            for (int j = i; j > 0 && sorted[j - 1] > sorted[j]; j--) {
++                UInt32 t = sorted[j];
++                sorted[j] = sorted[j - 1];
++                sorted[j - 1] = t;
++            }
++        /*
++         * Apple's tree does not name the four lines and does not list them in
++         * ascending order (gfx-asc on J293: 576 575 578 577). Linux's device
++         * trees give every ASC mailbox four consecutive AIC numbers as
++         * send-empty, send-not-empty, recv-empty, recv-not-empty (t8103.dtsi
++         * agx_mbox: 575..578), so the roles are taken from the sorted numbers.
++         */
++        if (sorted[3] != sorted[0] + 3 || sorted[1] != sorted[0] + 1 || sorted[2] != sorted[0] + 2) {
++            logf("%s: interrupts %u %u %u %u are not four consecutive numbers", full, (unsigned)sorted[0],
++                 (unsigned)sorted[1], (unsigned)sorted[2], (unsigned)sorted[3]);
++            ret = -EINVAL;
+             break;
+         }
++        m->res.aic_send_empty = sorted[0];
++        m->res.aic_send_not_empty = sorted[1];
++        m->res.aic_recv_empty = sorted[2];
++        m->res.aic_recv_not_empty = sorted[3];
+ 
+         int srcSend = -1, srcRecv = -1;
+         for (int i = 0; i < 4; i++) {
+@@ -469,8 +476,7 @@
+ 
+     if (!path || index != 0)
+         return -ENOENT;
+-    if (node && (nodeIsCompatible(node, "iop,ascwrap-v4") ||
+-                 nodeIsCompatible(node,"iop,m3wrap-v2-acio")) && name) {
++    if (node && nodeIsCompatible(node, "iop,ascwrap-v4") && name) {
+         /* an ASC wrapper is its own mailbox; every one on this SoC is a child of /arm-io */
+         return snprintf(path, len, "/arm-io/%s", name) < (int)len ? 0 : -EINVAL;
+     }
+--- head/src/Kernel/Extensions/SFDcp/rtkit/sf_rtkit_compat.h
++++ kernel48/src/Kernel/Extensions/SFDcp/rtkit/sf_rtkit_compat.h
+@@ -20,12 +20,6 @@
+ #include <asm/barrier.h>
+ 
+ #include "sf_rtkit_platform.h"
+-#include "sf_rtkit_iomem.h"
+-
+-/* LinuxKPI aliases this to ordinary memcpy, which may issue unaligned device
+- * loads. ACIO SRAM SYSLOG records actually triggered that data abort. */
+-#undef memcpy_fromio
+-#define memcpy_fromio(dst,src,bytes) sf_rtkit_memcpy_fromio((dst),(src),(bytes))
+ 
+ /*
+  * Logging. The layer's dev_err() is device_printf(dev->bsddev, ...), which
+--- head/src/Kernel/Extensions/SFDcp/rtkit/sf_rtkit_platform.h
++++ kernel48/src/Kernel/Extensions/SFDcp/rtkit/sf_rtkit_platform.h
+@@ -48,11 +48,11 @@
+ 	char		path[SF_RTKIT_PATH_MAX];	/* device-tree path of the ASC node */
+ 	char		name[SF_RTKIT_NAME_MAX];	/* its name, "gfx-asc" */
+ 	void		*node;		/* IORegistryEntry in gIODTPlane, retained for the kext's life */
+-	/* Linux compatible: ASCv4 or ACIO M3v2 (direct reg0, without ASC offset). */
++	/* Linux's compatible for this mailbox hardware: "apple,asc-mailbox-v4" for iop,ascwrap-v4 */
+ 	const char	*linux_compatible;
+ 	uint64_t	asc_phys;	/* reg 0, with the parents' ranges applied */
+ 	uint64_t	asc_size;
+-	uint64_t	mbox_phys;	/* ASC: asc_phys + 0x8000; ACIO M3v2: asc_phys */
++	uint64_t	mbox_phys;	/* asc_phys + SF_RTKIT_ASC_MBOX_OFFSET */
+ 	uint64_t	mbox_size;
+ 	/* AIC numbers in the order the node lists them, and by role (sorted: see the .cpp) */
+ 	uint32_t	aic_listed[4];
+--- head/src/Kernel/Extensions/SFDcp/sf_dcp_linux.c
++++ kernel48/src/Kernel/Extensions/SFDcp/sf_dcp_linux.c
+@@ -24,7 +24,6 @@
+ 
+ #include "sf_rtkit_platform.h"
+ #include "sf_rtkit_compat.h"
+-#include "sf_dcp_mailbox_plan.h"
+ 
+ void kprintf(const char *, ...);
+ extern int (*sf_platform_pre_probe)(struct platform_device *pdev);
+@@ -38,6 +37,8 @@
+ void *sf_dcp_host_of_nub(void *nub);		/* SFDcpHost.cpp */
+ extern struct device_node *of_root;
+ 
++#define SF_DCP_MBOX	"/arm-io/dcp"
++
+ /* boot-arg sfdcp: 0 off, 1 bind and start the coprocessor, 2 the same with KMS for clients */
+ int sf_dcp_mode;
+ 
+@@ -77,9 +78,6 @@
+ 	struct device_node *np = pdev->dev.of_node;
+ 	void *host;
+ 	int ret;
+-	struct sf_dcp_mailbox_plan plan;
+-	struct sf_rtkit_mbox_res actual = {0};
+-	struct resource *coproc;
+ 
+ 	if (np == NULL)
+ 		return (0);
+@@ -101,26 +99,8 @@
+ 		return (ret);
+ 	}
+ 	sf_rtkit_platform_set_log_prefix("SFDcp: rtkit: ");
+-	// Bind this actual consumer's coprocessor, never route dcpext through
+-	// the panel's hardcoded mailbox. Resolving validates native ADT resources
+-	// and IRQs before any mailbox startup. It does not power or start DCP.
+-	coproc = platform_get_resource_byname(pdev, IORESOURCE_MEM, "coproc");
+-	if (coproc == NULL)
+-		return -ENODEV;
+-	ret = sf_dcp_mailbox_plan_t8103(coproc->start, resource_size(coproc), &plan);
+-	if (ret)
+-		return ret;
+-	ret = sf_rtkit_platform_mbox_resolve(plan.path, &actual);
+-	if (ret)
+-		return ret;
+-	if (!actual.linux_compatible || strcmp(actual.linux_compatible, "apple,asc-mailbox-v4"))
+-		return -ENODEV;
+-	ret = sf_dcp_mailbox_check_t8103(&plan, actual.asc_phys, actual.asc_size,
+-	    actual.mbox_phys, actual.mbox_size, actual.aic_send_empty, actual.aic_recv_not_empty);
+-	if (ret)
+-		return ret;
+-	ret = sf_apple_mbox_bind(&pdev->dev, 0, plan.path);
+-	kprintf("SFDcp: dcp %s: mailbox 0 is %s (%d), probing\n", dev_name(&pdev->dev), plan.path, ret);
++	ret = sf_apple_mbox_bind(&pdev->dev, 0, SF_DCP_MBOX);
++	kprintf("SFDcp: dcp %s: mailbox 0 is %s (%d), probing\n", dev_name(&pdev->dev), SF_DCP_MBOX, ret);
+ 	return (ret);
+ }
+ 
+--- head/src/Kernel/Extensions/SFDcp/sf_dcp_prime.c
++++ kernel48/src/Kernel/Extensions/SFDcp/sf_dcp_prime.c
+@@ -46,7 +46,6 @@
+ };
+ 
+ static LIST_HEAD(sf_dcp_imports);
+-static LIST_HEAD(sf_dcp_import_quarantines); // pins + dma-buf refs retained until reboot
+ static DEFINE_MUTEX(sf_dcp_import_lock);
+ 
+ static void
+@@ -60,15 +59,6 @@
+ }
+ 
+ static void
+-sf_dcp_import_quarantine(struct sf_dcp_import *imp)
+-{
+-    mutex_lock(&sf_dcp_import_lock);
+-    list_add(&imp->link,&sf_dcp_import_quarantines);
+-    mutex_unlock(&sf_dcp_import_lock);
+-    kprintf("SFDcp: prime: DART retirement failed; retaining %u exporter pages/ref/pin until reboot\n",imp->npages);
+-}
+-
+-static void
+ sf_dcp_import_free(struct drm_gem_object *obj)
+ {
+ 	struct sf_dcp_import *imp = NULL, *it;
+@@ -90,10 +80,7 @@
+ 	/* the DART's state (error register included) while the mapping still exists */
+ 	sf_dcp_iommu_report(imp->dma_dev, "before an imported buffer is released");
+ 	/* the display must not reach the pages once the exporter may reuse them */
+-	if (sf_dma_unmap_phys_pages(imp->dma_dev, imp->dma, imp->npages)) {
+-		sf_dcp_import_quarantine(imp);
+-		return;
+-	}
++	sf_dma_unmap_phys_pages(imp->dma_dev, imp->dma, imp->npages);
+ 	sf_dcp_import_unpin(imp->exp);
+ 	dma_buf_put(imp->dmabuf);
+ 	if (dma_obj->sgt != NULL) {
+@@ -122,7 +109,7 @@
+ 	if (exp != NULL && exp->dev == dev)
+ 		return drm_gem_prime_import(dev, dma_buf);
+ 
+-	if (exp == NULL || exp->funcs == NULL || exp->funcs->get_sg_table == NULL || npages == 0 || dma_buf->size>UINT32_MAX ||
++	if (exp == NULL || exp->funcs == NULL || exp->funcs->get_sg_table == NULL || npages == 0 ||
+ 	    (dma_buf->size & (PAGE_SIZE - 1)) != 0) {
+ 		kprintf("SFDcp: prime: dma-buf of %zu bytes cannot be imported (no page table from its exporter)\n",
+ 		    dma_buf->size);
+@@ -166,12 +153,9 @@
+ 	}
+ 
+ 	imp->dma_dev = drm_dev_dma_dev(dev);
+-	get_dma_buf(dma_buf);
+-	imp->dmabuf=dma_buf;imp->exp=exp;imp->npages=npages;
+ 	ret = sf_dma_map_phys_pages(imp->dma_dev, phys, npages, &imp->dma);
+ 	if (ret) {
+ 		kprintf("SFDcp: prime: mapping %u pages for the display failed: %d\n", npages, ret);
+-		if (ret==-EBUSY)goto err_quarantine;
+ 		goto err_unpin;
+ 	}
+ 
+@@ -190,6 +174,7 @@
+ 		goto err_unmap;
+ 	}
+ 
++	get_dma_buf(dma_buf);
+ 	imp->obj = obj;
+ 	imp->dmabuf = dma_buf;
+ 	imp->exp = exp;
+@@ -234,17 +219,12 @@
+ 	return obj;
+ 
+ err_unmap:
+-	if (sf_dma_unmap_phys_pages(imp->dma_dev, imp->dma, npages))goto err_quarantine;
++	sf_dma_unmap_phys_pages(imp->dma_dev, imp->dma, npages);
+ err_unpin:
+ 	sf_dcp_import_unpin(exp);
+-	if (imp->dmabuf)dma_buf_put(imp->dmabuf);
+ err_free:
+ 	kfree(sgt);
+ 	kvfree(phys);
+ 	kfree(imp);
+ 	return ERR_PTR(ret);
+-err_quarantine:
+-	sf_dcp_import_quarantine(imp);
+-	kfree(sgt);kvfree(phys);
+-	return ERR_PTR(-EIO);
+ }

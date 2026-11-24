@@ -1,0 +1,51 @@
+#!/bin/sh
+# Guest side of the panel brightness test (SFDcp, sfdcp=2). The display has to be presenting
+# for a level to be applied, so the flip test runs in the background meanwhile.
+# Sets several levels with sf-backlight and reads back what was asked and what the display
+# coprocessor reports (kern.sf_backlight.actual_brightness), steps down and up, switches the
+# backlight off and on, and restores the level found at the start.
+# Pass: DL52_BACKLIGHT_RC=0; each "set" line shows the level asked for, and "display reports"
+# follows it (the firmware reports in nits; it may take a frame or two and may differ by a
+# few); the kernel prints "SFDcp: backlight: brightness N of M requested: 0" for each.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin; export PATH
+printf '\nDL52_BACKLIGHT_BEGIN_%s\n' "$nonce"
+rc=0
+say() { sed 's/^/DL52 /'; }
+bl() { o=$(sf-backlight "$@" 2>&1); r=$?; printf '%s\n' "$o" | say; return $r; }
+dcp-flip-test --seconds ${DL52_SECONDS:-30} > /tmp/dl52-flip.log 2>&1 &
+flip=$!
+sleep 4
+sysctl kern.sf_backlight 2>&1 | say
+start=$(sysctl -n kern.sf_backlight.brightness 2>/dev/null)
+printf 'DL52 start level %s\n' "$start"
+bl get || rc=1
+for pct in 10 40 70 100 25; do
+    printf 'DL52 set %s%%\n' "$pct"
+    bl set "$pct" || rc=1
+    sleep 1
+    bl get || rc=1
+done
+printf 'DL52 down, down, up\n'
+bl down; bl down; bl up
+sleep 1; bl get
+printf 'DL52 power off, then on\n'
+bl power off || rc=1
+sleep 2; bl get
+bl power on || rc=1
+sleep 1; bl get
+printf 'DL52 above the maximum (must fail)\n'
+bl raw 100000
+if [ -n "$start" ]; then
+    printf 'DL52 restore %s\n' "$start"
+    bl raw "$start" || rc=1
+    sleep 1; bl get
+else
+    rc=1
+fi
+wait $flip; frc=$?
+grep -e 'flips in' -e 'timing:' -e FAIL -e PASS /tmp/dl52-flip.log | cut -c1-240 | say
+printf 'DL52_FLIP_RC=%s\n' "$frc"
+printf 'DL52_BACKLIGHT_RC=%s\n' "$rc"
+printf 'DL52_BACKLIGHT_END_%s\n' "$nonce"

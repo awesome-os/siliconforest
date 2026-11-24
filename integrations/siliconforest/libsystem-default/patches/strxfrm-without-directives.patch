@@ -1,0 +1,75 @@
+diff -ruN a/src/Libraries/libSystem/libc/CMakeLists.txt b/src/Libraries/libSystem/libc/CMakeLists.txt
+--- a/src/Libraries/libSystem/libc/CMakeLists.txt	2026-11-13 10:17:49.394398914 -0800
++++ b/src/Libraries/libSystem/libc/CMakeLists.txt	2026-11-13 10:17:49.409764194 -0800
+@@ -266,6 +266,8 @@
+     stdio/FreeBSD/setvbuf.c      # _setvbuf
+     stdio/FreeBSD/tempnam.c      # _tempnam (gcc, llvm)
+     stdlib/FreeBSD/strtonum.c    # _strtonum (tmux)
++    string/FreeBSD/timingsafe_bcmp.c   # _timingsafe_bcmp (openssh, libfido2)
++    gen/FreeBSD/ualarm.c         # _ualarm (perl's Time::HiRes)
+     stdtime/FreeBSD/ftime.c      # _ftime
+     gen/getttyent.c              # _getttynam / _getttyent (ncurses, tmux, zsh)
+     compat-43/sigcompat.c        # _sigblock / _sigsetmask / _sigvec
+diff -ruN a/src/Libraries/libSystem/libc/string/FreeBSD/strxfrm.c b/src/Libraries/libSystem/libc/string/FreeBSD/strxfrm.c
+--- a/src/Libraries/libSystem/libc/string/FreeBSD/strxfrm.c	2026-11-13 10:17:27.334952002 -0800
++++ b/src/Libraries/libSystem/libc/string/FreeBSD/strxfrm.c	2026-11-13 10:18:17.791941699 -0800
+@@ -85,6 +85,20 @@
+ 
+ 	__collate_xfrm(wcs, xf, loc);
+ 
++	/*
++	 * A collation table without directives (or an allocation that failed)
++	 * leaves no transformed string: wcslen(NULL) below ended every program
++	 * that called strxfrm() in such a locale (en_US.UTF-8 here; perl does
++	 * at start). Such a locale collates by byte value, as the C locale.
++	 */
++	if (xf[0] == NULL) {
++		sverrno = errno;
++		free(wcs);
++		free(xf[1]);
++		errno = sverrno;
++		return strlcpy(dest, src, len);
++	}
++
+ 	slen = wcslen(xf[0]) * XFRM_BYTES;
+ 	if (xf[1])
+ 		slen += (wcslen(xf[1]) + 1) * XFRM_BYTES;
+diff -ruN a/src/Libraries/libSystem/libc/string/FreeBSD/wcsxfrm.c b/src/Libraries/libSystem/libc/string/FreeBSD/wcsxfrm.c
+--- a/src/Libraries/libSystem/libc/string/FreeBSD/wcsxfrm.c	2026-11-13 10:17:27.334987145 -0800
++++ b/src/Libraries/libSystem/libc/string/FreeBSD/wcsxfrm.c	2026-11-13 10:18:17.791995144 -0800
+@@ -71,6 +71,23 @@
+ 
+ 	__collate_xfrm(src, xf, loc);
+ 
++	/* no transformed string (see strxfrm_l): as without a collation table */
++	if (xf[0] == NULL) {
++		sverrno = errno;
++		free(xf[1]);
++		errno = sverrno;
++		slen = wcslen(src);
++		if (len > 0) {
++			if (slen < len)
++				wcscpy(dest, src);
++			else {
++				wcsncpy(dest, src, len - 1);
++				dest[len - 1] = L'\0';
++			}
++		}
++		return (slen);
++	}
++
+ 	slen = wcslen(xf[0]);
+ 	if (xf[1])
+ 		slen += wcslen(xf[1]) + 1;
+diff -ruN a/src/Libraries/libSystem/stub/CMakeLists.txt b/src/Libraries/libSystem/stub/CMakeLists.txt
+--- a/src/Libraries/libSystem/stub/CMakeLists.txt	2026-11-13 10:17:49.394398914 -0800
++++ b/src/Libraries/libSystem/stub/CMakeLists.txt	2026-11-13 10:18:17.791814402 -0800
+@@ -174,6 +174,8 @@
+         _roundl _scalblnl _scalbnl _setbuffer _setcontext _sigblock _sigsetmask _sinhl _sinl
+         _sqrtl _strtonum _swapcontext _tanhl _tanl _task_swap_exception_ports _tempnam
+         _tgammal _truncl _vfprintf_l _vm_read_overwrite _vm_region_recurse_64 _vsnprintf_l)
++        # further names of the same kind (GitHub issue 45, the gap scanner's list)
++        list(APPEND _libsystem_export_lines _timingsafe_bcmp _ualarm)
+         list(REMOVE_DUPLICATES _libsystem_export_lines)
+     endif()
+     set(_libsystem_exports_for_link ${CMAKE_CURRENT_BINARY_DIR}/libSystem.arm64.exports)

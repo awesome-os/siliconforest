@@ -1,0 +1,25 @@
+--- a/src/Frameworks/IOSurface/IOSurface.c
++++ b/src/Frameworks/IOSurface/IOSurface.c
+@@ -139,13 +139,20 @@
+     pthread_mutex_unlock(&lock);
+ }
+ 
+-// a surface this process already maps comes back as the same object
++// CoreFoundation's private try-retain: NULL once the object's last release has begun
++CF_EXPORT CFTypeRef _CFTryRetain(CFTypeRef cf);
++
++// a surface this process already maps comes back as the same object. byID holds no reference, so
++// the last CFRelease on another thread may already be finalizing the entry: a plain CFRetain then
++// revives an object whose mapping finalize is about to unmap (and whose next release finalizes it
++// again, reading the unmapped header). A dying entry counts as unknown: the caller maps the port
++// afresh and remember() replaces the entry; the dying object's forget() leaves the new one alone.
+ static IOSurfaceRef known(IOSurfaceID id) {
+     IOSurfaceRef s = NULL;
+ 
+     pthread_mutex_lock(&lock);
+     if (byID && (s = (IOSurfaceRef)CFDictionaryGetValue(byID, (const void *)(uintptr_t)id)))
+-        CFRetain(s);
++        s = (IOSurfaceRef)_CFTryRetain(s);
+     pthread_mutex_unlock(&lock);
+     return s;
+ }

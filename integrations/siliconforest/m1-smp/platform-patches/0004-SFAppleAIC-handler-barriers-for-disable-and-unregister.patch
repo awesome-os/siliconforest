@@ -1,0 +1,57 @@
+SFArmPlatformExpert: SFAppleAIC's handler has the barriers the disable protocol needs
+
+Audit finding H1 (docs/roadmap/research/smp-lock-audit.md). IOInterruptController's
+disableInterrupt()/unregisterInterrupt() set interruptDisabledSoft, issue a barrier and
+spin until interruptActive is clear; xnu's own handleInterrupt() issues a barrier after
+setting interruptActive. This handler did not, so with the interrupt on CPU 0 and a
+teardown on another CPU (Wi-Fi off/reload removes its event source) each side could miss
+the other's store: the handler then calls into an event source that was just freed. The
+handler also re-checks interruptDisabledSoft after marking the source hard disabled, so
+that an enableInterrupt() racing with the end of the handler cannot leave the source
+masked for good.
+
+--- a/src/Kernel/Extensions/SFArmPlatformExpert/SFAppleAIC.cpp
++++ b/src/Kernel/Extensions/SFArmPlatformExpert/SFAppleAIC.cpp
+@@ -258,6 +258,15 @@
+ 
+ 		IOInterruptVector *vector = &vectors[irq];
+ 		vector->interruptActive = 1;
++		/*
++		 * As IOInterruptController::handleInterrupt has it: disableInterrupt()
++		 * and unregisterInterrupt() on another CPU set interruptDisabledSoft,
++		 * issue a barrier and then wait for interruptActive to clear. Without
++		 * a barrier between our store and the load below both sides can miss
++		 * the other's store, and the handler runs on a vector that is being
++		 * torn down (its event source freed).
++		 */
++		OSMemoryBarrier();
+ 
+ 		if (!vector->interruptDisabledSoft && vector->interruptRegistered) {
+ 			vector->handler(vector->target, vector->refCon,
+@@ -269,6 +278,18 @@
+ 			 */
+ 			if (vector->interruptDisabledSoft) {
+ 				vector->interruptDisabledHard = 1;
++				/*
++				 * enableInterrupt() on another CPU clears DisabledSoft
++				 * and then looks at DisabledHard to decide whether to
++				 * unmask. If it cleared Soft after our test and read
++				 * Hard before our store, nobody would unmask the
++				 * source again: look once more and unmask it here.
++				 */
++				OSMemoryBarrier();
++				if (!vector->interruptDisabledSoft) {
++					vector->interruptDisabledHard = 0;
++					enableVector(irq, vector);
++				}
+ 			} else {
+ 				enableVector(irq, vector);
+ 			}
+@@ -277,6 +298,7 @@
+ 			disableVectorHard(irq, vector);
+ 		}
+ 
++		OSMemoryBarrier();
+ 		vector->interruptActive = 0;
+ 	}
+ 

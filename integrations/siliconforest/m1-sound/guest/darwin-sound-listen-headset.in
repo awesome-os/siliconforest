@@ -1,0 +1,30 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Listening script for the headset microphone: needs a person at the M1 with a headset
+# (headphones with a microphone) plugged in before the boot.
+# Run: SD_GUEST=guest/darwin-sound-listen-headset.in SD_RUNTIME=240 tools/sd_boot.sh sd<NN>
+# What to do and what must happen, three times in a row:
+#   1. When the log says SD_LISTEN record, speak into the headset microphone for 5 s.
+#      The "rms" in the SD_LISTEN recorded line must be far above the empty-jack value
+#      (about 120 of 8388608, which is only the converter's offset).
+#   2. Right after, the recording is played back into the headphones at @VOLUME@ dB
+#      attenuation: the voice must be recognisable, at the right speed and pitch.
+# The log must also show "jack=2" (headset); with "jack=1" the plug has no microphone.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+get() { sysctl -n "$1" 2>/dev/null; }
+printf '\nSD_BEGIN_%s\n' "$nonce"
+sysctl -w kern.sf_sound.volume_db=@VOLUME@ > /dev/null 2>&1
+n=0
+while [ "$n" -lt 3 ]; do
+    printf 'SD_LISTEN record jack=%s\n' "$(get kern.sf_sound.jack)"
+    dd if=/dev/sfmic of=/tmp/rec.raw bs=4096 count=235 2>/dev/null
+    printf 'SD_LISTEN recorded %s\n' "$(get kern.sf_sound.mic)"
+    cat /tmp/rec.raw > /dev/sfaudio
+    sleep 7
+    n=$((n+1))
+done
+sysctl kern.sf_sound.state kern.sf_sound.mic 2>&1
+printf 'SD_END_%s\n' "$nonce"
+printf '\nPD_BENCH_DONE\n'

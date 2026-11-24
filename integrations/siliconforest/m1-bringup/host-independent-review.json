@@ -1,0 +1,127 @@
+{
+  "schema": "darwin-lab-009-independent-host-review-v1",
+  "scope": "Read-only review of root loader, continuing capture, console proof and recovery controller; host-only tests/mutations, no SSH/device/build",
+  "reviewed_sha256": {
+    "integrations/puredarwin/m1-bringup/normal_image.py": "6f35e7239df2624fd5d98e8ae2d36f4af28ddd2ef4298d12c589738b41923793",
+    "integrations/puredarwin/m1-bringup/host_progress.py": "47878502bd8e5ecbd2b7b96719e9d80804e587e470bdb65c8b8b5d3f90da8a6d",
+    "integrations/puredarwin/m1-bringup/test_host_progress.py": "6e1ade6545996d46fbe44b8f216744950ffd945a86e749b0953038daad0442ee",
+    "tools/m1_bringup_cycle.py": "e0ec758c78a38e2f7a4aeda9832469efc5d06c14d2b1f0e6179dbda7ed1b861a",
+    "tests/test_m1_bringup_cycle.py": "a7085597b1ae1597e0b80b501d97799ac22c54e4564322048599c55a2433b4cf"
+  },
+  "status": "H6_H7_CLOSED_SOURCE_AND_HOST_TESTS_NO_RUNTIME_CLAIM",
+  "tests": {
+    "host_progress_passed": 12,
+    "controller_passed": 6,
+    "synthetic_mutations": "Historical pre-fix reproductions retained in previous review; current 12 host tests pass. Three additional dispatch-level parse/read/missing-pointer failure probes confirm fail-stop, callback identity retention, and exact original raw bytes when available."
+  },
+  "fixed_findings": [
+    {
+      "id": "H1",
+      "issue": "Later file-backed segment could overwrite inspected entry with zero bytes",
+      "evidence": "normal_image.py:139-150 now rejects conflicting file-backed overlap and later zero-fill; regression passed"
+    },
+    {
+      "id": "H2",
+      "issue": "Failed or unrelated build receipt accepted",
+      "evidence": "normal_image.py:190-199 now requires BUILT_NOT_BOOTED, exact integer zero exit, KC digest and concrete store paths; regression passed"
+    },
+    {
+      "id": "H3",
+      "issue": "Kernel member first-command/first-segment slide contract was unchecked",
+      "evidence": "normal_image.py:106-112 now requires first __TEXT segment and matching fileset VA/file offset; regression passed"
+    },
+    {
+      "id": "H4",
+      "issue": "Stock pre-KC ADT lifetime is invalid with CTRR/PPL omitted",
+      "evidence": [
+        "XNU pexpert/gen/device_tree.c:248-269 returns false without integrity implementation",
+        "XNU osfmk/arm64/arm_vm_init.c:1316 excludes unlocked DT from EXTRADATA; :1700 releases pre-segLOWEST pages",
+        "host_progress.py:261-300 now reserves ADT/TrustCache/RAMDisk after KC+BootArgs and coherently updates hv.adt_base/BootArgs/map",
+        "TrustCache above the KC is allowed for this DEBUG build by arm_vm_init.c:1349-1353"
+      ],
+      "qualification": "Source and fake layout test; actual Construct roundtrip/M1 runtime still required"
+    },
+    {
+      "id": "H5",
+      "issue": "Controller could exit zero after failed incomplete-latch clear",
+      "evidence": "tools/m1_bringup_cycle.py:191 now requires exact DARWIN_COMMAND_LINE_OBSERVED_LINUX_VERIFIED status; regression passed"
+    },
+    {
+      "id": "H6",
+      "priority": "pre-write validation",
+      "issue": "Total RAM bounds do not exclude MCC-protected carveouts",
+      "impact": "A sufficiently extended KC/post-kernel reservation can be inside reported DRAM but intersect a protected or guest-unmapped range. No overlap with the actual planned candidate was observed or asserted in this review.",
+      "status": "CLOSED",
+      "recheck_evidence": [
+        "host_progress.py:270-287 reads exactly80 bytes with bounded table pointer/ranges and a required zero sentinel; pinned mcc.c:32/:131 defines four16-byte ranges plus sentinel",
+        "host_progress.py:290-301 excludes intersections across the complete contiguous guest reservation, including rebuilt ADT/TrustCache/RAMDisk",
+        "host_progress.py:362-363 performs initial check before HV/image writes; :375-380 rechecks the same table in bounded_unmap before pinned load_raw transfers image bytes",
+        "Boundary/intersection and missing-sentinel host tests pass"
+      ],
+      "historical_evidence": [
+        "host_progress.py:273-275 checks only original BootArgs RAM extent for payload/source ranges",
+        "Pinned m1n1 hv/__init__.py:1687-1698 explicitly removes MCC carveouts from stage-2 mappings",
+        "Pinned load_raw performs target image writes after that removal; it does not reject a destination intersecting the removed ranges"
+      ],
+      "historical_action": "Before image/payload transfers, bound the MCC range query and reject any destination intersection (or bind an existing qualified carveout snapshot to the live session). Include the entire contiguous guest staging/reservation extent. Preserve exact observed ranges privately. Add intersecting/boundary cases.",
+      "followup_correction": {
+        "prior_review_missed": "MCC protected ranges may lie outside usable BootArgs mem_size while still inside physical DRAM. Previous bounds incorrectly rejected these legitimate ranges.",
+        "current_source": "host_progress.py:274-291 keeps the table pointer below usable_high, validates protected ranges against aligned DRAM base + mem_size_actual, and saves original80-byte table before descriptor validation. check_reservation/load_payloads still bound all destinations to usable RAM and reject every carveout intersection.",
+        "tests": "All12 host tests pass, including protected region above usable RAM but within actual DRAM and reservation intersection/boundary cases.",
+        "status": "SOURCE_CORRECTION_RECHECKED; actual retry outcome pending"
+      }
+    },
+    {
+      "id": "H7",
+      "priority": "diagnostic evidence",
+      "issue": "Context parse failures discard original bytes and callback identity",
+      "impact": "Synthetic parse failure saved no exception-context.bin and saved event=null. This remains fail-stop, not a continuation bypass.",
+      "status": "CLOSED",
+      "recheck_evidence": [
+        "host_progress.py:210-220 preserves _info_data/context_error and stops inside load_context before dispatch cleanup",
+        "host_progress.py:196-206 writes original raw bytes and catches reparse failure so diagnostic JSON survives",
+        "Three dispatch-level synthetic probes: parse failure saves exact raw bytes; read failure and missing pointer preserve event without fabricated raw bytes; all stop without continuation"
+      ],
+      "historical_evidence": [
+        "host_progress.py:210 calls original_load_context without preserving _info_data on error",
+        "host_progress.py:232-234 clears event/raw during exception unwinding before inherited run catches it",
+        "host_progress.py:199 reparses raw without catching parse errors, so malformed bytes can also prevent exception-context.json"
+      ],
+      "historical_action": "Mirror the frozen adapter error preservation: save original _info_data/context_error and stop inside load_context before dispatch cleanup; catch parse errors in stop so raw bytes and a diagnostic JSON survive. Test missing pointer and parse/read failures."
+    }
+  ],
+  "open_findings": [],
+  "reviewed_good_paths": [
+    "SYNC/HOOK_VM/FIQ dispatch reaches pinned handlers; only HANDLED P_EXIT acknowledgements are permitted; unhandled paths hit overridden run_shell and stop without guest continuation.",
+    "Original context is retained before ordinary handler mutation when parsing succeeds. Alarm still uses inherited main-thread guarded reply boundary.",
+    "CDC selection requires exact VID/PID/location and distinct data interfaces1 and3 in one IORegistry device; no first glob. Runtime enumeration is still an observation to validate.",
+    "Nonce command sends split literals; plain echo cannot form the required joined begin/end markers. Controller recomputes Darwin/arm64 response from raw secondary-console bytes and binds launch artifacts.",
+    "Shared lock, durable reboot/reset intent, verified child termination, one PD reset only with fresh native CDC, Linux fallback without blind reset, and incomplete-state latch remain present.",
+    "RAMDisk placement follows aligned post-BootArgs reservation and topOfKernelData protects it from normal VM allocation. Actual metadata ABI/image alignment needs root/M5 Construct and filesystem checks."
+  ],
+  "next_steps": [
+    "Root retains the newly reviewed helper hashes in the candidate packet.",
+    "Root validates actual reconstructed BootArgs/ADT and whole-page RAMDisk before its bounded cycle.",
+    "Actual normal kernel/userspace/duplex command-line and Linux recovery evidence remain required; this source recheck claims none."
+  ],
+  "revision": 3,
+  "supersedes_sha256": "a1fb060747d92c5677f994525665f77db32c17465eac7250031a5c9bb1745af1",
+  "recheck_scope": "Bounded follow-up: usable-RAM versus physical-DRAM MCC bounds after root actual attempt001 safe prewrite refusal.",
+  "build_update_from_root": {
+    "native_kc_status": "SUCCEEDED_NOT_BOOTED",
+    "path": "/nix/store/vn510pz79zjfvac0sb062swvnpw0lp4y-puredarwin-kc-arm64-0.1/kernel",
+    "bytes": 38883200,
+    "sha256": "496618b211db6ee3f4faf2cf2b0fd113f7db4ec7c088e38dd082c3e6e8aaf5a0",
+    "members": 50,
+    "platform_build": "root reports succeeded",
+    "verification_scope": "User/root supplied actual build result; artifact not re-inspected during this bounded H6/H7 pass"
+  },
+  "runtime_followup_from_root": {
+    "attempt": 1,
+    "result": "NO_COMMAND_LINE_OBSERVED_LINUX_VERIFIED",
+    "guest_image_written": false,
+    "reset_attempts": 1,
+    "incomplete_latch_cleared": true,
+    "provenance": "Root actual controller result supplied in thread; no target access by this reviewer"
+  }
+}

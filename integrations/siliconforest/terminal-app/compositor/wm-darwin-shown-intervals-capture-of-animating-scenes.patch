@@ -1,0 +1,128 @@
+diff -ruN desk10-next-001/source/crates/wm-darwin/src/inject.rs desk10-next-002/source/crates/wm-darwin/src/inject.rs
+--- desk10-next-001/source/crates/wm-darwin/src/inject.rs	2026-11-15 21:59:17.245318402 -0800
++++ desk10-next-002/source/crates/wm-darwin/src/inject.rs	2026-11-15 22:16:17.922048710 -0800
+@@ -149,7 +149,8 @@
+     poll_at: Instant,
+     wait_until: Option<Instant>,
+     buttons: u8,
+-    capture_since: Option<Instant>,
++    /// when the capture was first looked at, and the number of the frame drawn last then (DESK10)
++    capture_since: Option<(Instant, u64)>,
+     done: usize,
+     errors: Vec<String>,
+     active: bool,
+@@ -614,16 +615,24 @@
+         }
+         // The scene stays unrendered while the display sleeps (and for a moment while a frame is
+         // on its way): a capture does not wait for that longer than two seconds.
++        // DESK10 (CODEX-FX 05:17Z): an animating client makes the scene dirty again before every look, so
++        // a capture waited in vain; a frame completed after the request is taken (its number is said),
++        // the newer changes are the next frame's.
++        let seq = server.pacing.seq();
++        let mut newer = false;
+         if server.wm.backend().dirty {
+-            let since = *self.capture_since.get_or_insert_with(Instant::now);
+-            if since.elapsed() < Duration::from_secs(2) {
++            let (since, asked_at) = *self.capture_since.get_or_insert((Instant::now(), seq));
++            if seq <= asked_at {
++                if since.elapsed() < Duration::from_secs(2) {
++                    return Ok(());
++                }
++                self.errors.push(format!("capture {name}: no frame completed within 2 s of the request (is the display asleep? a key wakes it)"));
++                self.capture_since = None;
++                self.queue.pop_front();
++                self.done += 1;
+                 return Ok(());
+             }
+-            self.errors.push(format!("capture {name}: no frame of the current scene within 2 s (is the display asleep? a key wakes it)"));
+-            self.capture_since = None;
+-            self.queue.pop_front();
+-            self.done += 1;
+-            return Ok(());
++            newer = true;
+         }
+         self.capture_since = None;
+         let size = server.wm.backend().screen_size();
+@@ -639,7 +648,7 @@
+         }
+         let path = self.dir.join(format!("{name}.ppm"));
+         match std::fs::write(&path, file) {
+-            Ok(()) => eprintln!("WMINJECT capture={} size={}x{} source={source}", path.display(), size.w, size.h),
++            Ok(()) => eprintln!("WMINJECT capture={} size={}x{} source={source} frame={seq} scene={}", path.display(), size.w, size.h, if newer { "changed-since (a frame completed after the request; newer changes pending)" } else { "current" }),
+             Err(error) => self.errors.push(format!("capture {name}: {error}")),
+         }
+         self.queue.pop_front();
+diff -ruN desk10-next-001/source/crates/wm-darwin/src/pacing.rs desk10-next-002/source/crates/wm-darwin/src/pacing.rs
+--- desk10-next-001/source/crates/wm-darwin/src/pacing.rs	2026-11-15 19:29:35.366039773 -0800
++++ desk10-next-002/source/crates/wm-darwin/src/pacing.rs	2026-11-15 22:15:33.084398032 -0800
+@@ -52,6 +52,12 @@
+     recent: std::collections::VecDeque<u64>,
+     /// time in the desk's commit handler for this window's buffer commits (copies, imports, bookkeeping)
+     handler: Series,
++    /// DESK10 (CODEX-FX's 05:13Z ask): from one completed flip that showed a new buffer of this window to the
++    /// next (the panel's stamps when `flip_stamps`; each shown buffer counted once), and how many of the shown
++    /// buffers were a new picture (`framehash`)
++    last_shown: Option<Instant>,
++    shown_interval: Series,
++    shown_distinct: u64,
+ }
+ 
+ #[derive(Default)]
+@@ -203,6 +209,14 @@
+                     w.drawn = None;
+                     w.shown += 1;
+                     w.commit_to_flip.sample(at.saturating_duration_since(commit));
++                    // a pause of a second or more is the client resting, not a frame interval
++                    if let Some(prev) = w.last_shown.filter(|p| at.saturating_duration_since(*p) < Duration::from_secs(1)) {
++                        w.shown_interval.sample(at.saturating_duration_since(prev));
++                    }
++                    w.last_shown = Some(at);
++                    if w.drawn_distinct == Some(true) {
++                        w.shown_distinct += 1;
++                    }
+                 }
+             }
+         }
+@@ -225,11 +239,13 @@
+             let iv = w.intervals.take_sorted();
+             let cb = w.callback_to_commit.take_sorted();
+             let handler = w.handler.take_sorted();
+-            let hashes = if w.distinct + w.same + w.unhashed > 0 { format!(" | content: distinct={} same_as_before={} unread={} replaced_distinct={} revisits={}", w.distinct, w.same, w.unhashed, w.replaced_distinct, w.revisits) } else { String::new() };
++            let shown_iv = w.shown_interval.take_sorted();
++            let hashes = if w.distinct + w.same + w.unhashed > 0 { format!(" | content: distinct={} same_as_before={} unread={} replaced_distinct={} revisits={} shown_distinct={}", w.distinct, w.same, w.unhashed, w.replaced_distinct, w.revisits, w.shown_distinct) } else { String::new() };
+             lines.push(format!(
+-                "WMPACING over_ms={window_ms} window={id} app={:?} commits={} shown={} replaced_before_shown={} fifo_held={} fifo_timeouts={} unchanged_commits={} | {} | {} | {} | {} | commits by ms after the last flip {:?} | frames held for a fence={fence}{hashes}",
+-                w.app_id, w.commits, w.shown, w.replaced, w.fifo_held, w.fifo_timeouts, w.unchanged, text95(&ctf, "commit->flip"), window_text(&iv, "commit interval"), text95(&cb, "callback->commit"), text95(&handler, "commit handler"), w.phase
++                "WMPACING over_ms={window_ms} window={id} app={:?} commits={} shown={} replaced_before_shown={} fifo_held={} fifo_timeouts={} unchanged_commits={} | {} | {} | {} | {} | {} | commits by ms after the last flip {:?} | frames held for a fence={fence}{hashes}",
++                w.app_id, w.commits, w.shown, w.replaced, w.fifo_held, w.fifo_timeouts, w.unchanged, text95(&ctf, "commit->flip"), text95(&shown_iv, "shown->shown"), window_text(&iv, "commit interval"), text95(&cb, "callback->commit"), text95(&handler, "commit handler"), w.phase
+             ));
++            w.shown_distinct = 0;
+             w.commits = 0;
+             w.shown = 0;
+             w.replaced = 0;
+@@ -300,6 +316,25 @@
+         assert!(lines.iter().any(|l| l.contains("flip stamps:")), "{lines:?}");
+         assert!(lines.last().unwrap().starts_with("WMCOST "), "{lines:?}");
+     }
++    /// DESK10: the interval between the flips that showed a window's new buffers, each shown buffer once; a
++    /// refresh without a new buffer of it shows as a 33 ms interval.
++    #[test]
++    fn shown_to_shown_intervals_come_from_the_flips_that_showed_a_new_buffer() {
++        let mut p = PacingTrace::default();
++        let t0 = Instant::now();
++        for (k, commit) in [(0u64, true), (1, true), (2, false), (3, true)] {
++            if commit {
++                p.commit(5, Some("org.mozilla.firefox"));
++            }
++            p.drawn();
++            p.frame_committed();
++            p.flipped(t0 + Duration::from_micros(16_667 * k));
++        }
++        let lines = p.take_lines();
++        let line = lines.iter().find(|l| l.contains("window=5")).unwrap();
++        // intervals 16.7 (k 0 -> 1) and 33.3 (k 1 -> 3: the refresh k 2 showed nothing new of it)
++        assert!(line.contains("shown=3") && line.contains("shown->shown n=2 p50_ms=33.3 p95_ms=33.3 p99_ms=33.3 max_ms=33.3"), "{line}");
++    }
+     #[test]
+     fn content_hashes_tell_repeats_lost_frames_and_pictures_taking_turns() {
+         let mut p = PacingTrace::default();

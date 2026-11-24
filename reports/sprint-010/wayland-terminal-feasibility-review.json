@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_PLAN_REVIEW_NO_HARDWARE",
+  "plan": "reports/sprint-010/wayland-terminal-feasibility.json (Astra, sha256 305b21f01c4ddd2f)",
+  "verdict": "APPROVE AS A SOURCE PLAN: PTY smoke first, then a separate real terminal client. Every API, kernel and image claim I checked holds. The child/fd/cleanup contract is correctly conservative. T1-T3 refine expectations; none blocks the smoke implementation.",
+  "claims_verified": [
+    "Exports: both the new libSystem 8ff49e0c and the old 432c7369 export openpty, posix_openpt, grantpt, unlockpt, ptsname, ptsname_r, login_tty, setsid, tcsetattr, cfmakeraw, kevent and poll. forkpty is not exported in either. The smoke can therefore run on the 006 image or an earlier one.",
+    "libc behaviour: openpty strcpy()s into an unbounded caller 'name' and ignores the tcsetattr(TCSAFLUSH) and TIOCSWINSZ results (util/pty.c). login_tty ignores setsid and all three dup2 results, failing only on TIOCSCTTY (util/login_tty.c:41-50). The plan's rule (explicit checked steps, name/termp/winp NULL or no openpty) is right.",
+    "Kernel: MASTER:493 'pseudo-device ptmx 1 init ptmx_init' is unconditional. The KC's kernel (bringup output 1ys1x1hz) contains _ptmx_init, _ptsd_kqfilter and _ptcselect, so poll and kqueue readiness on the master exist. Master close (tty_dev.c:581-592) flushes and marks the slave TS_ZOMBIE 'except for sending SIGHUP', so explicit owned-PID/PGID signalling is required, as the plan states.",
+    "Image (candidate-006 RAM): /private/var/select/sh is a symlink to /bin/zsh; /bin/zsh and /bin/uname are regular files; /usr/bin/uname, /usr/share/terminfo and /etc/termcap are absent. TERM=dumb and an explicit /bin/uname path are the honest starting point.",
+    "Process contract: setsid in the child before TIOCSCTTY on the inherited O_NOCTTY slave fd (no setpgid first), checked dup2 to 0/1/2, postconditions (getsid/getpgrp/tcgetpgrp), a CLOEXEC status pipe whose EOF marks the exec boundary, signalling only the owned PID before setup and the owned PGID after, never kill(0)/kill(-1), no signal after reap, and no TIOCSCTTY/TIOCSWINSZ on /dev/console. All consistent with XNU tty.c semantics."
+  ],
+  "refinements": [
+    {"id": "T1", "kind": "shell startup expectation", "text": "sh.c rewrites argv[0] to 'sh' before exec'ing zsh, so zsh runs in sh emulation. In that mode zsh does not run its usual startup scripts (/etc/zshenv, zprofile, zshrc). A login shell reads /etc/profile and ~/.profile; an interactive shell reads $ENV if set. For the '/bin/sh -c' smoke (non-login, non-interactive) no startup file should run. For the later 'sh -i' terminal, control ENV (unset or a reviewed file), HOME and HISTFILE. The /etc/zshenv TERM default is then irrelevant, but verify it at runtime as the plan says."},
+    {"id": "T2", "kind": "runtime unknown", "text": "Under TERM=dumb an interactive zsh may still run its line editor (ZLE) and emit editing sequences or prompt redraws. The terminal milestone should either observe and account for the actual bytes, or explicitly disable the line editor through a reviewed option, before claiming a plain-prompt transcript."},
+    {"id": "T3", "kind": "evidence scope", "text": "The smoke qualifies PTY allocation, session, exec, I/O and reap only. Keep it separate from the Wayland terminal and from any host typing schedule. As the plan says, a new fixed-command host schedule must be a separate reviewed helper; the frozen A/click/drag helper is not to be widened."}
+  ],
+  "runtime_unknowns": "As listed in the plan, plus T2: actual /dev/ptmx clone, grant and unlock on this guest; controlling-tty semantics; master EOF/EIO behaviour after child exit (TS_ZOMBIE path); and zsh-as-sh interactive behaviour.",
+  "not_claimed": ["any PTY runtime", "terminal", "input", "physical keyboard"],
+  "scope": "Read-only. Exports trie, kernel symbols, source and debugfs stat reads only. No builds or hardware."
+}

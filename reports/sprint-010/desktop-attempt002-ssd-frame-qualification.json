@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_CAPTURE_QUALIFICATION_NO_HARDWARE",
+  "capture": "runs/m1-desktop-010/attempt-002 (private)",
+  "packet": "artifacts/m1-desktop-010/candidate-002 (approved in desktop-ssd-candidate002-packet-review.json)",
+  "verdict": "QUALIFIED: SERVER-SIDE DECORATED CPU WAYLAND DESKTOP FRAME IN FRAMEBUFFER MEMORY. The fresh-nonce SSD client negotiated xdg-decoration server_side before its first frame. Chonkstep composited it with its full NeXTSTEP chrome (title bar, buttons, resize bar, border) into the firmware framebuffer. One reset; Linux verified.",
+  "nonce": {
+    "value": "eb2142bfc3fcf4e24c5ce87f747b9c5bb8d68a4591997db5",
+    "fresh": "console-result nonce, carried in console-tx.bin (receipt sha matches, the ledger ends with exactly desktop-input.bin). It does not occur anywhere in attempt-001.",
+    "console": "Typed command (line 662) -> DL10_BEGIN (682) -> IOGOPFramebuffer open (762) -> DL10_SERVER_SOCKET (775) -> DL10_SSD_CONFIGURED (785) -> DL10_CLIENT_FRAME 1 (787) ... 127 (1039). Every marker carries this nonce."
+  },
+  "criteria": {
+    "C1_fresh_nonce_command": "PASS. console-result error null, desktop_command_sent true, TX ledger receipt match.",
+    "C2_guest_markers": "PASS. BEGIN and SERVER_SOCKET with the nonce. END and CLIENT_DONE are absent, as expected: at runtime 150 the script is still in its sleep and the client still in its loop.",
+    "C3_real_client_frames": "PASS. DL10_CLIENT_FRAME 1..127 is contiguous, with no 'darwin-wayland-client-ssd:' or 'chonkstep-darwin:' error line. The source requests exactly one frame callback per paint and paints at most every 500 ms.",
+    "C4_framebuffer_ownership": "PASS. PDGOP selected IOGOPFramebuffer, kPEDisableScreen 1, enableController 0x0, IOFB open. framebuffer.bin is 16384000 bytes, sha256 6208052f66ff1933 (matches framebuffer.json). Source: firmware boot framebuffer with the guest paused; physical_panel_observed false.",
+    "C5_pixel_content": "PASS. The 800x480 client block is at screen (1,24). Glyph masks match exactly (ink 1.0, background 1.0) for 'CHONKSTEP ON M1', 'DARWIN / ARM64 / WAYLAND', 'FRESH HOST NONCE:', 'eb2142bfc3fcf4e24c5ce87f' and '747b9c5bb8d68a4591997db5'. The red, green and blue bars are exact.",
+    "C6_live_frame": "PASS. On-screen 'FRAME 126' is an exact match, against 127 callbacks (paint index 126 is the 127th paint). The yellow marker is at client x 302 (screen 303), which equals 24 + (126*13) mod 680. The displayed buffer is the latest paint, not a stale first frame.",
+    "C7_compositor_chrome": "PASS AS FULL CHROME. Console: 'DL10_SSD_CONFIGURED <nonce> mode=server_side serial=1' comes before the first frame. Pixels: the frame occupies screen (0,0)-(801,512), exactly 802x513: a 1 px black border, a 24-row band above the client across all 802 columns, the client at (1,24), and a 9-row bevelled resize bar below it (aa grey with 130/170/250 relief). The title bar is focused black, with +80 bevel lines (80,80,80), a left miniaturize button, a right close button, and the centred title 'Chonkstep on M1 - real Wayland client' (the client's xdg title, visually verified at 2x). In edges mode (attempt-001 and preview-001) the same measurement found only a 1 px border with the client at (1,1). The decoration is the compositor's, not the client's: the client buffer is exactly the 800x480 block."
+  },
+  "recovery": {
+    "controller": "DARWIN_COMMAND_LINE_OBSERVED_LINUX_VERIFIED, command_line_observed true, linux_verified true, reset_attempts 1, diagnostics_complete true. Same pattern as attempt-001.",
+    "workers": "Expected exits: the guest worker ends HOST_WORKER_EXITED_WITHOUT_BOOT_VERDICT rc 1 and the bootstrap worker BOOTSTRAP_WORKER_EXITED_NO_RUNTIME_VERDICT rc 1, both identical to attempt-001. capture-core: console_capture_finalized true, console_close_error null. Its diagnostics_complete false is a pre-diagnostics core snapshot (also false in attempt-001). All 14 diagnostic steps have both started and completed markers.",
+    "sequence": "Workers and probes stopped before reset (reset-intent). One native reset at about 207 s, then ssh rc 255 while the machine rebooted, one bounded neighbor refresh (cause_unproven true), and ssh rc 0 at about 246 s.",
+    "linux": "returned-linux: boot id changed from the baseline; kernel, loader sha256 and ADT compatible (apple,j293 / apple,t8103) match the baseline; root btrfs rw; watchdog record present.",
+    "hv": "0 'Data abort on mapped page', 0 PMGR reads, 1 user interrupt (capture pause). The 'panic' grep hits are only EXT_PANICLOG init lines."
+  },
+  "evidence_png": "artifacts/m1-desktop-010/evidence/attempt-002-framebuffer.png is byte-identical to an independent render of framebuffer.bin with tools/render_boot_framebuffer.py (sha256 5c51fbdf16b25cda).",
+  "notes": [
+    {"id": "N1", "kind": "timing estimate, no effect on validity", "text": "127 callbacks at one paint per 500 ms or longer means at least about 63 s of client painting before capture, not about 28 s. The IOFB '00122350' prefix is IOFramebuffer's own debug clock, not time since the desktop command, so it cannot be compared with runtime 150. Either way the frame is live (C6)."},
+    {"id": "N2", "kind": "geometry for the input plan", "text": "This capture measures the geometry that desktop-virtual-input-plan.json assumes: frame at (0,0), 802x513, client origin (1,24), 2560x1600 output."}
+  ],
+  "not_claimed": ["physical panel output (framebuffer memory only)", "input of any kind", "GPU", "console return after compositor exit", "Wi-Fi"],
+  "scope": "Read-only. No hardware, SSH or builds. Scratch renders only, plus this receipt. Device identifiers from the private records are not reproduced."
+}

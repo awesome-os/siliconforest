@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "record": "host-capture-independent-review",
+  "recorded_at": "2026-11-08T01:28:35Z",
+  "reviewer": "Claude (independent, read-only source review; no edits, tests not run by reviewer)",
+  "subject": "integrations/puredarwin/m1-firstboot/host_console.py ParkCapture bounded context capture",
+  "reviewed_source_sha256": {
+    "integrations/puredarwin/m1-firstboot/host_console.py": "a9f68695c6465bc5a3c1a9df04f67da6a72f99265e899cf3b89ba671ab6d4417",
+    "integrations/puredarwin/m1-firstboot/HOST_CONSOLE.md": "b6824f1de005b20905087e03f513cbf8740e01c397924eb7e11c5661e13a8bd5",
+    "integrations/puredarwin/m1-firstboot/test_host_console.py": "6a24c2c9996ee6f5229854f2a3fb529bc35f14b809b16480c18f8c2e0cac259b"
+  },
+  "review_notes_on_hashes": "host_console.py changed during review (1524495c..., 5ab7bee8..., fea62ff7..., final a9f68695...). The ParkCapture guard logic was read in full at 5ab7bee8 and rechecked at the final hash; only stop-message wording changed. Test file was inspected by name only, not line by line. Root reconciles any later change.",
+  "m1n1_pin": "121fcbf35d4501814b58ca5347926a4173b6a512",
+  "verdict": "NO_BLOCKER_FOR_BOUNDED_HOST_CAPTURE_SOURCE",
+  "verdict_scope": "Host-side capture logic against pinned m1n1 proxyclient/target behavior. Not hardware evidence, not boot proof, not a guarantee that the target reaches or remains in any state.",
+  "pinned_behavior_relied_on": [
+    "HV._handle_sigint sets _sigint_pending and calls interrupt(); interrupt() writes one b'!' via iface.dev.write only when not _in_handler (proxyclient/m1n1/hv/__init__.py:1937-1946).",
+    "hv_tick raises HV_USER_INTERRUPT when the proxy iodev has any readable byte and passes the guest tick-time exc_info as .info (src/hv/hv.c:545-556, src/hv/hv_exc.c:63-67); the byte is later discarded by the uartproxy 0xAA55FF sync scanner (src/uartproxy.c:85).",
+    "handle_exception sets _in_handler then calls _load_context before any handler RPC, run_shell, _commit_context or p.exit (hv/__init__.py:941-1016).",
+    "proxyreq = cmd() single frame write then reply(); handle_boot/handle_event dispatch inside reply (proxyclient/m1n1/proxy.py:208-217,265-345,390-400).",
+    "Enums: START.HV=3, HV_EVENT HOOK_VM=1 VTIMER=2 USER_INTERRUPT=3 CPU_SWITCH=5 VIRTIO=6 PANIC=7, EXC_RET.HANDLED=2 (proxy.py:48-68, hv/types.py:34-41)."
+  ],
+  "confirmed_properties": [
+    "Injection boundary is the actual command/reply boundary, not hv.started: phase becomes frame-written only after the exact HV_START frame (opcode, entry, x0, zero args) is fully written with a full-count write; the one-shot ITIMER_REAL alarm is armed only on entry to that isolated outer reply and disarmed on exit.",
+    "safe_boundary requires phase waiting, hv.started, reply_depth==1, cmd_depth==io_depth==dispatch_depth==0, not _in_handler, not injected, not closed. All serial writes, readmem/writemem bulk transfers, commands and callbacks are depth-tracked; an alarm at any unsafe point stops without writing an interrupt byte.",
+    "Single main-thread SIGALRM; no timer thread, self-signal, second reader or retry. A duplicate alarm or pinned deferred _handle_sigint re-entry stops without a second byte.",
+    "Capture happens inside the wrapped _load_context: raw ExcInfo bytes are saved before any pinned handler RPC, context commit or P_EXIT. No p.exit after capture.",
+    "P_EXIT is permitted only as the ordinary pre-alarm HOOK_VM EXC_RET.HANDLED acknowledgement; any other continuation is blocked before the command is written. After stop, closed blocks every further command, write and bulk transfer, and BoundedStop (BaseException) escapes HV's Exception handlers.",
+    "Non-HOOK_VM callbacks, VIRTIO/PANIC (context read explicitly first), shell requests, read/parse/disk failures and HV.start return all end in a recorded non-boot observation; stale contexts are never reused.",
+    "Qualification is strict and recorded, not asserted: expected ELR = guest_base + park_address - vmin, x0 = guest_base + bootargs_off, x19 = 3, SPSR & 0x3df == 0x3c5, cpu_id = running CPU, and event == (HV, USER_INTERRUPT) with a completed interrupt write. The record is BOUNDED_CONTEXT_OBSERVATION_NO_BOOT_VERDICT, boot_proof false, and requires independent console-line review."
+  ],
+  "correction_to_earlier_reviewer_statement": {
+    "superseded": "Earlier review said that after BoundedStop the guest stays held in m1n1's nested proxy and is never resumed.",
+    "corrected": "That holds only while the host stream stays connected and readable. In exception-proxy mode a failed iodev read returns -1 (src/uartproxy.c:285-291) and _hv_exc_proxy's default case calls flush_and_reboot() (src/hv/hv_exc.c:69-88). After capture, worker exit or parent SIGKILL closes the host descriptor, so target state is unknown and an autonomous reboot is possible without any host reset command.",
+    "host_close_specific_trigger": "UNPROVEN: whether a host-side close alone (rather than cable unplug or USB reset) makes the target read fail was not traced below usb_dwc3_read (src/usb_dwc3.c:118-124).",
+    "implementation_status": "host_console.py records target_state_after_disconnect as unknown/possible autonomous reboot; HOST_CONSOLE.md:82-91 documents the disconnect path. Root keeps no p.exit after capture and adds no EXIT_GUEST command."
+  },
+  "non_blocking_recommendations": [
+    "Add a bounded post-injection one-shot: today, if no USER_INTERRUPT callback arrives (e.g. tick FIQ cannot preempt the DAIF-masked park), the worker blocks until the parent SIGKILL and no exception-context.json is written. A second alarm after a completed write could stop with an explicit 'interrupt written; no callback observed' inconclusive record.",
+    "authorize() still accepts --timeout >= 1; in execute mode require a floor above HV setup time plus DELAY (10 s) plus capture margin so the parent cannot kill before the alarm.",
+    "Residual window: an alarm that fires while reply() is parsing an inbound frame before handle_boot dispatch passes safe_boundary; the byte is then discarded by the target's nested scanner and the next callback is captured as non-qualifying (or none). The record's event/injected fields expose this; treat as inconclusive."
+  ],
+  "limits": [
+    "Source-only review; the reviewer did not run tests, the worker, SSH, hardware or a guest.",
+    "Unverified runtime facts: Apple FIQ routing that lets the m1n1 tick preempt the masked park; USB host-close semantics; installed stage2 (f5a82fdb-dirty) is not the pinned m1n1.",
+    "Under m1n1 VUART every UTRSTAT read reports TXBE|TXE, so guest polling/timeout behavior is untested in this route; x19=3 plus park ELR supports only the checkpoint and still requires the captured HVLOG line.",
+    "A capture, a timeout or a reboot is not a boot verdict."
+  ],
+  "hardware_accessed": false,
+  "tests_run_by_reviewer": false,
+  "runtime_proof": false,
+  "boot_proof": false
+}

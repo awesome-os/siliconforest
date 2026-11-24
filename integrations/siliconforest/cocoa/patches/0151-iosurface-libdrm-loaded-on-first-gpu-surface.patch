@@ -1,0 +1,52 @@
+--- a/src/Frameworks/IOSurface/IOSurface.c
++++ b/src/Frameworks/IOSurface/IOSurface.c
+@@ -15,6 +15,7 @@
+ #include <unistd.h>
+ #include "iosurfaced.h"
+ #include <xf86drm.h>
++#include <dlfcn.h>
+ #include <sys/fileport.h>
+ #include <sys/mman.h>
+ #include <fcntl.h>
+@@ -191,9 +192,41 @@
+ #define GPU_MAX_ALLOCATION (UINT64_C(1)<<30)
+ static pthread_mutex_t gpuLock=PTHREAD_MUTEX_INITIALIZER;
+ static int gpuRender=-2;
++/* (TERM9) libdrm is loaded the first time GPU storage is asked for (SFFX_IOSURFACE_GPU=1), so the system IOSurface
++ * every application loads does not depend on it; without it there is no GPU storage and surfaces are CPU ones. */
++static struct {
++    drmVersionPtr (*getVersion)(int);
++    void (*freeVersion)(drmVersionPtr);
++    int (*ioctl)(int, unsigned long, void *);
++    int (*primeHandleToFD)(int, uint32_t, uint32_t, int *);
++    int (*primeFDToHandle)(int, int, uint32_t *);
++} sfDRM;
++static int sfDRMLoadLocked(void) {
++    static int loaded;
++    if (loaded) return loaded > 0;
++    loaded = -1;
++    void *lib = dlopen("/usr/local/lib/mesa-asahi/libdrm.2.dylib", RTLD_NOW | RTLD_GLOBAL);
++    if (!lib) lib = dlopen("/usr/lib/libdrm.2.dylib", RTLD_NOW | RTLD_GLOBAL);
++    if (!lib) return 0;
++    sfDRM.getVersion = dlsym(lib, "drmGetVersion");
++    sfDRM.freeVersion = dlsym(lib, "drmFreeVersion");
++    sfDRM.ioctl = dlsym(lib, "drmIoctl");
++    sfDRM.primeHandleToFD = dlsym(lib, "drmPrimeHandleToFD");
++    sfDRM.primeFDToHandle = dlsym(lib, "drmPrimeFDToHandle");
++    if (!sfDRM.getVersion || !sfDRM.freeVersion || !sfDRM.ioctl || !sfDRM.primeHandleToFD || !sfDRM.primeFDToHandle)
++        return 0;
++    loaded = 1;
++    return 1;
++}
++#define drmGetVersion sfDRM.getVersion
++#define drmFreeVersion sfDRM.freeVersion
++#define drmIoctl sfDRM.ioctl
++#define drmPrimeHandleToFD sfDRM.primeHandleToFD
++#define drmPrimeFDToHandle sfDRM.primeFDToHandle
+ static int gpuRenderLocked(void) {
+     if (gpuRender!=-2) return gpuRender;
+     gpuRender=-1;
++    if (!sfDRMLoadLocked()) return gpuRender;
+     for (int i=128;i<144;i++) {
+         char path[80];snprintf(path,sizeof(path),"/dev/dri/renderD%d",i);
+         int fd=open(path,O_RDWR|O_CLOEXEC);

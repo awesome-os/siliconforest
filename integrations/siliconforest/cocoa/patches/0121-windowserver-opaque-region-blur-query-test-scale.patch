@@ -1,0 +1,148 @@
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -112,6 +112,8 @@
+     struct ext_background_effect_surface_v1 *blurEffect;
+     int blurOn, blurInset, blurRadius, blurDirty;
+     int ignoresMouse, inputDirty;
++    // AppKit's -[NSWindow isOpaque]: the compositor is told that the whole surface is opaque (a toplevel)
++    int opaque, opaqueDirty, opaqueW, opaqueH;
+     struct wsWindow *next;
+ };
+ 
+@@ -248,11 +250,27 @@
+ static void outputDone(void *data, struct wl_output *output) {
+ }
+ 
++/* SF_WS_SCALE=<percent> (a test instrument): the application draws its backing stores at that scale
++ * whatever the compositor prefers (which then scales the buffers to the output), e.g. 100 or 200 on a
++ * panel at 150 %, to see one program's drawing at every scale without changing the desk's. */
++static int wsForcedScale120(void) {
++    static int forced = -1;
++
++    if (forced < 0) {
++        const char *percent = getenv("SF_WS_SCALE");
++
++        forced = percent != NULL ? (atoi(percent) * 120 + 50) / 100 : 0;
++        if (forced < 60 || forced > 120 * 8)
++            forced = 0;
++    }
++    return forced;
++}
++
+ // without wp_fractional_scale the output's whole scale is all a client is told
+ static void outputScale(void *data, struct wl_output *output, int32_t factor) {
+     ws.outputScale = factor > 0 ? factor : 1;
+     if (ws.fractionalManager == NULL || ws.viewporter == NULL) {
+-        ws.scale120 = ws.outputScale * 120;
++        ws.scale120 = wsForcedScale120() ? wsForcedScale120() : ws.outputScale * 120;
+         screenUpdate();
+     }
+ }
+@@ -552,6 +570,8 @@
+ static void fractionalPreferredScale(void *data, struct wp_fractional_scale_v1 *fractional, uint32_t scale) {
+     struct wsWindow *window = data;
+ 
++    if (wsForcedScale120())
++        scale = wsForcedScale120();
+     if (scale < 60 || scale > 120 * 8)
+         return;
+     if (getenv("SF_WS_TRACE") != NULL)
+@@ -585,6 +605,11 @@
+ 
+ static int ensureConnected(void);
+ 
++// whether the compositor blurs what is behind a translucent window (ext-background-effect-v1)
++int _windowServerCanBlurBehind(void) {
++    return ensureConnected() && ws.blurManager != NULL;
++}
++
+ /* Layer-shell surfaces are for upstream's own desktop processes (its menu bar, dock, desktop), which
+  * place them themselves: SF_WS_LAYER_SHELL=1. An application's windows are xdg toplevels and its
+  * menus and tool tips xdg popups of them, placed by the compositor, also where the compositor offers
+@@ -662,7 +687,7 @@
+         wp_fractional_scale_v1_destroy(fractional);
+         wl_surface_destroy(probe);
+     } else {
+-        ws.scale120 = ws.outputScale * 120;
++        ws.scale120 = wsForcedScale120() ? wsForcedScale120() : ws.outputScale * 120;
+     }
+     screenUpdate();
+     if (getenv("SF_WS_TRACE") != NULL)
+@@ -1632,6 +1657,8 @@
+      * click into a point outside the view. */
+     event.x = newX;
+     event.y = window != NULL ? window->h - newY : newY;
++    if (wsTiming())
++        fprintf(stderr, "WSTIME %.1f motion surface=%d x=%.1f y=%.1f\n", wsNowMs(), ws.pointerWindowID, newX, newY);
+     event.dx = newX - lastPointerX;
+     event.dy = lastPointerY - newY;
+     event.mods = currentModifiers;
+@@ -3131,6 +3158,22 @@
+             if (window->blurDirty) {
+                 windowApplyBlur(window);
+             }
++            // an opaque window's surface is opaque everywhere (wl_surface.set_opaque_region), for a
++            // compositor that skips what lies under it; a window that shows what is behind has none
++            if (window->toplevel != NULL && (window->opaqueDirty || (window->opaque &&
++                (window->opaqueW != (int)window->w || window->opaqueH != (int)window->h)))) {
++                struct wl_region *opaque = NULL;
++
++                if (window->opaque) {
++                    opaque = wl_compositor_create_region(ws.compositor);
++                    wl_region_add(opaque, 0, 0, (int)window->w, (int)window->h);
++                }
++                wl_surface_set_opaque_region(window->surface, opaque);
++                if (opaque != NULL)
++                    wl_region_destroy(opaque);
++                window->opaqueW = (int)window->w, window->opaqueH = (int)window->h;
++                window->opaqueDirty = 0;
++            }
+             // an empty input region keeps the compositor from ever giving this surface the pointer
+             if (window->inputDirty) {
+                 struct wl_region *empty = window->ignoresMouse ? wl_compositor_create_region(ws.compositor) : NULL;
+@@ -3223,6 +3266,20 @@
+             }
+             return KERN_SUCCESS;
+         }
++
++        case kWSWindowSetOpaque: {
++            struct wsRPCSimple *msg = (struct wsRPCSimple *)data;
++            struct wsWindow *window = windowForID(msg->val1);
++
++            if (window == NULL) {
++                return KERN_FAILURE;
++            }
++            if (window->opaque != (msg->val2 != 0)) {
++                window->opaque = msg->val2 != 0;
++                window->opaqueDirty = 1;
++            }
++            return KERN_SUCCESS;
++        }
+ 
+         case kWSWindowSetIgnoresMouse: {
+             struct wsRPCSimple *msg = (struct wsRPCSimple *)data;
+--- a/src/Frameworks/WindowServer/rpc.h
++++ b/src/Frameworks/WindowServer/rpc.h
+@@ -38,6 +38,11 @@
+  * SF_WS_CLIENT_FRAME is not set), so AppKit leaves title bar and controls out of them. */
+ int _windowServerServerDecorations(void);
+ 
++/* 1 when the compositor blurs what is behind a translucent window (it offers ext-background-effect-v1).
++ * macOS always does; without it AppKit answers that transparency is reduced (NSWorkspace) unless the
++ * user's universal access preferences say otherwise. */
++int _windowServerCanBlurBehind(void);
++
+ /* 1 when windows at the pop-up menu level (menus, lists, tool tips) are xdg_popups: the compositor
+  * places them against the window they belong to and keeps them on the panel, and tells where it put
+  * them (WS_EVENT_POPUP_PLACED). AppKit then leaves all clamping to the screen to it. 0 on upstream's
+--- a/src/Frameworks/WindowServer/message.h
++++ b/src/Frameworks/WindowServer/message.h
+@@ -44,6 +44,8 @@
+     // wsRPCSimple: window, the window number of its parent (0: none). A sheet or a dialog: the
+     // compositor keeps it over its parent and centres it there (xdg_toplevel.set_parent)
+     kWSWindowSetParent = 15,
++    // wsRPCSimple: window, 1 when AppKit's window is opaque (the compositor gets an opaque region)
++    kWSWindowSetOpaque = 16,
+     kCGGetLastMouseDelta = 100,
+     kCGGetMouseLocation = 101,
+     /* windowID 0 asks for the active application window. */

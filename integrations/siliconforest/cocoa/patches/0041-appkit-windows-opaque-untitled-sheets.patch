@@ -1,0 +1,101 @@
+--- a/src/Frameworks/AppKit/NSWindow.m
++++ b/src/Frameworks/AppKit/NSWindow.m
+@@ -356,6 +356,9 @@
+    [_contentView setAutoresizingMask:NSViewWidthSizable|NSViewHeightSizable];
+ 
+    _backgroundColor=[[NSColor windowBackgroundColor] copy];
++   // as on macOS a window starts opaque (Terminal makes a window with a translucent profile
++   // clear only when -setOpaque:NO changes that)
++   _isOpaque=YES;
+ 
+    _delegate=nil;
+    _firstResponder=self;
+@@ -529,7 +532,11 @@
+          * zeroed isa when it drains. */
+         NSGraphicsContext *gc =
+             [NSGraphicsContext graphicsContextWithGraphicsPort:_context flipped:NO];
+-        [NSGraphicsContext setCurrentContext:gc];
++        /* made current only where nothing is drawing: an image's cache window is created inside
++         * -lockFocus while a view draws (Terminal's profile thumbnails), and taking the current
++         * context there sent the rest of the view's drawing into that window */
++        if([NSGraphicsContext currentContext] == nil)
++            [NSGraphicsContext setCurrentContext:gc];
+         NSValue *key = [NSValue valueWithPointer:[NSThread currentThread]];
+         [_threadToContext setObject:gc forKey:key];
+     }
+@@ -3318,6 +3325,14 @@
+ 
+    [self _setSheetOrigin];
+ 
++   // the compositor keeps the sheet over this window and centres it there (it knows where this
++   // window is; AppKit's frame may not)
++   struct wsRPCSimple parent = {
++       { kWSWindowSetParent, sizeof(struct wsRPCSimple) - sizeof(struct wsRPCBase) },
++       (int)[sheet windowNumber], (int)_number
++   };
++   _windowServerRPC(&parent, sizeof(parent), NULL, NULL);
++
+    // no slide animation, the sheet just appears above its parent
+    [sheet display];
+    [sheet orderWindow:NSWindowAbove relativeTo:[self windowNumber]];
+@@ -3975,6 +3990,11 @@
+         return;
+     }
+ 
++    // only a titled window has a title bar (a sheet or an alert panel has none)
++    if(!(styleMask & NSTitledWindowMask)) {
++        *top=*left=*bottom=*right=0;
++        return;
++    }
+     switch(styleMask & 0x0FFF) {
+         case NSBorderlessWindowMask:
+             *top=0;
+--- a/src/Frameworks/AppKit/NSThemeFrame.m
++++ b/src/Frameworks/AppKit/NSThemeFrame.m
+@@ -251,8 +251,8 @@
+ -(CGFloat)_titleHeight {
+     NSWindow *window = [self window];
+ 
+-    // no title bar of ours inside a frame the compositor draws
+-    if(NSWindowFrameIsDrawnByServer([window styleMask]))
++    // no title bar of ours inside a frame the compositor draws, nor on a window without one (a sheet)
++    if(NSWindowFrameIsDrawnByServer([window styleMask]) || !([window styleMask] & NSTitledWindowMask))
+         return 0;
+ 
+     if(!([window styleMask] & NSFullSizeContentViewWindowMask))
+@@ -389,9 +389,11 @@
+             break;
+ 
+         case NSWindowSheetBorderType:
+-            NSDrawButton(bounds,bounds);
+-            bounds = NSInsetRect(bounds, 2, 2);
+-            cheatSheet = 2;
++            // a hairline round the panel, as a sheet or an alert has on macOS (was a raised bevel)
++            [[NSColor colorWithCalibratedWhite:[[self effectiveAppearance] _isDark] ? 0.38 : 0.7 alpha:1] set];
++            NSFrameRect(bounds);
++            bounds = NSInsetRect(bounds, 1, 1);
++            cheatSheet = 1;
+             break;
+     }
+ 
+@@ -400,10 +402,20 @@
+     [[[self window] backgroundColor] getRed:&r green:&g blue:&b alpha:&a];
+     O2ContextSetRGBStrokeColor(_context, r, g, b, a);
+     O2ContextSetRGBFillColor(_context, r, g, b, a);
++    // copied, as AppKit fills a window's background: a translucent colour (Terminal's windows are
++    // clear) drawn over what the backing store held before would stack up with every redraw
++    O2ContextSaveGState(_context);
++    O2ContextSetBlendMode(_context, kO2BlendModeCopy);
+     O2ContextFillRect(_context, bounds);
++    O2ContextRestoreGState(_context);
+ 
+     if([[self window] styleMask] == NSBorderlessWindowMask || ([[self window] styleMask] & NSFullScreenWindowMask))
+         return;
++    // a sheet (NSDocModalWindowMask alone) has no title bar: its border is drawn above
++    if(!([[self window] styleMask] & NSTitledWindowMask)) {
++        _closeButtonRect = _miniButtonRect = _zoomButtonRect = controls = NSZeroRect;
++        return;
++    }
+     // the compositor draws this window's title bar, controls and edges: ours is the background above
+     if(NSWindowFrameIsDrawnByServer([[self window] styleMask])) {
+         _closeButtonRect = _miniButtonRect = _zoomButtonRect = controls = NSZeroRect;

@@ -1,0 +1,602 @@
+diff -ruN a/crates/wm-darwin/README.md b/crates/wm-darwin/README.md
+--- a/crates/wm-darwin/README.md	2026-11-07 21:51:23.119308981 -0800
++++ b/crates/wm-darwin/README.md	2026-11-08 02:09:06.109426500 -0800
+@@ -81,9 +81,13 @@
+ 
+ Append `--input sfhid` to acquire the fixed `/dev/usb_hid_kbd` and
+ `/dev/usb_hid_mouse` character devices. Both must open successfully before the
+-frontend advertises keyboard/pointer capabilities. Without this option it
+-remains a rendering-only frontend with no wl_seat. There is no alternate
+-input file, pipe or network injection interface in the binary.
++frontend advertises keyboard and pointer capabilities. `--input sfhid-keyboard`
++opens only `/dev/usb_hid_kbd` and advertises a keyboard capability with no
++pointer; a missing mouse node is not an error in that mode, and a missing
++keyboard node is. Without an input option the frontend stays rendering-only
++with no wl_seat. There is no alternate input file, pipe or network injection
++interface in the binary. Opening a queue or advertising a capability is not
++native input.
+ 
+ NeXTSTEP Classic requests DejaVu Sans. Install an appropriately licensed font
+ into the guest's `/Library/Fonts` or another fontdb Darwin search path when
+@@ -96,7 +100,8 @@
+ EAGAIN. These devices do not support kqueue filters; the main loop drains up to
+ 64 records of each kind every 8 ms. File descriptors stay owned for the complete
+ session. Opening the keyboard also grabs its console HID path; closing restores
+-it. This does not claim exclusive access: the kernel currently allows competing
++it. `--input sfhid-keyboard` owns only that keyboard descriptor and does not
++open `/dev/usb_hid_mouse` or construct a pointer seat. This does not claim exclusive access: the kernel currently allows competing
+ readers, so run only one queue consumer. Startup discards the bounded pre-open
+ backlog; the operator must release all keys/buttons before launching.
+ 
+diff -ruN a/crates/wm-darwin/src/hid.rs b/crates/wm-darwin/src/hid.rs
+--- a/crates/wm-darwin/src/hid.rs	2026-11-07 21:40:55.459574911 -0800
++++ b/crates/wm-darwin/src/hid.rs	2026-11-08 02:14:59.472571515 -0800
+@@ -68,36 +68,204 @@
+     }}
+ }
+ 
+-/// Holds both character devices, including the keyboard's console-grab lifetime.
+-/// No custom path or userspace pipe is accepted as a native device.
+-pub struct NativeHid { keyboard:std::fs::File,mouse:std::fs::File,decoder:Decoder }
++const EXPECTED_CLI: &str = "expected --run --socket ABSOLUTE_PATH [--input sfhid|sfhid-keyboard]";
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum InputMode {
++    Off,
++    Both,
++    KeyboardOnly,
++}
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Cli {
++    Help,
++    Run { socket: String, input: InputMode },
++}
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct SeatCaps {
++    pub keyboard: bool,
++    pub pointer: bool,
++}
++
++pub fn usage_text() -> &'static str {
++    "Chonkstep experimental Darwin CPU backend\n\
++Usage: chonkstep-darwin --run --socket /private/runtime/wayland-0 [--input sfhid|sfhid-keyboard]\n\
++Requires a caller-owned mode-0700 runtime directory and native SFGOP. \
++SFHID input is opt-in. sfhid opens both native character devices and advertises keyboard and pointer. \
++sfhid-keyboard opens only /dev/usb_hid_kbd and advertises keyboard with no pointer. \
++Default is input off. No GPU, X11 or privileged IPC is advertised. \
++A seat capability is not native input."
++}
++
++pub fn parse_cli(args: &[String]) -> Result<Cli, String> {
++    if args.is_empty() || args == ["--help"] {
++        return Ok(Cli::Help);
++    }
++    if args.len() < 3 || args[0] != "--run" || args[1] != "--socket" {
++        return Err(EXPECTED_CLI.into());
++    }
++    let input = if args.len() == 3 {
++        InputMode::Off
++    } else if args.len() == 5 && args[3] == "--input" {
++        match args[4].as_str() {
++            "sfhid" => InputMode::Both,
++            "sfhid-keyboard" => InputMode::KeyboardOnly,
++            _ => return Err(EXPECTED_CLI.into()),
++        }
++    } else {
++        return Err(EXPECTED_CLI.into());
++    };
++    Ok(Cli::Run { socket: args[2].clone(), input })
++}
++
++/// Wayland seat bits for a selected mode. Off advertises nothing.
++/// Both advertises keyboard and pointer. Keyboard-only advertises keyboard.
++pub fn advertised_caps(mode: InputMode) -> SeatCaps {
++    match mode {
++        InputMode::Off => SeatCaps { keyboard: false, pointer: false },
++        InputMode::Both => SeatCaps { keyboard: true, pointer: true },
++        InputMode::KeyboardOnly => SeatCaps { keyboard: true, pointer: false },
++    }
++}
++
++/// Reject events the selected seat did not advertise, and malformed decoded events.
++pub fn accept_for_seat(caps: SeatCaps, event: &Event) -> Result<(), String> {
++    match event {
++        Event::Key { evdev, .. } if *evdev == 0 || *evdev > 0x2ff => Err("invalid decoded input event".into()),
++        Event::Key { .. } if !caps.keyboard => Err("keyboard event rejected; seat has no keyboard".into()),
++        Event::Pointer { .. } if !caps.pointer => Err("pointer event rejected; seat has no pointer".into()),
++        Event::Pointer { buttons, .. } if *buttons & !7 != 0 => Err("invalid decoded input event".into()),
++        _ => Ok(()),
++    }
++}
++
++#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
++fn open_read_nofollow(path: &str) -> Result<std::fs::File, String> {
++    use std::os::unix::fs::OpenOptionsExt;
++    std::fs::OpenOptions::new()
++        .read(true)
++        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
++        .open(path)
++        .map_err(|e| format!("{path}: {e}"))
++}
++
++#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
++fn require_character_device(file: std::fs::File, path: &str) -> Result<std::fs::File, String> {
++    use std::os::unix::fs::FileTypeExt;
++    if !file.metadata().map_err(|e| e.to_string())?.file_type().is_char_device() {
++        return Err(format!("{path} is not a character device"));
++    }
++    Ok(file)
++}
++
++#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
++fn open_character_queue(path: &str) -> Result<std::fs::File, String> {
++    require_character_device(open_read_nofollow(path)?, path)
++}
++
++/// Open the keyboard queue first. Mouse is opened only for Both, and only
++/// after the keyboard open succeeds. A failing later open drops the keyboard
++/// file, which releases its console grab.
++#[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
++fn opened_queues(
++    mode: InputMode,
++    open_keyboard: impl FnOnce() -> Result<std::fs::File, String>,
++    open_mouse: impl FnOnce() -> Result<std::fs::File, String>,
++) -> Result<(std::fs::File, Option<std::fs::File>), String> {
++    match mode {
++        InputMode::Off => Err("input off does not open SFHID".into()),
++        InputMode::KeyboardOnly => Ok((open_keyboard()?, None)),
++        InputMode::Both => {
++            let keyboard = open_keyboard()?;
++            // A mouse-open failure returns here and drops `keyboard`, releasing its grab.
++            let mouse = open_mouse()?;
++            Ok((keyboard, Some(mouse)))
++        }
++    }
++}
++
++/// Holds the keyboard character device for its console-grab lifetime, plus the
++/// mouse device only when both queues were requested. No custom path or
++/// userspace pipe is accepted as a native device.
++pub struct NativeHid {
++    keyboard: std::fs::File,
++    mouse: Option<std::fs::File>,
++    decoder: Decoder,
++}
+ impl NativeHid {
+-    #[cfg(all(target_os="macos",target_arch="aarch64"))]
+-    pub fn open()->Result<Self,String>{
+-        use std::os::unix::fs::{OpenOptionsExt,FileTypeExt};
+-        fn open(path:&str)->Result<std::fs::File,String>{
+-            let f=std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK|libc::O_NOFOLLOW|libc::O_CLOEXEC).open(path).map_err(|e|format!("{path}: {e}"))?;
+-            if !f.metadata().map_err(|e|e.to_string())?.file_type().is_char_device(){return Err(format!("{path} is not a character device"));}Ok(f)
+-        }
+-        let mut input=Self{keyboard:open("/dev/usb_hid_kbd")?,mouse:open("/dev/usb_hid_mouse")?,decoder:Decoder::default()};
+-        // The queues retain pre-open events. Discard the bounded backlog before
+-        // clients are connected; the operator must release keys before launch.
++    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
++    fn acquire(mode: InputMode) -> Result<Self, String> {
++        let (keyboard, mouse) = opened_queues(
++            mode,
++            || open_character_queue("/dev/usb_hid_kbd"),
++            || open_character_queue("/dev/usb_hid_mouse"),
++        )?;
++        Self::discard_until_idle(keyboard, mouse)
++    }
++    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
++    pub fn open() -> Result<Self, String> {
++        Self::acquire(InputMode::Both)
++    }
++    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
++    pub fn open_keyboard() -> Result<Self, String> {
++        Self::acquire(InputMode::KeyboardOnly)
++    }
++    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
++    pub fn open() -> Result<Self, String> {
++        Err("native SFHID requires aarch64-apple-darwin".into())
++    }
++    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
++    pub fn open_keyboard() -> Result<Self, String> {
++        Err("native SFHID requires aarch64-apple-darwin".into())
++    }
++    pub fn seat_caps(&self) -> SeatCaps {
++        SeatCaps { keyboard: true, pointer: self.mouse.is_some() }
++    }
++    pub fn qualification_note(&self) -> &'static str {
++        if self.mouse.is_some() {
++            "SFHID queues opened; keyboard and pointer event delivery still requires live qualification"
++        } else {
++            "SFHID keyboard queue opened; pointer is not advertised; keyboard event delivery still requires live qualification"
++        }
++    }
++    // The queues retain pre-open events. Discard the bounded backlog before
++    // clients are connected; the operator must release keys before launch.
++    #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
++    fn discard_until_idle(keyboard: std::fs::File, mouse: Option<std::fs::File>) -> Result<Self, String> {
++        let mut input = Self { keyboard, mouse, decoder: Decoder::default() };
+         for _ in 0..128 {
+-            let k=read_record::<8>(&mut input.keyboard)?;
+-            let m=read_record::<12>(&mut input.mouse)?;
+-            if k.is_none() && m.is_none(){return Ok(input);}
++            let k = read_record::<8>(&mut input.keyboard)?;
++            let m = if let Some(mouse) = input.mouse.as_mut() {
++                read_record::<12>(mouse)?
++            } else {
++                None
++            };
++            if k.is_none() && m.is_none() {
++                return Ok(input);
++            }
+         }
+         Err("SFHID queues did not reach an idle boundary during acquisition".into())
+     }
+-    #[cfg(not(all(target_os="macos",target_arch="aarch64")))]
+-    pub fn open()->Result<Self,String>{Err("native SFHID requires aarch64-apple-darwin".into())}
+-    pub fn drain(&mut self)->Result<Vec<Event>,String>{
+-        let mut events=Vec::new();
++    pub fn drain(&mut self) -> Result<Vec<Event>, String> {
++        let mut events = Vec::new();
+         for _ in 0..64 {
+-            let k=read_record::<8>(&mut self.keyboard)?;let m=read_record::<12>(&mut self.mouse)?;
+-            if k.is_none() && m.is_none(){break;}
+-            if let Some(k)=k {if let Some(event)=self.decoder.keyboard(&k)?{events.push(event);}}
+-            if let Some(m)=m {events.push(self.decoder.mouse(&m)?);}
++            let k = read_record::<8>(&mut self.keyboard)?;
++            let m = if let Some(mouse) = self.mouse.as_mut() {
++                read_record::<12>(mouse)?
++            } else {
++                None
++            };
++            if k.is_none() && m.is_none() {
++                break;
++            }
++            if let Some(k) = k {
++                if let Some(event) = self.decoder.keyboard(&k)? {
++                    events.push(event);
++                }
++            }
++            if let Some(m) = m {
++                events.push(self.decoder.mouse(&m)?);
++            }
+         }
+         Ok(events)
+     }
+@@ -125,4 +293,201 @@
+         assert_eq!(d.mouse(&b).unwrap(),Event::Pointer{motion:Motion::Relative(-1,-128),buttons:3,wheel:-1});
+         b[..4].copy_from_slice(&2u32.to_le_bytes());b[9]=0x80;assert!(d.mouse(&b).is_err());
+     }
++
++    fn args(v: &[&str]) -> Vec<String> {
++        v.iter().map(|s| (*s).to_string()).collect()
++    }
++    #[test]
++    fn cli_modes_and_advertised_caps() {
++        assert_eq!(parse_cli(&[]).unwrap(), Cli::Help);
++        assert_eq!(parse_cli(&args(&["--help"])).unwrap(), Cli::Help);
++        match parse_cli(&args(&["--run", "--socket", "/private/runtime/wayland-0"])).unwrap() {
++            Cli::Run { socket, input } => {
++                assert_eq!(socket, "/private/runtime/wayland-0");
++                assert_eq!(input, InputMode::Off);
++            }
++            Cli::Help => panic!("default run is input off"),
++        }
++        match parse_cli(&args(&["--run", "--socket", "/sock", "--input", "sfhid"])).unwrap() {
++            Cli::Run { input, .. } => assert_eq!(input, InputMode::Both),
++            Cli::Help => panic!("sfhid is both queues"),
++        }
++        match parse_cli(&args(&["--run", "--socket", "/sock", "--input", "sfhid-keyboard"])).unwrap() {
++            Cli::Run { input, .. } => assert_eq!(input, InputMode::KeyboardOnly),
++            Cli::Help => panic!("sfhid-keyboard is keyboard only"),
++        }
++        for bad in [
++            &["--input", "sfhid"][..],
++            &["--run", "--socket", "/sock", "--input"][..],
++            &["--run", "--socket", "/sock", "--input", "sfhid-kbd"][..],
++            &["--run", "--socket", "/sock", "--input", "sfhid", "extra"][..],
++            &["--run", "--socket", "/sock", "sfhid-keyboard"][..],
++        ] {
++            assert!(parse_cli(&args(bad)).is_err(), "{bad:?}");
++        }
++        assert_eq!(advertised_caps(InputMode::Off), SeatCaps { keyboard: false, pointer: false });
++        assert_eq!(advertised_caps(InputMode::Both), SeatCaps { keyboard: true, pointer: true });
++        assert_eq!(advertised_caps(InputMode::KeyboardOnly), SeatCaps { keyboard: true, pointer: false });
++        let usage = usage_text();
++        assert!(usage.contains("sfhid-keyboard") && usage.contains("Default is input off"));
++        assert!(usage.contains("is not native input"));
++        let key = Event::Key { evdev: 30, down: true };
++        let pointer = Event::Pointer { motion: Motion::Relative(1, 0), buttons: 1, wheel: 0 };
++        assert!(accept_for_seat(advertised_caps(InputMode::KeyboardOnly), &key).is_ok());
++        let rejected = accept_for_seat(advertised_caps(InputMode::KeyboardOnly), &pointer).unwrap_err();
++        assert!(rejected.contains("no pointer"));
++        assert!(accept_for_seat(advertised_caps(InputMode::Both), &pointer).is_ok());
++        assert!(accept_for_seat(
++            advertised_caps(InputMode::Both),
++            &Event::Pointer { motion: Motion::Relative(0, 0), buttons: 0x8, wheel: 0 }
++        ).is_err());
++        assert!(accept_for_seat(advertised_caps(InputMode::Both), &Event::Key { evdev: 0, down: true }).is_err());
++        assert!(accept_for_seat(advertised_caps(InputMode::Off), &key).unwrap_err().contains("no keyboard"));
++    }
++
++    fn fd_closed(fd: i32) -> bool {
++        let rc = unsafe { libc::fcntl(fd, libc::F_GETFD) };
++        rc < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
++    }
++    fn nonblock_pipe() -> (std::fs::File, std::fs::File) {
++        use std::os::fd::FromRawFd;
++        let mut fds = [0i32; 2];
++        let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
++        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
++        unsafe { (std::fs::File::from_raw_fd(fds[0]), std::fs::File::from_raw_fd(fds[1])) }
++    }
++    #[test]
++    fn open_flags_character_rejection_and_nofollow_do_not_use_hid_nodes() {
++        use std::os::fd::AsRawFd;
++        let dir = std::env::temp_dir().join(format!("sfhid-keyboard-host-{}", std::process::id()));
++        let _ = std::fs::remove_dir_all(&dir);
++        std::fs::create_dir_all(&dir).unwrap();
++        let file = dir.join("regular");
++        std::fs::write(&file, b"not-a-device").unwrap();
++        let opened = open_read_nofollow(file.to_str().unwrap()).unwrap();
++        let fd = opened.as_raw_fd();
++        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
++        let fdflags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
++        assert_ne!(flags & libc::O_NONBLOCK, 0);
++        assert_ne!(fdflags & libc::FD_CLOEXEC, 0);
++        let rejected = require_character_device(opened, file.to_str().unwrap()).unwrap_err();
++        assert!(rejected.contains("is not a character device"));
++        assert!(fd_closed(fd));
++        let link = dir.join("link");
++        std::os::unix::fs::symlink(&file, &link).unwrap();
++        assert!(open_read_nofollow(link.to_str().unwrap()).is_err());
++        assert!(open_character_queue(file.to_str().unwrap()).unwrap_err().contains("is not a character device"));
++        let _ = std::fs::remove_dir_all(&dir);
++    }
++    #[test]
++    fn acquisition_eagain_failure_and_keyboard_only_decode() {
++        use std::io::Write;
++        use std::os::fd::AsRawFd;
++        let (read, _write) = nonblock_pipe();
++        let idle = NativeHid::discard_until_idle(read, None).unwrap();
++        assert_eq!(idle.seat_caps(), SeatCaps { keyboard: true, pointer: false });
++        assert!(idle.qualification_note().contains("pointer is not advertised"));
++        let fd = idle.keyboard.as_raw_fd();
++        drop(idle);
++        assert!(fd_closed(fd), "keyboard fd stays open only while NativeHid owns the console grab");
++
++        let (read, mut write) = nonblock_pipe();
++        let fd = read.as_raw_fd();
++        write.write_all(&[0u8; 7]).unwrap();
++        match NativeHid::discard_until_idle(read, None) {
++            Err(err) => assert!(err.contains("short record"), "{err}"),
++            Ok(_) => panic!("short record must fail acquisition"),
++        }
++        assert!(fd_closed(fd));
++
++        let (read, mut write) = nonblock_pipe();
++        let fd = read.as_raw_fd();
++        write.write_all(&[0u8; 8 * 128]).unwrap();
++        match NativeHid::discard_until_idle(read, None) {
++            Err(err) => assert!(err.contains("idle boundary"), "{err}"),
++            Ok(_) => panic!("a full backlog without EAGAIN must fail acquisition"),
++        }
++        assert!(fd_closed(fd));
++
++        let (kbd, _kw) = nonblock_pipe();
++        let kfd = kbd.as_raw_fd();
++        let missing = opened_queues(InputMode::Both, || Ok(kbd), || Err("mouse node absent".into()));
++        assert!(missing.unwrap_err().contains("mouse node absent"));
++        assert!(fd_closed(kfd));
++
++        let mut mouse_calls = 0;
++        let (kbd, _kw) = nonblock_pipe();
++        let (keyboard, mouse) = opened_queues(
++            InputMode::KeyboardOnly,
++            || Ok(kbd),
++            || {
++                mouse_calls += 1;
++                Err("mouse must not be opened".into())
++            },
++        )
++        .unwrap();
++        assert_eq!(mouse_calls, 0);
++        assert!(mouse.is_none());
++        let hid = NativeHid::discard_until_idle(keyboard, mouse).unwrap();
++        assert!(!hid.seat_caps().pointer);
++
++        let mut mouse_calls = 0;
++        let mut keyboard_calls = 0;
++        let err = opened_queues(
++            InputMode::Both,
++            || {
++                keyboard_calls += 1;
++                Err("keyboard node absent".into())
++            },
++            || {
++                mouse_calls += 1;
++                Err("mouse".into())
++            },
++        )
++        .unwrap_err();
++        assert_eq!(keyboard_calls, 1);
++        assert_eq!(mouse_calls, 0);
++        assert!(err.contains("keyboard node absent"));
++        let err = opened_queues(InputMode::Off, || Ok(nonblock_pipe().0), || Ok(nonblock_pipe().0)).unwrap_err();
++        assert!(err.contains("input off"));
++
++        let (kbd_r, mut kbd_w) = nonblock_pipe();
++        let (mouse_r, _mouse_w) = nonblock_pipe();
++        let mouse_fd = mouse_r.as_raw_fd();
++        let mut both = NativeHid::discard_until_idle(kbd_r, Some(mouse_r)).unwrap();
++        assert_eq!(both.seat_caps(), advertised_caps(InputMode::Both));
++        assert_eq!(
++            both.qualification_note(),
++            "SFHID queues opened; keyboard and pointer event delivery still requires live qualification"
++        );
++        kbd_w.write_all(&key(7, 0x04, 1)).unwrap();
++        assert_eq!(both.drain().unwrap(), vec![Event::Key { evdev: 30, down: true }]);
++        assert!(both.drain().unwrap().is_empty());
++        drop(both);
++        assert!(fd_closed(mouse_fd));
++
++        let (kbd_r, mut kbd_w) = nonblock_pipe();
++        let mut only = NativeHid::discard_until_idle(kbd_r, None).unwrap();
++        kbd_w.write_all(&key(3, 0x04, 1)).unwrap();
++        assert_eq!(only.drain().unwrap(), vec![Event::Key { evdev: 30, down: true }]);
++        kbd_w.write_all(&key(4, 0x04, 1)).unwrap();
++        assert!(only.drain().unwrap().is_empty(), "duplicate key-down is not a second event");
++        kbd_w.write_all(&key(5, 0x04, 2)).unwrap();
++        assert!(only.drain().unwrap_err().contains("malformed SFHID keyboard record"));
++        let fd = only.keyboard.as_raw_fd();
++        drop(only);
++        assert!(fd_closed(fd));
++
++        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
++        {
++            match NativeHid::open() {
++                Err(err) => assert!(err.contains("aarch64-apple-darwin"), "{err}"),
++                Ok(_) => panic!("host open must not acquire a device"),
++            }
++            match NativeHid::open_keyboard() {
++                Err(err) => assert!(err.contains("aarch64-apple-darwin"), "{err}"),
++                Ok(_) => panic!("host keyboard open must not acquire a device"),
++            }
++        }
++    }
+ }
+diff -ruN a/crates/wm-darwin/src/input.rs b/crates/wm-darwin/src/input.rs
+--- a/crates/wm-darwin/src/input.rs	2026-11-07 21:50:08.780286647 -0800
++++ b/crates/wm-darwin/src/input.rs	2026-11-08 02:09:06.147673637 -0800
+@@ -7,10 +7,10 @@
+     wayland::compositor::{with_states,SurfaceAttributes,BufferAssignment}};
+ use wm_core::{Backend,BackendEvent,SurfaceRef,Point,MouseButton,Modifiers,KeyCombo};
+ use wm_theme_api::DecorationBuffer;
+-use crate::{server::Server,hid::{Event,Motion}};
++use crate::{server::Server,hid::{Event,Motion,SeatCaps,accept_for_seat}};
+ 
+ pub(crate) struct InputState {
+-    pub seat:Seat<Server>,keyboard:KeyboardHandle<Server>,pointer:PointerHandle<Server>,
++    pub seat:Seat<Server>,keyboard:KeyboardHandle<Server>,pointer:Option<PointerHandle<Server>>,
+     position:(f64,f64),buttons:u8,forwarded:u8,modifiers:Modifiers,last_time:u32,
+     suppressed_keys:HashSet<u32>,pub cursor_surface:Option<WlSurface>,
+ }
+@@ -27,11 +27,12 @@
+ impl Server {
+     pub(crate) fn authorize_client_drag(&mut self,surface:&smithay::wayland::shell::xdg::ToplevelSurface,seat:&WlSeat,serial:smithay::utils::Serial)->Option<u64>{
+         let input=self.input.as_ref()?;
+-        if !input.seat.owns(seat) || !input.pointer.has_grab(serial) || input.buttons&1==0{return None;}
+-        let start=input.pointer.grab_start_data()?;
++        let pointer=input.pointer.as_ref()?;
++        if !input.seat.owns(seat) || !pointer.has_grab(serial) || input.buttons&1==0{return None;}
++        let start=pointer.grab_start_data()?;
+         if start.button!=0x110 || start.focus?.0!=*surface.wl_surface(){return None;}
+         let id=self.wm.backend().window_for_surface(surface.wl_surface())?;
+-        let pointer=input.pointer.clone();let position=input.position;let time=input.last_time;
++        let pointer=pointer.clone();let position=input.position;let time=input.last_time;
+         // Transfer the authenticated client implicit grab to wm-core. Leaving
+         // the client resets its pointer interaction; no synthetic key/button is sent.
+         pointer.unset_grab(self,serial,time);
+@@ -42,14 +43,22 @@
+     /// The production caller invokes this only after NativeHid::open succeeds.
+     /// Tests exercise the protocol independently; this method makes no device claim.
+     pub fn enable_sfhid_seat(&mut self,dh:&DisplayHandle)->Result<(),String>{
++        self.enable_sfhid_seat_caps(dh,SeatCaps{keyboard:true,pointer:true})
++    }
++    /// `caps.pointer` is false for `--input sfhid-keyboard`: no pointer handle,
++    /// so the seat does not advertise a pointer. This is not native input.
++    pub fn enable_sfhid_seat_caps(&mut self,dh:&DisplayHandle,caps:SeatCaps)->Result<(),String>{
+         if self.input.is_some(){return Err("SFHID seat already enabled".into());}
++        if !caps.keyboard{return Err("SFHID seat requires keyboard capability".into());}
+         let mut seat=self.seats.new_wl_seat(dh,"siliconforest-hid");
+         let keyboard=seat.add_keyboard(XkbConfig{rules:"evdev",model:"pc105",layout:"us",variant:"",options:None},500,25)
+             .map_err(|e|format!("XKB keymap initialization failed: {e:?}"))?;
+-        let pointer=seat.add_pointer();
++        let pointer=if caps.pointer{Some(seat.add_pointer())}else{None};
+         self.input=Some(InputState{seat,keyboard,pointer,position:(0.,0.),buttons:0,forwarded:0,
+             modifiers:Modifiers::empty(),last_time:0,suppressed_keys:HashSet::new(),cursor_surface:None});
+-        let b=self.wm.backend_mut();b.input_enabled=true;b.cursor=Some((Point::new(0,0),arrow()));b.dirty=true;
++        let b=self.wm.backend_mut();b.input_enabled=true;
++        if caps.pointer{b.cursor=Some((Point::new(0,0),arrow()));}
++        b.dirty=true;
+         self.sync_input_focus();Ok(())
+     }
+     pub(crate) fn sync_input_focus(&mut self){
+@@ -60,7 +69,8 @@
+     }
+     pub fn deliver_hid(&mut self,event:Event,time:u32)->Result<(),String>{
+         if self.input.is_none(){return Err("no SFHID seat; event not delivered".into());}
+-        if matches!(event,Event::Key{evdev,..} if evdev==0 || evdev>0x2ff) || matches!(event,Event::Pointer{buttons,..} if buttons&!7!=0){return Err("invalid decoded input event".into());}
++        let caps=SeatCaps{keyboard:true,pointer:self.input.as_ref().unwrap().pointer.is_some()};
++        accept_for_seat(caps,&event)?;
+         self.input.as_mut().unwrap().last_time=time;
+         self.sync_input_focus();
+         match event {
+@@ -79,13 +89,14 @@
+                     });
+             }
+             Event::Pointer{motion,buttons,wheel}=>{
++                let pointer=self.input.as_ref().unwrap().pointer.clone().ok_or("pointer event rejected; seat has no pointer")?;
+                 let size=self.wm.backend().screen_size();
+                 let input=self.input.as_mut().unwrap();
+                 let (x,y)=match motion {Motion::Absolute(x,y)=>(f64::from(x)*f64::from(size.w-1)/65535.,f64::from(y)*f64::from(size.h-1)/65535.),
+                     Motion::Relative(x,y)=>(input.position.0+f64::from(x),input.position.1+f64::from(y))};
+                 input.position=(x.clamp(0.,f64::from(size.w-1)),y.clamp(0.,f64::from(size.h-1)));
+                 let root=Point::new(input.position.0.floor() as i32,input.position.1.floor() as i32);
+-                let pointer=input.pointer.clone();let previous=input.buttons;let mods=input.modifiers;
++                let previous=input.buttons;let mods=input.modifiers;
+                 let b=self.wm.backend_mut();b.pointer=root;b.dirty=true;
+                 let hit=self.wm.backend().hit_at(root);
+                 self.wm.dispatch(BackendEvent::PointerMotion{root,surface_local:hit});
+diff -ruN a/crates/wm-darwin/src/main.rs b/crates/wm-darwin/src/main.rs
+--- a/crates/wm-darwin/src/main.rs	2026-11-07 21:47:33.011336104 -0800
++++ b/crates/wm-darwin/src/main.rs	2026-11-08 02:09:06.143426026 -0800
+@@ -6,7 +6,7 @@
+ };
+ use wm_darwin::smithay::reexports::wayland_server::{Display, ListeningSocket};
+ use wm_darwin::{presenter::Pdgop, server::Server};
+-use wm_darwin::hid::NativeHid;
++use wm_darwin::hid::{self, NativeHid};
+ static STOP: AtomicBool = AtomicBool::new(false);
+ extern "C" fn stop(_: libc::c_int) {
+     STOP.store(true, Ordering::Relaxed);
+@@ -14,15 +14,13 @@
+ 
+ fn run() -> Result<(), String> {
+     let args: Vec<String> = std::env::args().skip(1).collect();
+-    if args == ["--help"] || args.is_empty() {
+-        println!("Chonkstep experimental Darwin CPU backend\nUsage: chonkstep-darwin --run --socket /private/runtime/wayland-0 [--input sfhid]\nRequires a caller-owned mode-0700 runtime directory and native SFGOP. SFHID input is opt-in and requires both native character devices. No GPU, X11 or privileged IPC is advertised.");
+-        return Ok(());
+-    }
+-    let input_requested=args.len()==5 && args[3]=="--input" && args[4]=="sfhid";
+-    if (args.len() != 3 && !input_requested) || args[0] != "--run" || args[1] != "--socket" {
+-        return Err("expected --run --socket ABSOLUTE_PATH [--input sfhid]".into());
+-    }
+-    let path = PathBuf::from(&args[2]);
++    let (path, input_mode) = match hid::parse_cli(&args)? {
++        hid::Cli::Help => {
++            println!("{}", hid::usage_text());
++            return Ok(());
++        }
++        hid::Cli::Run { socket, input } => (PathBuf::from(socket), input),
++    };
+     if !path.is_absolute() {
+         return Err("socket must be an absolute path".into());
+     }
+@@ -35,10 +33,17 @@
+     }
+     let listener = ListeningSocket::bind_absolute(path).map_err(|e| e.to_string())?;
+     let mut display = Display::<Server>::new().map_err(|e| e.to_string())?;
+-    let mut input=if input_requested{Some(NativeHid::open()?)}else{None};
++    let mut input = match input_mode {
++        hid::InputMode::Off => None,
++        hid::InputMode::Both => Some(NativeHid::open()?),
++        hid::InputMode::KeyboardOnly => Some(NativeHid::open_keyboard()?),
++    };
+     let mut presenter = Pdgop::open()?;
+     let mut server = Server::new(&display.handle(), presenter.size())?;
+-    if input.is_some(){server.enable_sfhid_seat(&display.handle())?;eprintln!("SFHID queues opened; keyboard and pointer event delivery still requires live qualification");}
++    if let Some(queues) = &input {
++        server.enable_sfhid_seat_caps(&display.handle(), queues.seat_caps())?;
++        eprintln!("{}", queues.qualification_note());
++    }
+     // Signals only stop the main loop. Drawing stops before SFGOP is unmapped;
+     // no drawing thread, kernel reboot, or storage action exists here.
+     unsafe {

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_REVIEW_NO_HARDWARE_NO_EDITS",
+  "trigger": "runs/m1-keyboard-010/attempt-001: the bootstrap worker stopped in frozen host_console.validate_bootargs with 'Original ADT is not a u64' before any guest load. One recovery reset, new Linux boot verified, latch clear. No Darwin, kernel or keyboard execution.",
+  "root_cause": {
+    "observed": "iBoot boot_args virt_base 0xfffffffffe078000, phys_base 0x802078000, devtree 0x70c000, devtree_size 0x60000, top_of_kdata 0x805764000.",
+    "explanation": "The frozen validator computes devtree - virt_base + phys_base with Python integers, which goes negative here. The u64 result is 0x80470c000, which m1n1 itself used: startup.c:197 (u64 C arithmetic) and pinned proxyutils.py:269/277 (& 0xffffffffffffffff). The worker log shows m1n1 then parsed that ADT (model, target, 'pmgr: initialized, 268 devices').",
+    "recurrence": "The raw boot_args from the four earlier successful runs had virt_base 0xa078000 / 0xc078000 / 0x10078000 (varying in 32 MiB steps) with the same phys_base, so none wrapped. A wrapping virt_base can occur on any boot; the fix is required, not a one-off."
+  },
+  "reviewed_files": {
+    "integrations/puredarwin/m1-bringup/bootargs_progress.py": "8b131bd35dcfcd40",
+    "integrations/puredarwin/m1-bringup/bootstrap_progress.py": "52fdd9045d0f2d14",
+    "integrations/puredarwin/m1-bringup/host_progress.py": "d23923163b75360c",
+    "tools/m1_bringup_cycle.py": "7001158c32760a9da05c3700990ee6b6c9cf1446e21c8ac988c3415e8214aec9",
+    "hash_correction": "Revision 2: the first receipt listed f3707c33, a hash taken before root's final 22:53:31 edit. The reviewed diff and the 16 controller tests used the current bytes (mtime 22:53:31.85, sha 7001158c...). Re-verified: CONTINUING_SOURCES pins 52fdd904.../8b131bd3..., verify() calls continuing.verify, and bootstrap_child is present; 16/16 pass again on 7001158c.",
+    "frozen_unchanged": {"integrations/m1-boot-window/bootstrap.py": "350cd127fe7b4158", "bootstrap-trampoline.bin": "6cf0c6c7c88698af"}
+  },
+  "verdict": "APPROVE the continuing wrap fix. No hidden wrap, missing hash or missing check found.",
+  "verified": [
+    "Semantics: offset = (devtree - virt_base) mod 2^64 must satisfy offset + size <= mem_size; dt = phys_base + offset; then the physical span is checked without wrapping inside [dram, phys_base+mem_size). This accepts exactly the VAs inside the (possibly wrapping) mem_size window starting at virt_base. physical_to_virtual validates the whole physical span at or above phys_base before its single wrapping addition.",
+    "Adversarial cases (scratch, run against the helper): attempt-001 values give 0x80470c000; the earlier display-010 and bringup-009 values translate unchanged. Offset 0 and the exact last fit are accepted. One page below virt_base, one byte past mem_size, a physical address passed as devtree, misaligned virt_base, size 0, size 17 MiB, devtree >= 2^64 and negative devtree are refused. physical_to_virtual followed by validate_bootargs round-trips exactly, including the wrap (VA 0x70c000) and phys_base itself (VA 0xfffffffffe078000).",
+    "Translation sites: bootstrap_progress fixes BOTH frozen sites, the collect() incoming ADT and the outgoing stage-2 devtree (frozen bootstrap.py:314 would also have failed integer() whenever the relocated ADT lies more than 0x1f88000 above phys_base). The guest stage uses ContinuingBackend.collect, whose AST is identical to frozen PinnedBackend.collect once 'old.'/'f.' qualification is removed; its bare validate_bootargs resolves to bootargs_progress. The XNU guest devtree (host_progress:655) uses the virt_base that m1n1 load_raw sets (0xfffffe0010000000 + ...) before load_payloads, so it cannot wrap. No other virt_base arithmetic exists in host_console, host_progress, normal_image or the cycle tools.",
+    "bootstrap_progress vs frozen: exactly 4 declared changes (LAB depth, helper import, collect validator, physical_to_virtual), plus the LAB-absolute trampoline path. The trampoline bytes are still pinned by STUB_SHA in trampoline().",
+    "Controller: CONTINUING_SOURCES binds both new files at their current hashes, and the set must equal {bootstrap_progress, bootargs_progress}. verify() runs base.verify_local and then bootstrap_progress.verify before the reboot or any serial device is opened. bootstrap_child matches the frozen RealOps.child apart from the source path, the stronger verify() and namespace qualification. Both new sources are snapshotted per attempt, and their hashes are recorded in verified-inputs.",
+    "Tests here: bootargs_progress 14/14, bootstrap_progress 28/28 (old policy suite on the new module), source fidelity 2/2, host_progress 23/23, controller 16/16."
+  ],
+  "notes": [
+    {"id": "N1", "kind": "intended strictness", "text": "An ADT below phys_base (inside [dram, phys_base)) is now refused, where the frozen validator accepted it. All 5 observed boots place it above phys_base."},
+    {"id": "N2", "kind": "optional hardening", "text": "Also require dt + size <= top_of_kernel_data. This holds in all 5 observed boots, including the wrapped one (0x80476c000 <= 0x805764000)."},
+    {"id": "N3", "kind": "low", "text": "The controller's exec_module of bootstrap_progress runs its module-level sys.path.insert(m1-bringup) inside the controller process. Current imports go by explicit spec path, so this is harmless, but bare-name imports added later would resolve there."},
+    {"id": "N4", "kind": "low", "text": "m1n1 hv:612/628 debug translation helpers see the wrapped stage-2 virt_base between xnu_mode=True and load_raw. They are not on the boot path."}
+  ]
+}

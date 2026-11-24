@@ -1,0 +1,182 @@
+--- a/src/Kernel/xnu/bsd/miscfs/devfs/devfs_tree.c
++++ b/src/Kernel/xnu/bsd/miscfs/devfs/devfs_tree.c
+@@ -142,7 +142,7 @@
+ static void     devfs_release_event_log(devfs_event_log_t, int);
+ static void     devfs_bulk_notify(devfs_event_log_t);
+ static devdirent_t *devfs_make_node_internal(dev_t, devfstype_t type, uid_t, gid_t, int,
+-    int (*clone)(dev_t dev, int action), const char *fmt, va_list ap);
++    int (*clone)(dev_t dev, int action), unsigned int clone_flags, const char *fmt, va_list ap);
+ 
+ 
+ static LCK_GRP_DECLARE(devfs_lck_grp, "devfs_lock");
+@@ -1235,7 +1235,10 @@
+ 
+ 	if (dnp->dn_lflags & DN_CREATE) {
+ 		dnp->dn_lflags |= DN_CREATEWAIT;
+-		msleep(&dnp->dn_lflags, &devfs_mutex, PRIBIO, 0, 0);
++        /* A killed lookup must not strand its process/IPC endpoints while
++         * another thread owns creation. Never clear that thread's flag. */
++        error = msleep(&dnp->dn_lflags, &devfs_mutex, PRIBIO | PCATCH, 0, 0);
++        if (error) goto out;
+ 		goto retry;
+ 	}
+ 
+@@ -1281,7 +1284,7 @@
+ 			n_minor = (*dnp->dn_clone)(dnp->dn_typeinfo.dev, DEVFS_CLONE_ALLOC);
+ 			if (n_minor == -1) {
+ 				error = ENOMEM;
+-				goto out;
++				goto finish_create;
+ 			}
+ 
+ 			vfsp.vnfs_rdev = makedev(n_major, n_minor);
+@@ -1333,7 +1336,7 @@
+ 		if (dnp->dn_clone == NULL) {
+ 			dnp->dn_vn = vn_p;
+ 		}
+-	} else if (n_minor != DEVFS_CLONE_ALLOC) {
++	} else if (dnp->dn_clone != NULL) {
+ 		/*
+ 		 * If we failed the create, we need to release the cloned minor
+ 		 * back to the free list.  In general, this is only useful if
+@@ -1343,9 +1346,10 @@
+ 		 * assumed that any state to be released will be released when
+ 		 * the vnode is dropped, instead.
+ 		 */
+-		(void)(*dnp->dn_clone)(dnp->dn_typeinfo.dev, DEVFS_CLONE_FREE);
+-	}
+-
++		(void)(*dnp->dn_clone)(vfsp.vnfs_rdev, DEVFS_CLONE_FREE);
++	}
++
++finish_create:
+ 	dnp->dn_lflags &= ~DN_CREATE;
+ 	if (dnp->dn_lflags & DN_CREATEWAIT) {
+ 		dnp->dn_lflags &= ~DN_CREATEWAIT;
+@@ -1522,7 +1526,7 @@
+ 	}
+ 
+ 	va_start(ap, fmt);
+-	new_dev = devfs_make_node_internal(dev, type, uid, gid, perms, clone, fmt, ap);
++	new_dev = devfs_make_node_internal(dev, type, uid, gid, perms, clone, 0, fmt, ap);
+ 	va_end(ap);
+ out:
+ 	return new_dev;
+@@ -1544,6 +1548,28 @@
+  * Returns:
+  *   A handle to a device node if successful, NULL otherwise.
+  */
++
++/* Opt-in vnode-owned clone reservations. Legacy clone drivers retain their
++ * existing close semantics; only callers of this new API request reclaim. */
++void *
++devfs_make_node_clone_with_flags(dev_t dev, int chrblk, uid_t uid,
++    gid_t gid, int perms, int (*clone)(dev_t, int), unsigned int clone_flags,
++    const char *fmt, ...)
++{
++    devfstype_t type;
++    devdirent_t *node;
++    va_list ap;
++    if (!clone || (clone_flags & ~DEVFS_CLONE_FREE_ON_RECLAIM)) return NULL;
++    if (chrblk == DEVFS_CHAR) type = DEV_CDEV;
++    else if (chrblk == DEVFS_BLOCK) type = DEV_BDEV;
++    else return NULL;
++    va_start(ap, fmt);
++    node = devfs_make_node_internal(dev, type, uid, gid, perms, clone,
++        clone_flags, fmt, ap);
++    va_end(ap);
++    return node;
++}
++
+ void *
+ devfs_make_node(dev_t dev, int chrblk, uid_t uid,
+     gid_t gid, int perms, const char *fmt, ...)
+@@ -1559,17 +1585,18 @@
+ 	type = (chrblk == DEVFS_BLOCK ? DEV_BDEV : DEV_CDEV);
+ 
+ 	va_start(ap, fmt);
+-	new_dev = devfs_make_node_internal(dev, type, uid, gid, perms, NULL, fmt, ap);
++	new_dev = devfs_make_node_internal(dev, type, uid, gid, perms, NULL, 0, fmt, ap);
+ 	va_end(ap);
+ 
+ out:
+ 	return new_dev;
+ }
+ 
+-__printflike(7, 0)
++__printflike(8, 0)
+ static devdirent_t *
+ devfs_make_node_internal(dev_t dev, devfstype_t type, uid_t uid,
+-    gid_t gid, int perms, int (*clone)(dev_t dev, int action), const char *fmt, va_list ap)
++    gid_t gid, int perms, int (*clone)(dev_t dev, int action), unsigned int clone_flags,
++    const char *fmt, va_list ap)
+ {
+ 	devdirent_t *   new_dev = NULL;
+ 	devnode_t * dnp;
+@@ -1646,6 +1673,8 @@
+ 			new_dev->de_dnp->dn_uid = uid;
+ 			new_dev->de_dnp->dn_mode |= perms;
+ 			new_dev->de_dnp->dn_clone = clone;
++            if (clone_flags & DEVFS_CLONE_FREE_ON_RECLAIM)
++                new_dev->de_dnp->dn_lflags |= DN_CLONE_FREE_ON_RECLAIM;
+ #if CONFIG_MACF
+ 			mac_devfs_label_associate_device(dev, new_dev->de_dnp, buff);
+ #endif
+--- a/src/Kernel/xnu/bsd/miscfs/devfs/devfs_vnops.c
++++ b/src/Kernel/xnu/bsd/miscfs/devfs/devfs_vnops.c
+@@ -1578,6 +1578,12 @@
+ 	dnp = VTODN(vp);
+ 
+ 	if (dnp) {
++        if (dnp->dn_clone != NULL &&
++            (dnp->dn_lflags & DN_CLONE_FREE_ON_RECLAIM)) {
++            /* No live vnode operations remain. A stat-only clone never had
++             * d_open/d_close, so reclamation owns its minor reservation. */
++            (void)(*dnp->dn_clone)(vnode_specrdev(vp), DEVFS_CLONE_FREE);
++        }
+ 		/* If this is a cloning device, it didn't have a dn_vn anyway */
+ 		dnp->dn_vn = NULL;
+ 		vnode_clearfsnode(vp);
+--- a/src/Kernel/xnu/bsd/miscfs/devfs/devfsdefs.h
++++ b/src/Kernel/xnu/bsd/miscfs/devfs/devfsdefs.h
+@@ -160,6 +160,7 @@
+ #define DN_DELETE               0x02
+ #define DN_CREATE               0x04
+ #define DN_CREATEWAIT           0x08
++#define DN_CLONE_FREE_ON_RECLAIM 0x10 /* opt-in clone slot belongs to vnode */
+ 
+ 
+ struct devdirent {
+--- a/src/Kernel/xnu/bsd/miscfs/devfs/devfs.h
++++ b/src/Kernel/xnu/bsd/miscfs/devfs/devfs.h
+@@ -67,6 +67,9 @@
+  */
+ #define DEVFS_CLONE_ALLOC       1       /* Allocate minor number slot */
+ #define DEVFS_CLONE_FREE        0       /* Free minor number slot */
++/* Optional: FREE is called with the actual cloned dev_t on vnode reclaim,
++ * including stat-only lookups and failed opens. Do not also free on close. */
++#define DEVFS_CLONE_FREE_ON_RECLAIM 0x01
+ 
+ __BEGIN_DECLS
+ 
+@@ -92,6 +95,10 @@
+ void *  devfs_make_node_clone(dev_t dev, int chrblk, uid_t uid, gid_t gid,
+     int perms, int (*clone)(dev_t dev, int action),
+     const char *fmt, ...) __printflike(7, 8);
++
++void *devfs_make_node_clone_with_flags(dev_t dev, int chrblk, uid_t uid,
++    gid_t gid, int perms, int (*clone)(dev_t dev, int action),
++    unsigned int clone_flags, const char *fmt, ...) __printflike(8, 9);
+ 
+ /*
+  * Function: devfs_make_node
+--- a/src/Kernel/xnu/config/BSDKernel.exports
++++ b/src/Kernel/xnu/config/BSDKernel.exports
+@@ -139,6 +139,7 @@
+ _devfs_is_ready
+ _devfs_make_node
+ _devfs_make_node_clone
++_devfs_make_node_clone_with_flags
+ _devfs_remove
+ _enodev
+ _enodev_strat

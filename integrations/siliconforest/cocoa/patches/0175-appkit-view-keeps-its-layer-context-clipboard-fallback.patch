@@ -1,0 +1,41 @@
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -1960,6 +1960,14 @@
+ -(void)_createLayerContextIfNeeded {
+    if(!sfLayerRenderingAvailable())
+     return;
++   /* (TERM11) a view that has its context keeps it: a second one replaced it without invalidating it, and a render
++    * the first had queued messaged the view after it was freed (Firefox, a closing panel: SIGSEGV in
++    * -[CALayerContext _scheduleRender]'s block) */
++   if(_layerContext!=nil){
++    if([_superview layer]==nil)
++     [_layerContext setLayer:_layer];
++    return;
++   }
+    if([_superview layer]==nil){
+     _layerContext=[[CALayerContext alloc] initWithFrame:[self frame]];
+     [_layerContext setDelegate:self];
+--- a/src/Frameworks/AppKit/NSPasteboard.m
++++ b/src/Frameworks/AppKit/NSPasteboard.m
+@@ -162,6 +162,8 @@
+    close(fd);
+ }
+ 
++static BOOL sfPbTrace(void);
++
+ @interface NSPasteboard (SFOffered)
+ -(NSData *)_sfOfferedDataForType:(NSString *)type;
+ @end
+@@ -521,6 +523,12 @@
+     data=[[[publishedItems objectForKey:type] retain] autorelease];
+     pthread_mutex_unlock(&publishedLock);
+    }
++   // a request that came between the offer and the data written for it (the types are offered as they are declared)
++   if(data==nil && !_systemBacked)
++    data=[_items objectForKey:type];
++   if(sfPbTrace())
++    NSLog(@"pasteboard offered data for %@: %lu bytes (system-backed %d, change %d, offered %d, offered types %@)",type,
++          (unsigned long)[data length],(int)_systemBacked,_changeCount,publishedChangeCount,[publishedItems allKeys]);
+    return data;
+ }
+ 

@@ -1,0 +1,60 @@
+xnu: the T8103 machine configuration may be built as DEVELOPMENT
+
+The bring-up tree refused every kernel configuration but DEBUG for T8103 ("deliberately
+DEBUG-only"). DEBUG is XNU compiled without optimisation and with every debug check; the
+desktop now runs on it daily. config/MASTER.arm64.t8103 already defines DEVELOPMENT, and
+nothing about the non-PPL, CTRR-not-engaged setup depends on DEBUG: -unsafe_kernel_text and
+the serial console exist in DEVELOPMENT as well. RELEASE is still refused.
+
+The same guard is in two assembly includes (osfmk/arm64/m1_cache_helpers.inc and
+m1_progress_entry.inc: "#error ... require the explicit native DEBUG bringup configuration");
+they accept DEVELOPMENT too.
+
+Applied only for `--argstr kernelConfig development` (../kernel.nix); the DEBUG kernel's
+derivation is unchanged.
+UPSTREAM: for the bring-up tree's owner to decide.
+
+--- a/src/Kernel/xnu/CMakeLists.txt
++++ b/src/Kernel/xnu/CMakeLists.txt
+@@ -147,10 +147,12 @@
+         "Unsupported SILICONFOREST_XNU_KERNEL_CONFIG='${SILICONFOREST_XNU_KERNEL_CONFIG}'")
+ endif()
+ 
+-# The public non-PPL M1 development configuration is deliberately DEBUG-only.
++# The public non-PPL M1 configuration is for development kernels only: DEBUG, or DEVELOPMENT
++# (the same options with the DEBUG-only checks and -O0 gone; MASTER.arm64.t8103 defines
++# both). RELEASE stays refused: it has no serial console and no -unsafe_kernel_text.
+ if(SILICONFOREST_ARM64_MACHINE_CONFIG STREQUAL "T8103" AND
+-   NOT SILICONFOREST_XNU_KERNEL_CONFIG STREQUAL "DEBUG")
+-    message(FATAL_ERROR "T8103 bringup requires DEBUG")
++   NOT SILICONFOREST_XNU_KERNEL_CONFIG MATCHES "^(DEBUG|DEVELOPMENT)$")
++    message(FATAL_ERROR "T8103 bringup requires DEBUG or DEVELOPMENT")
+ endif()
+ 
+ file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/xnu_header_install)
+--- a/src/Kernel/xnu/osfmk/arm64/m1_cache_helpers.inc
++++ b/src/Kernel/xnu/osfmk/arm64/m1_cache_helpers.inc
+@@ -7,8 +7,8 @@
+  * No allocation, call, stack use, callee-saved GPR clobber or success stub.
+  * Ranges must be valid kernel VAs with non-wrapping end addresses.
+  */
+-#if !defined(ARM64_BOARD_CONFIG_T8103) || !DARWIN_LAB_M1_BRINGUP || !DEBUG
+-#error "M1 cache wrappers require the explicit native DEBUG bringup configuration"
++#if !defined(ARM64_BOARD_CONFIG_T8103) || !DARWIN_LAB_M1_BRINGUP || !(DEBUG || DEVELOPMENT)
++#error "M1 cache wrappers require the explicit native DEBUG or DEVELOPMENT bringup configuration"
+ #endif
+ 
+ 	.text
+--- a/src/Kernel/xnu/osfmk/arm64/m1_progress_entry.inc
++++ b/src/Kernel/xnu/osfmk/arm64/m1_progress_entry.inc
+@@ -5,8 +5,8 @@
+  * still continues through the original page-table/MMU/arm_init path.
+  * The physical UART is valid only here, before the stage-1 MMU is enabled.
+  */
+-#if !defined(ARM64_BOARD_CONFIG_T8103) || !DARWIN_LAB_M1_BRINGUP || !DEBUG
+-#error "M1 progress requires the explicit native DEBUG bringup configuration"
++#if !defined(ARM64_BOARD_CONFIG_T8103) || !DARWIN_LAB_M1_BRINGUP || !(DEBUG || DEVELOPMENT)
++#error "M1 progress requires the explicit native DEBUG or DEVELOPMENT bringup configuration"
+ #endif
+ 
+ 	movz x1, #0x3520, lsl #16

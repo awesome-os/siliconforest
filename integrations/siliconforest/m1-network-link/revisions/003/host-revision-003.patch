@@ -1,0 +1,55 @@
+--- a/integrations/puredarwin/m1-bringup/host_progress.py
++++ b/integrations/puredarwin/m1-bringup/host_progress.py
+@@ -41,7 +41,7 @@
+ from terminal_input_progress import TerminalInput
+ 
+ LINK_HELPER = 'integrations/puredarwin/m1-network-link/host/line_bridge.py'
+-LINK_HELPER_SHA = '3a1c5b51314eb1d433ec2dd11ef818905a761476f2c85987cd9100def1b82d42'
++LINK_HELPER_SHA = 'a65e3c1cc085336696d6e4bb134df2794417ed8cd528280849ceaf40afc3a23a'
+ image.require(image.sha(image.bounded_file(LAB/LINK_HELPER)) == LINK_HELPER_SHA,
+               'Network-link helper source changed')
+ link_spec = importlib.util.spec_from_file_location('darwin_link_bridge', LAB/LINK_HELPER)
+--- a/tools/m1_bringup_cycle.py
++++ b/tools/m1_bringup_cycle.py
+@@ -30,7 +30,7 @@
+ TERMINAL_HELPER_SHA = '2b8901e7c29357a3440c40e1db14f5e2416f38beb71af0fee7674cb05233568c'
+ CONTINUING_SOURCES = {'integrations/puredarwin/m1-bringup/bootstrap_progress.py': '52fdd9045d0f2d14d08b38577cd3bfca512b9eb6e083afc82fa7c081350c56d8', 'integrations/puredarwin/m1-bringup/bootargs_progress.py': '8b131bd35dcfcd4097676c4d61f05c69b7115e609cdf07f49774a2f7846bb489'}
+ LINK_HELPER = 'integrations/puredarwin/m1-network-link/host/line_bridge.py'
+-LINK_HELPER_SHA = '3a1c5b51314eb1d433ec2dd11ef818905a761476f2c85987cd9100def1b82d42'
++LINK_HELPER_SHA = 'a65e3c1cc085336696d6e4bb134df2794417ed8cd528280849ceaf40afc3a23a'
+ BASE_SHA = '3d274d1b699c0adfa1e38361d8348c3ee7567b854c5361ea80cbe23a18b7e3e6'
+ 
+ 
+--- a/integrations/puredarwin/m1-network-link/host/line_bridge.py
++++ b/integrations/puredarwin/m1-network-link/host/line_bridge.py
+@@ -128,6 +128,7 @@
+         self.guest_frames = []
+         self.guest_result = None
+         self.data_bytes = 0
++        self.trailing_cr_lines = self.trailing_cr_max = 0
+ 
+     def _close_socket(self):
+         sock, self.socket = self.socket, None
+@@ -160,7 +161,13 @@
+ 
+     def _line(self, line):
+         if line.endswith(b'\r'):
+-            line = line[:-1]
++            # ARM console translation may append multiple CR before LF even
++            # after the guest tty is raw. Strip line-ending CR only. Interior
++            # bytes, raw capture and frame CRC/nonce/sequence stay exact.
++            clean = line.rstrip(b'\r')
++            self.trailing_cr_lines += 1
++            self.trailing_cr_max = max(self.trailing_cr_max, len(line)-len(clean))
++            line = clean
+         if line.startswith(b'DL26_LINK_READY_'):
+             self._ready(line)
+         elif line.startswith(b'DL26_TX_'):
+@@ -301,5 +308,7 @@
+                 'close_error': self.close_error,
+                 'guest_result': self.guest_result, 'host_frames_issued': self.issued,
+                 'guest_frames': self.guest_frames, 'data_bytes': self.data_bytes,
++                'trailing_cr_lines': self.trailing_cr_lines,
++                'trailing_cr_max': self.trailing_cr_max,
+                 'ingress_alphabet': 'SPACE_LF_ONLY_ALL_SUFFIXES_WHITESPACE',
+                 'external_networking_claimed': False}

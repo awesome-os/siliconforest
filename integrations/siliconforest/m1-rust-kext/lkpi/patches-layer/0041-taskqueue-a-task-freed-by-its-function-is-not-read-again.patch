@@ -1,0 +1,38 @@
+taskqueue: a task freed by its own function is not read again
+
+Panic on the M1 (14 November 22:24:54Z, captured on the UART; runs/sfvk/vk-teardown-001-uart.txt):
+"Mutex 0xfffffe0011d05618 (Giant) is unexpectedly not owned by thread ..." in a taskqueue thread:
+thread_entry -> tq_handle_thread -> taskqueue_run_locked -> sfos_mtx_unlock(&Giant). Haiku's copy
+of FreeBSD's taskqueue_run_locked reads task->ta_flags AFTER task->ta_func returns, to decide
+whether to drop Giant. LinuxKPI work items embed their task, and a linux work function may free
+its own work item (the GPU driver's recovery work does, after a process left jobs on the GPU);
+the read is then a use after free, and freed memory with TASK_NEEDSGIANT set unlocks a Giant
+nobody holds. FreeBSD's own taskqueue never touches the task after the call. The flag is now
+read before it. Every kext built with add_fbsdkpi_driver links this file (SFAgx and SFDcp in
+the installed collection).
+UPSTREAM: yes (src/Kernel/fbsdkpi/haiku/freebsd_network/fbsd_subr_taskqueue.c).
+
+--- a/src/Kernel/fbsdkpi/haiku/freebsd_network/fbsd_subr_taskqueue.c	2026-11-14 14:30:05.296401053 -0800
++++ b/src/Kernel/fbsdkpi/haiku/freebsd_network/fbsd_subr_taskqueue.c	2026-11-14 14:34:02.388053938 -0800
+@@ -370,12 +370,19 @@
+ 
+ 		KASSERT(task->ta_func != NULL, ("task->ta_func is NULL"));
+ #ifdef __HAIKU__
+-		if ((task->ta_flags & TASK_NEEDSGIANT) != 0)
++		/*
++		 * The task may not be touched once its function has run: a
++		 * linux work item (its task is embedded in it) may free itself
++		 * in its own function, as linux allows. Decide about Giant
++		 * before the call.
++		 */
++		const int needs_giant = (task->ta_flags & TASK_NEEDSGIANT) != 0;
++		if (needs_giant)
+ 			mtx_lock(&Giant);
+ #endif
+ 		task->ta_func(task->ta_context, pending);
+ #ifdef __HAIKU__
+-		if ((task->ta_flags & TASK_NEEDSGIANT) != 0)
++		if (needs_giant)
+ 			mtx_unlock(&Giant);
+ #endif
+ 

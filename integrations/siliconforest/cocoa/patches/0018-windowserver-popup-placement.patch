@@ -1,0 +1,323 @@
+--- a/src/Frameworks/WindowServer/message.h
++++ b/src/Frameworks/WindowServer/message.h
+@@ -34,6 +34,9 @@
+     kWSWindowSetIgnoresMouse = 11,
+     // wsRPCWindow: window, x and y the smallest size, w and h the largest, in points, 0 for no limit
+     kWSWindowSetSizeLimits = 12,
++    // wsRPCWindow: a popup's anchor before it is shown. x, y, w, h: the rectangle it belongs to, on the
++    // screen as AppKit counts (y up); style: WS_POPUP_*; state: the window number of its parent (0: found)
++    kWSWindowSetPopupAnchor = 13,
+     kCGGetLastMouseDelta = 100,
+     kCGGetMouseLocation = 101,
+     /* windowID 0 asks for the active application window. */
+@@ -143,6 +146,14 @@
+ #define WS_EVENT_STATE        1011
+ // the compositor dismissed a popup (a menu, a pop-up list): the pointer was pressed outside the application
+ #define WS_EVENT_POPUP_DONE   1012
++// the compositor placed a popup: x and y are its frame origin on AppKit's screen (it may have slid or
++// flipped the popup to keep it on the panel), dx and dy the origin that was asked for
++#define WS_EVENT_POPUP_PLACED 1013
++// how a popup lies against its anchor rectangle, and what the compositor may do to keep it on the panel
++#define WS_POPUP_AT_FRAME     0   // where its frame says; slides along both axes
++#define WS_POPUP_BESIDE       1   // a submenu: beside the anchor (an item), flips to its other side, slides vertically
++#define WS_POPUP_BELOW        2   // a list under a control: flips to above it, slides horizontally
++#define WS_POPUP_BESIDE_LEFT  3   // a submenu of a menu that itself went to the left: left of the anchor first
+ #define WS_STATE_MAXIMIZED    1
+ #define WS_STATE_SUSPENDED    2
+ #define WS_STATE_FULLSCREEN   4
+--- a/src/Frameworks/WindowServer/rpc.h
++++ b/src/Frameworks/WindowServer/rpc.h
+@@ -38,6 +38,12 @@
+  * SF_WS_CLIENT_FRAME is not set), so AppKit leaves title bar and controls out of them. */
+ int _windowServerServerDecorations(void);
+ 
++/* 1 when windows at the pop-up menu level (menus, lists, tool tips) are xdg_popups: the compositor
++ * places them against the window they belong to and keeps them on the panel, and tells where it put
++ * them (WS_EVENT_POPUP_PLACED). AppKit then leaves all clamping to the screen to it. 0 on upstream's
++ * desktop, where such windows are layer-shell surfaces at the place AppKit says. */
++int _windowServerPlacesPopups(void);
++
+ // metal: the process's wl_display, and a desynchronised child surface of a window at (x, y) from its top left
+ // (wl_surface, with its wl_subsurface in *subsurfaceOut) for CAMetalLayer to present into with Vulkan. NULL without a wl_subcompositor or window.
+ void *_windowServerWaylandDisplay(void);
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -87,6 +87,13 @@
+     // a popup (xdg_popup): a menu, a pop-up list or a tool tip, placed against the window it belongs to
+     struct xdg_popup *popup;
+     int popupParentID;
++    // set by AppKit before the popup is shown (kWSWindowSetPopupAnchor)
++    int popupKind, popupParentHint;
++    double anchorX, anchorY, anchorW, anchorH;
++    // the frame origin AppKit asked for with the positioner last sent, and that request's token
++    double popupAskedX, popupAskedY;
++    int32_t popupRelX, popupRelY;   // the same request as a place in the parent, from its top left
++    uint32_t popupTokenSent, popupTokenSeen;
+     int flushed;           // AppKit has flushed the backing store at its current size
+     int staleConfigures;   // unmaps the compositor has not passed yet: configures from before them are void
+     char title[64];
+@@ -567,6 +574,12 @@
+     return ws.decorationManager != NULL && getenv("SF_WS_CLIENT_FRAME") == NULL;
+ }
+ 
++static int ensureConnected(void);
++
++int _windowServerPlacesPopups(void) {
++    return ensureConnected() && ws.layerShell == NULL;
++}
++
+ static int ensureConnected(void) {
+     if (ws.connected) {
+         return 1;
+@@ -1357,6 +1370,15 @@
+     pthread_mutex_unlock(&cursor.lock);
+ }
+ 
++// a menu, a list or a tool tip of ours is on the screen
++static int popupShown(void) {
++    for (struct wsWindow *w = ws.windows; w != NULL; w = w->next) {
++        if (w->popup != NULL && w->attached)
++            return 1;
++    }
++    return 0;
++}
++
+ static void pointerEnter(void *data, struct wl_pointer *pointer, uint32_t serial,
+                          struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y) {
+     for (struct wsWindow *w = ws.windows; w != NULL; w = w->next) {
+@@ -1370,8 +1392,11 @@
+     }
+     lastPointerX = wl_fixed_to_double(x);
+     lastPointerY = wl_fixed_to_double(y);
+-    // buttons pressed before enter belong to whoever had the pointer
+-    leftButtonDown = rightButtonDown = otherButtonDown = 0;
++    /* Buttons pressed before enter belong to whoever had the pointer - except while a popup of ours
++     * is up: the button that opened a menu is still down when the pointer goes from the window onto
++     * the menu, and its release there is what picks the item. */
++    if (!popupShown())
++        leftButtonDown = rightButtonDown = otherButtonDown = 0;
+ 
+     // a surface entered with no cursor set shows none, so the current shape goes on each time
+     pthread_mutex_lock(&cursor.lock);
+@@ -1399,7 +1424,9 @@
+             event.y = w->h - lastPointerY;
+             event.mods = currentModifiers;
+             // a held button leaving means a compositor grab took the pointer, its release never comes here
+-            int held[3] = { leftButtonDown, rightButtonDown, otherButtonDown };
++            // (with a popup of ours up the pointer is only crossing between our surfaces: the release will come)
++            int crossing = popupShown();
++            int held[3] = { crossing ? 0 : leftButtonDown, crossing ? 0 : rightButtonDown, crossing ? 0 : otherButtonDown };
+             int ups[3] = { WS_LEFT_MOUSE_UP, WS_RIGHT_MOUSE_UP, WS_OTHER_MOUSE_UP };
+             int exited = event.code;
+             for (int i = 0; i < 3; i++) {
+@@ -1413,7 +1440,8 @@
+             break;
+         }
+     }
+-    leftButtonDown = rightButtonDown = otherButtonDown = 0;
++    if (!popupShown())
++        leftButtonDown = rightButtonDown = otherButtonDown = 0;
+     pthread_mutex_lock(&cursor.lock);
+     cursor.inside = 0;
+     pthread_mutex_unlock(&cursor.lock);
+@@ -2167,6 +2195,10 @@
+ 
+     if (window->level != kWSPopUpMenuLevel || wsStyleWantsServerFrame(window->style))
+         return NULL;
++    // the parent AppKit named: the window a menu was opened from, the menu a submenu belongs to
++    best = windowForID(window->popupParentHint);
++    if (best != NULL && best != window && best->xdgSurface != NULL && best->attached)
++        return best;
+     for (candidate = ws.windows; candidate != NULL; candidate = candidate->next) {
+         // the list is newest first: the first mapped popup found is the last one opened
+         if (candidate != window && candidate->popup != NULL && candidate->attached)
+@@ -2182,10 +2214,27 @@
+ 
+ static void popupConfigure(void *data, struct xdg_popup *popup, int32_t x, int32_t y, int32_t width, int32_t height) {
+     struct wsWindow *window = data;
++    struct wsWindow *parent = windowForID(window->popupParentID);
++    struct mach_event placed = {0};
+ 
+     (void)popup;
+     if (getenv("SF_WS_TRACE") != NULL)
+-        fprintf(stderr, "WindowServer: popup %d placed at %d,%d in its parent, %dx%d\n", window->windowID, x, y, width, height);
++        fprintf(stderr, "WindowServer: popup %d placed at %d,%d in its parent, %dx%d, moved by %d,%d\n", window->windowID, x, y,
++                width, height, x - window->popupRelX, y - window->popupRelY);
++    // a configure from before the last reposition was answered says where the popup was, not where it is
++    if (parent == NULL || window->popupTokenSeen != window->popupTokenSent)
++        return;
++    /* Where the compositor put it, as a frame origin on AppKit's screen: AppKit hit-tests menus and
++     * their submenus against each other through these frames, so they must lie as the surfaces do. */
++    placed.windowID = window->windowID;
++    placed.code = WS_EVENT_POPUP_PLACED;
++    placed.x = parent->x + x;
++    placed.y = parent->y + parent->h - y - window->h;
++    placed.dx = window->popupAskedX;
++    placed.dy = window->popupAskedY;
++    window->x = placed.x;
++    window->y = placed.y;
++    queuePush(&placed);
+ }
+ 
+ static void popupDone(void *data, struct xdg_popup *popup) {
+@@ -2201,7 +2250,10 @@
+ }
+ 
+ static void popupRepositioned(void *data, struct xdg_popup *popup, uint32_t token) {
+-    (void)data, (void)popup, (void)token;
++    struct wsWindow *window = data;
++
++    (void)popup;
++    window->popupTokenSeen = token;
+ }
+ 
+ static const struct xdg_popup_listener popupListener = {
+@@ -2210,22 +2262,63 @@
+     .repositioned = popupRepositioned,
+ };
+ 
+-// where a popup goes: its frame against its parent's, as AppKit has them
++/* Where a popup goes. Its frame and its anchor rectangle are on AppKit's screen, which need not be
++ * where the compositor has the windows; what is sent is their place relative to the parent's frame,
++ * which is the same in both. The positioner is built so that an unconstrained popup lies exactly at
++ * its frame: the anchor rectangle and edges say what it hangs on (so the compositor can flip it to
++ * the other side), the offset is the rest. */
+ static struct xdg_positioner *popupPositioner(struct wsWindow *window, struct wsWindow *parent, int32_t *xp, int32_t *yp) {
+     struct xdg_positioner *positioner;
+-    int32_t x, y;
++    int32_t x, y, ax, ay, aw, ah, nx, ny;
++    uint32_t anchor, gravity, adjust;
+ 
+     // AppKit's y runs up from the bottom of the screen: the popup's top edge below the parent's top edge
+     x = (int32_t)floor(window->x - parent->x);
+     y = (int32_t)floor((parent->y + parent->h) - (window->y + window->h));
++    if (window->popupKind == WS_POPUP_AT_FRAME || window->anchorW < 1 || window->anchorH < 1) {
++        ax = x, ay = y, aw = 1, ah = 1;
++        anchor = XDG_POSITIONER_ANCHOR_TOP_LEFT;
++        // kept on the screen by sliding, as a menu at the screen's edge is on macOS
++        adjust = XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y;
++        nx = ax, ny = ay;
++    } else {
++        ax = (int32_t)floor(window->anchorX - parent->x);
++        ay = (int32_t)floor((parent->y + parent->h) - (window->anchorY + window->anchorH));
++        aw = (int32_t)fmax(1, window->anchorW), ah = (int32_t)fmax(1, window->anchorH);
++        if (window->popupKind == WS_POPUP_BESIDE_LEFT) {
++            // a submenu of a menu that is itself on the left of its parent keeps going left
++            anchor = XDG_POSITIONER_ANCHOR_TOP_LEFT;
++            adjust = XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
++                     XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y;
++            nx = ax - (int32_t)fmax(1, window->w), ny = ay;
++        } else if (window->popupKind == WS_POPUP_BESIDE) {
++            // a submenu to the right of its item; with no room there, to the left of it
++            anchor = XDG_POSITIONER_ANCHOR_TOP_RIGHT;
++            adjust = XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_X | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
++                     XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y;
++            nx = ax + aw, ny = ay;
++        } else {
++            // a list under its control; with no room there, above it
++            anchor = XDG_POSITIONER_ANCHOR_BOTTOM_LEFT;
++            adjust = XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_FLIP_Y | XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
++                     XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y;
++            nx = ax, ny = ay + ah;
++        }
++    }
++    gravity = (anchor == XDG_POSITIONER_ANCHOR_TOP_LEFT && aw > 1) ? XDG_POSITIONER_GRAVITY_BOTTOM_LEFT
++                                                                   : XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT;
+     positioner = xdg_wm_base_create_positioner(ws.wmBase);
+     xdg_positioner_set_size(positioner, (int32_t)fmax(1, window->w), (int32_t)fmax(1, window->h));
+-    xdg_positioner_set_anchor_rect(positioner, x, y, 1, 1);
+-    xdg_positioner_set_anchor(positioner, XDG_POSITIONER_ANCHOR_TOP_LEFT);
+-    xdg_positioner_set_gravity(positioner, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+-    // kept on the screen by sliding, as a menu at the screen's edge is on macOS
+-    xdg_positioner_set_constraint_adjustment(positioner, XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
+-                                                         XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y);
++    xdg_positioner_set_anchor_rect(positioner, ax, ay, aw, ah);
++    xdg_positioner_set_anchor(positioner, anchor);
++    xdg_positioner_set_gravity(positioner, gravity);
++    if (x != nx || y != ny)
++        xdg_positioner_set_offset(positioner, x - nx, y - ny);
++    xdg_positioner_set_constraint_adjustment(positioner, adjust);
++    window->popupAskedX = window->x;
++    window->popupAskedY = window->y;
++    window->popupRelX = x;
++    window->popupRelY = y;
+     *xp = x, *yp = y;
+     return positioner;
+ }
+@@ -2239,7 +2332,8 @@
+     if (parent == NULL || window->popup == NULL || xdg_popup_get_version(window->popup) < XDG_POPUP_REPOSITION_SINCE_VERSION)
+         return;
+     positioner = popupPositioner(window, parent, &x, &y);
+-    xdg_popup_reposition(window->popup, positioner, ++ws.popupToken);
++    window->popupTokenSent = ++ws.popupToken;
++    xdg_popup_reposition(window->popup, positioner, window->popupTokenSent);
+     xdg_positioner_destroy(positioner);
+     if (getenv("SF_WS_TRACE") != NULL)
+         fprintf(stderr, "WindowServer: popup %d moved to %d,%d of window %d, %gx%g\n", window->windowID, x, y,
+@@ -2260,6 +2354,7 @@
+     xdg_popup_add_listener(window->popup, &popupListener, window);
+     xdg_positioner_destroy(positioner);
+     window->popupParentID = parent->windowID;
++    window->popupTokenSent = window->popupTokenSeen = 0;
+     /* A menu holds the pointer until it is closed: the compositor then dismisses it when the
+      * pointer is pressed outside the application. A window that takes no mouse events (a tool
+      * tip) just sits there. */
+@@ -2631,8 +2726,11 @@
+                     window->state = NORMAL;
+                     windowRemap(window);
+                     // what AppKit last flushed, if it flushed at this size; else its next flush maps the window
+-                    if ((window->toplevel != NULL || window->layerSurface != NULL) &&
+-                        (windowShowFront(window) || (window->flushed && windowPresent(window)))) {
++                    // (a popup too: a tool tip is drawn and flushed before it is ordered in, and nothing flushes it again)
++                    // and never with the frame it showed the last time it was up: that is another menu's picture
++                    if (window->popup != NULL ? (window->flushed && windowPresent(window))
++                                              : ((window->toplevel != NULL || window->layerSurface != NULL) &&
++                                                 (windowShowFront(window) || (window->flushed && windowPresent(window))))) {
+                         wl_surface_commit(window->surface);
+                     }
+                 }
+@@ -2646,6 +2744,8 @@
+                 if (window->popup != NULL) {
+                     windowDestroyRole(window);
+                     window->configured = 0;
++                    // what it shows next has to be drawn and flushed after this
++                    window->flushed = 0;
+                     wl_display_flush(ws.display);
+                 }
+                 break;
+@@ -2658,6 +2758,14 @@
+     int moved = (msg->x != window->x || msg->y != window->y ||
+                  msg->w != window->w || msg->h != window->h);
+ 
++    /* A popup's frame is where the compositor put it. AppKit may still send the origin it asked for
++     * (the answer is on its way to the main thread): that request is already answered. */
++    if (window->popup != NULL && msg->w == window->w && msg->h == window->h &&
++        msg->x == window->popupAskedX && msg->y == window->popupAskedY) {
++        moved = 0;
++        msg->x = window->x, msg->y = window->y;
++    }
++
+     window->x = msg->x;
+     window->y = msg->y;
+     window->w = msg->w;
+@@ -2800,6 +2908,20 @@
+             return KERN_SUCCESS;
+         }
+ 
++        case kWSWindowSetPopupAnchor: {
++            struct wsRPCWindow *msg = (struct wsRPCWindow *)data;
++            struct wsWindow *window = windowForID(msg->windowID);
++
++            if (window == NULL) {
++                return KERN_FAILURE;
++            }
++            window->popupKind = (int)msg->style;
++            window->popupParentHint = msg->state;
++            window->anchorX = msg->x, window->anchorY = msg->y;
++            window->anchorW = msg->w, window->anchorH = msg->h;
++            return KERN_SUCCESS;
++        }
++
+         case kWSWindowSetBlur: {
+             struct wsRPCSimple *msg = (struct wsRPCSimple *)data;
+             struct wsWindow *window = windowForID(msg->val1);

@@ -1,0 +1,103 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Who runs the fan? One boot:
+#   check     short regression: transition stress, top states under load, drop when idle
+#   auto      @AUTO@ s of one worker per processor with the fan left to the SMC (F0Md = 0):
+#             does it start by itself as the die and the case warm up?
+#   control   @CONTROL@ s of the same load with kern.sf_thermal.fan_control=1: the fan must
+#             follow the target this driver writes
+#   back      fan_control=0 and idle: the fan must be the SMC's again (F0Md = 0)
+# Every temperature key is logged by the kernel at the start and end of "auto"
+# (kern.sf_thermal.dump). TH_MON every 5 s. tools/th_summary.py --fan reads the result.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nTH_BEGIN_%s\n' "$nonce"
+ncpu=$(sysctl -n hw.ncpu 2>/dev/null); ncpu=${ncpu:-1}
+t0=$(date +%s)
+now() { echo $(( $(date +%s) - t0 )); }
+phase() { printf 'TH_PHASE %s t=%s\n' "$1" "$(now)"; }
+get() { sysctl -n "$1" 2>/dev/null; }
+mon() {
+    printf 'TH_MON t=%s die_mc=%s status=%s cap=E%s/P%s pstate=E%s/P%s util=E%s/P%s fan=%s target=%s asked=%s mode=%s mw=%s tr=%s\n' \
+        "$(now)" "$(get kern.sf_thermal.die_mc)" "$(get kern.sf_thermal.status)" \
+        "$(get kern.sf_cpufreq.e_cap)" "$(get kern.sf_cpufreq.p_cap)" \
+        "$(get kern.sf_cpufreq.e_pstate)" "$(get kern.sf_cpufreq.p_pstate)" \
+        "$(get kern.sf_cpufreq.e_util)" "$(get kern.sf_cpufreq.p_util)" \
+        "$(get kern.sf_thermal.fan_rpm)" "$(get kern.sf_thermal.fan_target_rpm)" \
+        "$(get kern.sf_thermal.fan_asked_rpm)" "$(get kern.sf_thermal.fan_mode)" \
+        "$(get kern.sf_thermal.system_mw)" "$(get kern.sf_cpufreq.transitions)"
+}
+worker() {      # tag id seconds
+    i=0; start=$(date +%s); end=$(( start + $3 ))
+    while [ "$(date +%s)" -lt "$end" ]; do
+        dd if=/dev/zero bs=1048576 count=8 2>/dev/null | sha256sum > /dev/null
+        i=$((i+1))
+    done
+    printf 'TH_WORKER tag=%s id=%s megabytes=%s seconds=%s elapsed=%s\n' "$1" "$2" "$((i*8))" "$3" "$(( $(date +%s) - start ))"
+}
+group() {       # tag workers seconds
+    phase "$1"
+    pids=; w=0; while [ "$w" -lt "$2" ]; do worker "$1" "$w" "$3" & pids="$pids $!"; w=$((w+1)); done
+    wait $pids      # not the monitor
+    printf 'TH_GROUP_DONE tag=%s workers=%s\n' "$1" "$2"
+}
+spin() {        # seconds
+    end=$(( $(date +%s) + $1 ))
+    while [ "$(date +%s)" -lt "$end" ]; do j=0; while [ "$j" -lt 20000 ]; do j=$((j+1)); done; done
+}
+
+phase sensors
+n=0
+while [ "$(get kern.sf_thermal.valid)" != 1 ] && [ "$n" -lt 40 ]; do sleep 1; n=$((n+1)); done
+printf 'TH_SENSOR_WAIT seconds=%s valid=%s\n' "$n" "$(get kern.sf_thermal.valid)"
+sysctl kern.sf_thermal kern.sf_cpufreq 2>&1
+n=0
+while [ "$(get kern.sf_thermal.status)" != ok ] && [ "$n" -lt 25 ]; do sleep 1; n=$((n+1)); done
+printf 'TH_STATUS_WAIT seconds=%s status=%s\n' "$n" "$(get kern.sf_thermal.status)"
+( while :; do mon; sleep 5; done ) &
+monitor=$!
+
+phase check
+sysctl -w kern.sf_cpufreq.stress=@STRESS@ 2>&1
+printf 'TH_STRESS asked=%s done=%s failures=%s max_us=%s busy_timeouts=%s\n' @STRESS@ \
+    "$(get kern.sf_cpufreq.stress)" "$(get kern.sf_cpufreq.stress_failures)" "$(get kern.sf_cpufreq.stress_max_us)" \
+    "$(get kern.sf_cpufreq.busy_timeouts)"
+pids=; w=0; while [ "$w" -lt "$ncpu" ]; do spin 10 & pids="$pids $!"; w=$((w+1)); done
+sleep 6
+printf 'TH_LOADED pstate=E%s/P%s util=E%s/P%s\n' "$(get kern.sf_cpufreq.e_pstate)" "$(get kern.sf_cpufreq.p_pstate)" \
+    "$(get kern.sf_cpufreq.e_util)" "$(get kern.sf_cpufreq.p_util)"
+wait $pids
+sleep 10
+printf 'TH_IDLE2 pstate=E%s/P%s util=E%s/P%s\n' "$(get kern.sf_cpufreq.e_pstate)" "$(get kern.sf_cpufreq.p_pstate)" \
+    "$(get kern.sf_cpufreq.e_util)" "$(get kern.sf_cpufreq.p_util)"
+
+sysctl -w kern.sf_thermal.dump=1 > /dev/null 2>&1
+group auto "$ncpu" @AUTO@
+sysctl -w kern.sf_thermal.dump=1 > /dev/null 2>&1
+printf 'TH_AUTO_END die_mc=%s fan=%s target=%s mode=%s status=%s cap=E%s/P%s\n' "$(get kern.sf_thermal.die_mc)" \
+    "$(get kern.sf_thermal.fan_rpm)" "$(get kern.sf_thermal.fan_target_rpm)" "$(get kern.sf_thermal.fan_mode)" \
+    "$(get kern.sf_thermal.status)" "$(get kern.sf_cpufreq.e_cap)" "$(get kern.sf_cpufreq.p_cap)"
+
+sysctl -w kern.sf_thermal.fan_control=1 2>&1
+group control "$ncpu" @CONTROL@
+sleep 2
+printf 'TH_CONTROL_END die_mc=%s fan=%s target=%s asked=%s mode=%s writes=%s write_errors=%s status=%s cap=E%s/P%s\n' \
+    "$(get kern.sf_thermal.die_mc)" "$(get kern.sf_thermal.fan_rpm)" "$(get kern.sf_thermal.fan_target_rpm)" \
+    "$(get kern.sf_thermal.fan_asked_rpm)" "$(get kern.sf_thermal.fan_mode)" "$(get kern.sf_thermal.fan_writes)" \
+    "$(get kern.sf_thermal.fan_write_errors)" "$(get kern.sf_thermal.status)" \
+    "$(get kern.sf_cpufreq.e_cap)" "$(get kern.sf_cpufreq.p_cap)"
+
+phase back
+sysctl -w kern.sf_thermal.fan_control=0 2>&1
+sleep 25
+kill "$monitor" 2>/dev/null
+mon
+printf 'TH_BACK die_mc=%s fan=%s target=%s asked=%s mode=%s\n' "$(get kern.sf_thermal.die_mc)" \
+    "$(get kern.sf_thermal.fan_rpm)" "$(get kern.sf_thermal.fan_target_rpm)" "$(get kern.sf_thermal.fan_asked_rpm)" \
+    "$(get kern.sf_thermal.fan_mode)"
+phase end
+sysctl kern.sf_thermal kern.sf_cpufreq 2>&1
+printf 'TH_END_%s\n' "$nonce"
+# ends the capture at once (tools/pcie_iterate.sh PCIE_DONE)
+printf '\nPD_BENCH_DONE\n'

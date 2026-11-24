@@ -1,0 +1,1409 @@
+--- a/src/Frameworks/AppKit/NSViewLayout.h
++++ b/src/Frameworks/AppKit/NSViewLayout.h
+@@ -0,0 +1,43 @@
++// NSViewLayout.h - what a view tells Auto Layout about itself: intrinsic and fitting sizes,
++// alignment rectangles, baselines and the priorities of its content size
++// Copyright (c) 2026 The SiliconForest contributors, SPDX-License-Identifier: MPL-2.0 OR BSD-2-Clause
++#import <AppKit/NSView.h>
++#import <AppKit/NSLayoutConstraint.h>
++#import <AppKit/NSModernAppKit.h>
++
++// "no intrinsic size along this axis"; the second spelling is the one AppKit first shipped with
++APPKIT_EXPORT const CGFloat NSViewNoIntrinsicMetric;
++APPKIT_EXPORT const CGFloat NSViewNoInstrinsicMetric;
++
++@interface NSView (NSViewLayout)
++- (NSSize)intrinsicContentSize;
++- (void)invalidateIntrinsicContentSize;
++- (NSSize)fittingSize;
++
++- (NSEdgeInsets)alignmentRectInsets;
++- (NSRect)alignmentRectForFrame:(NSRect)frame;
++- (NSRect)frameForAlignmentRect:(NSRect)alignmentRect;
++
++- (CGFloat)firstBaselineOffsetFromTop;
++- (CGFloat)lastBaselineOffsetFromBottom;
++- (CGFloat)baselineOffsetFromBottom;
++
++- (NSLayoutPriority)contentCompressionResistancePriorityForOrientation:(NSLayoutConstraintOrientation)orientation;
++- (void)setContentCompressionResistancePriority:(NSLayoutPriority)priority forOrientation:(NSLayoutConstraintOrientation)orientation;
++
+++ (BOOL)requiresConstraintBasedLayout;
++- (BOOL)needsUpdateConstraints;
++- (void)setNeedsUpdateConstraints:(BOOL)flag;
++- (void)updateConstraints;
++- (void)updateConstraintsForSubtreeIfNeeded;
++- (BOOL)needsLayout;
++- (void)layout;
++@end
++
++// the solver's entry points (NSLayoutConstraint.m)
++@interface NSView (NSViewLayoutSolver)
++- (void)_sfSolveConstraints;
++- (void)_sfLayoutSubtree;
++- (NSSize)_sfFittingSize;
++- (NSSize)_sfLayoutTreeFitting:(BOOL)fitting apply:(BOOL)apply;
++@end
+--- a/src/Frameworks/AppKit/NSViewLayout.m
++++ b/src/Frameworks/AppKit/NSViewLayout.m
+@@ -0,0 +1,248 @@
++// NSViewLayout.m - what a view tells Auto Layout about itself
++// Copyright (c) 2026 The SiliconForest contributors, SPDX-License-Identifier: MPL-2.0 OR BSD-2-Clause
++//
++// The sizes come from the cells, so they are as right as -cellSize is. The rules on top of that
++// are the ones macOS 26 shows when asked (integrations/siliconforest/cocoa/conformance):
++//   - a control's intrinsic size is its cell's size, raised to whole device pixels;
++//   - a field the user types into, a horizontal slider and a progress bar have no intrinsic
++//     width, a vertical slider no intrinsic height;
++//   - a label's alignment rectangle leaves out the 2 points the cell keeps on either side of
++//     its text, so its intrinsic width is that much less than the cell's;
++//   - the fitting size of a view that holds no constraints is the frame of its intrinsic size,
++//     with 0 where there is none;
++//   - text sits in the middle of the control: the baseline is the descent above the line's
++//     bottom, the line being ascent plus descent each rounded to whole points.
++#import <AppKit/NSViewLayout.h>
++#import <AppKit/NSControl.h>
++#import <AppKit/NSCell.h>
++#import <AppKit/NSTextField.h>
++#import <AppKit/NSButton.h>
++#import <AppKit/NSSlider.h>
++#import <AppKit/NSProgressIndicator.h>
++#import <AppKit/NSFont.h>
++#import <AppKit/NSWindow.h>
++#import <AppKit/NSScreen.h>
++#import <Foundation/NSValue.h>
++#import <objc/runtime.h>
++#include <math.h>
++
++const CGFloat NSViewNoIntrinsicMetric = -1;
++const CGFloat NSViewNoInstrinsicMetric = -1;
++
++static const char compressionKey[2], needsUpdateKey;
++
++// up to the next device pixel of the view's window, or of the main screen for a view in none
++static CGFloat raised(NSView *view, CGFloat value) {
++    CGFloat scale = [view window] ? [[view window] backingScaleFactor] : [[NSScreen mainScreen] backingScaleFactor];
++
++    if (scale <= 0)
++        scale = 1;
++    return ceil(value * scale - 0.001) / scale;
++}
++
++@implementation NSView (NSViewLayout)
++
++- (NSSize)intrinsicContentSize {
++    return NSMakeSize(NSViewNoIntrinsicMetric, NSViewNoIntrinsicMetric);
++}
++
++- (void)invalidateIntrinsicContentSize {
++    NSView *holder = [self superview];
++
++    if (holder != nil)
++        [holder setNeedsLayout:YES];
++}
++
++- (NSEdgeInsets)alignmentRectInsets {
++    return NSEdgeInsetsMake(0, 0, 0, 0);
++}
++
++- (NSRect)alignmentRectForFrame:(NSRect)frame {
++    NSEdgeInsets insets = [self alignmentRectInsets];
++    BOOL flipped = [[self superview] isFlipped];
++
++    frame.origin.x += insets.left;
++    frame.origin.y += flipped ? insets.top : insets.bottom;
++    frame.size.width -= insets.left + insets.right;
++    frame.size.height -= insets.top + insets.bottom;
++    return frame;
++}
++
++- (NSRect)frameForAlignmentRect:(NSRect)rect {
++    NSEdgeInsets insets = [self alignmentRectInsets];
++    BOOL flipped = [[self superview] isFlipped];
++
++    rect.origin.x -= insets.left;
++    rect.origin.y -= flipped ? insets.top : insets.bottom;
++    rect.size.width += insets.left + insets.right;
++    rect.size.height += insets.top + insets.bottom;
++    return rect;
++}
++
++/* The smallest size the view's constraints, and the intrinsic sizes of what is in it, leave room
++ * for. A view with nothing in it is as large as its own intrinsic size. */
++- (NSSize)fittingSize {
++    NSSize intrinsic = [self intrinsicContentSize];
++    NSEdgeInsets insets = [self alignmentRectInsets];
++    NSSize size;
++
++    size.width = intrinsic.width < 0 ? 0 : intrinsic.width;
++    size.height = intrinsic.height < 0 ? 0 : intrinsic.height;
++    if ([[self subviews] count] != 0)
++        size = [self _sfFittingSize];
++    size.width = raised(self, fmax(0, size.width) + insets.left + insets.right);
++    size.height = raised(self, fmax(0, size.height) + insets.top + insets.bottom);
++    if (intrinsic.width < 0 && size.width <= insets.left + insets.right)
++        size.width = 0;
++    if (intrinsic.height < 0 && size.height <= insets.top + insets.bottom)
++        size.height = 0;
++    return size;
++}
++
++- (CGFloat)lastBaselineOffsetFromBottom {
++    return [self baselineOffsetFromBottom];
++}
++
++- (CGFloat)baselineOffsetFromBottom {
++    return 0;
++}
++
++- (CGFloat)firstBaselineOffsetFromTop {
++    NSSize intrinsic = [self intrinsicContentSize];
++    CGFloat height = intrinsic.height >= 0 ? intrinsic.height : [self bounds].size.height;
++
++    return height - [self baselineOffsetFromBottom];
++}
++
++- (NSLayoutPriority)contentCompressionResistancePriorityForOrientation:(NSLayoutConstraintOrientation)orientation {
++    NSNumber *value = objc_getAssociatedObject(self, &compressionKey[orientation ? 1 : 0]);
++
++    return value ? [value floatValue] : NSLayoutPriorityDefaultHigh;
++}
++
++- (void)setContentCompressionResistancePriority:(NSLayoutPriority)priority forOrientation:(NSLayoutConstraintOrientation)orientation {
++    objc_setAssociatedObject(self, &compressionKey[orientation ? 1 : 0], [NSNumber numberWithFloat:priority], OBJC_ASSOCIATION_RETAIN);
++    [self invalidateIntrinsicContentSize];
++}
++
++// what -contentHuggingPriorityForOrientation: answers until one is set
++- (NSLayoutPriority)_sfDefaultContentHuggingPriorityForOrientation:(NSLayoutConstraintOrientation)orientation {
++    return NSLayoutPriorityDefaultLow;
++}
++
+++ (BOOL)requiresConstraintBasedLayout {
++    return NO;
++}
++
++- (BOOL)needsUpdateConstraints {
++    return [objc_getAssociatedObject(self, &needsUpdateKey) boolValue];
++}
++
++- (void)setNeedsUpdateConstraints:(BOOL)flag {
++    objc_setAssociatedObject(self, &needsUpdateKey, flag ? [NSNumber numberWithBool:YES] : nil, OBJC_ASSOCIATION_RETAIN);
++}
++
++- (void)updateConstraints {
++    [self setNeedsUpdateConstraints:NO];
++}
++
++- (void)updateConstraintsForSubtreeIfNeeded {
++    for (NSView *subview in [self subviews])
++        [subview updateConstraintsForSubtreeIfNeeded];
++    if ([self needsUpdateConstraints])
++        [self updateConstraints];
++}
++
++- (void)layout {
++    [self _sfSolveConstraints];
++}
++
++@end
++
++@implementation NSControl (NSViewLayout)
++
++// a label: text only, nothing drawn around it and nothing to type into
++- (BOOL)_sfIsLabel {
++    NSCell *cell = [self cell];
++
++    return [self isKindOfClass:[NSTextField class]] && ![cell isBezeled] && ![cell isBordered] && ![cell isEditable];
++}
++
++// a control holds on to its height; one with no border of its own (a checkbox, a radio button) does not
++- (NSLayoutPriority)_sfDefaultContentHuggingPriorityForOrientation:(NSLayoutConstraintOrientation)orientation {
++    if (orientation == NSLayoutConstraintOrientationHorizontal)
++        return NSLayoutPriorityDefaultLow;
++    if ([self isKindOfClass:[NSButton class]] && ![[self cell] isBordered])
++        return NSLayoutPriorityDefaultLow;
++    return NSLayoutPriorityDefaultHigh;
++}
++
++- (NSEdgeInsets)alignmentRectInsets {
++    return [self _sfIsLabel] ? NSEdgeInsetsMake(0, 2, 0, 2) : NSEdgeInsetsMake(0, 0, 0, 0);
++}
++
++- (NSSize)intrinsicContentSize {
++    NSCell *cell = [self cell];
++    NSEdgeInsets insets = [self alignmentRectInsets];
++    NSSize size;
++
++    if (cell == nil)
++        return NSMakeSize(NSViewNoIntrinsicMetric, NSViewNoIntrinsicMetric);
++    size = [cell cellSize];
++    size.width = raised(self, size.width - insets.left - insets.right);
++    size.height = raised(self, size.height - insets.top - insets.bottom);
++    if ([self isKindOfClass:[NSTextField class]] && ![self _sfIsLabel] && [cell isEditable])
++        size.width = NSViewNoIntrinsicMetric;
++    return size;
++}
++
++- (CGFloat)baselineOffsetFromBottom {
++    NSFont *font = [self font];
++    CGFloat ascent, descent, height;
++
++    if (font == nil)
++        return 0;
++    ascent = round([font ascender]);
++    descent = round(-[font descender]);
++    // of the control at its own size, where its text is centred: a baseline is used to line views
++    // up before they have frames
++    height = [[self cell] cellSize].height;
++    if (height <= 0 || height > 1000)
++        height = [self bounds].size.height;
++    return floor((height - ascent - descent) / 2 * 2) / 2 + descent;
++}
++
++@end
++
++@implementation NSSlider (NSViewLayout)
++
++// the track runs as far as it is given: only the thickness is the slider's own
++- (NSSize)intrinsicContentSize {
++    NSSize frame = [self frame].size, cell = [[self cell] cellSize];
++    CGFloat thickness = MIN(cell.width, cell.height);
++
++    if (frame.height > frame.width)
++        return NSMakeSize(raised(self, thickness), NSViewNoIntrinsicMetric);
++    return NSMakeSize(NSViewNoIntrinsicMetric, raised(self, thickness));
++}
++
++- (CGFloat)baselineOffsetFromBottom {
++    return 0;
++}
++
++@end
++
++@implementation NSProgressIndicator (NSViewLayout)
++
++- (NSLayoutPriority)_sfDefaultContentHuggingPriorityForOrientation:(NSLayoutConstraintOrientation)orientation {
++    return orientation == NSLayoutConstraintOrientationHorizontal ? NSLayoutPriorityDefaultLow : NSLayoutPriorityDefaultHigh;
++}
++
++- (NSSize)intrinsicContentSize {
++    // the bar: 20 points, 12 for the small and mini sizes (macOS 26); a spinner is as large as it was made
++    if ([self style] == NSProgressIndicatorBarStyle)
++        return NSMakeSize(NSViewNoIntrinsicMetric, [self controlSize] == NSRegularControlSize ? 20 : 12);
++    return [self frame].size;
++}
++
++@end
+--- a/src/Frameworks/AppKit/NSLayoutConstraint.m
++++ b/src/Frameworks/AppKit/NSLayoutConstraint.m
+@@ -1,6 +1,11 @@
+ // NSLayoutConstraint.m - Auto Layout constraints, kept as data
+ // Copyright (c) 2026 The PureDarwin Project, SPDX-License-Identifier: MPL-2.0 OR BSD-2-Clause
+ #import <AppKit/NSLayoutConstraint.h>
++#import <AppKit/NSViewLayout.h>
++#import <CoreFoundation/CFDictionary.h>
++#import "SFLayoutSolver.h"
++#import <AppKit/NSWindow.h>
++#import <AppKit/NSScreen.h>
+ #import <Foundation/NSArray.h>
+ #import <Foundation/NSCoder.h>
+ #import <Foundation/NSString.h>
+@@ -15,102 +20,182 @@
+ 
+ 
+ 
+-@interface NSLayoutConstraint (Owner)
+-- (void)_setOwner:(id)owner;
++/* The class is Foundation's, where a constraint is only data: -setActive: there sets a flag, and a
++ * constraint made in code is never active nor held by any view, so nothing made with anchors and
++ * +activateConstraints: was ever laid out. What "active" means needs views, so it is said here:
++ * active is being held by a view, and activating finds the view to hold it - the nearest ancestor
++ * the two items share, or for a constraint on one view alone that view's superview (which is the
++ * one that lays it out), or the view itself while it has none. (These replace Foundation's
++ * synthesized accessor; they belong in the class once it can see NSView.) */
++@interface NSLayoutConstraint (SFActivation)
++- (void)_sfInstalledOn:(NSView *)holder;
+ @end
+ 
+-// one view's edges while solving, in the coordinates of the view that holds the constraints
+-typedef struct {
+-    NSView *view;
+-    CGFloat minX, maxX, minY, maxY;
+-    // edges a constraint has set in this pass: sizes give way to them
+-    BOOL pinMinX, pinMaxX, pinMinY, pinMaxY;
+-} SFLayoutItem;
++@implementation NSLayoutConstraint (SFActivation)
+ 
+-static SFLayoutItem *itemFor(SFLayoutItem *items, NSUInteger count, id view) {
+-    for (NSUInteger i = 0; i < count; i++) {
+-        if (items[i].view == view)
+-            return &items[i];
+-    }
+-    return NULL;
++- (void)_sfInstalledOn:(NSView *)holder {
++    _owner = holder;
++    _active = holder != nil;
+ }
+ 
+-// leading and trailing are left and right: this AppKit lays out left to right only
+-static CGFloat attributeValue(SFLayoutItem *item, NSLayoutAttribute attribute, BOOL flipped) {
+-    switch (attribute) {
+-    case NSLayoutAttributeLeft: case NSLayoutAttributeLeading: return item->minX;
+-    case NSLayoutAttributeRight: case NSLayoutAttributeTrailing: return item->maxX;
+-    case NSLayoutAttributeTop: return flipped ? item->minY : item->maxY;
+-    case NSLayoutAttributeBottom: case NSLayoutAttributeLastBaseline: return flipped ? item->maxY : item->minY;
+-    case NSLayoutAttributeWidth: return item->maxX - item->minX;
+-    case NSLayoutAttributeHeight: return item->maxY - item->minY;
+-    case NSLayoutAttributeCenterX: return (item->minX + item->maxX) / 2;
+-    case NSLayoutAttributeCenterY: return (item->minY + item->maxY) / 2;
+-    default: return 0;
++- (void)setActive:(BOOL)flag {
++    if (!flag) {
++        if (_owner != nil)
++            [(NSView *)_owner removeConstraint:self];
++        _active = NO;
++        return;
+     }
+-}
+-
+-// moving one edge: the view keeps its size unless its other edge is pinned
+-static void setEdge(CGFloat *edge, CGFloat *other, BOOL *pin, BOOL otherPinned, CGFloat value) {
+-    if (!otherPinned)
+-        *other += value - *edge;
+-    *edge = value;
+-    *pin = YES;
+-}
+-
+-// a size: the free edge moves, a view pinned on both sides keeps what the edges say
+-static void setSize(CGFloat *min, CGFloat *max, BOOL *pinMin, BOOL *pinMax, CGFloat value) {
+-    if (*pinMin && *pinMax)
++    if (_owner != nil)
+         return;
+-    if (*pinMax)
+-        *min = *max - value;
++
++    NSView *first = [_firstItem isKindOfClass:[NSView class]] ? _firstItem : nil;
++    NSView *second = [_secondItem isKindOfClass:[NSView class]] ? _secondItem : nil;
++    NSView *holder;
++
++    if (first != nil && second != nil && first != second)
++        holder = [first ancestorSharedWithView:second];
++    else {
++        NSView *only = first ? first : second;
++
++        holder = [only superview] ? [only superview] : only;
++    }
++    if (holder != nil)
++        [holder addConstraint:self];
+     else
+-        *max = *min + value;
++        _active = YES;    // items that are not views (or share no ancestor yet): kept as data
+ }
+ 
+-static void setCenter(CGFloat *min, CGFloat *max, BOOL pinMin, BOOL pinMax, CGFloat value) {
+-    CGFloat shift = value - (*min + *max) / 2;
++@end
+ 
+-    if (pinMin || pinMax)
+-        return;
+-    *min += shift;
+-    *max += shift;
++static const char constraintsKey, translatesKey, needsLayoutKey;
++
++// one view in a layout: its alignment rectangle as four solver variables, in points from the layout
++// root's top left corner with y running down (Auto Layout's coordinates, whichever way a view is flipped)
++typedef struct {
++    NSView *view;
++    SFSolverVariable left, top, width, height;
++    int ancestor;      // the nearest view above it that is in the layout too, -1 for the root
++    int depth;
++    BOOL given;        // its frame is not the layout's to set (autoresizing, or the root)
++} SFLayoutItem;
++
++typedef struct {
++    SFSolver *solver;
++    SFLayoutItem *items;
++    int count, capacity;
++    CFMutableDictionaryRef index;    // view -> item number + 1
++} SFLayout;
++
++static int layoutItemFor(SFLayout *layout, NSView *view) {
++    return (int)(intptr_t)CFDictionaryGetValue(layout->index, view) - 1;
++}
++
++static int layoutAddItem(SFLayout *layout, NSView *view) {
++    int at = layoutItemFor(layout, view);
++
++    if (at >= 0)
++        return at;
++    if (layout->count == layout->capacity) {
++        layout->capacity = layout->capacity ? layout->capacity * 2 : 32;
++        layout->items = realloc(layout->items, layout->capacity * sizeof(SFLayoutItem));
++    }
++    at = layout->count++;
++    memset(&layout->items[at], 0, sizeof(SFLayoutItem));
++    layout->items[at].view = view;
++    layout->items[at].left = SFSolverAddVariable(layout->solver);
++    layout->items[at].top = SFSolverAddVariable(layout->solver);
++    layout->items[at].width = SFSolverAddVariable(layout->solver);
++    layout->items[at].height = SFSolverAddVariable(layout->solver);
++    layout->items[at].ancestor = -1;
++    CFDictionarySetValue(layout->index, view, (void *)(intptr_t)(at + 1));
++    return at;
+ }
+ 
+-static void setAttribute(SFLayoutItem *item, NSLayoutAttribute attribute, CGFloat value, BOOL flipped) {
++// up to four terms of a linear expression over the solver's variables
++typedef struct {
++    SFSolverVariable variables[8];
++    double coefficients[8];
++    int count;
++    double constant;
++} SFExpression;
++
++static void term(SFExpression *e, SFSolverVariable variable, double coefficient) {
++    e->variables[e->count] = variable;
++    e->coefficients[e->count] = coefficient;
++    e->count++;
++}
++
++// adds scale * (the attribute of an item) to an expression; NO for an attribute that is not one
++// leading and trailing are left and right: this AppKit lays out left to right only
++static BOOL attributeTerms(SFExpression *e, SFLayoutItem *item, NSLayoutAttribute attribute, double scale) {
+     switch (attribute) {
+     case NSLayoutAttributeLeft: case NSLayoutAttributeLeading:
+-        setEdge(&item->minX, &item->maxX, &item->pinMinX, item->pinMaxX, value); break;
++        term(e, item->left, scale); return YES;
+     case NSLayoutAttributeRight: case NSLayoutAttributeTrailing:
+-        setEdge(&item->maxX, &item->minX, &item->pinMaxX, item->pinMinX, value); break;
++        term(e, item->left, scale); term(e, item->width, scale); return YES;
+     case NSLayoutAttributeTop:
+-        if (flipped)
+-            setEdge(&item->minY, &item->maxY, &item->pinMinY, item->pinMaxY, value);
+-        else
+-            setEdge(&item->maxY, &item->minY, &item->pinMaxY, item->pinMinY, value);
+-        break;
++        term(e, item->top, scale); return YES;
+     case NSLayoutAttributeBottom:
+-        if (flipped)
+-            setEdge(&item->maxY, &item->minY, &item->pinMaxY, item->pinMinY, value);
+-        else
+-            setEdge(&item->minY, &item->maxY, &item->pinMinY, item->pinMaxY, value);
+-        break;
+-    case NSLayoutAttributeWidth: setSize(&item->minX, &item->maxX, &item->pinMinX, &item->pinMaxX, value); break;
+-    case NSLayoutAttributeHeight: setSize(&item->minY, &item->maxY, &item->pinMinY, &item->pinMaxY, value); break;
+-    case NSLayoutAttributeCenterX: setCenter(&item->minX, &item->maxX, item->pinMinX, item->pinMaxX, value); break;
+-    case NSLayoutAttributeCenterY: setCenter(&item->minY, &item->maxY, item->pinMinY, item->pinMaxY, value); break;
+-    default: break;
++        term(e, item->top, scale); term(e, item->height, scale); return YES;
++    case NSLayoutAttributeWidth:
++        term(e, item->width, scale); return YES;
++    case NSLayoutAttributeHeight:
++        term(e, item->height, scale); return YES;
++    case NSLayoutAttributeCenterX:
++        term(e, item->left, scale); term(e, item->width, scale / 2); return YES;
++    case NSLayoutAttributeCenterY:
++        term(e, item->top, scale); term(e, item->height, scale / 2); return YES;
++    case NSLayoutAttributeLastBaseline:
++        term(e, item->top, scale); term(e, item->height, scale);
++        e->constant -= scale * [item->view lastBaselineOffsetFromBottom]; return YES;
++    case NSLayoutAttributeFirstBaseline:
++        term(e, item->top, scale);
++        e->constant += scale * [item->view firstBaselineOffsetFromTop]; return YES;
++    default:
++        return NO;
+     }
+ }
+ 
+-static BOOL isHorizontal(NSLayoutAttribute attribute) {
+-    return attribute == NSLayoutAttributeLeft || attribute == NSLayoutAttributeRight || attribute == NSLayoutAttributeLeading ||
+-           attribute == NSLayoutAttributeTrailing || attribute == NSLayoutAttributeWidth || attribute == NSLayoutAttributeCenterX;
++static void require(SFLayout *layout, SFSolverVariable a, double ca, SFSolverVariable b, double cb, double constant,
++                    int relation, double priority) {
++    SFSolverVariable variables[2] = { a, b };
++    double coefficients[2] = { ca, cb };
++
++    SFSolverAddConstraint(layout->solver, variables, coefficients, b ? 2 : 1, constant, relation, priority);
++}
++
++// the constraints every view in the subtree holds, those that are active
++static void collectConstraints(NSView *view, NSMutableArray *into) {
++    NSArray *held = objc_getAssociatedObject(view, &constraintsKey);
++
++    for (NSLayoutConstraint *c in held) {
++        if ([c isActive])
++            [into addObject:c];
++    }
++    for (NSView *subview in [view subviews])
++        collectConstraints(subview, into);
+ }
+ 
++// a view's place in the bounds of one above it, as an alignment rectangle from that one's top left
++static NSRect placeIn(NSView *view, NSView *above) {
++    NSRect rect = [view convertRect:[view bounds] toView:above];
++    NSRect bounds = [above bounds];
++    NSEdgeInsets insets = [view alignmentRectInsets];
++    NSRect place;
++
++    place.origin.x = NSMinX(rect) - NSMinX(bounds) + insets.left;
++    place.origin.y = ([above isFlipped] ? NSMinY(rect) - NSMinY(bounds) : NSMaxY(bounds) - NSMaxY(rect)) + insets.top;
++    place.size.width = rect.size.width - insets.left - insets.right;
++    place.size.height = rect.size.height - insets.top - insets.bottom;
++    return place;
++}
++
++static int sfLayoutApplying;       // frames are being set from a solution: the layouts that sets off are not run
++static BOOL sfLayoutSubtreePass;   // one -layoutSubtreeIfNeeded is under way, and its tree has been solved
++
+ @implementation NSView (NSConstraintBasedLayout)
+ 
+-static const char constraintsKey, translatesKey;
++
+ 
+ - (NSMutableArray *)_sfConstraints:(BOOL)create {
+     NSMutableArray *list = objc_getAssociatedObject(self, &constraintsKey);
+@@ -131,8 +216,10 @@
+ - (void)addConstraint:(NSLayoutConstraint *)constraint {
+     if (constraint == nil)
+         return;
+-    [[self _sfConstraints:YES] addObject:constraint];
+-    [constraint _setOwner:self];
++    if ([[self _sfConstraints:YES] indexOfObjectIdenticalTo:constraint] == NSNotFound)
++        [[self _sfConstraints:YES] addObject:constraint];
++    [constraint _sfInstalledOn:self];
++    [self setNeedsLayout:YES];
+ }
+ 
+ - (void)addConstraints:(NSArray *)constraints {
+@@ -141,8 +228,10 @@
+ }
+ 
+ - (void)removeConstraint:(NSLayoutConstraint *)constraint {
+-    [constraint _setOwner:nil];
++    [[constraint retain] autorelease];
+     [[self _sfConstraints:NO] removeObjectIdenticalTo:constraint];
++    [constraint _sfInstalledOn:nil];
++    [self setNeedsLayout:YES];
+ }
+ 
+ - (void)removeConstraints:(NSArray *)constraints {
+@@ -161,104 +250,270 @@
+ }
+ 
+ - (void)layoutSubtreeIfNeeded {
++    [self updateConstraintsForSubtreeIfNeeded];
++    [self _sfLayoutSubtree];
++}
++
++// the tree is solved once, at the view asked; below it only a subclass's own -layout has more to do
++- (void)_sfLayoutSubtree {
++    BOOL outermost = !sfLayoutSubtreePass;
++
++    if ([self needsLayout]) {
++        objc_setAssociatedObject(self, &needsLayoutKey, nil, OBJC_ASSOCIATION_RETAIN);
++        [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(_sfLayoutPending) object:nil];
++    }
++    if (outermost) {
++        NSView *top = self;
++
++        while ([top superview] != nil)
++            top = [top superview];
++        for (int pass = 0; pass < 2 && sfLayoutApplying == 0; pass++)
++            [top _sfLayoutTreeFitting:NO apply:YES];
++        sfLayoutSubtreePass = YES;
++    }
+     [self _sfLayoutConstraints];
+     for (NSView *subview in [self subviews])
+-        [subview layoutSubtreeIfNeeded];
++        [subview _sfLayoutSubtree];
++    if (outermost)
++        sfLayoutSubtreePass = NO;
++}
++
++- (BOOL)needsLayout {
++    return objc_getAssociatedObject(self, &needsLayoutKey) != nil;
+ }
+ 
++/* One layout at the end of the current turn of the run loop however often it is asked for: views
++ * are usually given their constraints one at a time, and laying out after each would be both
++ * slow and, half way through, wrong. -layoutSubtreeIfNeeded does it at once. */
+ - (void)setNeedsLayout:(BOOL)flag {
+-    if (flag)
+-        [self _sfLayoutConstraints];
++    if (flag == [self needsLayout])
++        return;
++    if (flag) {
++        objc_setAssociatedObject(self, &needsLayoutKey, [NSNumber numberWithBool:YES], OBJC_ASSOCIATION_RETAIN);
++        [self performSelector:@selector(_sfLayoutPending) withObject:nil afterDelay:0];
++    } else {
++        objc_setAssociatedObject(self, &needsLayoutKey, nil, OBJC_ASSOCIATION_RETAIN);
++        [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(_sfLayoutPending) object:nil];
++    }
+ }
+ 
+-// solves the equalities this view holds for its direct subviews by relaxation: each pass sets the first
+-// item's attribute (or the second's when the first is this view), and a few passes settle chains of them
++- (void)_sfLayoutPending {
++    objc_setAssociatedObject(self, &needsLayoutKey, nil, OBJC_ASSOCIATION_RETAIN);
++    [self updateConstraintsForSubtreeIfNeeded];
++    [self _sfLayoutConstraints];
++}
++
++// the hook every layout goes through (a resize, -setNeedsLayout:, -layoutSubtreeIfNeeded), so that a
++// subclass's -layout is what runs; NSView's own -layout comes back to -_sfSolveConstraints
+ - (void)_sfLayoutConstraints {
+-    NSArray *constraints = [self _sfConstraints:NO];
+-    NSArray *subviews = [self subviews];
+-    NSUInteger count = [subviews count];
+-    BOOL flipped = [self isFlipped];
++    [self layout];
++}
+ 
+-    if ([constraints count] == 0 || count == 0)
+-        return;
++/* One layout of the tree under `root`. Every active constraint held anywhere in that tree whose
++ * items are views of the tree takes part, whichever view holds it. The views the constraints name
++ * are the layout's items:
++ *   - a view laid out by constraints (translatesAutoresizingMaskIntoConstraints off) is free: its
++ *     four variables are the solver's to set, its intrinsic size holds it at its hugging and
++ *     compression resistance priorities, and its size is never negative;
++ *   - any other view named is given: it stays where it is in the nearest item above it;
++ *   - the root's box is given too - unless `fitting` is set, when its width and height are free
++ *     and as small as the rest allows (that is -fittingSize, at the priority AppKit uses for it).
++ * With `apply`, free views get their frames. Returns the root's solved alignment size. */
++- (NSSize)_sfLayoutTreeFitting:(BOOL)fitting apply:(BOOL)apply {
++    NSMutableArray *constraints = [NSMutableArray array];
++    NSSize result = [self bounds].size;
++    static BOOL warned;
++
++    collectConstraints(self, constraints);
++    if ([constraints count] == 0)
++        return fitting ? NSZeroSize : result;
++
++    SFLayout layout = { SFSolverCreate(), NULL, 0, 0, CFDictionaryCreateMutable(NULL, 0, NULL, NULL) };
++    int root = layoutAddItem(&layout, self);
++
++    layout.items[root].given = !fitting;
++
++    // the items, then for each the nearest item above it
++    for (NSLayoutConstraint *c in constraints) {
++        for (int which = 0; which < 2; which++) {
++            id item = which ? [c secondItem] : [c firstItem];
+ 
+-    SFLayoutItem *items = calloc(count + 1, sizeof(SFLayoutItem));
+-    NSRect bounds = [self bounds];
++            if ([item isKindOfClass:[NSView class]] && (item == self || [item isDescendantOf:self]))
++                layoutAddItem(&layout, item);
++        }
++    }
++    for (int i = 0; i < layout.count; i++) {
++        NSView *view = layout.items[i].view;
++        int depth = 0;
++
++        if (i == root)
++            continue;
++        layout.items[i].given = [view translatesAutoresizingMaskIntoConstraints];
++        for (NSView *above = [view superview]; above != nil; above = [above superview]) {
++            depth++;
++            if (layout.items[i].ancestor < 0)
++                layout.items[i].ancestor = layoutItemFor(&layout, above);
++            if (above == self)
++                break;
++        }
++        layout.items[i].depth = depth;
++    }
+ 
+-    items[0].view = self;
+-    items[0].minX = NSMinX(bounds), items[0].maxX = NSMaxX(bounds);
+-    items[0].minY = NSMinY(bounds), items[0].maxY = NSMaxY(bounds);
+-    for (NSUInteger i = 0; i < count; i++) {
+-        NSView *view = [subviews objectAtIndex:i];
+-        NSRect frame = [view frame];
+-
+-        items[i + 1].view = view;
+-        items[i + 1].minX = NSMinX(frame), items[i + 1].maxX = NSMaxX(frame);
+-        items[i + 1].minY = NSMinY(frame), items[i + 1].maxY = NSMaxY(frame);
+-    }
+-
+-    for (int pass = 0; pass < 4; pass++) {
+-        for (NSUInteger i = 1; i <= count; i++)
+-            items[i].pinMinX = items[i].pinMaxX = items[i].pinMinY = items[i].pinMaxY = NO;
+-
+-        // edges first, then sizes and centres, so a size gives way to the edges around it
+-        for (int phase = 0; phase < 2; phase++) {
+-            for (NSLayoutConstraint *c in constraints) {
+-                NSLayoutAttribute a1 = [c firstAttribute], a2 = [c secondAttribute];
+-                BOOL sizeOrCenter = a1 == NSLayoutAttributeWidth || a1 == NSLayoutAttributeHeight ||
+-                                    a1 == NSLayoutAttributeCenterX || a1 == NSLayoutAttributeCenterY;
++    // what holds each item
++    for (int i = 0; i < layout.count; i++) {
++        SFLayoutItem *item = &layout.items[i];
++        NSView *view = item->view;
++
++        if (i == root) {
++            NSRect bounds = [view bounds];
++            NSEdgeInsets insets = [view alignmentRectInsets];
++
++            require(&layout, item->left, 1, 0, 0, 0, SFSolverEqual, SFSolverRequired);
++            require(&layout, item->top, 1, 0, 0, 0, SFSolverEqual, SFSolverRequired);
++            if (!fitting) {
++                require(&layout, item->width, 1, 0, 0, -(bounds.size.width - insets.left - insets.right), SFSolverEqual, SFSolverRequired);
++                require(&layout, item->height, 1, 0, 0, -(bounds.size.height - insets.top - insets.bottom), SFSolverEqual, SFSolverRequired);
++                continue;
++            }
++        } else if (item->given) {
++            SFLayoutItem *above = &layout.items[item->ancestor];
++            NSRect place = placeIn(view, above->view);
++            NSEdgeInsets insets = [above->view alignmentRectInsets];
++
++            // `above` is known by its alignment rectangle, the place was measured in its bounds
++            require(&layout, item->left, 1, above->left, -1, -(place.origin.x - insets.left), SFSolverEqual, SFSolverRequired);
++            require(&layout, item->top, 1, above->top, -1, -(place.origin.y - insets.top), SFSolverEqual, SFSolverRequired);
++            require(&layout, item->width, 1, 0, 0, -place.size.width, SFSolverEqual, SFSolverRequired);
++            require(&layout, item->height, 1, 0, 0, -place.size.height, SFSolverEqual, SFSolverRequired);
++            continue;
++        }
+ 
+-                if ([c relation] != NSLayoutRelationEqual || [c priority] < NSLayoutPriorityRequired || ![c isActive])
+-                    continue;
+-                if (sizeOrCenter != (phase == 1))
+-                    continue;
++        NSSize intrinsic = [view intrinsicContentSize];
+ 
+-                SFLayoutItem *first = itemFor(items, count + 1, [c firstItem]);
+-                SFLayoutItem *second = [c secondItem] ? itemFor(items, count + 1, [c secondItem]) : NULL;
+-                CGFloat multiplier = [c multiplier] ? [c multiplier] : 1;
++        require(&layout, item->width, 1, 0, 0, 0, SFSolverGreaterOrEqual, SFSolverRequired);
++        require(&layout, item->height, 1, 0, 0, 0, SFSolverGreaterOrEqual, SFSolverRequired);
++        if (intrinsic.width >= 0) {
++            require(&layout, item->width, 1, 0, 0, -intrinsic.width, SFSolverLessOrEqual,
++                    [view contentHuggingPriorityForOrientation:NSLayoutConstraintOrientationHorizontal]);
++            require(&layout, item->width, 1, 0, 0, -intrinsic.width, SFSolverGreaterOrEqual,
++                    [view contentCompressionResistancePriorityForOrientation:NSLayoutConstraintOrientationHorizontal]);
++        }
++        if (intrinsic.height >= 0) {
++            require(&layout, item->height, 1, 0, 0, -intrinsic.height, SFSolverLessOrEqual,
++                    [view contentHuggingPriorityForOrientation:NSLayoutConstraintOrientationVertical]);
++            require(&layout, item->height, 1, 0, 0, -intrinsic.height, SFSolverGreaterOrEqual,
++                    [view contentCompressionResistancePriorityForOrientation:NSLayoutConstraintOrientationVertical]);
++        }
++        if (i == root) {
++            // NSLayoutPriorityFittingSizeCompression
++            require(&layout, item->width, 1, 0, 0, 0, SFSolverEqual, 50);
++            require(&layout, item->height, 1, 0, 0, 0, SFSolverEqual, 50);
++        }
++    }
+ 
+-                if (first == NULL || ([c secondItem] != nil && second == NULL))
+-                    continue;
+-                if (second != NULL && isHorizontal(a1) != isHorizontal(a2) && a1 != NSLayoutAttributeWidth &&
+-                    a1 != NSLayoutAttributeHeight)
+-                    continue;
++    // the constraints themselves: first - multiplier * second - constant (relation) 0
++    for (NSLayoutConstraint *c in constraints) {
++        id firstItem = [c firstItem], secondItem = [c secondItem];
++        int first = [firstItem isKindOfClass:[NSView class]] ? layoutItemFor(&layout, firstItem) : -1;
++        int second = [secondItem isKindOfClass:[NSView class]] ? layoutItemFor(&layout, secondItem) : -1;
++        CGFloat multiplier = [c multiplier] ? [c multiplier] : 1;
++        SFExpression e = { { 0 }, { 0 }, 0, -[c constant] };
++
++        if (first < 0 || (secondItem != nil && second < 0))
++            continue;
++        if (!attributeTerms(&e, &layout.items[first], [c firstAttribute], 1))
++            continue;
++        if (second >= 0 && !attributeTerms(&e, &layout.items[second], [c secondAttribute], -multiplier))
++            continue;
++        if (!SFSolverAddConstraint(layout.solver, e.variables, e.coefficients, e.count, e.constant, (int)[c relation],
++                                   [c priority]) && !warned) {
++            // as AppKit does: the constraint that cannot hold with the others is broken, and said once
++            NSLog(@"Unable to simultaneously satisfy constraints: leaving out %@ (first=%@ second=%@)", c,
++                  [firstItem class], [secondItem class]);
++            warned = YES;
++        }
++    }
+ 
+-                // this view's own frame is given: solve for the other item instead
+-                if (first == &items[0]) {
+-                    if (second == NULL || second == &items[0])
+-                        continue;
+-                    setAttribute(second, a2, (attributeValue(first, a1, flipped) - [c constant]) / multiplier, flipped);
+-                    continue;
+-                }
++    result.width = SFSolverValue(layout.solver, layout.items[root].width);
++    result.height = SFSolverValue(layout.solver, layout.items[root].height);
+ 
+-                CGFloat value = (second ? attributeValue(second, a2, flipped) * multiplier : 0) + [c constant];
++    if (apply) {
++        // parents before children: a child's frame is said in the bounds its parent has just been given
++        int maxDepth = 0;
++
++        for (int i = 0; i < layout.count; i++)
++            maxDepth = layout.items[i].depth > maxDepth ? layout.items[i].depth : maxDepth;
++        sfLayoutApplying++;
++        for (int depth = 1; depth <= maxDepth; depth++) {
++            for (int i = 0; i < layout.count; i++) {
++                SFLayoutItem *item = &layout.items[i];
++
++                if (item->depth != depth || item->given || i == root)
++                    continue;
+ 
+-                // two siblings' edges: the larger view moves its edge, so sidebars and bars keep their size
+-                if (second != NULL && second != &items[0] && second != first && !sizeOrCenter) {
+-                    CGFloat firstSize = isHorizontal(a1) ? first->maxX - first->minX : first->maxY - first->minY;
+-                    CGFloat secondSize = isHorizontal(a2) ? second->maxX - second->minX : second->maxY - second->minY;
+-
+-                    if (secondSize > firstSize) {
+-                        setAttribute(second, a2, (attributeValue(first, a1, flipped) - [c constant]) / multiplier, flipped);
+-                        continue;
+-                    }
++                SFLayoutItem *above = &layout.items[item->ancestor];
++                NSView *view = item->view, *holder = above->view, *superview = [view superview];
++                NSEdgeInsets insets = [view alignmentRectInsets], aboveInsets = [holder alignmentRectInsets];
++                NSRect bounds = [holder bounds], frame;
++                CGFloat x = SFSolverValue(layout.solver, item->left) - SFSolverValue(layout.solver, above->left);
++                CGFloat y = SFSolverValue(layout.solver, item->top) - SFSolverValue(layout.solver, above->top);
++
++                frame.size.width = fmax(0, SFSolverValue(layout.solver, item->width) + insets.left + insets.right);
++                frame.size.height = fmax(0, SFSolverValue(layout.solver, item->height) + insets.top + insets.bottom);
++                frame.origin.x = NSMinX(bounds) + aboveInsets.left + x - insets.left;
++                y += aboveInsets.top - insets.top;
++                frame.origin.y = [holder isFlipped] ? NSMinY(bounds) + y : NSMaxY(bounds) - y - frame.size.height;
++                if (superview != holder)
++                    frame = [superview convertRect:frame fromView:holder];
++                // on whole device pixels, as AppKit leaves them (half points exist only at 2x)
++                {
++                    CGFloat scale = [view window] ? [[view window] backingScaleFactor] : [[NSScreen mainScreen] backingScaleFactor];
++                    CGFloat right, top;
++
++                    if (scale <= 0)
++                        scale = 1;
++                    right = round(NSMaxX(frame) * scale) / scale;
++                    top = round(NSMaxY(frame) * scale) / scale;
++                    frame.origin.x = round(frame.origin.x * scale) / scale;
++                    frame.origin.y = round(frame.origin.y * scale) / scale;
++                    frame.size.width = right - frame.origin.x;
++                    frame.size.height = top - frame.origin.y;
++                }
++                if (fabs(frame.origin.x - [view frame].origin.x) > 0.01 || fabs(frame.origin.y - [view frame].origin.y) > 0.01 ||
++                    fabs(frame.size.width - [view frame].size.width) > 0.01 ||
++                    fabs(frame.size.height - [view frame].size.height) > 0.01) {
++                    [view setFrame:frame];
++                    [view setNeedsDisplay:YES];
+                 }
+-                setAttribute(first, a1, value, flipped);
+             }
+         }
++        sfLayoutApplying--;
+     }
+ 
+-    for (NSUInteger i = 1; i <= count; i++) {
+-        NSRect frame = NSMakeRect(items[i].minX, items[i].minY, fmax(0, items[i].maxX - items[i].minX),
+-                                  fmax(0, items[i].maxY - items[i].minY));
+-
+-        if (!NSEqualRects(frame, [items[i].view frame])) {
+-            [items[i].view setFrame:frame];
+-            [items[i].view setNeedsDisplay:YES];
+-        }
+-    }
+-    free(items);
+-    [self setNeedsDisplay:YES];
++    SFSolverFree(layout.solver);
++    CFRelease(layout.index);
++    free(layout.items);
++    return result;
++}
++
++/* What NSView's -layout does. A view that holds no constraints has nothing to say; one that does has
++ * the whole tree it is in laid out, since a constraint may tie any two views of a window together.
++ * Views whose frames autoresizing moves when their parents are given new ones (the given items)
++ * are measured again on a second pass. */
++- (void)_sfSolveConstraints {
++    NSView *top = self;
++
++    if (sfLayoutApplying > 0 || sfLayoutSubtreePass || [[self _sfConstraints:NO] count] == 0)
++        return;
++    while ([top superview] != nil)
++        top = [top superview];
++    for (int pass = 0; pass < 2; pass++)
++        [top _sfLayoutTreeFitting:NO apply:YES];
++}
++
++// the smallest box the constraints in this view's tree leave room for (-fittingSize), as an alignment size
++- (NSSize)_sfFittingSize {
++    return [self _sfLayoutTreeFitting:YES apply:NO];
+ }
+ 
+ @end
+--- a/src/Frameworks/AppKit/NSModernAppKit.h
++++ b/src/Frameworks/AppKit/NSModernAppKit.h
+@@ -264,3 +264,6 @@
+ - (void)moveParagraphBackwardAndModifySelection:(id)sender;
+ - (void)startDictation:(id)sender;
+ @end
++
++// the rest of what a view tells Auto Layout: intrinsic size, alignment rectangle, baselines
++#import <AppKit/NSViewLayout.h>
+--- a/src/Frameworks/AppKit/NSModernAppKit.m
++++ b/src/Frameworks/AppKit/NSModernAppKit.m
+@@ -763,13 +763,17 @@
+ 
+ static char SFHuggingKey[2];
+ 
++@interface NSView (ContentHuggingDefault)
++- (NSLayoutPriority)_sfDefaultContentHuggingPriorityForOrientation:(NSLayoutConstraintOrientation)orientation;
++@end
++
+ @implementation NSView (ContentHugging)
+ 
+ - (NSLayoutPriority)contentHuggingPriorityForOrientation:(NSLayoutConstraintOrientation)orientation
+ {
+     NSNumber *value = SFGet(self, &SFHuggingKey[orientation ? 1 : 0]);
+ 
+-    return value ? [value floatValue] : 250;
++    return value ? [value floatValue] : [self _sfDefaultContentHuggingPriorityForOrientation:orientation];
+ }
+ 
+ - (void)setContentHuggingPriority:(NSLayoutPriority)priority forOrientation:(NSLayoutConstraintOrientation)orientation
+--- a/src/Frameworks/AppKit/SFLayoutSolver.h
++++ b/src/Frameworks/AppKit/SFLayoutSolver.h
+@@ -0,0 +1,33 @@
++// SFLayoutSolver.h - the linear constraint solver under Auto Layout
++// Copyright (c) 2026 The SiliconForest contributors, SPDX-License-Identifier: MPL-2.0 OR BSD-2-Clause
++//
++// An incremental simplex solver for linear equalities and inequalities with strengths, after
++// Badros, Borning and Stuckey, "The Cassowary Linear Arithmetic Constraint Solving Algorithm"
++// (ACM TOCHI 8(4), 2001). Written for this tree from the paper; constraints are only ever added
++// (a layout builds a solver, reads the answer and throws it away), so the paper's removal and
++// edit-variable machinery is not here.
++#ifndef SFLAYOUTSOLVER_H
++#define SFLAYOUTSOLVER_H
++
++typedef struct SFSolver SFSolver;
++typedef int SFSolverVariable;
++
++enum { SFSolverLessOrEqual = -1, SFSolverEqual = 0, SFSolverGreaterOrEqual = 1 };
++
++// a strength at or above this is "must hold"
++#define SFSolverRequired 1000.0
++
++SFSolver *SFSolverCreate(void);
++void SFSolverFree(SFSolver *solver);
++SFSolverVariable SFSolverAddVariable(SFSolver *solver);
++
++/* Adds: sum(coefficients[i] * variables[i]) + constant  (relation)  0, at an Auto Layout
++ * priority (1...1000). Returns 1, or 0 when the constraint is required and cannot hold together
++ * with the required ones already there - it is then left out. */
++int SFSolverAddConstraint(SFSolver *solver, const SFSolverVariable *variables, const double *coefficients,
++                          int count, double constant, int relation, double priority);
++
++// a variable's value in the current solution (0 for one no constraint mentions)
++double SFSolverValue(SFSolver *solver, SFSolverVariable variable);
++
++#endif
+--- a/src/Frameworks/AppKit/SFLayoutSolver.m
++++ b/src/Frameworks/AppKit/SFLayoutSolver.m
+@@ -0,0 +1,403 @@
++// SFLayoutSolver.m - the linear constraint solver under Auto Layout (see SFLayoutSolver.h)
++// Copyright (c) 2026 The SiliconForest contributors, SPDX-License-Identifier: MPL-2.0 OR BSD-2-Clause
++#import "SFLayoutSolver.h"
++#include <stdlib.h>
++#include <string.h>
++#include <math.h>
++
++/* Symbols. External ones are the caller's variables and may take any value; slack and error
++ * symbols are the solver's own and never negative; a dummy stands for a required equality and
++ * never enters the basis. */
++enum { SYM_INVALID = 0, SYM_EXTERNAL, SYM_SLACK, SYM_ERROR, SYM_DUMMY };
++
++typedef int Symbol;    // index into SFSolver.kinds, 0 is "none"
++
++// a linear expression: constant + sum(coefficient * symbol)
++typedef struct {
++    double constant;
++    int count, capacity;
++    Symbol *symbols;
++    double *coefficients;
++} Row;
++
++struct SFSolver {
++    int symbolCount, symbolCapacity;
++    unsigned char *kinds;
++    Row **rows;            // by basic symbol: the row that defines it, or NULL when it is not basic
++    Row objective;
++    Row *artificial;
++};
++
++static const double epsilon = 1.0e-8;
++
++static int nearZero(double value) {
++    return value < 0 ? -value < epsilon : value < epsilon;
++}
++
++static void rowFree(Row *row) {
++    free(row->symbols);
++    free(row->coefficients);
++    row->symbols = NULL, row->coefficients = NULL, row->count = row->capacity = 0;
++}
++
++static Row *rowCopy(const Row *row) {
++    Row *copy = calloc(1, sizeof(Row));
++
++    copy->constant = row->constant;
++    copy->count = copy->capacity = row->count;
++    if (row->count > 0) {
++        copy->symbols = malloc(row->count * sizeof(Symbol));
++        copy->coefficients = malloc(row->count * sizeof(double));
++        memcpy(copy->symbols, row->symbols, row->count * sizeof(Symbol));
++        memcpy(copy->coefficients, row->coefficients, row->count * sizeof(double));
++    }
++    return copy;
++}
++
++static int rowFind(const Row *row, Symbol symbol) {
++    for (int i = 0; i < row->count; i++) {
++        if (row->symbols[i] == symbol)
++            return i;
++    }
++    return -1;
++}
++
++static double rowCoefficient(const Row *row, Symbol symbol) {
++    int i = rowFind(row, symbol);
++
++    return i < 0 ? 0 : row->coefficients[i];
++}
++
++static void rowRemoveAt(Row *row, int i) {
++    row->count--;
++    row->symbols[i] = row->symbols[row->count];
++    row->coefficients[i] = row->coefficients[row->count];
++}
++
++static void rowRemove(Row *row, Symbol symbol) {
++    int i = rowFind(row, symbol);
++
++    if (i >= 0)
++        rowRemoveAt(row, i);
++}
++
++// row += coefficient * symbol; a term that cancels out is dropped
++static void rowAdd(Row *row, Symbol symbol, double coefficient) {
++    int i = rowFind(row, symbol);
++
++    if (i >= 0) {
++        row->coefficients[i] += coefficient;
++        if (nearZero(row->coefficients[i]))
++            rowRemoveAt(row, i);
++        return;
++    }
++    if (nearZero(coefficient))
++        return;
++    if (row->count == row->capacity) {
++        row->capacity = row->capacity ? row->capacity * 2 : 8;
++        row->symbols = realloc(row->symbols, row->capacity * sizeof(Symbol));
++        row->coefficients = realloc(row->coefficients, row->capacity * sizeof(double));
++    }
++    row->symbols[row->count] = symbol;
++    row->coefficients[row->count] = coefficient;
++    row->count++;
++}
++
++// row += coefficient * other
++static void rowAddRow(Row *row, const Row *other, double coefficient) {
++    row->constant += other->constant * coefficient;
++    for (int i = 0; i < other->count; i++)
++        rowAdd(row, other->symbols[i], other->coefficients[i] * coefficient);
++}
++
++static void rowReverseSign(Row *row) {
++    row->constant = -row->constant;
++    for (int i = 0; i < row->count; i++)
++        row->coefficients[i] = -row->coefficients[i];
++}
++
++/* The row says 0 = constant + ... + c * symbol + ...; afterwards it says
++ * symbol = -constant/c - .../c, with the symbol gone from the right side. */
++static void rowSolveFor(Row *row, Symbol symbol) {
++    int at = rowFind(row, symbol);
++    double scale = -1.0 / row->coefficients[at];
++
++    rowRemoveAt(row, at);
++    row->constant *= scale;
++    for (int i = 0; i < row->count; i++)
++        row->coefficients[i] *= scale;
++}
++
++// the row says left = ...right...; afterwards it says right = ...left...
++static void rowSolveForPair(Row *row, Symbol left, Symbol right) {
++    rowAdd(row, left, -1.0);
++    rowSolveFor(row, right);
++}
++
++// replaces a symbol by the row that defines it
++static void rowSubstitute(Row *row, Symbol symbol, const Row *definition) {
++    int at = rowFind(row, symbol);
++
++    if (at >= 0) {
++        double coefficient = row->coefficients[at];
++
++        rowRemoveAt(row, at);
++        rowAddRow(row, definition, coefficient);
++    }
++}
++
++static Symbol newSymbol(SFSolver *solver, int kind) {
++    if (solver->symbolCount == solver->symbolCapacity) {
++        int capacity = solver->symbolCapacity ? solver->symbolCapacity * 2 : 64;
++
++        solver->kinds = realloc(solver->kinds, capacity);
++        solver->rows = realloc(solver->rows, capacity * sizeof(Row *));
++        memset(solver->rows + solver->symbolCapacity, 0, (capacity - solver->symbolCapacity) * sizeof(Row *));
++        solver->symbolCapacity = capacity;
++    }
++    solver->kinds[solver->symbolCount] = kind;
++    solver->rows[solver->symbolCount] = NULL;
++    return solver->symbolCount++;
++}
++
++SFSolver *SFSolverCreate(void) {
++    SFSolver *solver = calloc(1, sizeof(SFSolver));
++
++    newSymbol(solver, SYM_INVALID);    // symbol 0 is "none"
++    return solver;
++}
++
++void SFSolverFree(SFSolver *solver) {
++    if (solver == NULL)
++        return;
++    for (int i = 0; i < solver->symbolCount; i++) {
++        if (solver->rows[i] != NULL) {
++            rowFree(solver->rows[i]);
++            free(solver->rows[i]);
++        }
++    }
++    rowFree(&solver->objective);
++    if (solver->artificial != NULL) {
++        rowFree(solver->artificial);
++        free(solver->artificial);
++    }
++    free(solver->kinds);
++    free(solver->rows);
++    free(solver);
++}
++
++SFSolverVariable SFSolverAddVariable(SFSolver *solver) {
++    return newSymbol(solver, SYM_EXTERNAL);
++}
++
++double SFSolverValue(SFSolver *solver, SFSolverVariable variable) {
++    if (variable <= 0 || variable >= solver->symbolCount || solver->rows[variable] == NULL)
++        return 0;
++    return solver->rows[variable]->constant;
++}
++
++/* An Auto Layout priority as a weight in the objective. Cassowary's strengths are strictly
++ * ordered; in one sum of doubles that is approximated by weights that grow a thousandfold every
++ * 250 priority points (1 at 250, 1e3 at 500, 1e6 at 750, just under 1e9 at 999). Between two
++ * conflicting constraints the higher priority always wins, whatever the difference; only many
++ * low ones against one high one can outweigh it. */
++static double weightForPriority(double priority) {
++    if (priority < 1)
++        priority = 1;
++    return pow(1000.0, priority / 250.0 - 1.0);
++}
++
++// a symbol becomes basic, defined by `row`: every other row and the objective lose it
++static void substitute(SFSolver *solver, Symbol symbol, const Row *row) {
++    for (int i = 1; i < solver->symbolCount; i++) {
++        if (solver->rows[i] != NULL && solver->rows[i] != row)
++            rowSubstitute(solver->rows[i], symbol, row);
++    }
++    rowSubstitute(&solver->objective, symbol, row);
++    if (solver->artificial != NULL)
++        rowSubstitute(solver->artificial, symbol, row);
++}
++
++/* Minimises an objective by pivoting: a symbol with a negative coefficient in it enters the
++ * basis, in place of the basic symbol that reaches zero first as the entering one grows. */
++static void optimize(SFSolver *solver, Row *objective) {
++    for (int guard = 0; guard < 100000; guard++) {
++        Symbol entering = 0, leaving = 0;
++        double best = 0;
++
++        // Bland's rule (lowest index) on both choices: no cycling
++        for (int i = 0; i < objective->count; i++) {
++            Symbol s = objective->symbols[i];
++
++            if (solver->kinds[s] != SYM_DUMMY && objective->coefficients[i] < 0 && (entering == 0 || s < entering))
++                entering = s;
++        }
++        if (entering == 0)
++            return;
++
++        for (Symbol s = 1; s < solver->symbolCount; s++) {
++            Row *row = solver->rows[s];
++
++            if (row == NULL || solver->kinds[s] == SYM_EXTERNAL)
++                continue;
++
++            double coefficient = rowCoefficient(row, entering);
++
++            if (coefficient < 0) {
++                double ratio = -row->constant / coefficient;
++
++                if (leaving == 0 || ratio < best) {
++                    best = ratio;
++                    leaving = s;
++                }
++            }
++        }
++        if (leaving == 0)
++            return;    // unbounded: cannot happen with error symbols weighted positively
++
++        Row *row = solver->rows[leaving];
++
++        solver->rows[leaving] = NULL;
++        rowSolveForPair(row, leaving, entering);
++        substitute(solver, entering, row);
++        solver->rows[entering] = row;
++    }
++}
++
++// a row with no symbol that can be its subject gets an artificial one, driven to zero
++static int addWithArtificial(SFSolver *solver, Row *row) {
++    Symbol art = newSymbol(solver, SYM_SLACK);
++    int success;
++
++    solver->rows[art] = rowCopy(row);
++    solver->artificial = rowCopy(row);
++    optimize(solver, solver->artificial);
++    success = nearZero(solver->artificial->constant);
++    rowFree(solver->artificial);
++    free(solver->artificial);
++    solver->artificial = NULL;
++
++    Row *basic = solver->rows[art];
++
++    if (basic != NULL) {
++        solver->rows[art] = NULL;
++        if (basic->count == 0) {
++            rowFree(basic);
++            free(basic);
++            return success;
++        }
++
++        Symbol entering = 0;
++
++        for (int i = 0; i < basic->count; i++) {
++            int kind = solver->kinds[basic->symbols[i]];
++
++            if (kind == SYM_SLACK || kind == SYM_ERROR) {
++                entering = basic->symbols[i];
++                break;
++            }
++        }
++        if (entering == 0) {
++            rowFree(basic);
++            free(basic);
++            return 0;
++        }
++        rowSolveForPair(basic, art, entering);
++        substitute(solver, entering, basic);
++        solver->rows[entering] = basic;
++    }
++    for (int i = 1; i < solver->symbolCount; i++) {
++        if (solver->rows[i] != NULL)
++            rowRemove(solver->rows[i], art);
++    }
++    rowRemove(&solver->objective, art);
++    return success;
++}
++
++int SFSolverAddConstraint(SFSolver *solver, const SFSolverVariable *variables, const double *coefficients,
++                          int count, double constant, int relation, double priority) {
++    Row *row = calloc(1, sizeof(Row));
++    Symbol marker = 0, other = 0, subject = 0;
++    int required = priority >= SFSolverRequired;
++
++    // the expression, with every basic variable replaced by its definition
++    row->constant = constant;
++    for (int i = 0; i < count; i++) {
++        Symbol s = variables[i];
++
++        if (s <= 0 || s >= solver->symbolCount || nearZero(coefficients[i]))
++            continue;
++        if (solver->rows[s] != NULL)
++            rowAddRow(row, solver->rows[s], coefficients[i]);
++        else
++            rowAdd(row, s, coefficients[i]);
++    }
++
++    if (relation != SFSolverEqual) {
++        double coefficient = relation == SFSolverLessOrEqual ? 1.0 : -1.0;
++
++        marker = newSymbol(solver, SYM_SLACK);
++        rowAdd(row, marker, coefficient);
++        if (!required) {
++            other = newSymbol(solver, SYM_ERROR);
++            rowAdd(row, other, -coefficient);
++            rowAdd(&solver->objective, other, weightForPriority(priority));
++        }
++    } else if (!required) {
++        marker = newSymbol(solver, SYM_ERROR);
++        other = newSymbol(solver, SYM_ERROR);
++        rowAdd(row, marker, -1.0);
++        rowAdd(row, other, 1.0);
++        rowAdd(&solver->objective, marker, weightForPriority(priority));
++        rowAdd(&solver->objective, other, weightForPriority(priority));
++    } else {
++        marker = newSymbol(solver, SYM_DUMMY);
++        rowAdd(row, marker, 1.0);
++    }
++    if (row->constant < 0)
++        rowReverseSign(row);
++
++    // the subject: an external variable, else a new slack or error symbol with a negative coefficient
++    for (int i = 0; i < row->count; i++) {
++        if (solver->kinds[row->symbols[i]] == SYM_EXTERNAL && (subject == 0 || row->symbols[i] < subject))
++            subject = row->symbols[i];
++    }
++    if (subject == 0 && (solver->kinds[marker] == SYM_SLACK || solver->kinds[marker] == SYM_ERROR) &&
++        rowCoefficient(row, marker) < 0)
++        subject = marker;
++    if (subject == 0 && other != 0 && rowCoefficient(row, other) < 0)
++        subject = other;
++
++    if (subject == 0) {
++        int allDummies = 1;
++
++        for (int i = 0; i < row->count; i++) {
++            if (solver->kinds[row->symbols[i]] != SYM_DUMMY)
++                allDummies = 0;
++        }
++        if (allDummies) {
++            if (!nearZero(row->constant)) {
++                // a required constraint that contradicts the required ones before it
++                rowFree(row);
++                free(row);
++                return 0;
++            }
++            subject = marker;
++        }
++    }
++
++    if (subject == 0) {
++        int ok = addWithArtificial(solver, row);
++
++        rowFree(row);
++        free(row);
++        if (!ok)
++            return 0;
++    } else {
++        rowSolveFor(row, subject);
++        substitute(solver, subject, row);
++        solver->rows[subject] = row;
++    }
++    optimize(solver, &solver->objective);
++    return 1;
++}

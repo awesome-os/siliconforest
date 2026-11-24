@@ -1,0 +1,102 @@
+kernel: mm: reference counts and RSS counters only on LinuxKPI
+
+LinuxKPI's mm_struct is mm_count, mm_users and a lock; there are no VMAs to look up, no
+mmap lock API and no per-VMA locks. With cfg(sf_lkpi) `Mm`, `MmWithUser`, `RssCounter`,
+`add_rss_counter()` and `rss_counter()` are built (the C side is helpers/mm.c of
+m1-lkpi-extras, where the counters are documented no-ops) and `mm::virt`, `mmput_async`,
+the mmap read lock and the VMA read lock are compiled out. The Asahi driver uses exactly
+the first set (drivers/gpu/drm/asahi/memacct.rs).
+
+--- a/kernel/mm.rs
++++ b/kernel/mm.rs
+@@ -18,11 +18,18 @@
+ };
+ use core::{ops::Deref, ptr::NonNull};
+ 
++// SiliconForest: LinuxKPI's mm_struct is two reference counts (one static instance shared by
++// every task, never freed). `Mm`, `MmWithUser` and the RSS counter calls are built on it
++// (helpers/mm.c; the counters are no-ops). Everything that walks or locks a process's VMAs
++// has no counterpart: xnu's VM maps are not LinuxKPI's to read.
++#[cfg(not(sf_lkpi))]
+ pub mod virt;
++#[cfg(not(sf_lkpi))]
+ use virt::VmaRef;
+ 
+ #[cfg(CONFIG_MMU)]
+ pub use mmput_async::MmWithUserAsync;
++#[cfg(not(sf_lkpi))]
+ mod mmput_async;
+ 
+ /// A wrapper for the kernel's `struct mm_struct`.
+@@ -219,6 +226,7 @@
+         unsafe { &*ptr.cast() }
+     }
+ 
++    #[cfg(not(sf_lkpi))]
+     /// Attempt to access a vma using the vma read lock.
+     ///
+     /// This is an optimistic trylock operation, so it may fail if there is contention. In that
+@@ -249,6 +257,7 @@
+         None
+     }
+ 
++    #[cfg(not(sf_lkpi))]
+     /// Lock the mmap read lock.
+     #[inline]
+     pub fn mmap_read_lock(&self) -> MmapReadGuard<'_> {
+@@ -262,6 +271,7 @@
+         }
+     }
+ 
++    #[cfg(not(sf_lkpi))]
+     /// Try to lock the mmap read lock.
+     #[inline]
+     pub fn mmap_read_trylock(&self) -> Option<MmapReadGuard<'_>> {
+@@ -280,6 +290,7 @@
+     }
+ }
+ 
++#[cfg(not(sf_lkpi))]
+ /// A guard for the mmap read lock.
+ ///
+ /// # Invariants
+@@ -291,6 +302,7 @@
+     _nts: NotThreadSafe,
+ }
+ 
++#[cfg(not(sf_lkpi))]
+ impl<'a> MmapReadGuard<'a> {
+     /// Look up a vma at the given address.
+     #[inline]
+@@ -312,6 +324,7 @@
+     }
+ }
+ 
++#[cfg(not(sf_lkpi))]
+ impl Drop for MmapReadGuard<'_> {
+     #[inline]
+     fn drop(&mut self) {
+@@ -320,6 +333,7 @@
+     }
+ }
+ 
++#[cfg(not(sf_lkpi))]
+ /// A guard for the vma read lock.
+ ///
+ /// # Invariants
+@@ -331,6 +345,7 @@
+     _nts: NotThreadSafe,
+ }
+ 
++#[cfg(not(sf_lkpi))]
+ // Make all `VmaRef` methods available on `VmaReadGuard`.
+ impl Deref for VmaReadGuard<'_> {
+     type Target = VmaRef;
+@@ -341,6 +356,7 @@
+     }
+ }
+ 
++#[cfg(not(sf_lkpi))]
+ impl Drop for VmaReadGuard<'_> {
+     #[inline]
+     fn drop(&mut self) {

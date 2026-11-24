@@ -1,0 +1,186 @@
+--- head/src/Kernel/Extensions/SFAgx/rtkit/SFRtkitPlatform.cpp
++++ kernel48/src/Kernel/Extensions/SFAgx/rtkit/SFRtkitPlatform.cpp
+@@ -34,7 +34,6 @@
+ #include <sys/errno.h>
+ 
+ #include "sf_rtkit_platform.h"
+-#include "sf_rtkit_layout.h"
+ 
+ #define SOC_PAGE 0x4000ULL
+ 
+@@ -88,7 +87,6 @@
+ };
+ 
+ IOService *gHost;
+-int gInitState; // 0 uninitialized, 1 allocating, 2 release-published
+ IOWorkLoop *gLoop;
+ IOLock *gLock; /* gIrqs[].depth/registered/fn, gMbox, gMaps; thread context only */
+ const char *gPrefix = "sf_rtkit: ";
+@@ -307,33 +305,18 @@
+ 
+ int sf_rtkit_platform_init(void *host)
+ {
++    if (gHost)
++        return 0;
+     if (!host)
+         return -EINVAL;
+-    for (;;) {
+-        if (__atomic_load_n(&gInitState,__ATOMIC_ACQUIRE)==2)
+-            return 0;
+-        int expected=0;
+-        if (__atomic_compare_exchange_n(&gInitState,&expected,1,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE))
+-            break;
+-        IOSleep(1);
+-    }
+-    IOLock *lock=IOLockAlloc();
+-    IOWorkLoop *loop=IOWorkLoop::workLoop();
+-    if (!lock || !loop) {
+-        if (lock) IOLockFree(lock);
+-        OSSafeReleaseNULL(loop);
+-        __atomic_store_n(&gInitState,0,__ATOMIC_RELEASE);
++    gLock = IOLockAlloc();
++    gLoop = IOWorkLoop::workLoop();
++    if (!gLock || !gLoop)
+         return -ENOMEM;
+-    }
+-    gLock=lock;gLoop=loop;
+-    gHost=(IOService*)host;
+-    // IRQ/timer nubs use this anchor for the lifetime of this port's copy.
+-    // Per-mailbox clients retain their own native teardown responsibilities.
+-    gHost->retain();
++    gHost = (IOService *)host;
+     gIrqMode = sf_rtkit_platform_bootarg("sfrtkit_irq", kIrqModeReregister);
+     if (gIrqMode < kIrqModePoll || gIrqMode > kIrqModeReregister)
+         gIrqMode = kIrqModeReregister;
+-    __atomic_store_n(&gInitState,2,__ATOMIC_RELEASE);
+     return 0;
+ }
+ 
+@@ -362,7 +345,7 @@
+     Mbox *m = NULL;
+     int ret = 0;
+ 
+-    if (__atomic_load_n(&gInitState,__ATOMIC_ACQUIRE)!=2 || !path || !res || !fullPath(path, full, sizeof(full)))
++    if (!gHost || !path || !res || !fullPath(path, full, sizeof(full)))
+         return -EINVAL;
+ 
+     IOLockLock(gLock);
+@@ -389,13 +372,7 @@
+             break;
+         }
+         /* iop,ascwrap-v8 and later are a different mailbox (Linux apple,asc-mailbox-v4 does not cover them) */
+-        bool m3=nodeIsCompatible(node,"iop,m3wrap-v2-acio");
+-        // Port0 is the reserved bench path. Only ACIO1 is qualified here.
+-        if (m3 && strcmp(full,"/arm-io/acio-cpu1")) {
+-            ret=-ENODEV;
+-            break;
+-        }
+-        if (!m3 && !nodeIsCompatible(node, "iop,ascwrap-v4")) {
++        if (!nodeIsCompatible(node, "iop,ascwrap-v4")) {
+             logf("%s: not an iop,ascwrap-v4 node", full);
+             ret = -ENODEV;
+             break;
+@@ -404,6 +381,7 @@
+         bzero(&m->res, sizeof(m->res));
+         strlcpy(m->res.path, full, sizeof(m->res.path));
+         strlcpy(m->res.name, node->getName(gIODTPlane) ? node->getName(gIODTPlane) : "asc", sizeof(m->res.name));
++        m->res.linux_compatible = "apple,asc-mailbox-v4";
+ 
+         /* registry-owned array: used here, never released, asked for once per node */
+         OSArray *regs = IODTResolveAddressing(node, "reg", NULL);
+@@ -412,18 +390,47 @@
+             m->res.asc_phys = d->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+             m->res.asc_size = d->getLength();
+         }
++        if (!d || !m->res.asc_phys || m->res.asc_size < SF_RTKIT_ASC_MBOX_OFFSET + SF_RTKIT_ASC_MBOX_SIZE) {
++            logf("%s: reg 0 not resolved or too small (0x%llx len 0x%llx)", full,
++                 (unsigned long long)m->res.asc_phys, (unsigned long long)m->res.asc_size);
++            ret = -EINVAL;
++            break;
++        }
++        m->res.mbox_phys = m->res.asc_phys + SF_RTKIT_ASC_MBOX_OFFSET;
++        m->res.mbox_size = SF_RTKIT_ASC_MBOX_SIZE;
++
+         OSData *ints = OSDynamicCast(OSData, node->getProperty("interrupts"));
+-        UInt32 listed[4];
+-        if (!d || !ints || ints->getLength()!=sizeof(listed)) {
+-            ret=-EINVAL;
++        if (!ints || ints->getLength() != 4 * sizeof(UInt32)) {
++            logf("%s: expected 4 interrupts, property is %u bytes", full, ints ? ints->getLength() : 0);
++            ret = -EINVAL;
+             break;
+         }
+-        memcpy(listed,ints->getBytesNoCopy(),sizeof(listed));
+-        ret=sf_rtkit_mbox_layout(m3,m->res.asc_phys,m->res.asc_size,listed,&m->res);
+-        if (ret) {
+-            logf("%s: invalid %s mailbox registers or IRQ layout",full,m3?"M3v2":"ASCv4");
++        UInt32 sorted[4];
++        memcpy(m->res.aic_listed, ints->getBytesNoCopy(), sizeof(m->res.aic_listed));
++        memcpy(sorted, m->res.aic_listed, sizeof(sorted));
++        for (int i = 1; i < 4; i++)
++            for (int j = i; j > 0 && sorted[j - 1] > sorted[j]; j--) {
++                UInt32 t = sorted[j];
++                sorted[j] = sorted[j - 1];
++                sorted[j - 1] = t;
++            }
++        /*
++         * Apple's tree does not name the four lines and does not list them in
++         * ascending order (gfx-asc on J293: 576 575 578 577). Linux's device
++         * trees give every ASC mailbox four consecutive AIC numbers as
++         * send-empty, send-not-empty, recv-empty, recv-not-empty (t8103.dtsi
++         * agx_mbox: 575..578), so the roles are taken from the sorted numbers.
++         */
++        if (sorted[3] != sorted[0] + 3 || sorted[1] != sorted[0] + 1 || sorted[2] != sorted[0] + 2) {
++            logf("%s: interrupts %u %u %u %u are not four consecutive numbers", full, (unsigned)sorted[0],
++                 (unsigned)sorted[1], (unsigned)sorted[2], (unsigned)sorted[3]);
++            ret = -EINVAL;
+             break;
+         }
++        m->res.aic_send_empty = sorted[0];
++        m->res.aic_send_not_empty = sorted[1];
++        m->res.aic_recv_empty = sorted[2];
++        m->res.aic_recv_not_empty = sorted[3];
+ 
+         int srcSend = -1, srcRecv = -1;
+         for (int i = 0; i < 4; i++) {
+@@ -469,8 +476,7 @@
+ 
+     if (!path || index != 0)
+         return -ENOENT;
+-    if (node && (nodeIsCompatible(node, "iop,ascwrap-v4") ||
+-                 nodeIsCompatible(node,"iop,m3wrap-v2-acio")) && name) {
++    if (node && nodeIsCompatible(node, "iop,ascwrap-v4") && name) {
+         /* an ASC wrapper is its own mailbox; every one on this SoC is a child of /arm-io */
+         return snprintf(path, len, "/arm-io/%s", name) < (int)len ? 0 : -EINVAL;
+     }
+--- head/src/Kernel/Extensions/SFAgx/rtkit/sf_rtkit_compat.h
++++ kernel48/src/Kernel/Extensions/SFAgx/rtkit/sf_rtkit_compat.h
+@@ -20,12 +20,6 @@
+ #include <asm/barrier.h>
+ 
+ #include "sf_rtkit_platform.h"
+-#include "sf_rtkit_iomem.h"
+-
+-/* LinuxKPI aliases this to ordinary memcpy, which may issue unaligned device
+- * loads. ACIO SRAM SYSLOG records actually triggered that data abort. */
+-#undef memcpy_fromio
+-#define memcpy_fromio(dst,src,bytes) sf_rtkit_memcpy_fromio((dst),(src),(bytes))
+ 
+ /*
+  * Logging. The layer's dev_err() is device_printf(dev->bsddev, ...), which
+--- head/src/Kernel/Extensions/SFAgx/rtkit/sf_rtkit_platform.h
++++ kernel48/src/Kernel/Extensions/SFAgx/rtkit/sf_rtkit_platform.h
+@@ -48,11 +48,11 @@
+ 	char		path[SF_RTKIT_PATH_MAX];	/* device-tree path of the ASC node */
+ 	char		name[SF_RTKIT_NAME_MAX];	/* its name, "gfx-asc" */
+ 	void		*node;		/* IORegistryEntry in gIODTPlane, retained for the kext's life */
+-	/* Linux compatible: ASCv4 or ACIO M3v2 (direct reg0, without ASC offset). */
++	/* Linux's compatible for this mailbox hardware: "apple,asc-mailbox-v4" for iop,ascwrap-v4 */
+ 	const char	*linux_compatible;
+ 	uint64_t	asc_phys;	/* reg 0, with the parents' ranges applied */
+ 	uint64_t	asc_size;
+-	uint64_t	mbox_phys;	/* ASC: asc_phys + 0x8000; ACIO M3v2: asc_phys */
++	uint64_t	mbox_phys;	/* asc_phys + SF_RTKIT_ASC_MBOX_OFFSET */
+ 	uint64_t	mbox_size;
+ 	/* AIC numbers in the order the node lists them, and by role (sorted: see the .cpp) */
+ 	uint32_t	aic_listed[4];

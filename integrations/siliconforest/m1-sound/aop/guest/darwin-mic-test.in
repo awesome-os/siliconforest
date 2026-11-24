@@ -1,0 +1,116 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Unattended check of the built-in microphones (SFAopAudio), one boot, nobody in the room:
+#   bringup   wait for the driver; the AOP's RTKit state, the audio service, the stream
+#   kernel    @SECONDS@ s of capture without a reader (kern.sf_aop.capture): DMA progress,
+#             the measured sample rate and the kernel's statistics per microphone
+#   reader    /dev/sfmic read by sfmic-stat: statistics from the samples themselves,
+#             the first frames in hexadecimal
+#   dd        two seconds of raw frames through dd
+#   cycles    the microphones switched on and off three times
+#   smp       a capture while one reader per processor polls the driver's sysctls
+# tools/mic_summary.sh reads the result. (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nMIC_BEGIN_%s\n' "$nonce"
+ncpu=$(sysctl -n hw.ncpu 2>/dev/null); ncpu=${ncpu:-1}
+t0=$(date +%s)
+now() { echo $(( $(date +%s) - t0 )); }
+phase() { printf 'MIC_PHASE %s t=%s\n' "$1" "$(now)"; }
+get() { sysctl -n "$1" 2>/dev/null; }
+mon() {
+    printf 'MIC_MON %s t=%s capturing=%s sessions=%s periods=%s frames=%s rate_mhz=%s windows=%s ring_errors=%s dart_faults=%s stalls=%s overruns=%s calls=%s call_errors=%s\n' \
+        "$1" "$(now)" "$(get kern.sf_aop.capturing)" "$(get kern.sf_aop.sessions)" "$(get kern.sf_aop.periods)" \
+        "$(get kern.sf_aop.frames)" "$(get kern.sf_aop.rate_mhz)" "$(get kern.sf_aop.windows)" \
+        "$(get kern.sf_aop.ring_errors)" "$(get kern.sf_aop.dart_faults)" "$(get kern.sf_aop.stalls)" \
+        "$(get kern.sf_aop.overruns)" "$(get kern.sf_aop.calls)" "$(get kern.sf_aop.call_errors)"
+}
+stats() {
+    printf 'MIC_STATS %s mic0 %s\n' "$1" "$(get kern.sf_aop.stats0)"
+    printf 'MIC_STATS %s mic1 %s\n' "$1" "$(get kern.sf_aop.stats1)"
+    printf 'MIC_STATS %s mic2 %s\n' "$1" "$(get kern.sf_aop.stats2)"
+    printf 'MIC_DIFFER %s %s\n' "$1" "$(get kern.sf_aop.differ)"
+    printf 'MIC_STREAM %s %s\n' "$1" "$(get kern.sf_aop.stream)"
+}
+# waits until the microphones are off, at most $1 seconds
+idle() {
+    n=0
+    while [ "$(get kern.sf_aop.capturing)" = 1 ] && [ "$n" -lt "$1" ]; do sleep 1; n=$((n+1)); done
+    [ "$(get kern.sf_aop.capturing)" = 1 ] && printf 'MIC_FAIL still capturing after %s s\n' "$1"
+}
+finish() {
+    sysctl kern.sf_aop 2>&1
+    printf 'MIC_END_%s\n' "$nonce"
+    # ends the capture of the console at once (tools/pcie_iterate.sh PCIE_DONE)
+    printf '\nPD_BENCH_DONE\n'
+    exit 0
+}
+
+phase bringup
+n=0
+while [ "$n" -lt 60 ]; do
+    case "$(get kern.sf_aop.state)" in idle*|failed*|aop-only*|configured*) break;; esac
+    sleep 1; n=$((n+1))
+done
+printf 'MIC_STATE %s\n' "$(get kern.sf_aop.state)"
+printf 'MIC_RTKIT %s\n' "$(get kern.sf_aop.rtkit)"
+printf 'MIC_SERVICE %s\n' "$(get kern.sf_aop.service)"
+printf 'MIC_STREAM bringup %s\n' "$(get kern.sf_aop.stream)"
+sleep 2
+ls -l /dev/sfmic 2>&1
+case "$(get kern.sf_aop.state)" in
+idle*) ;;
+*)  printf 'MIC_FAIL the driver is not ready for capture\n'
+    finish;;
+esac
+
+phase kernel
+sysctl -w kern.sf_aop.capture=@SECONDS@ 2>&1
+n=0
+while [ "$n" -lt @SECONDS@ ]; do
+    sleep 1; n=$((n+1)); mon kernel
+    stats kernel
+done
+idle 10
+mon kernel-end
+
+phase reader
+if [ -x /usr/bin/sfmic-stat ]; then
+    sfmic-stat -s @SECONDS@ -x 12 -o 2400 -x 24 -o 24000 -x 24 -o 96000 -x 24 -k 1500 2>&1
+    printf 'MIC_READER exit=%s\n' "$?"
+else
+    printf 'MIC_SKIP no /usr/bin/sfmic-stat\n'
+fi
+idle 10; mon reader-end
+
+phase dd
+dd if=/dev/sfmic of=/dev/null bs=12288 count=94 2>&1 | tail -2
+idle 10; mon dd-end
+
+phase cycles
+i=0
+while [ "$i" -lt 3 ]; do
+    sfmic-stat -s 1 -i 0 2>&1 | grep -a 'total mic0'
+    idle 10; mon "cycle$i"
+    i=$((i+1))
+done
+
+phase smp
+reader() {
+    end=$(( $(date +%s) + @SECONDS@ )); i=0
+    while [ "$(date +%s)" -lt "$end" ]; do
+        sysctl -n kern.sf_aop.state kern.sf_aop.rtkit kern.sf_aop.stream kern.sf_aop.stats0 kern.sf_aop.differ > /dev/null 2>&1
+        i=$((i+1))
+    done
+    printf 'MIC_SYSCTL_READER id=%s reads=%s\n' "$1" "$i"
+}
+w=0; while [ "$w" -lt "$ncpu" ]; do reader "$w" & w=$((w+1)); done
+sfmic-stat -s @SECONDS@ -i 0 -k 1500 2>&1
+wait
+idle 10; mon smp-end
+stats smp-end
+
+phase end
+printf 'MIC_STATE %s\n' "$(get kern.sf_aop.state)"
+printf 'MIC_RTKIT %s\n' "$(get kern.sf_aop.rtkit)"
+finish

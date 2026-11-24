@@ -1,0 +1,472 @@
+--- a/src/Frameworks/AppKit/NSActivityMonitorAdditions.m
++++ b/src/Frameworks/AppKit/NSActivityMonitorAdditions.m
+@@ -0,0 +1,469 @@
++/* SPDX-License-Identifier: MIT */
++/* What Apple's Activity Monitor (macOS 26.5) imports from AppKit that this AppKit lacked
++   (docs/roadmap/issues/SF-AA-activity-monitor.md):
++     NSWorkspaceDidWakeNotification;
++     NSSearchToolbarItem: a toolbar item whose view is a search field;
++     the compositional layout's description objects (NSCollectionLayoutDimension, ...Size,
++     ...Item, ...Group, ...Section, NSCollectionViewCompositionalLayout): kept as data. This
++     AppKit's NSCollectionView is the old grid of item prototypes and does not lay them out:
++     -setCollectionViewLayout: keeps the layout and the view stays as it is. */
++#import <AppKit/AppKit.h>
++
++NSString *const NSWorkspaceDidWakeNotification = @"NSWorkspaceDidWakeNotification";
++
++#define EXPORT __attribute__((visibility("default")))
++
++/* ---- NSSearchToolbarItem ---- */
++
++EXPORT
++@interface NSSearchToolbarItem : NSToolbarItem {
++    NSSearchField *_searchField;
++    CGFloat _preferredWidthForSearchField;
++    BOOL _resignsFirstResponderWithCancel;
++}
++@end
++
++@implementation NSSearchToolbarItem
++
++- (void)_sfInstallField {
++    if (_searchField == nil) {
++        _searchField = [[NSSearchField alloc] initWithFrame:NSMakeRect(0, 0, 180, 22)];
++    }
++    [self setView:_searchField];
++    [self setMinSize:NSMakeSize(100, 22)];
++    [self setMaxSize:NSMakeSize(_preferredWidthForSearchField > 0 ? _preferredWidthForSearchField : 180, 22)];
++}
++
++- (id)initWithItemIdentifier:(NSString *)identifier {
++    if ((self = [super initWithItemIdentifier:identifier]) != nil) {
++        _preferredWidthForSearchField = 180;
++        _resignsFirstResponderWithCancel = YES;
++        [self _sfInstallField];
++    }
++    return self;
++}
++
++- (id)initWithCoder:(NSCoder *)coder {
++    if ((self = [super initWithCoder:coder]) != nil) {
++        _preferredWidthForSearchField = 180;
++        _resignsFirstResponderWithCancel = YES;
++        if ([[self view] isKindOfClass:[NSSearchField class]])
++            _searchField = [(NSSearchField *)[self view] retain];
++        [self _sfInstallField];
++    }
++    return self;
++}
++
++- (void)dealloc {
++    [_searchField release];
++    [super dealloc];
++}
++
++- (NSSearchField *)searchField { return _searchField; }
++
++- (void)setSearchField:(NSSearchField *)field {
++    if (field != _searchField) {
++        [_searchField release];
++        _searchField = [field retain];
++        [self _sfInstallField];
++    }
++}
++
++- (CGFloat)preferredWidthForSearchField { return _preferredWidthForSearchField; }
++- (void)setPreferredWidthForSearchField:(CGFloat)width {
++    _preferredWidthForSearchField = width;
++    [self setMaxSize:NSMakeSize(width, 22)];
++}
++- (BOOL)resignsFirstResponderWithCancel { return _resignsFirstResponderWithCancel; }
++- (void)setResignsFirstResponderWithCancel:(BOOL)value { _resignsFirstResponderWithCancel = value; }
++- (void)beginSearchInteraction { [[_searchField window] makeFirstResponder:_searchField]; }
++- (void)endSearchInteraction {
++    if (_resignsFirstResponderWithCancel)
++        [[_searchField window] makeFirstResponder:nil];
++}
++
++@end
++
++/* ---- the compositional layout's descriptions ---- */
++
++EXPORT
++@interface NSCollectionLayoutDimension : NSObject <NSCopying> {
++    NSInteger _kind; /* 0 fractional width, 1 fractional height, 2 absolute, 3 estimated */
++    CGFloat _dimension;
++}
++@end
++
++@implementation NSCollectionLayoutDimension
+++ (id)_sfWithKind:(NSInteger)kind dimension:(CGFloat)d {
++    NSCollectionLayoutDimension *o = [[self alloc] init];
++    o->_kind = kind;
++    o->_dimension = d;
++    return [o autorelease];
++}
+++ (id)fractionalWidthDimension:(CGFloat)d { return [self _sfWithKind:0 dimension:d]; }
+++ (id)fractionalHeightDimension:(CGFloat)d { return [self _sfWithKind:1 dimension:d]; }
+++ (id)absoluteDimension:(CGFloat)d { return [self _sfWithKind:2 dimension:d]; }
+++ (id)estimatedDimension:(CGFloat)d { return [self _sfWithKind:3 dimension:d]; }
++- (BOOL)isFractionalWidth { return _kind == 0; }
++- (BOOL)isFractionalHeight { return _kind == 1; }
++- (BOOL)isAbsolute { return _kind == 2; }
++- (BOOL)isEstimated { return _kind == 3; }
++- (CGFloat)dimension { return _dimension; }
++- (id)copyWithZone:(NSZone *)zone { return [self retain]; }
++@end
++
++EXPORT
++@interface NSCollectionLayoutSize : NSObject <NSCopying> {
++    NSCollectionLayoutDimension *_width, *_height;
++}
++@end
++
++@implementation NSCollectionLayoutSize
+++ (id)sizeWithWidthDimension:(NSCollectionLayoutDimension *)w heightDimension:(NSCollectionLayoutDimension *)h {
++    NSCollectionLayoutSize *o = [[self alloc] init];
++    o->_width = [w retain];
++    o->_height = [h retain];
++    return [o autorelease];
++}
++- (void)dealloc { [_width release]; [_height release]; [super dealloc]; }
++- (NSCollectionLayoutDimension *)widthDimension { return _width; }
++- (NSCollectionLayoutDimension *)heightDimension { return _height; }
++- (id)copyWithZone:(NSZone *)zone { return [self retain]; }
++@end
++
++EXPORT
++@interface NSCollectionLayoutItem : NSObject <NSCopying> {
++  @public
++    NSCollectionLayoutSize *_layoutSize;
++    NSArray *_subitems;
++    NSInteger _count;
++    BOOL _vertical;
++}
++@end
++
++@implementation NSCollectionLayoutItem
+++ (id)itemWithLayoutSize:(NSCollectionLayoutSize *)size {
++    NSCollectionLayoutItem *o = [[self alloc] init];
++    o->_layoutSize = [size retain];
++    return [o autorelease];
++}
+++ (id)itemWithLayoutSize:(NSCollectionLayoutSize *)size supplementaryItems:(NSArray *)items { return [self itemWithLayoutSize:size]; }
++- (void)dealloc { [_layoutSize release]; [_subitems release]; [super dealloc]; }
++- (NSCollectionLayoutSize *)layoutSize { return _layoutSize; }
++- (void)setContentInsets:(NSEdgeInsets)insets {}
++- (id)copyWithZone:(NSZone *)zone { return [self retain]; }
++@end
++
++EXPORT
++@interface NSCollectionLayoutGroup : NSCollectionLayoutItem
++@end
++
++@implementation NSCollectionLayoutGroup
+++ (id)_sfGroup:(NSCollectionLayoutSize *)size subitems:(NSArray *)items count:(NSInteger)count vertical:(BOOL)v {
++    NSCollectionLayoutGroup *o = [self itemWithLayoutSize:size];
++    o->_subitems = [items copy];
++    o->_count = count;
++    o->_vertical = v;
++    return o;
++}
+++ (id)horizontalGroupWithLayoutSize:(NSCollectionLayoutSize *)s subitem:(NSCollectionLayoutItem *)i count:(NSInteger)n {
++    return [self _sfGroup:s subitems:[NSArray arrayWithObject:i] count:n vertical:NO];
++}
+++ (id)horizontalGroupWithLayoutSize:(NSCollectionLayoutSize *)s subitems:(NSArray *)items {
++    return [self _sfGroup:s subitems:items count:0 vertical:NO];
++}
+++ (id)verticalGroupWithLayoutSize:(NSCollectionLayoutSize *)s subitem:(NSCollectionLayoutItem *)i count:(NSInteger)n {
++    return [self _sfGroup:s subitems:[NSArray arrayWithObject:i] count:n vertical:YES];
++}
+++ (id)verticalGroupWithLayoutSize:(NSCollectionLayoutSize *)s subitems:(NSArray *)items {
++    return [self _sfGroup:s subitems:items count:0 vertical:YES];
++}
++- (NSArray *)subitems { return _subitems; }
++- (void)setInterItemSpacing:(id)spacing {}
++@end
++
++EXPORT
++@interface NSCollectionLayoutSection : NSObject <NSCopying> {
++    NSCollectionLayoutGroup *_group;
++}
++@end
++
++@implementation NSCollectionLayoutSection
+++ (id)sectionWithGroup:(NSCollectionLayoutGroup *)group {
++    NSCollectionLayoutSection *o = [[self alloc] init];
++    o->_group = [group retain];
++    return [o autorelease];
++}
++- (void)dealloc { [_group release]; [super dealloc]; }
++- (NSCollectionLayoutGroup *)group { return _group; }
++- (void)setContentInsets:(NSEdgeInsets)insets {}
++- (void)setInterGroupSpacing:(CGFloat)spacing {}
++- (id)copyWithZone:(NSZone *)zone { return [self retain]; }
++@end
++
++EXPORT
++@interface NSCollectionViewCompositionalLayout : NSObject {
++    NSCollectionLayoutSection *_section;
++    id _provider;
++}
++@end
++
++@implementation NSCollectionViewCompositionalLayout
++- (id)initWithSection:(NSCollectionLayoutSection *)section {
++    if ((self = [super init]) != nil)
++        _section = [section retain];
++    return self;
++}
++- (id)initWithSectionProvider:(id)provider {
++    if ((self = [super init]) != nil)
++        _provider = [provider copy];
++    return self;
++}
++- (void)dealloc { [_section release]; [_provider release]; [super dealloc]; }
++- (void)invalidateLayout {}
++@end
++
++@implementation NSCollectionView (SFActivityMonitor)
++static NSMutableDictionary *sfLayouts;
++- (void)setCollectionViewLayout:(id)layout {
++    if (sfLayouts == nil)
++        sfLayouts = [[NSMutableDictionary alloc] init];
++    NSValue *key = [NSValue valueWithNonretainedObject:self];
++    if (layout)
++        [sfLayouts setObject:layout forKey:key];
++    else
++        [sfLayouts removeObjectForKey:key];
++}
++- (id)collectionViewLayout {
++    return [sfLayouts objectForKey:[NSValue valueWithNonretainedObject:self]];
++}
++@end
++
++/* ---- NSUserInterfaceItemIdentification for views (a table's cell views are found by it) ---- */
++#include <objc/runtime.h>
++static const char sfViewIdentifierKey;
++@implementation NSView (SFIdentifier)
++- (NSString *)identifier { return objc_getAssociatedObject(self, &sfViewIdentifierKey); }
++- (void)setIdentifier:(NSString *)identifier { objc_setAssociatedObject(self, &sfViewIdentifierKey, identifier, OBJC_ASSOCIATION_COPY); }
++@end
++
++/* ---- methods Activity Monitor sends that this AppKit lacked ---- */
++
++/* the Touch Bar is a list nothing shows (NSTouchBar.m); the item list Activity Monitor sets */
++static const char sfTouchBarItemsKey;
++@implementation NSTouchBar (SFItemIdentifiers)
++- (void)setItemIdentifiers:(NSArray *)identifiers {
++    objc_setAssociatedObject(self, &sfTouchBarItemsKey, identifiers, OBJC_ASSOCIATION_COPY);
++}
++@end
++
++@implementation NSColor (SFActivityMonitor)
+++ (NSColor *)systemCyanColor { return [NSColor colorWithCatalogName:@"System" colorName:@"systemCyanColor"]; }
+++ (NSColor *)systemMintColor { return [NSColor colorWithCalibratedRed:0.0 green:0.78 blue:0.75 alpha:1.0]; }
++/* An application's named colours, from its asset catalog (Contents/Resources/Assets.car), read with
++   Finch's catalog reader (SFCUIStore.m, SFCUIRendition.m): the colour rendition of the name for the
++   light appearance (or the one without an appearance), its components in its colour space, or the
++   system colour it names. A name the catalog does not have is nil, as on macOS. */
++#include "SFCUIPrivate.h"
++static NSMutableDictionary *sfCatalogs;   /* bundle path -> NSValue of cui_store * (or NSNull) */
++
++static cui_store *sfCatalogOfBundle(NSBundle *bundle) {
++    NSString *key = [bundle bundlePath];
++    if (key == nil)
++        return NULL;
++    if (sfCatalogs == nil)
++        sfCatalogs = [[NSMutableDictionary alloc] init];
++    id v = [sfCatalogs objectForKey:key];
++    if (v == nil) {
++        NSString *path = [bundle pathForResource:@"Assets" ofType:@"car"];
++        cui_store *store = path ? cui_store_open([path fileSystemRepresentation]) : NULL;
++        v = store ? (id)[NSValue valueWithPointer:store] : (id)[NSNull null];
++        [sfCatalogs setObject:v forKey:key];
++    }
++    return [v isKindOfClass:[NSValue class]] ? [v pointerValue] : NULL;
++}
++
+++ (NSColor *)colorNamed:(NSString *)name bundle:(NSBundle *)bundle {
++    cui_store *store = sfCatalogOfBundle(bundle ? bundle : [NSBundle mainBundle]);
++    const cui_facet *facet = (store && name) ? cui_store_facet(store, [name UTF8String]) : NULL;
++    if (facet == NULL)
++        return nil;
++    uint16_t aqua = 0, dark = 0;
++    BOOL haveAqua = cui_store_appearance(store, "NSAppearanceNameAqua", &aqua);
++    BOOL haveDark = cui_store_appearance(store, "NSAppearanceNameDarkAqua", &dark);
++    size_t first = 0, n = cui_store_renditions_for_identifier(store, facet->attrs.v[CUI_ATTR_IDENTIFIER], &first);
++    const cui_csi *best = NULL;
++    cui_csi csi, chosen;
++    int bestScore = -1;
++    for (size_t i = first; i < first + n; i++) {
++        const cui_rendition *r = &store->rends[i];
++        if (!cui_csi_parse(r->csi, r->len, &csi) || csi.layout != CUI_LAYOUT_COLOR)
++            continue;
++        uint16_t app = r->key.v[CUI_ATTR_APPEARANCE];
++        int score = (haveAqua && app == aqua) ? 3 : (app == 0 ? 2 : ((haveDark && app == dark) ? 0 : 1));
++        if (score > bestScore) {
++            bestScore = score;
++            chosen = csi;
++            best = &chosen;
++        }
++    }
++    unsigned space = 0, ncomps = 0;
++    double comps[8];
++    char sysname[128];
++    if (best == NULL || !cui_csi_color(best, &space, comps, &ncomps, sysname, sizeof(sysname)))
++        return nil;
++    if (sysname[0]) {
++        NSColor *c = [NSColor colorWithCatalogName:@"System" colorName:[NSString stringWithUTF8String:sysname]];
++        if (c != nil)
++            return c;
++    }
++    if (ncomps >= 4)       /* sRGB, Display P3, extended sRGB: red, green, blue, alpha */
++        return [NSColor colorWithCalibratedRed:comps[0] green:comps[1] blue:comps[2] alpha:comps[3]];
++    if (ncomps == 2)       /* grey, alpha */
++        return [NSColor colorWithCalibratedWhite:comps[0] alpha:comps[1]];
++    return nil;
++}
+++ (NSColor *)colorNamed:(NSString *)name { return [self colorNamed:name bundle:nil]; }
++@end
++
++@implementation NSFont (SFActivityMonitor)
++/* the system font's digits are tabular already where its face has them (Inter has tabular figures
++   as a feature this text system does not select): the system font of that weight */
+++ (NSFont *)monospacedDigitSystemFontOfSize:(CGFloat)size weight:(CGFloat)weight {
++    return [NSFont systemFontOfSize:size weight:weight];
++}
++@end
++
++@implementation NSBundle (SFImageForResource)
++- (NSImage *)imageForResource:(NSString *)name {
++    NSString *path = [self pathForImageResource:name];
++    return path ? [[[NSImage alloc] initWithContentsOfFile:path] autorelease] : [NSImage imageNamed:name];
++}
++@end
++
++@implementation NSSavePanel (SFAllowedContentTypes)
++/* UTTypes (UniformTypeIdentifiers) as the file name extensions this panel filters by */
++- (void)setAllowedContentTypes:(NSArray *)types {
++    NSMutableArray *exts = [NSMutableArray array];
++    for (id t in types)
++        if ([t respondsToSelector:@selector(preferredFilenameExtension)] && [t preferredFilenameExtension])
++            [exts addObject:[t preferredFilenameExtension]];
++    [self setAllowedFileTypes:[exts count] ? exts : nil];
++    objc_setAssociatedObject(self, @selector(allowedContentTypes), types, OBJC_ASSOCIATION_COPY);
++}
++- (NSArray *)allowedContentTypes { return objc_getAssociatedObject(self, @selector(allowedContentTypes)); }
++@end
++
++@implementation NSPrintOperation (SFModalForWindow)
++- (void)runOperationModalForWindow:(NSWindow *)window delegate:(id)delegate didRunSelector:(SEL)selector contextInfo:(void *)info {
++    BOOL ok = [self runOperation];
++    if (delegate && selector) {
++        void (*f)(id, SEL, NSPrintOperation *, BOOL, void *) = (void *)[delegate methodForSelector:selector];
++        f(delegate, selector, self, ok, info);
++    }
++}
++@end
++
++/* ---- a pan recogniser as the nibs carry one (Activity Monitor's graphs); like the others here it
++   keeps its configuration and recognises nothing (NSMacOS26Additions.m) ---- */
++#import <AppKit/NSMacOS26Additions.h>
++EXPORT
++@interface NSPanGestureRecognizer : NSGestureRecognizer {
++    NSUInteger _buttonMask;
++    NSInteger _numberOfTouchesRequired;
++}
++@end
++@implementation NSPanGestureRecognizer
++- (NSUInteger)buttonMask { return _buttonMask; }
++- (void)setButtonMask:(NSUInteger)m { _buttonMask = m; }
++- (NSInteger)numberOfTouchesRequired { return _numberOfTouchesRequired; }
++- (void)setNumberOfTouchesRequired:(NSInteger)n { _numberOfTouchesRequired = n; }
++- (NSPoint)translationInView:(NSView *)view { return NSZeroPoint; }
++- (void)setTranslation:(NSPoint)t inView:(NSView *)view {}
++- (NSPoint)velocityInView:(NSView *)view { return NSZeroPoint; }
++@end
++
++/* ---- NSSearchField's search-string options: kept; this field sends its action as it is set up to
++   (continuously or on Return), which is what "immediately" asks for when it is continuous ---- */
++static const char sfSendsImmediatelyKey, sfSendsWholeKey;
++@implementation NSSearchField (SFSearchOptions)
++- (BOOL)sendsSearchStringImmediately { return [objc_getAssociatedObject(self, &sfSendsImmediatelyKey) boolValue]; }
++- (void)setSendsSearchStringImmediately:(BOOL)b {
++    objc_setAssociatedObject(self, &sfSendsImmediatelyKey, [NSNumber numberWithBool:b], OBJC_ASSOCIATION_RETAIN);
++    if (b)
++        [self setContinuous:YES];
++}
++- (BOOL)sendsWholeSearchString { return [objc_getAssociatedObject(self, &sfSendsWholeKey) boolValue]; }
++- (void)setSendsWholeSearchString:(BOOL)b {
++    objc_setAssociatedObject(self, &sfSendsWholeKey, [NSNumber numberWithBool:b], OBJC_ASSOCIATION_RETAIN);
++    if (b)
++        [self setContinuous:NO];
++}
++// Apple's search field sends its action while the user types (incremental search) unless it sends the
++// whole search string only (then on Return, NSTextField's own behaviour)
++- (void)textDidChange:(NSNotification *)note {
++    [super textDidChange:note];
++    if (![self sendsWholeSearchString] && [self action] != NULL)
++        [self sendAction:[self action] to:[self target]];
++}
++@end
++
++/* ---- a window's subtitle (macOS 11): the compositor's title bar shows one line, so the subtitle is
++   kept and not shown; a table column's title as its header cell's string ---- */
++static const char sfSubtitleKey;
++@implementation NSWindow (SFSubtitle)
++- (NSString *)subtitle { NSString *s = objc_getAssociatedObject(self, &sfSubtitleKey); return s ? s : @""; }
++- (void)setSubtitle:(NSString *)s { objc_setAssociatedObject(self, &sfSubtitleKey, s, OBJC_ASSOCIATION_COPY); }
++@end
++
++@implementation NSTableColumn (SFTitle)
++- (NSString *)title { return [[self headerCell] stringValue]; }
++- (void)setTitle:(NSString *)title {
++    [[self headerCell] setStringValue:title ? title : @""];
++    [[[self tableView] headerView] setNeedsDisplay:YES];
++}
++@end
++
++/* ---- a diagnostic: SFViewTreeDump=<seconds> logs every window's view tree (class, frame, hidden)
++   that many seconds after launch, for finding where a view's layout differs from what is expected ---- */
++@interface SFViewTreeDumper : NSObject
++@end
++@implementation SFViewTreeDumper
++static void sfDumpView(NSView *v, int depth) {
++    NSRect f = [v frame];
++    NSLog(@"%*s%@ %p {{%.0f,%.0f},{%.0f,%.0f}}%@%@%@", depth * 2, "", [v class], v, f.origin.x, f.origin.y, f.size.width, f.size.height,
++        [v isHidden] ? @" hidden" : @"", [v translatesAutoresizingMaskIntoConstraints] ? @"" : @" constrained", [v respondsToSelector:@selector(identifier)] && [(id)v identifier] ? [NSString stringWithFormat:@" id=%@", [(id)v identifier]] : @"");
++    if (depth <= 8 && getenv("SFViewTreeConstraints"))
++        for (NSLayoutConstraint *c in [v constraints])
++            NSLog(@"%*s  constraint %@.%ld %ld %@.%ld x%.2f %+.1f @%.0f%@", depth * 2, "", [[c firstItem] class], (long)[c firstAttribute], (long)[c relation],
++                [c secondItem] ? (id)[[c secondItem] class] : (id)@"-", (long)[c secondAttribute], [c multiplier], [c constant], [c priority], [c isActive] ? @"" : @" inactive");
++    if (depth > 14)
++        return;
++    NSArray *subs = [v subviews];
++    NSUInteger n = [subs count];
++    for (NSUInteger i = 0; i < n && i < 40; i++)
++        sfDumpView([subs objectAtIndex:i], depth + 1);
++    if (n > 40)
++        NSLog(@"%*s... %lu more", (depth + 1) * 2, "", (unsigned long)(n - 40));
++}
+++ (void)dump:(id)unused {
++    for (NSWindow *w in [NSApp windows]) {
++        if (![w isVisible])
++            continue;
++        NSRect f = [w frame];
++        NSLog(@"window %@ \"%@\" {{%.0f,%.0f},{%.0f,%.0f}}", [w class], [w title], f.origin.x, f.origin.y, f.size.width, f.size.height);
++        sfDumpView([w contentView], 1);
++    }
++}
+++ (void)schedule:(NSNotification *)note {
++    const char *s = getenv("SFViewTreeDump");
++    [self performSelector:@selector(dump:) withObject:nil afterDelay:s ? atof(s) : 10];
++}
+++ (void)load {
++    const char *s = getenv("SFViewTreeDump");
++    if (s)
++        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(atof(s) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
++            [SFViewTreeDumper dump:nil];
++        });
++}
++@end

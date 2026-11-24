@@ -1,0 +1,143 @@
+diff --git a/crates/wm-darwin/src/policy.rs b/crates/wm-darwin/src/policy.rs
+index 7e48095..4139514 100644
+--- a/crates/wm-darwin/src/policy.rs
++++ b/crates/wm-darwin/src/policy.rs
+@@ -7,6 +7,7 @@
+ //! | key | default | what |
+ //! |---|---|---|
+ //! | `fifo` | on | a GPU client's newer buffer waits for the next refresh instead of replacing one no frame showed yet (`server.rs` FIFO) |
++//! | `fifo_shm` | off | the same for a window drawn on the CPU (shm: AppKit without its GPU presenter) |
+ //! | `client_wake` | on | the loop wakes for client requests while it waits (a commit is read when it comes, not up to 8 ms later) |
+ //! | `flip_time_callbacks` | on | frame callbacks carry the flip's time (CLOCK_MONOTONIC ms, wp_presentation's clock) and go out at the flip |
+ //! | `flip_stamps` | on | a flip's time is the kernel's stamp of it (when on a clock we read), not when its event was read |
+@@ -17,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime};
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub struct Switches {
+     pub fifo: bool,
++    pub fifo_shm: bool,
+     pub client_wake: bool,
+     pub flip_time_callbacks: bool,
+     pub flip_stamps: bool,
+@@ -24,11 +26,12 @@ pub struct Switches {
+ }
+ 
+ impl Switches {
+-    const KEYS: [&'static str; 5] = ["fifo", "client_wake", "flip_time_callbacks", "flip_stamps", "restore"];
++    const KEYS: [&'static str; 6] = ["fifo", "fifo_shm", "client_wake", "flip_time_callbacks", "flip_stamps", "restore"];
+     fn defaults() -> Self {
+         let env = |key: &str| std::env::var(format!("CHONKSTEP_DARWIN_{}", key.to_ascii_uppercase())).ok().and_then(|v| parse_bool(&v));
+         Self {
+             fifo: env("fifo").unwrap_or(true),
++            fifo_shm: env("fifo_shm").unwrap_or(false),
+             client_wake: env("client_wake").unwrap_or(true),
+             flip_time_callbacks: env("flip_time_callbacks").unwrap_or(true),
+             flip_stamps: env("flip_stamps").unwrap_or(true),
+@@ -38,6 +41,7 @@ impl Switches {
+     fn slot(&mut self, key: &str) -> Option<&mut bool> {
+         Some(match key {
+             "fifo" => &mut self.fifo,
++            "fifo_shm" => &mut self.fifo_shm,
+             "client_wake" => &mut self.client_wake,
+             "flip_time_callbacks" => &mut self.flip_time_callbacks,
+             "flip_stamps" => &mut self.flip_stamps,
+@@ -163,7 +167,7 @@ mod tests {
+     use super::*;
+     #[test]
+     fn the_policy_file_changes_switches_without_a_relaunch_and_a_test_pin_wins_until_released() {
+-        let base = Switches { fifo: true, client_wake: true, flip_time_callbacks: true, flip_stamps: true, restore: true };
++        let base = Switches { fifo: true, fifo_shm: true, client_wake: true, flip_time_callbacks: true, flip_stamps: true, restore: true };
+         let (s, refused) = Switches::parse("# comment\nfifo=off\nrestore = 0\nbogus=1\nclient_wake=maybe\n", base);
+         assert!(!s.fifo && !s.restore && s.client_wake && s.flip_time_callbacks);
+         assert_eq!(refused, vec!["bogus=1".to_string(), "client_wake=maybe".to_string()]);
+diff --git a/crates/wm-darwin/src/server.rs b/crates/wm-darwin/src/server.rs
+index 18bca33..2c43fb3 100644
+--- a/crates/wm-darwin/src/server.rs
++++ b/crates/wm-darwin/src/server.rs
+@@ -208,6 +208,8 @@ pub struct Server {
+     client_wake: Option<i32>,
+     /// DESK8: a flip completed in the wait: its frame callbacks are flushed to the clients at once.
+     pub(crate) flip_seen: bool,
++    /// DESK8: frame callbacks sent while the display is off (once a second).
++    callbacks_while_off_at: Option<std::time::Instant>,
+     /// DESK8: switches that change without a relaunch (`policy.rs`).
+     pub policy: crate::policy::Policy,
+     /// DESK8: a GPU client's newer buffer held for the next refresh while no frame has shown the one before
+@@ -419,6 +421,7 @@ impl Server {
+             input_wake: None,
+             client_wake: None,
+             flip_seen: false,
++            callbacks_while_off_at: None,
+             policy: Default::default(),
+             fifo: HashMap::new(),
+             input_refused: 0,
+@@ -724,8 +727,23 @@ impl Server {
+         // stays dirty and is shown in full when input wakes the display.
+         self.power_tick()?;
+         if self.power.off {
++            // DESK8 (the coordinator): a client is never starved while the panel sleeps - its frame callbacks
++            // go out once a second (and the frames it draws meanwhile are kept for the wake), so a window
++            // that waited for one before drawing its content has it when the display comes back
++            if self.callbacks_while_off_at.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
++                self.callbacks_while_off_at = Some(std::time::Instant::now());
++                let mut ready: Vec<wl_callback::WlCallback> = std::mem::take(&mut self.cursor_callbacks);
++                for (_, callbacks) in self.callbacks.drain() {
++                    ready.extend(callbacks);
++                }
++                ready.extend(self.awaiting_flip.drain(..));
++                for callback in ready {
++                    callback.done(time_ms);
++                }
++            }
+             return Ok(());
+         }
++        self.callbacks_while_off_at = None;
+         // Chrome that wm-core deferred during an interactive move or resize (one raster per
+         // window per frame) is painted now, so the frame's edges follow the window every frame
+         // (without this the old bottom edge stayed where the resize began until it ended).
+@@ -1233,18 +1251,21 @@ impl Server {
+     /// is applied with it (the ones between are replaced unseen, counted). Never for a commit answering a
+     /// resize, a window not visible, or with the display off.
+     fn fifo_pre_commit(&mut self, surface: &WlSurface) {
+-        if !self.policy.now.fifo || self.power.off {
++        if (!self.policy.now.fifo && !self.policy.now.fifo_shm) || self.power.off {
+             return;
+         }
+         let Some(id) = self.wm.backend().window_for_surface(surface) else { return };
+-        if self.fifo.contains_key(&id) || !self.held.contains_key(&id) || !self.pacing.pending_unshown(id) {
++        if self.fifo.contains_key(&id) || !self.pacing.pending_unshown(id) {
+             return;
+         }
+         let new_buffer = with_states(surface, |s| match &s.cached_state.get::<SurfaceAttributes>().pending().buffer {
+             Some(BufferAssignment::NewBuffer(b)) => Some(b.id()),
+             _ => None,
+         });
+-        if !new_buffer.is_some_and(|b| self.external_by_buffer.contains_key(&b)) {
++        let Some(new_buffer) = new_buffer else { return };
++        // a GPU buffer, or (policy `fifo_shm`, DESK8) a CPU one of an application window
++        let gpu = self.external_by_buffer.contains_key(&new_buffer);
++        if !(gpu && self.policy.now.fifo && self.held.contains_key(&id)) && !(!gpu && self.policy.now.fifo_shm && self.wm.backend().windows.get(&id).is_some_and(|w| w.committed)) {
+             return;
+         }
+         if self.wm.interactive_drag_active() || Self::client_behind(surface) || !self.wm.backend().visible(id) {
+@@ -1261,7 +1282,7 @@ impl Server {
+         if self.fifo.is_empty() {
+             return;
+         }
+-        if !self.policy.now.fifo || self.power.off {
++        if (!self.policy.now.fifo && !self.policy.now.fifo_shm) || self.power.off {
+             self.fifo_release(FifoWhy::Off);
+         } else if self.fifo.values().any(|h| h.since.elapsed() > std::time::Duration::from_millis(40)) {
+             self.fifo_release(FifoWhy::Timeout);
+@@ -2075,6 +2096,12 @@ impl CompositorHandler for Server {
+                         }
+                     }
+                 };
++                // DESK8: an application drawing on the CPU (shm: AppKit without its GPU presenter, c18) is
++                // traced and paced (FIFO) like a GPU client
++                if external.is_none() {
++                    let app = self.wm.backend().windows.get(&id).and_then(|w| w.app_id.clone().or_else(|| w.last_app_id.clone()));
++                    self.pacing.commit(id, app.as_deref());
++                }
+                 let w = self.wm.backend_mut().windows.get_mut(&id).unwrap();
+                 let first = !w.committed;
+                 w.committed = true;

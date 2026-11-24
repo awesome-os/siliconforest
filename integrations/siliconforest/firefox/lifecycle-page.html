@@ -1,0 +1,22 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>SF-FX isolated media lifecycle</title>
+<style>body{font:20px/1.5 system-ui;margin:30px}audio{display:block;margin:20px 0}pre{white-space:pre-wrap}</style>
+<h1>Isolated Firefox window and audio lifecycle</h1>
+<audio id="audio" controls loop preload="auto" src="tone.wav"></audio>
+<button id="play">Play test audio</button><pre id="state"></pre>
+<script>
+const token=new URLSearchParams(location.search).get('token');
+if(!token||!/^sffx-[a-f0-9]{16}$/.test(token))throw new Error('Owned fixture token required');
+document.title='SF-FX lifecycle '+token;
+const audio=document.querySelector('audio');audio.volume=.1;
+window.fxLifecycle={token,events:[],started:false};
+function state(){const q=audio.getVideoPlaybackQuality?.();return {token,wall:Date.now(),time:audio.currentTime,paused:audio.paused,ended:audio.ended,muted:audio.muted,volume:audio.volume,readyState:audio.readyState,visibility:document.visibilityState,error:audio.error?.code??null,quality:q?{total:q.totalVideoFrames,dropped:q.droppedVideoFrames}:null};}
+function event(name){const row={...state(),event:name};fxLifecycle.events.push(row);navigator.sendBeacon('events',JSON.stringify(row));}
+for(const name of ['playing','pause','waiting','stalled','ended','error'])audio.addEventListener(name,()=>event(name));
+for(const name of ['pagehide','pageshow','visibilitychange'])window.addEventListener(name,()=>event(name));
+window.fxLifecycleStart=async()=>{await audio.play();fxLifecycle.started=true;event('start');return state();};
+window.fxLifecycleState=state;
+document.querySelector('#play').onclick=()=>fxLifecycleStart();
+setInterval(()=>{const row=state();document.querySelector('#state').textContent=JSON.stringify(row,null,2);navigator.sendBeacon('events',JSON.stringify({...row,event:'heartbeat'}));},250);
+</script>

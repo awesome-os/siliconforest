@@ -1,0 +1,39 @@
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -2870,6 +2870,14 @@
+     if(visible)
+         return;
+ 
++    // (TERM8) as on macOS: with no window on screen, a minimised one comes back first
++    for(NSWindow *window in _windows) {
++        if([window isMiniaturized] && ![window isKindOfClass:[NSPanel class]]) {
++            [window deminiaturize:nil];
++            return;
++        }
++    }
++
+     // no window on screen, so the app gets the untitled window it opens at launch
+     id types=[[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleDocumentTypes"];
+     [self _openUntitledFile:[types count] > 0 ? [NSDocumentController sharedDocumentController] : nil];
+--- a/src/Frameworks/AppKit/NSWindowMenuStrip.m
++++ b/src/Frameworks/AppKit/NSWindowMenuStrip.m
+@@ -354,6 +354,19 @@
+         dispatch_async(dispatch_get_main_queue(), ^{ [NSApp sendAction:[item action] to:[item target] from:item]; });
+         return @"ok\n";
+     }
++    /* (TERM8) the dock's click on a running application's tile: macOS's reopen event (kAEReopenApplication), which
++     * asks the delegate (-applicationShouldHandleReopen:hasVisibleWindows:), unhides, brings back a minimised window
++     * or opens the untitled one - so an application with no window left (Firefox after its last window closed) is
++     * reachable again. "quit": the application's own Quit (-terminate:), with or without a window. Both after the
++     * answer, as an action may run a modal session. */
++    if ([verb isEqualToString:@"reopen"]) {
++        dispatch_async(dispatch_get_main_queue(), ^{ [NSApp performSelector:@selector(_reopen)]; });
++        return @"ok\n";
++    }
++    if ([verb isEqualToString:@"quit"]) {
++        dispatch_async(dispatch_get_main_queue(), ^{ [NSApp terminate:nil]; });
++        return @"ok\n";
++    }
+     if ([verb isEqualToString:@"menubar"]) {
+         NSString *how = [words count] > 1 ? [words objectAtIndex:1] : nil;
+         BOOL on = [NSWindow _sfMenuStripsEnabled];

@@ -1,0 +1,173 @@
+diff --git a/crates/wm-darwin/src/inject.rs b/crates/wm-darwin/src/inject.rs
+index a4c1c07..d260c79 100644
+--- a/crates/wm-darwin/src/inject.rs
++++ b/crates/wm-darwin/src/inject.rs
+@@ -33,6 +33,8 @@
+ //! latch on|off                     late latching of frames on or off (before/after numbers)
+ //! margin <us>|auto                 commit this long before the blank (500..10000), or learn it (DESK5)
+ //! cursorplane on|off               the pointer on the display's overlay plane, or drawn into frames
++//! precise on|off                   the last 3 ms before a commit waited for in the real-time
++//!                                  scheduling class, or by poll and nanosleep as before (DESK6)
+ //! motions <n>                      the next <n> event steps (abs/rel/buttons/wheel/...) in one frame,
+ //!                                  as a device that reports faster than the screen refreshes
+ //! stats                            one line: the input thread's counts (records, gaps, ...), the
+@@ -73,6 +75,8 @@ enum Step {
+     Margin(Option<u32>),
+     CursorPlane(bool),
+     Motions(usize),
++    /// `precise on|off`: the real-time wait before commits (DESK6), for before/after numbers.
++    Precise(bool),
+     Wait(Duration),
+     Capture(String),
+     Dump(String),
+@@ -161,6 +165,7 @@ impl Inject {
+                 ["stall", ms] => ms.parse::<u64>().ok().filter(|ms| *ms <= 5_000).map(|ms| Step::Stall(Duration::from_millis(ms))),
+                 ["fail"] => Some(Step::Fail),
+                 ["stats"] => Some(Step::Stats),
++                ["precise", on @ ("on" | "off")] => Some(Step::Precise(*on == "on")),
+                 ["latch", on @ ("on" | "off")] => Some(Step::Latch(*on == "on")),
+                 ["margin", "auto"] => Some(Step::Margin(None)),
+                 ["margin", us] => us.parse::<u32>().ok().filter(|us| (500..=10_000).contains(us)).map(|us| Step::Margin(Some(us))),
+@@ -224,6 +229,12 @@ impl Inject {
+                     self.done += 1;
+                 }
+             }
++            Some(Step::Precise(on)) => {
++                server.precise_wait = *on;
++                eprintln!("WMINJECT precise {}", if *on { "on (the last moments before a commit in the real-time class)" } else { "off (poll and nanosleep, as before)" });
++                self.queue.pop_front();
++                self.done += 1;
++            }
+             Some(Step::Motions(n)) => {
+                 self.burst = *n;
+                 self.queue.pop_front();
+diff --git a/crates/wm-darwin/src/input_latency.rs b/crates/wm-darwin/src/input_latency.rs
+index 04ee85b..f8c7924 100644
+--- a/crates/wm-darwin/src/input_latency.rs
++++ b/crates/wm-darwin/src/input_latency.rs
+@@ -87,6 +87,69 @@ pub fn interactive_qos(what: &str) {
+     let _ = what;
+ }
+ 
++/// How long before a frame's moment the loop stops polling and waits for it precisely (DESK6).
++pub const PRECISE_WINDOW: std::time::Duration = std::time::Duration::from_micros(3000);
++
++#[cfg(target_os = "macos")]
++struct Mach {
++    policy_set: extern "C" fn(u32, u32, *const i32, u32) -> i32,
++    thread: extern "C" fn(libc::pthread_t) -> u32,
++    wait_until: extern "C" fn(u64) -> i32,
++    now: extern "C" fn() -> u64,
++    numer: u64,
++    denom: u64,
++}
++#[cfg(target_os = "macos")]
++static MACH: std::sync::OnceLock<Option<Mach>> = std::sync::OnceLock::new();
++#[cfg(target_os = "macos")]
++fn mach() -> Option<&'static Mach> {
++    MACH.get_or_init(|| unsafe {
++        let f = |name: &std::ffi::CStr| { let p = libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()); (!p.is_null()).then_some(p) };
++        let (Some(a), Some(b), Some(c), Some(d), Some(e)) = (f(c"thread_policy_set"), f(c"pthread_mach_thread_np"), f(c"mach_wait_until"), f(c"mach_absolute_time"), f(c"mach_timebase_info")) else {
++            eprintln!("WMPACE precise wait: a mach call is absent (the poll and nanosleep wait stays)");
++            return None;
++        };
++        let timebase: extern "C" fn(*mut [u32; 2]) -> i32 = std::mem::transmute(e);
++        let mut info = [0u32; 2];
++        if timebase(&mut info) != 0 || info[0] == 0 || info[1] == 0 {
++            return None;
++        }
++        Some(Mach { policy_set: std::mem::transmute(a), thread: std::mem::transmute(b), wait_until: std::mem::transmute(c), now: std::mem::transmute(d), numer: u64::from(info[0]), denom: u64::from(info[1]) })
++    }).as_ref()
++}
++
++/// Waits until `due` with the calling thread in the time-constraint (real-time) scheduling class
++/// for the wait, then back in the standard class (DESK6, item 4: frames missed their blank 0.3-0.9 %
++/// of the time because the loop woke 1-2.5 ms late at user-interactive QoS; a real-time thread is
++/// run when its timer fires). `false`: not available here (the caller sleeps as before).
++pub fn precise_wait_until(due: std::time::Instant) -> bool {
++    #[cfg(target_os = "macos")]
++    {
++        let Some(m) = mach() else { return false };
++        let left = due.saturating_duration_since(std::time::Instant::now());
++        let ticks = |d: std::time::Duration| (d.as_nanos() as u64).saturating_mul(m.denom) / m.numer;
++        let thread = (m.thread)(unsafe { libc::pthread_self() });
++        // period one refresh, a millisecond of work, done within four, preemptible
++        let policy = [ticks(std::time::Duration::from_micros(16_667)) as i32, ticks(std::time::Duration::from_micros(1000)) as i32, ticks(std::time::Duration::from_micros(4000)) as i32, 1];
++        let rc = (m.policy_set)(thread, 2, policy.as_ptr(), 4); // THREAD_TIME_CONSTRAINT_POLICY
++        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
++            eprintln!("WMPACE precise wait: time-constraint policy for the last {} us before a commit rc={rc}", PRECISE_WINDOW.as_micros());
++        }
++        (m.wait_until)((m.now)().saturating_add(ticks(left)));
++        if rc == 0 {
++            let standard = [0i32; 1];
++            (m.policy_set)(thread, 1, standard.as_ptr(), 0); // THREAD_STANDARD_POLICY
++        }
++        true
++    }
++    #[cfg(not(target_os = "macos"))]
++    {
++        let _ = due;
++        false
++    }
++}
++
+ #[derive(Default)]
+ pub(crate) struct MotionLatency {
+     /// The oldest and the newest motion not shown yet.
+diff --git a/crates/wm-darwin/src/server.rs b/crates/wm-darwin/src/server.rs
+index 1d46305..aeab0a9 100644
+--- a/crates/wm-darwin/src/server.rs
++++ b/crates/wm-darwin/src/server.rs
+@@ -170,6 +170,9 @@ pub struct Server {
+     /// The moment a ready frame (staged, or a pointer move on its plane) is to be committed,
+     /// and the blank it aims at (DESK5).
+     commit_due: Option<(std::time::Instant, Option<std::time::Instant>)>,
++    /// The last moments before a commit are waited for in the real-time scheduling class (DESK6;
++    /// `CHONKSTEP_DARWIN_PRECISE_WAIT=0` or inject `precise off` turns it off).
++    pub(crate) precise_wait: bool,
+     /// The pointer's plane may be used (the test instrument's `cursorplane on|off`).
+     pub(crate) cursor_plane_allowed: bool,
+     /// The pointer as the staged frame drew the windows during an interactive move or resize:
+@@ -356,6 +359,7 @@ impl Server {
+             pacer: crate::input_latency::FramePacer::new(false),
+             render_due: None,
+             commit_due: None,
++            precise_wait: std::env::var("CHONKSTEP_DARWIN_PRECISE_WAIT").map_or(true, |v| v != "0"),
+             cursor_plane_allowed: true,
+             staged_drag_pointer: None,
+             input_wake: None,
+@@ -1000,16 +1004,21 @@ impl Server {
+                 (a, b) => a.or(b),
+             };
+             let mut precise = None;
++            // DESK6: the last PRECISE_WINDOW before the moment is waited for in the real-time
++            // scheduling class (input_latency::precise_wait_until); without it, as before
++            let window = if self.precise_wait { crate::input_latency::PRECISE_WINDOW } else { std::time::Duration::from_millis(2) };
+             if let Some(due) = due {
+                 let left = due.saturating_duration_since(std::time::Instant::now());
+-                if left <= std::time::Duration::from_millis(2) {
+-                    std::thread::sleep(left);
++                if left <= window {
++                    if !(self.precise_wait && crate::input_latency::precise_wait_until(due)) {
++                        std::thread::sleep(left);
++                    }
+                     return Ok(());
+                 }
+                 // poll counts whole milliseconds and wakes late rather than early: wait for whole
+                 // milliseconds short of the moment, then sleep the rest precisely (DESK5: the
+                 // rounding up made commits up to a millisecond late, which the display then missed)
+-                max = max.min(left - std::time::Duration::from_millis(1));
++                max = max.min(left - if self.precise_wait { window } else { std::time::Duration::from_millis(1) });
+                 precise = Some(due);
+             }
+             if fds.is_empty() {
+@@ -1023,7 +1032,7 @@ impl Server {
+             }
+             if let Some(due) = precise {
+                 let left = due.saturating_duration_since(std::time::Instant::now());
+-                if left <= std::time::Duration::from_millis(2) {
++                if left <= window && !(self.precise_wait && crate::input_latency::precise_wait_until(due)) {
+                     std::thread::sleep(left);
+                 }
+             }

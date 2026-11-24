@@ -1,0 +1,274 @@
+diff --git a/src/Kernel/Extensions/SFBwfm/SFBwfm.cpp b/src/Kernel/Extensions/SFBwfm/SFBwfm.cpp
+index 1e8e3880d..6d799bfbd 100644
+--- a/src/Kernel/Extensions/SFBwfm/SFBwfm.cpp
++++ b/src/Kernel/Extensions/SFBwfm/SFBwfm.cpp
+@@ -670,8 +670,43 @@ IOReturn SFBwfm::enable(IONetworkInterface *interface)
+ 
+ // The requests that change the radio pass through here: power is where bwfm_off takes
+ // effect, and once the chip was taken down every other one first needs it back.
++// FXNET: APPLE80211_IOC_POWERSAVE carries SiliconForest's own layout, not Apple's: a set takes
++// version, mode (0 constantly awake, 1 PS-Poll, 2 fast power save) and pm2_ret_ms (0 keeps
++// it); a get fills in what init will give the firmware and what the firmware says now (-1 when
++// it was not running). sf-wifipm (m1-bwfm/tools) is the userspace side.
++struct sf80211_powersave_data {
++	uint32_t	version;
++	uint32_t	mode;
++	uint32_t	pm2_ret_ms;
++	int32_t		fw_mode;
++	int32_t		fw_pm2_ret_ms;
++};
++
+ SInt32 SFBwfm::apple80211Request(bool set, int type, int value, void *data, uint32_t *len)
+ {
++	if (type == APPLE80211_IOC_POWERSAVE && fIC != NULL && fDev != NULL && len != NULL && data != NULL) {
++		struct sf80211_powersave_data *ps = (struct sf80211_powersave_data *)data;
++
++		if (set) {
++			if (*len < 3 * sizeof(uint32_t))
++				return EINVAL;
++			if ((fChipDown || fPortDown) && chipUp(false, "power save") != kIOReturnSuccess)
++				return EIO;
++			LOG("power save: mode %u, pm2_sleep_ret %u ms requested", ps->mode, ps->pm2_ret_ms);
++			return sf_bwfm_set_pm(fDev, (int)ps->mode, (int)ps->pm2_ret_ms);
++		}
++		if (*len < sizeof(*ps))
++			return EINVAL;
++		int fwMode, fwRet, wantMode, wantRet;
++		sf_bwfm_get_pm(fDev, &fwMode, &fwRet, &wantMode, &wantRet);
++		ps->version = APPLE80211_VERSION;
++		ps->mode = (uint32_t)wantMode;
++		ps->pm2_ret_ms = (uint32_t)wantRet;
++		ps->fw_mode = fwMode;
++		ps->fw_pm2_ret_ms = fwRet;
++		*len = sizeof(*ps);
++		return 0;
++	}
+ 	if (!set || fIC == NULL)
+ 		return super::apple80211Request(set, type, value, data, len);
+ 	if (type == APPLE80211_IOC_POWER && len != NULL && *len >= sizeof(struct apple80211_power_data)) {
+@@ -928,6 +963,24 @@ int sf_bwfm_want_dsack(void)
+ 	return value != 0;
+ }
+ 
++// FXNET: replies that come more than the firmware's 200 ms after our last frame waited for
++// the next DTIM beacon in fast power save (LAN ping at 1 s: p50 159 ms, max 318 ms)
++int sf_bwfm_want_pm(void)
++{
++	int value = 2;
++
++	PE_parse_boot_argn("bwfm_pm", &value, sizeof(value));
++	return value >= 0 && value <= 2 ? value : 2;
++}
++
++int sf_bwfm_want_pm2_ret(void)
++{
++	int value = 2000;
++
++	PE_parse_boot_argn("bwfm_pm2_ret", &value, sizeof(value));
++	return value >= 0 && value <= 60000 ? value : 2000;
++}
++
+ // config space, the tag is the IOPCIDevice
+ 
+ pcireg_t pci_conf_read(pci_chipset_tag_t pc, pcitag_t tag, int reg)
+diff --git a/src/Kernel/Extensions/SFBwfm/bwfm.c b/src/Kernel/Extensions/SFBwfm/bwfm.c
+index 98986aa16..d84f1fada 100644
+--- a/src/Kernel/Extensions/SFBwfm/bwfm.c
++++ b/src/Kernel/Extensions/SFBwfm/bwfm.c
+@@ -263,6 +263,64 @@ bwfm_lifecycle_exit(struct bwfm_softc *sc)
+ 	}
+ }
+ 
++/*
++ * SFBwfm (FXNET): the station's power save at run time, under the stack lock.
++ * mode is BWFM_PM_* (0 constantly awake, 1 PS-Poll, 2 fast power save); for
++ * mode 2, ret_ms > 0 is how long the firmware stays awake after the last frame
++ * (pm2_sleep_ret), 0 keeps what it has. Both are kept for the next init. The
++ * firmware is asked only while it runs; otherwise the next init applies them.
++ * Returns 0, EINVAL for a mode out of range, EIO when the firmware refused it.
++ */
++int
++bwfm_pm_set(struct bwfm_softc *sc, int mode, int ret_ms)
++{
++	int error = 0;
++
++	if (mode < BWFM_PM_CAM || mode > BWFM_PM_FAST_PS || ret_ms < 0 || ret_ms > 60000)
++		return EINVAL;
++	bwfm_lifecycle_enter(sc);
++	sc->sc_pm_known = 1;
++	sc->sc_pm_mode = mode;
++	if (ret_ms > 0)
++		sc->sc_pm2_ret_ms = ret_ms;
++	if (sc->sc_initialized && !sc->sc_bus_gone &&
++	    (sc->sc_ic.ic_if.if_flags & IFF_RUNNING)) {
++		if (mode == BWFM_PM_FAST_PS && sc->sc_pm2_ret_ms > 0 &&
++		    bwfm_fwvar_var_set_int(sc, "pm2_sleep_ret", sc->sc_pm2_ret_ms))
++			printf("%s: pm2_sleep_ret %d ms not taken: %s\n", DEVNAME(sc),
++			    sc->sc_pm2_ret_ms, BWFM_CTLWHY(sc));
++		if (bwfm_fwvar_cmd_set_int(sc, BWFM_C_SET_PM, mode))
++			error = EIO;
++		printf("%s: power save mode %d, pm2_sleep_ret %d ms: %s\n", DEVNAME(sc),
++		    mode, sc->sc_pm2_ret_ms, error ? BWFM_CTLWHY(sc) : "set");
++	}
++	bwfm_lifecycle_exit(sc);
++	return error;
++}
++
++/*
++ * SFBwfm (FXNET): what the firmware says now, its PM mode and pm2_sleep_ret
++ * (-1 each when it was not asked or did not answer), and what init will give it.
++ */
++void
++bwfm_pm_get(struct bwfm_softc *sc, int *fw_mode, int *fw_ret_ms, int *want_mode, int *want_ret_ms)
++{
++	uint32_t v;
++
++	*fw_mode = *fw_ret_ms = -1;
++	bwfm_lifecycle_enter(sc);
++	if (sc->sc_initialized && !sc->sc_bus_gone &&
++	    (sc->sc_ic.ic_if.if_flags & IFF_RUNNING)) {
++		if (bwfm_fwvar_cmd_get_int(sc, BWFM_C_GET_PM, &v) == 0)
++			*fw_mode = (int)v;
++		if (bwfm_fwvar_var_get_int(sc, "pm2_sleep_ret", &v) == 0)
++			*fw_ret_ms = (int)v;
++	}
++	*want_mode = sc->sc_pm_known ? sc->sc_pm_mode : sf_bwfm_want_pm();
++	*want_ret_ms = sc->sc_pm_known ? sc->sc_pm2_ret_ms : sf_bwfm_want_pm2_ret();
++	bwfm_lifecycle_exit(sc);
++}
++
+ static void
+ bwfm_task_barrier_done(void *arg)
+ {
+@@ -738,16 +796,34 @@ bwfm_init1(struct ifnet *ifp)
+ 	/*
+ 	 * Use CAM (constantly awake) when we are running as AP,
+ 	 * otherwise use fast power saving.
++	 *
++	 * SFBwfm (FXNET): the station's mode comes from bwfm_pm (default fast
++	 * power save) and, in fast power save, the firmware stays awake for
++	 * bwfm_pm2_ret ms after the last frame (default 2000; the firmware's
++	 * own 200 ms let replies that come later than that wait for the next
++	 * DTIM beacon, up to ~300 ms on the bench). Both can be changed at run
++	 * time, see sf_bwfm_set_pm().
+ 	 */
+-	pm = BWFM_PM_FAST_PS;
++	if (!sc->sc_pm_known) {
++		sc->sc_pm_mode = sf_bwfm_want_pm();
++		sc->sc_pm2_ret_ms = sf_bwfm_want_pm2_ret();
++		sc->sc_pm_known = 1;
++	}
++	pm = sc->sc_pm_mode;
+ #ifndef IEEE80211_STA_ONLY
+ 	if (ic->ic_opmode == IEEE80211_M_HOSTAP)
+ 		pm = BWFM_PM_CAM;
+ #endif
++	if (pm == BWFM_PM_FAST_PS && sc->sc_pm2_ret_ms > 0 &&
++	    bwfm_fwvar_var_set_int(sc, "pm2_sleep_ret", sc->sc_pm2_ret_ms))
++		printf("%s: pm2_sleep_ret %d ms not taken: %s\n", DEVNAME(sc),
++		    sc->sc_pm2_ret_ms, BWFM_CTLWHY(sc));
+ 	if (bwfm_fwvar_cmd_set_int(sc, BWFM_C_SET_PM, pm)) {
+ 		printf("%s: could not set power: %s\n", DEVNAME(sc), BWFM_CTLWHY(sc));
+ 		return;
+ 	}
++	printf("%s: power save mode %d, pm2_sleep_ret %d ms (0: firmware's)\n",
++	    DEVNAME(sc), pm, pm == BWFM_PM_FAST_PS ? sc->sc_pm2_ret_ms : 0);
+ 
+ 	bwfm_fwvar_var_set_int(sc, "txbf", 1);
+ 	bwfm_fwvar_cmd_set_int(sc, BWFM_C_UP, 0);
+diff --git a/src/Kernel/Extensions/SFBwfm/bwfmvar.h b/src/Kernel/Extensions/SFBwfm/bwfmvar.h
+index 719b8f848..20b970451 100644
+--- a/src/Kernel/Extensions/SFBwfm/bwfmvar.h
++++ b/src/Kernel/Extensions/SFBwfm/bwfmvar.h
+@@ -234,6 +234,16 @@ struct bwfm_softc {
+ 	int			 sc_media_done;
+ 	/* SFBwfm: the port is down, the glue keeps off the DART too */
+ 	int			 sc_bus_gone;
++	/*
++	 * SFBwfm (FXNET): the power save mode init gives the firmware
++	 * (BWFM_PM_*, read from the boot-args once sc_pm_known is 0) and, for
++	 * fast power save, how long it stays awake after the last frame
++	 * (pm2_sleep_ret, ms, 0: the firmware's own). sf_bwfm_set_pm() changes
++	 * both at run time.
++	 */
++	int			 sc_pm_known;
++	int			 sc_pm_mode;
++	int			 sc_pm2_ret_ms;
+ };
+ 
+ void bwfm_attach(struct bwfm_softc *);
+@@ -244,6 +254,9 @@ void bwfm_cleanup(struct bwfm_softc *);
+ void bwfm_lifecycle_enter(struct bwfm_softc *);
+ void bwfm_lifecycle_exit(struct bwfm_softc *);
+ int bwfm_task_barrier(struct bwfm_softc *);
++/* SFBwfm (FXNET): power save at run time, see bwfm.c */
++int bwfm_pm_set(struct bwfm_softc *, int, int);
++void bwfm_pm_get(struct bwfm_softc *, int *, int *, int *, int *);
+ int bwfm_radio_down(struct bwfm_softc *, int);
+ void bwfm_init(struct ifnet *);
+ void bwfm_stop(struct ifnet *);
+diff --git a/src/Kernel/Extensions/SFBwfm/sf_bwfm_compat.h b/src/Kernel/Extensions/SFBwfm/sf_bwfm_compat.h
+index 754903741..1477a52df 100644
+--- a/src/Kernel/Extensions/SFBwfm/sf_bwfm_compat.h
++++ b/src/Kernel/Extensions/SFBwfm/sf_bwfm_compat.h
+@@ -257,6 +257,11 @@ int	sf_bwfm_bootarg(const char *name, char *buf, int len);
+ int	sf_bwfm_want_fwsup(void);
+ // 1 when the firmware's deep sleep request is acknowledged as brcmfmac does (boot-arg bwfm_dsack=1; default 0)
+ int	sf_bwfm_want_dsack(void);
++// the station's power save mode, BWFM_PM_* (boot-arg bwfm_pm, default 2: fast power save)
++int	sf_bwfm_want_pm(void);
++// ms the firmware stays awake after the last frame in fast power save (boot-arg bwfm_pm2_ret,
++// default 2000; 0 leaves the firmware's own 200 ms)
++int	sf_bwfm_want_pm2_ret(void);
+ 
+ // the rest of the kernel bwfm touches
+ 
+diff --git a/src/Kernel/Extensions/SFBwfm/sf_bwfm_glue.c b/src/Kernel/Extensions/SFBwfm/sf_bwfm_glue.c
+index 85a73971e..e2b12b098 100644
+--- a/src/Kernel/Extensions/SFBwfm/sf_bwfm_glue.c
++++ b/src/Kernel/Extensions/SFBwfm/sf_bwfm_glue.c
+@@ -255,6 +255,30 @@ sf_bwfm_detach(struct device *dev)
+ 	return busy;
+ }
+ 
++// FXNET: the station's power save at run time, see bwfm_pm_set() and bwfm_pm_get() in bwfm.c
++int
++sf_bwfm_set_pm(struct device *dev, int mode, int ret_ms)
++{
++	struct bwfm_softc *sc = (struct bwfm_softc *)dev;
++	int error;
++
++	sf80211_lock();
++	error = bwfm_pm_set(sc, mode, ret_ms);
++	sf80211_unlock();
++	return error;
++}
++
++int
++sf_bwfm_get_pm(struct device *dev, int *fw_mode, int *fw_ret_ms, int *want_mode, int *want_ret_ms)
++{
++	struct bwfm_softc *sc = (struct bwfm_softc *)dev;
++
++	sf80211_lock();
++	bwfm_pm_get(sc, fw_mode, fw_ret_ms, want_mode, want_ret_ms);
++	sf80211_unlock();
++	return 0;
++}
++
+ struct ieee80211com *
+ sf_bwfm_ic(struct device *dev)
+ {
+diff --git a/src/Kernel/Extensions/SFBwfm/sf_bwfm_glue.h b/src/Kernel/Extensions/SFBwfm/sf_bwfm_glue.h
+index bda779ee8..1c8003129 100644
+--- a/src/Kernel/Extensions/SFBwfm/sf_bwfm_glue.h
++++ b/src/Kernel/Extensions/SFBwfm/sf_bwfm_glue.h
+@@ -25,6 +25,9 @@ int	sf_bwfm_dma_resume(void);
+ void	sf_bwfm_unhook(struct device *);
+ int	sf_bwfm_detach(struct device *);
+ struct ieee80211com *sf_bwfm_ic(struct device *);
++/* FXNET: power save at run time, see sf_bwfm_glue.c */
++int	sf_bwfm_set_pm(struct device *, int mode, int ret_ms);
++int	sf_bwfm_get_pm(struct device *, int *fw_mode, int *fw_ret_ms, int *want_mode, int *want_ret_ms);
+ 
+ #ifdef __cplusplus
+ }

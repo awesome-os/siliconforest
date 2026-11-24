@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "reviewer": "Grok",
+  "status": "SOURCE_ONLY_HOST_DIFFERENTIAL_NOT_HARDWARE",
+  "role": "integrations/puredarwin/m1-keyboard/protocol is an independent checker. The hardware candidate links native_protocol only. This receipt did not edit native_protocol.",
+  "approved_root_engine": {
+    "receipt": "reports/sprint-010/keyboard-native-protocol-review.json",
+    "r1": "APPROVED. deliver() accepts declared payload + 10 <= reassembled length. CRC stays at the real end. payload_length is the declared length.",
+    "dl_spi_hid.h_sha256": "c58d84b1965812b65210d0f0c794b577a6dcfecef1a5dc449e2ae1fc6fe5d5ec",
+    "dl_spi_hid.c_sha256": "88f2ae23fc527affa440fe5ee7309ac9b566de6c842cdb3e0d03dd054bf53103"
+  },
+  "sources_sha256": {
+    "pd_spi_hid_protocol.h": "edbad29fe9b3512e6d073afb489180eb68a337f837f5014e345f95a6db4e6609",
+    "pd_spi_hid_protocol.c": "57222fd29ad3e95c60cae86a5e3b973255799e96d1518785128be0b9f96c664c",
+    "test_pd_spi_hid_protocol.c": "c5e5b548280d566adf685c0d6fbbb70d19df8f505087a70a6c5542159a510d39",
+    "PROVENANCE.md": "f4ef59a8abb3bd40ce3be46567ba2e723699373f1c65948fccbd1b30fb0481f3",
+    "Makefile": "38df3ba0cef6b7c6656f04c4a56a158f374d28973396cb7788745c7e8275e093"
+  },
+  "fix": "assemble() no longer takes remain; the caller already stores offset+length+remain in span. test_copy now passes sizeof of an 8-byte destination. The earlier call claimed capacity 100 for a 4-byte array and ASan aborted.",
+  "host_command": "clang -std=c11 -Wall -Wextra -Werror -Wpedantic -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer pd_spi_hid_protocol.c test_pd_spi_hid_protocol.c",
+  "host_exit_code": 0,
+  "host_stdout": "pd_spi_hid_protocol: host checks passed",
+  "crc16_arc": "123456789 -> 0xbb3d on both engines",
+  "protocol_semantics": [
+    "Padding: payload_len+10 <= length is delivered; the payload length is the declared value. payload_len+10 > length is REJECT.",
+    "Unrelated input during a fragment (bad packet CRC, length under 10 that is not boot, bad single-message CRC, unknown flags) leaves the prefix in place.",
+    "A continuation whose device does not match abandons the prefix. A changed total does not.",
+    "A final fragment shorter than 10 bytes is REJECT and the prefix stays open.",
+    "Descriptor payload 513 is REJECT after reassembly, with no payload. Payload 512 is delivered.",
+    "CRC-valid a0 80 00 00 is BOOT before flags and before an 8-byte header. The four bytes are returned and an open fragment continues."
+  ],
+  "differential_vs_approved_root": [
+    {"case": "padded message, CRC at the real end", "protocol": "MESSAGE payload 5", "root": "MESSAGE payload 5, last_error NONE", "attribution": "Same as approved R1 and the Linux model."},
+    {"case": "declared payload past the buffer", "protocol": "REJECT", "root": "INVALID, DLSP_E_LENGTH", "attribution": "Same refusal."},
+    {"case": "bad packet CRC between fragments", "protocol": "REJECT, prefix kept, later continuation MESSAGE payload 20", "root": "INVALID, DLSP_E_PACKET_CRC, active cleared; continuation INVALID", "attribution": "Linux keeps the prefix. Root aborts it."},
+    {"case": "length-3 junk between fragments", "protocol": "REJECT, prefix kept", "root": "INVALID, DLSP_E_LENGTH, active cleared", "attribution": "Linux drops the short packet and keeps the prefix."},
+    {"case": "bad single-message CRC between fragments", "protocol": "REJECT, prefix kept, later continuation MESSAGE payload 20", "root": "INVALID, DLSP_E_MESSAGE_CRC, active cleared", "attribution": "Linux keeps the prefix."},
+    {"case": "final fragment of 5 bytes", "protocol": "REJECT, filled 15, total 20", "root": "MESSAGE payload 10", "attribution": "Linux drops a short final fragment. Root assembles it."},
+    {"case": "descriptor payload 513", "protocol": "REJECT, payload NULL", "root": "INVALID, DLSP_E_DESCRIPTOR", "attribution": "Both engines refuse before a caller sees a payload. The Linux handler refuses after delivery."},
+    {"case": "boot a0 80 00 00 with flags 0x81 during a fragment", "protocol": "BOOT, four-byte payload, prefix kept, later continuation MESSAGE payload 20", "root": "BOOT, payload NULL, active cleared", "attribution": "Recognition matches the reference, including unknown flags. Root clears the open fragment."},
+    {"case": "empty info, iface, and descriptor requests, id 7", "protocol": "256-byte match with dlsp_request", "root": "DLSP_WAIT", "attribution": "Same bytes, including both CRCs. Success for dlsp_request is 0."}
+  ],
+  "hardware_accessed": false,
+  "native_keyboard_working": false,
+  "command_line_observed": false,
+  "limits": "Host sanitizers and one linked differential of the cases above. Root's 3000-stream Linux model was not re-run. A passing host check is not a key event, a boot, or a Darwin result."
+}

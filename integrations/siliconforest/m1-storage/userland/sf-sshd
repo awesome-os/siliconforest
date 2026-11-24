@@ -1,0 +1,19 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# /usr/libexec/sf-sshd: what launchd's job org.siliconforest.sshd runs. The host key is made on
+# this machine the first time (one ed25519 key; it never leaves the disk), its fingerprint goes
+# to the console and to /var/log/sshd.log at every start, then sshd runs in the foreground.
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+mkdir -p /var/run /var/empty /etc/ssh
+chmod 755 /var/empty
+K=/etc/ssh/ssh_host_ed25519_key
+if [ ! -s "$K" ] || [ ! -s "$K.pub" ]; then
+    rm -f "$K" "$K.pub" < /dev/null
+    ssh-keygen -q -t ed25519 -N '' -C siliconforest -f "$K" || { echo "SF_SSHD no host key could be made"; sleep 30; exit 1; }
+    chmod 600 "$K"; chmod 644 "$K.pub"
+    echo "SF_SSHD host key made on this machine"
+fi
+fp=$(ssh-keygen -l -f "$K.pub" 2>&1)
+echo "SF_SSHD host key $fp"
+echo "SF_SSHD host key $fp" > /dev/console 2> /dev/null
+exec /sbin/sshd -D -e -f /etc/ssh/sshd_config

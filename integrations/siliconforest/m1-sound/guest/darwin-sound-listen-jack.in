@@ -1,0 +1,39 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Listening script for the headphone jack: needs a person at the M1 with headphones (a
+# headset with buttons if there is one). Run: SD_GUEST=guest/darwin-sound-listen-jack.in
+# SD_RUNTIME=420 tools/sd_boot.sh sd<NN>. What to do and what must happen:
+#   1. Nothing plugged at the start: "jack=0".
+#   2. Plug the headphones in within the first 60 s. The log must show a plug event and
+#      "jack=1" (headphones) or "jack=2" (headset with microphone) within 2 s.
+#   3. From then on a 1 kHz tone plays for 3 s every 6 s: first both ears, then left only,
+#      then right only, at @VOLUME@ dB attenuation. It must start cleanly (no clipped start)
+#      and left/right must be the right way round.
+#   4. On a headset, press each button once: every press must log "jack buttons".
+#      An Apple headset must log "Apple headset remote enabled" after plugging.
+#   5. Unplug in the last 30 s: an unplug event and "jack=0" within 2 s.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+get() { sysctl -n "$1" 2>/dev/null; }
+printf '\nSD_BEGIN_%s\n' "$nonce"
+sysctl -w kern.sf_sound.volume_db=@VOLUME@ kern.sf_sound.tone_db=@TONEDB@ > /dev/null 2>&1
+t0=$(date +%s); n=0
+while [ $(( $(date +%s) - t0 )) -lt 330 ]; do
+    j=$(get kern.sf_sound.jack)
+    printf 'SD_LISTEN t=%s jack=%s plugs=%s unplugs=%s detects=%s buttons=%s button_events=%s irqs=%s\n' \
+        "$(( $(date +%s) - t0 ))" "$j" "$(get kern.sf_sound.jack_plugs)" "$(get kern.sf_sound.jack_unplugs)" \
+        "$(get kern.sf_sound.jack_detects)" "$(get kern.sf_sound.jack_buttons)" \
+        "$(get kern.sf_sound.jack_button_events)" "$(get kern.sf_sound.jack_irqs)"
+    if [ "$j" = 1 ] || [ "$j" = 2 ]; then
+        case $((n % 3)) in 0) c=lr;; 1) c=l;; 2) c=r;; esac
+        sfplay -t 1000 -s 3 -d @TONEDB@ -c $c 2>&1
+        n=$((n+1))
+        sleep 3
+    else
+        sleep 2
+    fi
+done
+sysctl kern.sf_sound 2>&1
+printf 'SD_END_%s\n' "$nonce"
+printf '\nPD_BENCH_DONE\n'

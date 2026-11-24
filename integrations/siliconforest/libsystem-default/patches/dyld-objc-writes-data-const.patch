@@ -1,0 +1,84 @@
+diff -ruN a/src/Libraries/dyld/upstream/src/dyld2.cpp b/src/Libraries/dyld/upstream/src/dyld2.cpp
+--- a/src/Libraries/dyld/upstream/src/dyld2.cpp	2026-11-13 12:58:04.924063925 -0800
++++ b/src/Libraries/dyld/upstream/src/dyld2.cpp	2026-11-13 12:58:23.452050969 -0800
+@@ -1322,6 +1322,7 @@
+ 			if ( (onlyHandler == NULL) && ((state == dyld_image_state_bound) || (orLater && (dyld_image_state_bound > state))) && (sNotifyObjCMapped != NULL) ) {
+ 				const char* paths[imageCount];
+ 				const mach_header* mhs[imageCount];
++				ImageLoader* objcImages[imageCount];
+ 				unsigned objcImageCount = 0;
+ 				for (int i=0; i < imageCount; ++i) {
+ 					ImageLoader* image = findImageByMachHeader(infos[i].imageLoadAddress);
+@@ -1344,6 +1345,7 @@
+ 					if ( hasObjC ) {
+ 						paths[objcImageCount] = infos[i].imageFilePath;
+ 						mhs[objcImageCount]   = infos[i].imageLoadAddress;
++						objcImages[objcImageCount] = image;
+ 						++objcImageCount;
+ 						if ( image != NULL )
+ 							image->setObjCMappedNotified();
+@@ -1352,7 +1354,16 @@
+ 				if ( objcImageCount != 0 ) {
+ 					dyld3::ScopedTimer timer(DBG_DYLD_TIMING_OBJC_MAP, 0, 0, 0);
+ 					uint64_t t0 = mach_absolute_time();
++					// the runtime writes into __DATA_CONST of these images (see makeDataWritable())
++					for (unsigned int i=0; i < objcImageCount; ++i) {
++						if ( objcImages[i] != NULL )
++							objcImages[i]->makeDataWritable();
++					}
+ 					(*sNotifyObjCMapped)(objcImageCount, paths, mhs);
++					for (unsigned int i=0; i < objcImageCount; ++i) {
++						if ( objcImages[i] != NULL )
++							objcImages[i]->makeDataReadOnly();
++					}
+ 					uint64_t t1 = mach_absolute_time();
+ 					ImageLoader::fgTotalObjCSetupTime += (t1-t0);
+ 				}
+diff -ruN a/src/Libraries/dyld/upstream/src/ImageLoader.h b/src/Libraries/dyld/upstream/src/ImageLoader.h
+--- a/src/Libraries/dyld/upstream/src/ImageLoader.h	2026-11-13 12:58:04.919593138 -0800
++++ b/src/Libraries/dyld/upstream/src/ImageLoader.h	2026-11-13 12:58:04.937573471 -0800
+@@ -607,6 +607,7 @@
+ 	virtual bool						usesChainedFixups() const { return false; }
+ 
+ 	virtual void						makeDataReadOnly() const {}
++	virtual void						makeDataWritable() const {}
+ 	
+ 										// when resolving symbols look in subImage if symbol can't be found
+ 	void								reExport(ImageLoader* subImage);
+diff -ruN a/src/Libraries/dyld/upstream/src/ImageLoaderMachOCompressed.cpp b/src/Libraries/dyld/upstream/src/ImageLoaderMachOCompressed.cpp
+--- a/src/Libraries/dyld/upstream/src/ImageLoaderMachOCompressed.cpp	2026-11-13 12:58:04.922593096 -0800
++++ b/src/Libraries/dyld/upstream/src/ImageLoaderMachOCompressed.cpp	2026-11-13 12:58:04.937871760 -0800
+@@ -1222,6 +1222,22 @@
+     uint8_t type               = 0;
+ };
+ 
++// The Objective-C runtime corrects references in an image when it is told the image is mapped
++// (protocol and superclass references among them). Current linkers put those sections into the
++// read-only __DATA_CONST segment and Apple's current dyld opens that segment for the runtime;
++// dyld2.cpp does the same around the "mapped" notification with this and makeDataReadOnly().
++void ImageLoaderMachOCompressed::makeDataWritable() const
++{
++#if !TEXT_RELOC_SUPPORT
++	if ( fReadOnlyDataSegment && !this->ImageLoader::inSharedCache() ) {
++		for (unsigned int i=0; i < fSegmentsCount; ++i) {
++			if ( segIsReadOnlyData(i) )
++				::mprotect((void*)segActualLoadAddress(i), segSize(i), PROT_READ | PROT_WRITE);
++		}
++	}
++#endif
++}
++
+ void ImageLoaderMachOCompressed::makeDataReadOnly() const
+ {
+ #if !TEXT_RELOC_SUPPORT
+diff -ruN a/src/Libraries/dyld/upstream/src/ImageLoaderMachOCompressed.h b/src/Libraries/dyld/upstream/src/ImageLoaderMachOCompressed.h
+--- a/src/Libraries/dyld/upstream/src/ImageLoaderMachOCompressed.h	2026-11-13 12:58:04.920593124 -0800
++++ b/src/Libraries/dyld/upstream/src/ImageLoaderMachOCompressed.h	2026-11-13 12:58:04.937667644 -0800
+@@ -70,6 +70,7 @@
+ 	virtual void						registerInterposing(const LinkContext& context);
+ 	virtual bool						usesChainedFixups() const;
+ 	virtual void						makeDataReadOnly() const;
++	virtual void						makeDataWritable() const;
+ 
+ protected:
+ 	virtual void						doInterpose(const LinkContext& context);

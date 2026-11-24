@@ -1,0 +1,27 @@
+--- a/src/Libraries/Security/apple/OSX/sec/Security/SecItem.c
++++ b/src/Libraries/Security/apple/OSX/sec/Security/SecItem.c
+@@ -1768,6 +1768,13 @@
+     OSStatus status;
+     __block SecCFDictionaryCOW query = { inQuery };
+ 
++    /* SiliconForest: the caller's result is defined on every path. Without a keychain
++     * daemon the query comes back "successful" with nothing written, and callers that trust
++     * success (Firefox, enumerating client certificates) then use an uninitialised pointer. */
++    if (result != NULL) {
++        *result = NULL;
++    }
++
+     os_activity_t activity = os_activity_create("SecItemCopyMatching_ios", OS_ACTIVITY_CURRENT, OS_ACTIVITY_FLAG_DEFAULT);
+     os_activity_scope(activity);
+     os_release(activity);
+@@ -1800,6 +1807,10 @@
+     });
+ 
+ errOut:
++    /* a search that found nothing is errSecItemNotFound, as with an empty keychain on macOS */
++    if (status == errSecSuccess && result != NULL && *result == NULL) {
++        status = errSecItemNotFound;
++    }
+     secdebug("secitem", "SecItemCopyMatching_ios returned: %d", (int)status);
+     CFReleaseSafe(query.mutable_dictionary);
+     return status;

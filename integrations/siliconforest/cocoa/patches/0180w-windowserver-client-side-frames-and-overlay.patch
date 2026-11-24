@@ -1,0 +1,97 @@
+--- a/src/Frameworks/WindowServer/message.h
++++ b/src/Frameworks/WindowServer/message.h
+@@ -174,6 +174,10 @@
+ #define WS_STYLE_TITLED            (1u << 0)
+ #define WS_STYLE_DOC_MODAL         (1u << 6)
+ #define WS_STYLE_FULLSCREEN        (1u << 14)
++/* (TERM12, FX-002) AppKit draws this window's title bar itself: a full-size content view under a transparent title bar
++ * with the title hidden (Firefox's tabs in the title bar); the compositor gives it only its edges (client-side
++ * decorations, xdg-decoration client_side) */
++#define WS_STYLE_CLIENT_FRAME      (1u << 29)
+ 
+ /* Which windows have their frame drawn by the compositor when it offers to (xdg-decoration):
+  * every titled window. That includes windows whose content runs under the title bar (a
+@@ -182,7 +186,7 @@
+  * over it. Borderless windows (menus, tool tips, splash screens), sheets and full screen
+  * windows have no standard frame and keep drawing everything themselves. */
+ static inline int wsStyleWantsServerFrame(unsigned int style) {
+-    return (style & WS_STYLE_TITLED) != 0 && (style & (WS_STYLE_DOC_MODAL | WS_STYLE_FULLSCREEN)) == 0;
++    return (style & WS_STYLE_TITLED) != 0 && (style & (WS_STYLE_DOC_MODAL | WS_STYLE_FULLSCREEN | WS_STYLE_CLIENT_FRAME)) == 0;
+ }
+ 
+ /* Pixels of a backing store for a length in points at a scale in 120ths, the rounding the
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -3863,6 +3863,22 @@
+         }
+     }
+ 
++    /* (TERM12, FX-002) who draws the frame follows the style: a window whose title bar AppKit now draws itself (Firefox
++     * turning its tabs-in-title-bar on) asks the compositor for client-side decorations, and back */
++    if (msg->style != window->style) {
++        int was = _windowServerServerDecorations() && wsStyleWantsServerFrame(window->style);
++        int now = _windowServerServerDecorations() && wsStyleWantsServerFrame(msg->style);
++
++        window->style = msg->style;
++        if (was != now && window->decoration != NULL) {
++            if (getenv("SF_WS_TRACE") != NULL)
++                fprintf(stderr, "WindowServer: toplevel %d asks for a frame by the %s\n", window->windowID, now ? "compositor" : "application");
++            zxdg_toplevel_decoration_v1_set_mode(window->decoration, now ? ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE
++                                                                         : ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
++            wl_display_flush(ws.display);
++        }
++    }
++
+     if (msg->title[0] != '\0' && window->toplevel != NULL) {
+         xdg_toplevel_set_title(window->toplevel, msg->title);
+         if (getenv("SF_WS_TRACE") != NULL)
+@@ -5124,6 +5140,22 @@
+     if(window)window->baseClean=1;
+     pthread_mutex_unlock(&ws.pixelsLock);
+ }
++/* (TERM12, FX-002) the part of the window's CPU-drawn picture that goes over its GPU layers (x,y,w,h in window pixels,
++ * rows top-down; w or h 0: none): the title bar controls AppKit draws over a full-size content view */
++int _windowServerSFFXSetOverlay(int windowID,int x,int y,int w,int h){
++    pthread_mutex_lock(&ws.pixelsLock);
++    struct wsWindow *window=windowForID(windowID);int good=window!=NULL&&window->gpuPresenter!=NULL;
++    if(good){
++        struct sfGPUPresenter *p=window->gpuPresenter;
++        if(p->overlay[0]!=x||p->overlay[1]!=y||p->overlay[2]!=w||p->overlay[3]!=h){
++            sfGPUDamageRect(p,p->overlay[0],p->overlay[1],p->overlay[2],p->overlay[3]);
++            p->overlay[0]=x;p->overlay[1]=y;p->overlay[2]=w>0?w:0;p->overlay[3]=h>0?h:0;
++            sfGPUDamageRect(p,x,y,w,h);
++        }
++    }
++    pthread_mutex_unlock(&ws.pixelsLock);
++    return good;
++}
+ // (TERM12) the window's geometry serial (0: no such window): AppKit keeps it with the geometry of a view's GPU layer
+ uint64_t _windowServerSFFXGeometrySerial(int windowID){
+     pthread_mutex_lock(&ws.pixelsLock);
+--- a/src/Frameworks/WindowServer/sffx_gpu_present.h
++++ b/src/Frameworks/WindowServer/sffx_gpu_present.h
+@@ -90,6 +90,9 @@
+ struct sfGPULayer {uintptr_t key;void *surface;unsigned texture;double sx,sy,sw,sh,dx,dy,dw,dh;unsigned textures[2];void *textureSurface[2];unsigned textureNext;};
+ struct sfGPUPresenter {
+  void *context,*format;unsigned baseTexture,fbo;void *baseCache;size_t baseBytes;int baseW,baseH,failed;
++ // (TERM12, FX-002) a part of the CPU-drawn base that goes over the layers (x,y,w,h, window pixels, rows top-down): the
++ // title bar controls AppKit draws over a full-size content view (empty: none)
++ int overlay[4];
+  struct sfGPULayer layers[SF_GPU_LAYERS];int count;
+  uint64_t frames,baseUploadBytes,layerBytes,failures;
+  // (FXPERF2) damage (SFFX_GPU_DAMAGE=1): window pixels (x0,y0,x1,y1, rows top-down) changed since the last prepare,
+@@ -320,6 +323,14 @@
+    good=lw>0&&lh>0&&sfGPU.CGLTexImageIOSurface2D(p->context,0x0de1,0x1908,lw,lh,0x80e1,0x8367,l->surface,0)==0;
+    if(good){sfGPUTextureParameters();sfGPUQuad(l->dx,l->dy,l->dw,l->dh,l->sx/lw,l->sy/lh,l->sw/lw,l->sh/lh);p->layerBytes+=(uint64_t)lw*lh*4;}
+   }
++  // the base's overlay part again, over the layers (its pixels around the controls are transparent)
++  if(good&&p->overlay[2]>0&&p->overlay[3]>0){
++   const int *o=p->overlay;
++   if(!damageMode||(o[0]<region[2]&&region[0]<o[0]+o[2]&&o[1]<region[3]&&region[1]<o[1]+o[3])){
++    sfGPU.glBindTexture(0x0de1,p->baseTexture);sfGPUTextureParameters();
++    sfGPUQuad(o[0],o[1],o[2],o[3],(double)o[0]/w,(double)o[1]/h,(double)o[2]/w,(double)o[3]/h);
++   }
++  }
+   if(trace)drawDone=sfGPUClockMs();
+   if(damageMode)sfGPU.glDisable(0x0c11);
+   sfGPU.glFinish();good=good&&sfGPU.glGetError()==0;

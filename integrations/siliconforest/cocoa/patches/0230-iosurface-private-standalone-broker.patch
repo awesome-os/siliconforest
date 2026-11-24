@@ -1,0 +1,51 @@
+--- a/src/Frameworks/IOSurface/IOSurface.c
++++ b/src/Frameworks/IOSurface/IOSurface.c
+@@ -161,7 +161,11 @@
+ }
+ 
+ static void findDaemon(void) {
+-    if (bootstrap_look_up(bootstrap_port, IOSURFACED_SERVICE, &daemonService) != KERN_SUCCESS)
++    const char *name = getenv("SFFX_IOSURFACE_SERVICE");
++    const char *prefix = "org.siliconforest.iosurfaced.sffx.";
++    if (!name || strncmp(name, prefix, strlen(prefix)) || strlen(name) >= 128)
++        name = IOSURFACED_SERVICE;
++    if (bootstrap_look_up(bootstrap_port, name, &daemonService) != KERN_SUCCESS)
+         daemonService = MACH_PORT_NULL;
+ }
+ 
+--- a/src/Frameworks/IOSurface/iosurfaced.c
++++ b/src/Frameworks/IOSurface/iosurfaced.c
+@@ -107,7 +107,7 @@
+     mach_msg(&rep.head, MACH_SEND_MSG | MACH_SEND_TIMEOUT, rep.head.msgh_size, 0, MACH_PORT_NULL, 1000, MACH_PORT_NULL);
+ }
+ 
+-int main(void) {
++int main(int argc, char **argv) {
+     union {
+         mach_msg_header_t head;
+         struct iosurfaced_register_request reg;
+@@ -116,7 +116,23 @@
+         uint8_t space[1024];
+     } msg;
+ 
+-    if (bootstrap_check_in(bootstrap_port, IOSURFACED_SERVICE, &service) != KERN_SUCCESS) {
++    kern_return_t started;
++    if (argc == 2 && strcmp(argv[1], "--standalone") == 0) {
++        const char *name = getenv("SFFX_IOSURFACE_SERVICE");
++        const char *prefix = "org.siliconforest.iosurfaced.sffx.";
++        if (!name || strncmp(name, prefix, strlen(prefix)) || strlen(name) >= 128) {
++            fprintf(stderr, "iosurfaced: private service name required\n");
++            return 2;
++        }
++        started = mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &service);
++        if (started == KERN_SUCCESS)
++            started = mach_port_insert_right(mach_task_self(), service, service, MACH_MSG_TYPE_MAKE_SEND);
++        if (started == KERN_SUCCESS)
++            started = bootstrap_register(bootstrap_port, name, service);
++    } else {
++        started = bootstrap_check_in(bootstrap_port, IOSURFACED_SERVICE, &service);
++    }
++    if (started != KERN_SUCCESS) {
+         fprintf(stderr, "iosurfaced: no %s service from launchd\n", IOSURFACED_SERVICE);
+         return 1;
+     }

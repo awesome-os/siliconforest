@@ -1,0 +1,23 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# reboot, halt, poweroff and shutdown on a SiliconForest disk root (installed under each of
+# those names in /bin; the tree's own programs are kept beside them as <name>.xnu). All of
+# them end in /sbin/sf-halt, which stops the processes, makes the root clean on the disk,
+# closes the write fence, stops the storage controller and only then asks the kernel to
+# restart or power off the machine. The tree's programs call reboot(2) with the root still
+# read-write and the controller running.
+#   reboot                    restart
+#   halt | poweroff           power off (needs sfpoweroff=1 in the boot arguments)
+#   shutdown -r [now]         restart;   shutdown -h|-p [now]   power off
+case "$(basename "$0")" in
+    reboot) what=restart;;
+    halt|poweroff) what=poweroff;;
+    shutdown)
+        what=
+        for a in "$@"; do
+            case "$a" in -r) what=restart;; -h|-p) what=poweroff;; now|+0) ;; *) what=usage; break;; esac
+        done
+        case "$what" in restart|poweroff) ;; *) echo "usage: shutdown -r|-h|-p [now]" >&2; exit 64;; esac;;
+    *) echo "sf-command: installed as reboot, halt, poweroff or shutdown" >&2; exit 64;;
+esac
+exec /sbin/sf-halt "$what"

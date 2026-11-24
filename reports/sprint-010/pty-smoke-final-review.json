@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_FINAL_SOURCE_REVIEW_NO_HARDWARE",
+  "frozen": {
+    "pty-smoke.c": "3b63db563ca3fc87",
+    "transcript.c": "70b006a9caa7184b",
+    "transcript.h": "29cf05d0cab7499c",
+    "host-test.c": "fbad217e9192d532",
+    "README": "db238d307ac90797",
+    "receipt": "reports/sprint-010/pty-smoke-source.json (reviewed 50cee114, final 3b63db56, delta 'rlim_t cast only')"
+  },
+  "verdict": "APPROVE the frozen PTY smoke source for SDK004 and packet 007. F1, F2, N1, N2 and N3 from pty-smoke-source-review.json are resolved. F3 is a staging binding root owns: stage only into a 006-derived RAM with libSystem 8ff49e0c. This is source approval, not a Darwin result.",
+  "diffs": {
+    "917e9a06_to_50cee114": "Diffed against the exact store copy d0ifv6a7...-pty-smoke.c, with the source hash identical before and after review. F1: classifier JSON, then 'rx_hex' (the exact stored master bytes the classifier used, at most 65536) and 'tx_hex' (the prepared halves); the joined nonce is never printed as text. F2: each drain_master call reads at most 8 KiB; reaching OUT_CAP sets output_cap, stops all further draining, breaks the main loop and blocks PASS; the reaped-path final drain repeats only while output grows (bounded by the cap); in cleanup, reap_for's drain returns immediately once capped, so TERM->KILL is always reachable. N1: the child closes 3..bound (getrlimit computed in the parent, capped at 10240) except slave/status. N2: SIGCHLD set to SIG_DFL with sigaction before fork. N3: exec_boundary = status EOF after SETUP 0 with no stage-5 record, emitted in the JSON.",
+    "50cee114_to_3b63db56": "Only 'rl.rlim_cur > 3' becomes 'rl.rlim_cur > (rlim_t)3' in inherited_fd_bound. No behaviour change."
+  },
+  "independent_host_evidence": {
+    "host_test": "fbad217e built in scratch (cc -std=c11 -Wall -Wextra -Werror ... -lutil): HOST_ONLY, 0 failures. It adds an exact frozen-script-text assertion to the parser and Linux PTY controls. Not Darwin evidence.",
+    "frozen_program_on_linux": "pty-smoke.c 3b63db56 built for Linux in scratch (util.h shim including <pty.h>). With a fixed nonce: FAIL/parse (Linux uname), cleanup 'reaped', child_exit 0, exec_boundary 1, output_bytes 132. Three stdout lines; rx_hex decodes to exactly output_bytes bytes (the echoed halves, the joined line, Linux/x86_64/release); tx_hex equals the 50-byte split. The joined nonce never appears as ASCII in stdout, only inside the hex.",
+    "adversarial_flood_variant": "The same frozen pty-smoke.c linked with a scratch transcript.c whose script is \"trap '' TERM; while :; do echo flood...; done\": it stops at exactly 65536 bytes with FAIL/output_cap. SIGTERM is ignored, so it escalates to SIGKILL (term_sig 9), cleanup 'term_kill_reaped', signaled 1, and the run finishes in about 1.06 s. This demonstrates the F2 fix on the host. The variant is a test fixture only, not shipped."
+  },
+  "sdk_binding_note": "SDK002 (803dbe23, drv sxhxw8bd -> 1f7izz29) was built from 50cee114, not the frozen 3b63db56. Packet 007 must bind the SDK004 binary rebuilt from 3b63db56 (check the drv inputs: pty-smoke.c 3b63db56, transcript.c 70b006a9, transcript.h 29cf05d0) plus the 006-derived RAM with libSystem 8ff49e0c.",
+  "qualification_rule": "PASS only if the guest JSON shows status PASS, failure none, cleanup reaped, child_exit 0, normal_exit 1, signaled 0, output_capped 0, exec_boundary 1 and adjacent 1, AND the host independently decodes rx_hex (length == output_bytes) to find the joined nonce line immediately followed by Darwin, arm64 and a release token, with tx_hex equal to the split halves, plus a fresh nonce and Linux recovery.",
+  "not_claimed": ["Darwin PTY runtime", "terminal", "input"],
+  "scope": "Read-only source review plus host-only builds and runs in scratch. No SDK build or hardware."
+}

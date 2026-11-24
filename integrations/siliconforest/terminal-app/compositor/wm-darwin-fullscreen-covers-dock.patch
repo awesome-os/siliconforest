@@ -1,0 +1,94 @@
+diff --git a/crates/wm-darwin/src/desktop_entry.rs b/crates/wm-darwin/src/desktop_entry.rs
+index b802ca1..966045a 100644
+--- a/crates/wm-darwin/src/desktop_entry.rs
++++ b/crates/wm-darwin/src/desktop_entry.rs
+@@ -205,6 +205,7 @@ impl SessionIo for NativeIo<'_> {
+         self.server.capture_step();
+         self.server.gesture_tick();
+         self.server.foreign_sync();
++        self.server.layers_follow_fullscreen();
+         self.server.repaint(self.presenter, ms)?;
+         self.server.capture_after_repaint();
+         if let Some(inject) = &mut self.inject {
+diff --git a/crates/wm-darwin/src/layers.rs b/crates/wm-darwin/src/layers.rs
+index ce0a37b..2bd06f8 100644
+--- a/crates/wm-darwin/src/layers.rs
++++ b/crates/wm-darwin/src/layers.rs
+@@ -28,6 +28,10 @@ pub struct LayerEntry {
+     pub above: bool,
+     /// The edge and panel pixels it keeps windows away from.
+     pub exclusive: Option<(Anchor, u32)>,
++    /// The overlay layer (above full-screen windows); the top layer is not.
++    pub overlay: bool,
++    /// Not drawn and not under the pointer: a full-screen window covers the top layer.
++    pub hidden: bool,
+ }
+ 
+ impl Server {
+@@ -199,9 +203,12 @@ impl Server {
+                         backend.create_shell_surface(Rect::new(rect.pos, image_size), (0, 0, 0), above)
+                     }
+                 };
++                let hidden = self.layers[index].hidden;
+                 if let Some(shell) = shell {
+                     backend.paint_shell_surface(shell, &image);
+-                    backend.map_shell_surface(shell);
++                    if !hidden {
++                        backend.map_shell_surface(shell);
++                    }
+                     if old != Some(shell) {
+                         eprintln!("WMLAYER mapped namespace={} at={},{} size={}x{}", self.layers[index].namespace, rect.pos.x, rect.pos.y, image_size.w, image_size.h);
+                     }
+@@ -233,7 +240,7 @@ impl Server {
+                 && i64::from(root.x) < i64::from(l.rect.pos.x) + i64::from(l.rect.size.w)
+                 && i64::from(root.y) < i64::from(l.rect.pos.y) + i64::from(l.rect.size.h)
+         };
+-        self.layers.iter().rev().filter(|l| l.above).find(hit).map(|l| {
++        self.layers.iter().rev().filter(|l| l.above && !l.hidden).find(hit).map(|l| {
+             (l.surface.wl_surface().clone(), (f64::from(l.rect.pos.x) / density, f64::from(l.rect.pos.y) / density))
+         })
+     }
+@@ -265,6 +272,34 @@ impl Server {
+         out.push_str(&format!("foreign_listeners={}\n", self.foreign_listener_count()));
+         out
+     }
++    /// Once a frame: a full-screen window on the Space shown covers the top layer (the dock), as
++    /// on macOS and in wlroots compositors; the overlay layer stays above it.
++    pub fn layers_follow_fullscreen(&mut self) {
++        if self.layers.is_empty() {
++            return;
++        }
++        let space = self.wm.current_workspace();
++        let covered = self.wm.iter_clients().any(|(_, c)| {
++            c.workspace == space && c.lifecycle == wm_core::Lifecycle::Normal && c.flags.contains(wm_core::ClientFlags::FULLSCREEN)
++        });
++        let mut changed = false;
++        for i in 0..self.layers.len() {
++            let hide = covered && !self.layers[i].overlay && self.layers[i].above;
++            if self.layers[i].hidden == hide {
++                continue;
++            }
++            self.layers[i].hidden = hide;
++            changed = true;
++            if let Some(shell) = self.layers[i].shell {
++                let backend = self.wm.backend_mut();
++                if hide { backend.unmap_shell_surface(shell) } else { backend.map_shell_surface(shell) }
++            }
++        }
++        if changed {
++            eprintln!("WMLAYER top layer {} (full-screen window on Space {})", if covered { "covered" } else { "shown" }, space + 1);
++            self.refresh_pointer();
++        }
++    }
+     /// Where a layer surface is, for a popup placed against it.
+     pub(crate) fn layer_place_of(&self, surface: &WlSurface) -> Option<Point> {
+         self.layers.iter().find(|l| l.surface.wl_surface() == surface).map(|l| l.rect.pos)
+@@ -295,6 +330,8 @@ impl WlrLayerShellHandler for Server {
+             shell: None,
+             above: matches!(layer, Layer::Top | Layer::Overlay),
+             exclusive: None,
++            overlay: layer == Layer::Overlay,
++            hidden: false,
+         });
+     }
+     fn new_popup(&mut self, _parent: LayerSurface, popup: PopupSurface) {

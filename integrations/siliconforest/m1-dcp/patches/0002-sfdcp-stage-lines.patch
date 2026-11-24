@@ -1,0 +1,170 @@
+drm/apple: SFDcp stage lines
+
+Three lines for following a first bring-up on a console: each AFK endpoint start request,
+dcp_start() with the firmware compat chosen, and the first occurrence of every IOMFB callback
+the firmware makes with whether the driver has a handler (sf_dcp_note_callback(), in the
+kext). The driver's own messages are otherwise untouched.
+UPSTREAM: no.
+
+--- a/afk.c
++++ b/afk.c
+@@ -220,6 +220,8 @@
+ 
+ 	reinit_completion(&ep->started);
+ 	ret = apple_rtkit_start_ep(ep->dcp->rtk, ep->endpoint);
++	/* SFDcp: stage line */
++	dev_info(ep->dcp->dev, "endpoint 0x%02x start requested (%d)\n", ep->endpoint, ret);
+ 	if (ret)
+ 		return ret;
+ 	if (ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE &&
+--- a/apple_drv.c
++++ b/apple_drv.c
+@@ -956,8 +956,10 @@
+ 		}
+ 
+ 		dcp[num_dcp] = of_find_device_by_node(np);
+-		if (!dcp[num_dcp])
++		if (!dcp[num_dcp]) {
++			dev_info(dev, "stage: no platform device for dcp node %pOF, skipped\n", np); /* SFDcp */
+ 			continue;
++		}
+ 		/* A failed T8122 dcpext: bound, but no pipeline. */
+ 		if (dcp_ext_unusable(dcp[num_dcp])) {
+ 			dev_warn(dev, "%s: external display processor unusable, skipped\n",
+@@ -971,6 +973,7 @@
+ 		ret = apple_probe_per_dcp(dev, &apple->drm, dcp[num_dcp],
+ 					  num_dcp, dcp_ext, &encoder[num_dcp],
+ 					  &crtc_mask[num_dcp]);
++		dev_info(dev, "stage: planes/crtc/encoder/connector for dcp %d: %d\n", num_dcp, ret); /* SFDcp */
+ 		if (ret) {
+ 			if (of_device_is_compatible(np, "apple,t8140-dcpext")) {
+ 				put_device(&dcp[num_dcp]->dev);
+@@ -983,6 +986,7 @@
+ 		num_dcp++;
+ 	}
+ 
++	dev_info(dev, "stage: %d display processor(s) set up\n", num_dcp); /* SFDcp */
+ 	if (num_dcp < 1)
+ 		return -ENODEV;
+ 
+@@ -992,12 +996,14 @@
+ 	 * and it needs somewhere to report the display.
+ 	 */
+ 	ret = apple_probe_typec_ports(&apple->drm, dcp, crtc_mask, num_dcp);
++	dev_info(dev, "stage: type-c port connectors: %d\n", ret); /* SFDcp */
+ 	if (ret)
+ 		return ret;
+ 
+ 	for (i = 0; i < num_dcp; i++) {
+ 		connector_type[i] = dcp_get_connector_type(dcp[i]);
+ 		ret = dcp_start(dcp[i]);
++		dev_info(dev, "stage: dcp_start(%d) returned %d\n", i, ret); /* SFDcp */
+ 		started[i] = !ret;
+ 		if (ret)
+ 			dev_warn(dev, "DCP[%d] failed to start: %d\n", i, ret);
+@@ -1018,6 +1024,7 @@
+ 		if (!started[i])
+ 			continue;
+ 		ret = dcp_wait_ready(dcp[i], wait);
++		dev_info(dev, "stage: dcp_wait_ready(%d, %llu jiffies) returned %d\n", i, (unsigned long long)wait, ret); /* SFDcp */
+ 		ready[i] = !ret;
+ 		/*
+ 		 * Any other processor that does not come up is left out: the
+@@ -1067,6 +1074,7 @@
+ 	dev_set_drvdata(dev, apple);
+ 
+ 	ret = component_bind_all(dev, apple);
++	dev_info(dev, "stage: components bound: %d\n", ret); /* SFDcp */
+ 	if (ret)
+ 		return ret;
+ 
+@@ -1095,6 +1103,7 @@
+ 	apple->drm.mode_config.helper_private = &apple_mode_config_helpers;
+ 
+ 	ret = apple_drm_init_dcp(dev);
++	dev_info(dev, "stage: display processors initialised: %d\n", ret); /* SFDcp */
+ 	if (ret)
+ 		goto err_unbind;
+ 
+@@ -1108,7 +1117,9 @@
+ 		goto err_unbind;
+ 	}
+ 
++	dev_info(dev, "stage: boot framebuffer released, registering the DRM device\n"); /* SFDcp */
+ 	ret = drm_dev_register(&apple->drm, 0);
++	dev_info(dev, "stage: drm_dev_register: %d\n", ret); /* SFDcp */
+ 	if (ret)
+ 		goto err_unbind;
+ 
+@@ -1119,6 +1130,7 @@
+ 
+ 	/* A subsequent successful platform probe retries deferred GPU probes. */
+ 	ret = apple_g15_display_publish(dev);
++	dev_info(dev, "stage: bind complete (%d)\n", ret); /* SFDcp */
+ 	if (ret) {
+ 		drm_dev_unregister(&apple->drm);
+ 		goto err_unbind;
+@@ -1221,10 +1233,14 @@
+ 
+ 	/* add DCP components, handle less than 1 as probe error */
+ 	num_dcp = add_dcp_components(mdev, &match);
++	/* SFDcp: stage lines */
++	dev_info(mdev, "display-subsystem probe: %d dcp node(s) in the tree\n", num_dcp);
+ 	if (num_dcp < 1)
+ 		return -ENODEV;
+ 
+-	return component_master_add_with_match(mdev, &apple_drm_ops, match);
++	num_dcp = component_master_add_with_match(mdev, &apple_drm_ops, match);
++	dev_info(mdev, "display-subsystem probe: master added, returned %d\n", num_dcp);
++	return num_dcp;
+ }
+ 
+ static void apple_platform_remove(struct platform_device *pdev)
+--- a/dcp.c
++++ b/dcp.c
+@@ -2427,6 +2427,8 @@
+ 
+ 	/* Even if nothing starts, dcp_wait_ready() must find it initialised. */
+ 	init_completion(&dcp->start_done);
++	/* SFDcp: stage line */
++	dev_info(dcp->dev, "dcp_start: firmware compat id %d, external %d\n", dcp->fw_compat, dcp->external);
+ 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6)
+ 		return iomfb_v26_6_start(dcp);
+ 
+@@ -4040,7 +4042,9 @@
+ 
+ 	if (READ_ONCE(dcp->ext_dead))
+ 		return 0;
++	dev_info(dev, "component bind: start\n");	/* SFDcp: stage lines */
+ 	ret = dcp_comp_bind_pipe(dev, main, data);
++	dev_info(dev, "component bind: returned %d\n", ret);
+ 	if (ret && dcp->ext_failsafe) {
+ 		dcp_ext_give_up(dcp, ret, "bind");
+ 		return 0;
+@@ -4723,8 +4727,13 @@
+ 	void *group;
+ 	int ret;
+ 
+-	if (!of_device_is_compatible(dev->of_node, "apple,t8122-dcpext"))
+-		return dcp_platform_probe_pipe(pdev);
++	if (!of_device_is_compatible(dev->of_node, "apple,t8122-dcpext")) {
++		/* SFDcp: stage lines */
++		dev_info(dev, "dcp probe: start\n");
++		ret = dcp_platform_probe_pipe(pdev);
++		dev_info(dev, "dcp probe: returned %d\n", ret);
++		return ret;
++	}
+ 
+ 	ret = dcp_ext_route_suppliers(dev);
+ 	if (ret)
+--- a/iomfb.c
++++ b/iomfb.c
+@@ -1277,6 +1277,8 @@
+ 
+ 	handled = tag >= 0 && tag < IOMFB_MAX_CB && dcp->cb_handlers &&
+ 		  dcp->cb_handlers[tag];
++	/* SFDcp: one line per callback the firmware makes (kext/sf_dcp_linux.c) */
++	sf_dcp_note_callback(dev, tag, hdr->tag, hdr->in_len, hdr->out_len, context, handled);
+ 	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+ 	    (tag < 0 || tag >= IOMFB_MAX_CB ||
+ 	     (u64)sizeof(*hdr) + hdr->in_len + hdr->out_len != length ||

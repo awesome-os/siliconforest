@@ -1,0 +1,718 @@
+--- a/src/Frameworks/QuartzCore/CALayerContext.h
++++ b/src/Frameworks/QuartzCore/CALayerContext.h
+@@ -31,6 +31,14 @@
+     uint64_t _sfdSlotSerial[2];
+     int _sfdExportDamage[4];
+     BOOL _sfdExportPartial;
++    // (TERM12) frames rendered and presented on the render thread (SFFX_GPU_RENDER_THREAD=1): the presenter the
++    // delegate set (NULL: every frame on the main thread), its copy of what it needs, whether the view's geometry
++    // changed since (then the main thread does the next frame), when the last render was asked for
++    int (*_sfrtPresent)(CALayerContext *,const void *);
++    void *_sfrtInfo;
++    int _sfrtStale;
++    uint64_t _sfrtCommitStamp;
++    double _sfrtAskedAt;
+ }
+ 
+ -(void)_sffxMarkMutation;
+@@ -57,5 +65,13 @@
+ - (BOOL)_sfcaTakeNewFrame;
+ // the last render as an image, rows top down, premultiplied BGRA
+ - (CGImageRef)createImage;
++// (TERM12) the render thread. A frame (render, export, present) holds one process-wide lock wherever it runs; the
++// main thread takes it with -_sfrtBeginFrame/-_sfrtEndFrame (the latter lets the context go from the thread when the
++// render thread may want it). The delegate sets a presenter for the render thread after a frame it presented itself
++// (info is copied); -setFrame:, -setLayer: and -invalidate stop it until the delegate sets it again.
++- (BOOL)_sfrtEnabled;
++- (void)_sfrtBeginFrame;
++- (void)_sfrtEndFrame;
++- (void)_sfrtSetPresent:(int (*)(CALayerContext *,const void *))present info:(const void *)info length:(size_t)length;
+ 
+ @end
+--- a/src/Frameworks/QuartzCore/CALayerContext.m
++++ b/src/Frameworks/QuartzCore/CALayerContext.m
+@@ -15,6 +15,7 @@
+ #include <time.h>
+ #include <stdio.h>
+ #include <objc/runtime.h>
++#include <objc/message.h>
+ 
+ int CARendererSFFXDamageEnabled(void);
+ 
+@@ -92,6 +93,161 @@
+  }
+ }
+ 
++// (TERM12) SFFX_GPU_RENDER_THREAD=1 (Firefox's launcher, with SFFX_GPU_PRESENT=1): the layer tree is rendered and
++// presented on a thread of its own when a transaction is committed, as macOS's render server does it: Firefox commits
++// its layers from its compositor thread precisely so that its main thread, busy with the browser's own work, is not
++// in the frame path. Before, every frame was a block on the main queue that waited behind whatever the main thread
++// was doing (a page's or the browser's script, layout, input) and then ran the GPU waits of the export and the
++// window's compose there.
++static int sfrtOn(void){
++ static int on=-1;
++ if(on<0){
++  const char *v=getenv("SFFX_GPU_RENDER_THREAD"),*gpu=getenv("SFFX_GPU_PRESENT");
++  on=v!=NULL&&!strcmp(v,"1")&&gpu!=NULL&&!strcmp(gpu,"1");
++ }
++ return on;
++}
++// one frame at a time in the process, wherever it runs: CARenderer keeps texture and clip state in statics
++static pthread_mutex_t sfrtFrameLock;
++static pthread_once_t sfrtFrameLockOnce=PTHREAD_ONCE_INIT;
++static void sfrtFrameLockInit(void){
++ pthread_mutexattr_t a;
++ pthread_mutexattr_init(&a);pthread_mutexattr_settype(&a,PTHREAD_MUTEX_RECURSIVE);
++ pthread_mutex_init(&sfrtFrameLock,&a);pthread_mutexattr_destroy(&a);
++}
++static void sfrtLockFrame(void){pthread_once(&sfrtFrameLockOnce,sfrtFrameLockInit);pthread_mutex_lock(&sfrtFrameLock);}
++static void sfrtUnlockFrame(void){pthread_mutex_unlock(&sfrtFrameLock);}
++
++static double sfrtNowMs(void){
++ struct timespec t;
++ clock_gettime(CLOCK_MONOTONIC,&t);
++ return t.tv_sec*1e3+t.tv_nsec/1e6;
++}
++// SF_CA_FRAME_TRACE=1: every 5 s one line: frames done on the render thread / on the main thread (and how many of
++// those the render thread handed over), the wait from the commit to the frame's start and the frame's own time
++// (render, export, present), p50/p90/max in ms. Kept in memory between lines (a write costs ~5 ms on this disk)
++static int sfrtTraceOn(void){
++ static int on=-1;
++ if(on<0)on=getenv("SF_CA_FRAME_TRACE")!=NULL;
++ return on;
++}
++#define SFRT_TRACE 1024
++static struct { os_unfair_lock lock; double since; unsigned n,rt,main,handed,skipped; float wait[SFRT_TRACE],work[SFRT_TRACE];
++ void *who[8]; const char *whoClass[8]; int whoPresent[8],whoStale[8]; unsigned whoCount[8],whoN; unsigned why[5]; } sfrtTrace={OS_UNFAIR_LOCK_INIT};
++// (trace) the contexts whose frames ran on the main thread in the last line's time
++static void sfrtNoteWho(void *context,const char *cls,int present,int stale){
++ if(!sfrtTraceOn())return;
++ os_unfair_lock_lock(&sfrtTrace.lock);
++ unsigned i;
++ for(i=0;i<sfrtTrace.whoN&&sfrtTrace.who[i]!=context;i++){}
++ if(i==sfrtTrace.whoN&&i<8){sfrtTrace.who[i]=context;sfrtTrace.whoCount[i]=0;sfrtTrace.whoN++;}
++ if(i<8){sfrtTrace.whoClass[i]=cls;sfrtTrace.whoPresent[i]=present;sfrtTrace.whoStale[i]=stale;sfrtTrace.whoCount[i]++;}
++ os_unfair_lock_unlock(&sfrtTrace.lock);
++}
++static int sfrtCmp(const void *a,const void *b){float x=*(const float *)a,y=*(const float *)b;return x<y?-1:x>y;}
++static void sfrtNote(int where,double asked,double started,double ended){
++ if(!sfrtTraceOn())return;
++ char line[800];line[0]=0;
++ os_unfair_lock_lock(&sfrtTrace.lock);
++ if(sfrtTrace.since==0)sfrtTrace.since=started;
++ if(where==0)sfrtTrace.rt++;else if(where==1)sfrtTrace.main++;else if(where==2)sfrtTrace.handed++;else sfrtTrace.skipped++;
++ if(where<=1&&sfrtTrace.n<SFRT_TRACE){
++  sfrtTrace.wait[sfrtTrace.n]=asked>0?started-asked:0;sfrtTrace.work[sfrtTrace.n]=ended-started;sfrtTrace.n++;
++ }
++ if(ended-sfrtTrace.since>=5000&&sfrtTrace.n>0){
++  unsigned n=sfrtTrace.n;
++  qsort(sfrtTrace.wait,n,sizeof(float),sfrtCmp);qsort(sfrtTrace.work,n,sizeof(float),sfrtCmp);
++  int at=snprintf(line,sizeof(line),"PD-CA-FRAMES %.1fs rt=%u main=%u handed-to-main=%u nothing-new=%u wait p50/p90/max %.1f/%.1f/%.1f work %.1f/%.1f/%.1f ms main:",
++           (ended-sfrtTrace.since)/1000,sfrtTrace.rt,sfrtTrace.main,sfrtTrace.handed,sfrtTrace.skipped,sfrtTrace.wait[n/2],sfrtTrace.wait[n*9/10],sfrtTrace.wait[n-1],
++           sfrtTrace.work[n/2],sfrtTrace.work[n*9/10],sfrtTrace.work[n-1]);
++  for(unsigned k=0;k<sfrtTrace.whoN&&at>0&&at<(int)sizeof(line)-2;k++)
++   at+=snprintf(line+at,sizeof(line)-at," %p/%s/p%d/s%d=%u",sfrtTrace.who[k],sfrtTrace.whoClass[k]?sfrtTrace.whoClass[k]:"-",sfrtTrace.whoPresent[k],
++                sfrtTrace.whoStale[k],sfrtTrace.whoCount[k]);
++  {
++   void _CATransactionGateStats(char *line,size_t size);
++   char gate[200];
++   _CATransactionGateStats(gate,sizeof(gate));
++   if(at>0&&at<(int)sizeof(line)-2)
++    at+=snprintf(line+at,sizeof(line)-at," | %s | handed: no-presenter=%u stale=%u needs-display=%u declined=%u",gate,
++                 sfrtTrace.why[1],sfrtTrace.why[2],sfrtTrace.why[3],sfrtTrace.why[4]);
++   memset(sfrtTrace.why,0,sizeof(sfrtTrace.why));
++   {
++    static void (*counts)(uint64_t *);
++    static int looked;
++    if(!looked){counts=dlsym(RTLD_DEFAULT,"_windowServerSFFXPresentCounts");looked=1;}
++    uint64_t c[4]={0};
++    if(counts!=NULL)counts(c);
++    if(counts!=NULL && at>0 && at<(int)sizeof(line)-2)
++     at+=snprintf(line+at,sizeof(line)-at," | ws presents: flush=%llu render-thread=%llu on-release=%llu",
++                  (unsigned long long)c[0],(unsigned long long)c[1],(unsigned long long)c[2]);
++   }
++
++  }
++  if(at>0&&at<(int)sizeof(line)-1){line[at]='\n';line[at+1]=0;}
++  sfrtTrace.whoN=0;
++  sfrtTrace.n=sfrtTrace.rt=sfrtTrace.main=sfrtTrace.handed=sfrtTrace.skipped=0;sfrtTrace.since=ended;
++ }
++ os_unfair_lock_unlock(&sfrtTrace.lock);
++ if(line[0])fputs(line,stderr);
++}
++
++// whether a layer of the tree is marked for display: its -display runs the delegate's drawing or -updateLayer
++// (Firefox composites and ends its commit suspension there), which belongs to the main thread
++static BOOL sfrtTreeNeedsDisplay(CALayer *layer,int depth){
++ if(layer==nil)return NO;
++ if([layer needsDisplay])return YES;
++ if(depth<32)
++  for(CALayer *sub in [layer sublayers])
++   if(sfrtTreeNeedsDisplay(sub,depth+1))return YES;
++ return NO;
++}
++
++@interface CALayerContext(sfrt)
++-(void)_sfrtFrame;
++-(BOOL)_sfrtCommitTouches;
++-(void)_sfrtFrameOnMain;
++-(BOOL)_renderTree;
++-(void)_renderTreeGated;
++@end
++
++#define SFRT_QUEUE 64
++// inFrame: the render thread is in a frame; deferred: main-thread frames of other contexts that came meanwhile (they run
++// after it instead of the main thread waiting for the frame lock)
++static struct { pthread_mutex_t lock; pthread_cond_t ready; CALayerContext *queue[SFRT_QUEUE]; unsigned head,count; int started,inFrame;
++ CALayerContext *deferred[SFRT_QUEUE]; unsigned deferredCount; } sfrt={PTHREAD_MUTEX_INITIALIZER,PTHREAD_COND_INITIALIZER};
++
++static void *sfrtMain(void *unused){
++ pthread_setname_np("CARenderServer");
++ // as the main thread: frames must not wait behind ordinary threads of the process
++ int (*qos)(unsigned,int)=dlsym(RTLD_DEFAULT,"pthread_set_qos_class_self_np");
++ if(qos)qos(0x21,0);
++ for(;;){
++  pthread_mutex_lock(&sfrt.lock);
++  while(sfrt.count==0)pthread_cond_wait(&sfrt.ready,&sfrt.lock);
++  CALayerContext *context=sfrt.queue[sfrt.head];
++  sfrt.head=(sfrt.head+1)%SFRT_QUEUE;sfrt.count--;
++  pthread_mutex_unlock(&sfrt.lock);
++  @autoreleasepool { [context _sfrtFrame]; }
++ }
++ return NULL;
++}
++// takes the caller's reference to the context; NO: not queued (the caller keeps it)
++static BOOL sfrtEnqueue(CALayerContext *context){
++ pthread_mutex_lock(&sfrt.lock);
++ if(!sfrt.started){
++  pthread_t thread;
++  pthread_attr_t a;
++  pthread_attr_init(&a);pthread_attr_setdetachstate(&a,PTHREAD_CREATE_DETACHED);
++  sfrt.started=pthread_create(&thread,&a,sfrtMain,NULL)==0?1:-1;
++  pthread_attr_destroy(&a);
++ }
++ if(sfrt.started<0||sfrt.count==SFRT_QUEUE){pthread_mutex_unlock(&sfrt.lock);return NO;}
++ sfrt.queue[(sfrt.head+sfrt.count)%SFRT_QUEUE]=context;sfrt.count++;
++ pthread_cond_signal(&sfrt.ready);
++ pthread_mutex_unlock(&sfrt.lock);
++ return YES;
++}
++
+ // every live context, so a committed transaction reaches them all: an app can redraw an
+ // IOSurface it already set as contents and only commit, which changes no layer property
+ #define MAX_LIVE_CONTEXTS 64
+@@ -113,12 +269,20 @@
+    CALayerContext *contexts[MAX_LIVE_CONTEXTS];
+    int count=0;
+ 
++
+    os_unfair_lock_lock(&liveContextsLock);
+    for(int i=0;i<MAX_LIVE_CONTEXTS;i++)
+     if(liveContexts[i]!=nil)
+      contexts[count++]=[liveContexts[i] retain];
+    os_unfair_lock_unlock(&liveContextsLock);
+    for(int i=0;i<count;i++){
++    // (TERM12) a context the render thread does not draw (a popup's, another window's) is not asked for a render by a
++    // commit that changed nothing of its own (its own layers' changes ask for one): Firefox's every frame made each
++    // of its visible panels render and read back its layers on the main thread
++    if(sfrtOn() && __atomic_load_n(&contexts[i]->_sfrtPresent,__ATOMIC_ACQUIRE)==NULL && ![contexts[i] _sfrtCommitTouches]){
++     [contexts[i] release];
++     continue;
++    }
+     if(sfcaSkipUnchanged())
+      [contexts[i] _scheduleRender];
+     else
+@@ -176,6 +340,7 @@
+ -(void)dealloc {
+    [self invalidate];
+    free(_sffxLastStamps);
++   free(_sfrtInfo);
+    if(_sffxLastSurface)CFRelease(_sffxLastSurface);
+    for(int i=0;i<2;i++)if(_sffxFrames[i])CFRelease(_sffxFrames[i]);
+    [_timer invalidate];
+@@ -193,6 +358,7 @@
+ 
+ -(void)setFrame:(CGRect)rect {
+    [self _sffxMarkMutation];
++   __atomic_store_n(&_sfrtStale,1,__ATOMIC_SEQ_CST);
+    _frame=rect;
+    
+    GLint width=(GLint)ceil(rect.size.width*_backingScale);
+@@ -215,6 +381,7 @@
+ -(void)setLayer:(CALayer *)layer {
+    if(layer==_layer)return;
+    [self _sffxMarkMutation];
++   __atomic_store_n(&_sfrtStale,1,__ATOMIC_SEQ_CST);
+    layer=[layer retain];
+    // A retained former root must not keep a weak pointer to this context.
+    if([_layer _context]==self)[_layer _setContext:nil];
+@@ -226,7 +393,14 @@
+ }
+ 
+ -(void)invalidate {
+-   // the view is going away: a redisplay block already queued must not message it
++   // the view is going away: a redisplay block already queued must not message it, and the render thread presents
++   // for it no more once this returns (a frame it is doing is finished first)
++   if(sfrtOn()){
++    sfrtLockFrame();
++    _sfrtPresent=NULL;
++    __atomic_store_n(&_sfrtStale,1,__ATOMIC_SEQ_CST);
++    sfrtUnlockFrame();
++   }
+    _delegate=nil;
+    // The view can disappear while its client still owns the layer tree.
+    // Clear every weak context pointer before the context may be freed.
+@@ -270,17 +444,21 @@
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+ }
+ 
++// (TERM12) a layer leaving the context (from any thread) adds its texture name, the frame's thread deletes them
++static os_unfair_lock sfrtDeleteLock=OS_UNFAIR_LOCK_INIT;
+ -(void)_deletePendingTextures {
+    GLsizei i=0;
+-   GLuint  deleteIds[[_deleteTextureIds count]];
++   os_unfair_lock_lock(&sfrtDeleteLock);
++   NSUInteger count=[_deleteTextureIds count];
++   GLuint  deleteIds[count>0?count:1];
+    
+    for(NSNumber *number in _deleteTextureIds)
+     deleteIds[i++]=[number unsignedIntValue];
++   [_deleteTextureIds removeAllObjects];
++   os_unfair_lock_unlock(&sfrtDeleteLock);
+    
+    if(i>0)
+     glDeleteTextures(i,deleteIds);
+-   
+-   [_deleteTextureIds removeAllObjects];
+ }
+ 
+ -(void)renderLayer:(CALayer *)layer {
+@@ -343,6 +521,73 @@
+ 
+ -(void)render {
+    displayLayersIfNeeded(_layer,0);
++   [self _renderTree];
++}
++
++BOOL _CATransactionGateRenderEnter(void);
++void _CATransactionGateRenderExit(void);
++
++/* (TERM12) SF_CA_DUMP_STRIP=<x>,<w>,<frames>,<path>[,<after ms>]: after each frame this context renders (from <after ms>
++ * after its first frame on), the columns x..x+w of the
++ * whole drawable (rows bottom-up, RGBA) go into memory; after <frames> frames they are written to <path> once (per
++ * frame: a 16-byte header "CAST", frame number, milliseconds, height; then the rows). A per-commit record of what was
++ * rendered, for artefacts that last one frame (a screenshot is too slow to catch them). Diagnostic only. */
++static struct { int on,x,w,frames,n,h,after; double first; char path[256]; unsigned char *data; size_t used,cap; void *context; } sfrtStrip;
++static void sfrtDumpStrip(void *context,int width,int height){
++   if(sfrtStrip.on==0){
++    const char *v=getenv("SF_CA_DUMP_STRIP");
++    sfrtStrip.on=-1;
++    if(v!=NULL && sscanf(v,"%d,%d,%d,%255[^,],%d",&sfrtStrip.x,&sfrtStrip.w,&sfrtStrip.frames,sfrtStrip.path,&sfrtStrip.after)>=4 &&
++       sfrtStrip.w>0 && sfrtStrip.frames>0)
++     sfrtStrip.on=1;
++   }
++   if(sfrtStrip.on!=1 || sfrtStrip.n>=sfrtStrip.frames || height<=0 || sfrtStrip.x+sfrtStrip.w>width)
++    return;
++   // the first context that renders a frame this tall is the one recorded (a window's, not a popup's)
++   if(sfrtStrip.context==NULL && height>=600)sfrtStrip.context=context;
++   if(sfrtStrip.context!=context)
++    return;
++   if(sfrtStrip.first==0)sfrtStrip.first=sfrtNowMs();
++   if(sfrtNowMs()-sfrtStrip.first<sfrtStrip.after)
++    return;
++   size_t frame=16+(size_t)sfrtStrip.w*height*4;
++   if(sfrtStrip.data==NULL){
++    sfrtStrip.cap=frame*sfrtStrip.frames;
++    sfrtStrip.data=malloc(sfrtStrip.cap);
++    if(sfrtStrip.data==NULL){sfrtStrip.on=-1;return;}
++   }
++   if(sfrtStrip.used+frame>sfrtStrip.cap)
++    return;
++   unsigned char *at=sfrtStrip.data+sfrtStrip.used;
++   uint32_t head[4]={0x54534143,(uint32_t)sfrtStrip.n,(uint32_t)sfrtNowMs(),(uint32_t)height};
++   memcpy(at,head,16);
++   glPixelStorei(GL_PACK_ALIGNMENT,1);
++   glReadPixels(sfrtStrip.x,0,sfrtStrip.w,height,GL_RGBA,GL_UNSIGNED_BYTE,at+16);
++   sfrtStrip.used+=frame;
++   if(++sfrtStrip.n==sfrtStrip.frames){
++    FILE *out=fopen(sfrtStrip.path,"wb");
++    if(out!=NULL){fwrite(sfrtStrip.data,1,sfrtStrip.used,out);fclose(out);}
++    free(sfrtStrip.data);sfrtStrip.data=NULL;
++   }
++}
++
++// NO: no render (a transaction of another thread stayed open: its commit asks for the next frame)
++-(BOOL)_renderTree {
++   uint64_t serial=_sffxRenderSerial;
++   if(!_CATransactionGateRenderEnter())
++    return NO;
++   @try {
++    [self _renderTreeGated];
++   }
++   @finally {
++    _CATransactionGateRenderExit();
++   }
++   if(_sffxRenderSerial!=serial)
++    sfrtDumpStrip(self,(int)ceil(_frame.size.width*_backingScale),(int)ceil(_frame.size.height*_backingScale));
++   return YES;
++}
++
++-(void)_renderTreeGated {
+    if(CARendererSFFXDamageEnabled()){
+     [self _sfdRender];
+     return;
+@@ -378,11 +623,13 @@
+ 
+ -(void)timer:(NSTimer *)timer {
+    [self _sffxMarkMutation];
++   [self _sfrtBeginFrame];
+    [_renderer beginFrameAtTime:CACurrentMediaTime() timeStamp:NULL];
+ 
+    [self render];
+ 
+    [_renderer endFrame];
++   [self _sfrtEndFrame];
+ }
+ 
+ -(void)startTimerIfNeeded {
+@@ -391,7 +638,11 @@
+ }
+ 
+ -(void)deleteTextureId:(NSNumber *)textureId {
++   if(textureId==nil)
++    return;
++   os_unfair_lock_lock(&sfrtDeleteLock);
+    [_deleteTextureIds addObject:textureId];
++   os_unfair_lock_unlock(&sfrtDeleteLock);
+ }
+ 
+ -(void)setDelegate:delegate {
+@@ -408,6 +659,11 @@
+    [self _scheduleRender];
+ }
+ 
++// (TERM12) whether -_sfcaTakeNewFrame would say so, without taking the frame
++-(BOOL)_sfcaHasNewFrame {
++   return _sffxRenderSerial!=_sfcaPresentedSerial || !(sfcaSkipUnchanged() || CARendererSFFXDamageEnabled());
++}
++
+ -(BOOL)_sfcaTakeNewFrame {
+    BOOL fresh=_sffxRenderSerial!=_sfcaPresentedSerial;
+ 
+@@ -435,8 +691,18 @@
+    else if(__atomic_exchange_n(&_renderScheduled,YES,__ATOMIC_SEQ_CST))
+     return;
+    [self retain];
+-   // runs inside a run loop wait, so it drains its own pool (a frame's contents and images)
++   if(sfrtTraceOn())
++    _sfrtAskedAt=sfrtNowMs();
++   if(!sfcaOld() && sfrtOn() && __atomic_load_n(&_sfrtPresent,__ATOMIC_ACQUIRE)!=NULL && !__atomic_load_n(&_sfrtStale,__ATOMIC_ACQUIRE) &&
++      sfrtEnqueue(self))
++    return;
++   [self _sfrtFrameOnMain];
++}
++
++// runs inside a run loop wait, so it drains its own pool (a frame's contents and images); takes a reference
++-(void)_sfrtFrameOnMain {
+    dispatch_async(dispatch_get_main_queue(),^{
++    double started=sfrtTraceOn()?sfrtNowMs():0;
+     @autoreleasepool {
+      if(sfcaOld())
+       _renderScheduled=NO;
+@@ -444,13 +710,149 @@
+       __atomic_store_n(&_renderScheduled,NO,__ATOMIC_SEQ_CST);
+       __atomic_thread_fence(__ATOMIC_SEQ_CST);
+      }
++     if(started>0){
++      id window=[_delegate respondsToSelector:@selector(window)]?[_delegate performSelector:@selector(window)]:nil;
++      int level=-1,visible=-1;
++      if(window!=nil && [window respondsToSelector:@selector(level)]) level=(int)((NSInteger (*)(id,SEL))objc_msgSend)(window,@selector(level));
++      if(window!=nil && [window respondsToSelector:@selector(isVisible)]) visible=((BOOL (*)(id,SEL))objc_msgSend)(window,@selector(isVisible));
++      sfrtNoteWho(self,window?object_getClassName(window):"nowindow",_sfrtPresent!=NULL,(__atomic_load_n(&_sfrtStale,__ATOMIC_ACQUIRE)?1:0)|(visible>0?2:0)|((level&0xff)<<4));
++     }
++     // the main thread does not wait for the render thread's frame: this one runs after it
++     if(sfrtOn()){
++      pthread_mutex_lock(&sfrt.lock);
++      if(sfrt.inFrame && sfrt.deferredCount<SFRT_QUEUE){
++       sfrt.deferred[sfrt.deferredCount++]=self;
++       pthread_mutex_unlock(&sfrt.lock);
++       return;
++      }
++      pthread_mutex_unlock(&sfrt.lock);
++     }
+      if([_delegate respondsToSelector:@selector(layerContextNeedsDisplay:)])
+       [_delegate performSelector:@selector(layerContextNeedsDisplay:) withObject:self];
+     }
++    if(started>0)
++     sfrtNote(1,_sfrtAskedAt,started,sfrtNowMs());
+     [self release];
+    });
+ }
+ 
++// (TERM12) a frame on the render thread: rendered and handed to the presenter the delegate gave, all under the frame
++// lock; the main thread does it instead when the presenter is gone, the geometry it knows is stale, a layer is marked
++// for display (that runs the delegate's drawing) or the presenter declines (the window server not ready for it)
++-(void)_sfrtFrame {
++   // (diagnostic) SF_CA_DELAY_MS=<ms>: the render thread waits that long after a commit before it renders
++   static double delayMs=-1;
++   if(delayMs<0){const char *v=getenv("SF_CA_DELAY_MS");delayMs=v!=NULL?atof(v):0;if(!(delayMs>0&&delayMs<16))delayMs=0;}
++   if(delayMs>0){struct timespec t={0,(long)(delayMs*1e6)};nanosleep(&t,NULL);}
++   double started=sfrtTraceOn()?sfrtNowMs():0;
++   int done=0;
++
++   __atomic_store_n(&_renderScheduled,NO,__ATOMIC_SEQ_CST);
++   __atomic_thread_fence(__ATOMIC_SEQ_CST);
++   pthread_mutex_lock(&sfrt.lock);
++   sfrt.inFrame=1;
++   pthread_mutex_unlock(&sfrt.lock);
++   sfrtLockFrame();
++   int (*present)(CALayerContext *,const void *)=_sfrtPresent;
++   int why=0;
++   if(present==NULL || _delegate==nil) why=1;
++   else if(__atomic_load_n(&_sfrtStale,__ATOMIC_ACQUIRE)) why=2;
++   else if(sfrtTreeNeedsDisplay(_layer,0)) why=3;
++   else {
++    if(![self _renderTree])
++     done=2;               // not rendered: the transaction that kept it out asks for the next frame when it commits
++    else {
++     done=present(self,_sfrtInfo);
++     if(done<=0) why=4;
++    }
++    if(CGLGetCurrentContext()==_glContext)
++     CGLSetCurrentContext(NULL);
++   }
++   if(why>0 && sfrtTraceOn()){
++    os_unfair_lock_lock(&sfrtTrace.lock);
++    sfrtTrace.why[why]++;
++    os_unfair_lock_unlock(&sfrtTrace.lock);
++   }
++   sfrtUnlockFrame();
++   CALayerContext *deferred[SFRT_QUEUE];
++   unsigned deferredCount;
++   pthread_mutex_lock(&sfrt.lock);
++   sfrt.inFrame=0;
++   deferredCount=sfrt.deferredCount;
++   memcpy(deferred,sfrt.deferred,deferredCount*sizeof(deferred[0]));
++   sfrt.deferredCount=0;
++   pthread_mutex_unlock(&sfrt.lock);
++   for(unsigned i=0;i<deferredCount;i++)
++    [deferred[i] _sfrtFrameOnMain];
++   if(done<=0){
++    if(started>0)sfrtNote(2,_sfrtAskedAt,started,sfrtNowMs());
++    [self _sfrtFrameOnMain];
++    return;
++   }
++   if(started>0)sfrtNote(done==2?3:0,_sfrtAskedAt,started,sfrtNowMs());
++   // the last reference goes on the main thread: a context is freed there, with its GL context and timer
++   dispatch_async(dispatch_get_main_queue(),^{ [self release]; });
++}
++
++// (TERM12) whether a committed transaction may have changed this context's picture without a layer change of its own: an
++// IOSurface it shows redrawn in place (its seed moved since the last commit)
++-(BOOL)_sfrtCommitTouches {
++   struct SFFXLayerStamp stamps[SFFX_MAX_STAMPS];
++   unsigned count=0;
++   BOOL uncertain=NO;
++   uint64_t h=1469598103934665603ULL;
++
++   pthread_once(&sffxStampOnce,sffxLoadStampAPI);
++   sffxCollectStamps(_layer,stamps,&count,0,&uncertain);
++   for(unsigned i=0;i<count;i++){
++    uint64_t v[4]={(uintptr_t)stamps[i].layer,(uintptr_t)stamps[i].contents,stamps[i].localSeed,stamps[i].surfaceSeed};
++    for(int k=0;k<4;k++)
++     h=(h^v[k])*1099511628211ULL;
++   }
++   h^=count;
++   uint64_t old=__atomic_exchange_n(&_sfrtCommitStamp,h,__ATOMIC_ACQ_REL);
++   // contents that are not IOSurfaces (images) cannot change in place: their object and seed are in the stamp
++   (void)uncertain;
++   return old!=h;
++}
++
++-(BOOL)_sfrtEnabled {
++   return sfrtOn();
++}
++
++-(void)_sfrtBeginFrame {
++   if(sfrtOn())
++    sfrtLockFrame();
++}
++
++-(void)_sfrtEndFrame {
++   if(!sfrtOn())
++    return;
++   // an EGL context can be current on one thread only: the render thread makes it current for its frames
++   if(CGLGetCurrentContext()==_glContext)
++    CGLSetCurrentContext(NULL);
++   sfrtUnlockFrame();
++}
++
++-(void)_sfrtSetPresent:(int (*)(CALayerContext *,const void *))present info:(const void *)info length:(size_t)length {
++   if(!sfrtOn())
++    return;
++   void *copy=NULL;
++   if(present!=NULL && info!=NULL && length>0){
++    copy=malloc(length);
++    if(copy==NULL)
++     present=NULL;
++    else
++     memcpy(copy,info,length);
++   }
++   sfrtLockFrame();
++   free(_sfrtInfo);
++   _sfrtInfo=copy;
++   __atomic_store_n(&_sfrtPresent,present,__ATOMIC_RELEASE);
++   __atomic_store_n(&_sfrtStale,present==NULL,__ATOMIC_SEQ_CST);
++   sfrtUnlockFrame();
++}
++
+ // An opt-in GPU frame, never a CPU bitmap disguised as GPU storage.
+ -(CFTypeRef)copySFFXRenderedSurface {
+    const char *enabled=getenv("SFFX_GPU_PRESENT");
+--- a/src/Frameworks/QuartzCore/CATransaction.m
++++ b/src/Frameworks/QuartzCore/CATransaction.m
+@@ -1,6 +1,10 @@
+ #import <QuartzCore/CATransaction.h>
+ #include <dispatch/dispatch.h>
+ #include <pthread.h>
++#include <string.h>
++#include <stdlib.h>
++#include <time.h>
++#include <stdio.h>
+ #import <QuartzCore/CALayerContext.h>
+ #import <Foundation/NSString.h>
+ #import <Foundation/NSNumber.h>
+@@ -17,6 +21,116 @@
+ +(void)_commitImplicit;
+ @end
+ 
++/* (TERM12) Core Animation applies a transaction at its commit; here a layer's properties change as they are set, so a
++ * frame rendered while another thread was between +begin and +commit showed that thread's changes half made: Firefox
++ * moves its page tiles and video layers one by one in a transaction from its compositor thread, and a frame drawn in
++ * the middle had some layers at the new scroll position and some at the old (lines across and around videos while
++ * scrolling). With SFFX_GPU_RENDER_THREAD=1 explicit transactions and renders exclude each other (a reader/writer gate:
++ * transactions share it, a render has it alone): a render waits for the open ones to close and new ones wait for the
++ * render. A render that finds a transaction still open after 20 ms does not render at all (that transaction's commit
++ * asks for the next frame). Implicit changes (a property set outside +begin/+commit, as AppKit's own on the main
++ * thread) are not gated: their memory safety is the tree's (retained reads, locked swaps), as before.
++ * SF_CA_GATE=soft: new transactions do not wait for a render (for A/B: the render may see one half made). */
++static int gateOn(void){
++   static int on=-1;
++   if(on<0){
++    const char *v=getenv("SFFX_GPU_RENDER_THREAD"),*gpu=getenv("SFFX_GPU_PRESENT");
++    on=v!=NULL&&!strcmp(v,"1")&&gpu!=NULL&&!strcmp(gpu,"1")&&getenv("SF_CA_NO_GATE")==NULL;
++   }
++   return on;
++}
++static struct { pthread_mutex_t lock; pthread_cond_t moved; int open,rendering,waiting; } gate={PTHREAD_MUTEX_INITIALIZER,PTHREAD_COND_INITIALIZER};
++static _Thread_local int gateDepth,gateTook,gateRendering;
++static int gateFull(void){
++   static int full=-1;
++   if(full<0){const char *v=getenv("SF_CA_GATE");full=!(v!=NULL&&!strcmp(v,"soft"));}
++   return full;
++}
++static unsigned long gateTimeouts,gateRenders,gateRenderWaits,gateBeginWaits,gateOverlaps;
++static double gateRenderWaitMs,gateBeginWaitMs;
++static double gateNowMs(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1e3+t.tv_nsec/1e6;}
++
++static void gateTransactionBegin(void){
++   if(!gateOn() || gateDepth++>0 || gateRendering)
++    return;
++   pthread_mutex_lock(&gate.lock);
++   if(gateFull() && (gate.rendering || gate.waiting)){
++    double t0=gateNowMs();
++    while(gate.rendering || gate.waiting)
++     pthread_cond_wait(&gate.moved,&gate.lock);
++    gateBeginWaits++;gateBeginWaitMs+=gateNowMs()-t0;
++   }
++   if(gate.rendering)
++    gateOverlaps++;     // a transaction opened while a render reads the tree (soft gate): that frame may show it half done
++   gate.open++;
++   pthread_mutex_unlock(&gate.lock);
++   gateTook=1;
++}
++
++static void gateTransactionCommit(void){
++   if(!gateOn() || gateDepth==0 || --gateDepth>0 || !gateTook)
++    return;
++   gateTook=0;
++   pthread_mutex_lock(&gate.lock);
++   gate.open--;
++   pthread_cond_broadcast(&gate.moved);
++   pthread_mutex_unlock(&gate.lock);
++}
++
++// a render reads the tree: no other thread's transaction is open meanwhile (its own, if any, does not count)
++// YES: the render may read the tree (call _CATransactionGateRenderExit after); NO: a transaction stayed open, no render
++BOOL _CATransactionGateRenderEnter(void){
++   if(!gateOn())
++    return YES;
++   struct timespec deadline;
++   clock_gettime(CLOCK_REALTIME,&deadline);
++   deadline.tv_nsec+=20*1000000;
++   if(deadline.tv_nsec>=1000000000){deadline.tv_sec++;deadline.tv_nsec-=1000000000;}
++   int mine=gateTook;
++   pthread_mutex_lock(&gate.lock);
++   gate.waiting++;
++   gateRenders++;
++   BOOL admitted=YES;
++   if(gate.open-mine>0){
++    double t0=gateNowMs();
++    while(gate.open-mine>0)
++     if(pthread_cond_timedwait(&gate.moved,&gate.lock,&deadline)!=0 && gate.open-mine>0){
++      gateTimeouts++;
++      admitted=NO;
++      break;
++     }
++    gateRenderWaits++;gateRenderWaitMs+=gateNowMs()-t0;
++   }
++   gate.waiting--;
++   if(admitted)
++    gate.rendering++;
++   else
++    pthread_cond_broadcast(&gate.moved);   // begins held for the waiting render go on
++   pthread_mutex_unlock(&gate.lock);
++   if(admitted)
++    gateRendering++;
++   return admitted;
++}
++
++void _CATransactionGateRenderExit(void){
++   if(!gateOn())
++    return;
++   gateRendering--;
++   pthread_mutex_lock(&gate.lock);
++   gate.rendering--;
++   pthread_cond_broadcast(&gate.moved);
++   pthread_mutex_unlock(&gate.lock);
++}
++
++// (trace) since the last call: renders, renders that waited for transactions (ms), timeouts, begins that waited (ms)
++void _CATransactionGateStats(char *line,size_t size){
++   pthread_mutex_lock(&gate.lock);
++   snprintf(line,size,"gate%s renders=%lu waited=%lu/%.1fms timeouts=%lu begins-waited=%lu/%.1fms overlaps=%lu",gateFull()?"(full)":"",gateRenders,
++            gateRenderWaits,gateRenderWaitMs,gateTimeouts,gateBeginWaits,gateBeginWaitMs,gateOverlaps);
++   gateRenders=gateRenderWaits=gateTimeouts=gateBeginWaits=gateOverlaps=0;gateRenderWaitMs=gateBeginWaitMs=0;
++   pthread_mutex_unlock(&gate.lock);
++}
++
+ @implementation CATransaction
+ 
+ static NSMutableArray *transactionStack(){
+@@ -117,6 +231,7 @@
+ }
+ 
+ +(void)begin {
++   gateTransactionBegin();
+    CATransactionGroup *group=[[CATransactionGroup alloc] initWithOuterGroup:currentTransactionGroup()];
+    
+    [transactionStack() addObject:group];
+@@ -131,6 +246,8 @@
+ 
+    if(group!=nil)
+     [stack removeLastObject];
++   if(group!=nil && ![group isImplicit])
++    gateTransactionCommit();
+    [group release];
+    // (TERM10) an implicit transaction left under the outermost explicit one is committed with it
+    while([stack count]>0 && [[stack lastObject] isImplicit] && !pthread_main_np())

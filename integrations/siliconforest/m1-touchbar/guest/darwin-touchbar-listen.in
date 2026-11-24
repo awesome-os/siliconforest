@@ -1,0 +1,58 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# The Touch Bar with a person at the M1, without the desktop. Run:
+#   TB_GUEST=guest/darwin-touchbar-listen.in TB_RUNTIME=420 tools/tb_boot.sh tb<NN>
+# The idle timeouts are off until t=150, so the strip stays lit. What to do, and what must
+# be on the strip and in the log (TBKEY lines are the keys as the system receives them,
+# TB_LISTEN lines the last finger the digitizer reported and the layer):
+#   1. From about 20 s after the boot picture the strip shows five wide keys across its
+#      whole length: small sun, large sun, crossed speaker, speaker, loud speaker. No ESC,
+#      no FN key.
+#   2. Touch each from left to right. Each lightens under the finger and logs
+#      "usage=3a down=1/0", then 3b, 43, 44, 45.
+#   3. Hold the keyboard's Fn key: the strip shows F1 ... F12 for as long as it is held
+#      (TB_LISTEN: fn=1 layer=0). Still holding Fn, touch F1 to F12: 3a, 3b ... 45.
+#      Let Fn go: the five symbols are back (fn=0 layer=1). THIS IS THE STEP NO TEST HAS
+#      DONE: a real Fn press has never been seen by this driver.
+#   4. Put a finger on the loud speaker and, keeping it there, press Fn: the key is
+#      released (45 up) as the function keys appear, and nothing is pressed under the
+#      resting finger. Let go of both.
+#   5. Put a finger on the speaker and slide to the large sun without lifting: the
+#      speaker logs 44 down, then 44 up when the finger leaves it; nothing else.
+#   6. From t=150 the timeouts are 5 s (dim) and 10 s (dark): keep off the strip and the
+#      keyboard and watch it dim and go dark. Type a letter on the keyboard: the strip
+#      lights (kbd_wakes goes up). Let it go dark again and touch it: it lights and logs
+#      no key; the next touch presses.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+get() { sysctl -n "kern.sf_touchbar.$1" 2>/dev/null; }
+printf '\nTB_BEGIN_%s\n' "$nonce"
+n=0
+while [ "$n" -lt 150 ]; do
+    case "$(get state)" in ready*|display-only*|display-failed*|off*|'') break;; esac
+    sleep 1; n=$((n+1))
+done
+printf 'TB_STATE %s\nTB_DISPLAY %s\nTB_TOUCH %s\nTB_FN fn_known=%s default_layer=%s\n' "$(get state)" "$(get display)" "$(get touch)" "$(get fn_known)" "$(get default_layer)"
+sysctl -w kern.sf_touchbar.dim_ms=0 kern.sf_touchbar.off_ms=0 kern.sf_touchbar.brightness=128 > /dev/null 2>&1
+sftbtest --label listen wait:300000 2>&1 &
+t0=$(date +%s); last=
+while [ $(( $(date +%s) - t0 )) -lt 300 ]; do
+    t=$(( $(date +%s) - t0 ))
+    if [ "$t" -ge 150 ] && [ "$(get off_ms)" = 0 ]; then
+        sysctl -w kern.sf_touchbar.dim_ms=5000 kern.sf_touchbar.off_ms=10000 > /dev/null 2>&1
+        printf 'TB_LISTEN t=%s the strip now dims after 5 s and goes dark after 10 s\n' "$t"
+    fi
+    now="$(get last_touch) fn=$(get fn) layer=$(get layer) brightness=$(get actual_brightness) wakes=$(get wakes) kbd_wakes=$(get kbd_wakes) failsafes=$(get failsafes)"
+    if [ "$now" != "$last" ]; then
+        printf 'TB_LISTEN t=%s %s reports=%s irqs=%s bad_reports=%s spi_errors=%s\n' "$t" "$now" "$(get reports)" \
+            "$(get irqs)" "$(get bad_reports)" "$(get spi_errors)"
+        last=$now
+    fi
+    sleep 1
+done
+wait
+sysctl -w kern.sf_touchbar.dim_ms=30000 kern.sf_touchbar.off_ms=60000 > /dev/null 2>&1
+sysctl kern.sf_touchbar 2>&1 | grep -v 'keys:\|trace:\|fetch:' | cut -c1-600
+printf 'TB_END_%s\n' "$nonce"
+printf '\nPD_BENCH_DONE\n'

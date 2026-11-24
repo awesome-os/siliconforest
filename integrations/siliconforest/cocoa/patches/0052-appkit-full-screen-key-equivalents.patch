@@ -1,0 +1,436 @@
+--- a/src/Frameworks/AppKit/NSWindow.m
++++ b/src/Frameworks/AppKit/NSWindow.m
+@@ -74,6 +74,8 @@
+ +(NSCursor *)_windowResizeCursorForEdges:(int)edges;
+ @end
+ 
++static int sfFullScreenAsked(NSWindow *window);
++
+ // set while the pointer is over the resize band, so leaving it hands the cursor back
+ static char resizeBandKey;
+ #import "O2Context_builtin_FT.h"
+@@ -315,7 +317,7 @@
+     struct wsRPCWindow data = {
+         { kWSWindowCreate, sizeof(struct wsRPCWindow) - sizeof(struct wsRPCBase) },
+         _number, _frame.origin.x, _frame.origin.y,
+-        _frame.size.width, _frame.size.height, _styleMask, 0, {'\0'}, _level
++        _frame.size.width, _frame.size.height, (_styleMask&~NSFullScreenWindowMask), 0, {'\0'}, _level
+     };
+     struct wsRPCSimple reply = {0};
+     int len = sizeof(reply);
+@@ -891,6 +893,10 @@
+     { NSWindowWillCloseNotification,@selector(windowWillClose:) },
+     { NSWindowWillMiniaturizeNotification,@selector(windowWillMiniaturize:) },
+     { NSWindowWillMoveNotification,@selector(windowWillMove:) },
++    { NSWindowWillEnterFullScreenNotification,@selector(windowWillEnterFullScreen:) },
++    { NSWindowDidEnterFullScreenNotification,@selector(windowDidEnterFullScreen:) },
++    { NSWindowWillExitFullScreenNotification,@selector(windowWillExitFullScreen:) },
++    { NSWindowDidExitFullScreenNotification,@selector(windowDidExitFullScreen:) },
+     { nil, NULL }
+    };
+    int i;
+@@ -1228,6 +1234,10 @@
+ }
+ 
+ -(void)setTitle:(NSString *)title {
++    // Terminal sets the same title many times a second while it draws: a title that did not
++    // change is no message to the WindowServer, no redrawn frame and no rebuilt Window menu
++    if(title!=nil && _title!=nil && [title isEqualToString:_title] && [_miniwindowTitle isEqualToString:_title])
++        return;
+     title=[title copy];
+     [_title release];
+     _title=title;
+@@ -1242,8 +1252,13 @@
+         winTitle = _title;
+ 
+     [self _updateWSState];
+-    // the title bar is ours to draw, so a later title change has to repaint it
+-    [_backgroundView setNeedsDisplay:YES];
++    // the title bar is ours to draw, so a later title change has to repaint it (not where the
++    // compositor draws it: then the whole window drew again for nothing)
++    if(!NSWindowFrameIsDrawnByServer(_styleMask))
++        [_backgroundView setNeedsDisplay:YES];
++    // a tab shows its window's title in the bar of the group
++    if([self respondsToSelector:@selector(_sfTabTitleChanged)])
++        [self performSelector:@selector(_sfTabTitleChanged)];
+ 
+     if ([self _isApplicationWindow])
+         [NSApp changeWindowsItem:self title:title filename:NO];
+@@ -1252,7 +1267,8 @@
+ // the compositor's title and the title bar we draw, after the title or the edited state changed
+ -(void)_updatePlatformWindowTitle {
+     [self _updateWSState];
+-    [_backgroundView setNeedsDisplay:YES];
++    if(!NSWindowFrameIsDrawnByServer(_styleMask))
++        [_backgroundView setNeedsDisplay:YES];
+ }
+ 
+ -(void)setTitleWithRepresentedFilename:(NSString *)filename {
+@@ -1416,6 +1432,8 @@
+ }
+ 
+ -(void)setDocumentEdited:(BOOL)flag {
++   if(_isDocumentEdited==flag)
++    return;
+    _isDocumentEdited=flag;
+    [self _updatePlatformWindowTitle];
+ }
+@@ -2076,15 +2094,27 @@
+ 
+    _serverState=bits;
+    if((bits^was)&WS_STATE_SUSPENDED){
++    // put away and brought back by the compositor (its tile of the window, its buttons): the
++    // window's own miniaturised state follows, so that the Window menu and -isMiniaturized agree
+     if(bits&WS_STATE_SUSPENDED){
+      [self postNotificationName:NSWindowWillMiniaturizeNotification];
++     _isMiniaturized=YES;
+      [self postNotificationName:NSWindowDidMiniaturizeNotification];
+     }
+-    else
++    else {
++     if(_isMiniaturized){
++      _isMiniaturized=NO;
++      [self _updateWSState];
++     }
+      [self postNotificationName:NSWindowDidDeminiaturizeNotification];
++    }
+    }
+    if((bits^was)&WS_STATE_MAXIMIZED)
+     [_backgroundView setNeedsDisplay:YES];
++   if((bits^was)&WS_STATE_FULLSCREEN)
++    [self _sfServerFullScreen:(bits&WS_STATE_FULLSCREEN)!=0];
++   else if(sfFullScreenAsked(self)!=0 && (bits&WS_STATE_FULLSCREEN)==(sfFullScreenAsked(self)>0 ? WS_STATE_FULLSCREEN : 0))
++    [self _sfServerFullScreen:sfFullScreenAsked(self)>0];
+ }
+ 
+ /* The compositor's answer about this window's frame differs from what the window was laid out
+@@ -2109,14 +2139,21 @@
+    struct wsRPCWindow data = {
+        { kWSWindowSetSizeLimits, sizeof(struct wsRPCWindow) - sizeof(struct wsRPCBase) },
+        _number, min.width, min.height,
+-       max.width>=32767 ? 0 : max.width, max.height>=32767 ? 0 : max.height, _styleMask, 0, {'\0'}, _level
++       max.width>=32767 ? 0 : max.width, max.height>=32767 ? 0 : max.height, (_styleMask&~NSFullScreenWindowMask), 0, {'\0'}, _level
+    };
+    _windowServerRPC(&data, sizeof(data), NULL, NULL);
+ }
+ 
++extern char SFLatestConfigureKey;
++
+ -(void)_serverDidConfigureSize:(NSValue *)value {
+    NSSize size=[value sizeValue];
+    NSRect frame=[self frame];
++   NSValue *latest=objc_getAssociatedObject(self,&SFLatestConfigureKey);
++
++   // a later configure is on its way: this size is past already
++   if(latest!=nil && latest!=value && !NSEqualSizes([latest sizeValue],size))
++    return;
+ 
+    if(!(_styleMask&NSResizableWindowMask) || NSEqualSizes(size,frame.size))
+     return;
+@@ -2162,6 +2199,14 @@
+ 
+ // a full-size content view and the lights above it cover the frame, so they repaint with it
+ -(void)_redrawForKeyChange {
++   /* Where the compositor draws the frame, the title bar and its lights are its own: of ours only the
++    * tab bar looks different in a window that is not key. Redrawing the whole window here made every
++    * tab switch and every click into another window draw it twice. */
++   if(NSWindowFrameIsDrawnByServer(_styleMask)){
++    if([self respondsToSelector:@selector(_sfTabBarView)])
++     [[self performSelector:@selector(_sfTabBarView)] setNeedsDisplay:YES];
++    return;
++   }
+    [_backgroundView setNeedsDisplay:YES];
+    for(NSView *view in [_backgroundView subviews])
+     [view setNeedsDisplay:YES];
+@@ -2334,7 +2379,7 @@
+             struct wsRPCWindow flush = {
+                 { kWSWindowFlush, sizeof(struct wsRPCWindow) - sizeof(struct wsRPCBase) },
+                 _number, _frame.origin.x, _frame.origin.y,
+-                _frame.size.width, _frame.size.height, _styleMask, 0, {'\0'}, _level
++                _frame.size.width, _frame.size.height, (_styleMask&~NSFullScreenWindowMask), 0, {'\0'}, _level
+             };
+             _windowServerRPC(&flush, sizeof(flush), NULL, NULL);
+         }
+@@ -2516,7 +2561,7 @@
+     struct wsRPCWindow data = {
+         { kWSWindowDestroy, sizeof(struct wsRPCWindow) - sizeof(struct wsRPCBase) },
+         _number, _frame.origin.x, _frame.origin.y,
+-        _frame.size.width, _frame.size.height, _styleMask, 0, {'\0'}, _level
++        _frame.size.width, _frame.size.height, (_styleMask&~NSFullScreenWindowMask), 0, {'\0'}, _level
+     };
+     _windowServerRPC(&data, sizeof(data), NULL, NULL);
+ 
+@@ -2568,6 +2613,14 @@
+      if(![self isKindOfClass:[NSPanel class]] && ![self isExcludedFromWindowsMenu]) {
+          [NSApp changeWindowsItem:self title:_title filename:NO];
+      }
++     /* A window on screen brought to the front (Command-`, the Window menu, a window of the active
++      * application made key): the compositor raises and focuses it (xdg_activation_v1 in the
++      * WindowServer; it decides by its rule against stealing focus). A window just shown is placed
++      * by the compositor as a new one. */
++     if(wasVisible && relativeTo==0 && _level<NSPopUpMenuWindowLevel && ![self isKindOfClass:[NSPanel class]]){
++      struct wsRPCSimple order = { { kWSWindowOrder, sizeof(struct wsRPCSimple) - sizeof(struct wsRPCBase) }, _number, 0, 0, 0 };
++      _windowServerRPC(&order, sizeof(order), NULL, NULL);
++     }
+ 
+      break;
+ 
+@@ -3074,25 +3127,105 @@
+    objc_setAssociatedObject(self,&restorableKey,[NSNumber numberWithBool:value],OBJC_ASSOCIATION_RETAIN);
+ }
+ 
+-// full screen is the screen's whole frame with the size it had before kept to come back to
++/* Full screen. Where the compositor draws the frames it is the compositor's state
++ * (xdg_toplevel set_fullscreen): it takes the frame away, gives the window the whole output and
++ * puts it back where it was when the state ends; its configure sizes the window and its state
++ * (-_serverDidSetState:) says when the change is done, which is when the did-notifications go out.
++ * The window keeps its menu strip and tab bar (there is no menu bar to show above it). Elsewhere
++ * the window takes the screen's frame itself and returns to the frame it had. */
++static BOOL sfFullScreenByServer(NSWindow *window,NSUInteger styleMask) {
++   return NSWindowFrameIsDrawnByServer(styleMask&~NSFullScreenWindowMask);
++}
++
++// what was asked of the compositor and not answered yet: 1 full screen, -1 out of it
++static char fullScreenAskedKey;
++static int sfFullScreenAsked(NSWindow *window) {
++   return [objc_getAssociatedObject(window,&fullScreenAskedKey) intValue];
++}
++static void sfSetFullScreenAsked(NSWindow *window,int asked) {
++   objc_setAssociatedObject(window,&fullScreenAskedKey,asked ? [NSNumber numberWithInt:asked] : nil,OBJC_ASSOCIATION_RETAIN);
++}
++
+ -(void)toggleFullScreen:sender {
+    NSValue *saved=objc_getAssociatedObject(self,&fullScreenFrameKey);
+    NSNotificationCenter *center=[NSNotificationCenter defaultCenter];
++   BOOL server=sfFullScreenByServer(self,_styleMask);
+ 
+-   if(saved==nil){
++   if(!(_styleMask&NSFullScreenWindowMask)){
++    if(_sheetContext!=nil || [self isKindOfClass:[NSPanel class]])
++     return;
+     [center postNotificationName:NSWindowWillEnterFullScreenNotification object:self];
+     objc_setAssociatedObject(self,&fullScreenFrameKey,[NSValue valueWithRect:[self frame]],OBJC_ASSOCIATION_RETAIN);
+     _styleMask|=NSFullScreenWindowMask;
+-    [self setFrame:[[self screen] frame] display:YES];
+-    [center postNotificationName:@"NSWindowDidEnterFullScreenNotification" object:self];
++    if(server){
++     sfSetFullScreenAsked(self,1);
++     [self _updateWSState];
++     [self performSelector:@selector(_sfFullScreenUnanswered) withObject:nil afterDelay:1.0];
++    }
++    else {
++     [self setFrame:[[self screen] frame] display:YES];
++     [center postNotificationName:NSWindowDidEnterFullScreenNotification object:self];
++    }
+    }
+    else {
+     [center postNotificationName:NSWindowWillExitFullScreenNotification object:self];
+     _styleMask&=~(NSUInteger)NSFullScreenWindowMask;
+-    [self setFrame:[saved rectValue] display:YES];
++    if(server){
++     sfSetFullScreenAsked(self,-1);
++     [self _updateWSState];
++     [self performSelector:@selector(_sfFullScreenUnanswered) withObject:nil afterDelay:1.0];
++    }
++    else {
++     if(saved!=nil)
++      [self setFrame:[saved rectValue] display:YES];
++     [center postNotificationName:NSWindowDidExitFullScreenNotification object:self];
++    }
+     objc_setAssociatedObject(self,&fullScreenFrameKey,nil,OBJC_ASSOCIATION_RETAIN);
+-    [center postNotificationName:@"NSWindowDidExitFullScreenNotification" object:self];
+    }
++   [_backgroundView setNeedsDisplay:YES];
++}
++
++// a compositor that does not offer full screen leaves the window as it was
++-(void)_sfFullScreenUnanswered {
++   int asked=sfFullScreenAsked(self);
++
++   if(asked==0)
++    return;
++   sfSetFullScreenAsked(self,0);
++   NSLog(@"AppKit: the compositor did not %@ full screen", asked>0 ? @"enter" : @"leave");
++   if(asked>0){
++    _styleMask&=~(NSUInteger)NSFullScreenWindowMask;
++    objc_setAssociatedObject(self,&fullScreenFrameKey,nil,OBJC_ASSOCIATION_RETAIN);
++   }
++   else
++    _styleMask|=NSFullScreenWindowMask;
++   [self _updateWSState];
++   [_backgroundView setNeedsDisplay:YES];
++}
++
++// the compositor's answer: in full screen or out of it, asked for here or by its own keys
++-(void)_sfServerFullScreen:(BOOL)on {
++   NSNotificationCenter *center=[NSNotificationCenter defaultCenter];
++
++   if(on){
++    if(!(_styleMask&NSFullScreenWindowMask)){
++     [center postNotificationName:NSWindowWillEnterFullScreenNotification object:self];
++     objc_setAssociatedObject(self,&fullScreenFrameKey,[NSValue valueWithRect:[self frame]],OBJC_ASSOCIATION_RETAIN);
++     _styleMask|=NSFullScreenWindowMask;
++    }
++    sfSetFullScreenAsked(self,0);
++    [center postNotificationName:NSWindowDidEnterFullScreenNotification object:self];
++   }
++   else {
++    if(_styleMask&NSFullScreenWindowMask){
++     [center postNotificationName:NSWindowWillExitFullScreenNotification object:self];
++     _styleMask&=~(NSUInteger)NSFullScreenWindowMask;
++     objc_setAssociatedObject(self,&fullScreenFrameKey,nil,OBJC_ASSOCIATION_RETAIN);
++    }
++    sfSetFullScreenAsked(self,0);
++    [center postNotificationName:NSWindowDidExitFullScreenNotification object:self];
++   }
++   [_backgroundView setNeedsDisplay:YES];
+ }
+ 
+ -(void)zoom:sender {
+@@ -3745,6 +3878,16 @@
+     if ([item action] == @selector(selectNextTab:) || [item action] == @selector(selectPreviousTab:) ||
+         [item action] == @selector(moveTabToNewWindow:))
+         return [self _sfTabCommandEnabled:[item action]];
++    // the item says what it will do, as on macOS
++    if ([item action] == @selector(toggleFullScreen:)) {
++        BOOL full = (_styleMask & NSFullScreenWindowMask) != 0;
++
++        [item setTitle:NSLocalizedStringFromTableInBundle(full ? @"Exit Full Screen" : @"Enter Full Screen", nil,
++                                                          [NSBundle bundleForClass:[NSWindow class]], @"View menu")];
++        return (_styleMask & NSResizableWindowMask) || full;
++    }
++    if ([item action] == @selector(performZoom:) || [item action] == @selector(zoom:))
++        return (_styleMask & NSResizableWindowMask) && !(_styleMask & NSFullScreenWindowMask);
+     if ([item action] == @selector(undo:))
+         return [[self undoManager] canUndo];
+     if ([item action] == @selector(redo:))
+@@ -3925,7 +4068,7 @@
+     struct wsRPCWindow data = {
+         { kWSWindowModifyState, sizeof(struct wsRPCWindow) - sizeof(struct wsRPCBase) },
+         _number, _frame.origin.x, _frame.origin.y,
+-        _frame.size.width, _frame.size.height, _styleMask, 0, {'\0'}, _level
++        _frame.size.width, _frame.size.height, (_styleMask&~NSFullScreenWindowMask), 0, {'\0'}, _level
+     };
+     // a window may have no title (nil), and a title may have no UTF-8 form
+     const char *titleUTF8 = [_title UTF8String];
+@@ -3952,7 +4095,9 @@
+  * compositor. True for windows with a standard frame when the compositor offers to draw
+  * frames; see wsStyleWantsServerFrame for which styles those are. */
+ BOOL NSWindowFrameIsDrawnByServer(unsigned styleMask) {
+-    return !sfServerFramesRefused && _windowServerServerDecorations() && wsStyleWantsServerFrame(styleMask);
++    // in full screen the compositor shows no frame, but the window is still one it frames: the frame
++    // comes back with the window's place when full screen ends
++    return !sfServerFramesRefused && _windowServerServerDecorations() && wsStyleWantsServerFrame(styleMask & ~NSFullScreenWindowMask);
+ }
+ 
+ CGRect CGInsetRectForNativeWindowBorder(CGRect frame,unsigned styleMask) {
+--- a/src/Frameworks/AppKit/NSMenu.subproj/NSMenu.m
++++ b/src/Frameworks/AppKit/NSMenu.subproj/NSMenu.m
+@@ -531,8 +531,11 @@
+     NSString *characters=SFNormalizedKey([event charactersIgnoringModifiers]);
+     NSUInteger modifiers=[event modifierFlags]&(NSCommandKeyMask|NSAlternateKeyMask|NSShiftKeyMask|NSControlKeyMask);
+     
+-    if (_autoenablesItems)
+-        [self update];
++    /* A menu that fills itself in when it is shown is filled in now. Every item is not validated:
++       the one that matches is (below), as on macOS. Validating the whole menu, and again at each
++       level of submenus, was most of the time of every Command key in Terminal. */
++    if ([_delegate respondsToSelector:@selector(menuNeedsUpdate:)])
++        [_delegate menuNeedsUpdate:self];
+     
+     for(i=0;i<count;i++){
+         NSMenuItem *item=[_itemArray objectAtIndex:i];
+@@ -547,8 +550,12 @@
+         if([key length]==1 && [key characterAtIndex:0]>0x20 && [key characterAtIndex:0]<0x7f &&
+            !isalnum([key characterAtIndex:0]) && !(wanted&NSShiftKeyMask))
+             held&=~NSShiftKeyMask;
++        /* "+" (Bigger, Zoom In) is also the unshifted key that types it, as on macOS: Command-= and
++           Command-+ both make text bigger on a US keyboard */
++        BOOL plusAsEquals=[key isEqualToString:@"+"] && [characters isEqualToString:@"="];
++
+         if([key length]!=0 && held==wanted &&
+-           [SFNormalizedKey(key) isEqualToString:characters]){
++           ([SFNormalizedKey(key) isEqualToString:characters] || plusAsEquals)){
+             /* This *must* accurately reflect menu validation when ignoring or processing
+                 key equivalents. Relying on update to keep isEnabled in the proper state is
+                 unfortunately too tenuous.
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -19,6 +19,7 @@
+ #import "O2Font_FT.h"
+ #import <Foundation/NSConnection.h>
+ #import <AppKit/NSApplication.h>
++#include <objc/runtime.h>
+ #include <errno.h>
+ #import <AppKit/NSWindow-Private.h>
+ #import <AppKit/NSPanel.h>
+@@ -147,6 +148,8 @@
+ OBJC_EXPORT id objc_storeWeak(id *location, id obj);
+ OBJC_EXPORT id objc_storeWeakOrNil(id *location, id obj);
+ 
++char SFLatestConfigureKey;
++
+ @implementation NSApplication
+ 
+ id NSApp=nil;
+@@ -299,10 +302,17 @@
+                                     break;
+                                 }
+                                 case WS_EVENT_CONFIGURE:
+-                                    if(window != nil)
++                                    if(window != nil){
++                                        NSValue *size=[NSValue valueWithSize:NSMakeSize(me.dx, me.dy)];
++
++                                        // the newest size: a configure that a later one overtook is not applied
++                                        // (-_serverDidConfigureSize:); during a resize by dragging they come at
++                                        // the pointer's rate and each was a new backing store and a whole drawing
++                                        objc_setAssociatedObject(window,&SFLatestConfigureKey,size,OBJC_ASSOCIATION_RETAIN);
+                                         [window performSelectorOnMainThread:@selector(_serverDidConfigureSize:)
+-                                                                 withObject:[NSValue valueWithSize:NSMakeSize(me.dx, me.dy)]
++                                                                 withObject:size
+                                                               waitUntilDone:NO];
++                                    }
+                                     break;
+                                 case WS_EVENT_SCALE:
+                                     if(window != nil)
+@@ -877,6 +887,40 @@
+    return nil;
+ }
+ 
++/* Window > Cycle Through Windows (Command-`, and with Shift backwards): the next window of the
++ * application that is on screen, a document window rather than a panel, and not a background tab
++ * of a group, made key and brought to the front (the compositor raises it: kWSWindowOrder). */
++-(void)_sfCycleWindowsBackwards:(BOOL)backwards {
++   NSArray  *windows=[self orderedWindows];
++   NSWindow *key=[self keyWindow];
++
++   // the window server may not say the order: the application's own list then
++   if([windows count]==0)
++    windows=[self windows];
++   NSMutableArray *candidates=[NSMutableArray array];
++
++   for(NSWindow *window in windows)
++    if([window isVisible] && ![window isMiniaturized] && ![window isKindOfClass:[NSPanel class]] && [window canBecomeKeyWindow])
++     [candidates addObject:window];
++   if([candidates count]<2){
++    NSBeep();
++    return;
++   }
++   NSUInteger at=key ? [candidates indexOfObjectIdenticalTo:key] : NSNotFound;
++   NSUInteger count=[candidates count];
++   NSUInteger next=(at==NSNotFound) ? 0 : (backwards ? (at+count-1)%count : (at+1)%count);
++
++   [[candidates objectAtIndex:next] makeKeyAndOrderFront:nil];
++}
++
++-(void)_cycleWindows:sender {
++   [self _sfCycleWindowsBackwards:NO];
++}
++
++-(void)_cycleWindowsReversed:sender {
++   [self _sfCycleWindowsBackwards:YES];
++}
++
+ -(void)miniaturizeAll:sender {
+    int count=[_windows count];
+ 

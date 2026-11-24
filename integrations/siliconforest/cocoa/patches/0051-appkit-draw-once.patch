@@ -1,0 +1,188 @@
+--- a/src/Frameworks/AppKit/NSWindowMenuStrip.m
++++ b/src/Frameworks/AppKit/NSWindowMenuStrip.m
+@@ -111,9 +111,16 @@
+     // the window's own ground rather than a bar of another look
+     [(dark ? [NSColor colorWithCalibratedWhite:0.16 alpha:1] : [NSColor colorWithCalibratedWhite:0.955 alpha:1]) setFill];
+     NSRectFill(rect);
+-    _sfBarGroundDrawn = YES;
+-    [super drawRect:rect];
+-    _sfBarGroundDrawn = NO;
++    /* Where the content's top edge falls inside a device pixel (at 150% every odd number of points)
++     * each redraw of the content takes in that pixel row of the strip: the titles do not reach
++     * it, only the ground and the hairline are drawn again (laying out the titles was a sixth of
++     * every frame of a scrolling terminal). */
++    BOOL edgeOnly = [self isFlipped] ? NSMinY(rect) >= NSMaxY(bounds) - 1.5 : NSMaxY(rect) <= NSMinY(bounds) + 1.5;
++    if (!edgeOnly) {
++        _sfBarGroundDrawn = YES;
++        [super drawRect:rect];
++        _sfBarGroundDrawn = NO;
++    }
+     // a hairline between the strip and what lies under it
+     [[NSColor colorWithCalibratedWhite:dark ? 0.0 : 0.0 alpha:dark ? 0.5 : 0.14] setFill];
+     NSRectFillUsingOperation(NSMakeRect(0, NSMaxY(bounds) - 1, NSWidth(bounds), 1), NSCompositeSourceOver);
+@@ -146,7 +153,8 @@
+         return NO;
+     if ([self isKindOfClass:[NSPanel class]] || [self isSheet])
+         return NO;
+-    if (!(_styleMask & NSTitledWindowMask) || (_styleMask & (NSFullScreenWindowMask | NSFullSizeContentViewWindowMask)))
++    // in full screen too: there is no menu bar to show at the top of the screen
++    if (!(_styleMask & NSTitledWindowMask) || (_styleMask & NSFullSizeContentViewWindowMask))
+         return NO;
+     return NSWindowFrameIsDrawnByServer(_styleMask);
+ }
+--- a/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
++++ b/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
+@@ -72,7 +72,8 @@
+     // a character typed with Shift on the US layout shows as Shift and its key, as macOS shows
+     // Command-{ as Shift-Command-[
+     {
+-        static const char shifted[] = "~!@#$%^&*()_+{}|:\"<>?", plain[] = "`1234567890-=[]\\;',./";
++        // "+" stays "+" (macOS shows Command-+ for Bigger and Zoom In)
++        static const char shifted[] = "~!@#$%^&*()_{}|:\"<>?", plain[] = "`1234567890-[]\\;',./";
+         const char *at = c < 0x80 && c != 0 ? strchr(shifted, (int)c) : NULL;
+ 
+         if (at != NULL) {
+@@ -99,7 +100,18 @@
+     case NSDownArrowFunctionKey: [out appendString:@"\u2193"]; break;
+     case NSLeftArrowFunctionKey: [out appendString:@"\u2190"]; break;
+     case NSRightArrowFunctionKey: [out appendString:@"\u2192"]; break;
+-    default: [out appendString:[key uppercaseString]]; break;
++    // the keys of the navigation block and the function row, as macOS draws them
++    case NSHomeFunctionKey: [out appendString:@"\u2196"]; break;
++    case NSEndFunctionKey: [out appendString:@"\u2198"]; break;
++    case NSPageUpFunctionKey: [out appendString:@"\u21de"]; break;
++    case NSPageDownFunctionKey: [out appendString:@"\u21df"]; break;
++    case NSDeleteFunctionKey: [out appendString:@"\u2326"]; break;
++    default:
++        if (c >= NSF1FunctionKey && c <= NSF35FunctionKey)
++            [out appendFormat:@"F%d", (int)(c - NSF1FunctionKey + 1)];
++        else
++            [out appendString:[key uppercaseString]];
++        break;
+     }
+     return out;
+ }
+@@ -717,8 +729,13 @@
+     [window _sfSetPopupAnchorRect:anchor kind:kind parent:parent];
+     [[window contentView] addSubview:view];
+     [window orderFront:nil];
+-    // drawn now: the tracking loop holds the run loop that would otherwise paint it
+-    [window display];
++    /* Drawn now: the tracking loop holds the run loop that would otherwise paint it. Ordering it in
++     * has drawn it already, before the popup had its role: the drawing is handed over again rather
++     * than made a second time (that was a third of the time a menu took to open). */
++    if ([window viewsNeedDisplay])
++        [window display];
++    else
++        [window flushWindow];
+     return window;
+ }
+ 
+@@ -746,6 +763,15 @@
+     if (submenu == nil && loose == nil) {
+         return;
+     }
++    /* No application here offers a service: as on macOS, the Services menu then has one
++     * disabled row instead of opening as nothing. */
++    if (submenu != nil && [submenu numberOfItems] == 0 && submenu == [NSApp servicesMenu]) {
++        NSMenuItem *none = [[NSMenuItem alloc] initWithTitle:@"No Services Apply" action:NULL keyEquivalent:@""];
++
++        [none setEnabled:NO];
++        [submenu addItem:none];
++        [none release];
++    }
+     // the submenu's owner fills it in and its items are enabled or not as of now
+     [submenu update];
+     if ([[submenu delegate] respondsToSelector:@selector(menuWillOpen:)])
+--- a/src/Frameworks/AppKit/NSWindowTabbing.m
++++ b/src/Frameworks/AppKit/NSWindowTabbing.m
+@@ -167,6 +167,18 @@
+ 
+ - (NSString *)identifier { return _identifier; }
+ - (NSArray *)windows { return [[_windows copy] autorelease]; }
++
++// a tab dragged along the bar to another place
++- (void)_sfMoveWindow:(NSWindow *)window toIndex:(NSUInteger)index
++{
++    NSUInteger from = [_windows indexOfObjectIdenticalTo:window];
++
++    if (from == NSNotFound || index >= [_windows count] || index == from)
++        return;
++    CFArrayRemoveValueAtIndex((CFMutableArrayRef)_windows, from);
++    CFArrayInsertValueAtIndex((CFMutableArrayRef)_windows, index, window);
++    [self _sfUpdateBars];
++}
+ - (BOOL)isOverviewVisible { return _overviewVisible; }
+ - (void)setOverviewVisible:(BOOL)visible { _overviewVisible = visible; }
+ - (BOOL)isTabBarVisible { return [_windows count] > 1 || _barShownAlone; }
+@@ -211,7 +223,12 @@
+     sfTabSwitching--;
+     if (!taken)
+         NSLog(@"AppKit: tab: the WindowServer did not hand the toplevel over (the tab is a window of its own)");
+-    [window display];
++    // ordering it in drew what had changed and handed it over; drawing the whole window a second
++    // time made a switch take two frames' work
++    if ([window viewsNeedDisplay])
++        [window displayIfNeeded];
++    else
++        [window flushWindow];
+ }
+ 
+ - (void)_sfAttach:(NSWindow *)window
+@@ -473,10 +490,37 @@
+     if (tab < 0)
+         return;
+     NSWindow *window = [windows objectAtIndex:(NSUInteger)tab];
+-    if (close)
++    if (close) {
+         [window performClose:self];
+-    else
+-        [[window tabGroup] setSelectedWindow:window];
++        return;
++    }
++    [[window tabGroup] setSelectedWindow:window];
++    /* Dragged along the bar the tab takes the place it is over, as on macOS; let go well below or
++     * above the bar it leaves for a window of its own (Window > Move Tab to New Window). */
++    NSWindowTabGroup *group = [window tabGroup];
++    BOOL moved = NO, away = NO;
++    for (;;) {
++        NSEvent *next = [NSApp nextEventMatchingMask:NSLeftMouseDraggedMask | NSLeftMouseUpMask
++                                           untilDate:[NSDate distantFuture] inMode:NSEventTrackingRunLoopMode dequeue:YES];
++        NSPoint at = [self convertPoint:[next locationInWindow] fromView:nil];
++        NSUInteger count = [[group windows] count];
++
++        away = count > 1 && (at.y < NSMinY([self bounds]) - 40 || at.y > NSMaxY([self bounds]) + 40);
++        if ([next type] == NSLeftMouseUp)
++            break;
++        if (fabs(at.x - point.x) < 4 && !moved)
++            continue;
++        moved = YES;
++        for (NSUInteger i = 0; i < count && !away; i++) {
++            if (NSMinX([self _tabRect:i of:count]) <= at.x && at.x < NSMaxX([self _tabRect:i of:count])) {
++                [group _sfMoveWindow:window toIndex:i];
++                [[self window] displayIfNeeded];
++                break;
++            }
++        }
++    }
++    if (moved && away)
++        [window moveTabToNewWindow:self];
+ }
+ 
+ @end
+@@ -618,6 +662,15 @@
+ 
+ #pragma mark the tab bar of a window
+ 
++// the window's title changed: the bars of its group show it
++- (void)_sfTabTitleChanged
++{
++    NSWindowTabGroup *group = objc_getAssociatedObject(self, &SFTabGroupKey);
++
++    for (NSWindow *window in [group windows])
++        [[window _sfTabBarView] setNeedsDisplay:YES];
++}
++
+ - (NSView *)_sfTabBarView
+ {
+     return objc_getAssociatedObject(self, &SFTabBarKey);

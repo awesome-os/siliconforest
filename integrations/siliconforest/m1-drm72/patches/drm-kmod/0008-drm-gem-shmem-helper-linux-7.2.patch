@@ -1,0 +1,2019 @@
+--- a/include/drm/drm_gem_shmem_helper.h
++++ b/include/drm/drm_gem_shmem_helper.h
+@@ -0,0 +1,360 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++
++#ifndef __DRM_GEM_SHMEM_HELPER_H__
++#define __DRM_GEM_SHMEM_HELPER_H__
++
++#include <linux/fs.h>
++#include <linux/mm.h>
++#include <linux/mutex.h>
++
++#include <drm/drm_file.h>
++#include <drm/drm_gem.h>
++#include <drm/drm_ioctl.h>
++#include <drm/drm_prime.h>
++
++struct dma_buf_attachment;
++struct drm_mode_create_dumb;
++struct drm_printer;
++struct sg_table;
++
++/**
++ * struct drm_gem_shmem_object - GEM object backed by shmem
++ */
++struct drm_gem_shmem_object {
++	/**
++	 * @base: Base GEM object
++	 */
++	struct drm_gem_object base;
++
++	/**
++	 * @pages: Page table
++	 */
++	struct page **pages;
++
++	/** @cpu_vma_count: Revocable CPU VMAs, protected by base.resv. */
++	refcount_t cpu_vma_count;
++
++	/** @reclaimable_cpu_mappings: CPU VMAs may be revoked by the driver. */
++	bool reclaimable_cpu_mappings;
++
++	/**
++	 * @pages_no_reclaim: Disable direct reclaim during backing population.
++	 * Set before drm_gem_shmem_init(). Drivers that can fail a large pin
++	 * request cheaply may opt in; background reclaim remains enabled.
++	 */
++	bool pages_no_reclaim;
++
++	/**
++	 * @cpu_pages: Pages populated one at a time by CPU faults on revocable
++	 * VMAs while no device mapping holds @pages. Sparse; under base.resv.
++	 */
++	struct page **cpu_pages;
++
++	/** @cpu_pages_count: Populated entries of @cpu_pages. */
++	unsigned long cpu_pages_count;
++
++	/**
++	 * @pages_use_count:
++	 *
++	 * Reference count on the pages table.
++	 * The pages are put when the count reaches zero.
++	 */
++	refcount_t pages_use_count;
++
++	/**
++	 * @pages_pin_count:
++	 *
++	 * Reference count on the pinned pages table.
++	 *
++	 * Pages are hard-pinned and reside in memory if count
++	 * greater than zero. Otherwise, when count is zero, the pages are
++	 * allowed to be evicted and purged by memory shrinker.
++	 */
++	refcount_t pages_pin_count;
++
++	/**
++	 * @madv: State for madvise
++	 *
++	 * 0 is active/inuse.
++	 * A negative value is the object is purged.
++	 * Positive values are driver specific and not used by the helpers.
++	 */
++	int madv;
++
++	/**
++	 * @madv_list: List entry for madvise tracking
++	 *
++	 * Typically used by drivers to track purgeable objects
++	 */
++	struct list_head madv_list;
++
++	/**
++	 * @sgt: Scatter/gather table for imported PRIME buffers
++	 */
++	struct sg_table *sgt;
++
++	/**
++	 * @vaddr: Kernel virtual address of the backing memory
++	 */
++	void *vaddr;
++
++	/**
++	 * @vmap_use_count:
++	 *
++	 * Reference count on the virtual address.
++	 * The address are un-mapped when the count reaches zero.
++	 */
++	refcount_t vmap_use_count;
++
++	/**
++	 * @pages_mark_dirty_on_put:
++	 *
++	 * Mark pages as dirty when they are put.
++	 */
++	bool pages_mark_dirty_on_put : 1;
++
++	/**
++	 * @pages_mark_accessed_on_put:
++	 *
++	 * Mark pages as accessed when they are put.
++	 */
++	bool pages_mark_accessed_on_put : 1;
++
++	/**
++	 * @map_wc: map object write-combined (instead of using shmem defaults).
++	 */
++	bool map_wc : 1;
++};
++
++#define to_drm_gem_shmem_obj(obj) \
++	container_of(obj, struct drm_gem_shmem_object, base)
++
++int drm_gem_shmem_init(struct drm_device *dev, struct drm_gem_shmem_object *shmem, size_t size);
++struct drm_gem_shmem_object *drm_gem_shmem_create(struct drm_device *dev, size_t size);
++void drm_gem_shmem_release(struct drm_gem_shmem_object *shmem);
++void drm_gem_shmem_free(struct drm_gem_shmem_object *shmem);
++void __drm_gem_shmem_free_sgt_locked(struct drm_gem_shmem_object *shmem);
++
++void drm_gem_shmem_put_pages_locked(struct drm_gem_shmem_object *shmem);
++int drm_gem_shmem_pin(struct drm_gem_shmem_object *shmem);
++void drm_gem_shmem_unpin(struct drm_gem_shmem_object *shmem);
++int drm_gem_shmem_vmap_locked(struct drm_gem_shmem_object *shmem,
++			      struct iosys_map *map);
++void drm_gem_shmem_vunmap_locked(struct drm_gem_shmem_object *shmem,
++				 struct iosys_map *map);
++int drm_gem_shmem_mmap(struct drm_gem_shmem_object *shmem, struct vm_area_struct *vma);
++
++int drm_gem_shmem_pin_locked(struct drm_gem_shmem_object *shmem);
++void drm_gem_shmem_unpin_locked(struct drm_gem_shmem_object *shmem);
++
++int drm_gem_shmem_madvise_locked(struct drm_gem_shmem_object *shmem, int madv);
++
++static inline bool drm_gem_shmem_is_purgeable(struct drm_gem_shmem_object *shmem)
++{
++	return (shmem->madv > 0) &&
++		!refcount_read(&shmem->pages_pin_count) &&
++		!refcount_read(&shmem->vmap_use_count) &&
++		refcount_read(&shmem->pages_use_count) == !!shmem->sgt &&
++		!shmem->base.dma_buf && !drm_gem_is_imported(&shmem->base);
++}
++
++bool drm_gem_shmem_idle_pages_releasable_locked(struct drm_gem_shmem_object *shmem);
++int drm_gem_shmem_release_idle_pages_locked(struct drm_gem_shmem_object *shmem);
++void drm_gem_shmem_purge_locked(struct drm_gem_shmem_object *shmem);
++
++struct sg_table *drm_gem_shmem_get_sg_table(struct drm_gem_shmem_object *shmem);
++struct sg_table *drm_gem_shmem_get_pages_sgt(struct drm_gem_shmem_object *shmem);
++
++void drm_gem_shmem_print_info(const struct drm_gem_shmem_object *shmem,
++			      struct drm_printer *p, unsigned int indent);
++
++extern const struct vm_operations_struct drm_gem_shmem_vm_ops;
++
++/*
++ * GEM object functions
++ */
++
++/**
++ * drm_gem_shmem_object_free - GEM object function for drm_gem_shmem_free()
++ * @obj: GEM object to free
++ *
++ * This function wraps drm_gem_shmem_free(). Drivers that employ the shmem helpers
++ * should use it as their &drm_gem_object_funcs.free handler.
++ */
++static inline void drm_gem_shmem_object_free(struct drm_gem_object *obj)
++{
++	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
++
++	drm_gem_shmem_free(shmem);
++}
++
++/**
++ * drm_gem_shmem_object_print_info() - Print &drm_gem_shmem_object info for debugfs
++ * @p: DRM printer
++ * @indent: Tab indentation level
++ * @obj: GEM object
++ *
++ * This function wraps drm_gem_shmem_print_info(). Drivers that employ the shmem helpers should
++ * use this function as their &drm_gem_object_funcs.print_info handler.
++ */
++static inline void drm_gem_shmem_object_print_info(struct drm_printer *p, unsigned int indent,
++						   const struct drm_gem_object *obj)
++{
++	const struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
++
++	drm_gem_shmem_print_info(shmem, p, indent);
++}
++
++/**
++ * drm_gem_shmem_object_pin - GEM object function for drm_gem_shmem_pin()
++ * @obj: GEM object
++ *
++ * This function wraps drm_gem_shmem_pin(). Drivers that employ the shmem helpers should
++ * use it as their &drm_gem_object_funcs.pin handler.
++ */
++static inline int drm_gem_shmem_object_pin(struct drm_gem_object *obj)
++{
++	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
++
++	return drm_gem_shmem_pin_locked(shmem);
++}
++
++/**
++ * drm_gem_shmem_object_unpin - GEM object function for drm_gem_shmem_unpin()
++ * @obj: GEM object
++ *
++ * This function wraps drm_gem_shmem_unpin(). Drivers that employ the shmem helpers should
++ * use it as their &drm_gem_object_funcs.unpin handler.
++ */
++static inline void drm_gem_shmem_object_unpin(struct drm_gem_object *obj)
++{
++	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
++
++	drm_gem_shmem_unpin_locked(shmem);
++}
++
++/**
++ * drm_gem_shmem_object_get_sg_table - GEM object function for drm_gem_shmem_get_sg_table()
++ * @obj: GEM object
++ *
++ * This function wraps drm_gem_shmem_get_sg_table(). Drivers that employ the shmem helpers should
++ * use it as their &drm_gem_object_funcs.get_sg_table handler.
++ *
++ * Returns:
++ * A pointer to the scatter/gather table of pinned pages or error pointer on failure.
++ */
++static inline struct sg_table *drm_gem_shmem_object_get_sg_table(struct drm_gem_object *obj)
++{
++	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
++
++	return drm_gem_shmem_get_sg_table(shmem);
++}
++
++/*
++ * drm_gem_shmem_object_vmap - GEM object function for drm_gem_shmem_vmap_locked()
++ * @obj: GEM object
++ * @map: Returns the kernel virtual address of the SHMEM GEM object's backing store.
++ *
++ * This function wraps drm_gem_shmem_vmap_locked(). Drivers that employ the shmem
++ * helpers should use it as their &drm_gem_object_funcs.vmap handler.
++ *
++ * Returns:
++ * 0 on success or a negative error code on failure.
++ */
++static inline int drm_gem_shmem_object_vmap(struct drm_gem_object *obj,
++					    struct iosys_map *map)
++{
++	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
++
++	return drm_gem_shmem_vmap_locked(shmem, map);
++}
++
++/*
++ * drm_gem_shmem_object_vunmap - GEM object function for drm_gem_shmem_vunmap()
++ * @obj: GEM object
++ * @map: Kernel virtual address where the SHMEM GEM object was mapped
++ *
++ * This function wraps drm_gem_shmem_vunmap_locked(). Drivers that employ the shmem
++ * helpers should use it as their &drm_gem_object_funcs.vunmap handler.
++ */
++static inline void drm_gem_shmem_object_vunmap(struct drm_gem_object *obj,
++					       struct iosys_map *map)
++{
++	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
++
++	drm_gem_shmem_vunmap_locked(shmem, map);
++}
++
++/**
++ * drm_gem_shmem_object_mmap - GEM object function for drm_gem_shmem_mmap()
++ * @obj: GEM object
++ * @vma: VMA for the area to be mapped
++ *
++ * This function wraps drm_gem_shmem_mmap(). Drivers that employ the shmem helpers should
++ * use it as their &drm_gem_object_funcs.mmap handler.
++ *
++ * Returns:
++ * 0 on success or a negative error code on failure.
++ */
++static inline int drm_gem_shmem_object_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma)
++{
++	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
++
++	return drm_gem_shmem_mmap(shmem, vma);
++}
++
++/*
++ * Driver ops
++ */
++
++struct drm_gem_object *
++drm_gem_shmem_prime_import_sg_table(struct drm_device *dev,
++				    struct dma_buf_attachment *attach,
++				    struct sg_table *sgt);
++int drm_gem_shmem_dumb_create(struct drm_file *file, struct drm_device *dev,
++			      struct drm_mode_create_dumb *args);
++struct drm_gem_object *drm_gem_shmem_prime_import_no_map(struct drm_device *dev,
++							 struct dma_buf *buf);
++
++/**
++ * DRM_GEM_SHMEM_DRIVER_OPS - Default shmem GEM operations
++ *
++ * This macro provides a shortcut for setting the shmem GEM operations
++ * in the &drm_driver structure. Drivers that do not require an s/g table
++ * for imported buffers should use this.
++ */
++#ifdef __linux__
++#define DRM_GEM_SHMEM_DRIVER_OPS \
++	.gem_prime_import       = drm_gem_shmem_prime_import_no_map, \
++	.dumb_create            = drm_gem_shmem_dumb_create
++#elif defined(__FreeBSD__)
++/* no drm_gem_shmem_prime_import_no_map() here, see drm_gem_shmem_helper.c */
++#define DRM_GEM_SHMEM_DRIVER_OPS \
++	.dumb_create            = drm_gem_shmem_dumb_create
++
++/*
++ * SiliconForest: user mappings of /dev/dri GEM offsets do not go through
++ * file_operations.mmap and vm_operations_struct.fault. SFDRMDri asks the DRM
++ * kext once, at mmap time, for the physical pages behind an offset
++ * (sf_dri_ops.mmap_pages, see sf_dri_cdev.h). This is that resolver for shmem
++ * GEM objects; a driver built on this helper assigns it to sf_drm_mmap_pages.
++ */
++struct linux_file;
++int drm_gem_shmem_sf_mmap_pages(struct linux_file *filp, off_t offset,
++				size_t size, int prot, uint32_t *pages,
++				unsigned int *wimg, void (**release)(void *),
++				void **release_arg);
++#endif
++
++/*
++ * Kunit helpers
++ */
++
++#if IS_ENABLED(CONFIG_KUNIT)
++int drm_gem_shmem_vmap(struct drm_gem_shmem_object *shmem, struct iosys_map *map);
++void drm_gem_shmem_vunmap(struct drm_gem_shmem_object *shmem, struct iosys_map *map);
++int drm_gem_shmem_madvise(struct drm_gem_shmem_object *shmem, int madv);
++int drm_gem_shmem_purge(struct drm_gem_shmem_object *shmem);
++#endif
++
++#endif /* __DRM_GEM_SHMEM_HELPER_H__ */
+--- a/drivers/gpu/drm/drm_gem_shmem_helper.c
++++ b/drivers/gpu/drm/drm_gem_shmem_helper.c
+@@ -0,0 +1,1653 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright 2018 Noralf Trønnes
++ */
++
++#include <linux/dma-buf.h>
++#include <linux/export.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#ifdef __linux__
++#include <linux/folio_batch.h>
++#endif
++#include <linux/shmem_fs.h>
++#include <linux/swap.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++
++#ifdef CONFIG_X86
++#include <asm/set_memory.h>
++#endif
++
++#ifdef __linux__
++#include <kunit/visibility.h>
++#endif
++
++#include <drm/drm.h>
++#include <drm/drm_device.h>
++#include <drm/drm_drv.h>
++#ifdef __linux__
++#include <drm/drm_dumb_buffers.h>
++#endif
++#include <drm/drm_gem_shmem_helper.h>
++#include <drm/drm_prime.h>
++#include <drm/drm_print.h>
++
++#ifdef __FreeBSD__
++#include <linux/fs.h>
++#include <linux/workqueue.h>
++#include <drm/drm_file.h>
++#include <drm/drm_vma_manager.h>
++#include <linux/sf_lkpi72.h>
++
++/* the x86 WIMG values SFDRMDri takes, see sf_dri_cdev.h */
++#define SF_SHMEM_WIMG_DEFAULT	0x2
++#define SF_SHMEM_WIMG_WCOMB	0x6
++#endif
++
++#ifdef __linux__
++MODULE_IMPORT_NS("DMA_BUF");
++#endif
++
++/*
++ * SiliconForest port notes (the __FreeBSD__ branches below).
++ *
++ * Backing store: drm_gem_object_init() gives the object a LinuxKPI shmem file,
++ * which on SiliconForest is sf_drm_shmem.c: an array of wired kernel pages, one
++ * LinuxKPI page (PAGE_SIZE) each, allocated zeroed on first read and freed
++ * when the file is released or truncated. There is no swap behind it, no
++ * address_space, no folio batches and no LRU, so:
++ *  - pages are fetched one LinuxKPI page at a time with
++ *    shmem_read_mapping_page_gfp() and returned with put_page();
++ *  - the mapping GFP mask, the unevictable flag, dirty and accessed marks have
++ *    no backing and are not set (pages_no_reclaim has no effect: the page
++ *    allocator underneath always blocks);
++ *  - purging frees the pages through shmem_truncate_range() and is the only
++ *    way memory goes back to the system.
++ *
++ * CPU mappings: SiliconForest maps the pages of a GEM offset eagerly and keeps
++ * them mapped until the last user mapping is gone; it cannot revoke a mapping
++ * and never calls a fault handler. A user mapping therefore always holds a
++ * pages_use_count reference (drm_gem_shmem_sf_mmap_pages()), also for objects
++ * with reclaimable_cpu_mappings set, which makes a mapped object neither
++ * purgeable nor idle-releasable. The per-fault cpu_pages array of the Linux
++ * code is never populated. drm_gem_shmem_mmap() and drm_gem_shmem_vm_ops exist
++ * for their callers' benefit but are not reached from /dev/dri.
++ *
++ * Nothing here assumes a 4 KiB page: every size is PAGE_SIZE/PAGE_SHIFT of
++ * LinuxKPI, which must equal the kernel's page size for the page numbers
++ * handed to SFDRMDri to mean what it expects (true of the other resolvers in
++ * this tree as well).
++ */
++
++/**
++ * DOC: overview
++ *
++ * This library provides helpers for GEM objects backed by shmem buffers
++ * allocated using anonymous pageable memory.
++ *
++ * Functions that operate on the GEM object receive struct &drm_gem_shmem_object.
++ * For GEM callback helpers in struct &drm_gem_object functions, see likewise
++ * named functions with an _object_ infix (e.g., drm_gem_shmem_object_vmap() wraps
++ * drm_gem_shmem_vmap()). These helpers perform the necessary type conversion.
++ */
++
++static const struct drm_gem_object_funcs drm_gem_shmem_funcs = {
++	.free = drm_gem_shmem_object_free,
++	.print_info = drm_gem_shmem_object_print_info,
++	.pin = drm_gem_shmem_object_pin,
++	.unpin = drm_gem_shmem_object_unpin,
++	.get_sg_table = drm_gem_shmem_object_get_sg_table,
++	.vmap = drm_gem_shmem_object_vmap,
++	.vunmap = drm_gem_shmem_object_vunmap,
++	.mmap = drm_gem_shmem_object_mmap,
++	.vm_ops = &drm_gem_shmem_vm_ops,
++};
++
++#ifdef __FreeBSD__
++#define EXPORT_SYMBOL_IF_KUNIT(sym)
++#endif
++
++static int __drm_gem_shmem_init(struct drm_device *dev, struct drm_gem_shmem_object *shmem,
++				size_t size, bool private)
++{
++	struct drm_gem_object *obj = &shmem->base;
++	int ret = 0;
++
++	if (!obj->funcs)
++		obj->funcs = &drm_gem_shmem_funcs;
++
++	if (private) {
++		drm_gem_private_object_init(dev, obj, size);
++		shmem->map_wc = false; /* dma-buf mappings use always writecombine */
++	} else {
++		ret = drm_gem_object_init(dev, obj, size);
++	}
++	if (ret) {
++		drm_gem_private_object_fini(obj);
++		return ret;
++	}
++
++	ret = drm_gem_create_mmap_offset(obj);
++	if (ret)
++		goto err_release;
++
++	INIT_LIST_HEAD(&shmem->madv_list);
++
++#ifdef __linux__
++	if (!private) {
++		/*
++		 * Our buffers are kept pinned, so allocating them
++		 * from the MOVABLE zone is a really bad idea, and
++		 * conflicts with CMA. See comments above new_inode()
++		 * why this is required _and_ expected if you're
++		 * going to pin these pages.
++		 */
++		gfp_t gfp = GFP_HIGHUSER | __GFP_RETRY_MAYFAIL | __GFP_NOWARN;
++
++		/* A bulk pin must not run direct reclaim once per folio when
++		 * the driver can instead return an allocation failure. Clearing
++		 * DIRECT_RECLAIM also makes memcg charges fail without reclaim
++		 * or invoking the OOM killer. Preserve placement and kswapd.
++		 */
++		if (shmem->pages_no_reclaim)
++			gfp &= ~(__GFP_DIRECT_RECLAIM | __GFP_RETRY_MAYFAIL);
++		mapping_set_gfp_mask(obj->filp->f_mapping, gfp);
++	}
++#endif
++
++	return 0;
++err_release:
++	drm_gem_object_release(obj);
++	return ret;
++}
++
++/**
++ * drm_gem_shmem_init - Initialize an allocated object.
++ * @dev: DRM device
++ * @shmem: shmem GEM object to initialize
++ * @size: Buffer size in bytes
++ *
++ * This function initializes an allocated shmem GEM object.
++ *
++ * Returns:
++ * 0 on success, or a negative error code on failure.
++ */
++int drm_gem_shmem_init(struct drm_device *dev, struct drm_gem_shmem_object *shmem, size_t size)
++{
++	return __drm_gem_shmem_init(dev, shmem, size, false);
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_init);
++
++static struct drm_gem_shmem_object *
++__drm_gem_shmem_create(struct drm_device *dev, size_t size, bool private)
++{
++	struct drm_gem_shmem_object *shmem;
++	struct drm_gem_object *obj;
++	int ret = 0;
++
++	size = PAGE_ALIGN(size);
++
++	if (dev->driver->gem_create_object) {
++		obj = dev->driver->gem_create_object(dev, size);
++		if (IS_ERR(obj))
++			return ERR_CAST(obj);
++		shmem = to_drm_gem_shmem_obj(obj);
++	} else {
++		shmem = kzalloc_obj(*shmem);
++		if (!shmem)
++			return ERR_PTR(-ENOMEM);
++		obj = &shmem->base;
++	}
++
++	ret = __drm_gem_shmem_init(dev, shmem, size, private);
++	if (ret) {
++		kfree(obj);
++		return ERR_PTR(ret);
++	}
++
++	return shmem;
++}
++/**
++ * drm_gem_shmem_create - Allocate an object with the given size
++ * @dev: DRM device
++ * @size: Size of the object to allocate
++ *
++ * This function creates a shmem GEM object.
++ *
++ * Returns:
++ * A struct drm_gem_shmem_object * on success or an ERR_PTR()-encoded negative
++ * error code on failure.
++ */
++struct drm_gem_shmem_object *drm_gem_shmem_create(struct drm_device *dev, size_t size)
++{
++	return __drm_gem_shmem_create(dev, size, false);
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_create);
++
++/**
++ * __drm_gem_shmem_release_sgt_locked - Unpin and DMA unmap pages, and release the
++ * cached scatter/gather table for an shmem GEM object.
++ * @shmem: shmem GEM object
++ *
++ * If the passed shmem object has an active scatter/gather table for driver
++ * usage, this function will unmap it and release the memory associated with it.
++ * It is the responsibility of the caller to ensure it holds the dma_resv_lock
++ * for this object.
++ *
++ * Drivers should not need to call this function themselves, it is mainly
++ * intended for usage in the Rust shmem bindings.
++ */
++void __drm_gem_shmem_free_sgt_locked(struct drm_gem_shmem_object *shmem)
++{
++	dma_resv_assert_held(shmem->base.resv);
++
++	dma_unmap_sgtable(shmem->base.dev->dev, shmem->sgt, DMA_BIDIRECTIONAL, 0);
++	sg_free_table(shmem->sgt);
++	kfree(shmem->sgt);
++	shmem->sgt = NULL;
++}
++EXPORT_SYMBOL_GPL(__drm_gem_shmem_free_sgt_locked);
++
++/**
++ * drm_gem_shmem_release - Release resources associated with a shmem GEM object.
++ * @shmem: shmem GEM object
++ *
++ * This function cleans up the GEM object state, but does not free the memory used to store the
++ * object itself. This function is meant to be a dedicated helper for the Rust GEM bindings.
++ */
++static void drm_gem_shmem_put_cpu_pages_locked(struct drm_gem_shmem_object *shmem);
++
++void drm_gem_shmem_release(struct drm_gem_shmem_object *shmem)
++{
++	struct drm_gem_object *obj = &shmem->base;
++
++	if (shmem->cpu_pages) {
++		dma_resv_lock(obj->resv, NULL);
++		drm_gem_shmem_put_cpu_pages_locked(shmem);
++		dma_resv_unlock(obj->resv);
++	}
++
++	if (drm_gem_is_imported(obj)) {
++		drm_prime_gem_destroy(obj, shmem->sgt);
++	} else {
++		dma_resv_lock(shmem->base.resv, NULL);
++
++		drm_WARN_ON(obj->dev, refcount_read(&shmem->vmap_use_count));
++
++		if (shmem->sgt)
++			__drm_gem_shmem_free_sgt_locked(shmem);
++		if (shmem->pages)
++			drm_gem_shmem_put_pages_locked(shmem);
++
++		drm_WARN_ON(obj->dev, refcount_read(&shmem->pages_use_count));
++		drm_WARN_ON(obj->dev, refcount_read(&shmem->pages_pin_count));
++
++		dma_resv_unlock(shmem->base.resv);
++	}
++
++	drm_gem_object_release(obj);
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_release);
++
++/**
++ * drm_gem_shmem_free - Free resources associated with a shmem GEM object
++ * @shmem: shmem GEM object to free
++ *
++ * This function cleans up the GEM object state and frees the memory used to
++ * store the object itself.
++ */
++void drm_gem_shmem_free(struct drm_gem_shmem_object *shmem)
++{
++	drm_gem_shmem_release(shmem);
++	kfree(shmem);
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_free);
++
++#ifdef __FreeBSD__
++/*
++ * drm_gem_get_pages()/drm_gem_put_pages() of drm_gem.c are not built on
++ * FreeBSD (they walk the page cache). These are the same two operations on
++ * the SiliconForest shmem file: an array with one referenced page per LinuxKPI
++ * page of the object.
++ */
++static struct page **drm_gem_shmem_sf_get_pages(struct drm_gem_object *obj)
++{
++	unsigned long i, npages = obj->size >> PAGE_SHIFT;
++	struct page **pages, *page;
++
++	if (WARN_ON(!obj->filp))
++		return ERR_PTR(-EINVAL);
++	WARN_ON((obj->size & (PAGE_SIZE - 1)) != 0);
++	/* linux_shmem_read_mapping_page_gfp() takes an int page index */
++	if (npages > INT_MAX)
++		return ERR_PTR(-E2BIG);
++
++	pages = kvmalloc_array(npages, sizeof(struct page *), GFP_KERNEL);
++	if (pages == NULL)
++		return ERR_PTR(-ENOMEM);
++
++	for (i = 0; i < npages; i++) {
++		page = shmem_read_mapping_page_gfp(obj->filp->f_shmem, (int)i,
++						   GFP_KERNEL);
++		if (IS_ERR(page))
++			goto fail;
++		pages[i] = page;
++	}
++	return pages;
++
++fail:
++	while (i-- > 0)
++		put_page(pages[i]);
++	kvfree(pages);
++	return ERR_CAST(page);
++}
++
++static void drm_gem_shmem_sf_put_pages(struct drm_gem_object *obj,
++				       struct page **pages)
++{
++	unsigned long i, npages = obj->size >> PAGE_SHIFT;
++
++	for (i = 0; i < npages; i++) {
++		if (pages[i])
++			put_page(pages[i]);
++	}
++	kvfree(pages);
++}
++#endif
++
++static int drm_gem_shmem_get_pages_locked(struct drm_gem_shmem_object *shmem)
++{
++	struct drm_gem_object *obj = &shmem->base;
++	struct page **pages;
++
++	dma_resv_assert_held(shmem->base.resv);
++
++	if (refcount_inc_not_zero(&shmem->pages_use_count))
++		return 0;
++
++#ifdef __linux__
++	pages = drm_gem_get_pages(obj);
++#elif defined(__FreeBSD__)
++	pages = drm_gem_shmem_sf_get_pages(obj);
++#endif
++	if (IS_ERR(pages)) {
++		drm_dbg_kms(obj->dev, "Failed to get pages (%ld)\n",
++			    PTR_ERR(pages));
++		return PTR_ERR(pages);
++	}
++
++	/*
++	 * TODO: Allocating WC pages which are correctly flushed is only
++	 * supported on x86. Ideal solution would be a GFP_WC flag, which also
++	 * ttm_pool.c could use.
++	 */
++#ifdef CONFIG_X86
++	if (shmem->map_wc)
++		set_pages_array_wc(pages, obj->size >> PAGE_SHIFT);
++#endif
++
++	shmem->pages = pages;
++
++	refcount_set(&shmem->pages_use_count, 1);
++
++	return 0;
++}
++
++/*
++ * drm_gem_shmem_put_pages_locked - Decrease use count on the backing pages for a shmem GEM object
++ * @shmem: shmem GEM object
++ *
++ * This function decreases the use count and puts the backing pages when use drops to zero.
++ */
++void drm_gem_shmem_put_pages_locked(struct drm_gem_shmem_object *shmem)
++{
++	struct drm_gem_object *obj = &shmem->base;
++
++	dma_resv_assert_held(shmem->base.resv);
++
++	if (refcount_dec_and_test(&shmem->pages_use_count)) {
++#ifdef CONFIG_X86
++		if (shmem->map_wc)
++			set_pages_array_wb(shmem->pages, obj->size >> PAGE_SHIFT);
++#endif
++
++#ifdef __linux__
++		drm_gem_put_pages(obj, shmem->pages,
++				  shmem->pages_mark_dirty_on_put,
++				  shmem->pages_mark_accessed_on_put);
++#elif defined(__FreeBSD__)
++		drm_gem_shmem_sf_put_pages(obj, shmem->pages);
++#endif
++		shmem->pages = NULL;
++		shmem->pages_mark_accessed_on_put = false;
++		shmem->pages_mark_dirty_on_put = false;
++	}
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_put_pages_locked);
++
++int drm_gem_shmem_pin_locked(struct drm_gem_shmem_object *shmem)
++{
++	int ret;
++
++	dma_resv_assert_held(shmem->base.resv);
++
++	drm_WARN_ON(shmem->base.dev, drm_gem_is_imported(&shmem->base));
++
++	if (refcount_inc_not_zero(&shmem->pages_pin_count))
++		return 0;
++
++	ret = drm_gem_shmem_get_pages_locked(shmem);
++	if (!ret)
++		refcount_set(&shmem->pages_pin_count, 1);
++
++	return ret;
++}
++EXPORT_SYMBOL(drm_gem_shmem_pin_locked);
++
++void drm_gem_shmem_unpin_locked(struct drm_gem_shmem_object *shmem)
++{
++	dma_resv_assert_held(shmem->base.resv);
++
++	if (refcount_dec_and_test(&shmem->pages_pin_count))
++		drm_gem_shmem_put_pages_locked(shmem);
++}
++EXPORT_SYMBOL(drm_gem_shmem_unpin_locked);
++
++/**
++ * drm_gem_shmem_pin - Pin backing pages for a shmem GEM object
++ * @shmem: shmem GEM object
++ *
++ * This function makes sure the backing pages are pinned in memory while the
++ * buffer is exported.
++ *
++ * Returns:
++ * 0 on success or a negative error code on failure.
++ */
++int drm_gem_shmem_pin(struct drm_gem_shmem_object *shmem)
++{
++	struct drm_gem_object *obj = &shmem->base;
++	int ret;
++
++	drm_WARN_ON(obj->dev, drm_gem_is_imported(obj));
++
++	if (refcount_inc_not_zero(&shmem->pages_pin_count))
++		return 0;
++
++	ret = dma_resv_lock_interruptible(shmem->base.resv, NULL);
++	if (ret)
++		return ret;
++	ret = drm_gem_shmem_pin_locked(shmem);
++	dma_resv_unlock(shmem->base.resv);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_pin);
++
++/**
++ * drm_gem_shmem_unpin - Unpin backing pages for a shmem GEM object
++ * @shmem: shmem GEM object
++ *
++ * This function removes the requirement that the backing pages are pinned in
++ * memory.
++ */
++void drm_gem_shmem_unpin(struct drm_gem_shmem_object *shmem)
++{
++	struct drm_gem_object *obj = &shmem->base;
++
++	drm_WARN_ON(obj->dev, drm_gem_is_imported(obj));
++
++	if (refcount_dec_not_one(&shmem->pages_pin_count))
++		return;
++
++	dma_resv_lock(shmem->base.resv, NULL);
++	drm_gem_shmem_unpin_locked(shmem);
++	dma_resv_unlock(shmem->base.resv);
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_unpin);
++
++/*
++ * drm_gem_shmem_vmap_locked - Create a virtual mapping for a shmem GEM object
++ * @shmem: shmem GEM object
++ * @map: Returns the kernel virtual address of the SHMEM GEM object's backing
++ *       store.
++ *
++ * This function makes sure that a contiguous kernel virtual address mapping
++ * exists for the buffer backing the shmem GEM object. It hides the differences
++ * between dma-buf imported and natively allocated objects.
++ *
++ * Acquired mappings should be cleaned up by calling drm_gem_shmem_vunmap_locked().
++ *
++ * Returns:
++ * 0 on success or a negative error code on failure.
++ */
++int drm_gem_shmem_vmap_locked(struct drm_gem_shmem_object *shmem,
++			      struct iosys_map *map)
++{
++	struct drm_gem_object *obj = &shmem->base;
++	int ret = 0;
++
++	dma_resv_assert_held(obj->resv);
++
++	if (drm_gem_is_imported(obj)) {
++		ret = dma_buf_vmap(obj->import_attach->dmabuf, map);
++	} else {
++		pgprot_t prot = PAGE_KERNEL;
++
++		dma_resv_assert_held(shmem->base.resv);
++
++		if (refcount_inc_not_zero(&shmem->vmap_use_count)) {
++			iosys_map_set_vaddr(map, shmem->vaddr);
++			return 0;
++		}
++
++		ret = drm_gem_shmem_pin_locked(shmem);
++		if (ret)
++			return ret;
++
++		if (shmem->map_wc)
++			prot = pgprot_writecombine(prot);
++		shmem->vaddr = vmap(shmem->pages, obj->size >> PAGE_SHIFT,
++				    VM_MAP, prot);
++		if (!shmem->vaddr) {
++			ret = -ENOMEM;
++		} else {
++			iosys_map_set_vaddr(map, shmem->vaddr);
++			refcount_set(&shmem->vmap_use_count, 1);
++			shmem->pages_mark_accessed_on_put = true;
++			shmem->pages_mark_dirty_on_put = true;
++		}
++	}
++
++	if (ret) {
++		drm_dbg_kms(obj->dev, "Failed to vmap pages, error %d\n", ret);
++		goto err_put_pages;
++	}
++
++	return 0;
++
++err_put_pages:
++	if (!drm_gem_is_imported(obj))
++		drm_gem_shmem_unpin_locked(shmem);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_vmap_locked);
++
++/*
++ * drm_gem_shmem_vunmap_locked - Unmap a virtual mapping for a shmem GEM object
++ * @shmem: shmem GEM object
++ * @map: Kernel virtual address where the SHMEM GEM object was mapped
++ *
++ * This function cleans up a kernel virtual address mapping acquired by
++ * drm_gem_shmem_vmap_locked(). The mapping is only removed when the use count
++ * drops to zero.
++ *
++ * This function hides the differences between dma-buf imported and natively
++ * allocated objects.
++ */
++void drm_gem_shmem_vunmap_locked(struct drm_gem_shmem_object *shmem,
++				 struct iosys_map *map)
++{
++	struct drm_gem_object *obj = &shmem->base;
++
++	dma_resv_assert_held(obj->resv);
++
++	if (drm_gem_is_imported(obj)) {
++		dma_buf_vunmap(obj->import_attach->dmabuf, map);
++	} else {
++		dma_resv_assert_held(shmem->base.resv);
++
++		if (refcount_dec_and_test(&shmem->vmap_use_count)) {
++			vunmap(shmem->vaddr);
++			shmem->vaddr = NULL;
++
++			drm_gem_shmem_unpin_locked(shmem);
++		}
++	}
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_vunmap_locked);
++
++static int
++drm_gem_shmem_create_with_handle(struct drm_file *file_priv,
++				 struct drm_device *dev, size_t size,
++				 uint32_t *handle)
++{
++	struct drm_gem_shmem_object *shmem;
++	int ret;
++
++	shmem = drm_gem_shmem_create(dev, size);
++	if (IS_ERR(shmem))
++		return PTR_ERR(shmem);
++
++	/*
++	 * Allocate an id of idr table where the obj is registered
++	 * and handle has the id what user can see.
++	 */
++	ret = drm_gem_handle_create(file_priv, &shmem->base, handle);
++	/* drop reference from allocate - handle holds it now. */
++	drm_gem_object_put(&shmem->base);
++
++	return ret;
++}
++
++/* Update madvise status, returns true if not purged, else
++ * false or -errno.
++ */
++int drm_gem_shmem_madvise_locked(struct drm_gem_shmem_object *shmem, int madv)
++{
++	dma_resv_assert_held(shmem->base.resv);
++
++	if (shmem->madv >= 0)
++		shmem->madv = madv;
++
++	madv = shmem->madv;
++
++	return (madv >= 0);
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_madvise_locked);
++
++/*
++ * Revocable CPU mappings populate pages one at a time, so touching a few
++ * bytes of a large object neither materializes nor pins the whole object.
++ * The device path keeps using the full @pages array; both may coexist and
++ * reference the same page-cache pages.
++ */
++#ifdef __linux__
++static struct page *drm_gem_shmem_cpu_page_locked(struct drm_gem_shmem_object *shmem,
++						  pgoff_t index)
++{
++	struct drm_gem_object *obj = &shmem->base;
++	struct address_space *mapping = file_inode(obj->filp)->i_mapping;
++	struct page *page;
++
++	dma_resv_assert_held(obj->resv);
++
++	if (!shmem->cpu_pages) {
++		shmem->cpu_pages = kvcalloc(obj->size >> PAGE_SHIFT,
++					    sizeof(*shmem->cpu_pages), GFP_KERNEL);
++		if (!shmem->cpu_pages)
++			return ERR_PTR(-ENOMEM);
++	}
++	page = shmem->cpu_pages[index];
++	if (page)
++		return page;
++	/*
++	 * PFN mappings have no rmap, so reclaim could write the page to swap
++	 * and later drop it while the PTE still names it. Keep the mapping
++	 * unevictable while sparse pages exist, as drm_gem_get_pages() does
++	 * for the device array; the flag is cleared when the last holder goes.
++	 */
++	mapping_set_unevictable(mapping);
++	page = shmem_read_mapping_page(mapping, index);
++	if (IS_ERR(page))
++		return page;
++	shmem->cpu_pages[index] = page;
++	shmem->cpu_pages_count++;
++	return page;
++}
++
++static void drm_gem_shmem_put_cpu_pages_locked(struct drm_gem_shmem_object *shmem)
++{
++	struct drm_gem_object *obj = &shmem->base;
++	unsigned long i, npages = obj->size >> PAGE_SHIFT;
++	struct folio_batch fbatch;
++
++	dma_resv_assert_held(obj->resv);
++
++	if (!shmem->cpu_pages)
++		return;
++	/* A device array still holding these pages keeps the mapping unevictable. */
++	if (!shmem->pages)
++		mapping_clear_unevictable(file_inode(obj->filp)->i_mapping);
++	folio_batch_init(&fbatch);
++	for (i = 0; i < npages && shmem->cpu_pages_count; i++) {
++		struct folio *folio;
++
++		if (!shmem->cpu_pages[i])
++			continue;
++		folio = page_folio(shmem->cpu_pages[i]);
++		folio_mark_dirty(folio);
++		folio_mark_accessed(folio);
++		shmem->cpu_pages_count--;
++		if (!folio_batch_add(&fbatch, folio)) {
++			check_move_unevictable_folios(&fbatch);
++			__folio_batch_release(&fbatch);
++		}
++	}
++	if (folio_batch_count(&fbatch)) {
++		check_move_unevictable_folios(&fbatch);
++		__folio_batch_release(&fbatch);
++	}
++	kvfree(shmem->cpu_pages);
++	shmem->cpu_pages = NULL;
++}
++
++static struct page *drm_gem_shmem_present_page(struct drm_gem_shmem_object *shmem,
++					       pgoff_t index)
++{
++	if (shmem->pages && shmem->pages[index])
++		return shmem->pages[index];
++	if (shmem->cpu_pages)
++		return shmem->cpu_pages[index];
++	return NULL;
++}
++#elif defined(__FreeBSD__)
++/* cpu_pages is filled by the Linux fault handler only: always NULL here */
++static void drm_gem_shmem_put_cpu_pages_locked(struct drm_gem_shmem_object *shmem)
++{
++	dma_resv_assert_held(shmem->base.resv);
++	drm_WARN_ON(shmem->base.dev, shmem->cpu_pages != NULL);
++}
++#endif
++
++bool drm_gem_shmem_idle_pages_releasable_locked(struct drm_gem_shmem_object *shmem)
++{
++	struct drm_gem_object *obj = &shmem->base;
++
++	dma_resv_assert_held(obj->resv);
++	return !drm_gem_is_imported(obj) && !obj->dma_buf &&
++		shmem->madv >= 0 && !refcount_read(&shmem->pages_pin_count) &&
++		!refcount_read(&shmem->vmap_use_count) &&
++		refcount_read(&shmem->pages_use_count) == !!shmem->sgt &&
++		dma_resv_test_signaled(obj->resv, DMA_RESV_USAGE_BOOKKEEP);
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_idle_pages_releasable_locked);
++
++/**
++ * drm_gem_shmem_release_idle_pages_locked - Release idle backing without purging
++ * @shmem: shmem GEM object whose device mappings have been removed
++ *
++ * Drop the cached SG table and the page array of an object that no device
++ * mapping, pin, vmap or SG-table borrower uses, so ordinary shmem reclaim can
++ * swap its contents. Revocable CPU VMAs are zapped first and refault later.
++ * The caller holds the reservation lock, has removed every device mapping
++ * including cached translations, and excludes new device access. A later
++ * drm_gem_shmem_get_pages_sgt() may return different DMA addresses.
++ *
++ * Returns: 0 on success, -EBUSY if backing is still in use, -EINVAL for an
++ * imported, exported or purged object.
++ */
++int drm_gem_shmem_release_idle_pages_locked(struct drm_gem_shmem_object *shmem)
++{
++	struct drm_gem_object *obj = &shmem->base;
++
++	dma_resv_assert_held(obj->resv);
++
++	if (drm_gem_is_imported(obj) || obj->dma_buf || shmem->madv < 0)
++		return -EINVAL;
++
++	if (refcount_read(&shmem->pages_pin_count) ||
++	    refcount_read(&shmem->vmap_use_count) ||
++	    refcount_read(&shmem->pages_use_count) != !!shmem->sgt ||
++	    !dma_resv_test_signaled(obj->resv, DMA_RESV_USAGE_BOOKKEEP))
++		return -EBUSY;
++
++#ifdef __linux__
++	/* Zap revocable PFNs under resv so no fault can reinsert them. */
++	if (shmem->reclaimable_cpu_mappings && refcount_read(&shmem->cpu_vma_count)) {
++		drm_vma_node_unmap(&obj->vma_node, obj->dev->anon_inode->i_mapping);
++		drm_gem_shmem_put_cpu_pages_locked(shmem);
++	}
++#endif
++	/*
++	 * SiliconForest: a user mapping cannot be revoked; it holds a
++	 * pages_use_count reference instead, so the -EBUSY above already
++	 * covered a mapped object.
++	 */
++
++	if (!shmem->sgt)
++		return 0;
++
++	dma_unmap_sgtable(obj->dev->dev, shmem->sgt, DMA_BIDIRECTIONAL, 0);
++	sg_free_table(shmem->sgt);
++	kfree(shmem->sgt);
++	shmem->sgt = NULL;
++
++	shmem->pages_mark_dirty_on_put = true;
++	drm_gem_shmem_put_pages_locked(shmem);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_release_idle_pages_locked);
++
++void drm_gem_shmem_purge_locked(struct drm_gem_shmem_object *shmem)
++{
++	struct drm_gem_object *obj = &shmem->base;
++	struct drm_device *dev = obj->dev;
++
++	dma_resv_assert_held(shmem->base.resv);
++
++	drm_WARN_ON(obj->dev, !drm_gem_shmem_is_purgeable(shmem));
++
++	/* Revoke PFNs and complete the TLB flush while backing is still pinned. */
++	shmem->madv = -1;
++#ifdef __linux__
++	drm_vma_node_unmap(&obj->vma_node, dev->anon_inode->i_mapping);
++#endif
++	/*
++	 * SiliconForest: nothing to revoke. A purgeable object has no user
++	 * mapping (each one holds pages_use_count, see
++	 * drm_gem_shmem_is_purgeable()).
++	 */
++
++	if (shmem->sgt) {
++		dma_unmap_sgtable(dev->dev, shmem->sgt, DMA_BIDIRECTIONAL, 0);
++		sg_free_table(shmem->sgt);
++		kfree(shmem->sgt);
++		shmem->sgt = NULL;
++		drm_gem_shmem_put_pages_locked(shmem);
++	}
++	drm_gem_shmem_put_cpu_pages_locked(shmem);
++
++	drm_gem_free_mmap_offset(obj);
++
++	/* Our goal here is to return as much of the memory as
++	 * is possible back to the system as we are called from OOM.
++	 * To do this we must instruct the shmfs to drop all of its
++	 * backing pages, *now*.
++	 */
++#ifdef __linux__
++	shmem_truncate_range(file_inode(obj->filp), 0, (loff_t)-1);
++
++	invalidate_mapping_pages(file_inode(obj->filp)->i_mapping, 0, (loff_t)-1);
++#elif defined(__FreeBSD__)
++	/* frees every page nobody holds a reference to any more */
++	shmem_truncate_range(obj->filp->f_shmem, 0, (loff_t)-1);
++#endif
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_purge_locked);
++
++/**
++ * drm_gem_shmem_dumb_create - Create a dumb shmem buffer object
++ * @file: DRM file structure to create the dumb buffer for
++ * @dev: DRM device
++ * @args: IOCTL data
++ *
++ * This function computes the pitch of the dumb buffer and rounds it up to an
++ * integer number of bytes per pixel. Drivers for hardware that doesn't have
++ * any additional restrictions on the pitch can directly use this function as
++ * their &drm_driver.dumb_create callback.
++ *
++ * For hardware with additional restrictions, drivers can adjust the fields
++ * set up by userspace before calling into this function.
++ *
++ * Returns:
++ * 0 on success or a negative error code on failure.
++ */
++int drm_gem_shmem_dumb_create(struct drm_file *file, struct drm_device *dev,
++			      struct drm_mode_create_dumb *args)
++{
++#ifdef __linux__
++	int ret;
++
++	ret = drm_mode_size_dumb(dev, args, 0, 0);
++	if (ret)
++		return ret;
++#elif defined(__FreeBSD__)
++	/* drm_mode_size_dumb() is newer than this DRM core: Linux 6.14's sizing */
++	u32 min_pitch = DIV_ROUND_UP(args->width * args->bpp, 8);
++
++	if (!args->pitch || !args->size) {
++		args->pitch = min_pitch;
++		args->size = PAGE_ALIGN(args->pitch * args->height);
++	} else {
++		/* ensure sane minimum values */
++		if (args->pitch < min_pitch)
++			args->pitch = min_pitch;
++		if (args->size < args->pitch * args->height)
++			args->size = PAGE_ALIGN(args->pitch * args->height);
++	}
++#endif
++
++	return drm_gem_shmem_create_with_handle(file, dev, args->size, &args->handle);
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_dumb_create);
++
++#ifdef __linux__
++/* GEM and PRIME add the object's fake offset; VMA splits retain it.
++ * Direct helper callers may instead supply an object-relative offset.
++ */
++static pgoff_t drm_gem_shmem_object_offset(struct drm_gem_object *obj, pgoff_t pgoff)
++{
++	pgoff_t base = drm_vma_node_start(&obj->vma_node);
++
++	return pgoff >= base ? pgoff - base : pgoff;
++}
++
++static void drm_gem_shmem_record_mkwrite(struct vm_fault *vmf)
++{
++	struct vm_area_struct *vma = vmf->vma;
++	struct drm_gem_object *obj = vma->vm_private_data;
++	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
++	loff_t num_pages = obj->size >> PAGE_SHIFT;
++	pgoff_t page_offset = drm_gem_shmem_object_offset(obj, vmf->pgoff);
++
++	struct page *page;
++
++	if (drm_WARN_ON(obj->dev, page_offset >= num_pages))
++		return;
++	page = drm_gem_shmem_present_page(shmem, page_offset);
++	if (drm_WARN_ON(obj->dev, !page))
++		return;
++
++	file_update_time(vma->vm_file);
++	folio_mark_dirty(page_folio(page));
++}
++
++/*
++ * Because the vm_ops have a .pfn_mkwrite() callback, vma_set_page_prot()
++ * has cleared the write bit from vma->vm_page_prot.  vmf_insert_pfn()
++ * would install a read-only entry even for a write fault, relying on a
++ * second fault to reach .pfn_mkwrite() and upgrade it, but that second
++ * fault never happens for fixup_user_fault() callers that directly
++ * walk the page tables with follow_pfnmap_start().  To ensure that
++ * they don't see the read-only entry, pass FAULT_FLAG_WRITE info down
++ * to install a writable entry right away.  Because .pfn_mkwrite() is
++ * not invoked, record the write afterwards.
++ */
++static vm_fault_t try_insert_pfn(struct vm_fault *vmf, unsigned int order,
++				 unsigned long pfn)
++{
++	bool write = vmf->flags & FAULT_FLAG_WRITE;
++	vm_fault_t ret = VM_FAULT_FALLBACK;
++
++	if (!order) {
++#ifdef CONFIG_MM_SUBPAGE
++		struct vm_page_offset pos = vma_page_offset_at(vmf->vma, vmf->address);
++
++		ret = vmf_insert_pfn_prot_mkwrite_offset(vmf->vma, vmf->address,
++			pfn, pos.offset, vmf->vma->vm_page_prot, write);
++#else
++		ret = vmf_insert_pfn_mkwrite(vmf->vma, vmf->address, pfn, write);
++#endif
++#ifdef CONFIG_ARCH_SUPPORTS_PMD_PFNMAP
++	} else if (order == PMD_ORDER) {
++		unsigned long paddr = pfn << PAGE_SHIFT;
++		struct vm_area_struct *vma = vmf->vma;
++		unsigned long start = ALIGN_DOWN(vmf->address, PMD_SIZE);
++		unsigned long end = start + PMD_SIZE;
++		bool in_range = vma->vm_start <= start && end <= vma->vm_end;
++		bool aligned = (vmf->address & ~PMD_MASK) == (paddr & ~PMD_MASK);
++
++		if (aligned && in_range &&
++		    folio_test_pmd_mappable(page_folio(pfn_to_page(pfn)))) {
++			pfn &= PMD_MASK >> PAGE_SHIFT;
++			ret = vmf_insert_pfn_pmd(vmf, pfn, write);
++		}
++#endif
++	}
++
++	if (ret == VM_FAULT_NOPAGE && write)
++		drm_gem_shmem_record_mkwrite(vmf);
++	return ret;
++}
++
++static vm_fault_t drm_gem_shmem_any_fault(struct vm_fault *vmf, unsigned int order)
++{
++	struct vm_area_struct *vma = vmf->vma;
++	struct drm_gem_object *obj = vma->vm_private_data;
++	struct drm_device *dev = obj->dev;
++	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
++	loff_t num_pages = obj->size >> PAGE_SHIFT;
++	vm_fault_t ret = VM_FAULT_SIGBUS;
++	struct page **pages;
++	pgoff_t page_offset = drm_gem_shmem_object_offset(obj, vmf->pgoff);
++	struct page *page;
++	struct folio *folio;
++	unsigned long pfn;
++
++	if (order && (order != PMD_ORDER || mm_page_size(vma->vm_mm) != PAGE_SIZE))
++		return VM_FAULT_FALLBACK;
++
++	dma_resv_lock(obj->resv, NULL);
++
++	if (page_offset >= num_pages || shmem->madv < 0)
++		goto out;
++
++	if (shmem->reclaimable_cpu_mappings && !shmem->pages) {
++		/* Per-page population; huge mappings need the full array. */
++		if (order) {
++			ret = VM_FAULT_FALLBACK;
++			goto out;
++		}
++		page = drm_gem_shmem_cpu_page_locked(shmem, page_offset);
++		if (IS_ERR(page)) {
++			ret = vmf_error(PTR_ERR(page));
++			goto out;
++		}
++	} else {
++		pages = shmem->pages;
++		if (drm_WARN_ON_ONCE(dev, !pages))
++			goto out;
++		page = pages[page_offset];
++		if (drm_WARN_ON_ONCE(dev, !page))
++			goto out;
++	}
++	folio = page_folio(page);
++
++	pfn = page_to_pfn(page);
++
++	ret = try_insert_pfn(vmf, order, pfn);
++	if (ret == VM_FAULT_NOPAGE)
++		folio_mark_accessed(folio);
++
++out:
++	dma_resv_unlock(obj->resv);
++
++	return ret;
++}
++
++static vm_fault_t drm_gem_shmem_fault(struct vm_fault *vmf)
++{
++	return drm_gem_shmem_any_fault(vmf, 0);
++}
++
++static void drm_gem_shmem_vm_open(struct vm_area_struct *vma)
++{
++	struct drm_gem_object *obj = vma->vm_private_data;
++	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
++
++	drm_WARN_ON(obj->dev, drm_gem_is_imported(obj));
++
++	dma_resv_lock(shmem->base.resv, NULL);
++
++	/*
++	 * We should have already pinned the pages when the buffer was first
++	 * mmap'd, vm_open() just grabs an additional reference for the new
++	 * mm the vma is getting copied into (ie. on fork()).
++	 */
++	if (shmem->reclaimable_cpu_mappings)
++		refcount_inc(&shmem->cpu_vma_count);
++	else
++		drm_WARN_ON_ONCE(obj->dev,
++				 !refcount_inc_not_zero(&shmem->pages_use_count));
++
++	dma_resv_unlock(shmem->base.resv);
++
++	drm_gem_vm_open(vma);
++}
++
++static void drm_gem_shmem_vm_close(struct vm_area_struct *vma)
++{
++	struct drm_gem_object *obj = vma->vm_private_data;
++	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
++
++	dma_resv_lock(shmem->base.resv, NULL);
++	if (shmem->reclaimable_cpu_mappings) {
++		if (refcount_dec_and_test(&shmem->cpu_vma_count))
++			drm_gem_shmem_put_cpu_pages_locked(shmem);
++	} else {
++		drm_gem_shmem_put_pages_locked(shmem);
++	}
++	dma_resv_unlock(shmem->base.resv);
++
++	drm_gem_vm_close(vma);
++}
++
++static vm_fault_t drm_gem_shmem_pfn_mkwrite(struct vm_fault *vmf)
++{
++	struct drm_gem_object *obj = vmf->vma->vm_private_data;
++	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
++	vm_fault_t ret = 0;
++
++	if (!shmem->reclaimable_cpu_mappings) {
++		drm_gem_shmem_record_mkwrite(vmf);
++		return 0;
++	}
++
++	/* A revoked PFN must refault rather than be marked writable. */
++	dma_resv_lock(obj->resv, NULL);
++	if (!drm_gem_shmem_present_page(shmem, drm_gem_shmem_object_offset(obj, vmf->pgoff)))
++		ret = VM_FAULT_NOPAGE;
++	else
++		drm_gem_shmem_record_mkwrite(vmf);
++	dma_resv_unlock(obj->resv);
++	return ret;
++}
++
++const struct vm_operations_struct drm_gem_shmem_vm_ops = {
++	.fault = drm_gem_shmem_fault,
++#ifdef CONFIG_ARCH_SUPPORTS_PMD_PFNMAP
++	.huge_fault = drm_gem_shmem_any_fault,
++#endif
++	.open = drm_gem_shmem_vm_open,
++	.close = drm_gem_shmem_vm_close,
++	.pfn_mkwrite = drm_gem_shmem_pfn_mkwrite,
++};
++EXPORT_SYMBOL_GPL(drm_gem_shmem_vm_ops);
++#elif defined(__FreeBSD__)
++/*
++ * The vm_operations of a shmem GEM VMA. SiliconForest never faults on a GEM
++ * mapping (see the notes at the top and drm_gem_shmem_sf_mmap_pages()), so
++ * .fault only refuses; open and close keep the Linux reference counting for
++ * a caller that does go through drm_gem_shmem_mmap().
++ */
++static int drm_gem_shmem_fault(struct vm_fault *vmf)
++{
++	return VM_FAULT_SIGBUS;
++}
++
++static void drm_gem_shmem_vm_open(struct vm_area_struct *vma)
++{
++	struct drm_gem_object *obj = vma->vm_private_data;
++	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
++
++	drm_WARN_ON(obj->dev, drm_gem_is_imported(obj));
++
++	dma_resv_lock(shmem->base.resv, NULL);
++	drm_WARN_ON_ONCE(obj->dev,
++			 !refcount_inc_not_zero(&shmem->pages_use_count));
++	dma_resv_unlock(shmem->base.resv);
++
++	drm_gem_vm_open(vma);
++}
++
++static void drm_gem_shmem_vm_close(struct vm_area_struct *vma)
++{
++	struct drm_gem_object *obj = vma->vm_private_data;
++	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
++
++	dma_resv_lock(shmem->base.resv, NULL);
++	drm_gem_shmem_put_pages_locked(shmem);
++	dma_resv_unlock(shmem->base.resv);
++
++	drm_gem_vm_close(vma);
++}
++
++const struct vm_operations_struct drm_gem_shmem_vm_ops = {
++	.fault = drm_gem_shmem_fault,
++	.open = drm_gem_shmem_vm_open,
++	.close = drm_gem_shmem_vm_close,
++};
++EXPORT_SYMBOL_GPL(drm_gem_shmem_vm_ops);
++#endif
++
++/**
++ * drm_gem_shmem_mmap - Memory-map a shmem GEM object
++ * @shmem: shmem GEM object
++ * @vma: VMA for the area to be mapped
++ *
++ * This function implements an augmented version of the GEM DRM file mmap
++ * operation for shmem objects.
++ *
++ * Returns:
++ * 0 on success or a negative error code on failure.
++ */
++int drm_gem_shmem_mmap(struct drm_gem_shmem_object *shmem, struct vm_area_struct *vma)
++{
++	struct drm_gem_object *obj = &shmem->base;
++	int ret;
++
++	if (drm_gem_is_imported(obj)) {
++		/* Reset both vm_ops and vm_private_data, so we don't end up with
++		 * vm_ops pointing to our implementation if the dma-buf backend
++		 * doesn't set those fields.
++		 */
++		vma->vm_private_data = NULL;
++		vma->vm_ops = NULL;
++
++#ifdef __linux__
++		ret = dma_buf_mmap(obj->dma_buf, vma, 0);
++
++		/* Drop the reference drm_gem_mmap_obj() acquired.*/
++		if (!ret)
++			drm_gem_object_put(obj);
++
++		return ret;
++#elif defined(__FreeBSD__)
++		/* SiliconForest's dma-buf has no mmap */
++		return -ENODEV;
++#endif
++	}
++
++	if (is_cow_mapping(vma->vm_flags))
++		return -EINVAL;
++
++#ifdef CONFIG_MM_SUBPAGE
++	/* Validate bytes, including a partial native-page offset from PRIME. */
++	{
++		pgoff_t index = drm_gem_shmem_object_offset(obj, vma->vm_pgoff);
++		unsigned long offset, length = vma->vm_end - vma->vm_start;
++
++		if (check_mul_overflow(index, PAGE_SIZE, &offset) ||
++		    check_add_overflow(offset, (unsigned long)vma_subpage_offset(vma), &offset) ||
++		    offset > obj->size || length > obj->size - offset)
++			return -EINVAL;
++	}
++#endif
++
++#ifdef __linux__
++	/* Revocation zaps the device anon mapping only. */
++	if (shmem->reclaimable_cpu_mappings &&
++	    (!vma->vm_file || vma->vm_file->f_mapping != obj->dev->anon_inode->i_mapping))
++		return -EINVAL;
++
++	dma_resv_lock(shmem->base.resv, NULL);
++	if (shmem->reclaimable_cpu_mappings) {
++		if (!refcount_inc_not_zero(&shmem->cpu_vma_count))
++			refcount_set(&shmem->cpu_vma_count, 1);
++		ret = 0;
++	} else {
++		ret = drm_gem_shmem_get_pages_locked(shmem);
++	}
++	dma_resv_unlock(shmem->base.resv);
++#elif defined(__FreeBSD__)
++	/* no revocable mappings: every VMA holds the backing pages */
++	dma_resv_lock(shmem->base.resv, NULL);
++	ret = shmem->madv < 0 ? -EINVAL : drm_gem_shmem_get_pages_locked(shmem);
++	dma_resv_unlock(shmem->base.resv);
++#endif
++
++	if (ret)
++		return ret;
++
++	vm_flags_set(vma, VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
++	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
++	if (shmem->map_wc)
++		vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_mmap);
++
++#ifdef __FreeBSD__
++/* the backing-page reference one SiliconForest user mapping holds */
++struct drm_gem_shmem_sf_mapping {
++	struct work_struct work;
++	struct drm_gem_shmem_object *shmem;
++};
++
++/* dropping it takes the reservation lock, which sleeps: not on the VM teardown path */
++static void drm_gem_shmem_sf_unmap_work(struct work_struct *work)
++{
++	struct drm_gem_shmem_sf_mapping *map =
++		container_of(work, struct drm_gem_shmem_sf_mapping, work);
++	struct drm_gem_shmem_object *shmem = map->shmem;
++
++	dma_resv_lock(shmem->base.resv, NULL);
++	drm_gem_shmem_put_pages_locked(shmem);
++	dma_resv_unlock(shmem->base.resv);
++	drm_gem_object_put(&shmem->base);
++	kfree(map);
++}
++
++static void drm_gem_shmem_sf_unmap(void *arg)
++{
++	struct drm_gem_shmem_sf_mapping *map = arg;
++
++	INIT_WORK(&map->work, drm_gem_shmem_sf_unmap_work);
++	schedule_work(&map->work);
++}
++
++/**
++ * drm_gem_shmem_sf_mmap_pages - the pages behind a GEM mmap offset (SiliconForest)
++ * @filp: the open DRM file
++ * @offset: fake mmap offset, as returned by the driver's mmap-offset ioctl
++ * @size: length of the mapping in bytes, a multiple of PAGE_SIZE
++ * @prot: requested protection (unused)
++ * @pages: one physical page number (LinuxKPI PAGE_SHIFT units) per page of @size
++ * @wimg: cache mode for the mapping
++ * @release: called once the last mapping of these pages is gone
++ * @release_arg: its argument
++ *
++ * The SiliconForest counterpart of drm_gem_mmap() + drm_gem_shmem_mmap() + the
++ * fault handler: populates the object's backing pages, takes a pages_use_count
++ * reference and an object reference for the lifetime of the mapping, and
++ * reports the page numbers. A mapping always starts at the object's first
++ * page; @size may be shorter than the object.
++ *
++ * Returns:
++ * 0 on success or a negative error code on failure.
++ */
++int drm_gem_shmem_sf_mmap_pages(struct linux_file *filp, off_t offset,
++				size_t size, int prot, uint32_t *pages,
++				unsigned int *wimg, void (**release)(void *),
++				void **release_arg)
++{
++	struct drm_file *priv = filp->private_data;
++	struct drm_device *dev = priv->minor->dev;
++	struct drm_vma_offset_node *node;
++	struct drm_gem_object *obj = NULL;
++	struct drm_gem_shmem_object *shmem;
++	struct drm_gem_shmem_sf_mapping *map;
++	unsigned long npages = size >> PAGE_SHIFT, i;
++	int ret;
++
++	if (size == 0 || (size & (PAGE_SIZE - 1)) != 0 ||
++	    (offset & (PAGE_SIZE - 1)) != 0)
++		return -EINVAL;
++
++	drm_vma_offset_lock_lookup(dev->vma_offset_manager);
++	node = drm_vma_offset_exact_lookup_locked(dev->vma_offset_manager,
++						  offset >> PAGE_SHIFT, npages);
++	if (node != NULL) {
++		obj = container_of(node, struct drm_gem_object, vma_node);
++		if (!kref_get_unless_zero(&obj->refcount))
++			obj = NULL;
++	}
++	drm_vma_offset_unlock_lookup(dev->vma_offset_manager);
++	if (obj == NULL)
++		return -EINVAL;
++	if (!drm_vma_node_is_allowed(node, priv)) {
++		ret = -EACCES;
++		goto err_put;
++	}
++	/* SiliconForest's dma-buf has no mmap */
++	if (drm_gem_is_imported(obj) || size > obj->size) {
++		ret = -EINVAL;
++		goto err_put;
++	}
++	shmem = to_drm_gem_shmem_obj(obj);
++
++	map = kzalloc(sizeof(*map), GFP_KERNEL);
++	if (map == NULL) {
++		ret = -ENOMEM;
++		goto err_put;
++	}
++
++	ret = dma_resv_lock_interruptible(obj->resv, NULL);
++	if (ret)
++		goto err_free;
++	/* purged contents are gone */
++	ret = shmem->madv < 0 ? -EINVAL : drm_gem_shmem_get_pages_locked(shmem);
++	if (ret == 0) {
++		for (i = 0; i < npages; i++)
++			pages[i] = (uint32_t)(page_to_phys(shmem->pages[i]) >> PAGE_SHIFT);
++		shmem->pages_mark_accessed_on_put = true;
++		if (prot & VM_PROT_WRITE)
++			shmem->pages_mark_dirty_on_put = true;
++	}
++	dma_resv_unlock(obj->resv);
++	if (ret)
++		goto err_free;
++
++	*wimg = shmem->map_wc ? SF_SHMEM_WIMG_WCOMB : SF_SHMEM_WIMG_DEFAULT;
++	map->shmem = shmem;
++	*release = drm_gem_shmem_sf_unmap;
++	*release_arg = map;
++	return 0;
++
++err_free:
++	kfree(map);
++err_put:
++	drm_gem_object_put(obj);
++	return ret;
++}
++#endif
++
++/**
++ * drm_gem_shmem_print_info() - Print &drm_gem_shmem_object info for debugfs
++ * @shmem: shmem GEM object
++ * @p: DRM printer
++ * @indent: Tab indentation level
++ */
++void drm_gem_shmem_print_info(const struct drm_gem_shmem_object *shmem,
++			      struct drm_printer *p, unsigned int indent)
++{
++	if (drm_gem_is_imported(&shmem->base))
++		return;
++
++	drm_printf_indent(p, indent, "pages_pin_count=%u\n", refcount_read(&shmem->pages_pin_count));
++	drm_printf_indent(p, indent, "pages_use_count=%u\n", refcount_read(&shmem->pages_use_count));
++	drm_printf_indent(p, indent, "vmap_use_count=%u\n", refcount_read(&shmem->vmap_use_count));
++	drm_printf_indent(p, indent, "vaddr=%p\n", shmem->vaddr);
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_print_info);
++
++/**
++ * drm_gem_shmem_get_sg_table - Provide a scatter/gather table of pinned
++ *                              pages for a shmem GEM object
++ * @shmem: shmem GEM object
++ *
++ * This function exports a scatter/gather table suitable for PRIME usage by
++ * calling the standard DMA mapping API.
++ *
++ * Drivers who need to acquire an scatter/gather table for objects need to call
++ * drm_gem_shmem_get_pages_sgt() instead.
++ *
++ * Returns:
++ * A pointer to the scatter/gather table of pinned pages or error pointer on failure.
++ */
++struct sg_table *drm_gem_shmem_get_sg_table(struct drm_gem_shmem_object *shmem)
++{
++	struct drm_gem_object *obj = &shmem->base;
++
++	drm_WARN_ON(obj->dev, drm_gem_is_imported(obj));
++
++	return drm_prime_pages_to_sg(obj->dev, shmem->pages, obj->size >> PAGE_SHIFT);
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_get_sg_table);
++
++static struct sg_table *drm_gem_shmem_get_pages_sgt_locked(struct drm_gem_shmem_object *shmem)
++{
++	struct drm_gem_object *obj = &shmem->base;
++	int ret;
++	struct sg_table *sgt;
++
++	if (shmem->sgt)
++		return shmem->sgt;
++
++	/* Purged contents cannot be restored by rebuilding an empty table. */
++	if (shmem->madv < 0)
++		return ERR_PTR(-EINVAL);
++
++	drm_WARN_ON(obj->dev, drm_gem_is_imported(obj));
++
++	ret = drm_gem_shmem_get_pages_locked(shmem);
++	if (ret)
++		return ERR_PTR(ret);
++
++	sgt = drm_gem_shmem_get_sg_table(shmem);
++	if (IS_ERR(sgt)) {
++		ret = PTR_ERR(sgt);
++		goto err_put_pages;
++	}
++	/* Map the pages for use by the h/w. */
++	ret = dma_map_sgtable(obj->dev->dev, sgt, DMA_BIDIRECTIONAL, 0);
++	if (ret)
++		goto err_free_sgt;
++
++	shmem->sgt = sgt;
++
++	return sgt;
++
++err_free_sgt:
++	sg_free_table(sgt);
++	kfree(sgt);
++err_put_pages:
++	drm_gem_shmem_put_pages_locked(shmem);
++	return ERR_PTR(ret);
++}
++
++/**
++ * drm_gem_shmem_get_pages_sgt - Pin pages, dma map them, and return a
++ *				 scatter/gather table for a shmem GEM object.
++ * @shmem: shmem GEM object
++ *
++ * This function returns a scatter/gather table suitable for driver usage. If
++ * the sg table doesn't exist, the pages are pinned, dma-mapped, and a sg
++ * table created.
++ *
++ * This is the main function for drivers to get at backing storage, and it hides
++ * and difference between dma-buf imported and natively allocated objects.
++ * drm_gem_shmem_get_sg_table() should not be directly called by drivers.
++ *
++ * Returns:
++ * A pointer to the scatter/gather table of pinned pages or errno on failure.
++ */
++struct sg_table *drm_gem_shmem_get_pages_sgt(struct drm_gem_shmem_object *shmem)
++{
++	int ret;
++	struct sg_table *sgt;
++
++	ret = dma_resv_lock_interruptible(shmem->base.resv, NULL);
++	if (ret)
++		return ERR_PTR(ret);
++	sgt = drm_gem_shmem_get_pages_sgt_locked(shmem);
++	dma_resv_unlock(shmem->base.resv);
++
++	return sgt;
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_get_pages_sgt);
++
++/**
++ * drm_gem_shmem_prime_import_sg_table - Produce a shmem GEM object from
++ *                 another driver's scatter/gather table of pinned pages
++ * @dev: Device to import into
++ * @attach: DMA-BUF attachment
++ * @sgt: Scatter/gather table of pinned pages
++ *
++ * This function imports a scatter/gather table exported via DMA-BUF by
++ * another driver. Drivers that use the shmem helpers should set this as their
++ * &drm_driver.gem_prime_import_sg_table callback.
++ *
++ * Returns:
++ * A pointer to a newly created GEM object or an ERR_PTR-encoded negative
++ * error code on failure.
++ */
++struct drm_gem_object *
++drm_gem_shmem_prime_import_sg_table(struct drm_device *dev,
++				    struct dma_buf_attachment *attach,
++				    struct sg_table *sgt)
++{
++	size_t size = PAGE_ALIGN(attach->dmabuf->size);
++	struct drm_gem_shmem_object *shmem;
++
++	shmem = __drm_gem_shmem_create(dev, size, true);
++	if (IS_ERR(shmem))
++		return ERR_CAST(shmem);
++
++	shmem->sgt = sgt;
++
++	drm_dbg_prime(dev, "size = %zu\n", size);
++
++	return &shmem->base;
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_prime_import_sg_table);
++
++/**
++ * drm_gem_shmem_prime_import_no_map - Import dmabuf without mapping its sg_table
++ * @dev: Device to import into
++ * @dma_buf: dma-buf object to import
++ *
++ * Drivers that use the shmem helpers but also wants to import dmabuf without
++ * mapping its sg_table can use this as their &drm_driver.gem_prime_import
++ * implementation.
++ */
++#ifdef __linux__
++struct drm_gem_object *drm_gem_shmem_prime_import_no_map(struct drm_device *dev,
++							 struct dma_buf *dma_buf)
++{
++	struct dma_buf_attachment *attach;
++	struct drm_gem_shmem_object *shmem;
++	struct drm_gem_object *obj;
++	size_t size;
++	int ret;
++
++	if (drm_gem_is_prime_exported_dma_buf(dev, dma_buf)) {
++		/*
++		 * Importing dmabuf exported from our own gem increases
++		 * refcount on gem itself instead of f_count of dmabuf.
++		 */
++		obj = dma_buf->priv;
++		drm_gem_object_get(obj);
++		return obj;
++	}
++
++	attach = dma_buf_attach(dma_buf, dev->dev);
++	if (IS_ERR(attach))
++		return ERR_CAST(attach);
++
++	get_dma_buf(dma_buf);
++
++	size = PAGE_ALIGN(attach->dmabuf->size);
++
++	shmem = __drm_gem_shmem_create(dev, size, true);
++	if (IS_ERR(shmem)) {
++		ret = PTR_ERR(shmem);
++		goto fail_detach;
++	}
++
++	drm_dbg_prime(dev, "size = %zu\n", size);
++
++	shmem->base.import_attach = attach;
++	shmem->base.resv = dma_buf->resv;
++
++	return &shmem->base;
++
++fail_detach:
++	dma_buf_detach(dma_buf, attach);
++	dma_buf_put(dma_buf);
++
++	return ERR_PTR(ret);
++}
++EXPORT_SYMBOL_GPL(drm_gem_shmem_prime_import_no_map);
++#endif /* __linux__: needs drm_gem_is_prime_exported_dma_buf() of the 7.2 drm_prime.c */
++
++/*
++ * Kunit helpers
++ */
++
++#if IS_ENABLED(CONFIG_KUNIT)
++int drm_gem_shmem_vmap(struct drm_gem_shmem_object *shmem, struct iosys_map *map)
++{
++	struct drm_gem_object *obj = &shmem->base;
++	int ret;
++
++	ret = dma_resv_lock_interruptible(obj->resv, NULL);
++	if (ret)
++		return ret;
++	ret = drm_gem_shmem_vmap_locked(shmem, map);
++	dma_resv_unlock(obj->resv);
++
++	return ret;
++}
++EXPORT_SYMBOL_IF_KUNIT(drm_gem_shmem_vmap);
++
++void drm_gem_shmem_vunmap(struct drm_gem_shmem_object *shmem, struct iosys_map *map)
++{
++	struct drm_gem_object *obj = &shmem->base;
++
++	dma_resv_lock_interruptible(obj->resv, NULL);
++	drm_gem_shmem_vunmap_locked(shmem, map);
++	dma_resv_unlock(obj->resv);
++}
++EXPORT_SYMBOL_IF_KUNIT(drm_gem_shmem_vunmap);
++
++int drm_gem_shmem_madvise(struct drm_gem_shmem_object *shmem, int madv)
++{
++	struct drm_gem_object *obj = &shmem->base;
++	int ret;
++
++	ret = dma_resv_lock_interruptible(obj->resv, NULL);
++	if (ret)
++		return ret;
++	ret = drm_gem_shmem_madvise_locked(shmem, madv);
++	dma_resv_unlock(obj->resv);
++
++	return ret;
++}
++EXPORT_SYMBOL_IF_KUNIT(drm_gem_shmem_madvise);
++
++int drm_gem_shmem_purge(struct drm_gem_shmem_object *shmem)
++{
++	struct drm_gem_object *obj = &shmem->base;
++	int ret;
++
++	ret = dma_resv_lock_interruptible(obj->resv, NULL);
++	if (ret)
++		return ret;
++	drm_gem_shmem_purge_locked(shmem);
++	dma_resv_unlock(obj->resv);
++
++	return 0;
++}
++EXPORT_SYMBOL_IF_KUNIT(drm_gem_shmem_purge);
++#endif
++
++#ifdef __linux__
++MODULE_DESCRIPTION("DRM SHMEM memory-management helpers");
++MODULE_IMPORT_NS("DMA_BUF");
++MODULE_LICENSE("GPL");
++#endif

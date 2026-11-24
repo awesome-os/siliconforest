@@ -1,0 +1,91 @@
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -1608,6 +1608,7 @@
+     return 0;
+ }
+ 
++static void sfFingerCancel(void);
+ static void pointerEnter(void *data, struct wl_pointer *pointer, uint32_t serial,
+                          struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y) {
+     for (struct wsWindow *w = ws.windows; w != NULL; w = w->next) {
+@@ -1641,6 +1642,7 @@
+ 
+ static void pointerLeave(void *data, struct wl_pointer *pointer, uint32_t serial,
+                          struct wl_surface *surface) {
++    sfFingerCancel();
+     struct mach_event event = {0};
+ 
+     // the last position inside the surface, so AppKit's hit test still finds the view being left
+@@ -1754,39 +1756,42 @@
+ 
+ // wheel motion arrives in surface pixels, 10 to a notch on most compositors, AppKit's
+ // deltaY is in lines and positive when scrolling up, the opposite sign to Wayland
+-static void pointerAxis(void *data, struct wl_pointer *pointer, uint32_t time,
+-                        uint32_t axis, wl_fixed_t value) {
+-    noteInput();
+-    struct mach_event event = {0};
+-    struct wsWindow *window = windowForID(ws.pointerWindowID);
+-    double lines = -wl_fixed_to_double(value) / 10.0;
+-
+-    event.windowID = ws.pointerWindowID;
+-    event.code = WS_SCROLL_WHEEL;
+-    event.x = lastPointerX;
+-    event.y = window != NULL ? window->h - lastPointerY : lastPointerY;
+-    if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
+-        event.dy = lines;
+-    else
+-        event.dx = lines;
+-    event.mods = currentModifiers;
++// Only the paired private AppKit path consumes the low-word wire metadata.
++// Wheel clients keep line deltas. Finger clients retain the protocol's pixel
++// deltas and began/changed/ended phases; no momentum is invented.
++static uint32_t sfAxisSource=WL_POINTER_AXIS_SOURCE_WHEEL;
++static unsigned sfFingerAxes;
++static int sfFingerActive,sfFingerWindowID;
++static int sfPreciseScroll(void){const char *mode=getenv("SFFX_PRECISE_SCROLL");return mode&&!strcmp(mode,"1");}
++static void sfFingerCancel(void){
++    if(!sfFingerActive)return;
++    struct mach_event event={0};struct wsWindow *window=windowForID(sfFingerWindowID);
++    event.windowID=sfFingerWindowID;event.code=WS_SCROLL_WHEEL;event.x=lastPointerX;
++    event.y=window?window->h-lastPointerY:lastPointerY;event.mods=currentModifiers|7u;
++    sfFingerActive=0;sfFingerAxes=0;queuePush(&event);
++}
++static void pointerAxis(void *data,struct wl_pointer *pointer,uint32_t time,uint32_t axis,wl_fixed_t value){
++    if(axis>WL_POINTER_AXIS_HORIZONTAL_SCROLL)return;
++    noteInput();struct mach_event event={0};struct wsWindow *window=windowForID(ws.pointerWindowID);
++    int precise=sfPreciseScroll()&&sfAxisSource==WL_POINTER_AXIS_SOURCE_FINGER;
++    double delta=-wl_fixed_to_double(value)/(precise?1.0:10.0);
++    event.windowID=ws.pointerWindowID;event.code=WS_SCROLL_WHEEL;event.x=lastPointerX;
++    event.y=window?window->h-lastPointerY:lastPointerY;event.mods=currentModifiers;
++    if(precise){if(sfFingerActive&&sfFingerWindowID!=ws.pointerWindowID)sfFingerCancel();event.mods|=1u;if(!sfFingerActive)event.mods|=2u;sfFingerActive=1;sfFingerWindowID=ws.pointerWindowID;sfFingerAxes|=1u<<axis;}
++    if(axis==WL_POINTER_AXIS_VERTICAL_SCROLL)event.dy=delta;else event.dx=delta;
+     queuePush(&event);
+ }
+-
+-static void pointerFrame(void *data, struct wl_pointer *pointer) {
+-}
+-
+-static void pointerAxisSource(void *data, struct wl_pointer *pointer,
+-                              uint32_t source) {
+-}
+-
+-static void pointerAxisStop(void *data, struct wl_pointer *pointer,
+-                            uint32_t time, uint32_t axis) {
+-}
+-
+-static void pointerAxisDiscrete(void *data, struct wl_pointer *pointer,
+-                                uint32_t axis, int32_t discrete) {
++static void pointerFrame(void *data,struct wl_pointer *pointer){}
++static void pointerAxisSource(void *data,struct wl_pointer *pointer,uint32_t source){if(source!=WL_POINTER_AXIS_SOURCE_FINGER)sfFingerCancel();sfAxisSource=source;}
++static void pointerAxisStop(void *data,struct wl_pointer *pointer,uint32_t time,uint32_t axis){
++    if(axis>WL_POINTER_AXIS_HORIZONTAL_SCROLL||!sfPreciseScroll()||!sfFingerActive)return;
++    sfFingerAxes&=~(1u<<axis);if(sfFingerAxes)return;
++    struct mach_event event={0};struct wsWindow *window=windowForID(ws.pointerWindowID);
++    event.windowID=ws.pointerWindowID;event.code=WS_SCROLL_WHEEL;event.x=lastPointerX;
++    event.y=window?window->h-lastPointerY:lastPointerY;event.mods=currentModifiers|1u|4u;
++    sfFingerActive=0;sfAxisSource=WL_POINTER_AXIS_SOURCE_WHEEL;queuePush(&event);
+ }
++static void pointerAxisDiscrete(void *data,struct wl_pointer *pointer,uint32_t axis,int32_t discrete){}
+ 
+ static const struct wl_pointer_listener pointerListener = {
+     .enter = pointerEnter,

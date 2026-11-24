@@ -1,0 +1,87 @@
+--- a/crates/wm-darwin/src/terminal_launch.rs
++++ b/crates/wm-darwin/src/terminal_launch.rs
+@@ -21,6 +21,7 @@
+     next: u64,
+     end: Instant,
+ }
++const MAX_INSTANCE_COUNTER: u64 = 0xffff;
+ pub(crate) struct PrivateDirectory {
+     file: File,
+     path: PathBuf,
+@@ -165,16 +166,19 @@
+         })
+     }
+     fn identity(&mut self) -> io::Result<Instance> {
+-        self.next = self
++        let next = self
+             .next
+             .checked_add(1)
++            .filter(|next| *next <= MAX_INSTANCE_COUNTER)
+             .ok_or_else(|| io::Error::other("instance counter exhausted"))?;
+-        Instance::parse(&format!(
+-            "{}{:016x}",
+-            &self.session.as_str()[..32],
+-            self.next
+-        ))
+-        .map_err(io::Error::other)
++        // The ordinary application's title shows the first12 characters.
++        // Put the bounded sequence there, retaining176 bits of host nonce.
++        // Full canonical48 remains the status/records identity; the caption
++        // is only a visual label and never process or input authority.
++        let instance = Instance::parse(&format!("{next:04x}{}", &self.session.as_str()[..44]))
++            .map_err(io::Error::other)?;
++        self.next = next;
++        Ok(instance)
+     }
+     fn prepare(&self, instance: Instance, now: Instant) -> io::Result<Prepared> {
+         let remaining = self.end.saturating_duration_since(now).as_secs();
+@@ -332,6 +336,49 @@
+         assert_ne!(prepared.instance, launcher.identity().unwrap());
+     }
+     #[test]
++    fn first_two_instances_have_distinct_visible_prefixes_and_exact_full_ids() {
++        let (_root, mut launcher, _manager) = fixture();
++        let session = "0123456789abcdef0123456789abcdef0123456789abcdef";
++        launcher.session = Instance::parse(session).unwrap();
++        let first = launcher.identity().unwrap();
++        let second = launcher.identity().unwrap();
++        assert_eq!(first.as_str(), format!("0001{}", &session[..44]));
++        assert_eq!(second.as_str(), format!("0002{}", &session[..44]));
++        assert_eq!(&first.as_str()[..12], "000101234567");
++        assert_eq!(&second.as_str()[..12], "000201234567");
++        assert_ne!(&first.as_str()[..12], &second.as_str()[..12]);
++        for id in [&first, &second] {
++            assert_eq!(id.as_str().len(), 48);
++            assert!(Instance::parse(id.as_str()).is_ok());
++            assert_eq!(&id.as_str()[4..], &session[..44]);
++        }
++        let a = launcher.prepare(first.clone(), Instant::now()).unwrap();
++        let b = launcher.prepare(second.clone(), Instant::now()).unwrap();
++        assert_eq!(a.args[3], first.as_str());
++        assert_eq!(b.args[3], second.as_str());
++        assert!(a.directory.path.ends_with(first.as_str()));
++        assert!(b.directory.path.ends_with(second.as_str()));
++        assert_ne!(a.directory.path, b.directory.path);
++        // Preparing distinct real private inputs does not create apps/READY.
++    }
++    #[test]
++    fn four_hex_counter_accepts_last_value_then_refuses_without_wrap_or_side_effects() {
++        let (root, mut launcher, mut manager) = fixture();
++        launcher.next = MAX_INSTANCE_COUNTER - 1;
++        let last = launcher.identity().unwrap();
++        assert_eq!(last.as_str(), format!("ffff{}", "a".repeat(44)));
++        for exhausted in [MAX_INSTANCE_COUNTER, u64::MAX] {
++            launcher.next = exhausted;
++            assert!(launcher.request(1, &mut manager).is_err());
++            assert_eq!(launcher.next, exhausted);
++            assert!(manager.applications().is_empty());
++            assert!(manager.audit.attempts().is_empty());
++        }
++        assert!(std::fs::read_dir(root.path())
++            .unwrap()
++            .all(|entry| entry.unwrap().file_name() == "manager-status.log"));
++    }
++    #[test]
+     fn deadline_and_private_directory_refusals_are_before_spawn() {
+         let (root, mut launcher, mut manager) = fixture();
+         launcher.end = Instant::now();

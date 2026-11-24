@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "record": "bootstrap-independent-review",
+  "recorded_at": "2026-11-08T02:19:26Z",
+  "reviewer": "Claude (independent, read-only source review)",
+  "subject": "integrations/m1-boot-window bootstrap: window004 m1n1 proxy RAM-chainloads the exact 121fcbf increment007 raw image",
+  "scope": {
+    "files_written": ["reports/sprint-008/bootstrap-independent-review.json"],
+    "source_edits": false, "tests_run_by_reviewer": false, "ssh": false, "hardware_accessed": false,
+    "maclab_server_contacted": false
+  },
+  "reviewed_sha256": {
+    "integrations/m1-boot-window/bootstrap.py": "b50071ccec877c6b1901ccf550304cb72faf87ca00f1568af2076147003fc668",
+    "integrations/m1-boot-window/test_bootstrap.py": "ec598060a52037c1f5cc9f9de36b63f08647f5189fc05ce9720b35d8430c8f70",
+    "integrations/m1-boot-window/BOOTSTRAP.md": "f775f0bc84e42001946ed1295ce34c1689767f21a12b0aeb2fb508f680f53eea",
+    "integrations/m1-boot-window/bootstrap-trampoline.S": "076bc9f15199175347d1f06335d496e4427ff38a5320711e1d17ab557148f03c",
+    "integrations/m1-boot-window/bootstrap-trampoline.bin": "6cf0c6c7c88698af6d49ae7b40134e011bc7d38b43b908f0e210ebd0d2de5d92"
+  },
+  "bindings_checked": {
+    "window_raw": "ba5bf4b396168ac540df852e3507c4342dd289eef7bf2c1fc29c50f11f0822bf (attempt 4 receipt), footprint 0x420000, unique window-v1 tag",
+    "target_raw": "05b36cc8288843211e97bd4f68adcf521c81e5e68afd98a4d094a6f03defb32c, footprint 0x400000, unique exact 121fcbf tag",
+    "frozen_host_console": "a9f68695c6465bc5a3c1a9df04f67da6a72f99265e899cf3b89ba671ab6d4417 (the version independently reviewed in sprint 007)"
+  },
+  "verdict": "NO_SOURCE_BLOCKER; SEQUENCING_GATE_AND_TWO_RECOMMENDATIONS",
+  "confirmed": [
+    "Trampoline: all 24 instruction words equal the pinned proxyclient/tools/chainload.py stub (copy 16-byte pairs, dc cvac, dsb, ic ivau, dsb, isb, ldr/br). Only the 8-byte entry literal at 0x60 is patched; entry must be base + 0x800 so the RVBAR page stays the live base and no RVBAR write is needed (matching pinned chainload's rvbar == u.base case). The stub sits at stage + copy_size, as in pinned chainload.",
+    "P_VECTOR arguments (stub, BootArgs copy, staging image, live base, copy_size) match pinned chainload --vector-only and the trampoline's x0-x3 use; x0 BootArgs is preserved to the new image.",
+    "copy_size = 16K-aligned raw size + 4 is a nonzero multiple of 64 (required for the stub's loops to terminate). Its zero tail places the canonical terminator at exact121's _payload_start (base + footprint), so the new m1n1 cannot parse leftover window-image bytes as a payload. The destination must stay inside the known live footprint.",
+    "Memory policy: every memory-map region except Kernel-* ranges wholly inside the live image is protected. The destination may not overlap them; blob sources may not alias; all retained ranges must sit below the live heap in bounded DRAM. One exact monotonic heapblock reservation is rechecked before use. top_of_kernel_data becomes the reservation end, which is at or above the live heap, inherited top and all retained copies, consistent with pinned chainload's max() rule.",
+    "Firmware blobs are copied target-side with memcpy8; sources stay intact and bytes never cross the host link. SEPFW and TrustCache are required. Image, BootArgs, ADT and stub get full host readback, then dc_cvac over the whole reserved span and ic_ivau over the stub.",
+    "Exactly one P_VECTOR; no reload, P_CALL, NOP retry or reconnect; the acknowledgement is recorded as VECTOR_ACKNOWLEDGED_RUNTIME_UNVERIFIED. Original BootArgs and ADT are saved privately before any allocation. Identity (window tag at the live base, USB0/1, 20-byte CPUFeatures, J293/T8103, single running CPU) is checked and rechecked before staging."
+  ],
+  "sequencing_gate": {
+    "id": "B1",
+    "gate": "After a successful vector the target runs plain exact121 m1n1 with no Linux fallback, and m1n1 disables the hardware watchdog (src/main.c:245,285). Recovery is then only an external VDM reset (back to window, expiry, Linux). VDM reset has been qualified from halted Linux, not from an m1n1 proxy state. Before the first bootstrap vector, qualify reset-and-return from an idle claimed-window proxy (claim with one NOP, stop probes, VDM reboot serial, verify Linux returns), or keep the same one-time owner/manual-recovery availability as the first window boot. Pinned window handoff error paths after the vector acknowledgement (NVMe or display shutdown failure returns to proxy and then panics) also leave only VDM recovery."
+  },
+  "recommendations": [
+    {"id": "R1", "change": "Before staging, add a host-only parse-back self-check: reparse the rebuilt ADT with the pinned adt module and require every property to equal the original except the intended memory-map entries (blobs, BootArgs, DeviceTree); parse the rebuilt BootArgs and require only top_of_kernel_data, devtree and devtree_size to differ. The tests use a fake serializer, so live Construct/ADT round-trip fidelity is otherwise unproven until vector time."},
+    {"id": "R2", "change": "Expect possible fail-closed refusals: an iBoot Kernel-* range that overlaps the destination but extends past the live footprint is treated as protected, and the plan refuses. Record the live memory-map in the private observation so such a refusal can be diagnosed without retrying."}
+  ],
+  "delta_review_R1_R2": {
+    "recorded_at": "2026-11-08T02:24:28Z",
+    "reviewed_sha256": {
+      "integrations/m1-boot-window/bootstrap.py": "b1947b67d111202b48c020c215ff7116daf6ca90163356372e8e3c82449937ac",
+      "integrations/m1-boot-window/test_bootstrap.py": "9dfb79d9ebb4e39b1bd4109a0e4cfbff59412be346dc2ebed9453bd49c2eceb7",
+      "integrations/m1-boot-window/BOOTSTRAP.md": "fa519e8ba16fe31c1bf94f068707920761b8e21fb1aa6175dfe88c11f27763b1"
+    },
+    "scope": "Delta only: R1 parse-back helper, R2 private map record and their tests/doc lines. Trampoline, layout policy, prefix004 and the vector path were not re-reviewed beyond confirming the call path.",
+    "R1": {
+      "status": "IMPLEMENTED",
+      "evidence": "Before edits, snapshot_adt records every node path (duplicates refused), every property's encoded bytes via the pinned build_prop with its template flag, and ordered child paths. After the memory-map edits and a size-stable build, the rebuilt ADT is reparsed with the pinned load_adt and must equal that snapshot except the intended blob, BootArgs and DeviceTree entries. BootArgs are rebuilt, parsed back and must equal the original fields except top_of_kernel_data, devtree and devtree_size. Any mismatch refuses before staging (prepare_metadata runs before stage_and_vector).",
+      "residual": "Both snapshots are produced by the same pinned decoder/encoder, so a property the pinned adt module cannot round-trip byte-exactly would be invisible to this check. A cheap strengthening is to require load_adt(raw_adt).build() == raw_adt before editing (or compare unedited properties against an untyped parse of the original bytes). Not a blocker; host tests still use a fake serializer and the live round-trip remains the lead's M5 check, as BOOTSTRAP.md states."
+    },
+    "R2": {
+      "status": "IMPLEMENTED",
+      "evidence": "original-observation.json now records live_heap and the full decoded memory map (addr/size per entry) and is written before plan_memory, so a fail-closed range refusal (e.g. a Kernel-* range extending past the live footprint) is diagnosable without retry. test_private_memory_map_survives_range_refusal covers this."
+    },
+    "delta_verdict": "NO_NEW_BLOCKER; B1 sequencing gate unchanged (window fallback first, then idle claimed-proxy VDM reset before any vector, owner available at first setup)."
+  },
+  "delta_review_phandle": {
+    "recorded_at": "2026-11-08T02:46:08Z",
+    "trigger": "bootstrap001 refused safely before any RAM write or vector on 'Unknown memory-map encoding: AAPL,phandle' (a 4-byte node identity property).",
+    "reviewed_frozen_sha256": {
+      "integrations/m1-boot-window/bootstrap.py": "55ebd7f5e79536a69eb94688665be2d7afd4def7f1d08532a0ee8225763e036a",
+      "integrations/m1-boot-window/test_bootstrap.py": "bb245640d246fde92b6d0c4e1c9236dccba448ae699597ad227394d61bb7355b",
+      "integrations/m1-boot-window/BOOTSTRAP.md": "cb67457497122870ae7889c04b97375e80bc562501a8346de7c26948138fa74e"
+    },
+    "pins_unchanged": "PIN, WINDOW_TAG, WINDOW_SHA ba5bf4b3..., TARGET_SHA 05b36cc8..., FROZEN_SHA a9f68695..., STUB_SHA 6cf0c6c7... (trampoline bytes rehashed and unchanged).",
+    "evidence": [
+      "parse_memory_map skips only the property named exactly AAPL,phandle, and only when the pinned build_prop encodes it to exactly 4 bytes; a different length refuses. The node 'name' property is skipped as before. Every other memory-map property must still encode to 16 bytes or the run refuses.",
+      "The phandle is only excluded from the decoded region list used by plan_memory. It stays in the ADT, so the R1 snapshot/reparse comparison still requires it unchanged.",
+      "original-bootargs.bin and original-adt.bin are now written privately before memory-map decoding, so a decode refusal keeps the exact originals.",
+      "Tests cover phandle acceptance without mutation and malformed-phandle refusal."
+    ],
+    "minor_residual": "The raw saves still follow load_adt and validate_identity, so a failure inside load_adt itself would not leave the originals. Moving both writes directly after the raw reads would cover that; not a blocker.",
+    "delta_verdict": "NO_NEW_BLOCKER"
+  },
+  "delta_review_kernel_only": {
+    "recorded_at": "2026-11-08T02:51:15Z",
+    "trigger": "bootstrap002 refused safely before any RAM write or vector on an unknown 5-byte memory-map property kernel-only = 'true\\0'. Root's offline inspection of the complete original ADT found only name, AAPL,phandle and kernel-only as non-16-byte memory-map properties.",
+    "reviewed_frozen_sha256": {
+      "integrations/m1-boot-window/bootstrap.py": "350cd127fe7b41586c562847dd1b8c1cd6054df42276019844dfa2012e3beafb",
+      "integrations/m1-boot-window/test_bootstrap.py": "4d04312499da3b8bc58acd561c643aed652fcb6e5b200557683fda4441baee1c",
+      "integrations/m1-boot-window/BOOTSTRAP.md": "1a4c4e22c806153179287b311480571de3e0e5f7ee0c117c73d1ee04a4e5fd70"
+    },
+    "pins_unchanged": "WINDOW_SHA ba5bf4b3..., TARGET_SHA 05b36cc8..., FROZEN_SHA a9f68695..., STUB_SHA 6cf0c6c7... (trampoline bytes rehashed and unchanged).",
+    "source_fact_verified": "Pinned XNU iokit/Kernel/IODeviceTreeSupport.cpp:445 sets kernelOnly from whether SecureDTGetProperty(dtEntry, \"kernel-only\", ...) succeeds; the value is never read. The property is a presence/visibility flag, not a memory range.",
+    "evidence": [
+      "parse_memory_map skips kernel-only only when the pinned build_prop encoding equals exactly b'true\\0'; any other value refuses. name and AAPL,phandle (exactly 4 bytes) behave as before, and every other property must still encode to 16 bytes or the run refuses. The range policy is unchanged.",
+      "kernel-only is excluded only from the decoded region list used by plan_memory. It stays in the ADT, so the R1 snapshot/reparse comparison still requires it unchanged.",
+      "Tests cover structural metadata accepted without mutation and an altered kernel-only value refused."
+    ],
+    "minor_residual_unchanged": "original-bootargs.bin and original-adt.bin are still written after load_adt and validate_identity (bootstrap.py:216-221), so a failure inside load_adt itself would not leave the originals. Not a blocker.",
+    "delta_verdict": "NO_NEW_BLOCKER"
+  },
+  "limits": [
+    "Source review only; the reviewer did not run the 20 host tests or the offline plan.",
+    "Firmware copies are acknowledged target operations, not byte-verified snapshots; mutable logs can change during copy (as documented).",
+    "Vector execution, exact121 enumeration after handoff, and recovery behavior are unverified.",
+    "A window tag read at the live base is not a full live-code attestation."
+  ],
+  "hardware_boot_observed": false,
+  "runtime_verified": false
+}

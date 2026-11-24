@@ -1,0 +1,186 @@
+{
+  "schema_version": 1,
+  "review_revision": 1,
+  "reviewer": "Codex independent bounded manager review",
+  "prepared_utc": "2026-11-08T16:17:39.205081+00:00",
+  "status": "FROZEN_SHELL001_MANAGER_REVIEW_ONE_CONFIRMED_BLOCKER_NO_DARWIN_EXECUTION",
+  "subject_source_set_sha256": "4202fedc1f12b52b204bb94f88b8df299f907547e5902804a3ed590bf428b42b",
+  "verdict": "HOLD manager outcome admission for H1. The frozen source correctly separates child ownership and cleanup acknowledgement in most paths, but loses failed application exit outcomes after valid PTY cleanup. Fix and review a new frozen delta before treating manager.has_failures as a reliable session verdict. Other scoped ABI/FD/parser/journal mechanics are consistent subject to the explicit native-entry/runtime gates.",
+  "source_approved_for_native_outcome_admission": false,
+  "runtime_admitted": false,
+  "author_boundary": "Reviewer authored the separate ordinary terminal application and the separate runtime FD-whitelist fixture, not Astra's applications.rs/terminal_launch.rs/launch_audit.rs. This review is independent only for the manager leaf. It does not independently approve reviewer-authored client/runtime artifacts or root's C shim; their receipt hashes are checked solely as consumer bindings.",
+  "scope": {
+    "reviewed_modules_sha256": {
+      "crates/wm-darwin/src/applications.rs": "41fa5857419960a3de03d8483018daf7870fb545943d7ba10c657e995f8f7571",
+      "crates/wm-darwin/src/terminal_launch.rs": "cc5c98e78a9dd7bcc16a2575f218e3ef6008e97ddfd432dcdb5e26e7d779f412",
+      "crates/wm-darwin/src/launch_audit.rs": "4ab0a52ec6ec51f6700daeb7d81b5bf260438656b5a2d4895e5dae4ee157331f"
+    },
+    "reviewed_metadata_sha256": {
+      "source-validation.json": "f36eb00259da21bb7f48bf0723c08ffbf1767cd9c6d6bcea704f04eae73fa9c4",
+      "shell.patch": "add1c06e94b3e1c2c12b766875434b18e67177578cf8473be7261d4d0a821f45",
+      "IMPLEMENTATION.md": "777afbfde725f938c9d6782cde62604f8be0b3fafe14783db4768719a850eba6",
+      "verify_checkpoint.py": "ede29a5d2121adf02ce0517934bc40e34f0b35db84f0ff760fbdea3f87d3bee8"
+    },
+    "not_reviewed": [
+      "Moving implementation-revisions/002 source/native entry",
+      "Claude-owned shared Shell/profile/modal/input semantics",
+      "C shim implementation/runtime proof",
+      "Ordinary client source",
+      "IPC source or active host/controller/packet"
+    ]
+  },
+  "binding_verification": {
+    "computed_changed_source_set_sha256": "4202fedc1f12b52b204bb94f88b8df299f907547e5902804a3ed590bf428b42b",
+    "changed_source_files_verified": 16,
+    "dependency_files_verified": 8,
+    "metadata_and_log_hashes_verified": 9,
+    "mismatches": [],
+    "actual_C_source_sha256": "fd6dd36f575c77f1ff9d996f43e9dedb386811b0623678b812620f36f617db75",
+    "actual_C_header_sha256": "080c2e0c9694951bd8d8a689811b8c6bc525d76392aff2f8e2af792ebf947d4c",
+    "consumer_C_object_sha256": "71c322c1f47bb16373e01f2a3ff7b02690b441faf9a582327304543316a6c729",
+    "qualified_main_unchanged": true,
+    "patch_replay": {
+      "command": "python3 integrations/puredarwin/chonkstep-darwin/desktop-shell/verify_checkpoint.py",
+      "exit_code": 0,
+      "observation": "Exact16-file patch replay verified in temporary directory; no native build or execution."
+    }
+  },
+  "blockers": [
+    {
+      "id": "H1",
+      "severity": "high correctness/admission blocker",
+      "title": "A failed application exit can disappear after successful PTY cleanup",
+      "references": [
+        "applications.rs:523-526",
+        "applications.rs:568-582",
+        "applications.rs:674-683",
+        "launch_audit.rs:225-228"
+      ],
+      "source_chain": "UnixWait retains an actual terminal application wait status. LaunchAudit.observe records it without marking nonzero/signalled exit as failure. Application.cleanup_complete accepts every Reaped(raw) when a valid COMPLETE1 cleanup and sealed EOF exist; service sets Completion::Complete. OwnedApplications.has_failures examines launch/status/incomplete/journal failures but never unsuccessful application wait status. Therefore complete resource cleanup can hide an application fault.",
+      "confirmed_reproduction": {
+        "kind": "Real Linux child and actual manager waitpid; synthetic private-channel PTY acknowledgement only",
+        "steps": [
+          "Spawn /bin/sh -c exit7 as a real bounded host child; transfer its positive PID to the real OwnedChild without a competing wait.",
+          "Supply canonical READY and CLEANUP COMPLETE1 with a legitimate terminated PTY raw status15 over a real UnixStream, then close the peer.",
+          "Run actual Application.service/UnixWait until the child is reaped. Confirm WIFEXITED and WEXITSTATUS7 (raw status1792).",
+          "Confirm Completion::Complete for cleanup, then assert manager.has_failures must be true. The assertion fails: current manager returns false."
+        ],
+        "scratch": "/tmp/desktop-owned-apps-review-521wi223",
+        "argv": [
+          "cargo",
+          "test",
+          "--manifest-path",
+          "/tmp/desktop-owned-apps-review-521wi223/Cargo.toml",
+          "--offline",
+          "reviewer_nonzero_exit_regression",
+          "--",
+          "--test-threads=1"
+        ],
+        "exit_code": 101,
+        "log_sha256": "ae4a53aef07f2049c9f96c41ef4e4a0ea8f48cb2c09b2ff4b33e3e110b111448",
+        "test_name": "applications::reviewer_nonzero_exit_regression::real_host_app_exit_failure_must_remain_sticky_after_valid_pty_cleanup",
+        "result": "Intentional regression assertion failed after all actual-wait/cleanup preconditions passed; this confirms the defect, not a passing test."
+      },
+      "required_fix": "Record nonzero exited or signalled APPLICATION wait as a sticky attempt/outcome failure while preserving actual raw status and independent cleanup completeness. Do not require exit0 from the separately owned PTY shell intentionally terminated during normal cleanup. Preserve normal EOF/window close before READY when the application exits0 with complete cleanup. Add a focused real-host wait regression for failed application + valid cleanup and retain the normal exit0/terminated-PTY case.",
+      "runtime_claim": "No actual Darwin application fault, target process or hardware was executed by this regression."
+    }
+  ],
+  "consistent_scoped_findings": [
+    {
+      "id": "ABI",
+      "references": [
+        "applications.rs:19-64",
+        "applications.rs:173-198",
+        "applications.rs:286-335"
+      ],
+      "finding": "Request/result are repr(C),56bytes with checked alignment/offsets matching root's plain public header; no SDK opaque struct guessed. Apple-only native-managed-spawn calls only the declared C symbol; unavailable/default host paths refuse. Result validation requires exact0x400e flags/readback, version/reserved/stage/errors/duplicate count. Metadata binds exact frozen C source/header/object, but no link or exec proof follows."
+    },
+    {
+      "id": "OWNERSHIP",
+      "references": [
+        "applications.rs:82-151",
+        "applications.rs:199-335",
+        "applications.rs:780-864",
+        "terminal_launch.rs:238-281"
+      ],
+      "finding": "Launch owns CString storage and temporary argv/envp arrays through the synchronous C call and borrows exactly four source FDs. spawn_using adopts child_created1 positive PID before later validation, retaining it through native/local cleanup/version/flag failures. Manager inserts that child despite failure and records the full C result. Selected sources and child status peer are caller-owned until C returns; p.parent moves into the manager and the child-side source is dropped afterward. No ordinary Command/PATH/pre-exec production fallback exists."
+    },
+    {
+      "id": "PRIVATE_LAUNCH",
+      "references": [
+        "terminal_launch.rs:24-122",
+        "terminal_launch.rs:144-229"
+      ],
+      "finding": "Configured launcher uses bounded absolute explicit paths, unique per-session counter identities, owned0700 directory FDs, openat/mkdirat/no-follow/exclusive0600 files, and name-to-held-inode verification. stdin is /dev/null; stdout/stderr are per-instance files; fd3 is its own connected stream. Environment is explicit. Session11\u2013180s bounds leave10s reserve; app lifetimes1\u2013120s are supplied in the exact frozen CLI. Existing name collision refuses rather than overwrites."
+    },
+    {
+      "id": "STATUS",
+      "references": [
+        "applications.rs:338-511"
+      ],
+      "finding": "Private stream parser bounds each frame to256bytes includingLF, permits only printableASCII plus terminator, checks exact identity and positive owned PID, canonical signed32 decimal and exact boolean fields. READY is at most once; CLEANUP may precede READY but forbids all subsequent bytes, so duplicates/reordering fail sticky. COMPLETE1 requires actual nonnegative terminal PTY status, not sentinel-1. Fragmentation, exact EOF and pending truncation are handled. Drain verifies nonblocking and limits per-turn reads to4*256bytes. Application internal readiness is asserted over the private channel, not inferred from title/map order or physical input."
+    },
+    {
+      "id": "WAIT_AND_CLEANUP",
+      "references": [
+        "applications.rs:199-281",
+        "applications.rs:523-638",
+        "applications.rs:649-684"
+      ],
+      "finding": "Single owner calls waitpid only on positive direct child PID with WNOHANG, treats EINTR as pending/retry on later turns, and makes ECHILD/other ownership errors sticky Unknown. No signals after terminal/unknown state. App reap and PTY-cleanup acknowledgement+EOF are independently required. READY deadline25s, application lifetime, TERM5s/KILL3s and post-reap stream2s bounds retain unknown/incomplete outcomes and late reaps without rewriting failure. H1 is the missing unsuccessful APPLICATION outcome classification, not missing cleanup separation."
+    },
+    {
+      "id": "JOURNAL",
+      "references": [
+        "launch_audit.rs:80-150",
+        "launch_audit.rs:159-265",
+        "launch_audit.rs:268-298"
+      ],
+      "finding": "Configured launch requires an owned single-link empty regular0600 journal before spawning.128 attempts and2MiB/1024-byte-record bounds preserve prior observations. Gate writes sync before subsequent launch effects; global write/sync/quota error blocks later launches and makes existing children stop through normal ownership cleanup. After C creates a child, journal failure does not bypass insertion/adoption. First per-attempt failure and actual gates are retained. App internal PTY/keymap/SSD/frame gates are explicitly unknown until final client records."
+    }
+  ],
+  "notes_and_remaining_gates": [
+    {
+      "id": "N1",
+      "severity": "required outer integration gate, documented unfinished",
+      "finding": "There is no blocking Drop reaper and the qualified main.rs is unchanged. A native entry must poll/drive shutdown on every signal/error/End Session before display/HID/PDGOP teardown, preserve failures and surface unknown ownership. Moving002 is excluded from this review."
+    },
+    {
+      "id": "N2",
+      "severity": "scope limit",
+      "finding": "Configured paths use fresh position-zero private journal files; public journal adoption checks metadata/access but does not independently enforce append offset or exclusivity against all possible external aliases. Filesystem I/O/spawn syscalls have no in-process hard wall-time guarantee. The receipt correctly reserves the external controller as final boundary."
+    },
+    {
+      "id": "N3",
+      "severity": "runtime prerequisite",
+      "finding": "Root's actual Darwin FD-whitelist fixture is still pending hardware/runtime qualification. Host FakeSpawn/FakeWait tests prove Rust policy only; a Linux check of native-managed-spawn links no C implementation. A source/object hash binding and checked flag values are not descriptor inheritance proof."
+    },
+    {
+      "id": "N4",
+      "severity": "source scope limit",
+      "finding": "This review does not establish mapped-surface/child correlation, broad standalone side-effect reachability, font preflight, final artifact linking or disabled IPC admission. Claude/Astra/root own those boundaries separately."
+    }
+  ],
+  "validation": {
+    "existing_checkpoint_evidence": {
+      "library_tests": 29,
+      "real_wayland_tests": 4,
+      "scope": "Receipt/log verified, not broadly rerun. Fake C and wait facades are explicitly separate from actual Darwin FD inheritance. Source parser tests also use real host UnixStream fragmentation."
+    },
+    "independent_new_test": {
+      "focused_regression_executed": 1,
+      "expected_failures_confirming_H1": 1,
+      "broad_suite_rerun": false,
+      "host_dependencies": {
+        "libc": "0.2.189",
+        "tempfile": "3.27.0"
+      },
+      "scope": "Only copied immutable manager modules + temporary added regression in /tmp; real Linux /bin/sh and waitpid, synthetic PTY status acknowledgement."
+    }
+  },
+  "writes": "Only this own review report plus /tmp scratch source/test/log artifacts. No reviewed source, client, C shim, IPC, native002, source pins, controller or packet edits.",
+  "hardware_accessed": false,
+  "ssh": false,
+  "Darwin_build_or_execution": false,
+  "B2_closed": false
+}

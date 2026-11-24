@@ -1,0 +1,32 @@
+FXNET: mdnsd answered large CNAME results in pieces 0.25-0.4 s apart: the reply did not fit the
+client socket (a rotating CDN name carried 111 cached addresses) and udsserver_idle() only tried
+again at the next timer event, up to a second away. Bigger send buffer per client, retry in 10 ms.
+
+--- a/src/Libraries/mDNSResponder/mDNSShared/uds_daemon.c
++++ b/src/Libraries/mDNSResponder/mDNSShared/uds_daemon.c
+@@ -5055,6 +5055,12 @@
+     else
+     {
+         request_state *request = NewRequest();
++#if !defined(_WIN32)
++        // FXNET: room for a whole answer. A CDN name can carry 100+ cached addresses; with the
++        // default buffer the reply did not fit, and the rest waited for udsserver_idle().
++        int sndbuf = 256 * 1024;
++        (void)setsockopt(sd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
++#endif
+         request->ts    = t_morecoming;
+         request->sd    = sd;
+         request->errsd = sd;
+@@ -6231,8 +6237,10 @@
+ 
+         if (r->replies)     // If we failed to send everything, check our time_blocked timer
+         {
+-            if (nextevent - now > mDNSPlatformOneSecond)
+-                nextevent = now + mDNSPlatformOneSecond;
++            // FXNET: try again in 10 ms, not up to a second: the client is usually reading
++            // already (getaddrinfo waited 280 ms here for the end of a CNAME answer)
++            if (nextevent - now > mDNSPlatformOneSecond / 100)
++                nextevent = now + (mDNSPlatformOneSecond / 100 > 0 ? mDNSPlatformOneSecond / 100 : 1);
+ 
+             LogRedact(MDNS_LOG_CATEGORY_DEFAULT, MDNS_LOG_INFO,
+                "[R%u] Could not send all replies. Will try again in %d ticks.", r->request_id, nextevent - now);

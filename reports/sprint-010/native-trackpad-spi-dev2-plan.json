@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "SOURCE_ONLY_FEASIBILITY_PLAN_NO_IMPLEMENTATION_NO_INPUT_CLAIM",
+  "scope": "Independent feasibility of the J293 built-in SPI trackpad (logical device 2) over the already-verified PDM1SPIHID transport. Read-only use of pinned references and the frozen keyboard sources. No production edits, builds, hardware, SSH or fetch. Complements Astra's native-trackpad-gap-plan.json; it does not replace it.",
+  "preservation": "Keyboard SDK005 (PDM1SPIHID.cpp b38f0087, m1kbd_hid.c c4b9248c, PDM1SPIHID.h 55321230, m1kbd_hid.h 0badc449; owned set 60335f51) and the qualified native closed/live packets stay frozen. Any trackpad work goes in a separate, opt-in candidate. No task here touches the DART survey guard.",
+  "references": {
+    "transport": "sources/linux-aurora-keyboard-reference/drivers/hid/spi-hid/spi-hid-apple-core.c 9c18211e (pin 6a08a08e)",
+    "trackpad_driver": "sources/linux-aurora-trackpad-reference/drivers/hid/hid-magicmouse.c cfbc231b (git blob 970a10d2, pin 6a08a08e; receipt trackpad-source-acquisition-001.json)",
+    "actuator": "drivers/hid/hid-apple-mtp-haptic.c 6c0c197d, drivers/hid/hid-haptic.h 435229f9, include/linux/soc/apple/actuator.h 133f1f9d (receipt trackpad-source-acquisition-002.json)",
+    "license": "All references are GPL and used for facts only. The parser below is an original design; no code is copied."
+  },
+  "grounded_facts": [
+    {"id": "F1", "fact": "Logical devices: management 0, keyboard 1, trackpad 2, actuator 3; info target 0xd0; read packet 0x20, write packet 0x40; descriptor cap 512 bytes; input report cap 0x800.", "source": "spi-hid-apple-core.c:38-53"},
+    {"id": "F2", "fact": "Enumeration as actually called: device info (0xd0, cmd 0x20, report 0x01, sub 0xd0); per-interface info (0xd0, 0x20, report 0x02, sub i, resp 512); HID descriptor (0xd0, 0x20, report 0x10, sub i, resp 512) for i >= 1. The comment table at :255-273 lists 0x10 for interface info and is superseded by these calls.", "source": "spi-hid-apple-core.c:1107-1142"},
+    {"id": "F3", "fact": "Input routing: flags 0x20 with command (msg.u0) 0x10 from device d in 1..3 delivers the payload to that interface's HID device via hid_input_report. Device 0 / report 0xe0 is a status report.", "source": "spi-hid-apple-core.c:508-532, :266-272"},
+    {"id": "F4", "fact": "Raw requests: SET_REPORT (feature) is a write with command 0x52, report = report number, target = interface id, payload = report bytes; buf[0] must equal the report number. GET_REPORT (feature only) uses command 0x32 with response length = len, and the reply is routed by device to reply_buf. Output reports use command 0x51. The report number is not the interface id.", "source": "spi-hid-apple-core.c:392-453"},
+    {"id": "F5", "fact": "magicmouse binds BUS_SPI Apple devices only when hdev->type == HID_TYPE_SPI_MOUSE (the core sets this for device 2), and selects magicmouse_raw_event_spi / setup_input_spi.", "source": "hid-magicmouse.c:2287-2311, spi-hid-apple-core.c:1000-1014"},
+    {"id": "F6", "fact": "Multitouch enable on open (non-BUS_HOST): for SPI_DEVICE_ID_APPLE_MACBOOK_{AIR_2020, PRO13_2020, PRO14_2021, PRO16_2021} with the SPI vendor, a feature SET_REPORT of {0x02, 0x01} (report 0x02); the default for other products is {0xD7, 0x01}. -EIO is tolerated.", "source": "hid-magicmouse.c:343-363, 1769-1815"},
+    {"id": "F7", "fact": "SPI report: byte 0 = 0x02 (SPI_REPORT_ID), then an 8-byte standard mouse prefix (report_id, buttons, rel_x, rel_y, 4 padding), then the MTP body: a 38-byte tp_header (num_fingers at offset 22, buttons at 23) and N x 30-byte little-endian tp_finger records (abs_x, abs_y, rel_x, rel_y, tool/touch major/minor, orientation, pressure, ...). Valid if body >= 38 and (body - 38) % 30 == 0, with num_fingers <= N <= MAX_CONTACTS (16). Records with touch_major == 0 are skipped. Report 0x60 means the touch controller reset; MT mode must be re-enabled.", "source": "hid-magicmouse.c:165-177, 822-886, 967-1062"},
+    {"id": "F8", "fact": "Dimensions: on first open, the trackpad driver issues feature GET_REPORT 0xd9 (32-byte buffer: width, height, min/max x/y) to set axis ranges.", "source": "hid-magicmouse.c:365-409"},
+    {"id": "F9", "fact": "Click without the actuator: with no haptics device, the button equals the firmware button bit (tp_header.buttons & 1). The actuator powers up device-controlled ('the firmware owns the actuator and reports the button'). Pointer and click therefore need no device-3 writes.", "source": "hid-magicmouse.c:1635-1652; hid-apple-mtp-haptic.c:55-73, 92-104"},
+    {"id": "F10", "fact": "Saved Linux runtime on this machine bound magicmouse to 05AC:0341 on the J293 SPI transport and hid-apple-mtp-haptic to the actuator (Astra's citation of runs/m1-keyboard-010/linux-after-attempt002-keyboard-log.txt 243c4850).", "source": "native-trackpad-gap-plan.json established_evidence"}
+  ],
+  "not_grounded": [
+    "The value of SPI_DEVICE_ID_APPLE_MACBOOK_PRO13_2020 (needs include/linux/hid-ids.h at pin 6a08a08e). Without it, whether 0x0341 takes the {0x02,0x01} branch (F6) is an inference from the board name only.",
+    "The real device-2 interface metadata and HID descriptor (sizes, report IDs, application usages). No saved capture contains them; the J293 actuator descriptor is likewise unknown (the J313 note in F9 is about a different machine).",
+    "Whether the trackpad emits any reports before MT mode, and their size. magicmouse passes any report whose byte 0 is not 0x02 to generic HID, but the pre-mode behaviour on J293 is unobserved.",
+    "Whether IOHIDFamily rev002 would publish the mouse queue for this child: that depends on the descriptor's usages (GenericDesktop Mouse/Pointer versus Digitizer TouchPad)."
+  ],
+  "current_adapter_gaps": "Frozen PDM1SPIHID is keyboard-only by design: one IOHIDDevice; enumeration and one-use semantic keys cover only device 1 (m1kbd_hid.c:52, interface metadata accepts report 0x02/subdevice 0x01); the poll loop delivers only m1kbd_keyboard_input to handleReport, and other devices are counted as otherMessages (PDM1SPIHID.cpp:186, 246-263); there is no getReport/setReport override. These match Astra's line-level findings.",
+  "plan": [
+    {"phase": "T1 enumeration-only (read-only)", "evidence_level": "enumeration", "change": "Separate candidate (keyboard rev005 untouched as a revision base): extend the one-use request set by exactly two keys, device-2 interface info (0xd0, 0x20, 0x02, sub 2) and device-2 descriptor (0xd0, 0x20, 0x10, sub 2), with the same single-outstanding, 1 s deadline, CRC, exact-match and no-retry rules. Validate the 16-byte interface header (interface 2, shared 05ac:0341) and a 1..512-byte CRC-checked descriptor. Publish nothing; send no mode write.", "exit": "Private descriptor bytes plus length/hash/usage summary. That gives the real report IDs, sizes and usages for the next review."},
+    {"phase": "T2 child publication, no writes", "evidence_level": "enumeration + registry", "change": "One additional IOHIDDevice child for interface 2 with the real descriptor and limits, a distinct name, and the shared vendor/product, owned by the existing transport. Route flags 0x20 / cmd 0x10 / device 2 payloads only to it. No feature writes.", "exit": "IORegistry shows the child with the parsed descriptor. Any pre-mode reports are counted (sizes only) and not decoded or claimed."},
+    {"phase": "T3 MT mode enable (first device-2 write)", "evidence_level": "device configuration", "gate": "Only after T1 shows feature report 0x02 in the descriptor and hid-ids.h confirms the 0x0341 product branch. One SET_REPORT {0x02,0x01} (cmd 0x52, report 0x02, target 2) per open and once after a 0x60 reset; no retries, no actuator (device 3) traffic, no GET 0xd9 until it is separately reviewed.", "exit": "The trackpad starts sending report 0x02 frames; only sizes and counts are logged."},
+    {"phase": "T4 offline decode", "evidence_level": "report decode", "change": "Run the original pure parser (below) on privately captured frames, host-side, to establish header/record consistency. There is no input claim at this stage.", "exit": "All captured frames validate, or are refused with a reason."},
+    {"phase": "T5 pointer path", "evidence_level": "real pointer input (requires human observation)", "change": "Feed real frames to IOHID through the published child. If the descriptor declares a GenericDesktop pointing application, IOHIDFamily rev002 publishes the mouse queue from that real service. Run the compositor with both queues (an explicit new mode; the mouse queue has no console grab). Any absolute-to-relative conversion must be derived from real contacts, never synthesized.", "exit": "Human-observed pointer motion and click bound to a fresh challenge, as for physical typing. Host-origin or virtual input never substitutes."}
+  ],
+  "parser_proposal": {
+    "status": "design only (original); no file created",
+    "api": "int dltp_parse_spi(const uint8_t *p, size_t n, size_t max_input, struct dltp_frame *out); struct dltp_frame { uint8_t contact_count, button, mouse_buttons; int8_t rel_x, rel_y; struct dltp_contact c[16]; }; struct dltp_contact { int16_t x, y, rel_x, rel_y; uint16_t touch_major, touch_minor, tool_major, tool_minor, orientation, pressure; uint8_t source_index; };",
+    "results": "DLTP_FRAME (out written), DLTP_RESET (p[0] == 0x60; caller must re-enable MT once), DLTP_NOT_MT (p[0] != 0x02; leave to the generic descriptor path), negative errors (argument, size, alignment, count), with out unchanged on any non-FRAME result.",
+    "rules": [
+      "Require n >= 1 and n <= max_input (the interface's max_input_report_len) and n <= 2038 (current reassembly cap).",
+      "For report 0x02: require n >= 1 + 8 + 38 and (n - 47) % 30 == 0. N = (n - 47) / 30 <= 16, and header num_fingers (body offset 22) <= N.",
+      "Read all fields as explicit little-endian; no struct overlay or alignment assumption.",
+      "Emit contacts with touch_major != 0 in source order, recording source_index; button = header byte 23 bit 0; also keep the 8-byte mouse prefix fields.",
+      "No allocation, globals or I/O. Contact data are never logged by the parser."
+    ],
+    "tests_to_require": "Golden frames built from the documented layout: 0..16 contacts, zero-touch_major skips, num_fingers > N, misaligned tails, oversize/undersize, reset and non-0x02 reports, max_input bound, out-unchanged on errors, plus compiled mutants. No real contact data in fixtures."
+  },
+  "notes": [
+    {"id": "T-N1", "text": "The actuator (device 3) is out of scope. Pointer and click are source-grounded to work device-controlled (F9). Haptic writes are a separate later review."},
+    {"id": "T-N2", "text": "Feature I/O (T3, later 0xd9) needs a serialized request/response pump in the single transport owner that keeps servicing keyboard input. Astra's child/lifetime design covers this. The keyboard queue's console grab is unaffected."},
+    {"id": "T-N3", "text": "Next acquisition for root (no agent fetch): include/linux/hid-ids.h at 6a08a08e, to ground the 0x0341 branch in F6."}
+  ],
+  "not_claimed": ["trackpad enumeration on hardware", "report decode", "pointer input", "physical touch", "any keyboard or DART change"]
+}

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_BINARY_AND_SOURCE_CONFIRMATION_NO_EXECUTION",
+  "addends": "chonk-ipc-darwin-port-contract-review.json, blocker B2 option (a)",
+  "evidence_reviewed": "runs/m1-desktop-010/darwin-spawn-proof-001: main.rs (std::process::Command::new(\"/usr/bin/true\").spawn() then wait), spawn-probe 3504b49a8daaf2e7 (ARM64 MH_EXECUTE; libSystem/libc/libm), build.log. Not executed by root or by me.",
+  "verdict": "CONFIRMED. With the pinned toolchain, normal std::process::Command spawning on this Darwin target does NOT set POSIX_SPAWN_CLOEXEC_DEFAULT. B2 option (a) is ruled out; integration needs option (b), an audited serialization of every spawn against IPC fd creation/accept, or option (c), an explicit Darwin spawn adapter.",
+  "independent_checks": {
+    "toolchain": "The probe embeds rustc/48a229ceaefd4985c50990b14116b6d856af0985, which run logs record 45 times as 'rustc 1.98.1 (48a229cea 2026-09-01)'. The deployed chonkstep-darwin build output carries the same commit, so the same std is linked.",
+    "single_setflags_site": "My own llvm-objdump --macho disassembly (stub-symbolized) shows exactly one call to _posix_spawnattr_setflags in the whole binary (0x1000144a0), after _posix_spawnattr_init at 0x100014170 and before _posix_spawnp at 0x10001451c. This matches root's addresses.",
+    "flag_dataflow": "w21 = #0x0 (0x100014370) or #0x2 POSIX_SPAWN_SETPGROUP (0x100014378). The signal-default path calls sigemptyset, sigaddset(13) and posix_spawnattr_setsigdefault, and on success ORs #0x4 POSIX_SPAWN_SETSIGDEF (0x10001448c). Then mov x1, x21 and bl setflags. The other x21 writes in the region (0x1000143f0 ldr; 0x10001442c orr with x22<<32) build io::Error values and branch to the error return (0x1000142cc), never to setflags. The argument is therefore in {0, 2, 4, 6}. No #0x4000 immediate occurs anywhere in lines 16600-17100 of the disassembly.",
+    "libsystem_semantics": "Pinned libsystem_kernel/wrappers/spawn/posix_spawn.c (and xnu libsyscall's copy): posix_spawnattr_init sets psa_flags = 0 and posix_spawnattr_setflags assigns psa_flags = flags. So nothing adds CLOEXEC_DEFAULT behind std's back.",
+    "fallback_path": "The binary also imports _fork and _execvp (fork at 0x100013ea8, execvp at 0x100014c60). std takes that path when its posix_spawn eligibility checks fail (branches at 0x10001438c/0x100014494 to 0x100014390, which destroys attrs and leaves the posix_spawn path). It does not close arbitrary fds either; it relies on each fd's own close-on-exec flag."
+  },
+  "implications_for_option_c": [
+    "A Darwin spawn adapter must call posix_spawnattr_setflags including POSIX_SPAWN_CLOEXEC_DEFAULT (0x4000; supported by XNU kern_exec.c) at every chonk-shell spawn site (spawn.rs wrappers, appearance gsettings, button_layout publisher, omarchy_menu, and any others), not only the main supervised launcher.",
+    "Under CLOEXEC_DEFAULT even fds 0-2 are closed unless named in file actions. Stdio must be set explicitly (for example posix_spawn_file_actions_addopen of /dev/null, or adddup2/addinherit_np for intended fds), and existing env, cwd, process-group and signal-default behavior must be kept with checked return codes and attr/file-action destruction on every path.",
+    "Any Command feature that forces std's fork path (pre_exec and similar) must not be used at Darwin spawn sites unless the adapter covers it, because that path inherits every fd lacking close-on-exec."
+  ],
+  "limits": "Binary-level evidence for this toolchain and this Command shape (no pre_exec/uid/gid). Other std options stay within the same function's {0,2,4,6} flag set or the fork fallback; neither adds CLOEXEC_DEFAULT. Root's provisional darwin-ipc source and tests were not reviewed here.",
+  "scope": "Read-only: probe source, binary, my own disassembly, pinned libsystem posix_spawn.c, run-log toolchain records. No execution, edits or hardware."
+}

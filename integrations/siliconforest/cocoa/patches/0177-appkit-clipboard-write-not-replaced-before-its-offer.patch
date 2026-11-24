@@ -1,0 +1,42 @@
+--- a/src/Frameworks/AppKit/NSPasteboard.m
++++ b/src/Frameworks/AppKit/NSPasteboard.m
+@@ -145,6 +145,12 @@
+  * first) did not. A request is now answered from the data offered, on a thread of its own; only data an owner provides
+  * lazily goes through the main thread, and then from the offered board without taking another client's selection. */
+ static pthread_mutex_t publishedLock=PTHREAD_MUTEX_INITIALIZER;
++/* (TERM11) the general board has been written and its offer is not out yet: another client's selection that arrives
++ * meanwhile (the desk's clipboard keeper re-offering the previous copy) does not replace what the application has just
++ * written - that write is the newer clipboard. It did: the scheduled offer then went out with the other client's types
++ * and none of the data (Firefox's rich copy: 0 bytes, a lone BOM on the other side). */
++static BOOL generalPublishPending=NO;
++static NSTimeInterval generalPublishPendingSince;
+ static NSDictionary *publishedItems=nil, *publishedMimeMap=nil;
+ static int publishedChangeCount=-1;
+ 
+@@ -307,7 +313,7 @@
+    char **mimeTypes=NULL;
+    int count;
+ 
+-   if(![self _isGeneral])
++   if(![self _isGeneral] || (generalPublishPending && [NSDate timeIntervalSinceReferenceDate]-generalPublishPendingSince<1.0))
+     return;
+    generation=_windowServerSelectionGeneration();
+    if(generation==_systemGeneration)
+@@ -405,12 +411,17 @@
+    if(![self _isGeneral])
+     return;
+    _systemBacked=NO;
++   generalPublishPending=YES;
++   generalPublishPendingSince=[NSDate timeIntervalSinceReferenceDate];
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(_sfPublish) object:nil];
+    [self performSelector:@selector(_sfPublish) withObject:nil afterDelay:0
+                  inModes:@[ NSDefaultRunLoopMode, NSEventTrackingRunLoopMode, NSModalPanelRunLoopMode ]];
+ }
+ 
+ -(void)_sfPublish {
++   generalPublishPending=NO;
++   if(_systemBacked)
++    return;
+    NSMutableArray *mimeTypes=[NSMutableArray array];
+    NSMutableDictionary *map=[NSMutableDictionary dictionary];
+    const char **list;

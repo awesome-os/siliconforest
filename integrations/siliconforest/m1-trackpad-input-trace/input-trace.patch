@@ -1,0 +1,203 @@
+--- a/src/Kernel/Extensions/SFM1SPIHID/CMakeLists.txt
++++ b/src/Kernel/Extensions/SFM1SPIHID/CMakeLists.txt
+@@ -4,7 +4,7 @@
+ set_property(TARGET SFM1SPIHID.kext PROPERTY OUTPUT_NAME SFM1SPIHID)
+ target_sources(SFM1SPIHID.kext PRIVATE
+     SFM1SPIHID.cpp SFM1KeyboardHW.cpp m1kbd_board.c m1kbd_pio.c m1kbd_hid.c
+-    native_protocol/dl_spi_hid.c m1tp_enum.c SFM1SPITrackpad.cpp m1tp_child_policy.c)
++    native_protocol/dl_spi_hid.c m1tp_enum.c SFM1SPITrackpad.cpp m1tp_child_policy.c m1tp_trace.c)
+ target_include_directories(SFM1SPIHID.kext PRIVATE
+     ${CMAKE_CURRENT_SOURCE_DIR}
+     ${CMAKE_CURRENT_SOURCE_DIR}/../IOHIDFamily/IOHIDSystem
+--- a/src/Kernel/Extensions/SFM1SPIHID/SFM1SPIHID.cpp
++++ b/src/Kernel/Extensions/SFM1SPIHID/SFM1SPIHID.cpp
+@@ -84,6 +84,7 @@
+     childState.version=DL_M1_TP_CHILD_STATE_VERSION;
+     childState.byte_size=sizeof(childState);
+     t2Dispatches=0; childObserved=0; childRejected=0; childSubmitted=0;
++    m1tp_trace_init(&trackpadTrace);
+     return super::init(properties);
+ }
+ IOService *SFM1SPIHID::probe(IOService *provider, SInt32 *score)
+@@ -322,6 +323,8 @@
+     SFM1SPIHID *self=OSDynamicCast(SFM1SPIHID,owner);
+     if (!self || self->stopping || !self->published) return;
+     if (self->t2Enabled && __atomic_load_n(&self->t2Phase,__ATOMIC_ACQUIRE)!=1) return;
++    if (self->t2Enabled && m1tp_trace_announce(&self->trackpadTrace))
++        IOLog("DL24_TP_TRACE version=1 passive=1 cap02=16 cap3f=2 cap44=1 motion_reserved=1\n");
+     struct dlsp_message message;
+     /* A bounded batch lets other workloop users run, even with ready held low.
+      * Partial messages remain in the bounded heap reassembly buffer. */
+@@ -351,6 +354,7 @@
+                 IOLog("SFM1SPIHID: first device-1 input report accepted by IOHID; physical typing not yet verified\n");
+             }
+         } else if (self->t2Enabled && message.device==2 && message.flags==0x20 && message.command==0x10) {
++            self->traceTrackpad(&message);
+             self->routeTrackpad(&message);
+         } else {
+             /* Management/trackpad/aux reports are consumed but never relabeled
+@@ -361,6 +365,22 @@
+     self->publishCounters(false);
+     if (!self->stopping && self->pollTimer->setTimeoutMS(2)!=kIOReturnSuccess)
+         self->fail(M1KBD_IO,"timer-rearm");
++}
++void SFM1SPIHID::traceTrackpad(const struct dlsp_message *message)
++{
++    struct m1tp_trace_record r;
++    if (!m1tp_trace_select(&trackpadTrace,message,&r)) return;
++    IOLog("DL24_TP_BEGIN seq=%u id=%02x bytes=%u reason=%u seen02=%u seen3f=%u seen44=%u\n",
++          (unsigned)r.sequence,(unsigned)r.report_id,(unsigned)r.bytes,(unsigned)r.reason,
++          (unsigned)r.seen02,(unsigned)r.seen3f,(unsigned)r.seen44);
++    char hex[129];
++    for (size_t index=0;index<(r.bytes+63u)/64u;index++) {
++        (void)m1tp_trace_hex(message->payload,r.bytes,index,hex);
++        IOLog("DL24_TP_HEX seq=%u index=%u data=%s\n",
++              (unsigned)r.sequence,(unsigned)index,hex);
++    }
++    IOLog("DL24_TP_END seq=%u bytes=%u crc16=%04x\n",
++          (unsigned)r.sequence,(unsigned)r.bytes,(unsigned)r.crc16);
+ }
+ void SFM1SPIHID::publishCounters(bool force)
+ {
+--- a/src/Kernel/Extensions/SFM1SPIHID/SFM1SPIHID.h
++++ b/src/Kernel/Extensions/SFM1SPIHID/SFM1SPIHID.h
+@@ -4,6 +4,7 @@
+ #include "SFM1KeyboardHW.h"
+ #include "native_protocol/dl_spi_hid.h"
+ #include "m1kbd_hid.h"
++#include "m1tp_trace.h"
+ /* Layout first: it defines and undefines its own one-argument assert macro. */
+ #include "observation_layout.h"
+ #include "m1tp_enum.h"
+@@ -79,6 +80,8 @@
+     bool publishChildState();
+     void removeChildState();
+     void childFault(int32_t);
++    struct m1tp_trace_state trackpadTrace;
++    void traceTrackpad(const struct dlsp_message *);
+     void routeTrackpad(const struct dlsp_message *);
+     static void poll(OSObject *, IOTimerEventSource *);
+     static IOReturn startGated(OSObject *, void *, void *, void *, void *);
+--- /dev/null
++++ b/src/Kernel/Extensions/SFM1SPIHID/m1tp_trace.c
+@@ -0,0 +1,76 @@
++#include "m1tp_trace.h"
++#include <string.h>
++
++void m1tp_trace_init(struct m1tp_trace_state *s)
++{ if (s) memset(s,0,sizeof(*s)); }
++int m1tp_trace_announce(struct m1tp_trace_state *s)
++{
++    if (!s || s->announced) return 0;
++    s->announced=1;
++    return 1;
++}
++static void count(uint32_t *n)
++{ if (*n!=UINT32_MAX) ++*n; }
++int m1tp_trace_select(struct m1tp_trace_state *s, const struct dlsp_message *m,
++                      struct m1tp_trace_record *out)
++{
++    uint8_t id;
++    uint32_t reason=0;
++    int motion=0;
++    struct m1tp_trace_record r;
++    if (!s || !s->announced || !m || !out || m->device!=2 ||
++        m->flags!=0x20 || m->command!=0x10 || !m->payload ||
++        !m->payload_length || m->payload_length>1752u) return 0;
++    id=m->payload[0];
++    switch (id) {
++    case 0x02:
++        if (m->payload_length!=8) return 0;
++        motion=m->payload[2]!=0x80 && m->payload[3]!=0x80 &&
++            (m->payload[2]!=0 || m->payload[3]!=0);
++        count(&s->seen02);
++        if (s->logged02<16) reason=1;
++        else if (motion && !s->motion_logged) reason=2;
++        break;
++    case 0x3f:
++        if (m->payload_length!=17) return 0;
++        count(&s->seen3f);
++        if (s->logged3f<2) reason=1;
++        break;
++    case 0x44:
++        if (m->payload_length!=1752) return 0;
++        count(&s->seen44);
++        if (s->logged44<1) reason=1;
++        break;
++    default: return 0;
++    }
++    if (!reason || s->sequence>=M1TP_TRACE_MAX_RECORDS) return 0;
++    if (id==0x02) {
++        ++s->logged02;
++        if (motion) s->motion_logged=1;
++    } else if (id==0x3f) ++s->logged3f;
++    else ++s->logged44;
++    memset(&r,0,sizeof(r));
++    r.sequence=++s->sequence; r.reason=reason; r.report_id=id;
++    r.seen02=s->seen02; r.seen3f=s->seen3f; r.seen44=s->seen44;
++    r.bytes=(uint16_t)m->payload_length;
++    r.crc16=dlsp_crc16(m->payload,m->payload_length);
++    *out=r;
++    return 1;
++}
++size_t m1tp_trace_hex(const uint8_t *p, size_t n, size_t index,
++                      char out[M1TP_TRACE_HEX_BYTES])
++{
++    static const char digits[]="0123456789abcdef";
++    size_t off, len, i;
++    if (!p || !out || !n || n>1752u || index>(n-1u)/M1TP_TRACE_CHUNK_BYTES)
++        return 0;
++    off=index*M1TP_TRACE_CHUNK_BYTES;
++    len=n-off;
++    if (len>M1TP_TRACE_CHUNK_BYTES) len=M1TP_TRACE_CHUNK_BYTES;
++    for (i=0;i<len;i++) {
++        out[i*2u]=digits[p[off+i]>>4];
++        out[i*2u+1u]=digits[p[off+i]&15u];
++    }
++    out[len*2u]='\0';
++    return len;
++}
+--- /dev/null
++++ b/src/Kernel/Extensions/SFM1SPIHID/m1tp_trace.h
+@@ -0,0 +1,41 @@
++/* Original bounded passive observation policy. No upstream implementation copied. */
++#ifndef M1TP_TRACE_H
++#define M1TP_TRACE_H
++#include <stddef.h>
++#include <stdint.h>
++#include "native_protocol/dl_spi_hid.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++#define M1TP_TRACE_MAX_RECORDS 20u
++#define M1TP_TRACE_CHUNK_BYTES 64u
++#define M1TP_TRACE_HEX_BYTES 129u
++/* Serialized by the existing transport workloop. No new callback or owner. */
++struct m1tp_trace_state {
++    uint32_t seen02, seen3f, seen44;
++    uint32_t logged02, logged3f, logged44, sequence;
++    uint8_t announced, motion_logged;
++};
++struct m1tp_trace_record {
++    uint32_t sequence, reason, seen02, seen3f, seen44;
++    uint16_t bytes, crc16;
++    uint8_t report_id;
++};
++/* Silent initialization; only the admitted active T2 poll may announce. */
++void m1tp_trace_init(struct m1tp_trace_state *);
++/* Returns1 exactly once. Does not emit I/O. */
++int m1tp_trace_announce(struct m1tp_trace_state *);
++/* Called only on an already CRC-validated dlsp message. Rechecks dev2 Input
++ * identity/exact wire lengths. Ordinary02 captures include X/Y=-128; only
++ * reserved motion selection requires both axes in descriptor range.
++ * Counts saturate at UINT32_MAX. No payload pointer is retained. Returns1
++ * for selection; on0 the output record is unchanged. Never changes dispatch. */
++int m1tp_trace_select(struct m1tp_trace_state *, const struct dlsp_message *,
++                      struct m1tp_trace_record *);
++/* index is a zero-based64-byte chunk index. Returns source byte count, or0
++ * without changing output for invalid arguments. Fixed129 bytes incl NUL. */
++size_t m1tp_trace_hex(const uint8_t *, size_t, size_t, char [M1TP_TRACE_HEX_BYTES]);
++#ifdef __cplusplus
++}
++#endif
++#endif

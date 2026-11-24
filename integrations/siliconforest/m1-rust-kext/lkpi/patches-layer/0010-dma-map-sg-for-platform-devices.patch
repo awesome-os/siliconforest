@@ -1,0 +1,46 @@
+fbsdkpi: dma_map_sg works for a device-tree platform device, and its failure is an error
+
+- bus_dma: a tag without an IOKit device (bus_get_dma_tag() only knows pci, so every
+  platform device) made _bus_dmamap_load_phys() return EINVAL, and so dma_map_sg map nothing.
+  Such a device has no IOMapper; the seam's identity mapping applies.
+- dma_map_sgtable() returned 0 with nents 0 when nothing was mapped. Linux returns an error,
+  and a caller that trusts 0 (drm_gem_shmem_get_pages_sgt) went on with an empty table.
+UPSTREAM: yes.
+
+--- a/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/include/linux/dma-mapping.h
++++ b/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/include/linux/dma-mapping.h
+@@ -487,6 +487,9 @@
+ 	nents = dma_map_sg_attrs(dev, sgt->sgl, sgt->orig_nents, dir, attrs);
+ 	if (nents < 0)
+ 		return (nents);
++	/* SiliconForest: dma_map_sg_attrs() says 0 for "nothing mapped"; Linux returns an error */
++	if (nents == 0)
++		return (-EIO);
+ 	sgt->nents = nents;
+ 	return (0);
+ }
+--- a/src/Kernel/fbsdkpi/haiku/freebsd_network/bus_dma.cpp
++++ b/src/Kernel/fbsdkpi/haiku/freebsd_network/bus_dma.cpp
+@@ -202,7 +202,9 @@
+ 		*mapp = NULL;
+ 		return ENOMEM;
+ 	}
+-	if (dmat->sf_device != NULL) {
++	// also without an IOKit device behind the tag (a device-tree platform device): the seam
++	// then maps identity, see _bus_dmamap_load_phys
++	{
+ 		(*mapp)->sf_cookies = (void**)calloc(dmat->maxsegments, sizeof(void*));
+ 		if ((*mapp)->sf_cookies == NULL) {
+ 			free((*mapp)->segments);
+@@ -499,7 +501,10 @@
+ _bus_dmamap_load_phys(bus_dma_tag_t dmat, bus_dmamap_t map, vm_paddr_t buf,
+ 	bus_size_t buflen, int flags, bus_dma_segment_t* segs, int* segp)
+ {
+-	if (dmat->sf_device == NULL || map->sf_cookies == NULL)
++	// sf_device is NULL for a device-tree platform device (bus_get_dma_tag() only knows pci):
++	// no IOMapper can be in front of it, and sfos_dma_map_phys(NULL, ..) is the identity
++	// mapping when the device can address the range
++	if (map->sf_cookies == NULL)
+ 		return EINVAL;
+ 
+ 	_sf_unmap_segments(map);

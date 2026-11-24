@@ -1,0 +1,265 @@
+--- a/src/Frameworks/AppKit/NSTabView.m
++++ b/src/Frameworks/AppKit/NSTabView.m
+@@ -290,18 +290,17 @@
+ }
+ 
+ -(void)removeTabViewItem:(NSTabViewItem *)item {
+-    int selectedIndex = [self indexOfTabViewItem:_selectedItem];
++    // (the indexes were ints compared with NSNotFound: removing the only item selected item -1)
++    NSInteger selectedIndex = (_selectedItem != nil) ? (NSInteger)[_items indexOfObjectIdenticalTo:_selectedItem] : NSNotFound;
+     if (item == _selectedItem) {
+-        int newIndex = selectedIndex - 1;
++        NSInteger count = [self numberOfTabViewItems];
++        NSInteger newIndex = NSNotFound;
+ 
+-        if (newIndex < 0) {
++        if (selectedIndex != NSNotFound && selectedIndex > 0)
++            newIndex = selectedIndex - 1;
++        else if (selectedIndex != NSNotFound && selectedIndex + 1 < count)
+             newIndex = selectedIndex + 1;
+ 
+-            if (newIndex >= [self numberOfTabViewItems]) {
+-                newIndex = NSNotFound;
+-            }
+-        }
+-
+         if (newIndex == NSNotFound) {
+             [[_selectedItem view] removeFromSuperview];
+             _selectedItem = nil;
+--- a/src/Frameworks/AppKit/NSFoundWithTerminalAdditions.m
++++ b/src/Frameworks/AppKit/NSFoundWithTerminalAdditions.m
+@@ -0,0 +1,88 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * -[NSAttributedString URLAtIndex:effectiveRange:] (AppKit's addition for automatic link
++ * detection): the URL of a link attribute at the index, or the URL that the text around the index
++ * spells. Text counts as a URL when the run of characters without white space around the index
++ * (less surrounding punctuation) has a scheme followed by "://", is a mailto: address, or begins
++ * with "www."; nothing else is guessed.
++ */
++#import <Foundation/Foundation.h>
++#import <AppKit/NSAttributedString.h>
++
++@implementation NSAttributedString (SFURLAtIndex)
++
++- (NSURL *)URLAtIndex:(NSUInteger)location effectiveRange:(NSRangePointer)effectiveRange
++{
++    NSString *string = [self string];
++    NSUInteger length = [string length], start, end;
++    NSRange linkRange = NSMakeRange(NSNotFound, 0);
++    NSCharacterSet *space = [NSCharacterSet whitespaceAndNewlineCharacterSet];
++    NSCharacterSet *trimmed = [NSCharacterSet characterSetWithCharactersInString:@"<>()[]{}\"'`.,;:!?"];
++    NSString *word, *lower;
++    NSURL *url = nil;
++    id link;
++
++    if (effectiveRange != NULL)
++        *effectiveRange = NSMakeRange(location, 0);
++    if (location >= length)
++        return nil;
++    link = [self attribute:NSLinkAttributeName atIndex:location effectiveRange:&linkRange];
++    if ([link isKindOfClass:[NSString class]])
++        link = [NSURL URLWithString:link];
++    if ([link isKindOfClass:[NSURL class]]) {
++        if (effectiveRange != NULL)
++            *effectiveRange = linkRange;
++        return link;
++    }
++    if ([space characterIsMember:[string characterAtIndex:location]])
++        return nil;
++    // the run without white space round the index, at most 2048 characters each way
++    for (start = location; start > 0 && location - start < 2048 && ![space characterIsMember:[string characterAtIndex:start - 1]]; start--)
++        ;
++    for (end = location + 1; end < length && end - location < 2048 && ![space characterIsMember:[string characterAtIndex:end]]; end++)
++        ;
++    while (start < end && [trimmed characterIsMember:[string characterAtIndex:start]])
++        start++;
++    while (end > start && [trimmed characterIsMember:[string characterAtIndex:end - 1]])
++        end--;
++    if (location < start || location >= end)
++        return nil;
++    word = [string substringWithRange:NSMakeRange(start, end - start)];
++    lower = [word lowercaseString];
++    if ([lower hasPrefix:@"www."] && [word length] > 6)
++        url = [NSURL URLWithString:[@"http://" stringByAppendingString:word]];
++    else if ([lower hasPrefix:@"mailto:"] && [word rangeOfString:@"@"].location != NSNotFound)
++        url = [NSURL URLWithString:word];
++    else {
++        NSRange sep = [word rangeOfString:@"://"];
++        NSUInteger i;
++        BOOL scheme = sep.location != NSNotFound && sep.location > 0 && NSMaxRange(sep) < [word length];
++
++        for (i = 0; scheme && i < sep.location; i++) {
++            unichar c = [lower characterAtIndex:i];
++
++            scheme = (c >= 'a' && c <= 'z') || (i > 0 && ((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'));
++        }
++        if (scheme)
++            url = [NSURL URLWithString:word];
++    }
++    if (url != nil && effectiveRange != NULL)
++        *effectiveRange = NSMakeRange(start, end - start);
++    return url;
++}
++
++@end
++
++#import <AppKit/NSCell.h>
++
++/* -[NSCell interiorBackgroundStyle]: the background a cell's interior is drawn on (light, unless
++ * the cell is highlighted in a list, where it is the selection's dark fill). A table's custom cell
++ * asks before it draws. */
++@implementation NSCell (SFInteriorBackgroundStyle)
++
++- (NSInteger)interiorBackgroundStyle
++{
++    return [self isHighlighted] ? 1 /* NSBackgroundStyleDark */ : 0 /* NSBackgroundStyleLight */;
++}
++
++@end
+--- a/src/Frameworks/AppKit/NSToolbar.subproj/NSToolbar.m
++++ b/src/Frameworks/AppKit/NSToolbar.subproj/NSToolbar.m
+@@ -338,7 +338,9 @@
+    if([_delegate respondsToSelector:@selector(toolbarDefaultItemIdentifiers:)])
+     result=[self _itemsWithIdentifiers:[_delegate toolbarDefaultItemIdentifiers:self]];
+ 
+-   if(result==nil)
++   // a delegate that names no items leaves the toolbar what its nib gave it (the items of a nib's
++   // toolbar were all removed when its delegate outlet was connected)
++   if([result count]==0)
+     result=_defaultItems;
+     
+    return result;
+@@ -405,7 +407,7 @@
+     if ([_delegate respondsToSelector:notes[i].selector])
+      [[NSNotificationCenter defaultCenter] addObserver:_delegate selector:notes[i].selector name:notes[i].name object:self];
+      
+-   if (isNew) {  // allow the new delegate to reset the layout
++   if (isNew && !_isLoadingConfiguration) {  // allow the new delegate to reset the layout (not while the toolbar is being decoded)
+     _loadDefaultItems=YES;
+     [self loadDefaultItemsIfNeeded];
+     [_window _toolbarSizeDidChangeFromOldHeight:[self visibleHeight]];
+@@ -533,7 +535,6 @@
+       NSUnimplementedMethod();
+    else {
+       _identifier=[[coder decodeObjectForKey:@"NSToolbarIdentifier"] retain];
+-      [self setDelegate:[coder decodeObjectForKey:@"NSToolbarDelegate"]];
+       _items=[[coder decodeObjectForKey:@"NSToolbarIBDefaultItems"] mutableCopy];
+       _selectedItemIdentifier=nil;
+       _allowedItems=[[coder decodeObjectForKey:@"NSToolbarIBAllowedItems"] retain];
+@@ -552,6 +553,24 @@
+       _allowsUserCustomization=[coder decodeBoolForKey:@"NSToolbarAllowsUserCustomization"];
+       _isLoadingConfiguration=NO;
+       _loadDefaultItems=NO;
++      /* A toolbar whose items come from its delegate (-toolbarDefaultItemIdentifiers:,
++       * -toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:) has no items in the archive.
++       * The delegate is set once the toolbar can take items (it was set first, and what it
++       * supplied went into arrays that did not exist yet: the toolbar stayed empty), and it is
++       * asked at the first layout, when the nib's connections are made. */
++      if(_items==nil)
++       _items=[[NSMutableArray alloc] init];
++      if(_identifiedItems==nil)
++       _identifiedItems=[[NSMutableDictionary alloc] init];
++      {
++       id delegate=[coder decodeObjectForKey:@"NSToolbarDelegate"];
++       BOOL empty=[_items count]==0;
++
++       _isLoadingConfiguration=YES;
++       [self setDelegate:delegate];
++       _isLoadingConfiguration=NO;
++       _loadDefaultItems=(empty && delegate!=nil);
++      }
+       [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(toolbarChangedAppearance:) name:NSToolbarChangeAppearanceNotification object:nil];
+       /*
+        NSToolbarPrefersToBeShown = 1;
+--- a/src/Frameworks/AppKit/NSToolbar.subproj/NSToolbarView.m
++++ b/src/Frameworks/AppKit/NSToolbar.subproj/NSToolbarView.m
+@@ -157,7 +157,17 @@
+     for(i=0;i<count;i++){
+      NSToolbarItem *item=[items objectAtIndex:i];
+ 
+-     if([item visibilityPriority]==priority){
++     // any priority counts with the nearest of the four classes (an item whose priority was none
++     // of them never became visible, and a toolbar of such items stayed empty)
++     NSInteger itemPriority=[item visibilityPriority];
++
++     if(itemPriority>=NSToolbarItemVisibilityPriorityUser)
++      itemPriority=NSToolbarItemVisibilityPriorityUser;
++     else if(itemPriority>NSToolbarItemVisibilityPriorityStandard)
++      itemPriority=NSToolbarItemVisibilityPriorityHigh;
++     else if(itemPriority<NSToolbarItemVisibilityPriorityStandard)
++      itemPriority=NSToolbarItemVisibilityPriorityLow;
++     if(itemPriority==priority){
+       CGFloat availableWidth=desiredWidth-consumedWidth;
+ 
+       // if there are still items which can go in the overflow menu
+--- a/src/Frameworks/AppKit/NSWorkspace.m
++++ b/src/Frameworks/AppKit/NSWorkspace.m
+@@ -262,7 +262,48 @@
+    return [type isEqualToString:conformsToType];
+ }
+ 
++/* The uniform type identifier of a file, from its extension: the types the application itself
++ * declares (UTExportedTypeDeclarations, UTImportedTypeDeclarations of its Info.plist; there is no
++ * system-wide type database here), then a few public types. A file whose extension nothing
++ * declares is answered with the extension, as before. */
+ -(NSString *)typeOfFile:(NSString *)path error:(NSError **)error {
++   NSString     *extension=[[path pathExtension] lowercaseString];
++   NSDictionary *info=[[NSBundle mainBundle] infoDictionary];
++   BOOL          isDirectory=NO;
++
++   for(NSString *key in [NSArray arrayWithObjects:@"UTExportedTypeDeclarations",@"UTImportedTypeDeclarations",nil]){
++    id declarations=[info objectForKey:key];
++
++    if(![declarations isKindOfClass:[NSArray class]])
++     continue;
++    for(NSDictionary *declaration in declarations){
++     if(![declaration isKindOfClass:[NSDictionary class]])
++      continue;
++     id tags=[[declaration objectForKey:@"UTTypeTagSpecification"] objectForKey:@"public.filename-extension"];
++     NSString *identifier=[declaration objectForKey:@"UTTypeIdentifier"];
++
++     if([tags isKindOfClass:[NSString class]])
++      tags=[NSArray arrayWithObject:tags];
++     if(![tags isKindOfClass:[NSArray class]] || ![identifier isKindOfClass:[NSString class]])
++      continue;
++     for(NSString *tag in tags)
++      if([tag isKindOfClass:[NSString class]] && [[tag lowercaseString] isEqualToString:extension])
++       return identifier;
++    }
++   }
++   if([extension length]==0 && [[NSFileManager defaultManager] fileExistsAtPath:path isDirectory:&isDirectory] && isDirectory)
++    return @"public.folder";
++   {
++    static NSDictionary *known=nil;
++
++    if(known==nil)
++     known=[[NSDictionary alloc] initWithObjectsAndKeys:@"public.plain-text",@"txt",@"com.apple.property-list",@"plist",
++       @"public.png",@"png",@"public.jpeg",@"jpg",@"public.jpeg",@"jpeg",@"public.tiff",@"tiff",@"public.tiff",@"tif",
++       @"com.adobe.pdf",@"pdf",@"public.rtf",@"rtf",@"public.html",@"html",@"public.xml",@"xml",@"public.json",@"json",
++       @"public.shell-script",@"sh",@"com.apple.application-bundle",@"app",nil];
++    if([known objectForKey:extension]!=nil)
++     return [known objectForKey:extension];
++   }
+    return [path pathExtension];
+ }
+ 
+--- a/src/Frameworks/AppKit/NSDisplay.m
++++ b/src/Frameworks/AppKit/NSDisplay.m
+@@ -331,8 +331,15 @@
+    return standard;
+ }
+ 
++// NSBeep(): there is no system alert sound on this system yet. Said once; the caller goes on
++// (raising here ended up as an exception report for every bell of a terminal).
+ -(void)beep {
+-   NSUnimplementedMethod();
++   static BOOL said=NO;
++
++   if(!said){
++    said=YES;
++    NSLog(@"AppKit: NSBeep() makes no sound on this system (no system alert sound)");
++   }
+ }
+ 
+ -(NSSet *)allFontFamilyNames {

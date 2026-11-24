@@ -1,0 +1,467 @@
+--- a/src/Frameworks/AppKit/NSWindow.h
++++ b/src/Frameworks/AppKit/NSWindow.h
+@@ -145,6 +145,7 @@
+ APPKIT_EXPORT NSString *const NSWindowDidDeminiaturizeNotification;
+ APPKIT_EXPORT NSString *const NSWindowWillMoveNotification;
+ APPKIT_EXPORT NSString *const NSWindowDidMoveNotification;
++APPKIT_EXPORT NSString * const NSWindowDidChangeBackingPropertiesNotification;
+ APPKIT_EXPORT NSString *const NSWindowDidResizeNotification;
+ APPKIT_EXPORT NSString *const NSWindowDidUpdateNotification;
+ APPKIT_EXPORT NSString *const NSWindowWillCloseNotification;
+@@ -180,6 +181,12 @@
+     NSString *shmPath;
+     NSString *bundleID;
+     void *buffer;
++    // the scale the backing store and its context were made for, in 120ths
++    int _backingScale120;
++    // the scale the window last told its delegate and views about
++    int _reportedScale120;
++    // WS_STATE_* bits: what the compositor did with the window from its own frame
++    int _serverState;
+     int bufsize;
+ 
+     NSRect _frame;
+--- a/src/Frameworks/AppKit/NSWindow.m
++++ b/src/Frameworks/AppKit/NSWindow.m
+@@ -79,7 +79,6 @@
+ #import "O2Context_builtin_FT.h"
+ 
+ NSString * const NSWindowDidBecomeKeyNotification=@"NSWindowDidBecomeKeyNotification";
+-NSString * const NSWindowDidChangeBackingPropertiesNotification=@"NSWindowDidChangeBackingPropertiesNotification";
+ NSString * const NSWindowDidChangeScreenNotification=@"NSWindowDidChangeScreenNotification";
+ NSString * const NSWindowDidEnterFullScreenNotification=@"NSWindowDidEnterFullScreenNotification";
+ NSString * const NSWindowDidExitFullScreenNotification=@"NSWindowDidExitFullScreenNotification";
+@@ -97,6 +96,7 @@
+ NSString * const NSWindowDidMiniaturizeNotification=@"NSWindowDidMiniaturizeNotification";
+ NSString * const NSWindowDidDeminiaturizeNotification=@"NSWindowDidDeminiaturizeNotification";
+ NSString * const NSWindowDidMoveNotification=@"NSWindowDidMoveNotification";
++NSString * const NSWindowDidChangeBackingPropertiesNotification=@"NSWindowDidChangeBackingPropertiesNotification";
+ NSString * const NSWindowDidResizeNotification=@"NSWindowDidResizeNotification";
+ NSString * const NSWindowDidUpdateNotification=@"NSWindowDidUpdateNotification";
+ NSString * const NSWindowWillCloseNotification=@"NSWindowWillCloseNotification";
+@@ -194,6 +194,9 @@
+ -(void)_sfUpdateMetalLayers;
+ @end
+ 
++// set once a compositor that offers server-side decorations has refused them for a window
++static BOOL sfServerFramesRefused = NO;
++
+ @implementation NSWindow
+ 
+ +(NSWindowDepth)defaultDepthLimit {
+@@ -318,6 +321,8 @@
+    _sharingType=NSWindowSharingReadOnly;
+     // "The default maximum size of a window is {FLT_MAX, FLT_MAX}"
+    _maxSize=NSMakeSize(FLT_MAX,FLT_MAX);
++   [self _sendSizeLimits];
++   _reportedScale120=_windowServerBackingScale120();
+ 
+    _title=@"";
+    _miniwindowTitle=@"";
+@@ -454,8 +459,11 @@
+         int depth = [_display depth] / 8;
+         int shmfd = shm_open([shmPath cString], O_RDWR, 0600);
+         // whole pixels, truncated as the window server does, or a fractional width shears every row
+-        int pixelsWide = (int)_frame.size.width, pixelsHigh = (int)_frame.size.height;
++        // at the window server's scale: its backing store is this many pixels for the frame's size in points
++        int scale120 = _windowServerBackingScale120();
++        int pixelsWide = wsPixelsForPoints(_frame.size.width, scale120), pixelsHigh = wsPixelsForPoints(_frame.size.height, scale120);
+         bufsize = (size_t)depth * pixelsWide * pixelsHigh;
++        _backingScale120 = scale120;
+ 
+         if(shmfd >= 0) {
+             /* The window server sizes this object from its own idea of the
+@@ -484,6 +492,16 @@
+                 bitsPerComponent:8 bytesPerRow:4*pixelsWide colorSpace:colorSpace
+                 bitmapInfo:kO2BitmapByteOrder32Little|kCGImageAlphaPremultipliedFirst];
+         _context = [[O2Context_builtin_FT alloc] initWithSurface:surface flipped:NO];
++        /* Points to pixels. The context's base transform (between the user CTM, which views set
++         * outright when they take focus, and the surface's flip) takes the scale, so every path,
++         * glyph and image drawn in points is rasterised at the backing store's density and user
++         * space stays in points for everything above. The factors are the real ratios, which
++         * differ from the scale by the rounding of the size. */
++        if(scale120 != 120 && _frame.size.width >= 1 && _frame.size.height >= 1) {
++            CGFloat sx = pixelsWide / floor(_frame.size.width), sy = pixelsHigh / floor(_frame.size.height);
++
++            O2ContextSetBaseCTM(_context, O2AffineTransformMakeScale(sx, sy));
++        }
+ 
+         /* +currentContext is not owned by us; releasing it frees a context
+          * that is still held by the autorelease pool, which then faults on a
+@@ -1046,6 +1064,8 @@
+         [_backgroundView setFrameSize:_frame.size];
+         [_backgroundView resizeSubviewsWithOldSize:oldSize];
+         [self invalidateContextsWithNewSize:_frame.size forceRebuild:YES];
++        if(!(_styleMask&NSResizableWindowMask))
++            [self _sendSizeLimits];
+         [self resetCursorRects];
+         [self saveFrameUsingName:_autosaveFrameName];
+         [self postNotificationName:NSWindowDidResizeNotification];
+@@ -1109,10 +1129,12 @@
+ 
+ -(void)setMinSize:(NSSize)size {
+    _minSize=size;
++   [self _sendSizeLimits];
+ }
+ 
+ -(void)setMaxSize:(NSSize)size {
+    _maxSize=size;
++   [self _sendSizeLimits];
+ }
+ 
+ -(void)setContentMinSize:(NSSize)value {
+@@ -1120,6 +1142,7 @@
+ 
+    _contentMinSize=value;
+    _minSize=frame.size;
++   [self _sendSizeLimits];
+ }
+ 
+ -(void)setContentMaxSize:(NSSize)value {
+@@ -1583,9 +1606,9 @@
+ 
+ // device pixels per point: the screen's, or 1 off screen
+ -(CGFloat)backingScaleFactor {
+-   NSScreen *screen=[self screen];
+-
+-   return screen!=nil ? [screen backingScaleFactor] : 1.0;
++   // the scale of this window's own backing store; it has one whether or not its frame lies on
++   // a screen (AppKit's frame is not where the compositor put the window)
++   return (_backingScale120 > 0 ? _backingScale120 : _windowServerBackingScale120())/120.0;
+ }
+ 
+ -(NSResponder *)firstResponder {
+@@ -1676,6 +1699,9 @@
+ }
+ 
+ -(BOOL)isZoomed {
++    // maximised by the compositor's frame is zoomed, whatever size its work area gave the window
++    if(_serverState & WS_STATE_MAXIMIZED)
++        return YES;
+     NSRect zoomedFrame = [self zoomedFrame];
+     return NSEqualRects( _frame, zoomedFrame );
+ }
+@@ -1693,7 +1719,7 @@
+ }
+ 
+ -(BOOL)isMiniaturized {
+-    return _isMiniaturized;
++    return _isMiniaturized || (_serverState & WS_STATE_SUSPENDED) != 0;
+ }
+ 
+ -(BOOL)isMovable {
+@@ -1947,6 +1973,73 @@
+ }
+ 
+ // a tiling compositor picks the size, the top edge stays put in Cocoa's bottom-left coordinates
++/* The compositor's scale changed (the desktop's display scale). The window keeps its size in
++ * points; its backing store is remade at the new density (the window server does that when it
++ * hears the window's state again) and everything is drawn again. */
++-(void)_serverDidChangeScale:(NSNumber *)scale120 {
++   int scale=[scale120 intValue];
++
++   // a resize or a move that arrived with the new scale may have remade the backing store at it already
++   if(_backingScale120 != scale || _context == nil)
++    [self invalidateContextsWithNewSize:_frame.size forceRebuild:YES];
++   if(_reportedScale120 == scale)
++    return;
++   _reportedScale120 = scale;
++   [_backgroundView setNeedsDisplay:YES];
++   [self postNotificationName:NSWindowDidChangeBackingPropertiesNotification];
++   if([_delegate respondsToSelector:@selector(windowDidChangeBackingProperties:)])
++    [_delegate windowDidChangeBackingProperties:[NSNotification notificationWithName:NSWindowDidChangeBackingPropertiesNotification object:self]];
++   [_contentView viewDidChangeBackingProperties];
++   [self display];
++}
++
++/* The compositor maximised the window, put it away or brought it back, from the buttons of
++ * the frame it draws. The window is the application's all the same: its zoomed and
++ * miniaturised state follow, with the notifications and delegate calls a click on AppKit's
++ * own buttons would have produced. The size itself arrives as a configure. */
++-(void)_serverDidSetState:(NSNumber *)state {
++   int bits=[state intValue],was=_serverState;
++
++   _serverState=bits;
++   if((bits^was)&WS_STATE_SUSPENDED){
++    if(bits&WS_STATE_SUSPENDED){
++     [self postNotificationName:NSWindowWillMiniaturizeNotification];
++     [self postNotificationName:NSWindowDidMiniaturizeNotification];
++    }
++    else
++     [self postNotificationName:NSWindowDidDeminiaturizeNotification];
++   }
++   if((bits^was)&WS_STATE_MAXIMIZED)
++    [_backgroundView setNeedsDisplay:YES];
++}
++
++/* The compositor's answer about this window's frame differs from what the window was laid out
++ * for. Refused server-side decoration: from now on AppKit draws frames itself, and this
++ * window grows by its title bar around the same content. */
++-(void)_serverDidSetDecoration:(NSNumber *)server {
++   if([server boolValue] || !NSWindowFrameIsDrawnByServer(_styleMask))
++    return;
++   NSRect content=[self contentRectForFrameRect:_frame];
++   sfServerFramesRefused=YES;
++   NSRect frame=[self frameRectForContentRect:content];
++   NSSize oldSize=[_backgroundView frame].size;
++   _frame.size=NSMakeSize(oldSize.width+1,oldSize.height);   // the frame view must tile again even at an equal size
++   [self setFrame:frame display:YES];
++}
++
++// the size limits as the compositor needs them: its resize stops where AppKit's would
++-(void)_sendSizeLimits {
++   NSSize min=_minSize,max=_maxSize;
++   if(!(_styleMask&NSResizableWindowMask))
++    min=max=_frame.size;
++   struct wsRPCWindow data = {
++       { kWSWindowSetSizeLimits, sizeof(struct wsRPCWindow) - sizeof(struct wsRPCBase) },
++       _number, min.width, min.height,
++       max.width>=32767 ? 0 : max.width, max.height>=32767 ? 0 : max.height, _styleMask, 0, {'\0'}, _level
++   };
++   _windowServerRPC(&data, sizeof(data), NULL, NULL);
++}
++
+ -(void)_serverDidConfigureSize:(NSValue *)value {
+    NSSize size=[value sizeValue];
+    NSRect frame=[self frame];
+@@ -3605,6 +3698,9 @@
+ 
+     if(!(_styleMask & NSResizableWindowMask) || (_styleMask & NSFullScreenWindowMask) || _isZoomed || _sheetContext != nil)
+         return 0;
++    // the compositor's frame has the resize edges of a window it decorates
++    if(NSWindowFrameIsDrawnByServer(_styleMask))
++        return 0;
+     if(point.x < 0 || point.y < 0 || point.x > width || point.y > height)
+         return 0;
+ 
+@@ -3754,6 +3850,13 @@
+ void CGNativeBorderFrameWidthsForStyle(unsigned styleMask,CGFloat *top,CGFloat *left,
+                                        CGFloat *bottom,CGFloat *right);
+ 
++/* Whether a window of this style leaves its frame (title bar, controls, resize edges) to the
++ * compositor. True for windows with a standard frame when the compositor offers to draw
++ * frames; see wsStyleWantsServerFrame for which styles those are. */
++BOOL NSWindowFrameIsDrawnByServer(unsigned styleMask) {
++    return !sfServerFramesRefused && _windowServerServerDecorations() && wsStyleWantsServerFrame(styleMask);
++}
++
+ CGRect CGInsetRectForNativeWindowBorder(CGRect frame,unsigned styleMask) {
+     CGFloat top, left, bottom, right;
+     CGNativeBorderFrameWidthsForStyle(styleMask, &top, &left, &bottom, &right);
+@@ -3783,6 +3886,11 @@
+         *top=*left=*bottom=*right=0;
+         return;
+     }
++    // a standard window's frame is the compositor's where it draws one: the window is its content
++    if(NSWindowFrameIsDrawnByServer(styleMask)) {
++        *top=*left=*bottom=*right=0;
++        return;
++    }
+ 
+     switch(styleMask & 0x0FFF) {
+         case NSBorderlessWindowMask:
+--- a/src/Frameworks/AppKit/NSWindow-Private.h
++++ b/src/Frameworks/AppKit/NSWindow-Private.h
+@@ -13,6 +13,9 @@
+ // style flag for private windows (that NSApp doesn't have to know about)
+ #define NSAppKitPrivateWindow 0x8000000
+ 
++// whether a window of this style leaves its frame to the compositor (server-side decoration)
++APPKIT_EXPORT BOOL NSWindowFrameIsDrawnByServer(unsigned styleMask);
++
+ @interface NSWindow (NSWindow_private)
+ - (CGWindow *)platformWindow;
+ - (CGContextRef)cgContext;
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -297,12 +297,40 @@
+                                                                  withObject:[NSValue valueWithSize:NSMakeSize(me.dx, me.dy)]
+                                                               waitUntilDone:NO];
+                                     break;
++                                case WS_EVENT_SCALE:
++                                    if(window != nil)
++                                        [window performSelectorOnMainThread:@selector(_serverDidChangeScale:)
++                                                                 withObject:[NSNumber numberWithInt:(int)me.dx]
++                                                              waitUntilDone:NO];
++                                    break;
++                                case WS_EVENT_STATE:
++                                    if(window != nil)
++                                        [window performSelectorOnMainThread:@selector(_serverDidSetState:)
++                                                                 withObject:[NSNumber numberWithInt:(int)me.dx]
++                                                              waitUntilDone:NO];
++                                    break;
++                                case WS_EVENT_DECORATION:
++                                    if(window != nil)
++                                        [window performSelectorOnMainThread:@selector(_serverDidSetDecoration:)
++                                                                 withObject:[NSNumber numberWithBool:me.dx != 0]
++                                                              waitUntilDone:NO];
++                                    break;
+                                 case WS_EVENT_MOVED:
+                                     if(window != nil)
+                                         [window performSelectorOnMainThread:@selector(_serverDidMoveTo:)
+                                                                  withObject:[NSValue valueWithPoint:NSMakePoint(me.x, me.y)]
+                                                               waitUntilDone:NO];
+                                     break;
++                                case WS_EVENT_POPUP_DONE: {
++                                    // a menu's or list's tracking loop ends on this event, as it does when
++                                    // the application is deactivated under it
++                                    NSEvent *cancel = [NSEvent otherEventWithType:NSAppKitDefined location:NSZeroPoint modifierFlags:0
++                                                                        timestamp:0 windowNumber:0 context:nil
++                                                                          subtype:NSApplicationDeactivated data1:0 data2:0];
++
++                                    [self performSelectorOnMainThread:@selector(_sfPostCancelEvent:) withObject:cancel waitUntilDone:NO];
++                                    break;
++                                }
+                                 case WS_EVENT_CLOSE:
+                                     if(window != nil)
+                                         [window performSelectorOnMainThread:@selector(performClose:)
+@@ -2411,6 +2439,11 @@
+     }
+ }
+ 
++// from the event thread: a compositor-dismissed popup's cancel event, put at the head of the queue
++- (void)_sfPostCancelEvent:(NSEvent *)event {
++    [self postEvent:event atStart:YES];
++}
++
+ //private method called when the application is reopened
+ -(void)_reopen {
+     BOOL doReopen=YES;
+--- a/src/Frameworks/AppKit/NSThemeFrame.m
++++ b/src/Frameworks/AppKit/NSThemeFrame.m
+@@ -251,6 +251,10 @@
+ -(CGFloat)_titleHeight {
+     NSWindow *window = [self window];
+ 
++    // no title bar of ours inside a frame the compositor draws
++    if(NSWindowFrameIsDrawnByServer([window styleMask]))
++        return 0;
++
+     if(!([window styleMask] & NSFullSizeContentViewWindowMask))
+         return NSWindowTitleHeight;
+     switch([window toolbarStyle]) {
+@@ -400,6 +404,11 @@
+ 
+     if([[self window] styleMask] == NSBorderlessWindowMask || ([[self window] styleMask] & NSFullScreenWindowMask))
+         return;
++    // the compositor draws this window's title bar, controls and edges: ours is the background above
++    if(NSWindowFrameIsDrawnByServer([[self window] styleMask])) {
++        _closeButtonRect = _miniButtonRect = _zoomButtonRect = controls = NSZeroRect;
++        return;
++    }
+ 
+     if([[self window] isSheet])
+         bounds.size.height += cheatSheet;
+@@ -541,6 +550,13 @@
+     CGNativeBorderFrameWidthsForStyle([[self window] styleMask], &top, &left, &bottom, &right);
+     NSPoint pos = [event locationInWindow];
+ 
++    // inside the compositor's frame there is no title bar or control of ours to press
++    if(NSWindowFrameIsDrawnByServer([[self window] styleMask])) {
++        if([[self window] isMovableByWindowBackground])
++            [[self window] requestMove:event];
++        return;
++    }
++
+     // no title bar or buttons in full screen
+     if([[self window] styleMask] & NSFullScreenWindowMask)
+         return;
+--- a/src/Frameworks/AppKit/NSScreen.m
++++ b/src/Frameworks/AppKit/NSScreen.m
+@@ -27,6 +27,7 @@
+ #import <AppKit/NSApplication.h>
+ #import <AppKit/NSWindow.h>
+ #import <Onyx2D/O2ColorSpace.h>
++#import <WindowServer/rpc.h>
+ 
+ NSString * const NSScreenColorSpaceDidChangeNotification = @"NSScreenColorSpaceDidChangeNotification";
+ 
+@@ -35,7 +36,6 @@
+ -initWithFrame:(NSRect)frame visibleFrame:(NSRect)visibleFrame {
+     _frame=frame;
+     _visibleFrame=visibleFrame;
+-    _backingScaleFactor = 1.0;
+     _maximumPotentialExtendedDynamicRangeColorComponentsValue = 1.0;
+     _maximumExtendedDynamicRangeColorComponentValue = 1.0;
+     _maximumReferenceExtendedDynamicRangeColorComponentValue = 0;
+@@ -149,6 +149,11 @@
+    return 60;
+ }
+ 
++// pixels per point of windows on this screen: the compositor's scale, whole or fractional, as it is now
++-(CGFloat)backingScaleFactor {
++   return _windowServerBackingScale120()/120.0;
++}
++
+ -(CGFloat)userSpaceScaleFactor {
+    return 1.0;
+ }
+--- a/src/Frameworks/AppKit/NSDisplay.m
++++ b/src/Frameworks/AppKit/NSDisplay.m
+@@ -85,7 +85,9 @@
+     }
+     NSRect frame = NSMakeRect(0, 0, CGDisplayModeGetWidth(mode), CGDisplayModeGetHeight(mode));
+     NSRect visFrame = frame;
+-    visFrame.size.height -= MENU_BAR_HEIGHT;
++    // the menu bar is upstream's desktop: where the compositor draws the frames there is none to stay clear of
++    if(!_windowServerServerDecorations())
++        visFrame.size.height -= MENU_BAR_HEIGHT;
+     NSScreen *screen = [[[NSScreen alloc] initWithFrame:frame visibleFrame:visFrame] retain];
+     [screen _propertiesFromMode:mode colorSpace:cs displayID:mainDisplay];
+     CGDisplayModeRelease(mode);
+@@ -117,7 +119,8 @@
+     NSRect visFrame = frame;
+ 
+     CGDisplayModeRelease(mode);
+-    visFrame.size.height -= MENU_BAR_HEIGHT;
++    if(!_windowServerServerDecorations())
++        visFrame.size.height -= MENU_BAR_HEIGHT;
+     [[_screens objectAtIndex:0] _setFrame:frame visibleFrame:visFrame];
+     [[NSNotificationCenter defaultCenter] postNotificationName:NSApplicationDidChangeScreenParametersNotification object:NSApp];
+ }
+--- a/src/Frameworks/AppKit/NSView.h
++++ b/src/Frameworks/AppKit/NSView.h
+@@ -304,6 +304,7 @@
+ - (NSViewLayerContentsRedrawPolicy)layerContentsRedrawPolicy;
+ - (void)setLayerContentsRedrawPolicy:(NSViewLayerContentsRedrawPolicy)newPolicy;
+ - (CALayer *)makeBackingLayer;
++- (void)viewDidChangeBackingProperties;
+ - (NSSize)convertSizeToBacking:(NSSize)size;
+ - (NSSize)convertSizeFromBacking:(NSSize)size;
+ - (NSPoint)convertPointToBacking:(NSPoint)point;
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -530,7 +530,19 @@
+ 
+    if(context==nil)
+     return;
+-   [self displayRectIgnoringOpacity:rect inContext:context];
++   /* The rep made by -bitmapImageRepForCachingDisplayInRect: has the window's pixels, not its
++    * points: drawn into as it was, the view came out at 1x in a corner of a 2x bitmap. */
++   {
++    CGContextRef port=[context graphicsPort];
++    CGFloat sx=rect.size.width>0 ? [imageRep pixelsWide]/rect.size.width : 1;
++    CGFloat sy=rect.size.height>0 ? [imageRep pixelsHigh]/rect.size.height : 1;
++
++    CGContextSaveGState(port);
++    if(sx!=1 || sy!=1)
++     CGContextScaleCTM(port,sx,sy);
++    [self displayRectIgnoringOpacity:rect inContext:context];
++    CGContextRestoreGState(port);
++   }
+ }
+ 
+ -(BOOL)isHidden {
+@@ -1616,6 +1628,12 @@
+    return window!=nil ? [window backingScaleFactor] : 1.0;
+ }
+ 
++// the window's scale changed: a view that caches anything in pixels hears it here, subviews after it
++-(void)viewDidChangeBackingProperties {
++   for(NSView *view in [[_subviews copy] autorelease])
++    [view viewDidChangeBackingProperties];
++}
++
+ -(NSSize)convertSizeToBacking:(NSSize)size {
+    CGFloat s=backingScale(self);
+ 

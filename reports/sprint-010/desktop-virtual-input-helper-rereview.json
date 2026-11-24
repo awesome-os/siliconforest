@@ -1,0 +1,63 @@
+{
+  "schema": 1,
+  "reviewer": "Astra",
+  "date": "2026-11-08",
+  "verdict": "APPROVE_SOURCE_AND_HOST_FAKE_TEST_SCOPE",
+  "scope": "V1-V5 fixes, console-owner integration, explicit opt-in and the separate guest input launcher. No hardware, guest execution, source edits or physical-input claim. The earlier review is preserved.",
+  "identities": {
+    "integrations/puredarwin/m1-bringup/virtual_input_progress.py": "8749b364bc8da21e7805eaff0fcefc86be66ff6ec81316f2901ac70f13825741",
+    "integrations/puredarwin/m1-bringup/test_virtual_input_progress.py": "e0b284f4b7294747b1e4896ef89b65417ae4ec94da8f673c73df278a6d786828",
+    "integrations/puredarwin/m1-bringup/host_progress.py": "e3ffc5b33f1f3351855e7f8747abde050f23aca28e80931c0c2014e7cbe23709",
+    "integrations/puredarwin/m1-bringup/test_host_progress.py": "ce145b9335b85c25fe4329e8a8170c7a0de63c6a36b9f6aae8befdb4e6e80f7f",
+    "integrations/puredarwin/chonkstep-darwin/darwin-desktop-input-test": "f473208c924a9a625ce3deea2b2e268cf5f3f68c16f54dab2c5eccb9659a478c",
+    "tools/m1_bringup_cycle.py": "73db05cb2f85bc565875b6018c355641894f6bd0df597e5bacb77283fa256698"
+  },
+  "closed_findings": [
+    {"id": "V1", "source": "virtual_input_progress.py:60", "result": "feed refuses the existing expired deadline before consuming a READY or changing its deadline. Tests cover the boundary, a late READY and a fragmented READY finishing late."},
+    {"id": "V2", "source": "virtual_input_progress.py:108", "result": "Content-phase motion is parsed and checked against local (200,100), tolerance one pixel; contradictory or malformed motion clears a queued click. Same-chunk regression passes; later titlebar drag is not incorrectly subjected to the content-point constraint."},
+    {"id": "V3", "source": "virtual_input_progress.py:98", "result": "The bounded decimal grammar rejects malformed, nonfinite, signed-negative and excessively long coordinates before conversion. Accepted strings cannot make float conversion throw. Failure remains sticky."},
+    {"id": "V4", "source": "virtual_input_progress.py:91", "result": "Press evidence now requires a prior keying emission. Because the first keying action is fixed A-down, this establishes the intended causal ordering; integration write errors terminate the owner before further observations."},
+    {"id": "V5", "source": "virtual_input_progress.py:23", "result": "Upper endpoints are clamped to 32767; integer validation bounds the lower endpoints. Current interior schedule points are unchanged."}
+  ],
+  "integration": {
+    "source": "host_progress.py:263-417 and run_worker:806-838; tools/m1_bringup_cycle.py:27-46",
+    "assessment": [
+      "The same secondary-CDC owner calls feed/tick and writes returned bytes. Empty reads also advance time. There is no additional reader or timer-thread serial writer.",
+      "Attempted TX is recorded and fsynced before the serial write; short and exceptional writes enter the owner's sticky failure path and invalidate schedule completion, including failure on the final release.",
+      "close signals finish and joins before cancellation/reporting/device close. Unknown still-running ownership prevents successful finalization. No schedule retry or guessed SOH resynchronization is added.",
+      "Virtual input defaults off. Its exact version/origin/output/client/content-origin record is required alongside desktop opt-in and a hash-bound RAM root; keyboard mode is excluded.",
+      "The verified KC must contain PDSerialHID and IOHIDFamily and must exclude PDM1SPIHID. The guest framebuffer must match 2560x1600, stride 10240 and 30-bit depth before input execution.",
+      "Both controller and launcher pin the exact helper hash. The canonical desktop command remains fixed, single-use and nonce-validated; guest text cannot choose commands, coordinates, key usages or retry counts."
+    ]
+  },
+  "script": {
+    "source": "darwin-desktop-input-test:4-48",
+    "assessment": [
+      "The corrected --run --socket PATH --input pdhid order matches the strict wm-darwin/src/main.rs parser.",
+      "Nonce is exactly 48 lowercase hex characters. Runtime directory is mode 0700. No human prompt, synthetic device node or user-provided command path is introduced.",
+      "The nonce PRIME barrier precedes stat-only character-device polling: at most 50 sleeps of 0.1 s, then a 0.5 s quiet delay. Both real nodes are required before --input pdhid is started.",
+      "The native sleep source supports fractional seconds. The compositor opens both real queues with nonblocking/no-follow/close-on-exec flags and drains its bounded pre-open backlog before advertising the seat.",
+      "The socket wait is bounded by 100 sleeps of 0.1 s and checks the owned compositor PID. The exact client-input binary is started with the fresh nonce and a 120-second bound; the script's nominal active interval is 100 seconds.",
+      "Cleanup signals and waits only for the stored child PIDs, client first then compositor. It does not force text-console painting while the compositor owns the framebuffer."
+    ],
+    "limits": [
+      "The node check and quiet delay are ordering aids, not an acknowledgement that every prime was consumed. They do not qualify physical input or bypass the later actual READY/key/point/button/OBSERVED barriers.",
+      "The child wait calls are not individually timed. The enclosing host-worker/controller bounds remain necessary if guest teardown stalls. END alone is not clean PDGOP-close or console-restoration proof.",
+      "The client is normally terminated by the script before its 120-second normal completion. Do not claim client exit 0 or CLIENT_DONE from a successful input observation or END marker.",
+      "The packet assembler must place this reviewed script at the fixed /usr/bin/darwin-desktop-test path in the hash-bound RAM root, together with the exact client-input binary and XKB data. This review did not inspect or stage a new packet."
+    ]
+  },
+  "checks": [
+    {"command": "python3 integrations/puredarwin/m1-bringup/test_virtual_input_progress.py -v", "tests_passed": 17, "exit_code": 0},
+    {"command": "python3 integrations/puredarwin/m1-bringup/test_host_progress.py -v", "tests_passed": 31, "exit_code": 0, "includes": "Root's new short/exceptional final-write regression, same-owner empty-read pacing and close cancellation."},
+    {"command": "python3 -m unittest tests.test_m1_bringup_cycle -v", "tests_passed": 18, "exit_code": 0},
+    {"command": "sh -n integrations/puredarwin/chonkstep-darwin/darwin-desktop-input-test", "exit_code": 0, "scope": "Syntax only; script was not executed."},
+    {"check": "Independent in-memory fake-port final-write cases", "cases_passed": 2, "result": "Short return and OSError each produced exactly one attempted final release, sticky failure, schedule_completed=false, CLI proof false, preserved attempted TX and no subsequent write.", "scope": "Directly seeded final-drag state exercises the real owner/error/finalization path, not full hardware execution."}
+  ],
+  "remaining_evidence_boundary": [
+    "No new source blocker was found in this bounded re-review.",
+    "schedule_completed describes completed host emissions only. Qualify host-origin input from the fresh client's exact events plus the successful ordered TX ledger; qualify window dragging from actual resulting geometry/framebuffer evidence.",
+    "A controller command-line verdict remains a command-line verdict. It cannot by itself prove Wayland input, drag, compositor cleanup, panel scanout or physical keyboard/trackpad support.",
+    "The root-owned live boot uses its archived older sources. These local revisions must not be attributed to that run."
+  ]
+}

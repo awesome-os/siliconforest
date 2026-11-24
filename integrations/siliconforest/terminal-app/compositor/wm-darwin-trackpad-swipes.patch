@@ -1,0 +1,115 @@
+diff --git a/crates/wm-darwin/src/desktop_entry.rs b/crates/wm-darwin/src/desktop_entry.rs
+index 1db2d33..b802ca1 100644
+--- a/crates/wm-darwin/src/desktop_entry.rs
++++ b/crates/wm-darwin/src/desktop_entry.rs
+@@ -195,6 +195,7 @@ impl SessionIo for NativeIo<'_> {
+         for event in self.input.drain()? {
+             self.server.deliver_hid(event, ms)?;
+         }
++        self.server.trackpad_swipes(ms);
+         if let Some(autopilot) = &mut self.autopilot {
+             autopilot.step(self.server, ms)?;
+         }
+diff --git a/crates/wm-darwin/src/gesture.rs b/crates/wm-darwin/src/gesture.rs
+index de4a980..e65b2bd 100644
+--- a/crates/wm-darwin/src/gesture.rs
++++ b/crates/wm-darwin/src/gesture.rs
+@@ -35,6 +35,11 @@ pub struct Gesture {
+     vertical: Option<SwipeMotion>,
+     pub swipes: u64,
+     pub switches: u64,
++    /// The trackpad driver's swipe ring (`kern.sf_trackpad_swipe`): the last sequence number
++    /// taken, None before the first read; `absent` once the sysctl is not there.
++    ring_seq: Option<u32>,
++    ring_absent: bool,
++    pub ring_events: u64,
+     /// The stand-in for the swipe while the trackpad driver reports no multi-finger swipes:
+     /// Control-Command with a two-finger scroll (`wheel_swipe`). When the scroll stops, the swipe ends.
+     wheel_until: Option<Instant>,
+@@ -42,7 +47,7 @@ pub struct Gesture {
+ 
+ impl Default for Gesture {
+     fn default() -> Self {
+-        Self { tracker: SwipeTracker::default(), origin: None, position: 0.0, velocity: 0.0, spring: None, last: Instant::now(), vertical: None, swipes: 0, switches: 0, wheel_until: None }
++        Self { tracker: SwipeTracker::default(), origin: None, position: 0.0, velocity: 0.0, spring: None, last: Instant::now(), vertical: None, swipes: 0, switches: 0, wheel_until: None, ring_seq: None, ring_absent: false, ring_events: 0 }
+     }
+ }
+ 
+@@ -151,6 +156,47 @@ impl Server {
+         self.swipe(SwipePhase::Update, 3, i16::from(wheel) * 24, 0, time);
+         self.gesture.wheel_until = Some(Instant::now() + std::time::Duration::from_millis(250));
+     }
++    /// Every frame: the swipes the trackpad driver recognised (SFM1SPIHID, three or four
++    /// fingers; m1-trackpad-child/multitouch). Its ring is read with sysctl; each new event
++    /// becomes a Swipe event as an injected one would (`Server::deliver_hid`). Events lost to a
++    /// full ring end the swipe under way.
++    pub fn trackpad_swipes(&mut self, time: u32) {
++        if self.gesture.ring_absent || self.input.is_none() {
++            return;
++        }
++        let Some(ring) = read_swipe_ring() else {
++            self.gesture.ring_absent = true;
++            eprintln!("WMGESTURE trackpad swipes: kern.sf_trackpad_swipe absent (a trackpad driver without them)");
++            return;
++        };
++        let next = ring.1;
++        let Some(last) = self.gesture.ring_seq else {
++            self.gesture.ring_seq = Some(next.wrapping_sub(1));
++            eprintln!("WMGESTURE trackpad swipes: kern.sf_trackpad_swipe present next_seq={next}");
++            return;
++        };
++        let mut seq = last.wrapping_add(1);
++        while seq != next {
++            let e = ring.2[(seq % 32) as usize];
++            if e.0 != seq {
++                // overwritten before it was read: what is under way ends here
++                let _ = self.deliver_hid(crate::hid::Event::Swipe { phase: SwipePhase::Cancel, fingers: 3, dx: 0, dy: 0 }, time);
++                break;
++            }
++            let phase = match e.1 { 1 => Some(SwipePhase::Begin), 2 => Some(SwipePhase::Update), 3 => Some(SwipePhase::End), _ => None };
++            if let Some(phase) = phase {
++                self.gesture.ring_events += 1;
++                if self.gesture.ring_events == 1 {
++                    eprintln!("WMGESTURE trackpad swipes: first event phase={phase:?} fingers={} synthetic={}", e.2, e.5);
++                }
++                if let Err(error) = self.deliver_hid(crate::hid::Event::Swipe { phase, fingers: e.2, dx: e.3, dy: e.4 }, time) {
++                    eprintln!("WMGESTURE trackpad swipe not delivered: {error}");
++                }
++            }
++            seq = seq.wrapping_add(1);
++        }
++        self.gesture.ring_seq = Some(next.wrapping_sub(1));
++    }
+     /// Every frame: the spring after a release.
+     pub fn gesture_tick(&mut self) {
+         if self.gesture.wheel_until.is_some_and(|until| Instant::now() >= until) {
+@@ -216,3 +262,29 @@ impl Server {
+         eprintln!("WMGESTURE settled target={target} space={}", self.wm.current_workspace() + 1);
+     }
+ }
++
++/// (seq, phase, fingers, dx, dy, synthetic) of one event of the ring.
++type RingEvent = (u32, u8, u8, i16, i16, u8);
++/// `kern.sf_trackpad_swipe`: (version, next sequence, the 32 events); None without it.
++#[cfg(not(target_os = "linux"))]
++fn read_swipe_ring() -> Option<(u32, u32, [RingEvent; 32])> {
++    let mut bytes = [0u8; 8 + 32 * 16];
++    let mut len = bytes.len();
++    let name = c"kern.sf_trackpad_swipe";
++    let rc = unsafe { libc::sysctlbyname(name.as_ptr(), bytes.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) };
++    if rc != 0 || len != bytes.len() {
++        return None;
++    }
++    let u32_at = |o: usize| u32::from_ne_bytes(bytes[o..o + 4].try_into().unwrap());
++    let i16_at = |o: usize| i16::from_ne_bytes(bytes[o..o + 2].try_into().unwrap());
++    let mut events = [(0u32, 0u8, 0u8, 0i16, 0i16, 0u8); 32];
++    for (i, e) in events.iter_mut().enumerate() {
++        let o = 8 + i * 16;
++        *e = (u32_at(o), bytes[o + 4], bytes[o + 5], i16_at(o + 6), i16_at(o + 8), bytes[o + 10]);
++    }
++    (u32_at(0) == 1).then(|| (u32_at(0), u32_at(4), events))
++}
++#[cfg(target_os = "linux")]
++fn read_swipe_ring() -> Option<(u32, u32, [RingEvent; 32])> {
++    None
++}

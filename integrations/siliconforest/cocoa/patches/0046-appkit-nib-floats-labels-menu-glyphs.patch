@@ -1,0 +1,93 @@
+--- a/src/Frameworks/AppKit/nib.subproj/NSNibArchiveUnarchiver.m
++++ b/src/Frameworks/AppKit/nib.subproj/NSNibArchiveUnarchiver.m
+@@ -253,7 +253,10 @@
+     return (NSInteger)intOf([self valueForKey:key]);
+ }
+ 
+-- (CGFloat)decodeFloatForKey:(NSString *)key {
++// NSCoder's -decodeFloatForKey: answers a float: declared CGFloat here, the result came back in d0
++// while every caller (typed NSCoder or NSKeyedUnarchiver) read s0, the low half of the double, so a
++// nib's float values (a table column's width, a table's row height ...) were read as 0
++- (float)decodeFloatForKey:(NSString *)key {
+     return (float)doubleOf([self valueForKey:key]);
+ }
+ 
+--- a/src/Frameworks/AppKit/NSStringDrawer.m
++++ b/src/Frameworks/AppKit/NSStringDrawer.m
+@@ -208,7 +208,9 @@
+ {
+    CGContextRef graphicsPort=NSCurrentGraphicsPort();
+    CGContextSaveGState(graphicsPort);
+-   CGContextClipToRect(graphicsPort,rect);
++   // cut at the sides only: a nib's label is as tall as macOS's system font needs, and the
++   // descenders of the font here (Inter) reach a point or two lower (the view still clips)
++   CGContextClipToRect(graphicsPort,NSInsetRect(rect,0,-4));
+ 	
+ 	// In a perfect world, we could use the NSLineBreakByTruncatingTail attribute, but that's not supported for now
+ 	// by Cocotron
+@@ -216,9 +218,10 @@
+ 	NSSize size = [string size];
+ 	/* A title that is a little too wide for its place is drawn a little narrower rather than cut
+ 	 * ("New window with profi..."): nibs made on macOS are laid out for the widths of its system
+-	 * font, and the system font here (Inter) runs wider. Up to an eighth is taken out this way;
+-	 * a title that needs more is cut with an ellipsis as before. */
+-	if (truncateTail && size.width > rect.size.width && rect.size.width > 0 && size.width <= rect.size.width * 1.143 &&
++	 * font, and the system font here (Inter) runs wider. Up to an eighth is taken out this way,
++	 * whether the title would be cut or truncated; a title that needs more is cut with an ellipsis
++	 * (or clipped) as before. */
++	if (size.width > rect.size.width && rect.size.width > 0 && size.width <= rect.size.width * 1.143 &&
+ 	    size.height <= rect.size.height * 1.6 && [string length]) {
+ 		CGFloat squeeze = rect.size.width / size.width;
+ 
+--- a/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
++++ b/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
+@@ -45,6 +45,7 @@
+ #define TYPE_SELECT_PAUSE 1.0
+ 
+ #import <WindowServer/rpc.h>
++#include <string.h>
+ 
+ @interface NSWindow (SFPopupPlacement)
+ + (BOOL)_sfCompositorPlacesPopups;
+@@ -68,6 +69,18 @@
+     c = [key characterAtIndex:0];
+     if (![[key lowercaseString] isEqualToString:key])
+         mask |= NSShiftKeyMask;
++    // a character typed with Shift on the US layout shows as Shift and its key, as macOS shows
++    // Command-{ as Shift-Command-[
++    {
++        static const char shifted[] = "~!@#$%^&*()_+{}|:\"<>?", plain[] = "`1234567890-=[]\\;',./";
++        const char *at = c < 0x80 && c != 0 ? strchr(shifted, (int)c) : NULL;
++
++        if (at != NULL) {
++            mask |= NSShiftKeyMask;
++            c = (unichar)plain[at - shifted];
++            key = [NSString stringWithCharacters:&c length:1];
++        }
++    }
+     if (mask & NSControlKeyMask)
+         [out appendString:@"\u2303"];
+     if (mask & NSAlternateKeyMask)
+@@ -569,12 +582,20 @@
+         NSBezierPath *panel = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(box, 0.5, 0.5)
+                                                               xRadius:PANEL_R yRadius:PANEL_R];
+ 
+-        // stacked faint rounded rects make the soft shadow, dropped a few pixels as in the demo
++        // stacked faint rounded rects make the soft shadow, dropped a few pixels as in the demo; each
++        // is a ring round the panel (even-odd), not the panel's whole area again: eight fills of
++        // the whole menu were half the time it took to open
++        NSRect inner = NSInsetRect(box, PANEL_R, PANEL_R);
+         for (int k = 8; k >= 1; k--) {
+             NSRect r = NSOffsetRect(NSInsetRect(box, -k * 1.5, -k * 1.5), 0, 5);
++            NSBezierPath *ring = [NSBezierPath bezierPathWithRoundedRect:r xRadius:PANEL_R + k yRadius:PANEL_R + k];
+ 
++            if (inner.size.width > 0 && inner.size.height > 0) {
++                [ring appendBezierPathWithRect:inner];
++                [ring setWindingRule:NSEvenOddWindingRule];
++            }
+             [[NSColor colorWithCalibratedWhite:0 alpha:0.018] setFill];
+-            [[NSBezierPath bezierPathWithRoundedRect:r xRadius:PANEL_R + k yRadius:PANEL_R + k] fill];
++            [ring fill];
+         }
+         // the demo's 92%, the compositor blurs what shows through
+         BOOL dark = [[NSAppearance currentDrawingAppearance] _isDark];

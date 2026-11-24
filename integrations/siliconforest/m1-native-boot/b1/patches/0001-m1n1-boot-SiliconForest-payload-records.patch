@@ -1,0 +1,94 @@
+diff --git i/Makefile w/Makefile
+index 9c4784e..f03d0c6 100644
+--- i/Makefile
++++ w/Makefile
+@@ -195,6 +195,7 @@ OBJECTS := \
+ 	memory.o memory_asm.o \
+ 	nvme.o \
+ 	payload.o \
++	pdsf.o pdsf_boot.o pdsf_el2.o \
+ 	pcie.o \
+ 	pmgr.o \
+ 	proxy.o \
+@@ -261,6 +262,8 @@ build/$(RUST_LIB): src/../build/build_cfg.h rust/src/*.rs rust/src/gpu/*.rs rust
+ 	$(QUIET)cargo build $(CARGO_FLAGS) --target $(RUSTARCH) --lib --release --manifest-path rust/Cargo.toml --target-dir build
+ 	$(QUIET)cp "build/$(RUSTARCH)/release/${RUST_LIB}" "$@"
+ 
++build/pdsf_el2.o: build/pdsf_el2.bin
++
+ build/%.o: src/%.S src/../build/build_cfg.h
+ 	$(QUIET)echo "  AS    $@"
+ 	$(QUIET)mkdir -p $(DEPDIR)
+diff --git i/src/payload.c w/src/payload.c
+index 035968b..51ff2ac 100644
+--- i/src/payload.c
++++ w/src/payload.c
+@@ -22,6 +22,7 @@
+ 
+ #include "libfdt/libfdt.h"
+ #include "payload_profile.h"
++#include "pdsf.h"
+ #include "minilzlib/minlzma.h"
+ #include "tinf/tinf.h"
+ 
+@@ -392,6 +393,18 @@ int payload_run(void)
+         return -1;
+     }
+ 
++    /*
++     * SiliconForest: records after this image that name an XNU collection (pdsf_boot.c).
++     * Without them (1) m1n1 goes on exactly as before; with them, it boots that kernel or
++     * fails here: it never falls through to another payload.
++     */
++    int sf = pdsf_boot(payload_start());
++    if (sf <= 0) {
++        if (sf < 0)
++            next_stage.entry = NULL;
++        return sf;
++    }
++
+     if (!payload_scanned) {
+         void *p = payload_start();
+         cpufreq_payload_boost(true);
+diff --git i/src/smp.c w/src/smp.c
+index ed63e68..03c369e 100644
+--- i/src/smp.c
++++ w/src/smp.c
+@@ -984,3 +984,24 @@ u64 smp_get_release_addr(int cpu)
+     target->args[3] = 0;
+     return (u64)&target->target;
+ }
++
++/* SiliconForest stage (pdsf_boot.c): the core's reset vector register, 0 if unknown */
++u64 smp_get_impl_reg(int cpu)
++{
++    if (cpu < 0 || cpu >= MAX_CPUS || !cpu_info[cpu].valid)
++        return 0;
++    return cpu_info[cpu].impl_reg;
++}
++
++/*
++ * SiliconForest stage: a core that was called into the resident EL2 page never returns to its
++ * dispatch loop. Drop the call, so that the next stage is not refused for a pending callback.
++ */
++void smp_forget_call(int cpu)
++{
++    if (cpu < 0 || cpu >= MAX_CPUS || cpu == boot_cpu_idx)
++        return;
++    sysop("dmb sy");
++    spin_table[cpu].target = 0;
++    sysop("dsb sy");
++}
+diff --git i/src/smp.h w/src/smp.h
+index df55437..e0e147d 100644
+--- i/src/smp.h
++++ w/src/smp.h
+@@ -39,6 +39,8 @@ uint64_t smp_get_mpidr(int cpu);
+ u64 smp_get_release_addr(int cpu);
+ void smp_set_wfe_mode(bool new_mode);
+ void smp_send_ipi(int cpu);
++u64 smp_get_impl_reg(int cpu);
++void smp_forget_call(int cpu);
+ 
+ static inline int smp_id(void)
+ {

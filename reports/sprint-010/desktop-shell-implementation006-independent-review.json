@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "reviewer": "Grok (independent read-only source review; did not author 006)",
+  "status": "READ_ONLY_SOURCE_DELTA_REVIEW_NO_NATIVE_BUILD_NO_ADMISSION",
+  "prepared_utc": "2026-11-08T19:03:38+00:00",
+  "target": "integrations/puredarwin/chonkstep-darwin/desktop-shell/implementation-revisions/006",
+  "verdict": "NO_CONCRETE_DEFECT. The frozen four-file delta matches the stated D2 csops record and the stated B1 launch predicate. Source acceptance only. Host tests are not a Darwin run, and this review does not admit a native build or a boot. B1 is a serialization behaviour test and is not a fix for the first-app SIGKILL.",
+  "pins": {
+    "source_validation_sha256": "cbe279232cad3fd74de1df897391eb3dfbf1a57e2a0689ee91af72288a8e1d7d",
+    "source_set_sha256": "9e2e28deaba2be5d76572fe96fec02c30e906397c1ae9deebb0b5263cd1df9bd",
+    "incremental_source_set_sha256": "96cd79901fa593e5cb2369e5274474bb2d95ed73d415c620a905b4fad90db23f",
+    "full_source_tree_sha256": "82f4ccbd6e88ee330765d8661058914fd2839f78e0ce1c2eb46f54c2fe064cea",
+    "full_source_tree_logical_file_count": 3966,
+    "from_005_patch_sha256": "9198187d3a95deece68b959ce7ff2857c7fea46cc2969b9b3f412abd20fad26f",
+    "previous_005_receipt_sha256": "e42f2db2ecf7156a13951cede799fc2e9f98ebf37c6cedab54499e6ea2112d54",
+    "previous_005_full_tree_sha256": "566870e3b88900e4d11b868ac783d031c7778964ab15f6b5feb483830baa4488",
+    "previous_005_source_set_sha256": "7454a5bb11f198a1f33755077855f37373f3ed8bed627236cf32aae7e667273b"
+  },
+  "binding": {
+    "replay": "verify_checkpoint.py with assertions enabled printed: Verified006 cumulative 23 and incremental 4 files, full tree and dependencies; source only. It wrote only a temp scratch directory.",
+    "source_sets": "Recomputed cumulative after-hashes equal 9e2e28de and incremental after-hashes equal 96cd7990. Both use sha256, two spaces, relative path, LF, sorted.",
+    "tree_delta": "Independent logical-byte compare of 005/source and 006/source, skipping target/.git/__pycache__, is 3966 files each. Exactly four paths differ, and their before/after hashes match incremental_changed_files: applications.rs 66749201 -> 59922339, desktop.rs fe870304 -> 1cbac496, launch_audit.rs d1ec474d -> 559606e4, terminal_launch.rs 8cc0dad7 -> 33d80e20. The cumulative changed_files list of 23 is the history versus the keyboard-only baseline, not a fifth 005-to-006 edit."
+  },
+  "defects": [],
+  "d2": {
+    "placement": "launch_at calls query_cs_status on the owned pid immediately after audit.spawn and before the failure record. OwnedChild::poll_using calls exit_reason while WaitState is Running, and calls cs_status only when that reason returns Some, still before waitpid. Application::service journals exit_reason and then exit cs status before observe. A second poll after Reaped does not query again. Neither field is an input to wait status, signals, completion, or has_failures.",
+    "csops": "query_cs_status on target_vendor apple calls csops(pid, 0, &flags, 4). Return 0 stores Flags. Any other return stores QueryFailed from errno, or EIO if errno is empty. Other targets return Unsupported and do not call csops. bsd/sys/codesign.h defines CS_OPS_STATUS as 0 and declares the libc form int csops(pid_t, unsigned int, void *, size_t). syscalls.master entry 169 is csops. Canonical libSystem.B.dylib 8ff49e0c _csops is mov x16, #169; svc #0x80; b.lo success; otherwise a stub branch on the failure path. Display of Flags is flags={u32:#010x}, which is 0x and eight lowercase hex digits for every u32.",
+    "csops_internal": "bsd/kern/kern_proc.c csops_internal puts CS_OPS_STATUS in the switch that is not restricted to root, then proc_find, then under CONFIG_MACF the default arm calls mac_proc_check_get_cs_info. The STATUS case locks the proc, returns proc_getcsflags, and ORs CS_ENFORCEMENT, CS_PLATFORM_BINARY, and CS_PLATFORM_PATH. It copyouts a uint32. Flag values checked against osfmk/kern/cs_blobs.h: CS_VALID 0x1, CS_HARD 0x100, CS_KILL 0x200, CS_KILLED 0x01000000, CS_SIGNED 0x20000000. A MAC denial or proc_find miss becomes QueryFailed and does not change the launch outcome. The source comment that STATUS is unrestricted describes the root check. It does not promise that the MAC check is absent.",
+    "zombie": "The exit query runs only after waitid has reported the child exited, or after a waitid error other than EINTR. bsd/kern/kern_exit.c moves the proc to zombproc and sets P_REF_DEAD with the comment that it will not be visible via proc_find, before the parent is signalled. proc_find uses proc_ref_try_fast, which fails when P_REF_DEAD is set, and csops_internal returns ESRCH for PROC_NULL. The exit-time record on this source is therefore expected to be query_failed errno=ESRCH. The spawn-time query is the one that can observe live flags. The author comment states ESRCH otherwise. Criteria 003 D2 accepts that errno.",
+    "journal": "LaunchAudit::cs_status writes one event=CsStatus line per phase and keeps the first value. manager_cs_status appends one scope=manager self_cs_status line. TerminalLauncher::new calls it once, after the journal is attached, with std::process::id() (getpid). The snapshot adds attempt=N cs_at_spawn=... cs_at_exit=... after the exit_reason line and before the gate lines. A missing slot prints not_observed. Append still refuses a line longer than 1024 bytes. A CsStatus line is far under that bound.",
+    "outcome": "The pinned host log records cs_status_is_recorded_once_per_phase_and_in_the_snapshot and exit_time_cs_status_is_read_with_the_reason_before_the_reap as passed. The SIGKILL-shaped exit-reason test still keeps the failure. Darwin csops was not executed."
+  },
+  "b1": {
+    "predicate": "OwnedApplications::launch_in_progress is true when any owned app is Running, ready_observed is false, and completion is Pending. DesktopSession::service breaks out of the request loop while that is true, so it takes the next Shell request only when no owned app matches. take_request is otherwise unchanged. ManagedBridge keeps queued requests until they are taken, and begin_shutdown drains the ones still queued.",
+    "release": "READY releases the next launch while that app is still running. A Reaped or Unknown child also releases, because the predicate requires Running. The attempt-002 shape, a reaped first app that never became READY, releases on the service call after the reap poll. The second SpawnReturned is recorded on a later pass than that AppReaped mark. Poll runs after the launch loop, so a second request cannot be taken in the same pass that first observes the reap.",
+    "incomplete_running": "Completion Incomplete while the child is still Running does not match the predicate, because Pending is required. The following service can admit one more request before the shutdown_incomplete check sets closing. That matches the stated Running && !ready_observed && Pending rule. The READY-deadline path stays Pending until the child is reaped or the reap deadline fires, so it keeps blocking.",
+    "cancelled_second": "If the first app is still Running, not READY, and Pending when the session closes, the queued second request is cancelled in the bridge and never becomes an attempt. Criteria 003 then reports D3 not_applicable and C2/C3 still fail for the missing launch. Serialization does not invent a successful second app.",
+    "tests": "launch_waits_while_an_owned_app_is_neither_ready_nor_terminal passed. It shows a Running app without READY blocks, and that observing READY releases. The reaped sibling is inserted only after that READY release, and its completion is already Incomplete, so the test name's terminal case is also carried by the READY app. The predicate itself treats Reaped as not in progress. I read that in the source."
+  },
+  "residuals": [
+    "The 005 waitid-then-waitpid race remains. If waitid does not see the exit and waitpid reaps in the same poll, exit_reason and cs_at_exit both stay unset. The snapshot says not_observed for both. cs_at_spawn is still recorded when a child pid exists. Wait status and the failure rule are unchanged.",
+    "Exit-time csops is issued against a proc that this XNU has already marked P_REF_DEAD. The useful flags record is cs_at_spawn. cs_at_exit is the ESRCH fact unless some other waitid error queries csops while the pid is still findable.",
+    "CONFIG_MACF can still reject CS_OPS_STATUS through mac_proc_check_get_cs_info. That errno is stored as QueryFailed.",
+    "The Apple csops path is compiled by the Darwin type-check only. It has not run. Host query_cs_status returns Unsupported.",
+    "006 session-result snapshots gain a cs_at_spawn line, and the journal gains event=CsStatus and scope=manager self_cs_status. The frozen attempt-001 helper and the attempt-002 helper reject unknown session-result lines, so neither helper can grade a 006 capture.",
+    "Darwin cargo check exit 0 reports the same dead_code warning as 005: UnavailableShim is unconstructed on the Apple + native-managed-spawn type-check. The host clippy log shows no warning. The warning does not change D2 or B1."
+  ],
+  "host_evidence": {
+    "tests_log_sha256": "635daf99e97aa5589b6856c728d77a589523ecdfb3d9a087fa5202362fac56fa",
+    "tests": "Pinned validation/host-tests-006.log shows wm-darwin library tests 63 passed, 0 failed, and wayland_shm 5 passed, 0 failed, then exit=0. The log does not echo the cargo command. I did not re-run cargo.",
+    "clippy_log_sha256": "7f748a9cef324f4e80e7ec61ebad46d3a7cae82927de5bc1a98c31c0c16e8420",
+    "clippy": "Pinned validation/clippy-006.log finishes the dev profile and exit=0. No warning text and no command echo. I did not re-run clippy.",
+    "darwin_typecheck_log_sha256": "544dfe704db76b62f48c193dc90653ce0727e47cbe78890c52cabea95d1fe717",
+    "darwin_typecheck": "Pinned validation/darwin-typecheck-006.log checks wm-darwin for the recorded aarch64-apple-darwin command, prints the UnavailableShim dead_code warning, finishes, and exit=0. The receipt's scope line says this is a type-check, not a link or run. I did not re-run it."
+  },
+  "xnu_tree": "Compared with sources/puredarwin-m1-desktop/src/Kernel/xnu and canonical libSystem.B.dylib 8ff49e0c2a5f1c6532101c7ed662632444cc97ae9669479090e7968deddd12ff. _csops and _getpid are defined there. This review did not prove these sources are the bytes inside kernel 02fe2d41.",
+  "not_claimed": [
+    "a fix for the first-app SIGKILL",
+    "the kernel subsystem that raised it",
+    "native 006 build, link, or execution",
+    "a runtime or boot result",
+    "physical input",
+    "performance",
+    "two visible windows or a framebuffer qualification",
+    "that serialization removes the SIGKILL",
+    "that the attempt-001 or attempt-002 qualification helper can parse a 006 capture"
+  ],
+  "scope": "Read-only. verify_checkpoint.py, from-005.patch, the four Rust sources, ManagedBridge take and shutdown, pinned kern_proc.c csops_internal, kern_exit.c P_REF_DEAD, codesign.h, cs_blobs.h, syscalls.master, canonical libSystem _csops, and the three validation logs. No edits to 006, no cargo, no SSH, no hardware."
+}

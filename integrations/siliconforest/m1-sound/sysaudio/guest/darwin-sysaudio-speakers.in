@@ -1,0 +1,106 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Unattended check of the two real output devices, one boot (tools/sa_boot.sh sd<NN>
+# guest/darwin-sysaudio-speakers.in). NO safety daemon runs and none may: the kernel then holds
+# the speakers at -100 dB, so what is played into them cannot be heard; the proof is the two
+# drivers' counters and coreaudiod's log. The jack is empty.
+#   noserver   before coreaudiod runs a client is refused at once
+#   default    with the real kern.sf_sound.jack at 0 the default output is Speakers; one client:
+#              kern.sf_speaker.frames moves, the headphones' driver stays idle, the driver's
+#              count of written frames is coreaudiod's
+#   two        two clients at once on the speakers, 44.1 kHz and 48 kHz
+#   volume     sfvolume on the speakers is a software level: no driver sysctl moves
+#   explicit   a client that names the headphones by UID plays on /dev/sfaudio while the default
+#              stays Speakers
+#   switch     coreaudiod restarted with its test hook for the jack (a file): one client plays
+#              while the default goes Speakers -> Headphones -> Speakers on the real devices
+# Quiet: what can reach the speakers is @SPKDB@ dB below full scale (and the server's level
+# 0.5 below that); the headphones' tone @TONEDB@ dB below, codec attenuation @VOLUME@ dB.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+@COMMON@
+printf '\nSA_BEGIN_%s\n' "$nonce"
+bringup
+ls -l /dev/sfspeaker 2>&1
+monspk bringup
+if [ "$(get kern.sf_speaker.hold_probe)" != 1 ]; then
+    printf 'SA_FAIL the speakers are not held at the probe volume: not an unattended boot\n'
+    printf 'SA_END_%s\n' "$nonce"; printf '\nPD_BENCH_DONE\n'; exit 0
+fi
+
+phase noserver
+# a client without the server must fail at once, not hang (the desktop's volume keys rely on it)
+s0=$(date +%s)
+bounded 10 sfvolume get
+printf 'SA_NOSERVER seconds=%s\n' $(( $(date +%s) - s0 ))
+
+phase server
+start_server
+sleep 1; showlog
+bounded 10 sftone -l
+bounded 10 sfvolume get
+
+phase default
+f0=$(get kern.sf_speaker.frames)
+bounded 20 sftone -r 48000 -f 440 -s 4 -d @SPKDB@ -n spk
+monspk default; mon default
+printf 'SA_FRAMES speakers %s\n' $(( $(get kern.sf_speaker.frames) - f0 ))
+idlespk 15 default
+showlog
+
+phase two
+sftone -r 44100 -f 440 -s 5 -d @SPKDB@ -c l -n two44 2>&1 &
+a=$!
+sftone -r 48000 -f 660 -s 5 -d @SPKDB@ -c r -n two48 2>&1 &
+b=$!
+wait_pids 25 "$a" "$b"
+monspk two; mon two
+
+phase volume
+for c in "set 30" up down mute unmute "set 50"; do
+    bounded 10 sfvolume $c
+    printf 'SA_VOL after "%s": kern.sf_sound.volume_db=%s speakers volume_steps=%s\n' "$c" "$(get kern.sf_sound.volume_db)" "$(get kern.sf_speaker.volume_steps)"
+done
+idlespk 15 two
+showlog
+
+phase explicit
+f0=$(get kern.sf_sound.frames); s0=$(get kern.sf_speaker.frames)
+bounded 20 sftone -u SFAudio:headphones -f 440 -s 3 -d @TONEDB@ -n byuid
+mon explicit; monspk explicit
+printf 'SA_FRAMES explicit headphones=%s speakers=%s\n' $(( $(get kern.sf_sound.frames) - f0 )) $(( $(get kern.sf_speaker.frames) - s0 ))
+bounded 10 sfvolume get
+idle 15 explicit
+showlog
+
+phase switch
+kill "$server" 2>/dev/null; sleep 1
+jack=/var/run/sfjack
+echo 0 > "$jack"
+COREAUDIOD_JACK_FILE=$jack; export COREAUDIOD_JACK_FILE
+start_server
+sleep 1; showlog
+sftone -r 44100 -f 440 -s 16 -d @SPKDB@ -n route 2>&1 &
+tone=$!
+sleep 4
+monspk on-speakers; mon on-speakers
+echo 1 > "$jack"
+sleep 1
+bounded 10 sfvolume get
+sleep 3
+monspk on-headphones; mon on-headphones
+echo 0 > "$jack"
+sleep 1
+bounded 10 sfvolume get
+sleep 2
+monspk back-on-speakers; mon back-on-speakers
+wait_pids 25 "$tone"
+idle 15 switch
+idlespk 15 switch
+showlog
+
+phase end
+mon end; monspk end
+dmesg 2>/dev/null | grep 'SFSound: stopped\|SFSpeakers: stopped\|SFSpeakers: SHUT\|SFSpeakers: playing' | cut -c1-260 | tail -16
+kill "$server" 2>/dev/null
+printf 'SA_END_%s\n' "$nonce"
+printf '\nPD_BENCH_DONE\n'

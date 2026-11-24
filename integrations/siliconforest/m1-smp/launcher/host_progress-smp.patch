@@ -1,0 +1,81 @@
+--- a/integrations/puredarwin/m1-bringup/host_progress.py
++++ b/integrations/puredarwin/m1-bringup/host_progress.py
+@@ -114,6 +114,12 @@
+ 
+ BOOTARGS = ('-v -s debug=0x14e keepsyms=1 serial=3 serial-device-name=uart0 '
+             'disable-uart-irq=1 cpus=1 rd=md0 serial_video_mirror=1 pdtextboot=1')
++# Guest processors. One (`cpus=1`, the hypervisor's device tree pruned to the boot CPU,
++# secondary start refused) unless the extra boot arguments carry `cpus=N` with N > 1: then
++# all eight /cpus nodes stay in the tree, that argument replaces `cpus=1`, and the pinned
++# hypervisor's own start_secondary serves the guest's writes to the PMGR CPU-start block.
++# `cpus=1` in the extra arguments is the single-CPU boot whatever this default says.
++SMP_DEFAULT = False
+ 
+ 
+ def framebuffer_geometry(video, backend, carveouts):
+@@ -698,13 +704,41 @@
+     keyboard = keyboard_enabled(inputs)
+     survey = dart_survey_enabled(inputs)
+     trackpad = trackpad_enumeration_enabled(inputs)
+-    return (BOOTARGS + (' pdm1kbd=1' if keyboard or native or child else '') +
++    return (base_bootargs() + (' pdm1kbd=1' if keyboard or native or child else '') +
+             (' pddartsurvey=1' if survey else '') +
+             (' pdm1trackpadenum=1' if trackpad or child else '') +
+             (' pdm1trackpadchild=1' if child else '') + extra_bootargs() +
+             (' pdapciebridge=1' if apcie else ''))
+ 
+ 
++def guest_cpus():
++    """Requested guest processor count: N from a `cpus=N` extra boot argument, else None."""
++    tokens = [t for t in extra_bootargs().split() if t.startswith('cpus=')]
++    image.require(len(tokens) <= 1 and all(re.fullmatch(r'cpus=[1-8]', t) for t in tokens),
++                  'Extra boot arguments may name cpus=1..8 once')
++    return int(tokens[0][5:]) if tokens else None
++
++
++def smp_enabled():
++    cpus = guest_cpus()
++    return SMP_DEFAULT if cpus is None else cpus > 1
++
++
++def base_bootargs():
++    # Never two cpus= arguments: an explicit one, or SMP by default, drops the built-in cpus=1.
++    image.require(BOOTARGS.count(' cpus=1 ') == 1, 'Built-in boot arguments lack cpus=1')
++    if guest_cpus() is None and not smp_enabled():
++        return BOOTARGS
++    return BOOTARGS.replace(' cpus=1 ', ' ')
++
++
++def enable_smp(hv):
++    # The frozen backend refuses secondary CPUs (hv.smp False, start_secondary raising).
++    # Restore the pinned hypervisor's own behaviour for both, before hv.init() reads the tree.
++    hv.smp = True
++    hv.start_secondary = type(hv).start_secondary.__get__(hv)
++
++
+ def extra_bootargs():
+     # Extra kernel boot arguments for one run, from extra_bootargs.txt next to this file
+     # (written by tools/pcie_iterate.sh from PCIE_BOOTARGS; empty by default).
+@@ -1107,6 +1141,9 @@
+                           dict(snapshot=snapshot, layout=layout, packet=inputs.report,
+                                inventory_sha256=inputs.inventory_sha256, reservation=reservation))
+         hv = backend.new_hv()
++        smp = smp_enabled()
++        if smp:
++            enable_smp(hv)
+         hv.init()
+         # hv_init() runs m1n1's pcie_shutdown(), so PCIe is brought up after it:
+         # pcie_init, SMC radio power, port-0 link sequence. XNU inherits the link.
+@@ -1117,7 +1154,11 @@
+             pcie = pcie_linkup.launcher_step(backend.p, backend.u, directory)
+             print('PCIE_LINKUP ' + json.dumps({k: pcie.get(k) for k in ('mode', 'radio_power', 'pcie_init', 'm0_port_ready', 'link_up', 'ok')}), flush=True)
+         cpus = list(hv.adt['cpus'])
+-        image.require(len(cpus) == 1 and cpus[0].state == 'running', 'Expected one running guest CPU')
++        image.require(len(cpus) == (len(snapshot['cpus']) if smp else 1) and
++                      [cpu.state for cpu in cpus].count('running') == 1 and
++                      all(cpu.state in ('running', 'waiting') for cpu in cpus),
++                      'Expected one running guest CPU' + (' and the others waiting' if smp else ''))
++        print('GUEST_CPUS ' + json.dumps(dict(smp=smp, nodes=len(cpus), requested=guest_cpus())), flush=True)
+         hv.set_bootargs(bootargs)
+         display_console = configure_display_console(hv, backend, carveouts)
+         validate_input_geometry(display_console['geometry'], virtual_input=virtual_input,

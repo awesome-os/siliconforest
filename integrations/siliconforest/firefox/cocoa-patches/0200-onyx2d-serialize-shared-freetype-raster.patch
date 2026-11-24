@@ -1,0 +1,205 @@
+--- a/src/Frameworks/Onyx2D/O2Context_builtin.m
++++ b/src/Frameworks/Onyx2D/O2Context_builtin.m
+@@ -904,6 +904,8 @@
+ 
+ -(void)showGlyphs:(const O2Glyph *)glyphs advances:(const O2Size *)advances count:(unsigned)count {
+ #ifdef FREETYPE_PRESENT
++   // Shared FreeType faces and the process-wide bitmap cache are mutable.
++   @synchronized([O2Font_freetype class]) {
+    O2AffineTransform transform=O2ContextGetUserSpaceToDeviceSpaceTransform(self);
+    O2GState         *gState=O2ContextCurrentGState(self);
+    O2Paint          *paint;
+@@ -970,6 +972,7 @@
+ 
+     _textMatrix.tx+=(total/O2FontGetUnitsPerEm(font))*gState->_pointSize;
+    }
++   }
+ #endif
+ }
+ 
+--- a/src/Frameworks/Onyx2D/O2Font_freetype.m
++++ b/src/Frameworks/Onyx2D/O2Font_freetype.m
+@@ -52,6 +52,7 @@
+ 
+ 
+ -initWithDataProvider:(O2DataProviderRef)provider {
++   @synchronized([O2Font_freetype class]) {
+    if([super initWithDataProvider:provider]==nil)
+     return nil;
+ 
+@@ -129,14 +130,17 @@
+     _name=copyFullNameOfFace(_face);
+    _advances=NULL;
+    return self;
++   }
+ }
+ 
+ -(void)dealloc {
++   @synchronized([O2Font_freetype class]) {
+    FT_Done_Face(_face);
+    [_macRomanEncoding release];
+    [_macExpertEncoding release];
+    [_winAnsiEncoding release];
+    [super dealloc];
++   }
+ }
+ 
+ FT_Face O2FontFreeTypeFace(O2Font_freetype *self) {
+@@ -144,10 +148,13 @@
+ }
+ 
+ -(FT_Face)face {
++   @synchronized([O2Font_freetype class]) {
+    return _face;
++   }
+ }
+ 
+ -(void)fetchAdvances {
++   @synchronized([O2Font_freetype class]) {
+    O2Glyph glyph;
+ 
+    FT_Set_Char_Size(_face,0,_unitsPerEm*64,72,72);
+@@ -159,9 +166,11 @@
+     
+     _advances[glyph]=_face->glyph->advance.x/(float)(2<<5);
+    }
++   }
+ }
+ 
+ -(NSData *)copyTableForTag:(uint32_t)tag {
++   @synchronized([O2Font_freetype class]) {
+    FT_ULong length=0;
+ 
+    if(FT_Load_Sfnt_Table(_face,tag,0,NULL,&length)!=0 || length==0)
+@@ -174,16 +183,20 @@
+     return nil;
+    }
+    return data;
++   }
+ }
+ 
+ -(NSString *)copyPostScriptName {
++   @synchronized([O2Font_freetype class]) {
+    const char *name=FT_Get_Postscript_Name(_face);
+ 
+    return name!=NULL ? [[NSString alloc] initWithUTF8String:name] : nil;
++   }
+ }
+ 
+ // the tags are NSNumbers here, CoreGraphics turns them into bare values
+ -(NSArray *)copyTableTags {
++   @synchronized([O2Font_freetype class]) {
+    NSMutableArray *result=[[NSMutableArray alloc] init];
+    FT_ULong count=0;
+ 
+@@ -197,6 +210,7 @@
+      [result addObject:[NSNumber numberWithUnsignedInt:(uint32_t)tag]];
+    }
+    return result;
++   }
+ }
+ 
+ static double fixedToDouble(FT_Fixed value) {
+@@ -204,6 +218,7 @@
+ }
+ 
+ -(NSArray *)copyVariationAxes {
++   @synchronized([O2Font_freetype class]) {
+    FT_MM_Var *mm=NULL;
+ 
+    if(!FT_HAS_MULTIPLE_MASTERS(_face) || FT_Get_MM_Var(_face,&mm)!=0)
+@@ -225,10 +240,12 @@
+    }
+    FT_Done_MM_Var(freeTypeLibrary,mm);
+    return result;
++   }
+ }
+ 
+ // keyed by axis name, as Apple's CGFontCopyVariations is
+ -(NSDictionary *)copyVariations {
++   @synchronized([O2Font_freetype class]) {
+    FT_MM_Var *mm=NULL;
+ 
+    if(!FT_HAS_MULTIPLE_MASTERS(_face) || FT_Get_MM_Var(_face,&mm)!=0)
+@@ -247,10 +264,12 @@
+    }
+    FT_Done_MM_Var(freeTypeLibrary,mm);
+    return result;
++   }
+ }
+ 
+ // keys are axis names or axis tags as numbers, unnamed axes keep their current value
+ -(O2Font *)createCopyWithVariations:(NSDictionary *)variations {
++   @synchronized([O2Font_freetype class]) {
+    FT_MM_Var *mm=NULL;
+ 
+    if(!FT_HAS_MULTIPLE_MASTERS(_face) || FT_Get_MM_Var(_face,&mm)!=0)
+@@ -289,10 +308,12 @@
+    FT_Set_Var_Design_Coordinates(copy->_face,mm->num_axis,coords);
+    FT_Done_MM_Var(freeTypeLibrary,mm);
+    return copy;
++   }
+ }
+ 
+ // boxes in font units, as CGFontGetGlyphBBoxes reports them
+ -(BOOL)getGlyphBBoxes:(const O2Glyph *)glyphs count:(size_t)count bboxes:(O2Rect *)bboxes {
++   @synchronized([O2Font_freetype class]) {
+    BOOL ok=YES;
+ 
+    for(size_t i=0;i<count;i++){
+@@ -307,20 +328,26 @@
+     bboxes[i]=O2RectMake(m->horiBearingX,m->horiBearingY-m->height,m->width,m->height);
+    }
+    return ok;
++   }
+ }
+ 
+ -(O2Glyph)glyphWithGlyphName:(NSString *)name {
++   @synchronized([O2Font_freetype class]) {
+    return FT_Get_Name_Index(_face,(char *)[name cString]);
++   }
+ }
+ 
+ -(void)getGlyphsForCodePoints:(uint16_t *)codes:(O2Glyph *)glyphs:(int)length {
++   @synchronized([O2Font_freetype class]) {
+    int i;
+    
+    for(i=0;i<length;i++)
+     glyphs[i]=FT_Get_Char_Index(_face,codes[i]);
++   }
+ }
+ 
+ -(O2Encoding *)unicode_createEncodingForTextEncoding:(O2TextEncoding)encoding {
++   @synchronized([O2Font_freetype class]) {
+    unichar unicode[256];
+    O2Glyph glyphs[256];
+    
+@@ -354,9 +381,11 @@
+      return nil;
+    }
+    return nil;
++   }
+ }
+ 
+ -(O2Encoding *)MacRoman_createEncodingForTextEncoding:(O2TextEncoding)encoding {
++   @synchronized([O2Font_freetype class]) {
+    uint16_t codes[256];
+    O2Glyph glyphs[256];
+    unichar unicode[256];
+@@ -379,13 +408,16 @@
+    }
+    
+    return [_macRomanEncoding retain];
++   }
+ }
+ 
+ -(O2Encoding *)createEncodingForTextEncoding:(O2TextEncoding)encoding {
++   @synchronized([O2Font_freetype class]) {
+    if(_ftEncoding==FT_ENCODING_APPLE_ROMAN)
+     return [self MacRoman_createEncodingForTextEncoding:encoding];
+     
+    return [self unicode_createEncodingForTextEncoding:encoding];
++   }
+ }
+ 
+ @end

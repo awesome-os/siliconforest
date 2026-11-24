@@ -1,0 +1,113 @@
+{
+  "status": "SOURCE_AND_OFFLINE_ARTIFACT_REVIEW_NOT_GUEST_RUNTIME_PROOF",
+  "reviewer": "Astra",
+  "date": "2026-11-07",
+  "scope": "Read-only review of pinned XNU/ext4/libSystem, the existing disposable md0 image, and root-owned desktop launcher. Only this report was written; compositor source remains frozen.",
+  "identities": {
+    "puredarwin_base": "e7aa00a60f0b56ef35aa24252e81467787bf71ea",
+    "compositor_source_set_sha256": "36788d2155131f9875b251c6d2b0038f7d152c8372c8c4a5b02e4d973f66c99e",
+    "launcher_sha256": "f2f27b95a0154e98d730c0bad0c8bbb45fd6afbcf3002f7faefc1a6632fee4c7",
+    "stage_ramdisk_sha256": "6f70a35e3dca0490fa1effa97194a535e9af66cf09afcbc314849a2a7d8a71d5",
+    "baseline_ramdisk_sha256": "b1154b2854c9771445a9b1b631d3d48837b35f655a4747665b94c72da10e4d05",
+    "baseline_mount_sha256": "b52ee7bc7e66a50a040fc1c8dc17f1d9f243fbcf53c10ed612bf17f5bfaa7309",
+    "baseline_libSystem_sha256": "432c7369de607b8c0af8f1313ac7a0055cb8f327ea12d1bb9239081eebd53b83"
+  },
+  "resolved_launcher_blocker": {
+    "finding": "Pinned /sbin/mount rejects -u and -w, so mount -uw / stopped the former set-e script.",
+    "evidence": "sources/puredarwin-m1-bringup/src/Userspace/diskdev_cmds/mount.c:309-346; actual image binary contains the matching advrt:o: option string.",
+    "current_source": "integrations/puredarwin/chonkstep-darwin/darwin-desktop-test:10-16 removes the unsupported remount and requires create/write/read/unlink in the mode-0700 runtime directory.",
+    "guest_execution_of_fix_observed": false
+  },
+  "ram_only_storage": {
+    "recommendation": "Use existing ext4-on-md0; no new filesystem or persistent storage is required.",
+    "evidence": [
+      "sources/puredarwin-m1-bringup/src/Kernel/Extensions/ext4/ext4_vfsops.c:104-113 supports mount updates; :188-203 clears read-only for writable root media and enables local locks.",
+      "sources/puredarwin-m1-bringup/src/Kernel/xnu/bsd/dev/memdev.c:327-343 copies writes into RAM; :429-431 reports writable.",
+      "sources/puredarwin-m1-bringup/src/Kernel/Extensions/ext4/ext4_vnops.c:1419-1446 creates VSOCK; :972-988 preserves unlinked open files; :1287-1348 supports truncate; :2080-2212 implements page-in/page-out.",
+      "sources/puredarwin-m1-bringup/src/Kernel/xnu/bsd/vfs/kpi_vfs.c:5833-5848 selects genuine lf_advlock for local-lock vnodes; missing ext4 VNOP_ADVLOCK is not a blocker."
+    ],
+    "baseline_image_read_only_inspection": {
+      "path": "artifacts/m1-display-010/candidate-001/ramdisk.img",
+      "method": "debugfs without -w and dumpe2fs -h; no mount",
+      "private_tmp": "directory, uid 0, mode 01777",
+      "private_var_run": "absent; launcher mkdir -p creates it",
+      "free_bytes": 7442432
+    },
+    "new_staging_source": "stage_ramdisk.py:69 expands to 480M; :90-99 refuses publication below 16 MiB free after payload copy. This review did not execute staging."
+  },
+  "socket_and_shm": {
+    "source_supported": "Unix bind/connect, SCM_RIGHTS, local flock, regular-file ftruncate and MAP_SHARED.",
+    "client_contract": "Use an unlinked O_RDWR regular file in the guest RAM root. Keep backing storage alive and do not rewrite a submitted buffer before wl_buffer.release. Smithay maps the received FD READ|WRITE, so a read-only FD is unsuitable.",
+    "evidence": [
+      "sources/puredarwin-m1-bringup/src/Kernel/xnu/bsd/kern/uipc_usrreq.c:1216-1237 creates the socket vnode; :2505 validates SCM_RIGHTS.",
+      "sources/chonkstep-darwin/vendor/smithay-0.7.0/src/wayland/shm/pool.rs:262-273 maps shared read/write; :28-41 creates a pthread-backed cleanup thread on pool disposal."
+    ],
+    "posix_shm_caution": "XNU posix_shm.c:198-207 uses fo_no_write (ENXIO); :642-645 allows only one truncate. Do not treat shm_open descriptors as ordinary writable files."
+  },
+  "kqueue_and_libSystem": {
+    "actual_baseline_defined_external_symbols_verified": [
+      "kqueue", "kevent", "socket", "bind", "listen", "accept", "connect", "sendmsg", "recvmsg", "flock", "ftruncate", "mmap", "munmap", "shm_open", "shm_unlink", "pthread_create", "pthread_join", "pthread_key_create", "getentropy", "sigaction", "nanosleep", "mach_absolute_time"
+    ],
+    "method": "Read actual libSystem bytes from baseline image and inspect defined external Mach-O LC_SYMTAB entries, not only embedded strings.",
+    "source": "XNU syscalls.master:413-414,543-544 and kern_event.c:3088,8549; libsystem_kernel/CMakeLists.txt:50-69 generates wrappers from this syscall table.",
+    "runtime_qualification": "Not established for the compositor/client combination. A successful link does not prove socket FD passing, kqueue delivery, shared-file coherence, SIGBUS handling or pthread cleanup in this guest."
+  },
+  "xkb_and_dynamic_dependencies": {
+    "first_input_off": "No keyboard or XKB keymap is initialized; no wl_seat is advertised by that path.",
+    "future_input_blocker": "Baseline image lacks /usr/share/X11/xkb. Stage rules, keycodes, types, compat and symbols before enabling --input pdhid.",
+    "keymap_fallback": "Smithay utils/sealed_file.rs:55-95 attempts write on Darwin POSIX SHM and fails; input/keyboard/keymap_file.rs:35-44 retains no sealed file and :75-86 uses an unlinked regular temporary file instead. Keep XDG_RUNTIME_DIR writable.",
+    "native_link_receipt_dependencies": "CoreFoundation, iconv, libSystem, libc and libm. Their actual files or resolved symlink targets exist in the baseline image; preserve them in the augmented root."
+  },
+  "timing_and_evidence": {
+    "current_source": "Launcher starts the client with 120 seconds, waits 100 seconds, then checks owned process liveness; EXIT cleanup terminates those owned PIDs. The former equal-deadline race is removed.",
+    "socket_is_not_presentation": "Compositor main.rs:36 binds the socket before PDGOP open at :39. DL10_SERVER_SOCKET only proves that the socket exists.",
+    "proof_limit": "A Wayland callback establishes compositor acknowledgement only. Keep raw nonce-bearing frame evidence and physical panel confirmation separate from protocol success."
+  },
+  "client_review": {
+    "status": "NO_NEW_SOURCE_BLOCKER_FOR_CURRENT_INPUT_OFF_CLIENT_WITH_OUTER_HOST_TIMEOUT",
+    "identities": {
+      "main_rs_sha256": "e6ea5ee3503dadd58a20b628f7f8d92672e689a45311f2b4e195cdeaf2f79b4a",
+      "cargo_toml_sha256": "5832f67a27d929a8b164e785fc2087800431cd3c90b59eb44b2e27c14a8457b0",
+      "cargo_lock_sha256": "ea3f3b8a61afa422aa68ddee338e59c10b30ccf93a456c6ae2c32d743127d50a",
+      "readme_sha256": "188a56fe44f4a39e48f135a1a27f62fe8c078bcfcead1d5a59d109087ace30d9",
+      "unused_paint_rs_sha256": "d564934f5c6199a39693a76e8134bb775da9680e86c8858c8617d5f3fd7b2395"
+    },
+    "source": "integrations/puredarwin/chonkstep-darwin/client/src/main.rs",
+    "checks": [
+      "Lines 95-101 connect to the launcher-supplied Unix socket and send an empty initial xdg_surface commit. Lines 31-34 acknowledge configure before the first buffer attachment. Input-off requires no wl_seat or XKB.",
+      "Lines 102-106 create a new mode-0600 O_RDWR regular file, unlink it while open, truncate to exactly 800*480*4 = 1536000 bytes, then pass its FD through the cached Wayland implementation. The file remains owned throughout the loop; no POSIX-SHM write is used.",
+      "Lines 41-44 and 108-122 prohibit rewriting the single buffer until release. seek plus write_all fills the whole backing file before attach/damage/commit/flush. Fixed XRGB8888 little-endian B,G,R,x pixels and stride 3200 match the frozen compositor.",
+      "The client writes file bytes rather than mapping them itself. ext4_vnops.c:1242-1248 invalidates resident UBC pages after block-layer write; this is a genuine source path for the compositor's shared-map reads. Actual repeated-frame coherence remains a guest runtime qualification.",
+      "Lines 124-130 use prepare_read, flush, poll(POLLIN, 50 ms), then read. Timeout and EINTR drop the unread guard, cancelling the prepared read. Cached wayland-backend 0.3.17 uses Darwin-compatible SCM_RIGHTS, DONTWAIT and SO_NOSIGPIPE handling. XNU sys_generic.c:1684 implements poll.",
+      "Missing globals, file/syscall failures, connection failures and absent callbacks return failure. No buffer or callback is fabricated. At process exit the connection and file close; the receiving process owns its transferred FD independently."
+    ],
+    "nonblocking_findings": [
+      {
+        "id": "C1",
+        "evidence": "main.rs:95-107; wayland-client 0.31.15 event_queue.rs:420-435",
+        "finding": "The synchronous registry roundtrip precedes Instant::now and can wait indefinitely. The seconds option bounds only the later loop, and cannot bound blocked filesystem syscalls either.",
+        "action": "Retain the independent host worker timeout. Before using this client as an independently bounded tool, replace startup roundtrip with a deadline-driven sync callback/poll loop. This does not block the current externally supervised attempt."
+      },
+      {
+        "id": "C2",
+        "evidence": "main.rs:121,125,129",
+        "finding": "A transient WouldBlock on flush or read exits the client instead of retrying. This is fail-closed but may cause a false-negative run under socket backpressure or spurious readiness.",
+        "action": "If encountered, handle WouldBlock with the existing deadline and POLLOUT when outbound bytes remain; do not turn connection/protocol errors into success. No change is required to claim a successful observed run."
+      },
+      {
+        "id": "C3",
+        "evidence": "client/README.md versus client/src/main.rs:6-7,92-94,106,132-136",
+        "finding": "README describes chonkstep-shm-client, ARGB8888, adaptive 640x360 dimensions and exit 2. Actual binary is darwin-wayland-client, fixed 800x480 XRGB8888, exactly 48 hex nonce characters, and failure exit 1. paint.rs is not imported by main.rs, so its tests do not validate this executable's renderer.",
+        "action": "Align documentation and test-coverage claims with the reviewed main.rs before handing off the package."
+      }
+    ],
+    "evidence_limits": "DL10_CLIENT_FRAME is a real compositor callback receipt, not proof of physical scanout. The painted DARWIN / ARM64 / WAYLAND text is a literal, not a uname result; retain artifact/guest binding and fresh nonce-bearing framebuffer or physical-panel evidence separately.",
+    "client_modified": false,
+    "client_executed": false,
+    "tests_or_builds_run_for_this_review": false
+  },
+  "target_accessed": false,
+  "hardware_boot_performed": false,
+  "guest_wayland_runtime_verified_by_this_review": false,
+  "compositor_source_modified": false
+}

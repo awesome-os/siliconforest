@@ -1,0 +1,92 @@
+diff --git i/Makefile w/Makefile
+index 9c4784e..f978023 100644
+--- i/Makefile
++++ w/Makefile
+@@ -85,6 +85,11 @@ endif
+ ifeq ($(RELEASE),1)
+ CFG += RELEASE
+ endif
++# SiliconForest, installed on a disk (m1-native-boot/install): no USB proxy to fall back to and
++# no restart on failure; the machine stops with a message on the screen (sf_stop, utils.c).
++ifeq ($(SF_INSTALLED),1)
++CFG += SF_INSTALLED
++endif
+ 
+ # Required for no_std + alloc for now
+ export RUSTC_BOOTSTRAP=1
+diff --git i/src/main.c w/src/main.c
+index 3e0a9e1..0df9265 100644
+--- i/src/main.c
++++ w/src/main.c
+@@ -203,6 +203,10 @@ proxy_fallback:
+     fb_set_active(true);
+ 
+     printf("No valid payload found\n");
++#ifdef SF_INSTALLED
++    /* Installed SiliconForest: no proxy, no restart. The lines above say why. */
++    sf_stop("nothing could be started");
++#endif
+ #ifdef J613_ESP_STAGE1
+     /* Shown on the panel: this is where a user without a USB host ends up. */
+     printf("\nJ613 Stage 1: could not start Linux from the EFI partition.\n"
+diff --git i/src/utils.c w/src/utils.c
+index fd8b2cd..fb183c3 100644
+--- i/src/utils.c
++++ w/src/utils.c
+@@ -4,7 +4,9 @@
+ #include <stdarg.h>
+ 
+ #include "utils.h"
++#include "../build/build_cfg.h"
+ #include "cpu_regs.h"
++#include "fb.h"
+ #include "iodev.h"
+ #include "smp.h"
+ #include "types.h"
+@@ -126,10 +128,34 @@ bool timeout_expired(u64 timeout)
+     return expired;
+ }
+ 
++/*
++ * SiliconForest, installed (SF_INSTALLED): the end of every failure. The log becomes visible
++ * on the screen, nothing is restarted (a restart would start the same entry again, and
++ * the firmware counts failed starts), no USB device appears, nothing is written anywhere.
++ * The machine stays here until the power button is held.
++ */
++void sf_stop(const char *why)
++{
++    fb_set_active(true);
++    printf("\nSiliconForest: stopped (%s).\n"
++           "  Nothing on the disk was changed by this.\n"
++           "  Hold the power button until the machine is off. A short press then starts\n"
++           "  the default system; holding the button at start shows the startup picker.\n",
++           why);
++    printf("SF_STOPPED\n");
++    iodev_console_flush();
++    while (1)
++        sysop("wfi");
++}
++
+ void flush_and_reboot(void)
+ {
++#ifdef SF_INSTALLED
++    sf_stop("m1n1 gave up");
++#else
+     iodev_console_flush();
+     reboot();
++#endif
+ }
+ 
+ void spin_init(spinlock_t *lock)
+diff --git i/src/utils.h w/src/utils.h
+index dbefe60..f451079 100644
+--- i/src/utils.h
++++ w/src/utils.h
+@@ -422,6 +422,7 @@ u64 ticks_to_usecs(u64 ticks);
+ 
+ void reboot(void) __attribute__((noreturn));
+ void flush_and_reboot(void) __attribute__((noreturn));
++void sf_stop(const char *why) __attribute__((noreturn));
+ 
+ u64 timeout_calculate(u32 usec);
+ bool timeout_expired(u64 timeout);

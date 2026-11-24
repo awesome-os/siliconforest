@@ -1,0 +1,59 @@
+--- a/userland/CoreImage/CIImage.m
++++ b/userland/CoreImage/CIImage.m
+@@ -268,6 +268,56 @@
+ - (instancetype)initWithBitmapData:(NSData *)data bytesPerRow:(size_t)bytesPerRow size:(CGSize)size format:(CIFormat)format
+                         colorSpace:(CGColorSpaceRef)colorSpace
+ {
++    /* PD's rasterizer cannot consume floating-point CGImages. Keep supported
++       float input in CoreImage's own working buffer, without losing precision. */
++    if (format == kCIFormatRGBAf || format == kCIFormatRGBAh) {
++        BOOL linear = !colorSpace;
++        BOOL supported = !colorSpace;
++        if (colorSpace && CGColorSpaceGetModel(colorSpace) == kCGColorSpaceModelRGB) {
++            CFStringRef name = SFCICopyColorSpaceName(colorSpace);
++            if (name) {
++                linear = CFEqual(name, kCGColorSpaceLinearSRGB) || CFEqual(name, kCGColorSpaceExtendedLinearSRGB);
++                supported = linear || CFEqual(name, kCGColorSpaceSRGB) || CFEqual(name, kCGColorSpaceExtendedSRGB);
++                CFRelease(name);
++            }
++        }
++        size_t pixelBytes = format == kCIFormatRGBAf ? 16 : 8;
++        if (!supported || !isfinite(size.width) || !isfinite(size.height) ||
++            size.width < 1 || size.height < 1 || floor(size.width) != size.width || floor(size.height) != size.height ||
++            size.width >= (double)(SIZE_MAX / 16) || size.height >= (double)(SIZE_MAX / 16)) {
++            [self release];
++            return nil;
++        }
++        size_t width = (size_t)size.width, height = (size_t)size.height;
++        size_t rowBytes = width * pixelBytes;
++        if (bytesPerRow < rowBytes || height - 1 > (SIZE_MAX - rowBytes) / bytesPerRow ||
++            data.length < (height - 1) * bytesPerRow + rowBytes) {
++            [self release];
++            return nil;
++        }
++        NSData *storage = [data retain];
++        self = [self _finchInitWithExtent:CGRectMake(0, 0, width, height) render:^CIBuf(CGRect r) {
++            CIBuf b = ci_buf_alloc(r);
++            for (size_t y = 0; y < b.h; y++) {
++                size_t sourceY = height - 1 - ((size_t)r.origin.y + y);
++                const uint8_t *row = (const uint8_t *)storage.bytes + sourceY * bytesPerRow;
++                for (size_t x = 0; x < b.w; x++) {
++                    const uint8_t *input = row + ((size_t)r.origin.x + x) * pixelBytes;
++                    float *p = ci_buf_at(b, x, y);
++                    for (int c = 0; c < 4; c++) {
++                        if (pixelBytes == 16) memcpy(&p[c], input + c * 4, 4);
++                        else { _Float16 v; memcpy(&v, input + c * 2, 2); p[c] = (float)v; }
++                    }
++                    if (!linear && p[3] > 0)
++                        for (int c = 0; c < 3; c++) p[c] = ci_linear_from_srgb(p[c] / p[3]) * p[3];
++                }
++            }
++            return b;
++        }];
++        [storage release];
++        if (self) _space = CGColorSpaceRetain(colorSpace);
++        return self;
++    }
+     size_t bpc = 8, bpp = 32;
+     CGBitmapInfo info;
+     if (format == kCIFormatRGBA8)

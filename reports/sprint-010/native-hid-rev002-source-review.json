@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_ADVERSARIAL_SOURCE_REVIEW_NO_HARDWARE",
+  "reviewed": {
+    "source_validation": "integrations/puredarwin/m1-native-input/revisions/002/source-validation.json sha256 590fdbe373ed7aaa (matches root's message); manifest be188b03.",
+    "candidate.patch": "651153e32a6487f3 (cumulative, applies to pinned e7aa00a). The incremental publication-readiness.patch 4fec96f0 applies on top of frozen rev001 da499dd0.",
+    "files": "Only PDHIDEventQueue.cpp changes: dd2eb4e1 -> 7978e46a. IOHIDEventService.cpp 852df3bb, PDHIDEventQueue.h ee96bc82 and PDM1SPIHID.cpp b38f0087 are unchanged from rev001.",
+    "replay": "In scratch: incremental patch on rev001 after/ gives 7978e46a; cumulative patch on the live sources/puredarwin-m1-desktop (c7a2f35b/b2fdd461/856c46ec, unchanged) gives 7978e46a/ee96bc82/852df3bb. Both equal revisions/002/after. Revision 001, the live source tree and the active host were not touched."
+  },
+  "verdict": "APPROVE revision 002 for the SDK/KC build and the host regression (attempt 011). It fixes the 010 failure mode: no publication attempt, major or node exists before a genuine devfs_is_ready(). The IOBSD notifier is only a wake source with a correct ownership split. Both new waits are finite. The 60-attempt failure budget starts only after devfs and cannot be sped up. The lost-wake race is closed against XNU's actual ONCE semantics, and every transition logs numeric uptime. No blocking defects; four notes below.",
+  "verified": {
+    "callback_and_registration_ownership": [
+      "pd_hid_iobsd_published only does OSBitOrAtomic(1, &gBSDSeen); the first event alone calls thread_call_enter(gPublishCall). It never reads or removes the notifier, never publishes and takes no lock. The test harness checks this statically (no remove/release/gBSDNotifier/devfs_/cdevsw/publish_* in the body).",
+      "gBSDNotifier and every plain readiness global (gBSDWaitStarted/Ready/Refused, deadlines, registration count) are touched only by the ONCE worker. THREAD_CALL_OPTIONS_ONCE prevents concurrent runs, and the thread-call lock orders successive runs.",
+      "XNU addMatchingNotification (IOService.cpp:6615-6650) calls existing-service callbacks synchronously before returning the notifier. The worker stores the pointer only after the call returns. setNotification retains the matching dictionary (notify->matching = matching; retain), so the patch's matching->release() after registration is correct (the baseline did the same).",
+      "remove() is called only from the worker. _IOServiceNotifier::remove clears Enable and wait()s only for invocations on other threads (IOService.cpp:7177-7230). The callback never blocks on the worker, so there is no deadlock. Removal happens on readiness, on 'seen but devfs false' and on every refusal.",
+      "Delivery is well-founded. publishResource re-registers IOResources (IOService.cpp:5171-5185). doServiceMatch starts with reRegistered=true and, on every re-registration, adds each enabled gIOPublishNotification notifier whose matching passes matchPassive to the probe set. The IOBSD resource is published by IOKitBSDInit from bsd_autoconf (bsd_init.c:808), after vfsinit (:702) set devfs_ready."
+    ],
+    "genuine_devfs": [
+      "Success is only devfs_is_ready() read by the worker (pd_hid_devfs_gate). pd_hid_publish_nodes still re-checks it. IOBSD 'seen' with devfs false removes the notifier and rechecks every 1 s until the watchdog, then refuses with error 6. The event_is_not_devfs mutation is rejected.",
+      "Before the gate passes there is no cdevsw_add, no node, no 'publication deferred' line and attempts stay 0 (publication_before_bsd mutation rejected; deferred-devfs, late-event and startup-60-seconds cases)."
+    ],
+    "bounded_watchdog": [
+      "There is one 180 s gBSDWaitDeadline, from the first gate run that finds devfs false. It is checked at gate entry and again after registration (fresh clock sample), and every readiness re-arm is clamped to it. With the notifier installed the worker sleeps until the event or the deadline; there is no busy polling.",
+      "Registration failures (matching or notifier allocation) are retried no sooner than 1 s apart via gBSDRegisterAfter, and refused at 60 with error 5. Duplicate requests cannot reset or speed this up (registration-recover/refusal and matching-refusal cases).",
+      "180 s exceeds the source worst case: up to 60 s in IOKitInitializeTime, plus roughly 11 s of early kernel under the HV if a producer starts before bsd_init, plus network init up to IOBSD."
+    ],
+    "delayed_failure_budget": [
+      "The per-kind 60 attempts start at the first post-devfs attempt (startedAt). 'state.attempts && now < state.nextAttempt' rate-limits to at least 1 s apart whatever the wake source. The worker re-arms at the minimum pending nextAttempt (new-kind-no-acceleration case; accelerated_failures mutation rejected).",
+      "Thread-call soft deadlines never fire early (finish and expire compare soft_deadline <= now), so the bound is at least 59 s of real time after devfs."
+    ],
+    "reentry_and_lost_wakes": [
+      "XNU ONCE semantics (thread_call.c:709-770, 1588-1623): an enter while RUNNING records RESCHEDULE with deadline 0 (immediate) or d (delayed). The last writer wins, and finish re-queues accordingly. The patch arms the delayed deadline first, then compares gBSDSeen with the value sampled at gate entry and enters immediately if it changed.",
+      "Every interleaving with a callback (OR then enter) ends with an immediate enter as the last writer: an OR before the compare triggers the worker's own immediate enter after its delayed one, and an OR after the compare is followed by the callback's enter. Atomics are sequentially consistent and enters are serialised by the thread-call lock.",
+      "The synchronous existing-service callback re-enters the running call (RESCHEDULE only). Its effect is covered both by the post-registration devfs recheck and by the compare.",
+      "A new-capability request during a gate run can have its immediate enter overridden by the worker's long readiness re-arm. Nothing is lost: publication is gated on BSD, and the worker re-reads gPublishRequests when the IOBSD wake arrives.",
+      "Lost-wake cases before and after arming, callback-reentry, sync-existing and the lost_event_before_arm mutation are all covered. The fake scheduler models last-writer-wins, matching XNU."
+    ],
+    "numeric_timing_logs": [
+      "'BSD wait error=3 uptime_ms= timeout_ms=180000' (first gate)",
+      "'BSD ready seen= uptime_ms= elapsed_ms=' (the pre-devfs window, measured to the worker's wake)",
+      "'BSD notification deferred error=5 uptime_ms='",
+      "'BSD wait refused error=5|6 registration_failures= seen= uptime_ms= elapsed_ms='",
+      "'publication deferred kind= attempt=1 error= uptime_ms= elapsed_ms=0'",
+      "'ready kind= attempts= early_drops= uptime_ms= elapsed_ms= (endpoint, not input proof)'",
+      "'publication refused kind= attempts= error= uptime_ms= elapsed_ms='",
+      "uptime_ms comes from clock_get_uptime (mach_absolute_time), the same base as the kernel's '[ uptime]' console prefix, so it is directly comparable."
+    ],
+    "kpi_link": "clock_get_uptime, absolutetime_to_nanoseconds and clock_interval_to_deadline are in config/Mach.exports, and IOHIDFamily's Info.plist declares com.apple.kpi.mach. IOService.h is the IOKit KPI. The SDK/KC link remains root's build-time proof.",
+    "tests": "In a scratch copy: test_publication.py 35/35 OK (25.3 s, includes 13 compiled mutations rejected); verify_candidate.py PASS (frozen 001 unchanged, both routes replay to the same hashes). These are host-only checks with no kernel scheduler or ABI proof, as Astra states."
+  },
+  "notes": [
+    {"id": "N1", "severity": "note (policy)", "text": "The gate checks the 180 s deadline before devfs_is_ready(). A worker woken at or after the deadline refuses with error 6 even if devfs became ready just then. This fails closed and matches 'watchdog expiry remains failure'; it is only reachable if BSD takes more than 180 s."},
+    {"id": "N2", "severity": "note (evidence)", "text": "Kept deliberately from rev001: storage and gQueueReady are set before devfs, so reports arriving before the endpoint are enqueued rather than counted. early_drops=0 therefore does not prove that no input preceded the endpoint. After a BSD refusal the rings stay 'ready' with no node, which is unreachable. Before kminit the console kick is dropped safely (km.c:397-404). The compositor's open-time drain discards the backlog."},
+    {"id": "N3", "severity": "runtime unknown", "text": "This is the first runtime use of the IOBSD publish notifier in this lab: the baseline's notifier branch never ran in qualified captures, because publication happened after userspace. The source supports delivery (see above). If it does not fire, the outcome is 'BSD wait refused error=6 seen=0 elapsed_ms=180000': fail-closed and diagnosable. The remedy would be a coarse fallback devfs poll, which needs a new freeze, not a runtime workaround."},
+    {"id": "N4", "severity": "qualification", "text": "Expectations for attempt 011 (host regression, PDSerialHID present): one 'BSD wait error=3 uptime_ms=~55000-56000'; one 'BSD ready seen=1 uptime_ms= elapsed_ms=' with elapsed of about 55000-70000 (30 s IORTC + waitQuiet + time to IOBSD); then 'published /dev/usb_hid_kbd' and '/dev/usb_hid_mouse' and 'ready kind=1/2 attempts=1 ... elapsed_ms=0' before 'BSD root', with no 'BSD wait refused', 'publication refused' or 'publication deferred'. Then the 009 terminal close workload must qualify as before. An elapsed_ms below ~30000 contradicts the IORTC analysis: investigate it, do not accept it. For the native packet rules (native-startup-supervisor-review), also forbid 'BSD wait refused' and require no kind=2 ready line."}
+  ],
+  "not_claimed": ["SDK/KC build", "runtime publication", "IOBSD delivery on hardware", "host regression PASS", "native keyboard input", "physical typing"],
+  "scope": "Read-only source review, scratch patch replay and host tests. No edits to revision 001, production sources or the active host, and no hardware."
+}

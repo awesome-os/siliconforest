@@ -1,0 +1,96 @@
+fbsdkpi: a thread slot is dropped when its thread_t is reused by another thread
+
+The layer keeps per-thread state (linuxkpi's task_struct among it) in a table keyed by the
+thread_t address, and is never told when a thread it did not start exits. A new thread at a
+recycled address inherited the dead thread's state. Each slot now records xnu's unique thread
+id (thread_tid); on a mismatch the old state is released and the slot starts clean. The
+table therefore holds at most one slot per thread_t address ever seen. sf_thread_slot_stats()
+for diagnostics. (sfos_thread_tid() is in patch 0002's files.)
+UPSTREAM: yes.
+
+--- a/src/Kernel/fbsdkpi/sf/sf_haiku_kernel.cpp
++++ b/src/Kernel/fbsdkpi/sf/sf_haiku_kernel.cpp
+@@ -191,10 +191,16 @@
+ 	int32			priority;
+ 	char			name[B_OS_NAME_LENGTH];
+ 	void			*fbsd_thread;	// linuxkpi's struct thread, made on first use
++	// sf_tid: xnu's unique id of the thread, to notice a thread_t address reused by a new thread
++	uint64			tid;
+ };
+ 
+-static sf_thread sThreads[SF_THREAD_SLOTS];
++// sf_tables: allocated when the kext loads, not part of the image. As .bss these two tables
++// were 850 KiB of every kext that carries the layer, in a collection with 16 MiB for all kexts.
++static sf_thread *sThreads;
+ static spinlock sThreadLock;
++static long long sThreadsRecycled;	// sf_tid
++extern void (*sf_thread_fbsd_release)(void *fbsd_thread);	// sf_tid: defined below
+ static int32 sNextThreadID = 1;
+ 
+ static sf_thread *
+@@ -205,6 +211,8 @@
+ 	uintptr_t hash = ((uintptr_t)thread >> 4) % SF_THREAD_SLOTS;
+ 	sf_thread *found = NULL;
+ 	sf_thread *empty = NULL;
++	uint64 tid = sfos_thread_tid(thread);
++	void *stale = NULL;
+ 	for (int i = 0; i < SF_THREAD_SLOTS; i++) {
+ 		sf_thread *t = &sThreads[(hash + i) % SF_THREAD_SLOTS];
+ 		if (t->thread == thread) {
+@@ -216,10 +224,25 @@
+ 		if (t->thread == NULL && t->id == 0)
+ 			break;
+ 	}
++	if (found != NULL && found->tid != tid) {
++		// sf_tid: the slot's thread is gone and xnu gave its thread_t to a new thread. Nothing
++		// tells the layer that a thread it did not start has exited, so this is where its
++		// state (linuxkpi's task_struct, name, wait result) is dropped: the new thread starts
++		// clean instead of inheriting it, and the table only ever holds one slot per live
++		// thread_t address.
++		stale = found->fbsd_thread;
++		memset(found, 0, sizeof(*found));
++		found->thread = thread;
++		found->tid = tid;
++		found->id = sNextThreadID++;
++		found->resumed = 1;
++		sThreadsRecycled++;
++	}
+ 	if (found == NULL && create && empty != NULL) {
+ 		found = empty;
+ 		memset(found, 0, sizeof(*found));
+ 		found->thread = thread;
++		found->tid = tid;
+ 		found->id = sNextThreadID++;
+ 		found->resumed = 1;
+ 	}
+@@ -230,11 +253,29 @@
+ 	}
+ 	release_spinlock(&sThreadLock);
+ 	restore_interrupts(state);
++	if (stale != NULL && sf_thread_fbsd_release != NULL)
++		sf_thread_fbsd_release(stale);
+ 	if (found == NULL && create)
+-		dprintf("pd: no thread slot for %p, %d of %d in use\n", thread, used, SF_THREAD_SLOTS);
++		kprintf("pd: no thread slot for %p, %d of %d in use\n", thread, used, SF_THREAD_SLOTS);
+ 	return found;
+ }
+ 
++// sf_tid: slots in use, and slots taken over from a dead thread, for a kext's diagnostics
++extern "C" void
++sf_thread_slot_stats(int *used, long long *recycled)
++{
++	int n = 0;
++
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&sThreadLock);
++	for (int i = 0; i < SF_THREAD_SLOTS; i++)
++		n += sThreads[i].thread != NULL;
++	*recycled = sThreadsRecycled;
++	release_spinlock(&sThreadLock);
++	restore_interrupts(state);
++	*used = n;
++}
++
+ static sf_thread *
+ thread_slot_by_id(thread_id id)
+ {

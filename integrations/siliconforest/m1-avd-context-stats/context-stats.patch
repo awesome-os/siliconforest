@@ -1,0 +1,238 @@
+--- a/src/Kernel/Extensions/SFAppleAVD/include/sfavd/sfavd_ioctl.h
++++ b/src/Kernel/Extensions/SFAppleAVD/include/sfavd/sfavd_ioctl.h
+@@ -40,6 +40,7 @@
+ #define SFAVD_CAP_AV1  (1u << 3)
+ /* Optional ABI1 extension: atomic user capture-buffer import before MAP/decode. */
+ #define SFAVD_CAP_EXTERNAL_BUFFERS (1u << 16)
++#define SFAVD_CAP_CONTEXT_STATS (1u << 17)
+ 
+ #define SFAVD_MAX_BUFFERS 32
+ #define SFAVD_MAX_CTRLS   8
+@@ -113,6 +114,29 @@
+     struct sfavd_import_buffer buffers[SFAVD_MAX_BUFFERS];
+ };
+ 
++/* Additive diagnostics. Caller must own this live context; generation0 discovers
++ * its token, a nonzero token must match. No read triggers reap/allocate/decode.
++ * Jobs include HOLD slices; done counts successful final pictures. Capture byte
++ * fields describe ONLY the current capture set, not all private/coded/firmware
++ * allocations or post-DESTROY retirement. Global poison is not attributed.
++ * size/version/ctx/generation are inputs; flags and counters are outputs.
++ * reserved must be0; other output fields may contain a previous snapshot. */
++#define SFAVD_CONTEXT_STATS_VERSION 1u
++#define SFAVD_CTX_STATS_CORE_VALID       (1u << 0)
++#define SFAVD_CTX_STATS_CAPTURE_VALID    (1u << 1)
++#define SFAVD_CTX_STATS_IMPORTED         (1u << 2)
++#define SFAVD_CTX_STATS_SUBMITTED        (1u << 3)
++#define SFAVD_CTX_STATS_GLOBAL_POISONED  (1u << 4)
++struct sfavd_context_stats {
++    uint32_t size, version, ctx, flags;
++    uint64_t generation;
++    uint64_t jobs, done, errors, timeouts;
++    uint64_t last_decode_us, total_decode_us, max_decode_us;
++    uint64_t capture_backing_bytes, capture_iova_bytes, capture_prepared_bytes;
++    uint32_t capture_buffers, reserved;
++    uint64_t api_decode_calls, api_decode_errors;
++};
++
+ struct sfavd_destroy {
+ 	uint32_t ctx;
+ };
+@@ -122,6 +146,8 @@
+ #define SFAVD_IOC_MAP     _IOWR('V', 3, struct sfavd_map)
+ #define SFAVD_IOC_DECODE  _IOWR('V', 4, struct sfavd_decode)
+ #define SFAVD_IOC_DESTROY _IOW('V', 5, struct sfavd_destroy)
++#define SFAVD_IOC_CONTEXT_STATS _IOWR('V', 7, struct sfavd_context_stats)
++
+ #define SFAVD_IOC_IMPORT  _IOW('V', 6, struct sfavd_import)
+ 
+ #endif
+--- a/src/Kernel/Extensions/SFAppleAVD/kernel/sf_avd_core.h
++++ b/src/Kernel/Extensions/SFAppleAVD/kernel/sf_avd_core.h
+@@ -72,6 +72,9 @@
+ 	uint64_t last_decode_us, max_decode_us, total_decode_us;
+ };
+ void sf_avd_device_stats(struct sf_avd_device *dev, struct sf_avd_stats *out);
++/* Caller serialises with session decode/destroy, as for the other session APIs.
++ * Only synchronous job/picture/result counters are populated, not IRQ totals. */
++void sf_avd_session_stats(struct sf_avd_session *s, struct sf_avd_stats *out);
+ uint64_t sf_avd_os_now_us(void);
+ 
+ #ifdef __cplusplus
+--- a/src/Kernel/Extensions/SFAppleAVD/kernel/sf_avd_core.c
++++ b/src/Kernel/Extensions/SFAppleAVD/kernel/sf_avd_core.c
+@@ -465,6 +465,7 @@
+ 	unsigned int ncap;
+ 	bool started;
+ 	bool submitted, imported;
++	struct sf_avd_stats stats; /* owning session; not derived from global deltas */
+ 	struct avd_buf coded;        /* the coded ("OUTPUT") buffer, mapped for the decoder as videobuf2's is */
+ 	size_t ctrl_cap[SF_AVD_MAX_CTRLS];
+ };
+@@ -578,6 +579,11 @@
+ void sf_avd_device_stats(struct sf_avd_device *dev, struct sf_avd_stats *out)
+ {
+ 	*out = dev->stats;
++}
++
++void sf_avd_session_stats(struct sf_avd_session *s, struct sf_avd_stats *out)
++{
++    *out = s->stats;
+ }
+ 
+ /*
+@@ -1149,6 +1155,7 @@
+ 	dev->done = false;
+ 	spin_unlock_irqrestore(&avd->job_lock, flags);
+ 	dev->stats.jobs++;
++	s->stats.jobs++;
+ 	t0 = sf_avd_os_now_us();
+ 
+ 	ret = desc->ops->run(ctx);
+@@ -1156,6 +1163,7 @@
+ 		if (!s->m2m.sf_finished)
+ 			avd_job_finish(ctx, VB2_BUF_STATE_ERROR);
+ 		dev->stats.errors++;
++		s->stats.errors++;
+ 		return ret;
+ 	}
+ 
+@@ -1201,6 +1209,7 @@
+ 			avd_status(avd, 1);
+ 			avd_status(avd, 2);
+ 			dev->stats.timeouts++;
++			s->stats.timeouts++;
+ 			writel(0, avd->mbox + AVD_REG_MBOX_IRQ_ENABLE);
+ 			ret = avd_reset(dev);
+ 			if (ret)
+@@ -1236,7 +1245,11 @@
+                 if (ret) return ret;
+             }
+ 			dev->stats.done++;
++			s->stats.done++;
+ 			dev->stats.last_decode_us = us;
++			s->stats.last_decode_us = us;
++			s->stats.total_decode_us += us;
++			if (us > s->stats.max_decode_us) s->stats.max_decode_us = us;
+ 			dev->stats.total_decode_us += us;
+ 			if (us > dev->stats.max_decode_us)
+ 				dev->stats.max_decode_us = us;
+@@ -1244,6 +1257,7 @@
+ 		return 0;
+ 	}
+ 	dev->stats.errors++;
++	s->stats.errors++;
+ 	return -EIO;
+ }
+ 
+--- a/src/Kernel/Extensions/SFAppleAVD/kernel/SFAppleAVD.cpp
++++ b/src/Kernel/Extensions/SFAppleAVD/kernel/SFAppleAVD.cpp
+@@ -87,6 +87,7 @@
+ OSDefineMetaClassAndStructors(SFAppleAVD, IOService);
+ 
+ struct Context {
++    uint64_t generation, apiDecodeCalls, apiDecodeErrors;
+ 	struct sf_avd_session *session;
+ 	struct sfavd_format    format;
+ 	pid_t                  owner;
+@@ -125,6 +126,7 @@
+ static volatile SInt32 gWakes;
+ static volatile UInt32 gIrqs;
+ static Context      gContexts[MAX_CONTEXTS];
++static uint64_t gNextContextGeneration;
+ 
+ /* ---- sf_avd_os.h ----------------------------------------------------------------------- */
+ 
+@@ -599,6 +601,8 @@
+ 	c->owner = proc_selfpid();
+     c->ownerTask=current_task();task_reference(c->ownerTask);
+ 	c->buffers = req->buffers;
++    c->generation = ++gNextContextGeneration;
++    if (!c->generation) c->generation = ++gNextContextGeneration;
+ 	req->ctx = slot;
+ 	req->format = c->format;
+ 	if (gLevel >= 2)
+@@ -707,6 +711,43 @@
+ }
+ 
+ static int
++do_context_stats(struct sfavd_context_stats *req)
++{
++    if (req->size != sizeof(*req) || req->version != SFAVD_CONTEXT_STATS_VERSION ||
++        req->reserved) return EINVAL;
++    Context *c = context_of(req->ctx);
++    if (!c || c->owner != proc_selfpid() || c->ownerTask != current_task() ||
++        (req->generation && req->generation != c->generation)) return EINVAL;
++    struct sf_avd_stats stats = {};
++    sf_avd_session_stats(c->session, &stats);
++    struct sfavd_context_stats out = {};
++    out.size=sizeof(out);out.version=SFAVD_CONTEXT_STATS_VERSION;out.ctx=req->ctx;
++    out.generation=c->generation;
++    out.flags=SFAVD_CTX_STATS_CORE_VALID|SFAVD_CTX_STATS_CAPTURE_VALID;
++    if (c->imported) out.flags|=SFAVD_CTX_STATS_IMPORTED;
++    if (c->submitted) out.flags|=SFAVD_CTX_STATS_SUBMITTED;
++    if (gDart.poisoned) out.flags|=SFAVD_CTX_STATS_GLOBAL_POISONED;
++    out.jobs=stats.jobs;out.done=stats.done;out.errors=stats.errors;out.timeouts=stats.timeouts;
++    out.last_decode_us=stats.last_decode_us;out.total_decode_us=stats.total_decode_us;
++    out.max_decode_us=stats.max_decode_us;
++    out.capture_buffers=c->buffers;
++    out.api_decode_calls=c->apiDecodeCalls;out.api_decode_errors=c->apiDecodeErrors;
++    for (unsigned i=0;i<c->buffers;i++) {
++        void *cpu=NULL,*cookie=NULL;size_t bytes=0;
++        if (sf_avd_session_buffer(c->session,i,&cpu,&bytes,&cookie) || !cookie) return EIO;
++        DmaCookie *d=(DmaCookie *)cookie;
++        if (d->bytes>SIZE_MAX-16383) return EOVERFLOW;
++        uint64_t rounded=(d->bytes+16383)&~(size_t)16383;
++        if (out.capture_backing_bytes>UINT64_MAX-rounded) return EOVERFLOW;
++        out.capture_backing_bytes+=rounded;
++        if (d->iova) out.capture_iova_bytes+=rounded;
++        if (d->prepared) out.capture_prepared_bytes+=rounded;
++    }
++    *req=out;
++    return 0;
++}
++
++static int
+ do_decode(struct sfavd_decode *req)
+ {
+ 	Context *c = context_of(req->ctx);
+@@ -782,7 +823,7 @@
+ 	int err = ENOTTY;
+ 
+ 	IOLockLock(gLock);
+-	if (!gUp || (gDart.poisoned && cmd!=SFAVD_IOC_INFO && cmd!=SFAVD_IOC_DESTROY)) {
++	if (!gUp || (gDart.poisoned && cmd!=SFAVD_IOC_INFO && cmd!=SFAVD_IOC_DESTROY && cmd!=SFAVD_IOC_CONTEXT_STATS)) {
+ 		IOLockUnlock(gLock);
+ 		return ENXIO;
+ 	}
+@@ -791,7 +832,7 @@
+ 		struct sfavd_info *info = (struct sfavd_info *)data;
+ 		bzero(info, sizeof(*info));
+ 		info->abi = SFAVD_ABI_VERSION;
+-		info->caps = sf_avd_device_caps(gDev) | (gDart.poisoned ? 0 : SFAVD_CAP_EXTERNAL_BUFFERS);
++		info->caps = sf_avd_device_caps(gDev) | (gDart.poisoned ? 0 : SFAVD_CAP_EXTERNAL_BUFFERS) | SFAVD_CAP_CONTEXT_STATS;
+ 		info->booted = contexts_in_use() != 0;
+ 		info->contexts = contexts_in_use();
+ 		strlcpy(info->firmware, gFirmwareText, sizeof(info->firmware));
+@@ -807,9 +848,18 @@
+ 	case SFAVD_IOC_MAP:
+ 		err = do_map((struct sfavd_map *)data);
+ 		break;
+-	case SFAVD_IOC_DECODE:
+-		err = do_decode((struct sfavd_decode *)data);
+-		break;
++    case SFAVD_IOC_CONTEXT_STATS:
++        err=do_context_stats((struct sfavd_context_stats *)data);
++        break;
++    case SFAVD_IOC_DECODE: {
++        struct sfavd_decode *req=(struct sfavd_decode *)data;
++        Context *c=context_of(req->ctx);
++        bool owned=c && c->owner==proc_selfpid() && c->ownerTask==current_task();
++        if (owned) c->apiDecodeCalls++;
++        err=do_decode(req);
++        if (owned && err) c->apiDecodeErrors++;
++        break;
++    }
+ 	case SFAVD_IOC_DESTROY: {
+ 		Context *c = context_of(((struct sfavd_destroy *)data)->ctx);
+ 		if (c == NULL || (c->owner != proc_selfpid() || c->ownerTask != current_task())) {

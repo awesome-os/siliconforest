@@ -1,0 +1,29 @@
+pages: put_page() of a shared page drops its reference with a compare-and-swap
+
+Audit finding P6. The count was loaded, compared with 1 and then decremented as separate
+steps: two cpus releasing the last two references both took the "someone else still holds
+it" branch and the page was never freed.
+
+--- a/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_page.c
++++ b/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_page.c
+@@ -406,9 +406,16 @@
+ 	if (page == NULL)
+ 		return;
+ 	// a page someone took with get_page stays until its last holder lets go
+-	if (order == 0 && __atomic_load_n(&page->ref_count, __ATOMIC_ACQUIRE) > 1) {
+-		__atomic_sub_fetch(&page->ref_count, 1, __ATOMIC_ACQ_REL);
+-		return;
++	// (one compare-and-swap per step: with a separate load and decrement two cpus letting
++	// go of the last two references both saw 2, both subtracted, and nobody freed the page)
++	if (order == 0) {
++		int refs = __atomic_load_n(&page->ref_count, __ATOMIC_ACQUIRE);
++
++		while (refs > 1) {
++			if (__atomic_compare_exchange_n(&page->ref_count, &refs, refs - 1, 0,
++			    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
++				return;
++		}
+ 	}
+ 
+ 	run = page->sf_run;
+

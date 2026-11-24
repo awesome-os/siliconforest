@@ -1,0 +1,92 @@
+{
+  "schema": 1,
+  "reviewer": "Astra",
+  "date": "2026-11-08",
+  "status": "SOURCE_SUPPORTED_CAUSE_AND_SCOPED_PATCH_PROPOSAL",
+  "scope": "Read-only source and saved attempt003 evidence. Only this report was written. No patch, build, hardware access or new execution.",
+  "conclusion": "The graphics server reaches the serialized framebuffer close path. That path conditionally requests text ownership only when getPowerState() is nonzero. IOGOP has PMinit through its superclass but no registered power-state table, making the power predicate the leading source-supported reason for the missing ownership return. Kernel003 can handle an explicit Acquire; its remap-resume fix cannot manufacture a missing Acquire call.",
+  "evidence": {
+    "capture": "runs/m1-desktop-010/attempt-003",
+    "kernel_sha256": "7335c418494241a7c805d61172dcb690115dd61b6b57e833f883cdd6856f5c06",
+    "ramdisk_sha256": "0707900627ffdbc0b0ad14474fe35a367c45b2d566a6189f5872ac9b22bdc704",
+    "console_sha256": "6c73769ae9628a48a612124f131be0481096fceea3d45c98579be2625992d205",
+    "console_bytes": 33882,
+    "console_line_evidence": [
+      "727: PDGOP selected IOGOPFramebuffer; 735: kPEDisableScreen 1; 747-752: successful open, server user-client start and memory mapping.",
+      "831: real client DONE, callbacks=35 paints=36.",
+      "833-839: clientMemoryForType, clientClose, terminate, finalize, stop, IOFramebuffer::close and free.",
+      "840: client=0 compositor=0; 844-846: fresh text-console return footer/nonce appears in serial; 866: script END."
+    ],
+    "framebuffer_sha256": "815852d00bf2e28cb633e036475456abb80c6d9d9b45e3a5ff1493c428ac4cae",
+    "framebuffer_bytes": 16384000,
+    "framebuffer_digest_independently_checked": true,
+    "png": "artifacts/m1-desktop-010/evidence/attempt-003-framebuffer.png",
+    "png_sha256": "4062fc5b09a3a25efa8210de47c2a76e947204e23e10f69668b2c1221818ef33",
+    "visual_inspection": "Saved image still shows the decorated client FRAME 35 and graphics background, without the fresh text footer. This is framebuffer-memory evidence, not a fresh physical-panel observation.",
+    "controller_result": "DARWIN_COMMAND_LINE_OBSERVED_LINUX_VERIFIED, one reset, diagnostics_complete=true; original HOST_WORKER_EXITED_WITHOUT_BOOT_VERDICT/worker return 1 retained."
+  },
+  "source_identity": {
+    "base_directory": "sources/puredarwin-m1-desktop",
+    "src/Kernel/Extensions/IOGraphicsFamily/IOFramebuffer.cpp": "1bb98e66478d5c414de6bf4234a0c3286be6ea6b1cdfb4ce9057e43bbda87fdd",
+    "src/Kernel/Extensions/IOGraphicsFamily/IOFramebufferUserClient.cpp": "e318d167513af5ec0eeab863c33dc8b26f7bd998efeb8061f691dc04c2788ac4",
+    "src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.cpp": "72bdea3925213de85ed7caeeba52ca38bac18dd6acc9807d4dde0571d0344773",
+    "src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.h": "05a0c5f928e3b8b6498933e2240f6ad9c554a049182ce42b1d3746e37f2ff4cb",
+    "src/Kernel/xnu/pexpert/arm/pe_init.c": "51796b96999a9ec7d9079ab25265012ad5e9adde51ec7b1c82dbe1cc689e58b7",
+    "src/Kernel/xnu/osfmk/console/video_console.c": "ea3ad0963f75a0c86ab2c5d6506d6928c926787fe8e1351f8f9b05a427690a79",
+    "desktop_wc_patch": "integrations/puredarwin/m1-wayland/iogop-vram-write-combine.patch",
+    "desktop_wc_patch_sha256": "8337e974d6578049e689e4ad31ec1d6030ffa83900e86507d647d19d83165377",
+    "fidelity": "IOFramebuffer.cpp and IOFramebufferUserClient.cpp match baseline and kernel003 store source byte-for-byte. Both console C files match /nix/store/274mmx792npkzabn9yb7hg17q58syyn9-source. Local IOGOP is the inherited source; the desktop recipe additionally applies the reviewed 30-bit and WC patches. The existing Apple-only predicate is in the WC patch, not in the unpatched local IOGOP file."
+  },
+  "close_trace": [
+    {"source": "src/Libraries/PDGOP/PDGOP.c:155-175; sources/chonkstep-darwin/crates/wm-darwin/src/presenter.rs:119", "fact": "The single-owner presenter drops after its render loop ends. PDGOPClose requests unmap before IOServiceClose; it then releases service/port references. Its void API discards unmap/close return codes, so normal process exit alone is not proof of each individual RPC succeeding."},
+    {"source": "src/Kernel/Extensions/IOGraphicsFamily/IOFramebufferUserClient.cpp:166-171", "fact": "clientClose only calls terminate. Its explicit comment says parallel RPCs make this an unsafe place to manipulate framebuffer ownership."},
+    {"source": "src/Kernel/Extensions/IOGraphicsFamily/IOFramebufferUserClient.cpp:184-193,224-231", "fact": "Termination defers while active RPCs remain; stop then calls fOwner->extClose on the provider workloop."},
+    {"source": "src/Kernel/Extensions/IOGraphicsFamily/IOFramebuffer.cpp:10230-10257", "fact": "extClose schedules closeWork on the system workloop and sleeps with the provider gate open. closeWork holds the system gate, acquires the framebuffer gate, calls virtual close and wakes the original closer only afterward."},
+    {"source": "src/Kernel/Extensions/IOGraphicsFamily/IOFramebuffer.cpp:10342-10346", "fact": "Generic reacquire requires this==gIOFBConsoleFramebuffer, nonzero getPowerState(), and no accelerator-backed timing flag."},
+    {"source": "src/Kernel/Extensions/IOGraphicsFamily/IOFramebuffer.cpp:10356-10371", "fact": "The base close clears captured and finishes cleanup before clearing fServerConnect. It deliberately retains fServerConnect until then to block a replacement server during teardown."},
+    {"source": "src/Kernel/xnu/pexpert/arm/pe_init.c:239-253; osfmk/console/video_console.c:2982-3011", "fact": "Kernel003 Acquire restores the saved pre-disable console route, then initialize_screen enables text when the boot mode is text. The no-info release at server open deliberately prevents remap-based auto-reacquire while graphics is owned."}
+  ],
+  "power_predicate": {
+    "source": [
+      "src/Kernel/Extensions/IOGraphicsFamily/IOFramebuffer.cpp:4862-4867",
+      "src/Kernel/xnu/iokit/Kernel/IOServicePM.cpp:459-475,3591-3597",
+      "src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.cpp:469-508,536-540"
+    ],
+    "fact": "IOFramebuffer::start calls PMinit and joins the PM hierarchy. PMinit sets the controlling driver/table/count to null/null/zero and fCurrentPowerState to zero. IOGOP supplies no registerPowerDriver or real power-state transition implementation. getPowerState returns that PM state; it is not a query of whether firmware scanout or its DRAM is currently usable.",
+    "console_identity": "open's nowOnline branch sets gIOFBConsoleFramebuffer when empty (IOFramebuffer.cpp:9299-9303). The capture's displaysOnline and successful sole-framebuffer open support this branch, but the actual global pointer was not dumped.",
+    "confidence_limit": "The actual close-time getPowerState value, global console pointer and timing flags were not captured. The power guard explanation is a source-supported inference, not a measured branch trace.",
+    "logging_correction": "ARM PE_initialize_console only prints the kPEEnableScreen line in the combined Acquire/Enable branch. Acquire itself has no kprintf; setPlatformConsole uses tracing rather than a serial Acquire log. Absence of a kPEAcquireScreen string is therefore not proof it was not called."
+  },
+  "recommended_minimal_patch": {
+    "files": [
+      "src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.h",
+      "src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.cpp"
+    ],
+    "packaging": "A new isolated desktop console-return patch layered after the current framebuffer-format/WC patches. Preserve current KC/kernel003 and all attempt003 evidence. No XNU or generic IOGraphics behavior change is required for this narrow candidate.",
+    "implementation": [
+      "Declare an override of the existing virtual void close(void); no new base-class virtual slot or public PDGOP ABI change.",
+      "Save whether a server connection was actually present, then call super::close() first. The override is invoked by closeWork under both existing gates; do not move work into clientClose or schedule an ungated callback.",
+      "After base cleanup, require the saved server-presence condition, fServerConnect==NULL and fSharedConnect==NULL. Refuse inactive/dead/suspended or detached framebuffer/provider states. Do not clear these fields early to manufacture eligibility.",
+      "Scope the fallback to gop_apple_soc_firmware_fb(provider), the already reviewed AppleARM/non-PCI firmware predicate from the WC patch, with a non-null platform provider. Do not treat the WC cache property alone as an ownership decision.",
+      "Require getPowerState()==0 for this fallback; preserve the generic powered-console path. This describes IOGOP's missing PM model without inventing a power state or a successful power-management operation.",
+      "Read the current platform console description and require its tagged physical base (low tag bits masked), width, height and rowbytes to match this IOGOP instance's retained firmware framebuffer. Refuse a changed console or remapped/foreign framebuffer rather than forcing ownership.",
+      "For this text-return experiment, require current v_display==2, pdtextboot enabled, and the existing serial_video_mirror/gopconsole text-routing opt-in. These are already true for the captured candidate; serial-only or graphics boot should keep their existing behavior.",
+      "Only after those checks, call getPlatform()->setConsoleInfo(NULL, kPEAcquireScreen), which uses kernel003's existing route restoration and ownership-aware console implementation. Do not call kPETextMode, clear the framebuffer directly or force kPEEnableScreen while a server is live.",
+      "Add one bounded diagnostic at this actual call site, describing that text reacquisition was requested and its return code; avoid wording that claims pixel or panel success. A skipped-path reason can record the scalar eligibility checks without exposing addresses."
+    ],
+    "why_safe_for_current_path": "The parent cleanup and both gates serialize old-server teardown with a subsequent open. The fallback runs only after the old server pointer is cleared and refuses any remaining shared connection. The current presenter has stopped all painting and requested unmap before close. The existing no-info Release on every server open continues to suppress text painting while a graphics server owns the framebuffer.",
+    "deliberate_limits": [
+      "A surviving shared connection can still obtain VRAM (IOFramebufferSharedUserClient.cpp is part of IOFramebufferUserClient.cpp:593-624). The minimal patch must leave text disabled in that case. It need not implement last-shared-client return; that would require another serialized callback and a separate review.",
+      "This does not establish general revocation of every user mapping. IOUserClient mapping lifetime is separate from active-RPC lifetime. The bounded candidate uses the reviewed unmap-before-close presenter; retained or duplicated mappings are outside that proof.",
+      "The legacy /dev/fb0 writer has no ownership arbitration and is not used by this candidate. This patch must not be advertised as resolving concurrent raw-fb0 access.",
+      "A future GPU/DCP driver or changed console mapping must fail these firmware-identity checks; do not generalize this fallback into a global getPowerState bypass."
+    ]
+  },
+  "focused_validation_to_add_before_build": [
+    "Source-aware close harness: fake parent cleanup records call order; no Acquire before parent returns; eligible Apple firmware text + PM state zero + no remaining owner requests exactly one Acquire.",
+    "Negative cases: server still present, shared client present, no original server, detached/inactive/dead/suspended, non-Apple/PCI, mismatched base or geometry, graphics/serial-only boot and explicit pdtextboot=0 all request none.",
+    "Powered generic close retains its existing behavior without a duplicate fallback; no power-state values are fabricated.",
+    "Compose with existing console-resume state tests: Release/open/remap leaves text disabled; eligible post-close Acquire restores saved VC routing and enables text; a later open releases it again.",
+    "Actual SDK rebuild and immutable KC/member/source inspection are still required. A later authorized runtime must show the real close/fallback sequence and fresh nonce footer pixels after it, alongside verified Linux recovery. Serial footer, process exit 0 or request-log alone is insufficient."
+  ]
+}

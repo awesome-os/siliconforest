@@ -1,0 +1,155 @@
+--- a/src/Frameworks/AppKit/NSPopUpButton.m
++++ b/src/Frameworks/AppKit/NSPopUpButton.m
+@@ -262,15 +262,47 @@
+ 
+ @implementation NSPopUpButton (BindingSupport)
+ 
+--(void)_setItemValues:(NSArray *)values forKey:(NSString *)key {
+-
+-    [_cell removeAllItems];
+-    [_cell addItemsWithTitles:values];
+-    
+-	if ([self indexOfSelectedItem] >= values.count) {
+-		[self selectItem:nil];
+-	}
+-	[self synchronizeTitleAndSelectedItem];
++/* The content bindings. "content" is the array of the objects the items stand for, "contentObjects"
++ * (optional) what each item represents instead, "contentValues" (optional) what each item is
++ * called. Whichever arrives first makes the items; the others fill them in by index. A value that
++ * is not an array (a placeholder for "no selection") is no items. (Every array used to be given
++ * to -addItemsWithTitles: as if it held strings.) */
++static NSArray *sfBindingArray(id values) {
++    return [values isKindOfClass:[NSArray class]] ? values : [NSArray array];
++}
++
++static NSString *sfBindingTitle(id value) {
++    if([value isKindOfClass:[NSString class]])
++        return value;
++    if(value==nil || value==[NSNull null])
++        return @"";
++    return [value description];
++}
++
++// the items changed: what the selection is bound to is selected among the new items
++-(void)_sfSelectionFollowsContent {
++    static NSString * const names[]={@"selectedObject",@"selectedValue",@"selectedTag",@"selectedIndex"};
++    int i;
++
++    for(i=0;i<4;i++){
++        id binder=[self _binderForBinding:names[i]];
++
++        if(binder!=nil && [binder respondsToSelector:@selector(syncUp)]){
++            [binder syncUp];
++            break;
++        }
++    }
++}
++
++-(void)_sfSetItemCount:(NSUInteger)count {
++    NSInteger selected=[self indexOfSelectedItem];
++
++    while((NSUInteger)[_cell numberOfItems]>count)
++        [_cell removeItemAtIndex:[_cell numberOfItems]-1];
++    while((NSUInteger)[_cell numberOfItems]<count)
++        [[_cell menu] addItemWithTitle:@"" action:NULL keyEquivalent:@""];
++    if(selected>=(NSInteger)count)
++        [self selectItem:nil];
+ }
+ 
+ -(id)_contentValues
+@@ -278,18 +310,34 @@
+ 	return [self valueForKeyPath:@"itemArray.title"];
+ }
+ 
+-// FIXME: is it contentValues or contentObjects, or both?
+--(void)_setContentValues:(NSArray*)values
++-(void)_setContentValues:(id)values
+ {
+-	[self _setItemValues:values forKey:@"title"];
++    NSArray *titles=sfBindingArray(values);
++    NSUInteger i,count=[titles count];
++
++    [self _sfSetItemCount:count];
++    for(i=0;i<count;i++)
++        [[_cell itemAtIndex:i] setTitle:sfBindingTitle([titles objectAtIndex:i])];
++    [self _sfSelectionFollowsContent];
++    [self synchronizeTitleAndSelectedItem];
++    [self setNeedsDisplay:YES];
+ }
+ 
+ -(id)_contentObjects {
+-	return [self valueForKeyPath:@"itemArray.title"];
++	return [self valueForKeyPath:@"itemArray.representedObject"];
+ }
+ 
+--(void)_setContentObjects:(NSArray *)objects {
+-	[self _setItemValues:objects forKey:@"title"];
++-(void)_setContentObjects:(id)values {
++    NSArray *objects=sfBindingArray(values);
++    NSUInteger i,count=[objects count];
++
++    [self _sfSetItemCount:count];
++    for(i=0;i<count;i++){
++        id object=[objects objectAtIndex:i];
++
++        [[_cell itemAtIndex:i] setRepresentedObject:(object==[NSNull null])?nil:object];
++    }
++    [self _sfSelectionFollowsContent];
+ }
+ 
+ -(id)_content
+@@ -297,16 +345,47 @@
+ 	return [self valueForKeyPath:@"itemArray.representedObject"];
+ }
+ 
+--(void)_setContent:(NSArray*)values
++-(void)_setContent:(id)values
+ {
+-	[self _setItemValues:values forKey:@"representedObject"];
+-	if(![self _binderForBinding:@"contentValues"])
+-	{
+-		[self _setItemValues: [values valueForKey: @"description"] forKey:@"title"];
+-	}
++    NSArray *objects=sfBindingArray(values);
++    NSUInteger i,count=[objects count];
++    BOOL titled=[self _binderForBinding:@"contentValues"]!=nil;
++    BOOL represented=[self _binderForBinding:@"contentObjects"]!=nil;
++
++    [self _sfSetItemCount:count];
++    for(i=0;i<count;i++){
++        id object=[objects objectAtIndex:i];
++        NSMenuItem *item=[_cell itemAtIndex:i];
++
++        if(!represented)
++            [item setRepresentedObject:(object==[NSNull null])?nil:object];
++        if(!titled)
++            [item setTitle:sfBindingTitle(object)];
++    }
++    [self _sfSelectionFollowsContent];
++    [self synchronizeTitleAndSelectedItem];
++    [self setNeedsDisplay:YES];
++}
++
++// the object the selected item stands for
++-(id)_selectedObject {
++    return [[_cell selectedItem] representedObject];
++}
++
++-(void)_setSelectedObject:(id)object {
++    NSInteger i,count=[_cell numberOfItems];
++
++    for(i=0;i<count;i++){
++        id represented=[[_cell itemAtIndex:i] representedObject];
++
++        if(represented==object || (object!=nil && [represented isEqual:object])){
++            [self selectItemAtIndex:i];
++            return;
++        }
++    }
++    [self selectItem:nil];
+ }
+ 
+-
+ -(NSInteger)_selectedTag {
+    return [[_cell selectedItem] tag];
+ }

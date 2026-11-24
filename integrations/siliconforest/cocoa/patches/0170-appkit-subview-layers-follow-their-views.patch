@@ -1,0 +1,73 @@
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -1252,6 +1252,7 @@
+     [view _setSuperview:self];
+     // _setWindow placed hosted layers before the view had this superview, so place them again
+     [view _sfUpdateMetalLayers];
++    [view _sfPlaceLayerUnderSuperview];
+    }
+ 
+    if(index==NSNotFound)
+@@ -1598,6 +1599,9 @@
+    NSWindow *window=[self window];
+ 
+    [removeFrom willRemoveSubview:self];
++   // (TERM11) a removed view's layer no longer renders with its former superview's
++   if(_layer!=nil && !isSurfaceLayer(_layer) && removeFrom!=nil && [_layer superlayer]==[removeFrom layer])
++    [_layer removeFromSuperlayer];
+    _NSViewRemoveConstraintsReferringTo(removeFrom,self);
+    [self _deepResignFirstResponder];
+    [self _setSuperview:nil];
+@@ -2003,6 +2007,7 @@
+      fprintf(stderr,"SFWIN layers of window %d: view %s layer %p context %p canDraw %d\n",(int)[_window windowNumber],object_getClassName(self),(void *)_layer,(void *)_layerContext,(int)[self canDraw]);
+     return;
+    }
++   [self _sfAdoptLayersOfSubviews];
+    // a bare backing layer has nothing of its own to show, so skip the readback
+    if([[_layer sublayers] count]==0 && [_layer contents]==nil && [_layer backgroundColor]==NULL && [_layer borderWidth]==0){
+     if(getenv("SF_WIN_TRACE")!=NULL && [_window level]>=3)
+@@ -2083,6 +2088,44 @@
+    [self _createLayerContextIfNeeded];
+ }
+ 
++/* (TERM11, FX-022) A view that has a layer and moves under another view: its layer goes into the superview's layer (and
++ * renders with it) when that one has a layer, else the view renders it with a context of its own. Its layer stayed
++ * where it was: Firefox's popup puts its ChildView (with the layers its pixels are in) under a layer-backed content
++ * view, whose layer then had no sublayers - the menu panel was read back empty, a transparent window. */
++-(void)_sfPlaceLayerUnderSuperview {
++   if(_layer==nil || isSurfaceLayer(_layer))
++    return;
++   if([_superview layer]!=nil){
++    if([_layer superlayer]!=[_superview layer]){
++     [_layerContext invalidate];
++     [_layerContext release];
++     _layerContext=nil;
++     [_layer removeFromSuperlayer];
++     [[_superview layer] addSublayer:_layer];
++    }
++   }
++   else {
++    [_layer removeFromSuperlayer];
++    [self _createLayerContextIfNeeded];
++   }
++}
++
++// (TERM11) before a tree is rendered: a layer of a view below that lies outside it (an order of calls the rules above
++// do not cover) is put back where the views say it belongs
++-(void)_sfAdoptLayersOfSubviews {
++   for(NSView *view in _subviews){
++    CALayer *layer=[view layer];
++
++    if(layer!=nil && !isSurfaceLayer(layer) && _layer!=nil && [layer superlayer]!=_layer){
++     if(getenv("SF_WIN_TRACE")!=NULL)
++      fprintf(stderr,"SFWIN adopting the layer %p of %s under %s\n",(void *)layer,object_getClassName(view),object_getClassName(self));
++     [view _sfPlaceLayerUnderSuperview];
++    }
++    if(layer!=nil)
++     [view _sfAdoptLayersOfSubviews];
++   }
++}
++
+ /*
+   When turning off layering, we only turn off layers below us which did not want a layer
+   Layers which did want a layer are not touched, nor are their children.

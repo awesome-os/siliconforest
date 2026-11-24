@@ -1,0 +1,179 @@
+drm/asahi: TEMPORARY diagnostics on the kernel-mapping path ("SFAgx: diag:")
+
+Boot ag02 failed with ENOMEM at the first HeapAllocator::add_block mapping. One line per
+step that can fail between the GEM object and the page-table commit, the DMA segments of the
+first four mappings, and an error instead of a silent short mapping when the sg table covers
+less than the mapping; the first firmware messages, RTKit boot, and the first channel
+command the firmware consumes (or a line for each one it does not). Remove when the Mesa
+test passes.
+UPSTREAM: no.
+
+--- a/channel.rs
++++ b/channel.rs
+@@ -190,7 +190,10 @@
+         let timeout_ms = timeout_ms.max(1);
+         let timeout_fast = Delta::from_millis(timeout_ms.min(MAX_FAST_POLL));
+         let timeout_slow = Delta::from_millis(timeout_ms);
+-        self.ring.state.with(|raw, _inner| {
++        // SFAgx diag (temporary): the first time the firmware consumes a command, and every
++        // time it does not
++        static FIRST: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
++        let result = self.ring.state.with(|raw, _inner| {
+             while start.elapsed() < timeout_fast {
+                 if T::rptr(raw) == wptr {
+                     return Ok(());
+@@ -204,8 +207,19 @@
+                 fsleep(Delta::from_millis(5));
+                 mem::sync();
+             }
++            pr_err!(
++                "SFAgx: diag: firmware did not consume a channel command: read pointer {} wanted {} after {} ms\n",
++                T::rptr(raw), wptr, timeout_ms
++            );
+             Err(ETIMEDOUT)
+-        })
++        });
++        if result.is_ok() && FIRST.swap(false, core::sync::atomic::Ordering::Relaxed) {
++            pr_info!(
++                "SFAgx: diag: firmware consumed its first channel command after {} us\n",
++                start.elapsed().as_micros_ceil()
++            );
++        }
++        result
+     }
+ }
+ 
+--- a/gem.rs
++++ b/gem.rs
+@@ -124,7 +124,7 @@
+     gem: &'a Object,
+     dev: &'a kernel::device::Device<kernel::device::Bound>,
+ ) -> Result<shmem::SGTable<'a, AsahiObject>> {
+-    let sgt = gem.sg_table(dev)?;
++    let sgt = gem.sg_table(dev).inspect_err(|e| pr_err!("SFAgx: diag: gem sg_table (shmem get_pages, sg table, dma_map_sgtable) failed: {:?}\n", e))?;
+     set_mapping_held(gem, true);
+     Ok(sgt)
+ }
+--- a/gpu.rs
++++ b/gpu.rs
+@@ -463,6 +463,11 @@
+     }
+ }
+ 
++// SFAgx diag: set by the kext from the boot-arg sfagx_diag (agx/kext/sf_agx_linux.c)
++extern "C" {
++    static sf_agx_diag: core::ffi::c_int;
++}
++
+ #[versions(AGX)]
+ #[vtable]
+ impl rtkit::Operations for GpuManager::ver {
+@@ -472,6 +477,15 @@
+     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, ep: u8, msg: u64) {
+         let dev = &data.dev;
+         //dev_info!(dev.as_ref(), "RtKit message: {:#x}:{:#x}\n", ep, msg);
++        // SFAgx diag (sfagx_diag=1): the first messages the firmware sends after boot
++        {
++            static SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
++            let n = SEEN.fetch_add(1, Ordering::Relaxed);
++            // SAFETY: Written once, before the driver is registered.
++            if unsafe { sf_agx_diag } != 0 && n < 4 {
++                pr_info!("SFAgx: diag: firmware message {} from endpoint {:#x}: {:#x}\n", n + 1, ep, msg);
++            }
++        }
+ 
+         if ep != EP_FIRMWARE || msg != MSG_RX_DOORBELL {
+             dev_err!(dev.as_ref(), "Unknown message: {:#x}:{:#x}\n", ep, msg);
+@@ -1394,6 +1408,7 @@
+         rtk.as_mut()
+             .send_message(EP_DOORBELL, MSG_TX_DOORBELL | DOORBELL_DEVCTRL)?;
+         core::mem::drop(guard);
++        pr_info!("SFAgx: diag: RTKit booted, endpoints started, init message sent (initdata at {:#x})\n", initdata);
+ 
+         self.kick_firmware()?;
+         Ok(())
+--- a/mmu.rs
++++ b/mmu.rs
+@@ -927,10 +927,10 @@
+         let _mutation = self.mapping_mutation();
+         // Allocate detached RAM tables before excluding the firmware. The shadow L2 is not
+         // the reserved shared-L2; only final leaf stores below already linked L3s are live.
+-        self.page_table.prepare_map(node.start()..end)?;
++        self.page_table.prepare_map(node.start()..end).inspect_err(|e| pr_err!("SFAgx: diag: map_node page table prepare_map failed: {:?}\n", e))?;
+         let uat_inner = self.uat_inner.clone();
+-        let handoff = uat_inner.lock_m4_upper(self.is_kernel)?;
+-        let result = self.map_node_prepared(node, prot);
++        let handoff = uat_inner.lock_m4_upper(self.is_kernel).inspect_err(|e| pr_err!("SFAgx: diag: map_node lock_m4_upper failed: {:?}\n", e))?;
++        let result = self.map_node_prepared(node, prot).inspect_err(|e| pr_err!("SFAgx: diag: map_node_prepared failed: {:?}\n", e));
+         let discard = if result.is_err() {
+             // Rollback still changes live leaves and must remain under the PPL lease.
+             self.page_table.discard_partial_map(node.start()..end)
+@@ -1026,6 +1026,11 @@
+             }
+         }
+ 
++        // SFAgx diag (temporary): a table shorter than the mapping must not pass silently
++        if left != 0 {
++            pr_err!("SFAgx: diag: map_node_prepared: {:#x} bytes have no dma segment\n", left);
++            return Err(EIO);
++        }
+         // The caller invalidates negative translations after releasing its PPL lease.
+         Ok(())
+     }
+@@ -2063,6 +2068,11 @@
+ /// Reuse cached segments without allocating another copy for each bind. The bind lease was
+ /// acquired before BO locking: its getter synchronized with any earlier reclaim under resv,
+ /// and its extra count excludes new eviction until preparation/commit finishes.
++// SFAgx diag: set by the kext from the boot-arg sfagx_diag (agx/kext/sf_agx_linux.c)
++extern "C" {
++    static sf_agx_diag: core::ffi::c_int;
++}
++
+ fn prepare_sgt_segments(
+     dev: &device::Device<Bound>,
+     gem: &gem::Object,
+@@ -2517,7 +2527,7 @@
+         let reserved_size = size
+             .checked_add(if guard { UAT_PGSZ } else { 0 })
+             .ok_or(EOVERFLOW)?;
+-        let _residency = self.enter_residency()?;
++        let _residency = self.enter_residency().inspect_err(|e| pr_err!("SFAgx: diag: map_at enter_residency failed: {:?}\n", e))?;
+         // Pin and copy backing before taking BO or DMA reservation locks.
+         let dev = unsafe { self.dev.as_bound() };
+         let _bind_lease = crate::gem::held_sg_table(gem, dev)?.into_lease();
+@@ -2526,8 +2536,25 @@
+             .obtain(&gem, pin_init!(VmBoData {
+                 newest_bind: AtomicU64::new(0),
+                 segments <- new_mutex!(None),
+-            }))?;
+-        prepare_sgt_segments(dev, gem, &vm_bo, &_bind_lease)?;
++            })).inspect_err(|e| pr_err!("SFAgx: diag: map_at gpuvm obtain failed: {:?}\n", e))?;
++        prepare_sgt_segments(dev, gem, &vm_bo, &_bind_lease).inspect_err(|e| pr_err!("SFAgx: diag: map_at prepare_sgt_segments failed: {:?}\n", e))?;
++        // SFAgx diag (sfagx_diag=1): the first mappings, with what the DMA layer returned
++        {
++            static SHOWN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
++            // SAFETY: Written once, before the driver is registered.
++            if unsafe { sf_agx_diag } != 0 && SHOWN.fetch_add(1, Ordering::Relaxed) < 4 {
++                let segments = vm_bo.data().segments.lock();
++                let (count, first) = match &*segments {
++                    Some(s) => (s.iter().count(), s.iter().next().map(|(a, l)| (*a as u64, *l as u64))),
++                    None => (0, None),
++                };
++                let (first_addr, first_len) = first.unwrap_or((0, 0));
++                pr_info!(
++                    "SFAgx: diag: map_at {:#x} size {:#x}: {} dma segments, first {:#x} len {:#x}\n",
++                    addr, size, count, first_addr, first_len
++                );
++            }
++        }
+ 
+         // SAFETY: no other UniqRefGpuVm exists so `GpuVm::exec_lock()` is safe
+         let mut vm_exec = unsafe {
+@@ -2561,6 +2588,7 @@
+             Ok(node) => node,
+             Err(error) => {
+                 drop(vm_exec);
++                pr_err!("SFAgx: diag: map_at mm reserve_node failed: {:?}\n", error);
+                 return Err(error);
+             }
+         };

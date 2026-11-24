@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "status": "ADVERSARIAL_CHECKLIST_ONLY_NO_SOURCE_REVIEW",
+  "scope": "Future review of root's read-only identity collector under integrations/puredarwin/m1-trackpad-child/registry-gate-native/. This checklist does not review files, run tests, or approve an implementation.",
+  "collector_owner": "root",
+  "cli": "darwin-native-input-inventory --nonce plus exactly 48 lowercase hex digits",
+  "lines": "Collector and decoder lines use the DL16_GATE_* prefix only. A decoder that also accepts DL12_*, DL14_TP_*, or DL15_CHILD_* fails this review. Observer lines stay DL12_*. The T1 collector stays DL14_TP_*. The supervisor prefix DL15_CHILD_* is not this collector.",
+  "exits": {
+    "0": "Exact IOHIDDevice pair, one matching provider id, no PDSerialHID or other HID, valid iterators, child descriptor and interface bytes, exact ready state tuple, and both character endpoints.",
+    "77": "Clean absence of the expected child, parent, or endpoint before a contradictory identity, or a well-formed non-ready state.",
+    "1": "Query or MIG error, invalid iterator, extra or unexpected HID, bad class or provider identity, partial or wrong properties, or a malformed state.",
+    "2": "Bad CLI or nonce, before any registry RPC or stat."
+  },
+  "checks": [
+    {
+      "id": "eof-versus-error",
+      "require": [
+        "Admission uses io_iterator_next and keeps its raw status. IOIteratorNext is not the admission decision.",
+        "kIOReturnNoDevice (0xe00002c0) is the only genuine end. A following NULL object is not an extra device.",
+        "Success with a NULL object is exit 1, not an end and not absence.",
+        "Any other status, including NoResources (0xe00002be), is exit 1. It must not be reported as an empty iterator or as exit 77.",
+        "A successful IOHIDDevice match that returns a null iterator, before any child is observed, is clean absence (exit 77), and is not treated as NoDevice.",
+        "A non-null iterator is checked valid before the walk and again after a finished walk. A false result or a validity RPC failure is exit 1.",
+        "The third IOHIDDevice result is exit 1. The walk stops there. The first PDSerialHID instance is exit 1. A clean serial match is either a null iterator or a NoDevice end with zero instances.",
+        "There is no retry after an error end."
+      ]
+    },
+    {
+      "id": "null-parent",
+      "require": [
+        "Parent walk happens only on the retained PDM1SPITrackpad entry, in the IOService plane.",
+        "After that child is observed, a null parent iterator is exit 1, not exit 77.",
+        "After that child is observed, an immediate NoDevice end with zero parents is exit 1, not exit 77.",
+        "A parent-iterator RPC failure is exit 1.",
+        "Exactly one parent object is required. A second parent is exit 1 even when the first id matches the retained PDM1SPIHID entry.",
+        "A parent device with no child, and no other HID class, can be exit 77. A child with no PDM1SPIHID sibling is not clean absence."
+      ]
+    },
+    {
+      "id": "duplicate-and-high32-ids",
+      "require": [
+        "Compare full uint64 registry entry ids. A compare that keeps only the low 32 bits fails the review.",
+        "The child device id and the PDM1SPIHID device id must differ. Equal ids fail even when the parent link returns that same id.",
+        "The single parent-iterator id must equal the retained PDM1SPIHID id in all 64 bits. Example that must fail: device id 0x100000001 and link id 0x1.",
+        "Mach port numbers are not registry ids. A link id equal to the other object's port, but not to its entry id, fails.",
+        "Zero is not a special success value. Two zero ids are duplicates and fail."
+      ]
+    },
+    {
+      "id": "partial-properties",
+      "require": [
+        "ReportDescriptor, PDM1SPIInterfaceID, and PDM1TrackpadChildStateV1 are read from the retained child entry only. A parent or IOResources copy does not pass.",
+        "Descriptor length other than 110, including 0, 109, and more than 110, is exit 1. A 110-byte image whose digest is not 4ae5bc2626bff5458ba2325e29614f1fec5e8c5a4d32c396f64d59508ec77609 is exit 1.",
+        "NoResources for a missing key, a successful read of zero bytes, and an IPC or short-buffer error are exit 1, not exit 77.",
+        "PDM1SPIInterfaceID must be exactly the four bytes 02 00 00 00. A shorter, longer, or different value is exit 1. Do not accept an 8-byte number whose low half is 2.",
+        "The byte RPC is not a runtime type check. Four-byte OSData and OSNumber(32) are distinguished only by length and bytes.",
+        "No report or key bytes are emitted."
+      ]
+    },
+    {
+      "id": "non-ready-state",
+      "require": [
+        "The only ready tuple is version 1, byte_size 32, committed 1, route_ready 1, faulted 0, stop_requested 0, last_error 0, reserved 0.",
+        "A bool outside {0, 1}, reserved other than 0, version other than 1, or size other than 32 is exit 1.",
+        "route_ready 1 combined with committed 0, faulted 1, stop_requested 1, or a nonzero last_error is malformed (exit 1), not ready and not a synthetic fault.",
+        "faulted 1 with last_error 0 is exit 1. A nonzero last_error with faulted 0 and stop_requested 0 is exit 1.",
+        "Well-formed neutral, prepared, stopped, and faulted snapshots are exit 77. Neutral is uncommitted with the other flags and last_error clear. Prepared is committed with route_ready, faulted, stop_requested, and last_error clear. Stopped has stop_requested 1 and route_ready 0. Faulted has faulted 1, route_ready 0, and a nonzero signed cause.",
+        "Preserve the actual signed int32 cause, including negatives and INT32_MIN. Do not invent a finite error enum.",
+        "last_error is a T2 startup or runtime cause. Ordinary refused control requests or dropped unsupported input must not turn the ready tuple into a fault. A snapshot that keeps route_ready 1 and stores such a refusal in last_error is malformed.",
+        "A ready tuple is not atomic with the descriptor read, enumeration, endpoint stat, or later seat startup, and it is not future liveness or pointer input.",
+        "Stat both /dev/usb_hid_kbd and /dev/usb_hid_mouse only after the identity is ready. Do not open either node. A missing node is exit 77. A non-character node, or a stat error other than absence, is exit 1. A mouse node alone is not identity.",
+        "Public output keeps physical_input_proven false and device_opened false and omits registry ids. The nonce-bound private export carries raw class and provider ids plus the actual descriptor, interface, and state bytes and digests. The offline decoder recomputes identity and readiness from those bytes and rejects a public summary that claims ready without them."
+      ]
+    },
+    {
+      "id": "release-failures",
+      "require": [
+        "Exit 2 performs no master, match, iterator, property, release, or stat call.",
+        "Every acquired send right is released on exit 0, 77, and 1, including the third HID device, the first PDSerialHID device, both parent objects, and the malformed or unterminated class-name path.",
+        "A failing IOObjectRelease does not skip the remaining releases, is not retried, and cannot produce exit 0.",
+        "A port is not released twice. A null port is not released. The matching XML string is not released as a port.",
+        "The source does not call IOServiceOpen, an IOConnect method, a device or report read, or setProperty."
+      ]
+    }
+  ],
+  "not_claimed": [
+    "a review of registry-gate-native sources",
+    "a passing host or SDK test",
+    "compiled XNU or an attached IOHID child",
+    "FEATURE_02_CONFIRMED, pointer input, or physical_panel_observed"
+  ],
+  "hardware": false,
+  "source_edits": false
+}

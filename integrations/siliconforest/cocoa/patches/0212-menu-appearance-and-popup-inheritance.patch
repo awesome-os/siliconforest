@@ -1,0 +1,61 @@
+--- a/src/Frameworks/AppKit/NSAppearance.m
++++ b/src/Frameworks/AppKit/NSAppearance.m
+@@ -10,6 +10,7 @@
+ #import <AppKit/NSApplication.h>
+ #import <AppKit/NSWindow.h>
+ #import <AppKit/NSView.h>
++#import <AppKit/NSMenu.h>
+ #import <Foundation/NSDistributedNotificationCenter.h>
+ #import <Foundation/NSNotification.h>
+ #import <Foundation/NSKeyedArchiver.h>
+@@ -279,3 +280,24 @@
+ }
+ 
+ @end
++
++@implementation NSMenu (NSAppearance)
++
++- (NSAppearance *)appearance { return objc_getAssociatedObject(self, &appearanceKey); }
++
++- (void)setAppearance:(NSAppearance *)appearance
++{
++    objc_setAssociatedObject(self, &appearanceKey, appearance, OBJC_ASSOCIATION_RETAIN);
++    for (NSWindow *window in [NSApp windows]) {
++        NSView *view = [window contentView];
++        if ([view isKindOfClass:NSClassFromString(@"NSMenuView")] && [view menu] == self)
++            [view setNeedsDisplay:YES];
++    }
++}
++
++- (NSAppearance *)effectiveAppearance
++{
++    return [self appearance] ?: [[self supermenu] effectiveAppearance] ?: [NSApp effectiveAppearance];
++}
++
++@end
+--- a/src/Frameworks/AppKit/NSMenu.subproj/NSMenu.h
++++ b/src/Frameworks/AppKit/NSMenu.subproj/NSMenu.h
+@@ -112,3 +112,9 @@
+ - (BOOL)menu:(NSMenu *)menu updateItem:(NSMenuItem *)item atIndex:(NSInteger)index shouldCancel:(BOOL)shouldCancel;
+ 
+ @end
++
++@class NSAppearance;
++@interface NSMenu (NSAppearance)
++@property(retain) NSAppearance *appearance;
++@property(readonly) NSAppearance *effectiveAppearance;
++@end
+--- a/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
++++ b/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
+@@ -575,6 +575,11 @@
+     return [super menu];
+ }
+ 
++- (NSAppearance *)effectiveAppearance
++{
++    return [[self menu] effectiveAppearance] ?: [super effectiveAppearance];
++}
++
+ - (void)setHorizontal:(BOOL)flag
+ {
+     _horizontal = flag;

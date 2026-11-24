@@ -1,0 +1,309 @@
+--- a/src/Frameworks/CoreText/KTFont.m
++++ b/src/Frameworks/CoreText/KTFont.m
+@@ -12,8 +12,11 @@
+ #import "CTInternal.h"
+ #import <Foundation/NSArray.h>
+ #include FT_OUTLINE_H
++#include FT_MULTIPLE_MASTERS_H
+ #include FT_TRUETYPE_TABLES_H
+ #include <hb-ot.h>
++#include <pthread.h>
++#include <stdlib.h>
+ 
+ static CFTypeID fontTypeID;
+ 
+@@ -524,6 +527,37 @@
+ 
+ @end
+ 
++/* The graphics font of each installed face, made once. Finding it is a fontconfig search by name
++ * and a FreeType face opened from the file (or the whole file read when the search lands on
++ * another face): 0.1 ms to several ms, and Apple's Terminal makes a CTFont for every line it
++ * draws (CTLineCreateWithAttributedString), so a screenful paid it a hundred times. A shared
++ * graphics font also keeps Onyx2D's glyph bitmaps (cached by FreeType face) from being rendered
++ * again for each new CTFont. The cache holds one reference to each font for the process's life. */
++static pthread_mutex_t graphicsCacheLock=PTHREAD_MUTEX_INITIALIZER;
++static CFMutableDictionaryRef graphicsCache;
++
++static CGFontRef createGraphicsFont(const CTFontRecord *record);
++
++static CGFontRef copyGraphicsFont(const CTFontRecord *record) {
++   CFStringRef key=CFStringCreateWithFormat(NULL,NULL,CFSTR("%s#%ld"),record->path,record->index);
++   CGFontRef graphics;
++
++   pthread_mutex_lock(&graphicsCacheLock);
++   if(graphicsCache==NULL)
++    graphicsCache=CFDictionaryCreateMutable(NULL,0,&kCFTypeDictionaryKeyCallBacks,NULL);
++   graphics=(CGFontRef)CFDictionaryGetValue(graphicsCache,key);
++   if(graphics==NULL){
++    graphics=createGraphicsFont(record);
++    if(graphics!=NULL)
++     CFDictionarySetValue(graphicsCache,key,graphics);
++   }
++   if(graphics!=NULL)
++    CGFontRetain(graphics);
++   pthread_mutex_unlock(&graphicsCacheLock);
++   CFRelease(key);
++   return graphics;
++}
++
+ // a font CoreText makes itself, its graphics font found by name or loaded from the file
+ CTFontRef CTFontCreateWithRecord(const CTFontRecord *record,CGFloat size,const CGAffineTransform *matrix,CFDictionaryRef extra) {
+    CTFace *face=CTFaceCreateWithPath(record->path,record->index);
+@@ -531,7 +565,22 @@
+ 
+    if(face==NULL)
+     return NULL;
+-   graphics=CGFontCreateWithFontName(record->postScriptName);
++   graphics=getenv("SF_CT_NO_FONT_CACHE")!=NULL ? createGraphicsFont(record) : copyGraphicsFont(record);
++
++   KTFont *font=[KTFont alloc];
++
++   font->_font=graphics;
++   font->_unitsPerEm=face->unitsPerEm;
++   font->_size=size>0 ? size : CTDefaultFontSize;
++   font->_matrix=matrix ? *matrix : CGAffineTransformIdentity;
++   font->_ctFace=face;
++   font->_ctAttributes=extra ? CFDictionaryCreateCopy(NULL,extra) : NULL;
++   font->_fromGraphicsFont=NO;
++   return font;
++}
++
++static CGFontRef createGraphicsFont(const CTFontRecord *record) {
++   CGFontRef graphics=CGFontCreateWithFontName(record->postScriptName);
+    if(graphics!=NULL){
+     CFStringRef full=CGFontCopyFullName(graphics);
+ 
+@@ -552,15 +601,15 @@
+     }
+     if(url) CFRelease(url);
+    }
++   /* A named instance of a variable font (fontconfig's index carries it in its upper half): the
++    * graphics font was made from the file's default instance; its FreeType face is set to the
++    * instance, or the Bold of a variable family drew as its Regular. The graphics font is this
++    * record's own (made once per record above). */
++   if(graphics!=NULL && (record->index>>16)!=0 && [(id)graphics respondsToSelector:@selector(face)]){
++    FT_Face ft=(FT_Face)[(id)graphics face];
+ 
+-   KTFont *font=[KTFont alloc];
+-
+-   font->_font=graphics;
+-   font->_unitsPerEm=face->unitsPerEm;
+-   font->_size=size>0 ? size : CTDefaultFontSize;
+-   font->_matrix=matrix ? *matrix : CGAffineTransformIdentity;
+-   font->_ctFace=face;
+-   font->_ctAttributes=extra ? CFDictionaryCreateCopy(NULL,extra) : NULL;
+-   font->_fromGraphicsFont=NO;
+-   return font;
++    if(ft!=NULL)
++     FT_Set_Named_Instance(ft,(FT_UInt)(record->index>>16));
++   }
++   return graphics;
+ }
+--- a/src/Frameworks/CoreText/CTRegistry.m
++++ b/src/Frameworks/CoreText/CTRegistry.m
+@@ -228,6 +228,10 @@
+ static CFIndex recordCount;
+ static bool registryBuilt;
+ static CFMutableDictionaryRef fallbackCache;
++// the record a name no face carries was aliased to (kCFNull: none), until the registry changes
++static CFMutableDictionaryRef aliasCache;
++// the record CTFontCreateWithName gets for a name (kCFNull: none), until the registry changes
++static CFMutableDictionaryRef nameCache;
+ 
+ static void initRegistryLock(void) {
+     pthread_mutexattr_t attr;
+@@ -408,6 +412,10 @@
+     registryBuilt = false;
+     if (fallbackCache != NULL)
+         CFDictionaryRemoveAllValues(fallbackCache);
++    if (aliasCache != NULL)
++        CFDictionaryRemoveAllValues(aliasCache);
++    if (nameCache != NULL)
++        CFDictionaryRemoveAllValues(nameCache);
+ }
+ 
+ static bool CTRegistryAddFileUnlocked(const char *path) {
+@@ -630,7 +638,17 @@
+     }
+     // names no installed face carries go through fontconfig's aliases, Helvetica to Nimbus Sans and so on
+     if (count == 0 && name != NULL && family == NULL && !hasPath) {
+-        const CTFontRecord *alias = aliasRecordForName(name);
++        /* a fontconfig substitution and match each time: AppKit makes fonts by such names for
++         * every string it measures (a third of Terminal.app's launch); kept until the registry changes */
++        const void *cached = aliasCache ? CFDictionaryGetValue(aliasCache, name) : NULL;
++        const CTFontRecord *alias = cached == (const void *)kCFNull ? NULL : cached;
++
++        if (cached == NULL) {
++            alias = aliasRecordForName(name);
++            if (aliasCache == NULL)
++                aliasCache = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, NULL);
++            CFDictionarySetValue(aliasCache, name, alias ? (const void *)alias : (const void *)kCFNull);
++        }
+ 
+         if (alias != NULL) {
+             matches[0].record = alias;
+@@ -768,6 +786,21 @@
+     return ok;
+ }
+ 
++/* Every font file of a directory, through fontconfig's cache of that directory: a font file
++ * added alone is scanned each time (a variable font: every glyph of every named instance, for
++ * its spacing; the fonts Apple's Terminal carries took a second per configuration at each
++ * launch), a directory is scanned once and read back from the cache after that. */
++bool CTRegistryAddDirectory(const char *path) {
++    bool ok;
++
++    CTRegistryLock();
++    ok = FcConfigAppFontAddDir(config(), (const FcChar8 *)path) == FcTrue;
++    if (ok)
++        CTRegistryInvalidateUnlocked();
++    CTRegistryUnlock();
++    return ok;
++}
++
+ bool CTRegistryRemoveFile(const char *path) {
+     bool ok;
+ 
+@@ -786,6 +819,34 @@
+     return n;
+ }
+ 
++/* The best record for a font name alone (CTFontCreateWithName), found once per name until the
++ * registry changes: a match scores every installed face, and Apple's Terminal makes a font by
++ * name for each line it draws. */
++const CTFontRecord *CTRegistryRecordForFontName(CFStringRef name) {
++    const CTFontRecord *record = NULL;
++    const void *cached;
++
++    CTRegistryLock();
++    cached = nameCache ? CFDictionaryGetValue(nameCache, name) : NULL;
++    if (cached != NULL)
++        record = cached == (const void *)kCFNull ? NULL : cached;
++    else {
++        const void *key = kCTFontNameAttribute;
++        CFDictionaryRef attributes = CFDictionaryCreate(NULL, &key, (const void **)&name, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
++        const CTFontRecord **matches = NULL;
++
++        if (CTRegistryCopyMatchesUnlocked(attributes, &matches) > 0)
++            record = matches[0];
++        free(matches);
++        CFRelease(attributes);
++        if (nameCache == NULL)
++            nameCache = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, NULL);
++        CFDictionarySetValue(nameCache, name, record ? (const void *)record : (const void *)kCFNull);
++    }
++    CTRegistryUnlock();
++    return record;
++}
++
+ const CTFontRecord *CTRegistryDefaultRecord(bool bold) {
+     const CTFontRecord *r;
+ 
+--- a/src/Frameworks/CoreText/CTInternal.h
++++ b/src/Frameworks/CoreText/CTInternal.h
+@@ -57,6 +57,8 @@
+ const CTFontRecord *CTRegistryRecordForPath(const char *path, long index);
+ void CTRegistryInvalidate(void);
+ bool CTRegistryAddFile(const char *path);
++bool CTRegistryAddDirectory(const char *path);
++const CTFontRecord *CTRegistryRecordForFontName(CFStringRef name);
+ bool CTRegistryRemoveFile(const char *path);
+ 
+ // records matching a descriptor's attributes, best first, the caller frees the array
+--- a/src/Frameworks/CoreText/CTFontManager.m
++++ b/src/Frameworks/CoreText/CTFontManager.m
+@@ -167,6 +167,11 @@
+ 
+     if (!pathOfURL(fontURL, path, sizeof(path)) || stat(path, &st) != 0)
+         code = kCTFontManagerErrorFileNotFound;
++    // a directory (ours: an application's ATSApplicationFontsPath): its fonts, through fontconfig's cache
++    else if (S_ISDIR(st.st_mode)) {
++        if (!CTRegistryAddDirectory(path))
++            code = kCTFontManagerErrorInvalidFontData;
++    }
+     else if (!CTFontManagerIsSupportedFont(fontURL))
+         code = kCTFontManagerErrorInvalidFontData;
+     else if (!CTRegistryAddFile(path))
+--- a/src/Frameworks/CoreText/CTFont.m
++++ b/src/Frameworks/CoreText/CTFont.m
+@@ -16,6 +16,7 @@
+ #include FT_MULTIPLE_MASTERS_H
+ #include FT_TRUETYPE_IDS_H
+ #include <hb-ot.h>
++#include <math.h>
+ 
+ #pragma mark creation
+ 
+@@ -46,7 +47,12 @@
+    if(name==NULL)
+     return createWithAttributes(NULL,size,matrix);
+    attributes=CFDictionaryCreate(NULL,&key,(const void **)&name,1,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks);
+-   font=createWithAttributes(attributes,size,matrix);
++   // the record for a name is remembered by the registry (a match scores every installed face)
++   const CTFontRecord *record=CTRegistryRecordForFontName(name);
++
++   if(record==NULL)
++    record=CTRegistryDefaultRecord(false);
++   font=record ? CTFontCreateWithRecord(record,size,matrix,attributes) : NULL;
+    CFRelease(attributes);
+    return font;
+ }
+@@ -137,24 +143,53 @@
+    CTFontRef copy=NULL;
+    CTFontSymbolicTraits want=(CTFontGetSymbolicTraits(font)&~mask)|(value&mask);
+ 
+-   // Apple returns NULL when the family has no face with the traits asked for
+-   for(CFIndex i=0;matches!=NULL && i<CFArrayGetCount(matches) && copy==NULL;i++){
++   /* Apple returns NULL when the family has no face with the traits asked for. Of the faces that
++    * have them, the one of the font's own family and the weight the traits mean: bold is Bold (a
++    * variable family's named instances are Semibold, Bold and Heavy alike to the bold trait; the
++    * first found was taken: Terminal's bold text came out Heavy), otherwise the font's weight. */
++   CFStringRef family=CTFontCopyFamilyName(font);
++   CGFloat targetWeight=(want&kCTFontTraitBold) && !(CTFontGetSymbolicTraits(font)&kCTFontTraitBold) ? 0.4 : 0;
++   CTFontDescriptorRef best=NULL;
++   CGFloat bestScore=0;
++
++   if(!(want&kCTFontTraitBold) || (CTFontGetSymbolicTraits(font)&kCTFontTraitBold)){
++    CFDictionaryRef own=CTFontCopyTraits(font);
++    CFNumberRef w=own ? CFDictionaryGetValue(own,kCTFontWeightTrait) : NULL;
++
++    if(w) CFNumberGetValue(w,kCFNumberCGFloatType,&targetWeight);
++    if(own) CFRelease(own);
++   }
++   for(CFIndex i=0;matches!=NULL && i<CFArrayGetCount(matches);i++){
+     CTFontDescriptorRef d=CFArrayGetValueAtIndex(matches,i);
+     CFDictionaryRef traits=CTFontDescriptorCopyAttribute(d,kCTFontTraitsAttribute);
++    CFStringRef dFamily=CTFontDescriptorCopyAttribute(d,kCTFontFamilyNameAttribute);
+     uint32_t symbolic=0;
++    CGFloat weight=0;
+ 
+     if(traits!=NULL){
+      CFNumberRef n=CFDictionaryGetValue(traits,kCTFontSymbolicTrait);
++     CFNumberRef w=CFDictionaryGetValue(traits,kCTFontWeightTrait);
+ 
+      if(n) CFNumberGetValue(n,kCFNumberSInt32Type,&symbolic);
++     if(w) CFNumberGetValue(w,kCFNumberCGFloatType,&weight);
+      CFRelease(traits);
+     }
+     if((symbolic&mask&(kCTFontTraitBold|kCTFontTraitItalic|kCTFontTraitMonoSpace|kCTFontTraitCondensed|kCTFontTraitExpanded))==(want&mask&(kCTFontTraitBold|kCTFontTraitItalic|kCTFontTraitMonoSpace|kCTFontTraitCondensed|kCTFontTraitExpanded))){
+-     CGAffineTransform m=matrix ? *matrix : CTFontGetMatrix(font);
++     CGFloat score=fabs(weight-targetWeight)+((family && dFamily && CFEqual(family,dFamily)) ? 0 : 10);
+ 
+-     copy=CTFontCreateWithFontDescriptor(d,size>0 ? size : CTFontGetSize(font),&m);
++     if(best==NULL || score<bestScore){
++      best=d;
++      bestScore=score;
++     }
+     }
++    if(dFamily) CFRelease(dFamily);
++   }
++   if(best!=NULL){
++    CGAffineTransform m=matrix ? *matrix : CTFontGetMatrix(font);
++
++    copy=CTFontCreateWithFontDescriptor(best,size>0 ? size : CTFontGetSize(font),&m);
+    }
++   if(family) CFRelease(family);
+    if(matches) CFRelease(matches);
+    CFRelease(wanted);
+    CFRelease(base);

@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "status": "SOURCE_ONLY_PLAN_NOT_IMPLEMENTED_OR_EXECUTED",
+  "prepared_at_utc": "2026-11-08T08:10:55.468996+00:00",
+  "purpose": "Unattended CPU Wayland input qualification through actual guest PDSerialHID/IOHID/PDHID queues. Host-origin virtual input, never physical keyboard/trackpad evidence.",
+  "source_evidence": {
+    "sources/puredarwin-m1-desktop/src/Kernel/xnu/osfmk/console/serial_general.c": {
+      "sha256": "c19a8f601a0151807a3a80a072ec185244ed5ecf193f3982501df9092f7c5ce5",
+      "lines": "44-76 SOH filter, 87-133 serial input poll independent of graphics ownership"
+    },
+    "sources/puredarwin-m1-desktop/src/Kernel/Extensions/PDSerialHID/PDSerialHID.cpp": {
+      "sha256": "39f718cf93af77098bdd7c1b3fcf95fe591db9f374785cfb73c0f14eefc37b07",
+      "lines": "13-24 report descriptor; 28-52 registration/report delivery; 55-82 decimal parser"
+    },
+    "sources/puredarwin-m1-desktop/src/Kernel/Extensions/IOHIDFamily/IOHIDSystem/PDHIDEventQueue.cpp": {
+      "sha256": "c7a2f35bd86bc2da17c766d39728d930fe80aedf1526935b739e74e74204a602",
+      "lines": "103-125 keyboard grab; 215-244 lazy node publication; 388-407 modifiers/nonprinting; 538-610 enqueue"
+    },
+    "sources/puredarwin-m1-desktop/src/Kernel/Extensions/IOHIDFamily/IOHIDFamily/IOHIDEventService.cpp": {
+      "sha256": "856c46ec745af36ba9f7ce7b3c92b68b1f5c90bdf336308309d24e868fbb02fb",
+      "lines": "89-104 absolute scaling; 1794-1795 raw keys; 1909-1951 absolute queue; 2407-2422 calibrated digitizer bridge"
+    },
+    "sources/puredarwin-m1-desktop/src/Kernel/Extensions/IOHIDFamily/IOHIDFamily/IOHIDEventDriver.cpp": {
+      "sha256": "2d7ca3b283ad3afe13fffd04d24eef4aac1e00d16071f82630c4de5540fda493",
+      "lines": "255-265 zero initialization; 396-398 optional axis calibration; 651-680 absolute transducer fallback; 2918-2926 calibration; 3440-3473 report axes"
+    },
+    "sources/chonkstep-darwin/crates/wm-darwin/src/hid.rs": {
+      "sha256": "eace58887c692cef0f160960eb52c9888f71e50d9e909f609b8c344a8a024bd9",
+      "lines": "17-39 record sequencing; 46-58 USB usage mapping; 75-103 opens/drains both queues"
+    },
+    "sources/chonkstep-darwin/crates/wm-darwin/src/input.rs": {
+      "sha256": "26bbb8637e0f8902069128f144347c3d6ca8aa4fea5dde3f712053abc0cb0431",
+      "lines": "44-59 seat/XKB/focus; 61-120 keyboard/pointer/drag forwarding"
+    },
+    "sources/chonkstep-darwin/crates/wm-darwin/src/scene.rs": {
+      "sha256": "33ab78c279cebb3565d6757e6c1badaa982a4943ce241536211273fc557c8d51",
+      "lines": "128-150 hit testing; frame/content positions; decorations rendered after content"
+    },
+    "sources/chonkstep-darwin/crates/wm-darwin/src/main.rs": {
+      "sha256": "99ffbeaa82375db72bfc27f2a64694664216ceec76d0aa5955004692b3e9977e",
+      "lines": "38-65 input opened before presenter; single drawing/input loop; SIGTERM and RAII teardown"
+    },
+    "sources/chonkstep-darwin/crates/wm-core/src/manager.rs": {
+      "sha256": "c05afe07e465fee6e8189ea669cacb01dd773712e6d5588d515534515c1e9008",
+      "lines": "3027 onward titlebar left press starts drag; repeated press may shade"
+    },
+    "sources/chonkstep-darwin/crates/wm-darwin/tests/wayland_shm.rs": {
+      "sha256": "5c182254a9c9b754616ca734419be05a91122d78f4bd3c969a46638f360a5e6b",
+      "lines": "466-500 existing HOST-ONLY seat/key/pointer/drag wire test; no kernel/serial evidence"
+    },
+    "integrations/puredarwin/m1-bringup/host_progress.py": {
+      "sha256": "a8d61ebe4c92006cdbf2aa846f14282cdeec869f149f0c1d19b37b645a069b2d",
+      "lines": "258-325 single secondary CDC reader/writer and durable TX ledger; no virtual-input scheduler yet"
+    }
+  },
+  "route": "Existing uniquely paired secondary CDC data interface 3 -> m1n1 USB_VUART -> guest uart0 -> serial_keyboard_poll (serial=3) -> SOH filter -> PDSerialHID handleReport -> IOHIDEventDriver/EventService -> real /dev/usb_hid_kbd and /dev/usb_hid_mouse -> NativeHid -> wm-core/Smithay seat -> real Wayland client.",
+  "transport_contract": {
+    "endpoint": "Use only existing ConsoleSession secondary VUART writer. Never primary proxy, a new serial reader, a timer-thread writer, or /dev/debug-console.",
+    "framing": "Every line is raw byte 0x01, exact ASCII command, and ONE LF byte. No CRLF: the second delimiter escapes the SOH filter and reaches the tty.",
+    "keyboard": "\\x01k MODS K1 K2 K3 K4 K5 K6\\n; decimal, exactly seven numeric values. Full boot-report state, not ASCII characters and not PDHID 8-byte records.",
+    "mouse": "\\x01m X Y BUTTONS\\n; decimal integers 0..32767 and buttons 0 or 1 for this test. Absolute reports, not pixels, relative deltas, or PDHID 12-byte records.",
+    "bounds": "Allowlisted complete lines below 127 payload bytes; proposed total <=32 lines and <=1024 bytes; each phase single-use, >=100 ms between reports, active schedule <=10 seconds after client readiness.",
+    "failure": "Parser has no framing timeout/resynchronizing SOH and permissively truncates/masks numbers. Validate host values exactly. Short/failed write is terminal: preserve TX ledger, send no guessed suffix/resend/new report. No backend acknowledgement exists; serial write completion is not event acceptance."
+  },
+  "priming": {
+    "prerequisite": "Fresh normal guest, verified PDSerialHID KC member and listening log, serial=3; nonce-bound fixed guest launcher emits PRIME_READY and waits boundedly for both character nodes. Do not touch native SPI bootarg for this experiment.",
+    "lines_escaped": [
+      "\\x01k 0 0 0 0 0 0 0\\n",
+      "\\x01k 2 0 0 0 0 0 0\\n",
+      "\\x01k 0 0 0 0 0 0 0\\n",
+      "\\x01m 16384 16384 0\\n",
+      "\\x01m 16385 16384 0\\n"
+    ],
+    "why": "All-release then left Shift down/up creates real keyboard transitions without printable tty bytes or lock toggles. Nonzero, changed, button-free absolute mouse samples create the mouse queue. All-zero keyboard alone may create no event/node.",
+    "barrier": "Guest stats (never opens) both nodes, with <=5 second timeout. After complete release transmissions leave a bounded quiet interval before acquisition; this interval is pacing, not a device ACK. Compositor opens both nodes once and drains <=128 rounds to EAGAIN before exposing the seat. Any missing node or nonidle acquisition fails.",
+    "neutral_state_limit": "Node existence/idle drain cannot prove device state. Require later actual A down/up and zero-modifier events; missing or unexpected transitions fail rather than retrying priming."
+  },
+  "phases": [
+    "Validate explicit separate hash-bound virtual-input experiment, new guest script/client hashes, one PDSerialHID + IOHIDFamily KC member, paired CDC identity, shared lock, normal deadline/recovery. No reuse of keyboard physical-typing verdict.",
+    "Complete existing strict shell proof, invoke fixed RAM-root launcher, then wait PRIME_READY before the one priming sequence. No arbitrary guest-provided commands or coordinates.",
+    "Launch unchanged compositor with --input pdhid, only after both nodes exist. Start a separate SSD input-observer client. Require actual acknowledged SSD, wl_seat keyboard+pointer, valid XKB keymap, zero modifiers, keyboard focus on its own surface and first real frame callback. Existing SERVER_SOCKET alone is insufficient.",
+    "Send one A press and release (USB usage 4, modifiers 0). Require client wl_keyboard evdev code 30 pressed then released with increasing stream order and no unexpected key; raw host frames are explicitly recorded.",
+    "Move with buttons 0 to known client-local (200,100), then buttons 1 then 0 at same absolute point. Require client pointer enter/motion at that local point, one BTN_LEFT 0x110 press/release, and a fresh nonce-bound client observation marker. No pointer/keyboard events are invented by the test client.",
+    "Only after that observed content-click proof, move to safe interior of the independently qualified SSD titlebar, press once, move along three fixed interior coordinates, release once. No second titlebar click (double-click shades), menus, close buttons, resize edges or modifiers.",
+    "Capture displaced nonce-bearing client plus server chrome, and ensure client button count did not grow during the decoration drag. A Wayland client has no authoritative global window position; do not invent one from xdg configure.",
+    "Send final neutral keyboard and mouse release while the compositor is alive and VUART writer healthy, then stop all injection. A later separate cleanup candidate terminates/waits owned client then compositor, observes normal exits, checks text-console return, and uses existing single-reset verified-Linux recovery on completion/failure."
+  ],
+  "key_lines_escaped": [
+    "\\x01k 0 4 0 0 0 0 0\\n",
+    "\\x01k 0 0 0 0 0 0 0\\n"
+  ],
+  "coordinate_contract": {
+    "preconditions": "Numbers below apply only after actual 2560x1600 output and full 800x480 SSD client at frame origin (0,0) are qualified. Expected full frame 802x513, client origin (1,24). Refuse different geometry; no blind drag.",
+    "formula": "For a desired integer screen coordinate p, use q=round((p+0.5)*32767/(extent-1)), clamped to 0..32767. Kernel absolute scaling/calibration and fixed-point rounding intervene; verify observed client-local position within one pixel before any button press.",
+    "calibration": "IOHIDEventDriver expansion starts zero, but an inherited AbsoluteAxisBoundsRemovalPercentage property can change calibration. Non-digitizer absolute mouse elements use the digitizer fallback and calibrated 16.16 conversion before the 0..65535 queue. Do not assume raw mouse values are direct queue coordinates. Any measured mismatch refuses the drag.",
+    "drag_example": [
+      {
+        "screen": [
+          200,
+          12
+        ],
+        "raw": [
+          2567,
+          256
+        ],
+        "buttons": 0
+      },
+      {
+        "screen": [
+          200,
+          12
+        ],
+        "raw": [
+          2567,
+          256
+        ],
+        "buttons": 1
+      },
+      {
+        "screen": [
+          250,
+          52
+        ],
+        "raw": [
+          3208,
+          1076
+        ],
+        "buttons": 1
+      },
+      {
+        "screen": [
+          300,
+          92
+        ],
+        "raw": [
+          3848,
+          1896
+        ],
+        "buttons": 1
+      },
+      {
+        "screen": [
+          400,
+          172
+        ],
+        "raw": [
+          5128,
+          3535
+        ],
+        "buttons": 1
+      },
+      {
+        "screen": [
+          400,
+          172
+        ],
+        "raw": [
+          5128,
+          3535
+        ],
+        "buttons": 0
+      }
+    ],
+    "expected_displacement": "Approximately (+200,+160), bounded rounding tolerance, same content/chrome extent. Proof is captured pixels plus actual input observations, not transmitted coordinates alone."
+  },
+  "pitfalls": [
+    "Both original and SSD clients bind no seat; a new separate client-input is required. Its observations must come from real protocol callbacks and be labelled host-origin PDSerialHID.",
+    "Current desktop launcher uses input OFF and host sends no SOH schedule. A future separate hash-bound script/host state machine is required; this plan does not authorize implicit activation.",
+    "NativeHid requires BOTH real character devices. Never fabricate nodes/queue records, and never use inventory to open/grab/destructively read the queues.",
+    "Queues are destructive, shared, 64 records, no kqueue, and sequence gaps terminate the decoder. Use one consumer and small paced sequences. Native events/other consumers can make provenance ambiguous; refuse unmatched evidence.",
+    "A keyboard open suppresses HID text-console forwarding until last close; it does not stop serial_keyboard_poll or SOH processing. Ordinary serial tty bytes remain a separate route. Modifier state changes before grab checks; always release Shift. Never prime with caps/num/scroll lock, Ctrl, Alt, Super or Enter.",
+    "XKB rules evdev/model pc105/layout us and staged xkeyboard-config become actual runtime prerequisites only when input is enabled. Input-OFF presentation did not qualify them.",
+    "PDSerialHID sendReport drops allocation failures and ignores handleReport return. Never count a TX line, listener/service, node, seat or keymap as delivered input.",
+    "Host scheduling must tick despite no incoming console bytes; current read loop continues on empty read. Add bounded phase processing in that SAME owner thread, not a second writer. Cancel sends before capture close/guest pause; no sends after stop/close begins.",
+    "Do not unload PDSerialHID or alter its unsynchronized callback registration during the run. Keep all mappings and existing quarantine/lifetime rules."
+  ],
+  "cleanup": {
+    "normal": "Neutral releases first while owned transport remains healthy; require actual A/button release evidence. Stop injection; TERM/wait client, then compositor. NativeHid fd drop releases keyboard grab on last close; drawing stops before PDGOP unmap/close. Record process exit statuses, do not hide them with || :.",
+    "close_limits": "PDGOP close discards unmap/close statuses; process exit alone does not prove successful graphical ownership return. A fresh text marker in a post-close framebuffer is separate required cleanup evidence. Do not force VC acquire while compositor owns the framebuffer.",
+    "failure": "No event retries or extra reset. If transport write failed or guest/worker state is uncertain, no best-guess release is sent. Preserve failure and use existing worker-quiescence-before-reset rules and one reset maximum, verified Linux return."
+  },
+  "next_implementation_scope": [
+    "Separate client-input copied from frozen client-ssd, real keyboard/pointer observer and pure state tests; preserve both original clients.",
+    "After independent plan review, root owns separate guest launcher and finite host VUART scheduler/receipt binding. Existing compositor needs no new input backend for this virtual path.",
+    "Host tests should exercise framing, short writes, missing nodes/seat/keymap/focus, wrong/stale/duplicate events, modifier residue, coordinate mismatch, queue loss and stop-during-phase; not count as kernel input evidence."
+  ],
+  "evidence_labels": {
+    "planned_success": "HOST_ORIGIN_PDSerialHID_WAYLAND_INPUT_AND_SSD_DRAG_OBSERVED, only after actual event and pixel evidence plus verified Linux",
+    "physical_keyboard": false,
+    "physical_trackpad": false,
+    "panel": false,
+    "gpu": false,
+    "hardware_accessed": false
+  }
+}

@@ -1,0 +1,91 @@
+--- a/src/Frameworks/QuartzCore/CALayerContext.h
++++ b/src/Frameworks/QuartzCore/CALayerContext.h
+@@ -17,11 +17,13 @@
+     NSTimer *_timer;
+     id _delegate;
+     BOOL _renderScheduled;
++    CGFloat _backingScale;
+ }
+ 
+ - initWithFrame:(CGRect)rect;
+ 
+ - (void)setFrame:(CGRect)value;
++- (void)setBackingScale:(CGFloat)value;
+ - (void)setLayer:(CALayer *)layer;
+ 
+ - (void)invalidate;
+--- a/src/Frameworks/QuartzCore/CALayerContext.m
++++ b/src/Frameworks/QuartzCore/CALayerContext.m
+@@ -6,6 +6,7 @@
+ #import <OpenGL/gl.h>
+ #import <CoreGraphics/CoreGraphics.h>
+ #include <string.h>
++#include <math.h>
+ #include <stdlib.h>
+ #include <dispatch/dispatch.h>
+ #include <os/lock.h>
+@@ -59,9 +60,10 @@
+     NSLog(@"CGLCreateContext failed with %d in %s %d",error,__FILE__,__LINE__);
+ 
+    _frame=rect;
++   if(!(_backingScale>0)) _backingScale=1;
+    
+-   GLint width=rect.size.width;
+-   GLint height=rect.size.height;
++   GLint width=(GLint)ceil(rect.size.width*_backingScale);
++   GLint height=(GLint)ceil(rect.size.height*_backingScale);
+    
+    GLint backingOrigin[2]={rect.origin.x,rect.origin.y};
+    GLint backingSize[2]={width,height};
+@@ -98,8 +100,8 @@
+ -(void)setFrame:(CGRect)rect {
+    _frame=rect;
+    
+-   GLint width=rect.size.width;
+-   GLint height=rect.size.height;
++   GLint width=(GLint)ceil(rect.size.width*_backingScale);
++   GLint height=(GLint)ceil(rect.size.height*_backingScale);
+    
+    GLint backingOrigin[2]={rect.origin.x,rect.origin.y};
+    GLint backingSize[2]={width,height};
+@@ -108,6 +110,13 @@
+    CGLSetParameter(_glContext,kCGLCPSurfaceBackingSize,backingSize);
+ }
+ 
++-(void)setBackingScale:(CGFloat)value {
++   if(!isfinite(value) || value<=0 || value>8 || value==_backingScale)
++    return;
++   _backingScale=value;
++   [self setFrame:_frame];
++}
++
+ -(void)setLayer:(CALayer *)layer {
+    layer=[layer retain];
+    [_layer release];
+@@ -147,14 +156,14 @@
+    glEnable(GL_DEPTH_TEST);
+    //glShadeModel(GL_SMOOTH);
+ 
+-   GLint width=_frame.size.width;
+-   GLint height=_frame.size.height;
++   GLint width=(GLint)ceil(_frame.size.width*_backingScale);
++   GLint height=(GLint)ceil(_frame.size.height*_backingScale);
+    
+    glViewport(0,0,width,height);
+    glMatrixMode(GL_PROJECTION);
+    glLoadIdentity();
+    // deep enough for nested sublayers, each a step nearer than its parent
+-   glOrtho(0,width,0,height,-1000,1000);
++   glOrtho(0,_frame.size.width,0,_frame.size.height,-1000,1000);
+    glMatrixMode(GL_MODELVIEW);
+    glLoadIdentity();
+    glEnable(GL_TEXTURE_2D);
+@@ -225,7 +234,7 @@
+ }
+ 
+ -(CGImageRef)createImage {
+-   size_t width=_frame.size.width,height=_frame.size.height,row=width*4;
++   size_t width=(size_t)ceil(_frame.size.width*_backingScale),height=(size_t)ceil(_frame.size.height*_backingScale),row=width*4;
+    uint8_t *flipped,*pixels;
+ 
+    if(width==0 || height==0)

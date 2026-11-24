@@ -1,0 +1,163 @@
+sf_dri: select(), poll() and kqueue on a DRM fd wake when an event is queued
+
+dri_select() only reported readiness and never recorded the waiter: select() slept until
+its timeout, and poll()/kqueue refused the device (xnu implements poll with kqueue, and a
+character device must opt in with cdevsw_setkqueueok()).
+- SFDRMDri: a selinfo per open file; dri_select() records the waiter and re-checks;
+  sf_dri_wakeup(cookie) wakes it; the major opts in to kqueue.
+- fbsdkpi/drm/src/sf_drm_cdev.c: each open DRM file keeps an entry on its drm_file's event
+  wait queue that forwards the DRM core's wake_up to sf_dri_wakeup().
+UPSTREAM: yes (SFDRMDri and fbsdkpi together).
+
+--- a/src/Kernel/Extensions/SFDRMDri/SFDRMDri.cpp
++++ b/src/Kernel/Extensions/SFDRMDri/SFDRMDri.cpp
+@@ -35,6 +35,9 @@
+ static int sMajor = -1;
+ static void *sSlots[SF_DRI_SLOTS];
+ static bool sSlotUsed[SF_DRI_SLOTS];
++// select/poll/kqueue: one waiter record per open file. a drm kext reports "this file became
++// readable" with sf_dri_wakeup(cookie); dri_select records the waiter when nothing is ready
++static struct selinfo sSel[SF_DRI_SLOTS];
+ static lck_grp_t *sLockGroup;
+ static lck_mtx_t *sLock;
+ static const struct sf_dri_ops *sProviders[SF_DRI_PROVIDERS];
+@@ -109,6 +112,9 @@
+ 	if (cookie != NULL) {
+ 		owner_ops(dev)->close(cookie);
+ 		sSlots[SF_DRI_SLOT(dev)] = NULL;
++		// nobody may stay recorded on a slot the next open reuses
++		selwakeup(&sSel[SF_DRI_SLOT(dev)]);
++		selthreadclear(&sSel[SF_DRI_SLOT(dev)]);
+ 	}
+ 	return 0;
+ }
+@@ -152,9 +158,35 @@
+ {
+ 	void *cookie = slot_cookie(dev);
+ 
++	int ready;
++
++	if (cookie == NULL)
++		return 0;
++	ready = owner_ops(dev)->poll(cookie, which, wql);
++	if (!ready) {
++		// record the waiter, then look again: an event queued in between has already
++		// called sf_dri_wakeup() with nobody recorded
++		selrecord(p, &sSel[SF_DRI_SLOT(dev)], wql);
++		ready = owner_ops(dev)->poll(cookie, which, wql);
++	}
++	return ready;
++}
++
++// a drm kext calls this when the file behind `cookie` has something to read (a drm event was
++// queued): wakes select(), poll() and kqueue waiters of that open file. any context that may
++// take a mutex.
++int
++sf_dri_wakeup(void *cookie)
++{
+ 	if (cookie == NULL)
+ 		return 0;
+-	return owner_ops(dev)->poll(cookie, which, wql);
++	for (int slot = 1; slot < SF_DRI_SLOTS; slot++) {
++		if (sSlots[slot] == cookie) {
++			selwakeup(&sSel[slot]);
++			return 1;
++		}
++	}
++	return 0;
+ }
+ 
+ static int
+@@ -197,6 +229,10 @@
+ 		if (sMajor < 0)
+ 			return ENXIO;
+ 		sf_cdev_mmap_register(sMajor, dri_mmap_pages);
++		// kqueue (and so poll(), which xnu implements with it) only works on a character
++		// device that says its d_select may be used that way
++		if (cdevsw_setkqueueok(sMajor, &sDriCdevsw, 0) < 0)
++			IOLog("sf_dri: kqueue not enabled for the dri devices\n");
+ 		IOLog("sf_dri: character major %d\n", sMajor);
+ 	}
+ 	lck_mtx_lock(sLock);
+--- a/src/Kernel/fbsdkpi/drm/src/sf_drm_cdev.c
++++ b/src/Kernel/fbsdkpi/drm/src/sf_drm_cdev.c
+@@ -10,6 +10,8 @@
+ #include <linux/slab.h>
+ 
+ #include <drm/drm_device.h>
++#include <drm/drm_file.h>
++#include <linux/wait.h>
+ 
+ #include "../../sf_dri_cdev.h"
+ 
+@@ -19,6 +21,11 @@
+ struct sf_dri_inode {
+ 	uint32_t magic;
+ 	unsigned int minor;
++	// select/poll/kqueue: stays on the drm file's event wait queue for as long as the file
++	// is open and forwards every wakeup to SFDRMDri (sf_dri_wakeup)
++	wait_queue_t wake;
++	struct linux_file *filp;
++	bool queued;
+ };
+ #define SF_DRI_INODE_MAGIC	0x70646969
+ 
+@@ -38,6 +45,16 @@
+ 	return pi != NULL && pi->magic == SF_DRI_INODE_MAGIC ? pi->minor : 0;
+ }
+ 
++// called by the drm core's wake_up on file_priv->event_wait (an event was queued for the file)
++static int
++sf_dri_event_wake(wait_queue_t *wq, unsigned int mode, int flags, void *key)
++{
++	struct sf_dri_inode *pi = wq->private;
++
++	sf_dri_wakeup(pi->filp);
++	return 0;
++}
++
+ static int
+ sf_dri_open(int drm_minor, int flags, void **cookie)
+ {
+@@ -68,6 +85,17 @@
+ 		kfree(pi);
+ 		return -ret;
+ 	}
++	// a drm device file: its private data is the struct drm_file with the event queue
++	if (filp->private_data != NULL) {
++		struct drm_file *priv = filp->private_data;
++
++		pi->filp = filp;
++		pi->wake.private = pi;
++		pi->wake.func = sf_dri_event_wake;
++		INIT_LIST_HEAD(&pi->wake.entry);
++		add_wait_queue(&priv->event_wait, &pi->wake);
++		pi->queued = true;
++	}
+ 	*cookie = filp;
+ 	return 0;
+ }
+@@ -79,6 +107,12 @@
+ 	struct sf_dri_inode *pi = (struct sf_dri_inode *)filp->f_vnode;
+ 
+ 	linux_set_current(curthread);
++	if (pi->queued && filp->private_data != NULL) {
++		struct drm_file *priv = filp->private_data;
++
++		remove_wait_queue(&priv->event_wait, &pi->wake);
++		pi->queued = false;
++	}
+ 	if (filp->f_op->release != NULL)
+ 		filp->f_op->release((struct inode *)pi, filp);
+ 	kfree(filp);
+--- a/src/Kernel/fbsdkpi/sf_dri_cdev.h
++++ b/src/Kernel/fbsdkpi/sf_dri_cdev.h
+@@ -47,6 +47,8 @@
+ };
+ 
+ int sf_dri_register(const struct sf_dri_ops *ops);
++// the open file `cookie` has become readable: wake its select/poll/kqueue waiters
++int sf_dri_wakeup(void *cookie);
+ // both live in SFDRMDri.kext, shared by every drm kext
+ int sf_dri_make_node(const struct sf_dri_ops *ops, int drm_minor, const char *name,
+ 	const struct sf_dri_pci *pci);

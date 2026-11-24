@@ -1,0 +1,692 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -4,7 +4,7 @@
+ set_property(TARGET SFM1SPIHID.kext PROPERTY OUTPUT_NAME SFM1SPIHID)
+ target_sources(SFM1SPIHID.kext PRIVATE
+     SFM1SPIHID.cpp SFM1KeyboardHW.cpp m1kbd_board.c m1kbd_pio.c m1kbd_hid.c
+-    native_protocol/dl_spi_hid.c m1tp_enum.c)
++    native_protocol/dl_spi_hid.c m1tp_enum.c SFM1SPITrackpad.cpp m1tp_child_policy.c)
+ target_include_directories(SFM1SPIHID.kext PRIVATE
+     ${CMAKE_CURRENT_SOURCE_DIR}
+     ${CMAKE_CURRENT_SOURCE_DIR}/../IOHIDFamily/IOHIDSystem
+--- a/SFM1SPIHID.cpp
++++ b/SFM1SPIHID.cpp
+@@ -1,4 +1,7 @@
+ #include "SFM1SPIHID.h"
++#include "SFM1SPITrackpad.h"
++#include "m1tp_child_policy.h"
++#include "trackpad_reference.h"
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOLib.h>
+ #include <libkern/c++/OSData.h>
+@@ -74,16 +77,26 @@
+     trackpadEnumeration.version=M1TP_OBSERVATION_VERSION;
+     trackpadEnumeration.result=M1TP_OBS_NOT_ATTEMPTED;
+     trackpadEnumeration.stage=M1TP_OBS_BEFORE_IO;
++    t2Enabled=false; t2Phase=0; childInitialized=false; childAttached=false; childStarted=false;
++    privateStopRunning=false; privateStopDone=false;
++    childOwned=nullptr; childSink=nullptr; t2Provider=nullptr; t2CommitData=nullptr;
++    bzero(&childState,sizeof(childState));
++    childState.version=DL_M1_TP_CHILD_STATE_VERSION;
++    childState.byte_size=sizeof(childState);
++    t2Dispatches=0; childObserved=0; childRejected=0; childSubmitted=0;
+     return super::init(properties);
+ }
+ IOService *SFM1SPIHID::probe(IOService *provider, SInt32 *score)
+ {
+-    int enabled=0, trackpadOptIn=0;
++    int enabled=0, trackpadOptIn=0, childOptIn=0;
+     if (!PE_parse_boot_argn("sfm1kbd",&enabled,sizeof(enabled)) || enabled!=1) return nullptr;
+     /* Experimental T1 bundle: both explicit opt-ins precede the one-shot
+      * claim, so neither default nor keyboard-only boots reach this probe. */
+     if (!PE_parse_boot_argn("sfm1trackpadenum",&trackpadOptIn,sizeof(trackpadOptIn)) ||
+         trackpadOptIn!=1) return nullptr;
++    bool childToken=PE_parse_boot_argn("sfm1trackpadchild",&childOptIn,sizeof(childOptIn));
++    if (childToken && childOptIn!=1) return nullptr;
++    t2Enabled=childToken && childOptIn==1;
+     if (!OSCompareAndSwap(0,1,&gSFM1KeyboardProbeClaimed)) {
+         IOLog("SFM1SPIHID: probe refused; one attempt already claimed this boot, registry_id=%llu\n",
+               (unsigned long long)getRegistryEntryID());
+@@ -96,8 +109,16 @@
+ IOWorkLoop *SFM1SPIHID::getWorkLoop() const { return transportLoop; }
+ bool SFM1SPIHID::start(IOService *provider)
+ {
++    if (t2Enabled) {
++        t2Provider=provider;
++        if (t2Provider) t2Provider->retain();
++        if (!t2Provider || !setProperty(kIOHIDRegisterServiceKey,kOSBooleanFalse) ||
++            getProperty(kIOHIDRegisterServiceKey)!=kOSBooleanFalse || !publishChildState()) {
++            childFault((int32_t)kIOReturnNoMemory); disposeTransport(); return false;
++        }
++    }
+     transportLoop=IOWorkLoop::workLoop();
+-    if (!transportLoop) return false;
++    if (!transportLoop) { disposeTransport(); return false; }
+     transportGate=IOCommandGate::commandGate(this);
+     /* WorkLoop delivery avoids passive thread-call actions waiting outside
+      * the workloop gate. cancelTimeout joins the signal callout; removal
+@@ -115,6 +136,7 @@
+     /* IOHIDDevice calls handleStart before asking for the real descriptor.
+      * No timer is armed and report operations are Unsupported during init. */
+     if (!super::start(provider)) { disposeTransport(); return false; }
++    if (t2Enabled) return startT2(provider);
+     published=true;
+     if (pollTimer->setTimeoutMS(2)!=kIOReturnSuccess) {
+         super::stop(provider); disposeTransport(); return false;
+@@ -299,21 +321,28 @@
+ {
+     SFM1SPIHID *self=OSDynamicCast(SFM1SPIHID,owner);
+     if (!self || self->stopping || !self->published) return;
++    if (self->t2Enabled && __atomic_load_n(&self->t2Phase,__ATOMIC_ACQUIRE)!=1) return;
+     struct dlsp_message message;
+     /* A bounded batch lets other workloop users run, even with ready held low.
+      * Partial messages remain in the bounded heap reassembly buffer. */
+     for (unsigned budget=0;budget<8;budget++) {
++        if (self->t2Enabled && (self->stopping ||
++            __atomic_load_n(&self->t2Phase,__ATOMIC_ACQUIRE)!=1)) break;
+         int e=self->receive(&message);
+         if (e==DLSP_INVALID) return;
+         if (e==DLSP_BOOT) { self->fail(M1KBD_STATE,"runtime-device-reboot"); return; }
+         if (e==DLSP_WAIT) break;
++        if (self->t2Enabled && (self->stopping ||
++            __atomic_load_n(&self->t2Phase,__ATOMIC_ACQUIRE)!=1)) break;
+         int eligible=m1kbd_keyboard_input(&message,self->identity.max_input);
+         if (eligible<0) { self->fail(M1KBD_INVALID,"input-size"); return; }
+         if (eligible) {
+             IOBufferMemoryDescriptor *report=IOBufferMemoryDescriptor::withBytes(
+                 message.payload,message.payload_length,kIODirectionNone);
+             if (!report) { self->fail(M1KBD_IO,"input-allocation"); return; }
++            if (self->t2Enabled) { self->retain(); self->t2Dispatches++; }
+             IOReturn kr=self->handleReport(report,kIOHIDReportTypeInput);
++            if (self->t2Enabled) { self->t2Dispatches--; self->release(); }
+             report->release();
+             if (kr!=kIOReturnSuccess) { self->fail((int)kr,"hid-input"); return; }
+             self->reportsDelivered++;
+@@ -321,6 +350,8 @@
+                 self->publishCounters(true);
+                 IOLog("SFM1SPIHID: first device-1 input report accepted by IOHID; physical typing not yet verified\n");
+             }
++        } else if (self->t2Enabled && message.device==2 && message.flags==0x20 && message.command==0x10) {
++            self->routeTrackpad(&message);
+         } else {
+             /* Management/trackpad/aux reports are consumed but never relabeled
+              * as keyboard events or evidence of supported native trackpad. */
+@@ -340,11 +371,20 @@
+     setProperty("SFM1KeyboardReports",reportsDelivered,64);
+     setProperty("SFM1KeyboardOtherMessages",otherMessages,64);
+     setProperty("SFM1KeyboardCountersUS",t,64);
++    if (t2Enabled) {
++        setProperty("SFM1TrackpadObserved",childObserved,64);
++        setProperty("SFM1TrackpadRejected",childRejected,64);
++        setProperty("SFM1TrackpadSubmitted",childSubmitted,64);
++    }
+     lastCountersUS=t; countersDirty=false;
+ }
+ void SFM1SPIHID::fail(int error, const char *phase)
+ {
+     stopping=true;
++    if (t2Enabled) {
++        if (t2Committed()) __atomic_store_n(&t2Phase,2,__ATOMIC_RELEASE);
++        childFault((int32_t)error);
++    }
+     setProperty("SFM1KeyboardPhase",phase);
+     setProperty("SFM1KeyboardError",(uint64_t)(int64_t)error,64);
+     publishCounters(true);
+@@ -377,6 +417,9 @@
+ }
+ void SFM1SPIHID::quiesce()
+ {
++    if (t2Committed()) {
++        IOLog("SFM1SPIHID: TEARDOWN_DEFERRED quiesce refused\n"); return;
++    }
+     if (transportGate && gateAdded) {
+         IOReturn kr=transportGate->runAction(stopGated);
+         if (kr!=kIOReturnSuccess) panic("SFM1SPIHID: refusing teardown without workloop quiescence");
+@@ -391,18 +434,44 @@
+     if (e) setProperty("SFM1KeyboardCleanupError",(uint64_t)(int64_t)e,64);
+ }
+ void SFM1SPIHID::handleStop(IOService *provider)
+-{ quiesce(); super::handleStop(provider); }
++{
++    if (t2Committed()) { (void)transportGate->runAction(stopT2Gated); return; }
++    if (t2Enabled && !childState.faulted) childFault((int32_t)kIOReturnError);
++    rollbackChild(); quiesce(); super::handleStop(provider);
++}
+ void SFM1SPIHID::stop(IOService *provider)
+-{ super::stop(provider); disposeTransport(); }
++{
++    if (t2Committed()) {
++        (void)transportGate->runAction(stopT2Gated);
++        return;
++    }
++    if (privateStopDone || privateStopRunning) return;
++    privateStopRunning=true;
++    rollbackChild(); super::stop(provider);
++    privateStopRunning=false; privateStopDone=true;
++    disposeTransport();
++}
+ void SFM1SPIHID::disposeTransport()
+ {
++    if (t2Committed()) {
++        IOLog("SFM1SPIHID: TEARDOWN_DEFERRED dispose refused\n"); return;
++    }
++    rollbackChild();
+     quiesce();
+     if (transportGate && gateAdded) { transportLoop->removeEventSource(transportGate); gateAdded=false; }
+     if (pollTimer) { pollTimer->release(); pollTimer=nullptr; }
+     if (transportGate) { transportGate->release(); transportGate=nullptr; }
+     if (transportLoop) { transportLoop->release(); transportLoop=nullptr; }
+-}
+-void SFM1SPIHID::free() { disposeTransport(); super::free(); }
++    if (t2CommitData) { t2CommitData->release(); t2CommitData=nullptr; }
++    if (t2Provider) { t2Provider->release(); t2Provider=nullptr; }
++}
++void SFM1SPIHID::free()
++{
++    if (t2Committed()) {
++        IOLog("SFM1SPIHID: invariant violation; committed free refused\n"); return;
++    }
++    disposeTransport(); super::free();
++}
+ bool SFM1SPIHID::terminate(IOOptionBits options)
+ {
+     (void)options;
+@@ -425,3 +494,5 @@
+ OSNumber *SFM1SPIHID::newVersionNumber() const { return OSNumber::withNumber(identity.version,32); }
+ OSNumber *SFM1SPIHID::newLocationIDNumber() const { return OSNumber::withNumber(0x3510c000,32); }
+ OSNumber *SFM1SPIHID::newCountryCodeNumber() const { return OSNumber::withNumber(identity.country,32); }
++
++#include "SFM1SPIHIDChild.inc"
+--- a/SFM1SPIHID.h
++++ b/SFM1SPIHID.h
+@@ -7,10 +7,13 @@
+ /* Layout first: it defines and undefines its own one-argument assert macro. */
+ #include "observation_layout.h"
+ #include "m1tp_enum.h"
++#include "child_state.h"
+ #include <IOKit/IOCommandGate.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/IOWorkLoop.h>
+ 
++class SFM1SPITrackpad;
++class OSData;
+ class SFM1SPIHID : public IOHIDDevice {
+     OSDeclareDefaultStructors(SFM1SPIHID);
+ public:
+@@ -23,6 +26,10 @@
+     bool handleStart(IOService *) APPLE_KEXT_OVERRIDE;
+     void handleStop(IOService *) APPLE_KEXT_OVERRIDE;
+     bool terminate(IOOptionBits options=0) APPLE_KEXT_OVERRIDE;
++    bool handleOpen(IOService *, IOOptionBits, void *) APPLE_KEXT_OVERRIDE;
++    IOReturn newUserClient(task_t, void *, UInt32, OSDictionary *, IOUserClient **) APPLE_KEXT_OVERRIDE;
++    /* Recursive sink clear: no waiting or dispatch-drain sleep. */
++    void retireChild(SFM1SPITrackpad *expected);
+     IOReturn newReportDescriptor(IOMemoryDescriptor **) const APPLE_KEXT_OVERRIDE;
+     OSString *newTransportString() const APPLE_KEXT_OVERRIDE;
+     OSString *newProductString() const APPLE_KEXT_OVERRIDE;
+@@ -52,6 +59,27 @@
+     uint64_t lastCountersUS;
+     bool countersDirty, requestPending;
+     uint8_t pendingReport, pendingSubdevice, requestID;
++    bool t2Enabled, childInitialized, childAttached, childStarted;
++    bool privateStopRunning, privateStopDone;
++    volatile UInt32 t2Phase;
++    SFM1SPITrackpad *childOwned, *childSink;
++    IOService *t2Provider;
++    OSData *t2CommitData;
++    struct dl_m1_trackpad_child_state_v1 childState;
++    uint32_t t2Dispatches;
++    uint64_t childObserved, childRejected, childSubmitted;
++    bool t2Committed() const;
++    bool prepareChild();
++    void rollbackChild();
++    bool startT2(IOService *);
++    static IOReturn commitT2Gated(OSObject *, void *, void *, void *, void *);
++    static IOReturn stopT2Gated(OSObject *, void *, void *, void *, void *);
++    static IOReturn retireChildGated(OSObject *, void *, void *, void *, void *);
++    bool installChildState(OSData *);
++    bool publishChildState();
++    void removeChildState();
++    void childFault(int32_t);
++    void routeTrackpad(const struct dlsp_message *);
+     static void poll(OSObject *, IOTimerEventSource *);
+     static IOReturn startGated(OSObject *, void *, void *, void *, void *);
+     static IOReturn stopGated(OSObject *, void *, void *, void *, void *);
+--- /dev/null
++++ b/SFM1SPIHIDChild.inc
+@@ -0,0 +1,218 @@
++/* Original T2-only lifecycle. Included by SFM1SPIHID.cpp after the frozen
++ * transport implementation. No SPI encoder/request or async report API. */
++
++bool SFM1SPIHID::t2Committed() const
++{ return t2Enabled && __atomic_load_n(&t2Phase,__ATOMIC_ACQUIRE)!=0; }
++
++bool SFM1SPIHID::handleOpen(IOService *client, IOOptionBits options, void *argument)
++{
++    /* M1: legacy T1 base-start can already match/open before timer arm. */
++    if (t2Enabled && (__atomic_load_n(&t2Phase,__ATOMIC_ACQUIRE)!=1 || isInactive()))
++        return false;
++    return super::handleOpen(client,options,argument);
++}
++IOReturn SFM1SPIHID::newUserClient(task_t task, void *security, UInt32 type,
++    OSDictionary *properties, IOUserClient **out)
++{
++    if (t2Enabled && (__atomic_load_n(&t2Phase,__ATOMIC_ACQUIRE)!=1 || isInactive())) {
++        if (out) *out=nullptr;
++        return kIOReturnNotReady;
++    }
++    return super::newUserClient(task,security,type,properties,out);
++}
++
++void SFM1SPIHID::removeChildState()
++{
++    removeProperty(DL_M1_TP_CHILD_STATE_PROPERTY);
++    if (t2Provider) t2Provider->removeProperty(DL_M1_TP_CHILD_STATE_PROPERTY);
++    if (childOwned && childInitialized) childOwned->removeProperty(DL_M1_TP_CHILD_STATE_PROPERTY);
++}
++bool SFM1SPIHID::installChildState(OSData *data)
++{
++    /* Do not short-circuit the three independent immutable copies. */
++    bool a=data && setProperty(DL_M1_TP_CHILD_STATE_PROPERTY,data);
++    bool b=data && t2Provider && t2Provider->setProperty(DL_M1_TP_CHILD_STATE_PROPERTY,data);
++    bool c=!childInitialized || (data && childOwned && childOwned->setProperty(DL_M1_TP_CHILD_STATE_PROPERTY,data));
++    if (!a || !b || !c) {
++        removeChildState();
++        IOLog("SFM1SPIHID: T2 diagnostic publication failed parent=%u provider=%u child=%u; old ready copies removed\n",
++              a?1u:0u,b?1u:0u,c?1u:0u);
++        return false;
++    }
++    return true;
++}
++bool SFM1SPIHID::publishChildState()
++{
++    /* Never modify OSData visible to MIG; invalidate before allocating a
++     * replacement. A reader may already hold an older snapshot. */
++    removeChildState();
++    OSData *copy=OSData::withBytes(&childState,sizeof(childState));
++    bool okay=installChildState(copy);
++    if (copy) copy->release();
++    return okay;
++}
++void SFM1SPIHID::childFault(int32_t error)
++{
++    childSink=nullptr;
++    if (childOwned) childOwned->markRetired();
++    childState.route_ready=0; childState.faulted=1;
++    if (!childState.last_error)
++        childState.last_error=error?error:(int32_t)kIOReturnError;
++    bool saved=publishChildState();
++    IOLog("SFM1SPIHID: T2 fault committed=%u cause=%d diagnostic=%u (not input)\n",
++          childState.committed,(int)childState.last_error,saved?1u:0u);
++}
++
++bool SFM1SPIHID::prepareChild()
++{
++    static_assert(sizeof(dl_m1_tp_descriptor_reference)==DL_M1_TP_DESCRIPTOR_BYTES,"reference length");
++    if (trackpadEnumeration.result!=M1TP_OBS_ENUM_OK ||
++        trackpadEnumeration.stage!=M1TP_OBS_COMPLETE ||
++        trackpadEnumeration.request_mask!=M1TP_CLAIM_MASK ||
++        trackpadInterface.interface!=2 ||
++        trackpadEnumeration.descriptor_payload_bytes!=DL_M1_TP_DESCRIPTOR_BYTES ||
++        !m1tp_child_descriptor_equal(trackpadEnumeration.descriptor,trackpadEnumeration.descriptor_bytes,
++                                    dl_m1_tp_descriptor_reference,sizeof(dl_m1_tp_descriptor_reference))) {
++        childFault((int32_t)kIOReturnUnsupported); return false;
++    }
++    childOwned=new SFM1SPITrackpad;
++    childInitialized=childOwned && childOwned->initWithSnapshot(trackpadEnumeration.descriptor,
++        trackpadEnumeration.descriptor_bytes,identity.vendor,identity.product,identity.version,
++        trackpadInterface.country);
++    if (!childInitialized) {
++        childFault((int32_t)kIOReturnNoMemory); return false;
++    }
++    if (!childOwned->attach(this)) { childFault((int32_t)kIOReturnError); return false; }
++    childAttached=true;
++    childStarted=childOwned->start(this);
++    if (!childStarted) { childFault((int32_t)kIOReturnError); return false; }
++    return true;
++}
++void SFM1SPIHID::rollbackChild()
++{
++    if (t2Committed()) {
++        IOLog("SFM1SPIHID: TEARDOWN_DEFERRED child rollback refused\n"); return;
++    }
++    /* Private startup has no producer or matching callback. Move the allocation
++     * reference before stop reentry; releasing a sink never releases ownership. */
++    SFM1SPITrackpad *child=childOwned;
++    bool attached=childAttached, started=childStarted;
++    childSink=nullptr; childOwned=nullptr; childInitialized=false; childAttached=false; childStarted=false;
++    if (!child) return;
++    if (started) child->stop(this); // failed base start already stopped itself
++    if (attached) child->detach(this);
++    child->release();
++}
++bool SFM1SPIHID::startT2(IOService *provider)
++{
++    if (!prepareChild()) rollbackChild(); // explicit keyboard-only fallback
++    struct dl_m1_trackpad_child_state_v1 next=childState;
++    next.committed=1;
++    next.route_ready=childStarted && !next.faulted ? 1u : 0u;
++    t2CommitData=OSData::withBytes(&next,sizeof(next));
++    IOReturn commitError=!t2CommitData ? kIOReturnNoMemory :
++        !transportGate ? kIOReturnNotReady : transportGate->runAction(commitT2Gated);
++    if (commitError!=kIOReturnSuccess) {
++        childFault((int32_t)commitError);
++        rollbackChild(); stop(provider); return false;
++    }
++    /* From here no false return or rollback, even if a concurrent runtime
++     * stop/diagnostic failure inhibits registration. Explicit pins remain. */
++    t2CommitData->release(); t2CommitData=nullptr;
++    if (__atomic_load_n(&t2Phase,__ATOMIC_ACQUIRE)==1)
++        registerService(kIOServiceAsynchronous);
++    if (childOwned && childOwned->admitting() && !childOwned->isInactive())
++        childOwned->registerService(kIOServiceAsynchronous);
++    IOLog("SFM1SPIHID: T2 committed retained cohort; asynchronous registration requested (not input)\n");
++    return true;
++}
++IOReturn SFM1SPIHID::commitT2Gated(OSObject *owner, void *, void *, void *, void *)
++{
++    SFM1SPIHID *self=OSDynamicCast(SFM1SPIHID,owner);
++    if (!self || self->stopping || self->t2Committed() || !self->t2CommitData ||
++        (self->childOwned && (!self->childStarted || self->childOwned->isInactive())))
++        return kIOReturnNotReady;
++    IOReturn kr=self->pollTimer->setTimeoutMS(2);
++    if (kr!=kIOReturnSuccess) return kr;
++    self->retain(); // permanent boot pin: intentionally no release path
++    if (self->childOwned) {
++        self->childOwned->retain(); // second permanent boot pin
++        self->childOwned->markCommitted();
++    }
++    __atomic_store_n(&self->t2Phase,1,__ATOMIC_RELEASE);
++    self->published=true;
++    self->childState.committed=1;
++    self->childSink=self->childStarted && !self->childState.faulted ? self->childOwned : nullptr;
++    self->childState.route_ready=self->childSink?1u:0u;
++    if (!self->installChildState(self->t2CommitData))
++        self->childFault((int32_t)kIOReturnNoMemory); // runtime failure, retain cohort
++    return kIOReturnSuccess;
++}
++IOReturn SFM1SPIHID::stopT2Gated(OSObject *owner, void *, void *, void *, void *)
++{
++    SFM1SPIHID *self=OSDynamicCast(SFM1SPIHID,owner);
++    if (!self || !self->t2Committed()) return kIOReturnNotReady;
++    __atomic_store_n(&self->t2Phase,2,__ATOMIC_RELEASE);
++    self->stopping=true; self->published=false; self->childSink=nullptr;
++    if (self->childOwned) self->childOwned->markRetired();
++    self->childState.route_ready=0; self->childState.stop_requested=1;
++    if (self->pollTimer) self->pollTimer->cancelTimeout();
++    bool saved=self->publishChildState();
++    IOLog("SFM1SPIHID: TEARDOWN_DEFERRED dispatches=%u diagnostic=%u (retained until reboot)\n",
++          self->t2Dispatches,saved?1u:0u);
++    return kIOReturnSuccess;
++}
++void SFM1SPIHID::retireChild(SFM1SPITrackpad *expected)
++{
++    if (!expected || !transportGate || !gateAdded) return;
++    IOReturn kr=transportGate->runAction(retireChildGated,expected);
++    if (kr!=kIOReturnSuccess) {
++        /* Child's atomic admission already closed; never destroy on failure. */
++        removeChildState();
++        IOLog("SFM1SPIHID: T2 recursive sink clear failed=%d; retained\n",(int)kr);
++    }
++}
++IOReturn SFM1SPIHID::retireChildGated(OSObject *owner, void *arg, void *, void *, void *)
++{
++    SFM1SPIHID *self=OSDynamicCast(SFM1SPIHID,owner);
++    SFM1SPITrackpad *child=static_cast<SFM1SPITrackpad *>(arg);
++    if (!self || !child) return kIOReturnBadArgument;
++    if (self->childSink==child) self->childSink=nullptr;
++    if (self->childOwned==child && self->t2Committed()) {
++        child->markRetired();
++        self->childState.route_ready=0; self->childState.stop_requested=1;
++        (void)self->publishChildState();
++    }
++    return kIOReturnSuccess;
++}
++
++void SFM1SPIHID::routeTrackpad(const struct dlsp_message *message)
++{
++    childObserved++; countersDirty=true;
++    int eligible=m1tp_child_input(message);
++    if (eligible!=1) {
++        childRejected++;
++        if (childRejected==1)
++            IOLog("SFM1SPIHID: T2 input rejected id=%u bytes=%u (no payload)\n",
++                  message->payload && message->payload_length?(unsigned)message->payload[0]:0u,
++                  (unsigned)message->payload_length);
++        return; // no route fault/last_error change for ordinary input refusal
++    }
++    SFM1SPITrackpad *child=childSink;
++    if (!child) return;
++    if (!child->admitting() || child->isInactive()) { retireChild(child); return; }
++    IOBufferMemoryDescriptor *report=IOBufferMemoryDescriptor::withBytes(
++        message->payload,message->payload_length,kIODirectionNone);
++    if (!report) { childFault((int32_t)kIOReturnNoMemory); return; }
++    retain(); child->retain(); t2Dispatches++;
++    /* M4: synchronous base handleReport uses retained IOHIDDevice::_workLoop.
++     * Never invoke an async API or resolve the provider loop after detach. */
++    IOReturn kr=child->handleReport(report,kIOHIDReportTypeInput);
++    t2Dispatches--;
++    if (kr==kIOReturnSuccess) {
++        childSubmitted++;
++        if (childSubmitted==1)
++            IOLog("SFM1SPIHID: first dev2 input submitted to passive child; physical input unverified\n");
++    } else childFault((int32_t)kr);
++    report->release(); child->release(); release();
++}
+--- /dev/null
++++ b/SFM1SPITrackpad.cpp
+@@ -0,0 +1,115 @@
++#include "SFM1SPITrackpad.h"
++#include "SFM1SPIHID.h"
++#include <IOKit/IOBufferMemoryDescriptor.h>
++#include <IOKit/IOLib.h>
++#include <libkern/libkern.h>
++
++#define super IOHIDDevice
++OSDefineMetaClassAndStructors(SFM1SPITrackpad,IOHIDDevice);
++
++bool SFM1SPITrackpad::initWithSnapshot(const uint8_t *bytes, size_t length,
++    uint16_t vid, uint16_t pid, uint16_t ver, uint8_t ctry)
++{
++    phase=0; privateStopRunning=false; privateStopDone=false; baseStarted=false;
++    if (!bytes || length!=sizeof(descriptor) || !super::init()) return false;
++    bcopy(bytes,descriptor,sizeof(descriptor));
++    vendor=vid; product=pid; version=ver; country=ctry;
++    OSNumber *iface=OSNumber::withNumber(2,32);
++    bool okay=iface && setProperty(DL_M1_TP_INTERFACE_PROPERTY,iface) &&
++        getProperty(DL_M1_TP_INTERFACE_PROPERTY)==iface;
++    if (iface) iface->release();
++    return okay && setProperty(kIOHIDRegisterServiceKey,kOSBooleanFalse) &&
++        getProperty(kIOHIDRegisterServiceKey)==kOSBooleanFalse &&
++        setProperty("Built-In",kOSBooleanTrue) &&
++        setProperty("HIDDefaultBehavior",kOSBooleanTrue);
++}
++bool SFM1SPITrackpad::committed() const
++{ return __atomic_load_n(&phase,__ATOMIC_ACQUIRE)!=0; }
++bool SFM1SPITrackpad::admitting() const
++{ return __atomic_load_n(&phase,__ATOMIC_ACQUIRE)==1; }
++void SFM1SPITrackpad::markCommitted()
++{ __atomic_store_n(&phase,1,__ATOMIC_RELEASE); }
++void SFM1SPITrackpad::markRetired()
++{
++    if (committed()) {
++        __atomic_store_n(&phase,2,__ATOMIC_RELEASE);
++        /* Even a late stop with no provider argument must invalidate this
++         * child's admission record without dynamically resolving a loop. */
++        removeProperty(DL_M1_TP_CHILD_STATE_PROPERTY);
++    }
++}
++
++bool SFM1SPITrackpad::start(IOService *provider)
++{
++    if (getProperty(kIOHIDRegisterServiceKey)!=kOSBooleanFalse) return false;
++    /* Inherited getWorkLoop uses the attached provider only during base start.
++     * Base IOHIDDevice retains _workLoop. No dynamic loop lookup after detach. */
++    baseStarted=super::start(provider);
++    IOLog("SFM1SPITrackpad: descriptor parse/interface allocation base_start=%u bytes=%u (no input proof)\n",
++          baseStarted?1u:0u,(unsigned)sizeof(descriptor));
++    return baseStarted;
++}
++void SFM1SPITrackpad::clearProviderSink(IOService *provider)
++{
++    SFM1SPIHID *parent=OSDynamicCast(SFM1SPIHID,provider);
++    if (parent) parent->retireChild(this);
++}
++bool SFM1SPITrackpad::willTerminate(IOService *provider, IOOptionBits options)
++{
++    markRetired();
++    clearProviderSink(provider);
++    return super::willTerminate(provider,options);
++}
++void SFM1SPITrackpad::stop(IOService *provider)
++{
++    markRetired();
++    /* M2: may already hold the inherited loop's recursive gate. This neither
++     * waits for dispatches nor resolves getWorkLoop() after detach. */
++    clearProviderSink(provider);
++    if (committed()) {
++        IOLog("SFM1SPITrackpad: TEARDOWN_DEFERRED committed cohort retained\n");
++        return;
++    }
++    if (privateStopDone || privateStopRunning) return;
++    privateStopRunning=true;
++    super::stop(provider);
++    privateStopRunning=false; privateStopDone=true;
++}
++void SFM1SPITrackpad::handleStop(IOService *provider)
++{
++    markRetired(); clearProviderSink(provider);
++    if (committed()) return;
++    super::handleStop(provider);
++}
++void SFM1SPITrackpad::free()
++{
++    if (committed()) {
++        IOLog("SFM1SPITrackpad: invariant violation; committed free refused\n");
++        return;
++    }
++    super::free();
++}
++bool SFM1SPITrackpad::handleOpen(IOService *client, IOOptionBits options, void *argument)
++{ return admitting() && !isInactive() && super::handleOpen(client,options,argument); }
++IOReturn SFM1SPITrackpad::newUserClient(task_t, void *, UInt32, OSDictionary *, IOUserClient **out)
++{ if (out) *out=nullptr; return kIOReturnUnsupported; }
++IOReturn SFM1SPITrackpad::newReportDescriptor(IOMemoryDescriptor **out) const
++{
++    if (!out) return kIOReturnBadArgument;
++    *out=IOBufferMemoryDescriptor::withBytes(descriptor,sizeof(descriptor),kIODirectionNone);
++    return *out?kIOReturnSuccess:kIOReturnNoMemory;
++}
++IOReturn SFM1SPITrackpad::getReport(IOMemoryDescriptor *, IOHIDReportType, IOOptionBits)
++{ return kIOReturnUnsupported; }
++IOReturn SFM1SPITrackpad::setReport(IOMemoryDescriptor *, IOHIDReportType, IOOptionBits)
++{ return kIOReturnUnsupported; }
++IOReturn SFM1SPITrackpad::getReport(IOMemoryDescriptor *, IOHIDReportType, IOOptionBits, UInt32, IOHIDCompletion *)
++{ return kIOReturnUnsupported; }
++IOReturn SFM1SPITrackpad::setReport(IOMemoryDescriptor *, IOHIDReportType, IOOptionBits, UInt32, IOHIDCompletion *)
++{ return kIOReturnUnsupported; }
++OSString *SFM1SPITrackpad::newTransportString() const { return OSString::withCString("SPI"); }
++OSString *SFM1SPITrackpad::newProductString() const { return OSString::withCString("Apple SPI Trackpad (J293 passive)"); }
++OSNumber *SFM1SPITrackpad::newVendorIDNumber() const { return OSNumber::withNumber(vendor,32); }
++OSNumber *SFM1SPITrackpad::newProductIDNumber() const { return OSNumber::withNumber(product,32); }
++OSNumber *SFM1SPITrackpad::newVersionNumber() const { return OSNumber::withNumber(version,32); }
++OSNumber *SFM1SPITrackpad::newCountryCodeNumber() const { return OSNumber::withNumber(country,32); }
+--- /dev/null
++++ b/SFM1SPITrackpad.h
+@@ -0,0 +1,45 @@
++/* Original passive descriptor-backed child; no transport ownership. */
++#ifndef SF_M1_SPI_TRACKPAD_H
++#define SF_M1_SPI_TRACKPAD_H
++#include "IOHIDDevice.h"
++#include "child_state.h"
++
++class SFM1SPIHID;
++class SFM1SPITrackpad : public IOHIDDevice {
++    OSDeclareDefaultStructors(SFM1SPITrackpad);
++    friend class SFM1SPIHID;
++public:
++    bool initWithSnapshot(const uint8_t *, size_t, uint16_t, uint16_t, uint16_t, uint8_t);
++    bool start(IOService *) APPLE_KEXT_OVERRIDE;
++    void stop(IOService *) APPLE_KEXT_OVERRIDE;
++    void handleStop(IOService *) APPLE_KEXT_OVERRIDE;
++    void free() APPLE_KEXT_OVERRIDE;
++    bool willTerminate(IOService *, IOOptionBits) APPLE_KEXT_OVERRIDE;
++    bool handleOpen(IOService *, IOOptionBits, void *) APPLE_KEXT_OVERRIDE;
++    IOReturn newUserClient(task_t, void *, UInt32, OSDictionary *, IOUserClient **) APPLE_KEXT_OVERRIDE;
++    IOReturn newReportDescriptor(IOMemoryDescriptor **) const APPLE_KEXT_OVERRIDE;
++    IOReturn getReport(IOMemoryDescriptor *, IOHIDReportType, IOOptionBits) APPLE_KEXT_OVERRIDE;
++    IOReturn setReport(IOMemoryDescriptor *, IOHIDReportType, IOOptionBits) APPLE_KEXT_OVERRIDE;
++    IOReturn getReport(IOMemoryDescriptor *, IOHIDReportType, IOOptionBits, UInt32, IOHIDCompletion *) APPLE_KEXT_OVERRIDE;
++    IOReturn setReport(IOMemoryDescriptor *, IOHIDReportType, IOOptionBits, UInt32, IOHIDCompletion *) APPLE_KEXT_OVERRIDE;
++    OSString *newTransportString() const APPLE_KEXT_OVERRIDE;
++    OSString *newProductString() const APPLE_KEXT_OVERRIDE;
++    OSNumber *newVendorIDNumber() const APPLE_KEXT_OVERRIDE;
++    OSNumber *newProductIDNumber() const APPLE_KEXT_OVERRIDE;
++    OSNumber *newVersionNumber() const APPLE_KEXT_OVERRIDE;
++    OSNumber *newCountryCodeNumber() const APPLE_KEXT_OVERRIDE;
++private:
++    uint8_t descriptor[DL_M1_TP_DESCRIPTOR_BYTES];
++    uint16_t vendor, product, version;
++    uint8_t country;
++    /* 0 private; 1 committed/admitting; 2 committed/retired. Atomic reads in
++     * handleOpen avoid acquiring the workloop under the arbitration lock. */
++    volatile UInt32 phase;
++    bool privateStopRunning, privateStopDone, baseStarted;
++    void clearProviderSink(IOService *);
++    bool committed() const;
++    bool admitting() const;
++    void markCommitted();
++    void markRetired();
++};
++#endif
+--- /dev/null
++++ b/m1tp_child_policy.c
+@@ -0,0 +1,26 @@
++#include "m1tp_child_policy.h"
++
++int m1tp_child_input(const struct dlsp_message *m)
++{
++    size_t expected;
++    if (!m) return -1;
++    if (m->flags!=0x20 || m->device!=2 || m->command!=0x10) return 0;
++    if (!m->payload || !m->payload_length || m->payload_length>DLSP_MESSAGE_BYTES-10u)
++        return -1;
++    switch (m->payload[0]) {
++    case 0x02: expected=DL_M1_TP_REPORT02_BYTES; break;
++    case 0x3f: expected=DL_M1_TP_REPORT3F_BYTES; break;
++    case 0x44: expected=DL_M1_TP_REPORT44_BYTES; break;
++    default: return -1;
++    }
++    return m->payload_length==expected ? 1 : -1;
++}
++
++int m1tp_child_descriptor_equal(const uint8_t *a, size_t n,
++                               const uint8_t *r, size_t rn)
++{
++    size_t i;
++    if (!a || !r || n!=DL_M1_TP_DESCRIPTOR_BYTES || rn!=n) return 0;
++    for (i=0;i<n;i++) if (a[i]!=r[i]) return 0;
++    return 1;
++}
+--- /dev/null
++++ b/m1tp_child_policy.h
+@@ -0,0 +1,19 @@
++/* Original passive T2 policy. License pending; no device operations. */
++#ifndef M1TP_CHILD_POLICY_H
++#define M1TP_CHILD_POLICY_H
++#include <stddef.h>
++#include <stdint.h>
++#include "native_protocol/dl_spi_hid.h"
++#include "child_state.h"
++#ifdef __cplusplus
++extern "C" {
++#endif
++/* 1: exact known input; 0: other envelope; -1: invalid input length/ID. */
++int m1tp_child_input(const struct dlsp_message *message);
++/* Identity only. The reference is never returned as an acquired descriptor. */
++int m1tp_child_descriptor_equal(const uint8_t *actual, size_t actual_bytes,
++                               const uint8_t *reference, size_t reference_bytes);
++#ifdef __cplusplus
++}
++#endif
++#endif

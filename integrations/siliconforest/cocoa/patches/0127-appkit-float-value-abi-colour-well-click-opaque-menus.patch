@@ -1,0 +1,270 @@
+--- a/src/Frameworks/AppKit/NSCell.h
++++ b/src/Frameworks/AppKit/NSCell.h
+@@ -172,7 +172,7 @@
+ - objectValue;
+ - (NSString *)stringValue;
+ - (int)intValue;
+-- (CGFloat)floatValue;
++- (float)floatValue;
+ - (double)doubleValue;
+ - (NSInteger)integerValue;
+ - (NSAttributedString *)attributedStringValue;
+@@ -219,7 +219,7 @@
+ - (void)setObjectValue:(id<NSCopying>)value;
+ - (void)setStringValue:(NSString *)value;
+ - (void)setIntValue:(int)value;
+-- (void)setFloatValue:(CGFloat)value;
++- (void)setFloatValue:(float)value;
+ - (void)setDoubleValue:(double)value;
+ - (void)setIntegerValue:(NSInteger)value;
+ - (void)setAttributedStringValue:(NSAttributedString *)value;
+--- a/src/Frameworks/AppKit/NSCell.m
++++ b/src/Frameworks/AppKit/NSCell.m
+@@ -370,7 +370,9 @@
+       return [_objectValue intValue];
+ }
+ 
+--(CGFloat)floatValue {
++// float as in macOS's API (an application built for macOS reads s0: a double answered garbage, Terminal's
++// colour panel opacity read 0 and set it)
++-(float)floatValue {
+    if (_objectValue == nil) {
+       // [nil someFloatMethod] doesn't return 0.f on Cocotron - tmp fix until the runtime is fixed
+       return 0.f;
+@@ -688,7 +690,7 @@
+    [self setObjectValue:[NSNumber numberWithInt:value]];
+ }
+ 
+--(void)setFloatValue:(CGFloat)value {
++-(void)setFloatValue:(float)value {
+    [self setObjectValue:[NSNumber numberWithFloat:value]];
+ }
+ 
+--- a/src/Frameworks/AppKit/NSControl.h
++++ b/src/Frameworks/AppKit/NSControl.h
+@@ -47,7 +47,7 @@
+ - (NSString *)stringValue;
+ - (NSAttributedString *)attributedStringValue;
+ - (int)intValue;
+-- (CGFloat)floatValue;
++- (float)floatValue;
+ - (double)doubleValue;
+ - (NSInteger)integerValue;
+ 
+@@ -76,7 +76,7 @@
+ - (void)setStringValue:(NSString *)value;
+ - (void)setIntValue:(int)value;
+ - (void)setIntegerValue:(NSInteger)value;
+-- (void)setFloatValue:(CGFloat)value;
++- (void)setFloatValue:(float)value;
+ - (void)setDoubleValue:(double)value;
+ - (void)setIntegerValue:(NSInteger)anInteger;
+ - (void)setAttributedStringValue:(NSAttributedString *)value;
+--- a/src/Frameworks/AppKit/NSControl.m
++++ b/src/Frameworks/AppKit/NSControl.m
+@@ -177,7 +177,7 @@
+    return [[self selectedCell] intValue];
+ }
+ 
+--(CGFloat)floatValue {
++-(float)floatValue {
+    return [[self selectedCell] floatValue];
+ }
+ 
+@@ -340,7 +340,7 @@
+     sfValueMayResize(self,sfBefore);
+ }
+ 
+--(void)setFloatValue:(CGFloat)value {
++-(void)setFloatValue:(float)value {
+     NSUInteger sfBefore=sfValueLength(self);
+     [self abortEditing];
+     [[self selectedCell] setFloatValue:value];
+--- a/src/Frameworks/AppKit/NSActionCell.m
++++ b/src/Frameworks/AppKit/NSActionCell.m
+@@ -112,7 +112,7 @@
+ /**
+  * Retrieve the value of the receiver as a float.
+  */
+-- (CGFloat) floatValue
++- (float) floatValue
+ {
+     [self _validateEditing];
+     return [super floatValue];
+--- a/src/Frameworks/AppKit/NSScroller.h
++++ b/src/Frameworks/AppKit/NSScroller.h
+@@ -63,7 +63,7 @@
+ - (NSScrollArrowPosition)arrowsPosition;
+ - (NSControlSize)controlSize;
+ 
+-- (void)setFloatValue:(CGFloat)zeroToOneValue knobProportion:(CGFloat)zeroToOneKnob;
++- (void)setFloatValue:(float)zeroToOneValue knobProportion:(CGFloat)zeroToOneKnob;
+ - (void)setArrowsPosition:(NSScrollArrowPosition)position;
+ - (void)setControlSize:(NSControlSize)value;
+ 
+--- a/src/Frameworks/AppKit/NSScroller.m
++++ b/src/Frameworks/AppKit/NSScroller.m
+@@ -203,7 +203,7 @@
+    return sFlags.isHoriz?NO:YES;
+ }
+ 
+--(CGFloat)floatValue {
++-(float)floatValue {
+    return _floatValue;
+ }
+ 
+@@ -218,7 +218,7 @@
+ - (NSControlSize)controlSize {
+     return _controlSize; }
+ 
+--(void)setFloatValue:(CGFloat)zeroToOneValue knobProportion:(CGFloat)zeroToOneKnob {
++-(void)setFloatValue:(float)zeroToOneValue knobProportion:(CGFloat)zeroToOneKnob {
+     if(zeroToOneValue>1)
+         zeroToOneValue=1;
+     if(zeroToOneValue<0)
+--- a/src/Frameworks/AppKit/NSColorWell.m
++++ b/src/Frameworks/AppKit/NSColorWell.m
+@@ -248,8 +248,8 @@
+ -(void)mouseDown:(NSEvent *)event
+ {
+         if (sfColorTrace())
+-                fprintf(stderr, "NSColorWell: %s %p mouseDown enabled=%d bordered=%d active=%d\n", object_getClassName(self), self,
+-                        (int)[self isEnabled], (int)[self isBordered], (int)[self isActive]);
++                fprintf(stderr, "NSColorWell: %s %p mouseDown enabled=%d bordered=%d active=%d bounds=%s\n", object_getClassName(self), self,
++                        (int)[self isEnabled], (int)[self isBordered], (int)[self isActive], [NSStringFromRect(_bounds) UTF8String]);
+         if(![self isEnabled]) {
+                 return;
+         }
+@@ -284,10 +284,16 @@
+                 }
+ 
+                 BOOL shouldStartDrag = NO;
++                NSPoint pressedAt = point;
+                 do {
+                         event=[[self window] nextEventMatchingMask:NSLeftMouseUpMask|NSLeftMouseDraggedMask];
+                         point=[self convertPoint:[event locationInWindow] fromView:nil];
+                         BOOL mouseInBounds=NSMouseInRect(point,_bounds,[self isFlipped]);
++                        /* A drag is a move of three points or more with the button down: a compositor sends motion at
++                         * every button change, and that "drag" in place started a colour drag instead of the click
++                         * that opens the colour panel (Terminal's background well never opened it) */
++                        if ([event type] == NSLeftMouseDragged && fabs(point.x - pressedAt.x) < 3 && fabs(point.y - pressedAt.y) < 3)
++                                continue;
+                         if ([event type] == NSLeftMouseDragged) {
+                                 if (canStartDrag) {
+                                         // Get dragging the color
+--- a/src/Frameworks/AppKit/NSSliderCell.m
++++ b/src/Frameworks/AppKit/NSSliderCell.m
+@@ -530,6 +530,8 @@
+     }
+ 
+     percentPixels=position/length;
++    if(getenv("SF_SLIDER_TRACE")!=NULL)
++     fprintf(stderr,"NSSliderCell %p: point %g,%g in %s: %.3f of %g..%g\n",self,point.x,point.y,[NSStringFromRect(_lastRect) UTF8String],percentPixels,_minValue,_maxValue);
+ 
+ #if 0
+     NSLog(@"percentPixels is %g; max-min is %g", percentPixels, _maxValue - _minValue);
+--- a/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
++++ b/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
+@@ -164,6 +164,8 @@
+ @end
+ 
+ 
++extern int _windowServerCanBlurBehind(void) __attribute__((weak_import));
++
+ // the panel of a vertical menu as vectors: clear, then a soft shadow and the rounded panel (light or dark)
+ static void sfDrawPanel(NSRect bounds, BOOL dark)
+ {
+@@ -191,9 +193,14 @@
+         [[NSColor colorWithCalibratedWhite:0 alpha:0.018] setFill];
+         [ring fill];
+     }
+-    // the demo's 92%, the compositor blurs what shows through
+-    [(dark ? [NSColor colorWithCalibratedRed:0.172 green:0.172 blue:0.18 alpha:0.92]
+-           : [NSColor colorWithCalibratedRed:0.98 green:0.969 blue:0.961 alpha:0.92]) setFill];
++    // the demo's 92% where the compositor blurs what shows through; where it cannot, the text of the window
++    // behind showed through sharp: opaque then, as macOS's menus with Reduce Transparency
++    static CGFloat panelAlpha = 0;
++
++    if (panelAlpha == 0)
++        panelAlpha = (_windowServerCanBlurBehind != NULL && _windowServerCanBlurBehind()) ? 0.92 : 1.0;
++    [(dark ? [NSColor colorWithCalibratedRed:0.172 green:0.172 blue:0.18 alpha:panelAlpha]
++           : [NSColor colorWithCalibratedRed:0.98 green:0.969 blue:0.961 alpha:panelAlpha]) setFill];
+     [panel fill];
+     [[NSColor colorWithCalibratedWhite:dark ? 1 : 0 alpha:0.12] setStroke];
+     [panel setLineWidth:1];
+--- a/src/Frameworks/AppKit/NSAlert.m
++++ b/src/Frameworks/AppKit/NSAlert.m
+@@ -437,6 +437,10 @@
+ }
+ 
+ -(void)_alertButton:sender {
++   // ending the sheet runs -sheetDidEnd:..., which lets the alert go (and its window, its buttons): it stays
++   // until this event is done, -close below used it after it was freed
++   [[self retain] autorelease];
++   [[_window retain] autorelease];
+    if([NSApp modalWindow]!=_window && [_window isSheet])
+     [NSApp endSheet:_window returnCode:[sender tag]];
+    else
+--- a/src/Frameworks/AppKit/NSButton.m
++++ b/src/Frameworks/AppKit/NSButton.m
+@@ -235,6 +235,10 @@
+     // an empty key equivalent is none (a modifier key alone arrives with no characters: Shift
+     // pressed in Terminal's inspector opened the process table's pull-down)
+     if([key length]>0 && [key isEqualToString:characters]){
++     if(getenv("SF_KEYEQ_TRACE")!=NULL)
++      fprintf(stderr,"NSButton %p '%s' key equivalent: target %p action %s window %p\n",self,[[self title] UTF8String],[self target],sel_getName([self action]),[self window]);
++     // the button and its window stay until the click's action is done (the action may close the window)
++     [[self retain] autorelease];
+      [self performClick:nil];
+      return YES;
+     }
+--- a/src/Frameworks/AppKit/NSTextFinder.m
++++ b/src/Frameworks/AppKit/NSTextFinder.m
+@@ -52,6 +52,7 @@
+ - (NSTextField *)countLabel;
+ - (BOOL)showsReplace;
+ - (void)setShowsReplace:(BOOL)shows;
++- (void)_sfFinderGone;
+ @end
+ 
+ @interface NSTextFinder (FinchPrivate)
+@@ -67,6 +68,17 @@
+ 
+ @implementation NSTextFinderBarView
+ 
++- (void)_sfFinderGone
++{
++    for (NSView *view in [self subviews]) {
++        if ([view isKindOfClass:[NSControl class]] && [(NSControl *)view target] == _finder)
++            [(NSControl *)view setTarget:nil];
++    }
++    if ([_searchField delegate] == (id)_finder)
++        [_searchField setDelegate:nil];
++    _finder = nil;
++}
++
+ - (instancetype)initWithFinder:(NSTextFinder *)finder
+ {
+     self = [super initWithFrame:NSMakeRect(0, 0, 400, kFindRow)];
+@@ -172,6 +184,9 @@
+ 
+ - (void)dealloc
+ {
++    // the bar may outlive its finder (a container keeps it in its window): its controls must not message a
++    // freed finder (Terminal ended with SIGSEGV when Escape clicked Done on a bar whose finder was gone)
++    [_bar _sfFinderGone];
+     [_bar release];
+     [super dealloc];
+ }
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -2779,6 +2779,9 @@
+    }
+    CGRect b=[layer bounds];
+ 
++   if(sfCATrace())
++    fprintf(stderr,"PD-CA view %s %p draws its layer %s %p on the CPU: bounds %s, contents %p, %lu sublayers\n",object_getClassName(view),view,
++            object_getClassName(layer),layer,[NSStringFromRect(NSRectFromCGRect(b)) UTF8String],[layer contents],(unsigned long)[[layer sublayers] count]);
+    sfCPULayerRegister(view);
+    CGContextSaveGState(ctx);
+    // the root layer's bounds are the view's (configureLayerGeometry); layer geometry is y up

@@ -1,0 +1,598 @@
+diff -ruN desk10-next-002/source/Cargo.lock desk10-next-003/source/Cargo.lock
+--- desk10-next-002/source/Cargo.lock	2026-11-15 15:30:49.370535587 -0800
++++ desk10-next-003/source/Cargo.lock	2026-11-15 22:43:58.136554738 -0800
+@@ -3510,6 +3510,7 @@
+  "tiny-skia",
+  "wayland-client",
+  "wayland-protocols",
++ "wayland-scanner",
+  "wm-config",
+  "wm-core",
+  "wm-theme",
+diff -ruN desk10-next-002/source/crates/wm-darwin/Cargo.toml desk10-next-003/source/crates/wm-darwin/Cargo.toml
+--- desk10-next-002/source/crates/wm-darwin/Cargo.toml	2026-11-15 15:30:49.505229779 -0800
++++ desk10-next-003/source/crates/wm-darwin/Cargo.toml	2026-11-15 22:43:58.138322878 -0800
+@@ -7,7 +7,7 @@
+ 
+ [features]
+ default = []
+-darwin-backend = ["dep:smithay", "dep:wm-core", "dep:wm-theme", "dep:wm-theme-api", "dep:tiny-skia", "dep:libc", "dep:png"]
++darwin-backend = ["dep:smithay", "dep:wm-core", "dep:wm-theme", "dep:wm-theme-api", "dep:tiny-skia", "dep:libc", "dep:png", "dep:wayland-scanner"]
+ desktop-shell = ["darwin-backend", "dep:chonk-shell", "dep:wm-config", "dep:image"]
+ # Root links the frozen, reviewed-source C object explicitly. This does not
+ # establish Darwin FD-whitelist runtime admission. The separate desktop binary
+@@ -26,6 +26,8 @@
+ tiny-skia = { version = "0.11", optional = true }
+ libc = { version = "0.2", optional = true }
+ png = { version = "0.18", optional = true }
++# DESK10: sf_window_position_v1 (protocols/), generated at expansion time as wm-wayland does its own protocols
++wayland-scanner = { version = "0.31", optional = true }
+ chonk-shell = { path = "../chonk-shell", optional = true }
+ wm-config = { path = "../wm-config", optional = true }
+ # Screen recordings: Photo-JPEG frames in a QuickTime movie (record.rs).
+diff -ruN desk10-next-002/source/crates/wm-darwin/protocols/sf-window-position-v1.xml desk10-next-003/source/crates/wm-darwin/protocols/sf-window-position-v1.xml
+--- desk10-next-002/source/crates/wm-darwin/protocols/sf-window-position-v1.xml	1969-12-31 16:00:00.000000000 -0800
++++ desk10-next-003/source/crates/wm-darwin/protocols/sf-window-position-v1.xml	2026-11-15 22:43:51.764634331 -0800
+@@ -0,0 +1,44 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<protocol name="sf_window_position_v1">
++  <copyright>
++    Copyright (c) 2026 The PureDarwin Project
++    SPDX-License-Identifier: MPL-2.0 OR BSD-2-Clause
++  </copyright>
++
++  <interface name="sf_window_position_manager_v1" version="1">
++    <description summary="where the compositor placed a client's windows">
++      Wayland keeps window positions with the compositor. AppKit reports frames in screen
++      coordinates, so a window learns where it is from this.
++    </description>
++
++    <request name="destroy" type="destructor"/>
++
++    <request name="get_window_position">
++      <arg name="id" type="new_id" interface="sf_window_position_v1"/>
++      <arg name="surface" type="object" interface="wl_surface"/>
++    </request>
++  </interface>
++
++  <interface name="sf_window_position_v1" version="1">
++    <description summary="one window's position">
++      Sent once when created and again every time the compositor moves the window.
++    </description>
++
++    <request name="destroy" type="destructor"/>
++
++    <request name="set_position">
++      <description summary="where the client wants its window">
++        Top left in global compositor coordinates. Wayland leaves placement to the compositor,
++        an AppKit window still opens and moves where the app put it.
++      </description>
++      <arg name="x" type="int"/>
++      <arg name="y" type="int"/>
++    </request>
++
++    <event name="position">
++      <description summary="top left of the window in global compositor coordinates"/>
++      <arg name="x" type="int"/>
++      <arg name="y" type="int"/>
++    </event>
++  </interface>
++</protocol>
+diff -ruN desk10-next-002/source/crates/wm-darwin/src/clipboard.rs desk10-next-003/source/crates/wm-darwin/src/clipboard.rs
+--- desk10-next-002/source/crates/wm-darwin/src/clipboard.rs	2026-11-15 16:01:35.033415455 -0800
++++ desk10-next-003/source/crates/wm-darwin/src/clipboard.rs	2026-11-15 22:39:47.949329670 -0800
+@@ -25,8 +25,13 @@
+     /// The client's source of the clipboard now, and the copy's number.
+     source: Option<SelectionSource>,
+     serial: u64,
+-    /// (serial, the bytes read so far) - written by the reading thread.
+-    captured: Arc<Mutex<(u64, Vec<(String, Vec<u8>)>)>>,
++    /// (serial, the bytes read so far, the read finished) - written by the reading thread.
++    captured: Arc<Mutex<(u64, Vec<(String, Vec<u8>)>, bool)>>,
++    /// DESK10: when the desk last asked the source for its bytes, and how often for this copy (a client may answer
++    /// the first ask, made the moment it set the clipboard, before its data is ready: Firefox through AppKit gave 0
++    /// bytes for every type on the M1)
++    asked: Option<Instant>,
++    attempts: u8,
+     /// The desk serves the clipboard itself (the copying client went).
+     pub serving: bool,
+     pub kept: u32,
+@@ -45,7 +50,7 @@
+ }
+ 
+ /// Read every pipe to its end (the writers closed them), within the deadline and the size limit.
+-fn read_all(serial: u64, pipes: Vec<(String, OwnedFd)>, into: Arc<Mutex<(u64, Vec<(String, Vec<u8>)>)>>) {
++fn read_all(serial: u64, pipes: Vec<(String, OwnedFd)>, into: Arc<Mutex<(u64, Vec<(String, Vec<u8>)>, bool)>>) {
+     let deadline = Instant::now() + READ_FOR;
+     let mut total = 0usize;
+     let mut done: Vec<(String, Vec<u8>)> = Vec::new();
+@@ -80,6 +85,7 @@
+     if let Ok(mut c) = into.lock() {
+         if c.0 == serial {
+             c.1 = done;
++            c.2 = true;
+         }
+     }
+ }
+@@ -89,9 +95,16 @@
+     pub fn copied(&mut self, source: SelectionSource) {
+         self.serial += 1;
+         self.serving = false;
++        self.source = Some(source);
++        self.attempts = 0;
++        self.ask();
++    }
++    /// Asks the source for every type it offers; a thread reads the answers.
++    fn ask(&mut self) {
++        let Some(source) = self.source.as_ref() else { return };
+         let serial = self.serial;
+         if let Ok(mut c) = self.captured.lock() {
+-            *c = (serial, Vec::new());
++            *c = (serial, Vec::new(), false);
+         }
+         let mut pipes = Vec::new();
+         for mime in source.mime_types().into_iter().take(MAX_TYPES) {
+@@ -99,10 +112,25 @@
+             source.send(mime.clone(), write);
+             pipes.push((mime, read));
+         }
+-        self.source = Some(source);
++        self.asked = Some(Instant::now());
++        self.attempts += 1;
+         let into = self.captured.clone();
+         let _ = std::thread::Builder::new().name("clipboard-copy".into()).spawn(move || read_all(serial, pipes, into));
+     }
++    /// DESK10: a live source that answered with nothing at all for every type is asked again, 250 ms and then
++    /// 1 s after the ask before (three asks at most). Returns the attempt when it asked.
++    pub fn ask_again_if_empty(&mut self) -> Option<u8> {
++        if self.attempts >= 3 || !self.source.as_ref().is_some_and(|s| s.is_alive()) {
++            return None;
++        }
++        let empty = self.captured.lock().ok().is_some_and(|c| c.0 == self.serial && c.2 && c.1.iter().all(|(_, b)| b.is_empty()));
++        let wait = if self.attempts <= 1 { Duration::from_millis(250) } else { Duration::from_secs(1) };
++        if empty && self.asked.is_some_and(|t| t.elapsed() >= wait) {
++            self.ask();
++            return Some(self.attempts);
++        }
++        None
++    }
+     /// The desk set the clipboard itself (a screenshot): the client's copy is no longer the clipboard.
+     pub fn desk_set(&mut self) {
+         self.source = None;
+@@ -128,7 +156,8 @@
+     }
+     fn take_copy(&mut self) -> Option<Arc<ClipData>> {
+         let c = self.captured.lock().ok()?;
+-        if c.0 != self.serial || c.1.is_empty() {
++        // DESK10: nothing kept when every type came back empty (an empty clipboard, not empty text)
++        if c.0 != self.serial || c.1.iter().all(|(_, b)| b.is_empty()) {
+             return None;
+         }
+         self.serving = true;
+@@ -148,6 +177,9 @@
+     }
+     /// Once a turn: a clipboard source that went without a selection event.
+     pub(crate) fn clipboard_tick(&mut self) {
++        if let Some(n) = self.clipboard.ask_again_if_empty() {
++            eprintln!("WMCLIP the copying client gave no bytes for any type: asked again ({n})");
++        }
+         if let Some(data) = self.clipboard.orphaned() {
+             self.clipboard_keep(data);
+         }
+diff -ruN desk10-next-002/source/crates/wm-darwin/src/desktop_entry.rs desk10-next-003/source/crates/wm-darwin/src/desktop_entry.rs
+--- desk10-next-002/source/crates/wm-darwin/src/desktop_entry.rs	2026-11-15 21:51:59.638158930 -0800
++++ desk10-next-003/source/crates/wm-darwin/src/desktop_entry.rs	2026-11-15 22:44:43.124574269 -0800
+@@ -264,6 +264,7 @@
+         self.deliver_input(ms);
+         self.server.trackpad_swipes(ms);
+         self.server.scroll_tick(ms);
++        self.server.window_positions_tick();
+         let scale = self.server.scale();
+         let changes = self.outputs.tick(crate::kms::read_hotplug_seq, || {
+             let libs = crate::gpu::Libraries::load()?;
+diff -ruN desk10-next-002/source/crates/wm-darwin/src/lib.rs desk10-next-003/source/crates/wm-darwin/src/lib.rs
+--- desk10-next-002/source/crates/wm-darwin/src/lib.rs	2026-11-15 21:49:52.609455408 -0800
++++ desk10-next-003/source/crates/wm-darwin/src/lib.rs	2026-11-15 22:44:43.124034978 -0800
+@@ -76,3 +76,4 @@
+ pub mod session_restore;
+ pub mod terminal_launch;
+ pub mod volume;
++pub mod window_position;
+diff -ruN desk10-next-002/source/crates/wm-darwin/src/policy.rs desk10-next-003/source/crates/wm-darwin/src/policy.rs
+--- desk10-next-002/source/crates/wm-darwin/src/policy.rs	2026-11-15 21:49:52.609620923 -0800
++++ desk10-next-003/source/crates/wm-darwin/src/policy.rs	2026-11-15 22:44:43.124195467 -0800
+@@ -20,6 +20,7 @@
+ //! | `trackpad_scroll` | on | DESK10: the built-in trackpad's two-finger scrolling goes to clients as finger scrolling in points, accelerated, with `axis_stop` at the lift (`scroll.rs`); off: as wheel notches, one per driver step (before DESK10) |
+ //! | `scroll_speed` | 100 | DESK10: the trackpad's scrolling speed in percent (25..400), as macOS's scrolling speed slider: a factor on the whole curve |
+ //! | `natural_scroll` | on | DESK10: the content follows the fingers (macOS's default); off: the other way |
++//! | `window_position` | off | DESK10: `sf_window_position_v1` advertised: an AppKit window opens where its application put it (a modal panel centred, FX-027) and AppKit learns where the desk placed it; applications started after the switch see it |
+ //! | `scroll_trace` | off | DESK10: one `WMSCROLLRAW` line per trackpad scroll record (its steps, time, speed, what was sent): the owner's own scrolling as evidence |
+ use std::path::PathBuf;
+ use std::time::{Duration, Instant, SystemTime};
+@@ -40,12 +41,13 @@
+     pub trackpad_scroll: bool,
+     pub natural_scroll: bool,
+     pub scroll_trace: bool,
++    pub window_position: bool,
+     /// percent, 25..400 (not a switch: `scroll_speed=<n>`)
+     pub scroll_speed: u16,
+ }
+ 
+ impl Switches {
+-    const KEYS: [&'static str; 14] = ["fifo", "fifo_shm", "client_wake", "flip_time_callbacks", "flip_stamps", "restore", "skip_unchanged", "partial_repaint", "framehash", "late_latch", "restore_after_reboot", "trackpad_scroll", "natural_scroll", "scroll_trace"];
++    const KEYS: [&'static str; 15] = ["fifo", "fifo_shm", "client_wake", "flip_time_callbacks", "flip_stamps", "restore", "skip_unchanged", "partial_repaint", "framehash", "late_latch", "restore_after_reboot", "trackpad_scroll", "natural_scroll", "scroll_trace", "window_position"];
+     fn defaults() -> Self {
+         let env = |key: &str| std::env::var(format!("CHONKSTEP_DARWIN_{}", key.to_ascii_uppercase())).ok().and_then(|v| parse_bool(&v));
+         Self {
+@@ -63,6 +65,7 @@
+             trackpad_scroll: env("trackpad_scroll").unwrap_or(true),
+             natural_scroll: env("natural_scroll").unwrap_or(true),
+             scroll_trace: env("scroll_trace").unwrap_or(false),
++            window_position: env("window_position").unwrap_or(false),
+             scroll_speed: std::env::var("CHONKSTEP_DARWIN_SCROLL_SPEED").ok().and_then(|v| parse_speed(&v)).unwrap_or(100),
+         }
+     }
+@@ -82,6 +85,7 @@
+             "trackpad_scroll" => &mut self.trackpad_scroll,
+             "natural_scroll" => &mut self.natural_scroll,
+             "scroll_trace" => &mut self.scroll_trace,
++            "window_position" => &mut self.window_position,
+             _ => return None,
+         })
+     }
+@@ -217,14 +221,14 @@
+     use super::*;
+     #[test]
+     fn the_policy_file_changes_switches_without_a_relaunch_and_a_test_pin_wins_until_released() {
+-        let base = Switches { fifo: true, fifo_shm: true, client_wake: true, flip_time_callbacks: true, flip_stamps: true, restore: true, skip_unchanged: true, partial_repaint: true, framehash: false, late_latch: true, restore_after_reboot: false, trackpad_scroll: true, natural_scroll: true, scroll_trace: false, scroll_speed: 100 };
++        let base = Switches { fifo: true, fifo_shm: true, client_wake: true, flip_time_callbacks: true, flip_stamps: true, restore: true, skip_unchanged: true, partial_repaint: true, framehash: false, late_latch: true, restore_after_reboot: false, trackpad_scroll: true, natural_scroll: true, scroll_trace: false, window_position: false, scroll_speed: 100 };
+         // DESK10: the trackpad's scrolling speed is a number, the rest switches
+         let (sp, refused) = Switches::parse("scroll_speed=140\nscroll_trace=on\ntrackpad_scroll=off\n", base);
+         assert!(refused.is_empty() && sp.scroll_speed == 140 && sp.scroll_trace && !sp.trackpad_scroll && sp.natural_scroll);
+         let (sp, refused) = Switches::parse("scroll_speed=1000\nscroll_speed=fast\n", base);
+         assert_eq!(sp.scroll_speed, 100);
+         assert_eq!(refused.len(), 2);
+-        assert!(sp.text().ends_with("scroll_trace=off scroll_speed=100"));
++        assert!(sp.text().ends_with("scroll_trace=off window_position=off scroll_speed=100"));
+         let (s, refused) = Switches::parse("# comment\nfifo=off\nrestore = 0\nbogus=1\nclient_wake=maybe\n", base);
+         assert!(!s.fifo && !s.restore && s.client_wake && s.flip_time_callbacks);
+         assert_eq!(refused, vec!["bogus=1".to_string(), "client_wake=maybe".to_string()]);
+diff -ruN desk10-next-002/source/crates/wm-darwin/src/scene.rs desk10-next-003/source/crates/wm-darwin/src/scene.rs
+--- desk10-next-002/source/crates/wm-darwin/src/scene.rs	2026-11-15 21:56:41.164651083 -0800
++++ desk10-next-003/source/crates/wm-darwin/src/scene.rs	2026-11-15 22:44:43.121539327 -0800
+@@ -14,6 +14,9 @@
+     /// window hidden by its application, or minimised by unmapping).
+     pub last_app_id: Option<String>,
+     pub content: Rect,
++    /// DESK10: where its application asked its window to open (`sf_window_position_v1`, panel pixels), taken
++    /// as the window's own position when it first maps.
++    pub(crate) requested_pos: Option<Point>,
+     /// Replace or edit only through `CpuBackend::set_window_image` /
+     /// `window_image_mut` + `window_image_damaged`, which version the pixels.
+     pub(crate) image: Option<DecorationBuffer>,
+@@ -630,6 +633,7 @@
+                 app_id: None,
+                 last_app_id: None,
+                 content: Rect::new(Point::new(0, 0), Size::new(1, 1)),
++                requested_pos: None,
+                 image: None,
+                 generation: 0,
+                 partial: None,
+diff -ruN desk10-next-002/source/crates/wm-darwin/src/server.rs desk10-next-003/source/crates/wm-darwin/src/server.rs
+--- desk10-next-002/source/crates/wm-darwin/src/server.rs	2026-11-15 21:57:24.198464280 -0800
++++ desk10-next-003/source/crates/wm-darwin/src/server.rs	2026-11-15 22:44:43.122695413 -0800
+@@ -332,6 +332,8 @@
+     pub(crate) finger_dropped: u64,
+     /// DESK10: finger frames for the other seat than the one being delivered, sent at the loop's next turn.
+     pub(crate) finger_later: Vec<crate::scroll::Out>,
++    /// DESK10: sf_window_position_v1 (window_position.rs).
++    pub(crate) window_positions: crate::window_position::WindowPositions,
+     /// The test instrument's events held back while the owner holds a key or a button (input.rs).
+     pub(crate) deferred_virtual: std::collections::VecDeque<(crate::hid::Event, std::time::Instant)>,
+     /// Popups made without a parent, waiting for a layer surface to adopt them (`get_popup`).
+@@ -529,6 +531,7 @@
+             touch_swipe_mm: 0.0,
+             finger_dropped: 0,
+             finger_later: Vec::new(),
++            window_positions: Default::default(),
+             pointer_shared: None,
+             pointer_thread_covers: false,
+             loop_probe: Default::default(),
+@@ -2344,7 +2347,8 @@
+                     // first shows a window empty and tiny, then at its real
+                     // size, would otherwise keep the tiny one's corner.
+                     if w.content.size != size {
+-                        w.content.pos = wm_core::Point::new(0, 0);
++                        // DESK10: where its application put it (sf_window_position_v1), else the desk decides
++                        w.content.pos = w.requested_pos.take().unwrap_or(wm_core::Point::new(0, 0));
+                     }
+                     w.content.size = size;
+                     // a window kept while minimised (above) maps again: the desk still has it, at
+diff -ruN desk10-next-002/source/crates/wm-darwin/src/window_position.rs desk10-next-003/source/crates/wm-darwin/src/window_position.rs
+--- desk10-next-002/source/crates/wm-darwin/src/window_position.rs	1969-12-31 16:00:00.000000000 -0800
++++ desk10-next-003/source/crates/wm-darwin/src/window_position.rs	2026-11-15 22:44:25.758209625 -0800
+@@ -0,0 +1,162 @@
++//! DESK10 (FX-027, TERM10's request): `sf_window_position_v1`, the window positions AppKit asks for and the
++//! ones the desk gives. libWindowServer binds the manager when it is advertised, asks for a window's
++//! position object when it gives the window its role, and sends the place AppKit put the window
++//! (`set_position`, top-left in the desk's logical coordinates: AppKit centres a modal panel, cascades a
++//! document window, restores a saved frame); it reads back where the desk placed and moved it (`position`
++//! events), which AppKit needs to turn surface-local pointer positions into screen coordinates.
++//!
++//! What the desk does with a `set_position`: before the window first maps, the place becomes the window's
++//! requested position, which the placement policy honours as a client's real position (wm-core: kept on
++//! the work area); after that it is only said in the log (a move by the application itself is not done yet).
++//! The global is advertised only with policy `window_position=on` (off by default: a change of where every
++//! AppKit window opens, for the owner to try), switched live; applications started after it see it.
++use smithay::reexports::wayland_server::backend::GlobalId;
++use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
++use smithay::reexports::wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
++use wm_core::Backend;
++
++#[allow(non_upper_case_globals, non_camel_case_types, non_snake_case)]
++#[allow(dead_code, unused_imports, unused_variables, unused_unsafe)]
++#[allow(missing_docs, clippy::all)]
++pub mod bindings {
++    use smithay::reexports::wayland_server;
++    use smithay::reexports::wayland_server::protocol::*;
++
++    pub mod __interfaces {
++        use smithay::reexports::wayland_server::backend as wayland_backend;
++        use smithay::reexports::wayland_server::protocol::__interfaces::*;
++        wayland_scanner::generate_interfaces!("protocols/sf-window-position-v1.xml");
++    }
++    use self::__interfaces::*;
++    wayland_scanner::generate_server_code!("protocols/sf-window-position-v1.xml");
++}
++
++use bindings::sf_window_position_manager_v1::{self, SfWindowPositionManagerV1};
++use bindings::sf_window_position_v1::{self, SfWindowPositionV1};
++
++use crate::server::Server;
++
++/// One window's position object: its surface, and the position last told (logical units).
++pub(crate) struct Entry {
++    resource: SfWindowPositionV1,
++    surface: WlSurface,
++    told: Option<(i32, i32)>,
++}
++
++#[derive(Default)]
++pub(crate) struct WindowPositions {
++    global: Option<GlobalId>,
++    entries: Vec<Entry>,
++    /// requests honoured as an initial place, and requests after the map (said, not done)
++    pub placed: u64,
++    pub moves_asked: u64,
++}
++
++impl Server {
++    /// Every turn: the global follows the policy, and every live position object is told where its window is
++    /// now (only when that changed).
++    pub fn window_positions_tick(&mut self) {
++        let want = self.policy.now.window_position;
++        let dh = self.display_handle.clone();
++        match (want, self.window_positions.global.is_some()) {
++            (true, false) => {
++                self.window_positions.global = Some(dh.create_global::<Server, SfWindowPositionManagerV1, ()>(1, ()));
++                eprintln!("WMPOS sf_window_position_v1 advertised (policy window_position=on): applications started from now on place their windows");
++            }
++            (false, true) => {
++                if let Some(id) = self.window_positions.global.take() {
++                    dh.remove_global::<Server>(id);
++                }
++                eprintln!("WMPOS sf_window_position_v1 withdrawn (policy window_position=off)");
++            }
++            _ => {}
++        }
++        if self.window_positions.entries.is_empty() {
++            return;
++        }
++        self.window_positions.entries.retain(|e| e.resource.is_alive() && e.surface.is_alive());
++        let density = self.scale().factor();
++        let backend = self.wm.backend();
++        let mut tell = Vec::new();
++        for (i, e) in self.window_positions.entries.iter().enumerate() {
++            let Some(id) = backend.window_for_surface(&e.surface) else { continue };
++            let Some(w) = backend.windows.get(&id) else { continue };
++            if !w.mapped {
++                continue;
++            }
++            let at = ((f64::from(w.content.pos.x) / density).round() as i32, (f64::from(w.content.pos.y) / density).round() as i32);
++            if e.told != Some(at) {
++                tell.push((i, at));
++            }
++        }
++        for (i, at) in tell {
++            let e = &mut self.window_positions.entries[i];
++            e.resource.position(at.0, at.1);
++            e.told = Some(at);
++        }
++    }
++
++    fn window_position_asked(&mut self, surface: &WlSurface, x: i32, y: i32) {
++        let density = self.scale().factor();
++        let Some(id) = self.wm.backend().window_for_surface(surface) else {
++            eprintln!("WMPOS set_position {x},{y} for a surface that is no window of the desk: ignored");
++            return;
++        };
++        let at = wm_core::Point::new((f64::from(x) * density).round() as i32, (f64::from(y) * density).round() as i32);
++        let w = self.wm.backend_mut().windows.get_mut(&id).unwrap();
++        if w.committed {
++            self.window_positions.moves_asked += 1;
++            eprintln!("WMPOS window={id} asks to be moved to {x},{y} (logical) after it mapped: not done (the desk places mapped windows)");
++            return;
++        }
++        // (0,0) is AppKit's "anywhere" as much as any client's: the placement policy decides then
++        w.requested_pos = (at != wm_core::Point::new(0, 0)).then_some(at);
++        self.window_positions.placed += 1;
++        eprintln!("WMPOS window={id} opens where its application put it: {x},{y} logical = {},{} panel px (kept on the work area)", at.x, at.y);
++    }
++}
++
++impl GlobalDispatch<SfWindowPositionManagerV1, ()> for Server {
++    fn bind(_: &mut Self, _: &DisplayHandle, _: &Client, resource: New<SfWindowPositionManagerV1>, _: &(), data_init: &mut DataInit<'_, Self>) {
++        data_init.init(resource, ());
++    }
++}
++
++impl Dispatch<SfWindowPositionManagerV1, ()> for Server {
++    fn request(
++        state: &mut Self,
++        _: &Client,
++        _: &SfWindowPositionManagerV1,
++        request: sf_window_position_manager_v1::Request,
++        _: &(),
++        _: &DisplayHandle,
++        data_init: &mut DataInit<'_, Self>,
++    ) {
++        match request {
++            sf_window_position_manager_v1::Request::GetWindowPosition { id, surface } => {
++                let resource = data_init.init(id, surface.clone());
++                state.window_positions.entries.push(Entry { resource, surface, told: None });
++            }
++            sf_window_position_manager_v1::Request::Destroy => {}
++            _ => {}
++        }
++    }
++}
++
++impl Dispatch<SfWindowPositionV1, WlSurface> for Server {
++    fn request(
++        state: &mut Self,
++        _: &Client,
++        resource: &SfWindowPositionV1,
++        request: sf_window_position_v1::Request,
++        surface: &WlSurface,
++        _: &DisplayHandle,
++        _: &mut DataInit<'_, Self>,
++    ) {
++        match request {
++            sf_window_position_v1::Request::SetPosition { x, y } => state.window_position_asked(surface, x, y),
++            sf_window_position_v1::Request::Destroy => state.window_positions.entries.retain(|e| &e.resource != resource),
++            _ => {}
++        }
++    }
++}
+diff -ruN desk10-next-002/source/crates/wm-darwin/tests/wayland_shm.rs desk10-next-003/source/crates/wm-darwin/tests/wayland_shm.rs
+--- desk10-next-002/source/crates/wm-darwin/tests/wayland_shm.rs	2026-11-15 21:57:56.072586208 -0800
++++ desk10-next-003/source/crates/wm-darwin/tests/wayland_shm.rs	2026-11-15 22:45:41.559246254 -0800
+@@ -390,6 +390,7 @@
+                 }
+                 let _ = state.repaint(&mut out, started.elapsed().as_millis() as u32);
+                 state.scroll_tick(started.elapsed().as_millis() as u32);
++                state.window_positions_tick();
+                 if let Some((pilot, reply, lines)) = &mut autopilot {
+                     pilot.after_repaint(&mut state).unwrap();
+                     lines.extend(pilot.take_lines());
+@@ -2017,3 +2018,110 @@
+     assert!(a.protocol_error().is_none(), "{:?}", a.protocol_error());
+     assert_eq!(h.snapshot().visible, 2, "both windows shown again");
+ }
++
++/// DESK10 (Firefox on the M1: the desk kept "5 types, 0 bytes" and the paste after Firefox quit was empty): a copying
++/// client that answers the desk's first ask - made the moment it set the clipboard - with nothing for every type is
++/// asked again while it lives, and what it gives then is what the next client pastes after it quit.
++#[test]
++#[cfg(feature="desktop-shell")]
++fn a_clipboard_first_answered_with_nothing_is_asked_again_and_kept(){
++    let(h,a)=Harness::with_input(true);let(tx,rx)=mpsc::channel();h.tx.send(Request::Desktop(tx)).unwrap();rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
++    {
++        let(mut qa,mut ca,_sa,_xa,_ta)=map_client(&a,"late-copier");
++        qa.roundtrip(&mut ca).unwrap();
++        let source=ca.data_manager.as_ref().unwrap().create_data_source(&qa.handle(),());
++        source.offer("text/plain;charset=utf-8".into());
++        ca.data_device.as_ref().unwrap().set_selection(Some(&source),0);
++        // the first ask: answered with nothing (the pipe closed at once)
++        let started=Instant::now();
++        while ca.send_requests.is_empty() {qa.roundtrip(&mut ca).unwrap();h.snapshot();assert!(started.elapsed()<Duration::from_secs(3),"the desk asks at once");}
++        ca.send_requests.clear();
++        // asked again within a second, answered now
++        let started=Instant::now();
++        while ca.send_requests.is_empty() {qa.roundtrip(&mut ca).unwrap();h.snapshot();std::thread::sleep(Duration::from_millis(20));assert!(started.elapsed()<Duration::from_secs(3),"the desk asks again");}
++        for (_,fd) in ca.send_requests.drain(..) {std::fs::File::from(fd).write_all(b"ready late").unwrap();}
++        qa.roundtrip(&mut ca).unwrap();
++        std::thread::sleep(Duration::from_millis(200));
++        drop(source);
++    }
++    drop(a);
++    std::thread::sleep(Duration::from_millis(300));h.snapshot();
++    let(server,b)=UnixStream::pair().unwrap();h.tx.send(Request::AddClient(server)).unwrap();h.snapshot();let b=Connection::from_socket(b).unwrap();
++    let(mut qb,mut cb,_sb,_xb,_tb)=map_client(&b,"paster");
++    let started=Instant::now();
++    while cb.selection.is_none() {h.snapshot();qb.roundtrip(&mut cb).unwrap();assert!(started.elapsed()<Duration::from_secs(3),"B is offered the kept clipboard");std::thread::sleep(Duration::from_millis(10));}
++    let offer=cb.selection.clone().unwrap();
++    let (mut read,write)=std::io::pipe().unwrap();
++    offer.receive("text/plain;charset=utf-8".into(),write.as_fd());drop(write);
++    qb.roundtrip(&mut cb).unwrap();h.snapshot();
++    let mut text=String::new();read.read_to_string(&mut text).unwrap();
++    assert_eq!(text,"ready late");
++}
++
++#[allow(non_upper_case_globals, non_camel_case_types, non_snake_case, dead_code, unused_imports, unused_variables, clippy::all)]
++mod sf_position {
++    use wayland_client;
++    use wayland_client::protocol::*;
++    pub mod __interfaces {
++        use wayland_client::backend as wayland_backend;
++        use wayland_client::protocol::__interfaces::*;
++        wayland_scanner::generate_interfaces!("protocols/sf-window-position-v1.xml");
++    }
++    use self::__interfaces::*;
++    wayland_scanner::generate_client_code!("protocols/sf-window-position-v1.xml");
++}
++#[derive(Default)]
++struct PositionClient { manager: Option<sf_position::sf_window_position_manager_v1::SfWindowPositionManagerV1>, told: Vec<(i32, i32)> }
++impl Dispatch<wl_registry::WlRegistry, ()> for PositionClient {
++    fn event(s: &mut Self, r: &wl_registry::WlRegistry, e: wl_registry::Event, _: &(), _: &Connection, q: &QueueHandle<Self>) {
++        if let wl_registry::Event::Global { name, interface, .. } = e {
++            if interface == "sf_window_position_manager_v1" { s.manager = Some(r.bind(name, 1, q, ())); }
++        }
++    }
++}
++delegate_noop!(PositionClient: ignore sf_position::sf_window_position_manager_v1::SfWindowPositionManagerV1);
++impl Dispatch<sf_position::sf_window_position_v1::SfWindowPositionV1, ()> for PositionClient {
++    fn event(s: &mut Self, _: &sf_position::sf_window_position_v1::SfWindowPositionV1, e: sf_position::sf_window_position_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
++        if let sf_position::sf_window_position_v1::Event::Position { x, y } = e { s.told.push((x, y)); }
++    }
++}
++
++/// DESK10 (FX-027: AppKit centres a modal file panel and the desk put it lower right): with policy
++/// window_position=on the desk advertises sf_window_position_v1; a window whose client set a position before it
++/// first mapped opens there (its frame's corner at that place, on the work area), and the client is told where
++/// its window is.
++#[test]
++#[cfg(feature = "desktop-shell")]
++fn a_window_opens_where_its_application_put_it_with_sf_window_position() {
++    std::env::set_var("CHONKSTEP_DARWIN_WINDOW_POSITION", "1");
++    let (h, a) = Harness::with_input(true);
++    let (tx, rx) = mpsc::channel();
++    h.tx.send(Request::Desktop(tx)).unwrap();
++    rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
++    h.snapshot();
++    // the position protocol on its own queue of the same connection
++    let mut pq = a.new_event_queue();
++    let mut pc = PositionClient::default();
++    a.display().get_registry(&pq.handle(), ());
++    for _ in 0..3 { pq.roundtrip(&mut pc).unwrap(); h.snapshot(); }
++    let manager = pc.manager.clone().expect("sf_window_position_manager_v1 advertised with window_position=on");
++    let mut queue = a.new_event_queue(); let q = queue.handle(); let mut c = Client::default();
++    a.display().get_registry(&q, ()); for _ in 0..3 { queue.roundtrip(&mut c).unwrap(); }
++    let surface = c.compositor.as_ref().unwrap().create_surface(&q, ());
++    let xdg = c.shell.as_ref().unwrap().get_xdg_surface(&surface, &q, ()); let top = xdg.get_toplevel(&q, ());
++    top.set_title("placed".into());
++    let position = manager.get_window_position(&surface, &pq.handle(), ());
++    position.set_position(150, 60);
++    pq.roundtrip(&mut pc).unwrap();
++    surface.commit(); queue.roundtrip(&mut c).unwrap();
++    let mut file = tempfile::tempfile().unwrap(); file.write_all(&[10, 20, 240, 255].repeat(60 * 40)).unwrap();
++    let pool = c.shm.as_ref().unwrap().create_pool(file.as_fd(), 60 * 40 * 4, &q, ());
++    let buffer = pool.create_buffer(0, 60, 40, 240, wl_shm::Format::Argb8888, &q, ());
++    surface.attach(Some(&buffer), 0, 0); surface.commit();
++    for _ in 0..3 { queue.roundtrip(&mut c).unwrap(); h.snapshot(); pq.roundtrip(&mut pc).unwrap(); }
++    let content = h.snapshot().content.unwrap();
++    // the frame's corner at (150, 60); the content inside it by the frame's border and title bar
++    assert!((150..=170).contains(&content.pos.x) && (60..=110).contains(&content.pos.y), "content at {:?}", content.pos);
++    for _ in 0..3 { pq.roundtrip(&mut pc).unwrap(); h.snapshot(); }
++    assert_eq!(pc.told.last().copied(), Some((content.pos.x, content.pos.y)), "the client is told where its window is: {:?}", pc.told);
++}

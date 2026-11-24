@@ -1,0 +1,162 @@
+--- a/src/Frameworks/QuartzCore/CALayerContext.h
++++ b/src/Frameworks/QuartzCore/CALayerContext.h
+@@ -20,7 +20,13 @@
+     CGFloat _backingScale;
+     CFTypeRef _sffxFrames[2];
+     unsigned _sffxNext;
++    uint64_t _sffxGeneration,_sffxRenderedGeneration,_sffxRenderSerial,_sffxCopiedSerial;
++    CFTypeRef _sffxLastSurface;
++    void *_sffxLastStamps;
++    unsigned _sffxStampCount;
+ }
++
++-(void)_sffxMarkMutation;
+ 
+ - initWithFrame:(CGRect)rect;
+ 
+--- a/src/Frameworks/QuartzCore/CALayerContext.m
++++ b/src/Frameworks/QuartzCore/CALayerContext.m
+@@ -12,13 +12,46 @@
+ #include <os/lock.h>
+ #include <dlfcn.h>
+ #include <pthread.h>
++#include <objc/runtime.h>
+ 
+ @interface CALayer(private)
+ -(void)_setContext:(CALayerContext *)context;
+ -(CALayerContext *)_context;
+ -(NSNumber *)_textureId;
++-(uint32_t)_contentsSeed;
+ -(void)_setTextureId:(NSNumber *)value;
+ @end
++
++// Shared pixels can change in another process without a parent layer mutation.
++// Compare every tracked identity/revision exactly. Unknown content disables reuse.
++#define SFFX_MAX_STAMPS 256
++struct SFFXLayerStamp { CALayer *layer; id contents; uint32_t localSeed,surfaceSeed; };
++static pthread_once_t sffxStampOnce=PTHREAD_ONCE_INIT;
++static CFTypeID (*sffxSurfaceType)(void);
++static uint32_t (*sffxSurfaceSeed)(CFTypeRef);
++static Class sffxCFWrapper;
++static void sffxLoadStampAPI(void){
++ sffxSurfaceType=dlsym(RTLD_DEFAULT,"IOSurfaceGetTypeID");
++ sffxSurfaceSeed=dlsym(RTLD_DEFAULT,"IOSurfaceGetSeed");
++ sffxCFWrapper=objc_getClass("__NSCFType");
++}
++static void sffxCollectStamps(CALayer *layer,struct SFFXLayerStamp *stamps,unsigned *count,unsigned depth,BOOL *uncertain){
++ if(layer==nil)return;
++ if(*count==SFFX_MAX_STAMPS||depth>32){*uncertain=YES;return;}
++ id contents=[layer contents];uint32_t seed=0;
++ if(contents!=nil){
++  if(sffxSurfaceType&&sffxSurfaceSeed&&sffxCFWrapper&&[contents isKindOfClass:sffxCFWrapper]&&CFGetTypeID((CFTypeRef)contents)==sffxSurfaceType())
++   seed=sffxSurfaceSeed((CFTypeRef)contents);
++  else *uncertain=YES;
++ }
++ stamps[(*count)++]=(struct SFFXLayerStamp){layer,contents,[layer _contentsSeed],seed};
++ for(CALayer *child in [layer sublayers])sffxCollectStamps(child,stamps,count,depth+1,uncertain);
++}
++static BOOL sffxSameStamps(const struct SFFXLayerStamp *a,const struct SFFXLayerStamp *b,unsigned count){
++ if(!a||!b)return NO;
++ for(unsigned i=0;i<count;i++)if(a[i].layer!=b[i].layer||a[i].contents!=b[i].contents||a[i].localSeed!=b[i].localSeed||a[i].surfaceSeed!=b[i].surfaceSeed)return NO;
++ return YES;
++}
+ 
+ // every live context, so a committed transaction reaches them all: an app can redraw an
+ // IOSurface it already set as contents and only commit, which changes no layer property
+@@ -90,6 +123,8 @@
+ }
+ 
+ -(void)dealloc {
++   free(_sffxLastStamps);
++   if(_sffxLastSurface)CFRelease(_sffxLastSurface);
+    for(int i=0;i<2;i++)if(_sffxFrames[i])CFRelease(_sffxFrames[i]);
+    [self invalidate];
+    [_timer invalidate];
+@@ -98,6 +133,7 @@
+ }
+ 
+ -(void)setFrame:(CGRect)rect {
++   [self _sffxMarkMutation];
+    _frame=rect;
+    
+    GLint width=(GLint)ceil(rect.size.width*_backingScale);
+@@ -119,6 +155,7 @@
+ 
+ -(void)setLayer:(CALayer *)layer {
+    if(layer==_layer)return;
++   [self _sffxMarkMutation];
+    layer=[layer retain];
+    // A retained former root must not keep a weak pointer to this context.
+    if([_layer _context]==self)[_layer _setContext:nil];
+@@ -201,12 +238,31 @@
+      displayLayersIfNeeded(sub,depth+1);
+ }
+ 
++-(void)_sffxMarkMutation {
++   __atomic_add_fetch(&_sffxGeneration,1,__ATOMIC_RELEASE);
++}
++
+ -(void)render {
+    displayLayersIfNeeded(_layer,0);
++   uint64_t generation=__atomic_load_n(&_sffxGeneration,__ATOMIC_ACQUIRE);
++   BOOL enabled=getenv("SFFX_GPU_DIRTY_FRAMES")!=NULL,uncertain=NO;
++   struct SFFXLayerStamp stamps[SFFX_MAX_STAMPS];unsigned count=0;
++   if(enabled){
++    pthread_once(&sffxStampOnce,sffxLoadStampAPI);
++    sffxCollectStamps(_layer,stamps,&count,0,&uncertain);
++    if(!uncertain&&_sffxLastSurface&&generation==_sffxRenderedGeneration&&count==_sffxStampCount&&sffxSameStamps(stamps,_sffxLastStamps,count))return;
++   }
+    [self renderLayer:_layer];
++   _sffxRenderedGeneration=generation;_sffxRenderSerial++;
++   _sffxStampCount=0;
++   if(enabled&&!uncertain){
++    if(!_sffxLastStamps)_sffxLastStamps=malloc(sizeof(stamps));
++    if(_sffxLastStamps){memcpy(_sffxLastStamps,stamps,count*sizeof(stamps[0]));_sffxStampCount=count;}
++   }
+ }
+ 
+ -(void)timer:(NSTimer *)timer {
++   [self _sffxMarkMutation];
+    [_renderer beginFrameAtTime:CACurrentMediaTime() timeStamp:NULL];
+ 
+    [self render];
+@@ -229,6 +285,7 @@
+ 
+ // coalesced so a burst of property changes costs one display
+ -(void)_layerTreeChanged {
++   [self _sffxMarkMutation];
+    if(_renderScheduled || _delegate==nil)
+     return;
+    _renderScheduled=YES;
+@@ -278,6 +335,9 @@
+    if(!create||!width||!height||!copy)return NULL;
+    int w=(int)ceil(_frame.size.width*_backingScale),h=(int)ceil(_frame.size.height*_backingScale);
+    if(w<=0||h<=0||w>16384||h>16384)return NULL;
++   if(getenv("SFFX_GPU_DIRTY_FRAMES") && _sffxLastSurface &&
++      _sffxCopiedSerial==_sffxRenderSerial && width(_sffxLastSurface)==(size_t)w && height(_sffxLastSurface)==(size_t)h)
++    return CFRetain(_sffxLastSurface);
+    unsigned index=_sffxNext++%2;
+    CFTypeRef surface=_sffxFrames[index];
+    if(surface&&(width(surface)!=(size_t)w||height(surface)!=(size_t)h)){
+@@ -292,7 +352,10 @@
+     _sffxFrames[index]=surface=create(props);CFRelease(props);
+    }
+    CGLSetCurrentContext(_glContext);
+-   return surface&&copy(surface,1)?CFRetain(surface):NULL;
++   if(!surface||!copy(surface,1))return NULL;
++   if(_sffxLastSurface)CFRelease(_sffxLastSurface);
++   _sffxLastSurface=CFRetain(surface);_sffxCopiedSerial=_sffxRenderSerial;
++   return CFRetain(surface);
+ }
+ 
+ static void releasePixels(void *info,const void *data,size_t size){
+--- a/src/Frameworks/QuartzCore/CALayer.m
++++ b/src/Frameworks/QuartzCore/CALayer.m
+@@ -695,6 +695,7 @@
+ // not ask for another display
+ -(void)_setContentsWithoutRender:(id)value {
+    [lockedSwap(&_contents,[value retain]) release];
++   [_context _sffxMarkMutation];
+ }
+ 
+ -(void)_setNeedsRender {

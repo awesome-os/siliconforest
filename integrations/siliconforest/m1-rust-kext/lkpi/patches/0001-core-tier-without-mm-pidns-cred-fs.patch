@@ -1,0 +1,170 @@
+kernel: build the core tier without mm, pid namespaces, credentials, fs and device
+
+LinuxKPI's task_struct has no mm_struct users, pid namespaces or credentials, and the core
+tier (alloc, sync, time, print, ...) is built without the fs, device and uaccess modules.
+Each item that needs one of them gets a #[cfg(sf_mod_<module>)], so it comes back by
+enabling that module; nothing is removed.
+
+--- a/kernel/page.rs
++++ b/kernel/page.rs
+@@ -18,8 +18,9 @@
+         Ownable,
+         Owned, //
+     },
+-    uaccess::UserSliceReader, //
+ };
++#[cfg(sf_mod_uaccess)]
++use crate::uaccess::UserSliceReader;
+ use core::{
+     marker::PhantomData,
+     mem::ManuallyDrop,
+@@ -354,6 +355,7 @@
+         })
+     }
+ 
++    #[cfg(sf_mod_uaccess)]
+     /// Copies data from userspace into this page.
+     ///
+     /// This method will perform bounds checks on the page offset. If `offset .. offset+len` goes
+--- a/kernel/prelude.rs
++++ b/kernel/prelude.rs
+@@ -92,14 +92,6 @@
+         static_assert, //
+     },
+     current,
+-    dev_alert,
+-    dev_crit,
+-    dev_dbg,
+-    dev_emerg,
+-    dev_err,
+-    dev_info,
+-    dev_notice,
+-    dev_warn,
+     error::{
+         code::*,
+         Error,
+@@ -117,9 +109,14 @@
+     str::CStrExt as _,
+     try_init,
+     try_pin_init,
+-    uaccess::UserPtr,
+     ThisModule, //
+ };
++#[cfg(sf_mod_device)]
++#[doc(no_inline)]
++pub use super::{dev_alert, dev_crit, dev_dbg, dev_emerg, dev_err, dev_info, dev_notice, dev_warn};
++#[cfg(sf_mod_uaccess)]
++#[doc(no_inline)]
++pub use super::uaccess::UserPtr;
+ 
+ // `super::std_vendor` is hidden, which makes the macro inline for some reason.
+ #[doc(no_inline)]
+--- a/kernel/sync.rs
++++ b/kernel/sync.rs
+@@ -17,6 +17,7 @@
+ mod condvar;
+ pub mod lock;
+ mod locked_by;
++#[cfg(sf_mod_fs)]
+ pub mod poll;
+ pub mod rcu;
+ mod refcount;
+--- a/kernel/task.rs
++++ b/kernel/task.rs
+@@ -6,12 +6,14 @@
+ 
+ use crate::{
+     bindings,
+-    mm::MmWithUser,
+-    pid_namespace::PidNamespace,
+     prelude::*,
+     sync::aref::ARef,
+     types::{NotThreadSafe, Opaque},
+ };
++#[cfg(sf_mod_pid_namespace)]
++use crate::pid_namespace::PidNamespace;
++#[cfg(sf_mod_mm)]
++use crate::mm::MmWithUser;
+ use core::{
+     ops::Deref,
+     ptr, //
+@@ -147,6 +149,7 @@
+ /// The type of process identifiers (PIDs).
+ pub type Pid = bindings::pid_t;
+ 
++#[cfg(sf_mod_cred)]
+ /// The type of user identifiers (UIDs).
+ #[derive(Copy, Clone)]
+ pub struct Kuid {
+@@ -210,6 +213,7 @@
+         unsafe { *ptr::addr_of!((*self.as_ptr()).pid) }
+     }
+ 
++    #[cfg(sf_mod_cred)]
+     /// Returns the UID of the given task.
+     #[inline]
+     pub fn uid(&self) -> Kuid {
+@@ -217,6 +221,7 @@
+         Kuid::from_raw(unsafe { bindings::task_uid(self.as_ptr()) })
+     }
+ 
++    #[cfg(sf_mod_cred)]
+     /// Returns the effective UID of the given task.
+     #[inline]
+     pub fn euid(&self) -> Kuid {
+@@ -231,6 +236,7 @@
+         unsafe { bindings::signal_pending(self.as_ptr()) != 0 }
+     }
+ 
++    #[cfg(sf_mod_pid_namespace)]
+     /// Returns task's pid namespace with elevated reference count
+     #[inline]
+     pub fn get_pid_ns(&self) -> Option<ARef<PidNamespace>> {
+@@ -246,6 +252,7 @@
+         }
+     }
+ 
++    #[cfg(sf_mod_pid_namespace)]
+     /// Returns the given task's pid in the provided pid namespace.
+     #[doc(alias = "task_tgid_nr_ns")]
+     #[inline]
+@@ -271,6 +278,7 @@
+ }
+ 
+ impl CurrentTask {
++    #[cfg(sf_mod_mm)]
+     /// Access the address space of the current task.
+     ///
+     /// This function does not touch the refcount of the mm.
+@@ -301,6 +309,7 @@
+         Some(unsafe { MmWithUser::from_raw(mm) })
+     }
+ 
++    #[cfg(sf_mod_pid_namespace)]
+     /// Access the pid namespace of the current task.
+     ///
+     /// This function does not touch the refcount of the namespace or use RCU protection.
+@@ -370,6 +379,7 @@
+ 
+ impl Eq for Task {}
+ 
++#[cfg(sf_mod_cred)]
+ impl Kuid {
+     /// Get the current euid.
+     #[inline]
+@@ -400,6 +410,7 @@
+     }
+ }
+ 
++#[cfg(sf_mod_cred)]
+ impl PartialEq for Kuid {
+     #[inline]
+     fn eq(&self, other: &Kuid) -> bool {
+@@ -408,6 +419,7 @@
+     }
+ }
+ 
++#[cfg(sf_mod_cred)]
+ impl Eq for Kuid {}
+ 
+ /// Annotation for functions that can sleep.

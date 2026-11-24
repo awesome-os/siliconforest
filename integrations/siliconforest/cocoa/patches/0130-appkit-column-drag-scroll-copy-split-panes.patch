@@ -1,0 +1,1374 @@
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -7,6 +7,7 @@
+ 
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+ 
++#include <time.h>
+ #import <AppKit/NSView.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -980,6 +981,17 @@
+    [_subviews makeObjectsPerformSelector:_cmd];
+ }
+ 
++extern BOOL _NSViewIsLayoutBoundary(NSView *view);
++
++// a move whose pixels were already copied to the new place (a table's cells right of a column being dragged)
++static BOOL sfQuietMove;
++
++-(void)_sfSetFrameOriginWithoutDisplay:(NSPoint)origin {
++   sfQuietMove=YES;
++   [self setFrameOrigin:origin];
++   sfQuietMove=NO;
++}
++
+ -(void)_setFrame:(NSRect)frame {
+   // Cocoa does not post the notification if the frames are equal
+    // Possible that resizeSubviewsWithOldSize is not called if the sizes are equal
+@@ -1004,7 +1016,10 @@
+ 
+     [_window invalidateCursorRectsForView:self]; // this also invalidates tracking areas
+ 
+-   if(_autoresizesSubviews){
++   /* A view whose constraints name only views inside it (a table's row or cell view) that moved without
++    * changing size has nothing to lay out: as on macOS, where -setFrameOrigin: resizes no subviews (each
++    * cell moved by a column made wider had its constraints solved again) */
++   if(_autoresizesSubviews && !(NSEqualSizes(oldFrame.size,_frame.size) && _NSViewIsLayoutBoundary(self))){
+     [self resizeSubviewsWithOldSize:oldSize];
+    }
+ 
+@@ -1019,11 +1034,30 @@
+     // hosted layers anywhere below move with this view
+     [self _sfUpdateMetalLayers];
+ 
+-   if(_superview!=nil && !NSContainsRect(_frame,oldFrame))
+-    [_superview setNeedsDisplayInRect:oldFrame];
++   if(_superview!=nil && !NSContainsRect(_frame,oldFrame) && !sfQuietMove){
++    NSRect uncovered=oldFrame;
++
++    // a view made narrower or shorter in place leaves only a strip uncovered (a table whose column was made
++    // narrower had all of its rows drawn again by its clip view, at each step of the drag)
++    if(NSEqualPoints(oldFrame.origin,_frame.origin)){
++     if(oldFrame.size.height==_frame.size.height && _frame.size.width<oldFrame.size.width){
++      uncovered.origin.x=NSMaxX(_frame);
++      uncovered.size.width=NSMaxX(oldFrame)-NSMaxX(_frame);
++     }
++     else if(oldFrame.size.width==_frame.size.width && _frame.size.height<oldFrame.size.height){
++      uncovered.origin.y=NSMaxY(_frame);
++      uncovered.size.height=NSMaxY(oldFrame)-NSMaxY(_frame);
++     }
++    }
++    [_superview setNeedsDisplayInRect:uncovered];
++   }
+ 
+    if(_postsNotificationOnFrameChange)
+     [[NSNotificationCenter defaultCenter] postNotificationName:NSViewFrameDidChangeNotification object:self];
++   /* as on macOS, for a view with a surface of its own (a hosted CAMetalLayer, a CALayerHost): posted for
++    * every view, at each frame change of every cell of a table, it cost Activity Monitor a quarter of a
++    * column drag's layout (nothing observes it for other views) */
++   if(isSurfaceLayer(_layer))
+     [[NSNotificationCenter defaultCenter] postNotificationName:NSViewGlobalFrameDidChangeNotification object:self];
+ }
+ 
+@@ -2807,6 +2841,9 @@
+ 
+    // a view answering -displayLayer: fills its layer that way, as CoreAnimation asks the delegate first (Qt does this)
+    BOOL displaysLayer=_layer!=nil && [_layer delegate]==self && [self respondsToSelector:@selector(displayLayer:)];
++   if(_layer!=nil && sfCATrace())
++    fprintf(stderr,"PD-CA view %s %p display %s: canDraw %d displaysLayer %d wantsUpdateLayer %d alpha %g\n",object_getClassName(self),self,
++            [NSStringFromRect(rect) UTF8String],(int)[self canDraw],(int)displaysLayer,(int)[self wantsUpdateLayer],sfInheritedAlpha*[self alphaValue]);
+ 
+    if ([self canDraw] && _layer!=nil && (displaysLayer || [self wantsUpdateLayer]) && ![NSGraphicsContext inQuartzDebugMode]) {
+       // as on macOS a view that updates its layer itself gets no drawing context: no backing bitmap
+@@ -3150,6 +3187,16 @@
+         [documentView scrollRectToVisible:visible];
+         // (cocoa 0114) the user scrolled: overlay scrollers appear
+         [scrollView flashScrollers];
++        // SF_WS_TIMING: when a wheel step was taken (the next commit shows it), on the window server's clock
++        static int timing=-1;
++        if(timing<0)
++         timing=getenv("SF_WS_TIMING")!=NULL;
++        if(timing){
++         struct timespec ts;
++
++         clock_gettime(CLOCK_REALTIME,&ts);
++         fprintf(stderr,"WSTIME %.1f scroll-wheel dy=%g y=%g\n",ts.tv_sec*1000.0+ts.tv_nsec/1e6,[event deltaY],[documentView visibleRect].origin.y);
++        }
+     }
+ }
+ 
+--- a/src/Frameworks/AppKit/NSLayoutConstraint.m
++++ b/src/Frameworks/AppKit/NSLayoutConstraint.m
+@@ -226,12 +226,26 @@
+  * in it name only views of that row) is the top of its own layouts and is left out of its window's:
+  * a window of a hundred rows otherwise solved every row's constraints whenever any one row's view
+  * asked, at each display. (Activity Monitor: docs/roadmap/issues/SF-AA-activity-monitor.md.) */
++/* So is a cell view in a row view: its constraints name only views inside it (a cell view is a
++ * prototype of the table's nib), so a column made wider solves only the cells that changed size, not
++ * their rows (each row of Activity Monitor holds a dozen cell views). */
+ static BOOL sfIsLayoutBoundary(NSView *view) {
+-    static Class rowView;
++    static Class rowView, cellView;
+ 
+-    if (rowView == Nil)
++    if (rowView == Nil) {
+         rowView = NSClassFromString(@"NSTableRowView");
+-    return rowView != Nil && [view isKindOfClass:rowView];
++        cellView = NSClassFromString(@"NSTableCellView");
++    }
++    if (rowView == Nil)
++        return NO;
++    if ([view isKindOfClass:rowView])
++        return YES;
++    return cellView != Nil && [view isKindOfClass:cellView] && [[view superview] isKindOfClass:rowView];
++}
++
++// a view whose constraints are its own (NSView.m: it moved without changing size has nothing to lay out)
++BOOL _NSViewIsLayoutBoundary(NSView *view) {
++    return sfIsLayoutBoundary(view);
+ }
+ 
+ static NSView *sfLayoutTop(NSView *view) {
+@@ -300,10 +314,12 @@
+  * Every view of that cascade that holds constraints asked for the whole tree to be solved (twice),
+  * so a tree of n such views was solved 2n times for one change: decoding the tab view of a
+  * preferences window ran 388 solves, 4.8 s. The solves asked for inside a cascade are put off to
+- * its end and done once. (A subclass's own -layout still runs where it is asked for.) */
+-static int sfResizeDepth;          // -resizeSubviewsWithOldSize: calls under way
+-static NSView *sfResizePending;    // the top of a tree whose solve was put off (retained)
+-static NSView *sfResizeSolved;     // the top solved inside the outermost call (not retained; compared only)
++ * its end and done once. (A subclass's own -layout still runs where it is asked for.)
++ * Several trees may be put off in one cascade (a table laying out its rows: each row view is the top
++ * of its own); each is solved once at the end, in the order first asked for. A tree solved in place
++ * at the outermost level is taken off the list: what was asked for before is done by that solve. */
++static int sfResizeDepth;               // -resizeSubviewsWithOldSize: calls under way
++static NSMutableArray *sfResizePending; // the tops of trees whose solve was put off, each once
+ 
+ void _NSViewLayoutBeginResize(void) {
+     sfResizeDepth++;
+@@ -314,15 +330,29 @@
+         return;
+     sfResizeDepth = 0;
+ 
+-    NSView *top = sfResizePending;
++    NSMutableArray *tops = sfResizePending;
+ 
+     sfResizePending = nil;
+-    if (top != nil && top != sfResizeSolved && sfLayoutApplying == 0 && !sfLayoutSubtreePass) {
+-        for (int pass = 0; pass < 2; pass++)
+-            [top _sfLayoutTreeFitting:NO apply:YES];
++    if (sfLayoutApplying == 0 && !sfLayoutSubtreePass) {
++        for (NSView *top in tops)
++            for (int pass = 0; pass < 2; pass++)
++                [top _sfLayoutTreeFitting:NO apply:YES];
+     }
+-    sfResizeSolved = nil;
+-    [top release];
++    [tops release];
++}
++
++static void sfResizePutOff(NSView *top) {
++    if (sfResizePending == nil)
++        sfResizePending = [[NSMutableArray alloc] init];
++    if ([sfResizePending indexOfObjectIdenticalTo:top] == NSNotFound)
++        [sfResizePending addObject:top];
++}
++
++static void sfResizeSolvedInPlace(NSView *top) {
++    NSUInteger i = [sfResizePending indexOfObjectIdenticalTo:top];
++
++    if (i != NSNotFound)
++        [sfResizePending removeObjectAtIndex:i];
+ }
+ 
+ @implementation NSView (NSConstraintBasedLayout)
+@@ -665,16 +695,13 @@
+     top = sfLayoutTop(self);
+     if (sfResizeDepth > 1) {
+         // inside a resize cascade: once, at its end
+-        if (sfResizePending != top) {
+-            [sfResizePending release];
+-            sfResizePending = [top retain];
+-        }
++        sfResizePutOff(top);
+         return;
+     }
++    if (sfResizeDepth == 1)
++        sfResizeSolvedInPlace(top);
+     for (int pass = 0; pass < 2; pass++)
+         [top _sfLayoutTreeFitting:NO apply:YES];
+-    if (sfResizeDepth == 1)
+-        sfResizeSolved = top;
+ }
+ 
+ // the smallest box the constraints in this view's tree leave room for (-fittingSize), as an alignment size
+--- a/src/Frameworks/AppKit/NSTableView.m
++++ b/src/Frameworks/AppKit/NSTableView.m
+@@ -54,6 +54,8 @@
+ 
+ @interface NSTableView (SFColumnAutoresizingStyle)
+ -(NSInteger)columnAutoresizingStyle;
++-(BOOL)_sfBeginMoveRightOf:(CGFloat)x by:(CGFloat)dx;
++-(BOOL)_sfOverlayShowing;
+ @end
+ 
+ // the row the click sequence began on (a double action needs both clicks on one row)
+@@ -1239,6 +1241,101 @@
+     [_headerView setNeedsDisplay:YES];
+ }
+ 
++/* a column's width changed while it is dragged: the table and its header take the columns' new width
++ * (as -tile does, without its reload of every row and its measuring of every row's height); a
++ * view-based table moves its cells at the next display */
++-(void)_sfColumnWidthsChanged {
++    [self _sfColumnWidthsChangedFromColumn:0];
++}
++
++/* only what is right of the column's left edge moved: what is left of it is not drawn again */
++-(void)_sfColumnWidthsChangedFromColumn:(NSInteger)column {
++    NSTableColumn *tc = (column >= 0 && column < (NSInteger)[_tableColumns count]) ? [_tableColumns objectAtIndex:column] : nil;
++
++    [self _sfColumnWidthsChangedFromColumn:column oldWidth:tc != nil ? [tc width] : 0];
++}
++
++// the room an overlay scroller may take at the right and bottom of the visible rectangle: not copied, drawn again
++#define SF_SCROLLER_ROOM 20
++
++/* A column dragged wider or narrower moves what is right of it: those pixels are copied along in the window
++ * (as macOS moves its layers) and only the column, and the strips the move uncovers, are drawn again. Every
++ * cell right of the column was drawn again at each step of the drag (most of a step in Activity Monitor). Not
++ * when something is waiting to be drawn (it would be copied as it was); SF_TABLE_NO_COPY=1 never copies. */
++-(void)_sfColumnWidthsChangedFromColumn:(NSInteger)column oldWidth:(CGFloat)oldWidth {
++    NSClipView *clip = (NSClipView *)[self superview];
++    BOOL clipped = [clip isKindOfClass:[NSClipView class]];
++    NSSize size = [self frame].size;
++    CGFloat width = 0;
++    NSInteger i, count = [_tableColumns count];
++    NSTableColumn *tc = (column >= 0 && column < count) ? [_tableColumns objectAtIndex:column] : nil;
++    CGFloat dx = (tc != nil && ![tc isHidden]) ? [tc width] - oldWidth : 0;
++    CGFloat left = 0;
++    static int noCopy = -1;
++
++    if (noCopy < 0)
++        noCopy = getenv("SF_TABLE_NO_COPY") != NULL;
++    for (i = 0; i < column && i < count; i++)
++        left += sfColumnAdvance(_tableColumns,i,_intercellSpacing.width);
++
++    CGFloat oldRight = left + oldWidth + _intercellSpacing.width, newRight = oldRight + dx;
++    BOOL copy = !noCopy && dx != 0 && clipped && [self columnAutoresizingStyle] == 0 && [self window] != nil &&
++        ![[self window] viewsNeedDisplay] && [self layer] == nil && [_headerView layer] == nil &&
++        [self _sfBeginMoveRightOf:oldRight by:dx];
++
++    if ([self columnAutoresizingStyle] != 0)
++        [self sizeLastColumnToFit];
++    for (i = 0; i < count; i++)
++        width += sfColumnAdvance(_tableColumns,i,_intercellSpacing.width);
++    if (clipped)
++        width = MAX(width, [clip bounds].size.width);
++    if (width != size.width)
++        [self setFrameSize:NSMakeSize(width, size.height)];
++    if (_headerView != nil && [_headerView frame].size.width != width)
++        [_headerView setFrameSize:NSMakeSize(width, [_headerView frame].size.height)];
++
++    if (copy) {
++        NSRect v = [self visibleRect];
++        NSScrollView *sv = [self enclosingScrollView];
++        id vs = [sv hasVerticalScroller] ? [sv verticalScroller] : nil, hs = [sv hasHorizontalScroller] ? [sv horizontalScroller] : nil;
++        // an overlay scroller shown over the rows is not copied along: what is under it is drawn again
++        CGFloat right = ([vs respondsToSelector:@selector(_sfOverlayShowing)] && [vs _sfOverlayShowing]) ? SF_SCROLLER_ROOM : 0;
++        CGFloat below = ([hs respondsToSelector:@selector(_sfOverlayShowing)] && [hs _sfOverlayShowing]) ? SF_SCROLLER_ROOM : 0;
++        CGFloat from = MIN(oldRight, newRight), edge = NSMaxX(v) - right, bottom = NSMaxY(v) - below;
++        NSRect r = NSMakeRect(from, NSMinY(v), edge - from, bottom - NSMinY(v));
++
++        if (r.size.width > 0 && r.size.height > 0)
++            [self scrollRect:r by:NSMakeSize(dx, 0)];
++        [self setNeedsDisplayInRect:NSMakeRect(left, NSMinY(v), MAX(oldRight, newRight) - left, NSHeight(v))];
++        // the strip a narrower column uncovers at the right, and where a scroller is shown
++        if (dx < 0 || right > 0)
++            [self setNeedsDisplayInRect:NSMakeRect(edge + MIN(dx, 0), NSMinY(v), NSMaxX(v) - edge - MIN(dx, 0), NSHeight(v))];
++        if (below > 0)
++            [self setNeedsDisplayInRect:NSMakeRect(from, bottom, NSMaxX(v) - from, NSMaxY(v) - bottom)];
++        if (_headerView != nil) {
++            NSRect hv = [_headerView visibleRect];
++            NSRect hr = NSMakeRect(from, NSMinY(hv), NSMaxX(hv) - from, NSHeight(hv));
++
++            if (hr.size.width > 0)
++                [_headerView scrollRect:hr by:NSMakeSize(dx, 0)];
++            [_headerView setNeedsDisplayInRect:NSMakeRect(left, NSMinY(hv), MAX(oldRight, newRight) - left, NSHeight(hv))];
++            if (dx < 0)
++                [_headerView setNeedsDisplayInRect:NSMakeRect(NSMaxX(hv) + dx, NSMinY(hv), -dx, NSHeight(hv))];
++        }
++        return;
++    }
++    NSRect moved = [self bounds];
++    moved.origin.x = left;
++    moved.size.width = MAX(0, NSMaxX([self bounds]) - left);
++    [self setNeedsDisplayInRect:moved];
++    if (_headerView != nil) {
++        NSRect h = [_headerView bounds];
++        h.origin.x = left;
++        h.size.width = MAX(0, NSMaxX([_headerView bounds]) - left);
++        [_headerView setNeedsDisplayInRect:h];
++    }
++}
++
+ -(void)sizeLastColumnToFit {
+     NSClipView *clipView = (NSClipView *)[self superview];
+ 
+--- a/src/Frameworks/AppKit/NSTableViewViewBased.m
++++ b/src/Frameworks/AppKit/NSTableViewViewBased.m
+@@ -23,6 +23,7 @@
+ #import <AppKit/NSTableView.h>
+ #import <AppKit/NSOutlineView.h>
+ #import <AppKit/NSNib.h>
++#include <math.h>
+ #include <objc/runtime.h>
+ 
+ #define EXPORT __attribute__((visibility("default")))
+@@ -197,6 +198,9 @@
+     NSInteger updates;
+     NSView *preferred;                  /* during a reload: the view a cell has, which
+                                            -makeViewWithIdentifier:owner: gives back for it (not retained) */
++    BOOL moving;                        /* the pixels of the cells right of moveFrom were copied moveBy
++                                           points along: the next layout moves those cells without drawing them */
++    CGFloat moveFrom, moveBy;
+ }
+ @end
+ 
+@@ -223,6 +227,14 @@
+ 
+ static const char sfViewBasedKey;
+ 
++// the solves a run of frame changes asks for, put off to its end (NSLayoutConstraint.m)
++extern void _NSViewLayoutBeginResize(void);
++extern void _NSViewLayoutEndResize(void);
++
++@interface NSView (SFQuietMove)
++- (void)_sfSetFrameOriginWithoutDisplay:(NSPoint)origin;
++@end
++
+ @interface NSTableView (SFViewBasedPrivate)
+ - (id)dataSourceObjectValueForTableColumn:(NSTableColumn *)tableColumn row:(int)row;
+ @end
+@@ -369,15 +381,32 @@
+     [s->rows removeAllObjects];
+ }
+ 
++/* A column drag copies the pixels right of the column along (NSTableView.m); the cell views there are then
++ * moved by the next layout without being drawn again. NO when a move is still to be laid out. */
++- (BOOL)_sfBeginMoveRightOf:(CGFloat)x by:(CGFloat)dx {
++    if (![self _sfIsViewBased])
++        return YES;   /* a table of cells draws them where its columns say */
++    SFViewBasedState *s = [self _sfViewState];
++    if (s->moving || s->dirty)
++        return NO;
++    s->moving = YES;
++    s->moveFrom = x;
++    s->moveBy = dx;
++    return YES;
++}
++
+ /* the frame of a column's view inside its row view */
+ - (NSRect)_sfFrameOfViewAtColumn:(NSInteger)column row:(NSInteger)row {
+     NSRect rowRect = [self rectOfRow:row];
+-    NSRect cell = [self rectOfColumn:column];
++    NSRect span = [self rectOfColumn:column];
++    return [self _sfFrameOfViewInSpan:span.origin.x width:span.size.width column:column row:row rowHeight:rowRect.size.height];
++}
++
++/* the same from the column's span across the table (its x and width, the intercell spacing in it):
++ * the layout of the rows works them out once for every row, -rectOfColumn: adds up every row's height */
++- (NSRect)_sfFrameOfViewInSpan:(CGFloat)x width:(CGFloat)width column:(NSInteger)column row:(NSInteger)row rowHeight:(CGFloat)height {
+     NSSize spacing = [self intercellSpacing];
+-    cell.origin.x += floor(spacing.width / 2);
+-    cell.size.width -= spacing.width;
+-    cell.origin.y = 0;
+-    cell.size.height = rowRect.size.height;
++    NSRect cell = NSMakeRect(x + floor(spacing.width / 2), 0, width - spacing.width, height);
+     if ([self isKindOfClass:[NSOutlineView class]]) {
+         NSOutlineView *ov = (NSOutlineView *)self;
+         if ([[self tableColumns] objectAtIndex:column] == [ov outlineTableColumn]) {
+@@ -454,55 +483,89 @@
+     NSIndexSet *selected = [self selectedRowIndexes];
+     BOOL emphasized = [[self window] isKeyWindow] && [[self window] firstResponder] == self;
+     id d = [self delegate];
+-    for (NSInteger r = visible.location; r < (NSInteger)NSMaxRange(visible) && r < nrows; r++) {
+-        NSNumber *key = [NSNumber numberWithInteger:r];
+-        NSTableRowView *rv = [s->rows objectForKey:key];
+-        BOOL fresh = NO;
+-        if (rv == nil) {
+-            rv = [self _sfMakeRowViewForRow:r];
+-            [s->rows setObject:rv forKey:key];
+-            fresh = YES;
+-        }
+-        NSRect rowRect = [self rectOfRow:r];
+-        /* a row view spans the table, as on macOS: its background and selection reach past the last
+-         * column (what was right of it was never drawn after a reload, black) */
+-        rowRect.size.width = MAX(NSWidth(rowRect), NSWidth([self bounds]));
+-        if (!NSEqualRects([rv frame], rowRect))
+-            [rv setFrame:rowRect];
+-        if (!fresh && reload) {
+-            [self _sfReloadRowView:rv row:r];
+-            /* as for a row view added by a reload on macOS: the delegate sees it again (Activity
+-             * Monitor colours a hung process's name there) */
+-            if ([self isKindOfClass:[NSOutlineView class]]) {
+-                if ([d respondsToSelector:@selector(outlineView:didAddRowView:forRow:)])
+-                    [d outlineView:(NSOutlineView *)self didAddRowView:rv forRow:r];
+-            } else if ([d respondsToSelector:@selector(tableView:didAddRowView:forRow:)])
+-                [d tableView:self didAddRowView:rv forRow:r];
+-        }
+-        if (fresh) {
+-            for (NSInteger c = 0; c < ncols; c++) {
+-                NSTableColumn *tc = [[self tableColumns] objectAtIndex:c];
+-                NSView *v = [tc isHidden] ? nil : [self _sfMakeViewForColumn:c row:r];
+-                if (v == nil)
+-                    v = [[[NSView alloc] initWithFrame:NSZeroRect] autorelease];   /* keeps column order */
+-                [rv addSubview:v];
++    NSArray *columns = [self tableColumns];
++    /* each column's span, once (a cell's frame asked -rectOfColumn:, which adds up the heights of all
++     * the rows, for every cell) */
++    CGFloat spanX[ncols > 0 ? ncols : 1], spanW[ncols > 0 ? ncols : 1];
++    {
++        CGFloat x = 0, sp = [self intercellSpacing].width;
++        for (NSInteger c = 0; c < ncols; c++) {
++            NSTableColumn *tc = [columns objectAtIndex:c];
++            spanX[c] = x;
++            spanW[c] = [tc isHidden] ? 0 : [tc width] + sp;
++            x += spanW[c];
++        }
++    }
++    /* The frames given to the row and cell views ask for their constraints to be solved: each cell view
++     * that moved or changed size had its whole row solved again, twice (a column made wider moves every
++     * cell right of it in every row: Activity Monitor spent 2.4 s of a 4 s column drag in the solver).
++     * They are taken together here and each row that changed is solved once, at the end. */
++    _NSViewLayoutBeginResize();
++    @try {
++        for (NSInteger r = visible.location; r < (NSInteger)NSMaxRange(visible) && r < nrows; r++) {
++            NSNumber *key = [NSNumber numberWithInteger:r];
++            NSTableRowView *rv = [s->rows objectForKey:key];
++            BOOL fresh = NO;
++            if (rv == nil) {
++                rv = [self _sfMakeRowViewForRow:r];
++                [s->rows setObject:rv forKey:key];
++                fresh = YES;
+             }
+-            [self addSubview:rv];
+-            if ([self isKindOfClass:[NSOutlineView class]]) {
+-                if ([d respondsToSelector:@selector(outlineView:didAddRowView:forRow:)])
+-                    [d outlineView:(NSOutlineView *)self didAddRowView:rv forRow:r];
+-            } else if ([d respondsToSelector:@selector(tableView:didAddRowView:forRow:)])
+-                [d tableView:self didAddRowView:rv forRow:r];
+-        }
+-        NSArray *cells = [rv subviews];
+-        for (NSInteger c = 0; c < ncols && c < (NSInteger)[cells count]; c++) {
+-            NSView *v = [cells objectAtIndex:c];
+-            NSRect f = [[[self tableColumns] objectAtIndex:c] isHidden] ? NSZeroRect : [self _sfFrameOfViewAtColumn:c row:r];
+-            if (!NSEqualRects([v frame], f))
+-                [v setFrame:f];
++            NSRect rowRect = [self rectOfRow:r];
++            /* a row view spans the table, as on macOS: its background and selection reach past the last
++             * column (what was right of it was never drawn after a reload, black) */
++            rowRect.size.width = MAX(NSWidth(rowRect), NSWidth([self bounds]));
++            if (!NSEqualRects([rv frame], rowRect))
++                [rv setFrame:rowRect];
++            if (!fresh && reload) {
++                [self _sfReloadRowView:rv row:r];
++                /* as for a row view added by a reload on macOS: the delegate sees it again (Activity
++                 * Monitor colours a hung process's name there) */
++                if ([self isKindOfClass:[NSOutlineView class]]) {
++                    if ([d respondsToSelector:@selector(outlineView:didAddRowView:forRow:)])
++                        [d outlineView:(NSOutlineView *)self didAddRowView:rv forRow:r];
++                } else if ([d respondsToSelector:@selector(tableView:didAddRowView:forRow:)])
++                    [d tableView:self didAddRowView:rv forRow:r];
++            }
++            if (fresh) {
++                for (NSInteger c = 0; c < ncols; c++) {
++                    NSTableColumn *tc = [[self tableColumns] objectAtIndex:c];
++                    NSView *v = [tc isHidden] ? nil : [self _sfMakeViewForColumn:c row:r];
++                    if (v == nil)
++                        v = [[[NSView alloc] initWithFrame:NSZeroRect] autorelease];   /* keeps column order */
++                    [rv addSubview:v];
++                }
++                /* the table places the cell views (below): the row view does not resize them as well when it is
++                 * given a new width (each cell of every row was resized, and solved, at each step of a column drag,
++                 * then put back) */
++                [rv setAutoresizesSubviews:NO];
++                [self addSubview:rv];
++                if ([self isKindOfClass:[NSOutlineView class]]) {
++                    if ([d respondsToSelector:@selector(outlineView:didAddRowView:forRow:)])
++                        [d outlineView:(NSOutlineView *)self didAddRowView:rv forRow:r];
++                } else if ([d respondsToSelector:@selector(tableView:didAddRowView:forRow:)])
++                    [d tableView:self didAddRowView:rv forRow:r];
++            }
++            NSArray *cells = [rv subviews];
++            for (NSInteger c = 0; c < ncols && c < (NSInteger)[cells count]; c++) {
++                NSView *v = [cells objectAtIndex:c];
++                NSRect f = [[columns objectAtIndex:c] isHidden] ? NSZeroRect
++                    : [self _sfFrameOfViewInSpan:spanX[c] width:spanW[c] column:c row:r rowHeight:rowRect.size.height];
++                NSRect old = [v frame];
++                if (NSEqualRects(old, f))
++                    continue;
++                if (s->moving && !fresh && NSEqualSizes(old.size, f.size) && old.origin.y == f.origin.y &&
++                    NSMinX(old) >= s->moveFrom - 0.5 && fabs(NSMinX(f) - NSMinX(old) - s->moveBy) < 0.01)
++                    [v _sfSetFrameOriginWithoutDisplay:f.origin];   /* its pixels are there already */
++                else
++                    [v setFrame:f];
++            }
++            [rv setEmphasized:emphasized || ![self window]];
++            [rv setSelected:[selected containsIndex:r]];
+         }
+-        [rv setEmphasized:emphasized || ![self window]];
+-        [rv setSelected:[selected containsIndex:r]];
++    } @finally {
++        s->moving = NO;
++        _NSViewLayoutEndResize();
+     }
+ }
+ 
+--- a/src/Frameworks/AppKit/NSTableHeaderView.m
++++ b/src/Frameworks/AppKit/NSTableHeaderView.m
+@@ -23,12 +23,37 @@
+ #import <Foundation/NSKeyedArchiver.h>
+ #import <AppKit/NSRaise.h>
+ #import <AppKit/NSOutlineView.h>
++#import <AppKit/NSApplication.h>
+ #import <objc/message.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <time.h>
++#include <math.h>
+ 
+ @interface NSTableView(NSTableView_private)
+ -(void)noteColumnDidResizeWithOldWidth:(CGFloat)oldWidth;
++-(void)_sfColumnWidthsChanged;
++-(void)_sfColumnWidthsChangedFromColumn:(NSInteger)column;
++-(void)_sfColumnWidthsChangedFromColumn:(NSInteger)column oldWidth:(CGFloat)oldWidth;
++-(void)_saveColumnLayout;
+ @end
+ 
++// SF_WS_TIMING: which pointer position a column drag follows, on the window server's clock (wall clock, ms)
++static int sfTiming(void) {
++    static int on = -1;
++
++    if (on < 0)
++        on = getenv("SF_WS_TIMING") != NULL;
++    return on;
++}
++
++static double sfNowMs(void) {
++    struct timespec ts;
++
++    clock_gettime(CLOCK_REALTIME, &ts);
++    return (double)ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
++}
++
+ @implementation NSTableHeaderView
+ 
+ -initWithCoder:(NSCoder *)coder {
+@@ -146,6 +171,11 @@
+         if ([column isHidden])
+             continue;
+         columnRect.size.width = [column width] + spacing.width;
++        // only the columns in the rectangle asked for (a column drag asks for those right of the column)
++        if (NSMaxX(columnRect) < NSMinX(rect) || NSMinX(columnRect) > NSMaxX(rect)) {
++            columnRect.origin.x += [column width] + spacing.width;
++            continue;
++        }
+         [[column headerCell] setHighlighted:[_tableView isColumnSelected:[[_tableView tableColumns] indexOfObject:column]]];
+         [[column headerCell] setControlView:self];
+         if ([[column headerCell] respondsToSelector:@selector(_sfSetShowsSortIndicator:)])
+@@ -198,47 +228,130 @@
+             if (NSMouseInRect(location, [self _resizeRectBeforeColumn:i],[self isFlipped])) {
+                 NSTableColumn *resizingColumn = [[_tableView tableColumns] objectAtIndex:i-1];
+                 float resizedColumnWidth = [resizingColumn width];
++                NSEventMask mask = NSLeftMouseUpMask|NSLeftMouseDraggedMask;
+ 
++                // a hidden column's edge is the next one's: the column left of the line is the one shown
++                if ([resizingColumn isHidden])
++                    continue;
+                 if (![resizingColumn isResizable])
+                     return;
+ 
+                 _resizedColumn = i - 1;
+-                location=[self convertPoint:[theEvent locationInWindow] fromView:nil];
+-                do { // greatly simplified code...
++                /* The line stays where it was taken (a press beside it no longer made the column jump that
++                 * far), and only the last of the drags waiting is followed: each drag laid the whole table
++                 * out again (-tile, a reload of every row), so the column fell behind the pointer more with
++                 * each one (Activity Monitor). The table is laid out once a frame, at its display; the
++                 * widths are saved and the change told once, at the release. */
++                NSRect columnRect = [self headerRectOfColumn:i-1];
++                CGFloat spacing = [_tableView intercellSpacing].width;
++                CGFloat grab = NSMaxX(columnRect) - location.x;
++
++                do {
+                     NSPoint newPoint;
+                     NSRect newRect;
+-                    int q;
+-                    float newWidth=newPoint.x;
+-                    
+-                    theEvent=[[self window] nextEventMatchingMask:NSLeftMouseUpMask|NSLeftMouseDraggedMask];
+-                    newPoint=[self convertPoint:[theEvent locationInWindow] fromView:nil];
++                    int skipped = 0;
+ 
+-                    newWidth=newPoint.x;
+-                    for (q = 0; q < _resizedColumn; ++q) {
+-                        newWidth -= [[[_tableView tableColumns] objectAtIndex:q] width];
+-                        newWidth -= [_tableView intercellSpacing].width;
++                    theEvent=[[self window] nextEventMatchingMask:mask];
++                    if ([theEvent type] == NSLeftMouseDragged) {
++                        NSEvent *next;
++
++                        int taken = 0;
++
++                        while ((next = [NSApp nextEventMatchingMask:mask untilDate:[NSDate distantPast] inMode:NSEventTrackingRunLoopMode dequeue:NO]) != nil &&
++                               [next type] == NSLeftMouseDragged) {
++                            theEvent = [NSApp nextEventMatchingMask:mask untilDate:[NSDate distantPast] inMode:NSEventTrackingRunLoopMode dequeue:YES];
++                            taken++;
++                        }
++                        skipped = taken;
+                     }
++                    newPoint=[self convertPoint:[theEvent locationInWindow] fromView:nil];
+ 
+-                    [resizingColumn setWidth:newWidth];
++                    CGFloat newWidth = newPoint.x + grab - NSMinX(columnRect) - spacing;
++                    CGFloat oldWidth = [resizingColumn width];
++                    CGFloat scale = [[self window] backingScaleFactor];
++
++                    // by whole device pixels: what is right of the column is copied along by as much
++                    if (scale > 0)
++                        newWidth = oldWidth + round((newWidth - oldWidth) * scale) / scale;
+ 
+-                    [_tableView tile];
+-                    newRect.origin=[_tableView convertPoint:newPoint fromView:self];
+-                    newRect.size=NSMakeSize(10,10);
+-                    [_tableView scrollRectToVisible:newRect];
+-                    
+-                    location=newPoint;
++                    [resizingColumn setWidth:newWidth];
++                    if (sfTiming() && [theEvent type] == NSLeftMouseDragged)
++                        fprintf(stderr, "WSTIME %.1f column-drag x=%.1f skipped=%d changed=%d\n", sfNowMs(), [theEvent locationInWindow].x, skipped,
++                                [resizingColumn width] != oldWidth);
++                    if ([resizingColumn width] != oldWidth) {
++                        [_tableView _sfColumnWidthsChangedFromColumn:i-1 oldWidth:oldWidth];
++                        newRect.origin=[_tableView convertPoint:newPoint fromView:self];
++                        newRect.size=NSMakeSize(10,10);
++                        [_tableView scrollRectToVisible:newRect];
++                    }
+                 } while ([theEvent type] != NSLeftMouseUp);
+ 
+                 [[self window] invalidateCursorRectsForView:self];
+ 
+-                [_tableView noteColumnDidResizeWithOldWidth:resizedColumnWidth];
+-         
++                if ([resizingColumn width] != resizedColumnWidth) {
++                    [_tableView tile];
++                    [_tableView _saveColumnLayout];
++                    [_tableView noteColumnDidResizeWithOldWidth:resizedColumnWidth];
++                }
++
+                 _resizedColumn = -1;
+                 return;
+             }
+         }
+     }
+ 	
++    /* A press on a header that moves along the header drags the column to another place (it was not
++     * possible: nothing followed the pointer); it changes places with each column whose middle the pointer
++     * passes, as the delegate allows. As on macOS, a click (no move) is taken at the release and sorts. */
++    if ([_tableView allowsColumnReordering]) {
++        NSEventMask mask = NSLeftMouseUpMask|NSLeftMouseDraggedMask;
++        NSInteger moving = clickedColumn;
++        BOOL dragging = NO;
++        id d = [_tableView delegate];
++        BOOL outlineView = [_tableView isKindOfClass:[NSOutlineView class]];
++        SEL mayMove = outlineView ? @selector(outlineView:shouldReorderColumn:toColumn:) : @selector(tableView:shouldReorderColumn:toColumn:);
++
++        for (;;) {
++            NSEvent *e = [[self window] nextEventMatchingMask:mask];
++
++            if ([e type] == NSLeftMouseUp)
++                break;
++            NSEvent *next;
++            while ((next = [NSApp nextEventMatchingMask:mask untilDate:[NSDate distantPast] inMode:NSEventTrackingRunLoopMode dequeue:NO]) != nil &&
++                   [next type] == NSLeftMouseDragged)
++                e = [NSApp nextEventMatchingMask:mask untilDate:[NSDate distantPast] inMode:NSEventTrackingRunLoopMode dequeue:YES];
++
++            NSPoint p = [self convertPoint:[e locationInWindow] fromView:nil];
++
++            if (!dragging && fabs(p.x - location.x) < 4)
++                continue;
++            dragging = YES;
++            NSInteger over = [self columnAtPoint:NSMakePoint(p.x, NSMidY([self bounds]))];
++
++            if (over < 0 || over == NSNotFound || over == moving)
++                continue;
++            NSRect r = [self headerRectOfColumn:over];
++
++            if ((over > moving && p.x < NSMidX(r)) || (over < moving && p.x > NSMidX(r)))
++                continue;
++            if ([d respondsToSelector:mayMove] &&
++                !((BOOL (*)(id, SEL, id, NSInteger, NSInteger))objc_msgSend)(d, mayMove, _tableView, moving, over))
++                continue;
++            [_tableView moveColumn:moving toColumn:over];
++            moving = over;
++            [self setNeedsDisplay:YES];
++        }
++        if (dragging) {
++            SEL dragged = outlineView ? @selector(outlineView:didDragTableColumn:) : @selector(tableView:didDragTableColumn:);
++
++            if ([d respondsToSelector:dragged])
++                ((void (*)(id, SEL, id, id))objc_msgSend)(d, dragged, _tableView, [[_tableView tableColumns] objectAtIndex:moving]);
++            [[self window] invalidateCursorRectsForView:self];
++            [self setNeedsDisplay:YES];
++            return;
++        }
++    }
++
+     // Apple asks the delegate on every click in a header (not on a resize edge) whether the column may
+     // be selected, whether or not the table allows column selection; applications sort there
+     // (Activity Monitor's -outlineView:shouldSelectTableColumn: sets its sort column and direction)
+--- a/src/Frameworks/AppKit/NSSplitView.m
++++ b/src/Frameworks/AppKit/NSSplitView.m
+@@ -17,6 +17,39 @@
+ #import <AppKit/NSCursor.h>
+ #import <Foundation/NSKeyedArchiver.h>
+ #import <AppKit/NSRaise.h>
++#include <stdio.h>
++#include <math.h>
++#include <stdlib.h>
++#include <objc/runtime.h>
++
++extern int backtrace(void **frames, int size);
++extern void backtrace_symbols_fd(void *const *frames, int size, int fd);
++
++// SF_SPLIT_TRACE: what a split view is asked and what its panes become (a closed split left a grey box)
++static int sfSplitTrace(void) {
++    static int on = -1;
++
++    if (on < 0)
++        on = getenv("SF_SPLIT_TRACE") != NULL;
++    return on;
++}
++
++static void sfSplitLog(NSSplitView *self, const char *what, int depth) {
++    if (!sfSplitTrace())
++        return;
++    fprintf(stderr, "PD-SPLIT %s %p %s frame %s style %d thickness %g vertical %d delegate %s:", object_getClassName(self), self, what,
++            [NSStringFromRect([self frame]) UTF8String], (int)[self dividerStyle], [self dividerThickness], [self isVertical],
++            [self delegate] ? object_getClassName([self delegate]) : "-");
++    for (NSView *v in [self subviews])
++        fprintf(stderr, " [%s %s%s]", object_getClassName(v), [NSStringFromRect([v frame]) UTF8String], [v isHidden] ? " hidden" : "");
++    fprintf(stderr, "\n");
++    if (depth > 0) {
++        void *frames[12];
++
++        fflush(stderr);
++        backtrace_symbols_fd(frames, backtrace(frames, depth < 12 ? depth : 12), 2);
++    }
++}
+ 
+ NSString * const NSSplitViewDidResizeSubviewsNotification = @"NSSplitViewDidResizeSubviewsNotification";
+ NSString * const NSSplitViewWillResizeSubviewsNotification = @"NSSplitViewWillResizeSubviewsNotification";
+@@ -135,14 +168,36 @@
+         }
+     }
+    
++    // panes that have no width yet (one just added with an empty frame) share the width equally
++    if (totalWidthBefore <= 0) {
++        int shown = 0;
++
++        for (i = 0; i < count; i++)
++            if (![self isSubviewCollapsed:[_subviews objectAtIndex:i]])
++                shown++;
++        for (i = 0; i < count && shown > 0; i++) {
++            NSView *subview = [_subviews objectAtIndex:i];
++            if (![self isSubviewCollapsed:subview])
++                [subview setFrameSize:NSMakeSize(floor(totalWidthAfter / shown), height)];
++        }
++        totalWidthBefore = shown > 0 ? floor(totalWidthAfter / shown) * shown : 1;
++    }
+     float delta = totalWidthAfter / totalWidthBefore;
+     
+     NSRect  frame = [self bounds];
++    // the last pane shown takes what the rounding down of the others left (a pixel or so at each split
++    // and close: Terminal fits its window to its panes' rows, and the window shrank every time)
++    int last = -1;
++    for(i = 0; i < count; i++)
++        if ([self isSubviewCollapsed: [_subviews objectAtIndex: i]] == NO)
++            last = i;
+     for(i = 0; i < count; i++){
+         NSView *subview = [_subviews objectAtIndex: i];
+         if ([self isSubviewCollapsed: subview] == NO) {
+             frame.size.width= NSWidth([subview frame]) * delta;
+             frame.size.width=floor(frame.size.width);
++            if (i == last)
++                frame.size.width = MAX(0, NSMaxX([self bounds]) - NSMinX(frame));
+             frame.size.height = height;
+             
+             NSSize oldSize = [subview frame].size;
+@@ -176,15 +231,36 @@
+         }
+     }
+ 
++    // panes that have no height yet share the height equally
++    if (totalHeightBefore <= 0) {
++        int shown = 0;
++
++        for (i = 0; i < count; i++)
++            if (![self isSubviewCollapsed:[_subviews objectAtIndex:i]])
++                shown++;
++        for (i = 0; i < count && shown > 0; i++) {
++            NSView *subview = [_subviews objectAtIndex:i];
++            if (![self isSubviewCollapsed:subview])
++                [subview setFrameSize:NSMakeSize(width, floor(totalHeightAfter / shown))];
++        }
++        totalHeightBefore = shown > 0 ? floor(totalHeightAfter / shown) * shown : 1;
++    }
+     float delta = totalHeightAfter / totalHeightBefore;
+     
+ 
+     NSRect  frame=[self bounds];
++    // the last pane shown takes what the rounding down of the others left
++    int last = -1;
++    for(i = 0; i < count; i++)
++        if ([self isSubviewCollapsed: [_subviews objectAtIndex: i]] == NO)
++            last = i;
+     for(i=0;i<count;i++){
+         NSView *subview = [_subviews objectAtIndex: i];
+         if ([self isSubviewCollapsed: subview] == NO) {
+             frame.size.height= NSHeight([subview frame]) * delta;
+             frame.size.height=floor(frame.size.height);
++            if (i == last)
++                frame.size.height = MAX(0, NSMaxY([self bounds]) - NSMinY(frame));
+             frame.size.width = width;
+             
+             NSSize oldSize = [subview frame].size;
+@@ -206,8 +282,28 @@
+  * added or removed, to reestablish the consistency of subview placement.
+  */
+ -(void)adjustSubviews {
++    sfSplitLog(self, "adjustSubviews", 6);
++    [self _sfAdjustSubviews];
++    sfSplitLog(self, "adjusted", 0);
++}
+ 
+-    if ([_subviews count] < 2) {
++-(void)_sfAdjustSubviews {
++
++    if ([_subviews count] == 0) {
++        return;
++    }
++    /* One pane left (a split closed, Terminal's Shift-Command-D): as on macOS, it fills the split view.
++     * Nothing was done for fewer than two, so the pane kept its half and the other half stayed an empty
++     * grey box where the closed pane and the divider had been. */
++    if ([_subviews count] == 1) {
++        NSView *only = [_subviews objectAtIndex:0];
++
++        if (![self isSubviewCollapsed:only] && !NSEqualRects([only frame], [self bounds])) {
++            [self _postNoteWillResize];
++            [only setFrame:[self bounds]];
++            [self setNeedsDisplay:YES];
++            [self _postNoteDidResize];
++        }
+         return;
+     }
+     
+@@ -262,12 +358,84 @@
+    [image drawAtPoint: point fromRect: NSZeroRect operation: NSCompositeSourceOver fraction: 1.0];
+ }
+ 
++/* As on macOS, adding or removing a pane does not lay the panes out at once (Apple's documentation: send
++ * -adjustSubviews after adding or removing); an application that places its panes itself keeps the frames it
++ * gave them. Terminal splits a pane by giving both halves their frames, adding them and making its window
++ * taller by what that needs: laid out again at each -addSubview:, the halves came out 298 and 152 points, Terminal
++ * fitted its window to their rows, and the window shrank at each split and close. What the application leaves
++ * inconsistent (a pane left alone when a split closes) is laid out before the split view is next drawn. */
++static char sfSplitNeedsAdjustKey;
++
++-(void)_sfSplitNeedsAdjust {
++   objc_setAssociatedObject(self, &sfSplitNeedsAdjustKey, [NSNumber numberWithBool:YES], OBJC_ASSOCIATION_RETAIN);
++   [self setNeedsDisplay:YES];
++}
++
++// the panes and dividers fill the split view exactly, in order, across its whole width (or height)
++-(BOOL)_sfSplitFits {
++   NSRect bounds = [self bounds];
++   CGFloat at = [self isVertical] ? NSMinX(bounds) : NSMinY(bounds), thickness = [self dividerThickness];
++   NSUInteger i, count = [_subviews count];
++
++   for (i = 0; i < count; i++) {
++    NSView *v = [_subviews objectAtIndex:i];
++    NSRect f = [v frame];
++
++    if ([self isSubviewCollapsed:v]) {
++     at += (i + 1 < count) ? thickness : 0;
++     continue;
++    }
++    if ([self isVertical]) {
++     if (fabs(NSMinX(f) - at) > 0.5 || fabs(NSHeight(f) - NSHeight(bounds)) > 0.5)
++      return NO;
++     at = NSMaxX(f);
++    } else {
++     if (fabs(NSMinY(f) - at) > 0.5 || fabs(NSWidth(f) - NSWidth(bounds)) > 0.5)
++      return NO;
++     at = NSMaxY(f);
++    }
++    if (i + 1 < count)
++     at += thickness;
++   }
++   return count == 0 || fabs(at - ([self isVertical] ? NSMaxX(bounds) : NSMaxY(bounds))) <= 0.5;
++}
++
++-(void)viewWillDraw {
++   if (objc_getAssociatedObject(self, &sfSplitNeedsAdjustKey) != nil) {
++    objc_setAssociatedObject(self, &sfSplitNeedsAdjustKey, nil, OBJC_ASSOCIATION_RETAIN);
++    if (![self _sfSplitFits]) {
++     sfSplitLog(self, "viewWillDraw: the panes do not fill the split view", 0);
++     [self adjustSubviews];
++    }
++   }
++   [super viewWillDraw];
++}
++
+ -(void)addSubview:(NSView *)view {
+    [super addSubview:view];
+-   [self adjustSubviews];
++   sfSplitLog(self, "addSubview", 6);
++   [self _sfSplitNeedsAdjust];
++}
++
++-(void)didAddSubview:(NSView *)view {
++   [super didAddSubview:view];
++   sfSplitLog(self, "didAddSubview", 0);
++}
++
++-(void)willRemoveSubview:(NSView *)view {
++   [super willRemoveSubview:view];
++   sfSplitLog(self, "willRemoveSubview", 6);
++   [self _sfSplitNeedsAdjust];
+ }
+ 
+ -(void)resizeSubviewsWithOldSize:(NSSize)oldSize {
++   if (sfSplitTrace()) {
++    char what[128];
++
++    snprintf(what, sizeof what, "resizeSubviewsWithOldSize %g x %g (delegate resizes: %d)", oldSize.width, oldSize.height,
++             [_delegate respondsToSelector:@selector(splitView:resizeSubviewsWithOldSize:)]);
++    sfSplitLog(self, what, 0);
++   }
+    NSSize  size=[self bounds].size;
+    NSPoint origin=[self bounds].origin;
+    int     i,count=[_subviews count];
+@@ -421,6 +589,12 @@
+  */
+ - (void)setPosition:(CGFloat)position ofDividerAtIndex:(int)index
+ {
++    if (sfSplitTrace()) {
++        char what[64];
++
++        snprintf(what, sizeof what, "setPosition %g ofDividerAtIndex %d", position, index);
++        sfSplitLog(self, what, 5);
++    }
+     // a divider that is not there (a split view with one pane: Terminal asks when a split closes) moves nothing,
+     // as on macOS; the assertion raised and the event that asked was lost
+     if (index < 0 || index + 1 >= (int)[[self subviews] count])
+--- a/src/Frameworks/AppKit/NSStringDrawer.h
++++ b/src/Frameworks/AppKit/NSStringDrawer.h
+@@ -20,6 +20,9 @@
+     // sizes of unbounded one-style strings measured lately: {attributes: {string: size}}
+     NSMutableDictionary *_sfSizes;
+     NSUInteger _sfSizeCount;
++    // strings laid out lately for drawing in a rectangle of a size, each in a text system of its own:
++    // this generation and the one before it
++    NSMutableDictionary *_sfTypeset, *_sfTypesetOld;
+ }
+ 
+ + (NSStringDrawer *)sharedStringDrawer;
+--- a/src/Frameworks/AppKit/NSStringDrawer.m
++++ b/src/Frameworks/AppKit/NSStringDrawer.m
+@@ -7,17 +7,83 @@
+ 
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+ 
++#include <stdlib.h>
+ #import <AppKit/NSStringDrawer.h>
+ #import <AppKit/NSTextStorage.h>
+ #import <AppKit/NSLayoutManager.h>
+ #import <AppKit/NSTextContainer.h>
+ #import <AppKit/NSStringDrawing.h>
++#import <AppKit/NSParagraphStyle.h>
++#import <AppKit/NSAttributedString.h>
+ #import <AppKit/NSView.h>
+ #import <AppKit/NSGraphicsContextFunctions.h>
+ #import <ApplicationServices/ApplicationServices.h>
+ 
+ const float NSStringDrawerLargeDimension=1000000.;
+ 
++/* A string laid out for drawing in a rectangle of one size: drawing laid every string out again, at
++ * every display (most of what Activity Monitor's table cost to draw, a column drag drawing every cell
++ * right of the column at each step), though most of them do not change from one display to the next. */
++@interface SFTypesetKey : NSObject <NSCopying> {
++@public
++    NSAttributedString *_string;
++    NSSize _size;
++    NSUInteger _hash;
++}
++@end
++
++@implementation SFTypesetKey
++-(id)initWithString:(NSAttributedString *)string size:(NSSize)size {
++    self=[super init];
++    _string=[string copy];
++    _size=size;
++    _hash=[[_string string] hash] ^ ((NSUInteger)(size.width*64) << 7) ^ (NSUInteger)(size.height*64);
++    return self;
++}
++-(void)dealloc {
++    [_string release];
++    [super dealloc];
++}
++-(id)copyWithZone:(NSZone *)zone {
++    return [self retain];
++}
++-(NSUInteger)hash {
++    return _hash;
++}
++-(BOOL)isEqual:(id)other {
++    SFTypesetKey *key=other;
++
++    if(other==self)
++     return YES;
++    if(![other isKindOfClass:[SFTypesetKey class]] || key->_hash!=_hash || !NSEqualSizes(key->_size,_size))
++     return NO;
++    return [key->_string isEqualToAttributedString:_string];
++}
++@end
++
++@interface SFTypeset : NSObject {
++@public
++    NSTextStorage *_storage;
++    NSLayoutManager *_layout;
++    NSTextContainer *_container;
++    NSRange _glyphs;
++}
++@end
++
++@implementation SFTypeset
++-(void)dealloc {
++    [_storage release];
++    [_layout release];
++    [_container release];
++    [super dealloc];
++}
++@end
++
++// strings this long or longer are laid out each time (a text view's are not drawn this way)
++#define SF_TYPESET_MAX_LENGTH 256
++// a generation of laid out strings: a table window's worth of cells and more
++#define SF_TYPESET_LIMIT 800
++
+ @implementation NSStringDrawer
+ 
+ +(NSStringDrawer *)sharedStringDrawer {
+@@ -148,9 +214,97 @@
+    return [_layoutManager usedRectForTextContainer:_textContainer].size;
+ }
+ 
++// the string laid out in a text system of its own for a rectangle of that size, kept for the next time
++-(SFTypeset *)_sfTypesetFor:(NSAttributedString *)astring size:(NSSize)size {
++   NSUInteger length=[astring length];
++   static int off=-1;
++
++   // SF_TYPESET_NO_CACHE=1: every string laid out at every drawing, as before (to compare)
++   if(off<0)
++    off=getenv("SF_TYPESET_NO_CACHE")!=NULL;
++   if(off || length==0 || length>=SF_TYPESET_MAX_LENGTH || size.width<=0 || size.height<=0)
++    return nil;
++
++   SFTypesetKey *key=[[[SFTypesetKey alloc] initWithString:astring size:size] autorelease];
++   SFTypeset *typeset=[_sfTypeset objectForKey:key];
++
++   if(typeset!=nil)
++    return typeset;
++   typeset=[_sfTypesetOld objectForKey:key];
++   if(typeset==nil){
++    typeset=[[[SFTypeset alloc] init] autorelease];
++    // as the shared text system is made (NSTextStorage's -initWithAttributedString: answers a plain attributed string)
++    typeset->_storage=[NSTextStorage new];
++    typeset->_layout=[NSLayoutManager new];
++    typeset->_container=[[NSTextContainer alloc] init];
++    [typeset->_container setLineFragmentPadding:[_textContainer lineFragmentPadding]];
++    [typeset->_storage addLayoutManager:typeset->_layout];
++    [typeset->_layout addTextContainer:typeset->_container];
++    [typeset->_container setContainerSize:size];
++    [typeset->_storage setAttributedString:key->_string];
++    typeset->_glyphs=[typeset->_layout glyphRangeForTextContainer:typeset->_container];
++    // as below: a rect lower than one line is given the height the text asks for
++    if(typeset->_glyphs.length==0){
++     NSSize need;
++
++     [typeset->_container setContainerSize:NSMakeSize(size.width,NSStringDrawerLargeDimension)];
++     need=[typeset->_layout usedRectForTextContainer:typeset->_container].size;
++     [typeset->_container setContainerSize:NSMakeSize(size.width,MAX(size.height,ceil(need.height)+1))];
++     typeset->_glyphs=[typeset->_layout glyphRangeForTextContainer:typeset->_container];
++    }
++   }
++   if([_sfTypeset count]>=SF_TYPESET_LIMIT){
++    [_sfTypesetOld release];
++    _sfTypesetOld=_sfTypeset;
++    _sfTypeset=nil;
++   }
++   if(_sfTypeset==nil)
++    _sfTypeset=[[NSMutableDictionary alloc] init];
++   [_sfTypeset setObject:typeset forKey:key];
++   return typeset;
++}
++
++/* A one-style string that fits on one line in the rectangle is laid out the same in any rectangle as wide or
++ * wider, only placed by its alignment: it is laid out for its own width and placed here, so that a rectangle
++ * whose width changes (a table column being dragged, a window being resized) finds it laid out already. */
++-(SFTypeset *)_sfTypesetFor:(NSAttributedString *)astring inRect:(NSRect)rect offset:(CGFloat *)offset {
++   NSUInteger length=[astring length];
++
++   *offset=0;
++   if(length>0 && length<=256 && rect.size.width>0){
++    NSRange run=NSMakeRange(0,0);
++    NSDictionary *attributes=[astring attributesAtIndex:0 longestEffectiveRange:&run inRange:NSMakeRange(0,length)];
++
++    if(run.location==0 && run.length==length && [[astring string] rangeOfCharacterFromSet:[NSCharacterSet newlineCharacterSet]].location==NSNotFound){
++     NSSize natural=[self sizeOfString:[astring string] withAttributes:attributes inSize:NSZeroSize];
++     NSParagraphStyle *style=[attributes objectForKey:NSParagraphStyleAttributeName];
++     NSTextAlignment alignment=(style!=nil)?[style alignment]:NSLeftTextAlignment;
++     CGFloat width=ceil(natural.width)+1;
++
++     if(width<rect.size.width && alignment!=NSJustifiedTextAlignment){
++      if(alignment==NSRightTextAlignment)
++       *offset=rect.size.width-width;
++      else if(alignment==NSCenterTextAlignment)
++       *offset=(rect.size.width-width)/2;
++      return [self _sfTypesetFor:astring size:NSMakeSize(width,rect.size.height)];
++     }
++    }
++   }
++   return [self _sfTypesetFor:astring size:rect.size];
++}
++
+ -(void)drawAttributedString:(NSAttributedString *)astring inRect:(NSRect)rect {
+    NSRange glyphRange;
++   CGFloat offset=0;
++   SFTypeset *typeset=[self _sfTypesetFor:astring inRect:rect offset:&offset];
+ 
++   if(typeset!=nil){
++    NSPoint at=NSMakePoint(rect.origin.x+offset,rect.origin.y);
++
++    [typeset->_layout drawBackgroundForGlyphRange:typeset->_glyphs atPoint:at];
++    [typeset->_layout drawGlyphsForGlyphRange:typeset->_glyphs atPoint:at];
++    return;
++   }
+    [_textContainer setContainerSize:rect.size];
+    [_textStorage setAttributedString:astring];
+ 
+--- a/src/Frameworks/AppKit/NSWindow.m
++++ b/src/Frameworks/AppKit/NSWindow.m
+@@ -1084,6 +1084,21 @@
+ }
+ 
+ -(void)setFrame:(NSRect)newFrame display:(BOOL)display animate:(BOOL)animate tellWS:(BOOL)tellWS {
++    // SF_WINFRAME_TRACE: each change of a window's frame and who asked (where a window shrank)
++    static int frameTrace = -1;
++
++    if (frameTrace < 0)
++        frameTrace = getenv("SF_WINFRAME_TRACE") != NULL;
++    if (frameTrace && !NSEqualRects(newFrame, _frame)) {
++        extern int backtrace(void **frames, int size);
++        extern void backtrace_symbols_fd(void *const *frames, int size, int fd);
++        void *frames[14];
++
++        fprintf(stderr, "PD-WINFRAME %s %p %s -> %s tellWS=%d\n", object_getClassName(self), self, [NSStringFromRect(_frame) UTF8String],
++                [NSStringFromRect(newFrame) UTF8String], tellWS);
++        fflush(stderr);
++        backtrace_symbols_fd(frames, backtrace(frames, 14), 2);
++    }
+     if (NSEqualSizes([self minSize], NSMakeSize(0, 0)) == NO) {
+        newFrame.size.width = MAX(NSWidth(newFrame), [self minSize].width);
+        newFrame.size.height = MAX(NSHeight(newFrame), [self minSize].height);
+--- a/src/Frameworks/AppKit/NSClipView.m
++++ b/src/Frameworks/AppKit/NSClipView.m
+@@ -6,15 +6,22 @@
+ 
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+ 
++#include <math.h>
++#include <stdlib.h>
+ #import <AppKit/NSClipView.h>
+ #import <AppKit/NSColor.h>
+ #import <AppKit/NSGraphics.h>
+ #import <AppKit/NSScrollView.h>
++#import <AppKit/NSScroller.h>
+ #import <AppKit/NSEvent.h>
+ #import <AppKit/NSCursor.h>
+ #import <Foundation/NSKeyedArchiver.h>
+ #import <AppKit/NSRaise.h>
+ 
++@interface NSScroller (SFOverlay)
++-(BOOL)_sfOverlay;
++@end
++
+ @implementation NSClipView
+ 
+ -(void)encodeWithCoder:(NSCoder *)coder {
+@@ -29,6 +36,7 @@
+     unsigned           flags=[keyed decodeIntForKey:@"NScvFlags"];
+ 
+     _drawsBackground=(flags&0x04)?YES:NO;
++    _copiesOnScroll=YES;   // macOS's default; the nib's flag for it is not known here
+     _backgroundColor=[[keyed decodeObjectForKey:@"NSBGColor"] retain];
+     _docView=[[keyed decodeObjectForKey:@"NSDocView"] retain];
+ 
+@@ -50,6 +58,7 @@
+    [super initWithFrame:frame];
+    _backgroundColor=[[NSColor controlBackgroundColor] retain];
+    _drawsBackground=YES;
++   _copiesOnScroll=YES;   // as on macOS
+    return self;
+ }
+ 
+@@ -262,12 +271,78 @@
+     }
+ }
+ 
++// the room an overlay scroller takes over the content: not copied, drawn again
++#define SF_CLIP_SCROLLER_ROOM 20
++
++/* As on macOS with copiesOnScroll (the default): what stays visible is copied to its new place in the window
++ * and only what the scroll uncovers is drawn. Every scroll step drew the whole visible document again (a table
++ * of processes, a sample's text: the owner's scrolling lag). Not when something is waiting to be drawn (it would
++ * be copied as it was), for a move of the whole height or width, or with layers; SF_CLIP_NO_COPY=1 never copies.
++ * The strips under overlay scrollers are drawn again (the scroller is drawn over them). */
++-(BOOL)_sfScrollByCopyingTo:(NSPoint)point {
++   static int noCopy=-1;
++   NSRect     old=[self bounds];
++   CGFloat    dx=point.x-old.origin.x,dy=point.y-old.origin.y;
++   NSWindow  *window=[self window];
++
++   if(noCopy<0)
++    noCopy=getenv("SF_CLIP_NO_COPY")!=NULL;
++   if(noCopy || !_copiesOnScroll || window==nil || [window viewsNeedDisplay] || [self layer]!=nil || [_docView layer]!=nil ||
++      fabs(dx)>=NSWidth(old) || fabs(dy)>=NSHeight(old) || [_docView isHidden])
++    return NO;
++
++   CGFloat right=0,below=0;
++   id      sv=[self superview];
++
++   if([sv isKindOfClass:[NSScrollView class]]){
++    id vs=[sv hasVerticalScroller]?[sv verticalScroller]:nil,hs=[sv hasHorizontalScroller]?[sv horizontalScroller]:nil;
++
++    // a scroll reveals an overlay scroller: its strip is drawn again whether it shows now or not
++    if([vs respondsToSelector:@selector(_sfOverlay)] && [vs _sfOverlay])
++     right=SF_CLIP_SCROLLER_ROOM;
++    if([hs respondsToSelector:@selector(_sfOverlay)] && [hs _sfOverlay])
++     below=SF_CLIP_SCROLLER_ROOM;
++   }
++
++   NSRect r=old;
++   r.size.width-=right;
++   if([self isFlipped])
++    r.size.height-=below;
++   else {
++    r.origin.y+=below;
++    r.size.height-=below;
++   }
++   if(r.size.width>0 && r.size.height>0)
++    [self scrollRect:r by:NSMakeSize(-dx,-dy)];
++   [self setBoundsOrigin:point];
++
++   NSRect now=[self bounds];
++
++   // what the scroll uncovered
++   if(dy>0)
++    [self setNeedsDisplayInRect:NSMakeRect(NSMinX(now),NSMaxY(now)-dy,NSWidth(now),dy)];
++   else if(dy<0)
++    [self setNeedsDisplayInRect:NSMakeRect(NSMinX(now),NSMinY(now),NSWidth(now),-dy)];
++   if(dx>0)
++    [self setNeedsDisplayInRect:NSMakeRect(NSMaxX(now)-dx,NSMinY(now),dx,NSHeight(now))];
++   else if(dx<0)
++    [self setNeedsDisplayInRect:NSMakeRect(NSMinX(now),NSMinY(now),-dx,NSHeight(now))];
++   // under the scrollers
++   if(right>0)
++    [self setNeedsDisplayInRect:NSMakeRect(NSMaxX(now)-right,NSMinY(now),right,NSHeight(now))];
++   if(below>0)
++    [self setNeedsDisplayInRect:NSMakeRect(NSMinX(now),[self isFlipped]?NSMaxY(now)-below:NSMinY(now),NSWidth(now),below)];
++   return YES;
++}
++
+ -(void)scrollToPoint:(NSPoint)point {
+    point=[self constrainScrollPoint:point];
+     // Not need for more work and a full redislay if we don't really scroll
+     if (!NSEqualPoints(point, _bounds.origin)) {
+-        [self setBoundsOrigin:point];
+-        [self setNeedsDisplay:YES];
++        if(![self _sfScrollByCopyingTo:point]){
++         [self setBoundsOrigin:point];
++         [self setNeedsDisplay:YES];
++        }
+ 
+         if([[self superview] isKindOfClass:[NSScrollView class]])
+             [[self superview] reflectScrolledClipView:self];
+--- a/src/Frameworks/AppKit/NSScroller.m
++++ b/src/Frameworks/AppKit/NSScroller.m
+@@ -97,6 +97,11 @@
+    return ![self _sfOverlay];
+ }
+ 
++// an overlay scroller drawn over the content now (not faded out): what is under it is not the content's alone
++-(BOOL)_sfOverlayShowing {
++   return [self _sfOverlay] && _sfOverlayAlpha>0;
++}
++
+ // a faded overlay scroller lets clicks through to the content under it
+ -(NSView *)hitTest:(NSPoint)point {
+    if([self _sfOverlay] && _sfOverlayAlpha<=0)
+--- a/src/Frameworks/AppKit/NSGradient.m
++++ b/src/Frameworks/AppKit/NSGradient.m
+@@ -186,7 +186,38 @@
+ 	CGPoint tanSize; 
+ 
+ 	angle = (CGFloat)fmod(angle, 360);
+-	
++	if (angle < 0)
++		angle += 360;
++
++	/* Straight up or down in a context that is not turned: one colour per row of device pixels. The shading
++	 * asked the gradient's function for every pixel (a table header's cells cost a millisecond each, drawn at
++	 * every step of a column drag). The rows are filled without antialiasing, so that rows that do not fall on
++	 * device pixels neither overlap nor leave the background between them. */
++	{
++		CGContextRef context = [[NSGraphicsContext currentContext] graphicsPort];
++		CGAffineTransform m = CGContextGetUserSpaceToDeviceSpaceTransform(context);
++		CGFloat rows = fabs(rect.size.height * m.d);
++
++		if ((angle == 90 || angle == 270) && m.b == 0 && m.c == 0 && rows >= 1 && rows <= 4096 && _numberOfComponents == 4) {
++			NSInteger i, n = (NSInteger)ceil(rows - 0.01);
++			CGFloat slice = rect.size.height / n;
++
++			CGContextSaveGState(context);
++			CGContextSetShouldAntialias(context, false);
++			for (i = 0; i < n; i++) {
++				CGFloat input[1] = { (i + 0.5) / n }, output[4];
++
++				if (angle == 270)
++					input[0] = 1 - input[0];
++				evaluate(self, input, output);
++				CGContextSetRGBFillColor(context, output[0], output[1], output[2], output[3]);
++				CGContextFillRect(context, CGRectMake(rect.origin.x, rect.origin.y + i * slice, rect.size.width, slice));
++			}
++			CGContextRestoreGState(context);
++			return;
++		}
++	}
++
+ 	if (angle < 90)
+ 	{
+ 		start = CGPointMake(rect.origin.x, rect.origin.y);

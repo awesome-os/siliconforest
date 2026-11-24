@@ -1,0 +1,39 @@
+SiliconForest, tip only: keep SFGOP buildable against the static string-matching IOKit.
+
+Upstream f8715cf9 removed SFGOP.c's `#ifdef _SF_IOKITLIB_H` branch (SFIOKitLib's
+string-based IOServiceMatching/IOServiceGetMatchingService) and left only the
+CoreFoundation form, which needs IOKit.framework. The lab links SFGOP statically
+with the string-based libIOKit.a into the compositor and the Mesa tests (no
+CoreFoundation in those links). This restores the branch exactly as it was at
+e7aa00a6; with IOKit.framework's header the CF form is still what compiles.
+
+diff --git a/src/Libraries/SFGOP/SFGOP.c b/src/Libraries/SFGOP/SFGOP.c
+index 99025b0c..fdf43547 100644
+--- a/src/Libraries/SFGOP/SFGOP.c
++++ b/src/Libraries/SFGOP/SFGOP.c
+@@ -42,7 +42,11 @@ kern_return_t
+ SFGOPOpen(SFGOPFramebuffer *fb)
+ {
+     kern_return_t kr;
++#ifdef _SF_IOKITLIB_H
++    char *matching;
++#else
+     CFDictionaryRef matching;
++#endif
+     uint64_t scalarOut[2] = {0, 0};
+     uint32_t scalarOutCnt = 2;
+     uint64_t scalarIn[3];
+@@ -76,8 +80,13 @@ SFGOPOpen(SFGOPFramebuffer *fb)
+         if (matching == NULL) {
+             continue;
+         }
++#ifdef _SF_IOKITLIB_H
++        kr = IOServiceGetMatchingService(fb->masterPort, matching,
++            &fb->service);
++#else
+         fb->service = IOServiceGetMatchingService(fb->masterPort, matching);
+         kr = fb->service != IO_OBJECT_NULL ? KERN_SUCCESS : KERN_FAILURE;
++#endif
+         if (fb->service != IO_OBJECT_NULL) {
+             char serviceName[128] = {0};
+             if (IORegistryEntryGetName(fb->service, serviceName) == KERN_SUCCESS)

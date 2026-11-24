@@ -1,0 +1,143 @@
+--- a/src/Frameworks/AppKit/NSTableHeaderCell.m
++++ b/src/Frameworks/AppKit/NSTableHeaderCell.m
+@@ -9,28 +9,73 @@
+ #import <AppKit/NSGraphicsStyle.h>
+ #import <AppKit/NSRaise.h>
+ 
++#import <objc/runtime.h>
++
++// the slot of the sort indicator at the cell's trailing edge: the chevron and the room round it
++#define SF_SORT_SLOT 18.0
++#define SF_SORT_W     9.0
++#define SF_SORT_H     6.0
++static char sfShowsIndicatorKey;
++
+ @implementation NSTableHeaderCell
+ 
++/* The header view says, before it draws the cell, whether the column shows a sort indicator: the title then
++ * ends before the indicator's slot (right-aligned titles end there, left-aligned ones are cut with an ellipsis
++ * before it), as on macOS. It was drawn over the title (Activity Monitor's "% CPU" and the chevron on top of
++ * each other). */
++- (void)_sfSetShowsSortIndicator:(BOOL)flag {
++   objc_setAssociatedObject(self,&sfShowsIndicatorKey,flag ? (id)kCFBooleanTrue : nil,OBJC_ASSOCIATION_ASSIGN);
++}
++
++- (BOOL)_sfShowsSortIndicator {
++   return objc_getAssociatedObject(self,&sfShowsIndicatorKey)!=nil;
++}
++
+ - (NSRect)sortIndicatorRectForBounds:(NSRect)bounds {
+-   NSUnimplementedMethod();
+-   return bounds;
++   return NSMakeRect(NSMaxX(bounds)-SF_SORT_SLOT+(SF_SORT_SLOT-SF_SORT_W)/2,NSMidY(bounds)-SF_SORT_H/2,SF_SORT_W,SF_SORT_H);
+ }
+ 
++// a chevron, up for ascending, in the secondary label colour
+ - (void)drawSortIndicatorWithFrame:(NSRect)frame inView:(NSView *)controlView ascending:(BOOL)ascending priority:(NSInteger)priority {
+-   NSUnimplementedMethod();
++   NSRect r=[self sortIndicatorRectForBounds:frame];
++   BOOL up=[controlView isFlipped] ? !ascending : ascending;
++   NSBezierPath *p=[NSBezierPath bezierPath];
++
++   if(priority!=0)
++    return;
++   if(controlView!=nil)
++    r=[controlView centerScanRect:r];
++   if(up){
++    [p moveToPoint:NSMakePoint(NSMinX(r),NSMaxY(r))];
++    [p lineToPoint:NSMakePoint(NSMidX(r),NSMinY(r))];
++    [p lineToPoint:NSMakePoint(NSMaxX(r),NSMaxY(r))];
++   }
++   else {
++    [p moveToPoint:NSMakePoint(NSMinX(r),NSMinY(r))];
++    [p lineToPoint:NSMakePoint(NSMidX(r),NSMaxY(r))];
++    [p lineToPoint:NSMakePoint(NSMaxX(r),NSMinY(r))];
++   }
++   [p setLineWidth:1.5];
++   [p setLineCapStyle:NSRoundLineCapStyle];
++   [p setLineJoinStyle:NSRoundLineJoinStyle];
++   [[NSColor secondaryLabelColor] setStroke];
++   [p stroke];
+ }
+ 
+ - (NSRect)titleRectForBounds:(NSRect)rect {
+    rect.origin.x   += 3.0;
+    rect.origin.y   += 2.5;
+    rect.size.width -= 6.0;
++   if([self _sfShowsSortIndicator])
++    rect.size.width=MAX(0,rect.size.width-(SF_SORT_SLOT-3.0));
+    return rect;
+ }
+ 
+ - (void)drawWithFrame:(NSRect)cellFrame inView:(NSView *)controlView {
+    _controlView=controlView;
+    [[controlView graphicsStyle] drawTableViewHeaderInRect:cellFrame highlighted:[self isHighlighted]];
+-   [[self attributedStringValue] _clipAndDrawInRect:[self titleRectForBounds:cellFrame] truncatingTail:(_lineBreakMode > NSLineBreakByClipping)];
++   // a title too wide for its place is cut with an ellipsis rather than run into the indicator or the next column
++   [[self attributedStringValue] _clipAndDrawInRect:[self titleRectForBounds:cellFrame] truncatingTail:YES];
+ }
+ 
+ @end
+--- a/src/Frameworks/AppKit/NSTableHeaderView.m
++++ b/src/Frameworks/AppKit/NSTableHeaderView.m
+@@ -100,32 +100,33 @@
+ // the sort indicator: the image the table was given for the column (-setIndicatorImage:inTableColumn:),
+ // or, for the highlighted column without one, a chevron in the direction of the table's first sort
+ // descriptor (this AppKit has no NSAscendingSortIndicator image)
+--(void)_sfDrawSortIndicatorForColumn:(NSTableColumn *)column inRect:(NSRect)rect {
++-(BOOL)_sfColumnShowsSortIndicator:(NSTableColumn *)column {
+     NSImage *image = [_tableView respondsToSelector:@selector(indicatorImageInTableColumn:)] ? [_tableView indicatorImageInTableColumn:column] : nil;
+     BOOL highlighted = [_tableView respondsToSelector:@selector(highlightedTableColumn)] && [_tableView highlightedTableColumn] == column;
+-    if (image == nil && !highlighted)
++
++    return image != nil || highlighted;
++}
++
++// the sort indicator in the header cell's own slot (-sortIndicatorRectForBounds:): the image the table was given
++// for the column, or a chevron in the direction of the table's first sort descriptor
++-(void)_sfDrawSortIndicatorForColumn:(NSTableColumn *)column inRect:(NSRect)rect {
++    NSImage *image = [_tableView respondsToSelector:@selector(indicatorImageInTableColumn:)] ? [_tableView indicatorImageInTableColumn:column] : nil;
++    NSTableHeaderCell *cell = [column headerCell];
++
++    if (![self _sfColumnShowsSortIndicator:column])
+         return;
+-    NSRect r = NSMakeRect(NSMaxX(rect) - 16, NSMinY(rect) + (NSHeight(rect) - 8) / 2, 9, 8);
+     if (image != nil && [image size].width > 1) {
+-        [image drawInRect:r fromRect:NSZeroRect operation:NSCompositeSourceOver fraction:1.0];
++        NSSize size = [image size];
++        NSRect slot = [cell sortIndicatorRectForBounds:rect];
++        NSRect r = NSMakeRect(NSMidX(slot) - size.width / 2, NSMidY(slot) - size.height / 2, size.width, size.height);
++
++        [image drawInRect:[self centerScanRect:r] fromRect:NSZeroRect operation:NSCompositeSourceOver fraction:1.0];
+         return;
+     }
+     NSArray *sort = [_tableView sortDescriptors];
+     BOOL ascending = [sort count] ? [[sort objectAtIndex:0] ascending] : YES;
+-    BOOL up = [self isFlipped] ? !ascending : ascending;
+-    NSBezierPath *p = [NSBezierPath bezierPath];
+-    if (up) {
+-        [p moveToPoint:NSMakePoint(NSMinX(r), NSMaxY(r) - 2)];
+-        [p lineToPoint:NSMakePoint(NSMidX(r), NSMinY(r) + 2)];
+-        [p lineToPoint:NSMakePoint(NSMaxX(r), NSMaxY(r) - 2)];
+-    } else {
+-        [p moveToPoint:NSMakePoint(NSMinX(r), NSMinY(r) + 2)];
+-        [p lineToPoint:NSMakePoint(NSMidX(r), NSMaxY(r) - 2)];
+-        [p lineToPoint:NSMakePoint(NSMaxX(r), NSMinY(r) + 2)];
+-    }
+-    [p setLineWidth:1.5];
+-    [[NSColor secondaryLabelColor] setStroke];
+-    [p stroke];
++
++    [cell drawSortIndicatorWithFrame:rect inView:self ascending:ascending priority:0];
+ }
+ 
+ -(void)drawRect:(NSRect)rect {
+@@ -147,6 +148,8 @@
+         columnRect.size.width = [column width] + spacing.width;
+         [[column headerCell] setHighlighted:[_tableView isColumnSelected:[[_tableView tableColumns] indexOfObject:column]]];
+         [[column headerCell] setControlView:self];
++        if ([[column headerCell] respondsToSelector:@selector(_sfSetShowsSortIndicator:)])
++            [(id)[column headerCell] _sfSetShowsSortIndicator:[self _sfColumnShowsSortIndicator:column]];
+         [[column headerCell] drawWithFrame:columnRect inView:self];        
+         [self _sfDrawSortIndicatorForColumn:column inRect:columnRect];
+         columnRect.origin.x += [column width] + spacing.width;

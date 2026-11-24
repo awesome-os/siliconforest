@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "record": "window-independent-review",
+  "recorded_at": "2026-11-08T01:57:48Z",
+  "reviewer": "Claude (independent, read-only source review; host scratch tests only)",
+  "subject": "J293/T8103 bounded CDC proxy window in sources/m1n1-boot-window (base 121fcbf35d4501814b58ca5347926a4173b6a512)",
+  "scope": {
+    "files_written": ["reports/sprint-008/window-independent-review.json"],
+    "source_edits": false, "build": false, "ssh": false, "hardware_accessed": false,
+    "maclab_server_contacted": false,
+    "host_scratch_tests": "Compiled integrations/m1-boot-window/test_window.c plus a reviewer adversarial test against the candidate's m1_boot_window.c in the reviewer scratchpad; both passed."
+  },
+  "reviewed_sha256": {
+    "git_diff_vs_base": "8dfd5696c019732ac5aefe433d6e22349370dfcf1514f6fe96085769280c0a80",
+    "Makefile": "7110933cebd76507656d752104cab30196a4e2664c2cc2df3a0ebd4a3494d103",
+    "src/main.c": "9c09b0849badab4d59e726b555227ccc14eafdcf7bb0745dc94a6724631b1a8c",
+    "src/uartproxy.c": "b842794d10dd16813c2c68ccfcbd0260a0363e9f199206603cf02cc43cbf783e",
+    "src/uartproxy.h": "1121de61b3cff9f11b883f2ca9a2595683e9b44caaee7a2794693af8f672f7d6",
+    "src/m1_boot_window.c": "e293b9355bbbba41f7ab59bc799e37c1e0beef5ba59cff15e718b92cac06e454",
+    "src/m1_boot_window.h": "f05a597ec3733065a4e886af35cbb2401fbb4afdfef465ce94e4e8d5ffb55a95",
+    "integrations/m1-boot-window/test_window.c": "d2cf223cd1cc95b28c724b3c2bb47ae128085ace513c473cf226466071ba7056",
+    "integrations/m1-boot-window/test_candidate.py": "9e90bb9d9fc567a5aec7470f213c174a9c0a5ecb54d148e96af46a001820b5ef"
+  },
+  "verdict": "NO_BOOT_BLOCKING_DEFECT; ONE_HANDOFF_STATE_FINDING_TO_RESOLVE_BEFORE_UNATTENDED_ROLLOUT",
+  "contract_checks": [
+    {"requirement": "No host, partial frame or bad NOP can block Linux", "result": "PASS",
+     "evidence": "uartproxy_wait_m1_boot_window: monotonic get_ticks deadline checked before every byte read and in the outer loop; reads only after iodev_can_read>0, one byte at a time, a 256-byte budget per port per pass, and mdelay(1) between passes. Expiry returns false, main.c prints and falls through to the unchanged payload path. With a valid trailer, stage1_proxy_payload_action returns NATIVE before consulting any USB state (src/stage1_proxy.c:37-38)."},
+    {"requirement": "Only a fully checksum-validated NOP claims", "result": "PASS",
+     "evidence": "valid_nop requires ff 55 aa 00 (REQ_NOP) and the m1n1 wire checksum (init 0xDEADBEEF, x31337 + (b^0x5A) over 60 bytes, ^0xADDEDBAD), identical to uartproxy.c:222-256, using a per-port rolling 64-byte window. Scratch tests: valid REQ_PROXY, a single bit flip and a NOP split across ports never claim; noise followed by a valid NOP claims on the correct port."},
+    {"requirement": "Deadline checked through reads", "result": "PASS",
+     "evidence": "m1_boot_window_feed applies expiry before accepting any byte, so expiry wins even on the final byte of a valid NOP, and TIMEOUT is sticky (scratch-tested). Note: usb_init/usb_iodev_init run before the window clock starts, so total added boot time is USB bring-up plus 10 s."},
+    {"requirement": "Normal NOP dispatcher, reply and feature state unchanged", "result": "PASS for the proxy",
+     "evidence": "The claimed 64 bytes are copied into UartRequest from .type (layout _pad,type,union,checksum); uartproxy_run uses them once on window_iodev, re-verifies the checksum and dispatches normally; later iterations use the unchanged sync path. Exception-mode (start != NULL) behavior is unchanged."},
+    {"requirement": "No duplicate USB init", "result": "PASS (configuration-dependent)",
+     "evidence": "The window sets run_actions' local usb_up before usb_init/usb_iodev_init, so the later fallback guard skips re-init (main.c:245). uartproxy_wait_stage1 initializes USB itself, but stage1_config_window_ms returns 0 unless J613_ESP_STAGE1 || (CHAINLOADING && !ESP_STAGE2) (stage1_config.c:12), and the Makefile forces ESP_STAGE2=1 for M1_BOOT_WINDOW. main.c rejects EARLY_PROXY_TIMEOUT, USE_DEBUG_USB and BRINGUP."},
+    {"requirement": "No privileged success stubs", "result": "PASS", "evidence": "No stubbed results; a claim enters the real proxy, and after acquisition Linux fallthrough is deliberately forbidden until a next stage is set."},
+    {"requirement": "Wrong board has no effect", "result": "PASS",
+     "evidence": "m1_boot_window_allowed requires chip_id 0x8103, ADT target-type exactly J293 with length 5, and a non-debug build; otherwise no USB init and no window. Scratch-tested against J313, T8112, debug, NULL, wrong length and extra characters. The code is compiled only with M1_BOOT_WINDOW=1 plus ESP_STAGE2=1."}
+  ],
+  "findings": [
+    {"id": "W1", "severity": "should_fix_or_prove_before_unattended_rollout (not boot-blocking)",
+     "finding": "Every J293 boot now runs usb_init, whose usb_init_one calls tps6598x_powerup and tps6598x_disable_irqs: all port-controller interrupt flags are acknowledged and INT_MASK1 is written to zero (src/usb.c:310-321, src/tps6598x.c:243-253). The saved masks are restored only by usb_hpm_restore_irqs, called from P_VECTOR (src/proxy.c:110) and HV init (src/hv/hv.c:175). The native Linux-trailer handoff tears down dwc3 (usb_iodev_shutdown, main.c:361-364) but never restores the masks. Before this candidate, a normal J293 stage-2 boot did not run usb_init, so Linux inherited untouched masks.",
+     "impact": "Linux boots, but its Type-C controller may start with all event interrupts masked unless the Linux tipd/cd321x driver rewrites INT_MASK1 at probe (not verified here). Possible effect: missed USB-C or PD events on the DFU port that also carries VDM serial.",
+     "fix_options": ["On window expiry, before falling through, call usb_hpm_restore_irqs(true), mirroring P_VECTOR.", "Or show on hardware that Linux reprograms the masks: compare tipd probe logs and interrupt counts after a window-expired boot against the baseline image."]},
+    {"id": "W2", "severity": "note",
+     "finding": "A successful claim deliberately prevents Linux fallthrough (main.c loops on uartproxy_run until next_stage.entry). If the host dies after claiming, the target stays in the proxy until an external reset. That is acceptable only because the S1 halt-and-VDM reset path is qualified; after a reset the window expires without a host and Linux boots."},
+    {"id": "W3", "severity": "integration_note",
+     "finding": "The window adds USB bring-up plus 10 s to every J293 boot; adjust the unattended return budgets (cycle 1 returned in about 25 s on the previous image). The custom build tag will not match host_console.py's pinned TAG check, which fails closed; the packet and receipt tooling must name this image explicitly."}
+  ],
+  "W1_follow_up": {
+    "recorded_at": "2026-11-08T02:16:04Z",
+    "status": "RESOLVED_IN_SOURCE_AND_LINKED_IMAGE_NOT_HARDWARE_VERIFIED",
+    "reviewed": {
+      "receipt": "reports/sprint-008/window-candidate-build.json attempt 4 (sha256 bef504e30642f6eedc413a1a16ed1f1a1070be9597d24f25e11da403c80a46d7)",
+      "candidate_patch_sha256": "1ef6a9743dc60f8c24c2edf69adeeec18430d554968ec23ef61e49b53ad5f959",
+      "source_tree_git_diff_sha256": "efbec25238c3de0a3e667e83cbd0f9aaeb55454afd9191ac5d8014de5e3d8b55",
+      "raw_m1n1_window_bin_sha256": "ba5bf4b396168ac540df852e3507c4342dd289eef7bf2c1fc29c50f11f0822bf",
+      "proposed_boot_bin_sha256": "e4ead838bb87a04dd00909edf8a598f813056ee2f9611777a4a77c4bf7351e27",
+      "linked_disassembly_sha256": "edc9b2671e3868126c62828a445c5a360930418623e94086470bd4c0fc288347"
+    },
+    "source_fix": "main.c records window_timed_out only on window expiry. In the payload_action == STAGE1_PAYLOAD_NATIVE branch it calls usb_hpm_restore_irqs(true) before returning to the unchanged next-stage handoff (usb_cdc_cleanup, usb_iodev_shutdown), mirroring P_VECTOR's restore-then-handoff order. The claimed-window path and the invalid-payload proxy fallback are unchanged.",
+    "partial_init_guards_verified_in_unmodified_upstream": "usb_hpm_restore_irqs_match rejects out-of-range HPM indices and requires tps6598x_irq_state[idx].valid (usb.c:358-371). tps6598x_disable_irqs returns before setting valid if the mask read fails and sets valid before the clear/mask writes (tps6598x.c:235-241), so only a genuinely saved INT_MASK1 is ever restored. force=true only bypasses the port-in-use check, as P_VECTOR does.",
+    "link_evidence": "In linked run_actions, stage1_proxy_payload_action's NATIVE result (cbz w0 to 0x4a1d4) tests the window_timed_out flag (tbz w19), then sets w0=1 and calls usb_hpm_restore_irqs at 0x4a1dc before the 'Valid payload found' debug_printf and return. The window call (uartproxy_wait_m1_boot_window at 0x4a0c4) precedes payload_run (0x4a154). The artifact hashes match the receipt.",
+    "remaining_limits": [
+      "Restore I2C failures are logged but the helper returns void; Linux could still inherit cleared masks on such a failure.",
+      "Event flags acknowledged by usb_init are not reconstructed.",
+      "Whether Linux tipd/cd321x behaves normally after the restored handoff is hardware-unverified.",
+      "First persistent boot needs one-time owner availability with a manual Recovery rollback; no non-persistent launch path exists in the original stage2."
+    ]
+  },
+  "limits": [
+    "Source review plus host scratch tests only; no ARM build, link or run by the reviewer.",
+    "Not verified: USB controller event handling cost, iodev_read non-blocking behavior when can_read>0 on the real dwc3 path, and console write behavior if a host holds the CDC port open without reading (inherited base behavior).",
+    "Linux tipd/cd321x mask handling at probe is unknown; W1 needs a fix or hardware evidence."
+  ],
+  "hardware_boot_observed": false
+}

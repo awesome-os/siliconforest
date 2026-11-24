@@ -1,0 +1,442 @@
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -597,6 +597,15 @@
+     }
+ }
+ 
++fn child_exec_facts(pty: &pty::Pty) -> serde_json::Value {
++    serde_json::json!({
++        "pre_exec_fd_check_observed":pty.pre_exec_fd_scan_bound().is_some(),
++        "pre_exec_fd_scan_bound_exclusive":pty.pre_exec_fd_scan_bound(),
++        "exec_status_pipe_eof_observed":pty.exec_status_pipe_eof_observed(),
++        "shell_exec_checked":pty.exec_checked(),
++        "inventory_scope":"pre_exec_only_not_after_exec_inventory"
++    })
++}
+ fn session(
+     stream: UnixStream,
+     instance: &str,
+@@ -630,7 +639,7 @@
+                 let mut child = log(dir, "child-ready.json")?;
+                 serde_json::to_writer_pretty(
+                     &mut child,
+-                    &serde_json::json!({"parent_pid":std::process::id(),"child_pid":pty.pid(),"sid":pty.pid(),"pgid":pty.pid(),"session_and_ctty_checked_in_child":true,"exec_status_pipe_closed":true,"shell":"/bin/sh"}),
++                    &serde_json::json!({"parent_pid":std::process::id(),"child_pid":pty.pid(),"sid":pty.pid(),"pgid":pty.pid(),"session_and_ctty_checked_in_child":true,"exec_status_pipe_closed":true,"exec_boundary":child_exec_facts(pty),"shell":"/bin/sh"}),
+                 )?;
+                 child.write_all(b"\n")?;
+                 child.sync_all()?;
+@@ -781,7 +790,7 @@
+     } else {
+         "deadline"
+     };
+-    *audit = serde_json::json!({"configure_serial":s.ssd.serial(),"ready":s.ready,"keymap":s.input.keys.ready(),"pty_exec_checked":pty.exec_checked(),"ssd":s.ssd.ready(),"frames":s.frames.callbacks,"commits":s.frames.commits,"pty_rx_bytes":received,"pty_tx_bytes":s.input.written,"input_accepted_bytes":s.input.accepted,"input_unsent_bytes":s.input.pending_len(),"unsupported_terminal_sequences":grid.unsupported,"stop_cause":stop_cause,"term_signal":STOP.load(Ordering::Relaxed),"window_closed":s.closed,"pty_eof":pty.eof});
++    *audit = serde_json::json!({"configure_serial":s.ssd.serial(),"ready":s.ready,"keymap":s.input.keys.ready(),"pty_exec_checked":pty.exec_checked(),"exec_boundary":child_exec_facts(pty),"ssd":s.ssd.ready(),"frames":s.frames.callbacks,"commits":s.frames.commits,"pty_rx_bytes":received,"pty_tx_bytes":s.input.written,"input_accepted_bytes":s.input.accepted,"input_unsent_bytes":s.input.pending_len(),"unsupported_terminal_sequences":grid.unsupported,"stop_cause":stop_cause,"term_signal":STOP.load(Ordering::Relaxed),"window_closed":s.closed,"pty_eof":pty.eof});
+     // Preserve a protocol failure even if writing the final grid also fails.
+     let grid_result = (|| -> Result<()> {
+         let mut final_grid = log(dir, "grid-final.txt")?;
+@@ -885,7 +894,7 @@
+             cleanup.complete = false;
+         }
+     }
+-    let record = serde_json::json!({"schema":1,"instance":instance,"app_pid":std::process::id(),"shell":"/bin/sh","term":"dumb","child_pid":child_pid,"session":audit,"cleanup":{"complete":cleanup.complete,"status":cleanup.status,"term_sent":cleanup.term_sent,"kill_sent":cleanup.kill_sent,"error":cleanup.error},"errors":errors});
++    let record = serde_json::json!({"schema":1,"instance":instance,"app_pid":std::process::id(),"shell":"/bin/sh","term":"dumb","child_pid":child_pid,"child_exec_boundary":pty.as_ref().map(child_exec_facts),"session":audit,"cleanup":{"complete":cleanup.complete,"status":cleanup.status,"term_sent":cleanup.term_sent,"kill_sent":cleanup.kill_sent,"error":cleanup.error},"errors":errors});
+     if let Err(error) = json_record(&dir, "result.json", &record) {
+         errors.push(format!("final record: {error}"));
+         cleanup.complete = false;
+--- a/src/pty.rs
++++ b/src/pty.rs
+@@ -22,17 +22,20 @@
+ const CTTY_REQUEST: libc::c_ulong = libc::TIOCSCTTY as libc::c_ulong;
+ #[cfg(not(target_vendor = "apple"))]
+ const CTTY_REQUEST: libc::c_ulong = libc::TIOCSCTTY;
++const FD_CHECKED: i32 = 9;
+ const READY: i32 = 10;
+ #[derive(Default, Debug)]
+ struct Status {
+     bytes: Vec<u8>,
+     ready: bool,
++    fd_checked: bool,
+     eof: bool,
+     failed: bool,
+ }
+ impl Status {
+-    fn feed(&mut self, data: &[u8], pid: i32) -> Result<()> {
++    fn feed(&mut self, data: &[u8], pid: i32, bound: i32, pipe: i32) -> Result<()> {
+         if self.eof || self.failed || self.bytes.len() + data.len() > 64 {
++            self.failed = true;
+             return Err(io::Error::other("invalid child status stream"));
+         }
+         self.bytes.extend_from_slice(data);
+@@ -44,25 +47,40 @@
+                 .map(|b| i32::from_ne_bytes(*b))
+                 .collect();
+             self.bytes.drain(..16);
+-            if vals[0] != MAGIC
+-                || vals[1] != READY
+-                || vals[2] != pid
+-                || vals[3] != pid
+-                || self.ready
+-            {
++            let valid = vals[0] == MAGIC
++                && match vals[1] {
++                    FD_CHECKED if !self.fd_checked && !self.ready => {
++                        if vals[2] == bound && vals[3] == pipe {
++                            self.fd_checked = true;
++                            true
++                        } else {
++                            false
++                        }
++                    }
++                    READY if self.fd_checked && !self.ready => {
++                        if vals[2] == pid && vals[3] == pid {
++                            self.ready = true;
++                            true
++                        } else {
++                            false
++                        }
++                    }
++                    _ => false,
++                };
++            if !valid {
+                 self.failed = true;
+                 return Err(io::Error::other(format!(
+                     "child setup failed stage={} errno={} group={}",
+                     vals[1], vals[2], vals[3]
+                 )));
+             }
+-            self.ready = true;
+         }
+         Ok(())
+     }
+     fn end(&mut self) -> Result<()> {
+         self.eof = true;
+-        if !self.ready || self.failed || !self.bytes.is_empty() {
++        if !self.fd_checked || !self.ready || self.failed || !self.bytes.is_empty() {
++            self.failed = true;
+             return Err(io::Error::other(
+                 "child status closed without complete setup",
+             ));
+@@ -70,7 +88,7 @@
+         Ok(())
+     }
+     fn exec_ok(&self) -> bool {
+-        self.ready && self.eof && !self.failed
++        self.fd_checked && self.ready && self.eof && !self.failed && self.bytes.is_empty()
+     }
+ }
+ fn checked(v: i32) -> Result<i32> {
+@@ -151,6 +169,37 @@
+         },
+     );
+     libc::_exit(126)
++}
++// Actual post-sweep observations; no allocation/open/repair below fork.
++unsafe fn fd_failure(pipe: i32, fd: i32, error: i32) -> ! {
++    emit(
++        pipe,
++        Record {
++            magic: MAGIC,
++            stage: 7,
++            value: error,
++            group: fd,
++        },
++    );
++    libc::_exit(126)
++}
++unsafe fn verify_child_fds(pipe: i32, bound: i32) {
++    for fd in 0..bound {
++        let flags = libc::fcntl(fd, libc::F_GETFD);
++        if fd < 3 || fd == pipe {
++            if flags < 0 {
++                fd_failure(pipe, fd, errno());
++            }
++            let expected = if fd == pipe { libc::FD_CLOEXEC } else { 0 };
++            if flags & libc::FD_CLOEXEC != expected {
++                fd_failure(pipe, fd, libc::EINVAL);
++            }
++        } else if flags >= 0 {
++            fd_failure(pipe, fd, libc::EBUSY);
++        } else if errno() != libc::EBADF {
++            fd_failure(pipe, fd, errno());
++        }
++    }
+ }
+ unsafe fn child(
+     slave: i32,
+@@ -208,10 +257,20 @@
+         }
+     }
+     for fd in 3..maxfd {
+-        if fd != pipe {
++        if fd != pipe && !(inject == 7 && fd == slave) {
+             libc::close(fd);
+         }
+     }
++    verify_child_fds(pipe, maxfd);
++    emit(
++        pipe,
++        Record {
++            magic: MAGIC,
++            stage: FD_CHECKED,
++            value: maxfd,
++            group: pipe,
++        },
++    );
+     emit(
+         pipe,
+         Record {
+@@ -238,6 +297,8 @@
+     status_fd: Option<OwnedFd>,
+     pid: i32,
+     status: Status,
++    fd_bound: i32,
++    child_exec_pipe: i32,
+     pub eof: bool,
+     pub received: usize,
+     started: Instant,
+@@ -334,6 +395,12 @@
+         let read = promote(read)?;
+         let write = promote(write)?;
+         nonblock(read.as_raw_fd())?;
++        let child_exec_pipe = write.as_raw_fd();
++        if child_exec_pipe < 3 || child_exec_pipe >= maxfd as i32 {
++            return Err(io::Error::other(
++                "exec-status pipe outside exact FD scan bound",
++            ));
++        }
+         let pid = unsafe { libc::fork() };
+         checked(pid)?;
+         if pid == 0 {
+@@ -354,6 +421,8 @@
+             status_fd: Some(read),
+             pid,
+             status: Status::default(),
++            fd_bound: maxfd as i32,
++            child_exec_pipe,
+             eof: false,
+             received: 0,
+             started: Instant::now(),
+@@ -373,6 +442,12 @@
+     pub fn exec_checked(&self) -> bool {
+         self.status.exec_ok()
+     }
++    pub fn pre_exec_fd_scan_bound(&self) -> Option<i32> {
++        self.status.fd_checked.then_some(self.fd_bound)
++    }
++    pub fn exec_status_pipe_eof_observed(&self) -> bool {
++        self.status.eof
++    }
+     pub fn fd(&self) -> i32 {
+         self.master.as_ref().map_or(-1, AsRawFd::as_raw_fd)
+     }
+@@ -387,7 +462,12 @@
+         loop {
+             let n = unsafe { libc::read(fd.as_raw_fd(), b.as_mut_ptr().cast(), b.len()) };
+             if n > 0 {
+-                self.status.feed(&b[..n as usize], self.pid)?;
++                self.status.feed(
++                    &b[..n as usize],
++                    self.pid,
++                    self.fd_bound,
++                    self.child_exec_pipe,
++                )?;
+             } else if n == 0 {
+                 self.status.end()?;
+                 if let Some(fd) = self.status_fd.take() {
+@@ -536,24 +616,35 @@
+             .flat_map(i32::to_ne_bytes)
+             .collect()
+     }
+-    #[test]
+-    fn split_exec_protocol_and_failure_after_setup() {
+-        let bytes = status_bytes(Record {
++    fn setup_bytes() -> Vec<u8> {
++        let mut bytes = status_bytes(Record {
++            magic: MAGIC,
++            stage: FD_CHECKED,
++            value: 128,
++            group: 7,
++        });
++        bytes.extend(status_bytes(Record {
+             magic: MAGIC,
+             stage: READY,
+             value: 42,
+             group: 42,
+-        });
+-        for split in 0..=16 {
++        }));
++        bytes
++    }
++    #[test]
++    fn split_fd_check_and_exec_protocol_requires_all_observations() {
++        let bytes = setup_bytes();
++        for split in 0..=bytes.len() {
+             let mut s = Status::default();
+-            s.feed(&bytes[..split], 42).unwrap();
+-            s.feed(&bytes[split..], 42).unwrap();
++            s.feed(&bytes[..split], 42, 128, 7).unwrap();
++            s.feed(&bytes[split..], 42, 128, 7).unwrap();
++            assert!(s.fd_checked && s.ready);
+             assert!(!s.exec_ok());
+             s.end().unwrap();
+             assert!(s.exec_ok());
+         }
+         let mut s = Status::default();
+-        s.feed(&bytes, 42).unwrap();
++        s.feed(&bytes, 42, 128, 7).unwrap();
+         assert!(s
+             .feed(
+                 &status_bytes(Record {
+@@ -562,25 +653,51 @@
+                     value: 2,
+                     group: 0
+                 }),
+-                42
++                42,
++                128,
++                7
+             )
+             .is_err());
++        assert!(s.fd_checked);
+         assert!(!s.exec_ok());
+     }
+     #[test]
+-    fn missing_partial_wrong_owner_rejected() {
+-        for n in 0..16 {
++    fn missing_partial_wrong_bound_pipe_and_order_fail_closed() {
++        let bytes = setup_bytes();
++        for n in 0..bytes.len() {
+             let mut s = Status::default();
+-            let b = status_bytes(Record {
++            s.feed(&bytes[..n], 42, 128, 7).unwrap();
++            assert!(s.end().is_err());
++        }
++        for record in [
++            Record {
+                 magic: MAGIC,
+                 stage: READY,
+                 value: 42,
+                 group: 42,
+-            });
+-            s.feed(&b[..n], 42).unwrap();
+-            assert!(s.end().is_err());
++            },
++            Record {
++                magic: MAGIC,
++                stage: FD_CHECKED,
++                value: 129,
++                group: 7,
++            },
++            Record {
++                magic: MAGIC,
++                stage: FD_CHECKED,
++                value: 128,
++                group: 8,
++            },
++        ] {
++            assert!(Status::default()
++                .feed(&status_bytes(record), 42, 128, 7)
++                .is_err());
+         }
+         let mut s = Status::default();
++        s.feed(&bytes[..16], 42, 128, 7).unwrap();
++        assert!(s.feed(&bytes[..16], 42, 128, 7).is_err());
++        let mut s = Status::default();
++        s.feed(&bytes[..16], 42, 128, 7).unwrap();
+         assert!(s
+             .feed(
+                 &status_bytes(Record {
+@@ -589,9 +706,33 @@
+                     value: 42,
+                     group: 7
+                 }),
+-                42
++                42,
++                128,
++                7
+             )
+             .is_err());
++    }
++    #[test]
++    fn partial_error_after_checked_setup_cannot_become_exec_success_at_eof() {
++        let mut s = Status::default();
++        s.feed(&setup_bytes(), 42, 128, 7).unwrap();
++        s.feed(
++            &status_bytes(Record {
++                magic: MAGIC,
++                stage: 6,
++                value: 2,
++                group: 0,
++            })[..8],
++            42,
++            128,
++            7,
++        )
++        .unwrap();
++        assert!(s.end().is_err());
++        assert!(s.fd_checked);
++        assert!(s.eof);
++        assert!(!s.exec_ok());
++        assert!(s.feed(&[], 42, 128, 7).is_err());
+     }
+     fn drive(p: &mut Pty) -> Result<Vec<u8>> {
+         let mut out = Vec::new();
+@@ -610,6 +751,58 @@
+             std::thread::sleep(Duration::from_millis(5));
+         }
+         Ok(out)
++    }
++    #[test]
++    fn host_real_pre_exec_fd_check_and_exec_without_proc() {
++        let sentinel = std::fs::File::open("/dev/null").unwrap();
++        assert_eq!(
++            unsafe { libc::fcntl(sentinel.as_raw_fd(), libc::F_SETFD, 0) },
++            0
++        );
++        let mut p =
++            Pty::spawn("/bin/sh", &["sh", "-c", "printf checked_child"], 80, 24, 0).unwrap();
++        let output = drive(&mut p).unwrap();
++        assert_eq!(output, b"checked_child");
++        assert_eq!(
++            p.pre_exec_fd_scan_bound(),
++            Some(unsafe { libc::sysconf(libc::_SC_OPEN_MAX) } as i32)
++        );
++        assert!(p.exec_status_pipe_eof_observed());
++        assert!(p.exec_checked());
++        let cleanup = p.cleanup();
++        assert!(cleanup.complete);
++        assert_eq!(cleanup.status, Some(0));
++    }
++    #[test]
++    fn host_live_extra_fd_cannot_become_checked_setup_or_exec() {
++        // Only this cfg(test) constructor can request the deliberate slave leak.
++        let mut p =
++            Pty::spawn("/bin/sh", &["sh", "-c", "printf must_not_exec"], 80, 24, 7).unwrap();
++        let error = drive(&mut p).unwrap_err();
++        assert!(error.to_string().contains("stage=7"), "{error}");
++        assert!(
++            error
++                .to_string()
++                .contains(&format!("errno={}", libc::EBUSY)),
++            "{error}"
++        );
++        assert!(p.pre_exec_fd_scan_bound().is_none());
++        assert!(!p.exec_checked());
++        let cleanup = p.cleanup();
++        assert!(cleanup.complete);
++        // Cleanup's deliberate TERM can race the failing child's _exit(126).
++        // Keep its actual terminal wait status rather than requiring one cause.
++        let raw = cleanup.status.unwrap();
++        assert!(libc::WIFEXITED(raw) || libc::WIFSIGNALED(raw));
++    }
++    #[test]
++    fn host_exec_failure_retains_pre_exec_fd_fact_without_exec_success() {
++        let mut p = Pty::spawn("/does/not/exist", &["sh"], 80, 24, 0).unwrap();
++        let error = drive(&mut p).unwrap_err();
++        assert!(error.to_string().contains("stage=6"));
++        assert!(p.pre_exec_fd_scan_bound().is_some());
++        assert!(!p.exec_checked());
++        assert!(p.cleanup().complete);
+     }
+     #[test]
+     fn host_actual_pty_bytes_and_exit_reaped_once() {

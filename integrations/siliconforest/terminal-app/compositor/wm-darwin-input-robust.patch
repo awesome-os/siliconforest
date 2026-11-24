@@ -1,0 +1,1333 @@
+diff -ruN '--exclude=.git' '--exclude=target' desk3-src/crates/wm-darwin/src/desktop_entry.rs desk4-next-002/source/crates/wm-darwin/src/desktop_entry.rs
+--- desk3-src/crates/wm-darwin/src/desktop_entry.rs	2026-11-14 10:47:34.475674205 -0800
++++ desk4-next-002/source/crates/wm-darwin/src/desktop_entry.rs	2026-11-14 18:38:57.394295014 -0800
+@@ -157,7 +157,8 @@
+     display: &'a mut Display<Server>,
+     server: &'a mut Server,
+     listener: &'a ListeningSocket,
+-    input: &'a mut NativeHid,
++    /// The device queues, read on their own thread (hid.rs `InputThread`).
++    input: &'a mut crate::hid::InputThread,
+     presenter: &'a mut Output,
+     /// An error from waiting between frames, reported by the next frame.
+     wait_error: Option<String>,
+@@ -192,8 +193,17 @@
+             .dispatch_clients(self.server)
+             .map_err(|e| e.to_string())?;
+         let ms = self.elapsed().as_millis() as u32;
+-        for event in self.input.drain()? {
+-            self.server.deliver_hid(event, ms)?;
++        // Nothing the keyboard or the trackpad gives can end the desktop: an event it cannot
++        // use is said in the log and dropped (DESK4, after the 00:53Z drop of 15 November).
++        for stamped in self.input.take() {
++            if let crate::hid::Event::Pointer { motion, .. } = stamped.event {
++                if motion != crate::hid::Motion::Relative(0, 0) {
++                    self.server.note_pointer_motion(stamped.at);
++                }
++            }
++            if let Err(error) = self.server.deliver_hid(stamped.event, ms) {
++                self.server.note_input_refused(&error);
++            }
+         }
+         self.server.trackpad_swipes(ms);
+         if let Some(autopilot) = &mut self.autopilot {
+@@ -341,7 +351,7 @@
+     let capture_socket = options.socket.parent().map(|dir| dir.join("capture"));
+     let listener = ListeningSocket::bind_absolute(options.socket).map_err(|e| e.to_string())?;
+     let mut display = Display::<Server>::new().map_err(|e| e.to_string())?;
+-    let mut input = NativeHid::open()?;
++    let mut input = NativeHid::open()?.spawn()?;
+     let request = match options.renderer {
+         Some(request) => request,
+         None => RendererRequest::from_env()?,
+@@ -350,6 +360,7 @@
+     let mut presenter = selected.output;
+     let mut server = Server::new_with_fonts(&display.handle(), selected.size, fonts.clone())?;
+     server.set_renderer_boxed(selected.renderer);
++    server.set_input_wake(input.wake_fd());
+     if let Some(path) = &capture_socket {
+         if let Err(error) = server.captures.listen(path) {
+             eprintln!("WMCAPTURE no socket: {error}");
+@@ -383,6 +394,12 @@
+         _ => "default",
+     };
+     server.persist_desktop_settings(true);
++    // sf-session's word after the compositor before this one ended by itself (DESK4).
++    if let Some(text) = std::env::var("CHONKSTEP_DARWIN_START_NOTICE").ok().filter(|t| !t.trim().is_empty()) {
++        let text: String = text.chars().filter(|c| !c.is_control()).take(120).collect();
++        eprintln!("WMSESSION start notice: {text}");
++        server.show_desktop_notice(&text);
++    }
+     eprintln!(
+         "WMSCALE initial scale={} scale120={} source={scale_source} panel={}x{} logical={}x{} wl_output_scale={} theme={} theme_source={theme_source} wallpaper={} wallpaper_source={wallpaper_source} steps={}",
+         scale.label(), scale.v120(), selected.size.w, selected.size.h, logical.w, logical.h, scale.integer(),
+@@ -394,6 +411,7 @@
+     result.sync_all().map_err(|e| e.to_string())?;
+     // No fallible early returns after this point until the coordinator has
+     // attempted/sealed cleanup. Prior startup errors cannot have spawned apps.
++    let injector = input.injector();
+     let outcome = {
+         let mut io = NativeIo {
+             display: &mut display,
+@@ -403,7 +421,7 @@
+             presenter: &mut presenter,
+             wait_error: None,
+             autopilot: crate::autopilot::Autopilot::from_env().map(|a| a.with_records(records_path.clone())),
+-            inject: crate::inject::Inject::from_env(),
++            inject: crate::inject::Inject::from_env().map(|inject| inject.with_injector(injector)),
+             result: &mut result,
+             started: Instant::now(),
+             shutdown: false,
+diff -ruN '--exclude=.git' '--exclude=target' desk3-src/crates/wm-darwin/src/desktop.rs desk4-next-002/source/crates/wm-darwin/src/desktop.rs
+--- desk3-src/crates/wm-darwin/src/desktop.rs	2026-11-14 13:22:21.120889051 -0800
++++ desk4-next-002/source/crates/wm-darwin/src/desktop.rs	2026-11-14 18:38:57.386842876 -0800
+@@ -437,6 +437,12 @@
+         desktop.space_seen = Some(space);
+         self.service_host_requests()
+     }
++    /// A notice on the screen (the session's, at start, after the compositor before ended by itself).
++    pub fn show_desktop_notice(&mut self, text: &str) {
++        if let Some(desktop) = self.desktop.as_mut() {
++            desktop.shell.notify(&mut self.wm, text);
++        }
++    }
+     pub(crate) fn desktop_key(&mut self, combo: KeyCombo, down: bool) -> Result<bool, String> {
+         use chonk_shell::shell::KeyResolution;
+         let Some(desktop) = self.desktop.as_mut() else {
+diff -ruN '--exclude=.git' '--exclude=target' desk3-src/crates/wm-darwin/src/hid.rs desk4-next-002/source/crates/wm-darwin/src/hid.rs
+--- desk3-src/crates/wm-darwin/src/hid.rs	2026-11-14 01:15:01.639401641 -0800
++++ desk4-next-002/source/crates/wm-darwin/src/hid.rs	2026-11-14 18:38:57.415059155 -0800
+@@ -49,6 +49,60 @@
+         let buttons=self.mouse_buttons.values().fold(0,|all,mask|all|mask);
+         Ok(Event::Pointer{motion,buttons,wheel:bytes[8] as i8})
+     }
++    /// The running desktop's decoding (`NativeHid`): nothing here is an error. A gap in the
++    /// sequence releases the keys held (their releases may be among the lost records; a key
++    /// still held comes back down with its next record, Wayland clients repeat from their own
++    /// timers so a lost release would repeat forever); malformed records and keys without a
++    /// key code are dropped. Each such thing is put in `faults`.
++    pub fn keyboard_into(&mut self,bytes:&[u8],out:&mut Vec<Event>,faults:&mut Vec<Fault>){
++        if bytes.len()!=8 {faults.push(Fault::Malformed{queue:Queue::Keyboard});return;}
++        // A record of the right size is numbered even when its contents are bad.
++        if let Some(lost)=sequence_gap(&mut self.keyboard_sequence,u32::from_le_bytes(bytes[..4].try_into().unwrap())){
++            faults.push(Fault::Gap{queue:Queue::Keyboard,lost});
++            self.release_keys(out);
++        }
++        if bytes[5]>1 || bytes[6..]!=[0,0]{faults.push(Fault::Malformed{queue:Queue::Keyboard});return;}
++        let usage=bytes[4];let down=bytes[5]!=0;
++        let Some(evdev)=usage_to_evdev(usage) else {faults.push(Fault::Unsupported{usage});return;};
++        if down {if self.keys.insert(usage){out.push(Event::Key{evdev,down:true});}}
++        else if self.keys.remove(&usage){out.push(Event::Key{evdev,down:false});}
++    }
++    /// The pointer's record carries every button of its device, so after a gap the next one
++    /// puts the buttons right by itself; only the motion in the lost records is gone.
++    pub fn mouse_into(&mut self,bytes:&[u8],out:&mut Vec<Event>,faults:&mut Vec<Fault>){
++        if bytes.len()!=12 {faults.push(Fault::Malformed{queue:Queue::Mouse});return;}
++        if let Some(lost)=sequence_gap(&mut self.mouse_sequence,u32::from_le_bytes(bytes[..4].try_into().unwrap())){
++            faults.push(Fault::Gap{queue:Queue::Mouse,lost});
++        }
++        if bytes[5]&!7!=0 || bytes[9]&!1!=0 || (bytes[9]==0 && bytes[10..]!=[0,0]) {faults.push(Fault::Malformed{queue:Queue::Mouse});return;}
++        let motion=if bytes[9]==1 {Motion::Absolute(u16::from_le_bytes(bytes[6..8].try_into().unwrap()),u16::from_le_bytes(bytes[10..12].try_into().unwrap()))}
++            else {Motion::Relative(bytes[6] as i8,bytes[7] as i8)};
++        self.mouse_buttons.insert(bytes[4],bytes[5]);
++        let buttons=self.mouse_buttons.values().fold(0,|all,mask|all|mask);
++        out.push(Event::Pointer{motion,buttons,wheel:bytes[8] as i8});
++    }
++    /// Key releases for every key held, lowest usage first.
++    pub fn release_keys(&mut self,out:&mut Vec<Event>){
++        let mut held:Vec<u8>=self.keys.drain().collect();held.sort_unstable();
++        out.extend(held.into_iter().filter_map(usage_to_evdev).map(|evdev|Event::Key{evdev,down:false}));
++    }
++    /// A queue opened again: its sequence starts afresh and what was held is let go.
++    pub fn forget(&mut self,queue:Queue,out:&mut Vec<Event>){
++        match queue {
++            Queue::Keyboard=>{self.keyboard_sequence=None;self.release_keys(out);}
++            Queue::Mouse=>{
++                self.mouse_sequence=None;
++                let held=self.mouse_buttons.values().fold(0,|all,mask|all|mask);
++                self.mouse_buttons.clear();
++                if held!=0{out.push(Event::Pointer{motion:Motion::Relative(0,0),buttons:0,wheel:0});}
++            }
++        }
++    }
++}
++/// Records skipped between the last sequence number and this one (none for the first).
++fn sequence_gap(last:&mut Option<u32>,next:u32)->Option<u32>{
++    let lost=last.map(|last|next.wrapping_sub(last).wrapping_sub(1)).filter(|lost|*lost!=0);
++    *last=Some(next);lost
+ }
+ 
+ /// USB HID keyboard usage -> evdev numbering required by wl_keyboard/XKB.
+@@ -195,23 +249,229 @@
+     }
+ }
+ 
++/// Which device node a record came from.
++#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
++pub enum Queue { Keyboard, Mouse }
++impl Queue {
++    pub fn name(self) -> &'static str { match self { Queue::Keyboard => "keyboard", Queue::Mouse => "mouse" } }
++    pub fn path(self) -> &'static str { match self { Queue::Keyboard => "/dev/usb_hid_kbd", Queue::Mouse => "/dev/usb_hid_mouse" } }
++    pub fn record_len(self) -> usize { match self { Queue::Keyboard => 8, Queue::Mouse => 12 } }
++}
++
++/// Something wrong with what the input queues gave. None of these ends the desktop: the
++/// record is dropped, the state is put right (held keys released after a gap) or the device
++/// node is opened again, and the first of each kind is said once in the log (`WMHID`).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Fault {
++    /// The sequence numbers skipped `lost` records: the kernel's ring (64 records, the oldest
++    /// overwritten when it is full) filled before the reader took them, or another process
++    /// read them. Held keys are released; the pointer's buttons come back with its next
++    /// record, which carries them all.
++    Gap { queue: Queue, lost: u32 },
++    Malformed { queue: Queue },
++    Unsupported { usage: u8 },
++    Short { queue: Queue, len: usize },
++    Read { queue: Queue, error: String },
++    /// A read returned no bytes at all: the device went away.
++    Closed { queue: Queue },
++}
++impl Fault {
++    fn kind(&self) -> usize {
++        match self { Fault::Gap { .. } => 0, Fault::Malformed { .. } => 1, Fault::Unsupported { .. } => 2, Fault::Short { .. } => 3, Fault::Read { .. } => 4, Fault::Closed { .. } => 5 }
++    }
++    pub fn describe(&self) -> String {
++        match self {
++            Fault::Gap { queue, lost } => format!("{} queue: {lost} records lost (the kernel's 64-record ring was full before they were read, or another reader took them); held keys released, input goes on", queue.name()),
++            Fault::Malformed { queue } => format!("{} queue: a malformed record dropped", queue.name()),
++            Fault::Unsupported { usage } => format!("keyboard usage {usage:#04x} has no key code here; dropped"),
++            Fault::Short { queue, len } => format!("{} queue: a short record ({len} of {} bytes) dropped", queue.name(), queue.record_len()),
++            Fault::Read { queue, error } => format!("{} queue: read failed: {error}", queue.name()),
++            Fault::Closed { queue } => format!("{} queue: the device gave no bytes (gone)", queue.name()),
++        }
++    }
++}
++
++/// Counts of everything that went wrong with the input queues, and of what was read.
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++pub struct HidHealth {
++    pub records: u64,
++    pub events: u64,
++    pub gaps: u64,
++    pub lost: u64,
++    pub malformed: u64,
++    pub unsupported: u64,
++    pub short: u64,
++    pub read_errors: u64,
++    pub closed: u64,
++    pub reopens: u64,
++    pub open_failures: u64,
++    /// Events the reader thread could not hand on because the desktop had not taken the ones
++    /// before (only after a stall of many seconds), dropped or merged with the one before.
++    pub backlog_dropped: u64,
++}
++impl HidHealth {
++    fn note(&mut self, fault: &Fault) {
++        match fault {
++            Fault::Gap { lost, .. } => { self.gaps += 1; self.lost += u64::from(*lost); }
++            Fault::Malformed { .. } => self.malformed += 1,
++            Fault::Unsupported { .. } => self.unsupported += 1,
++            Fault::Short { .. } => self.short += 1,
++            Fault::Read { .. } => self.read_errors += 1,
++            Fault::Closed { .. } => self.closed += 1,
++        }
++    }
++    pub fn faults(&self) -> u64 {
++        self.gaps + self.malformed + self.unsupported + self.short + self.read_errors + self.closed + self.open_failures + self.backlog_dropped
++    }
++    pub fn summary(&self) -> String {
++        format!("records={} events={} gaps={} lost_records={} malformed={} unsupported_keys={} short={} read_errors={} gone={} reopens={} open_failures={} backlog_dropped={}",
++            self.records, self.events, self.gaps, self.lost, self.malformed, self.unsupported, self.short, self.read_errors, self.closed, self.reopens, self.open_failures, self.backlog_dropped)
++    }
++}
++
++/// Where records come from: the device node, or (tests) anything that reads like it.
++pub trait RecordSource: Send {
++    fn read_record_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize>;
++    fn raw_fd(&self) -> Option<i32> { None }
++}
++impl RecordSource for std::fs::File {
++    fn read_record_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> { Read::read(self, buf) }
++    fn raw_fd(&self) -> Option<i32> { Some(std::os::fd::AsRawFd::as_raw_fd(self)) }
++}
++/// Opens an endpoint again after it failed.
++pub type Opener = Box<dyn FnMut() -> Result<Box<dyn RecordSource>, String> + Send>;
++
++const BACKOFF_FIRST: std::time::Duration = std::time::Duration::from_millis(50);
++const BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(5);
++/// Read errors in a row (no record, no empty queue between them) before the node is reopened.
++const ERRORS_BEFORE_REOPEN: u32 = 3;
++
++enum ReadOne { Record, Empty, Failed }
++
++/// One device node: read, and when it keeps failing, closed and opened again with back-off
++/// (50 ms doubling to 5 s). Closing the keyboard node gives the console its keys for as long
++/// as it stays closed (the kernel's grab follows the open file).
++struct Endpoint {
++    queue: Queue,
++    source: Option<Box<dyn RecordSource>>,
++    opener: Option<Opener>,
++    errors_in_row: u32,
++    backoff: std::time::Duration,
++    retry_at: Option<std::time::Instant>,
++    down_since: Option<std::time::Instant>,
++}
++impl Endpoint {
++    fn new(queue: Queue, source: Box<dyn RecordSource>, opener: Option<Opener>) -> Self {
++        Self { queue, source: Some(source), opener, errors_in_row: 0, backoff: BACKOFF_FIRST, retry_at: None, down_since: None }
++    }
++    fn fail(&mut self, now: std::time::Instant) {
++        self.source = None;
++        self.errors_in_row = 0;
++        self.down_since.get_or_insert(now);
++        self.retry_at = Some(now + self.backoff);
++        eprintln!("WMHID {} queue closed after failures; reopening in {} ms (input from it is lost meanwhile; the desktop goes on)", self.queue.name(), self.backoff.as_millis());
++    }
++    /// Reopen when due. True when the endpoint was (re)opened just now.
++    fn revive(&mut self, now: std::time::Instant, health: &mut HidHealth) -> bool {
++        if self.source.is_some() || self.retry_at.is_some_and(|at| now < at) {
++            return false;
++        }
++        let Some(opener) = self.opener.as_mut() else {
++            self.retry_at = Some(now + BACKOFF_MAX);
++            return false;
++        };
++        match opener() {
++            Ok(source) => {
++                self.source = Some(source);
++                health.reopens += 1;
++                eprintln!("WMHID {} queue reopened after {} ms", self.queue.name(), self.down_since.take().map_or(0, |t| now.duration_since(t).as_millis()));
++                self.backoff = BACKOFF_FIRST;
++                self.retry_at = None;
++                true
++            }
++            Err(error) => {
++                health.open_failures += 1;
++                if health.open_failures == 1 || self.backoff < BACKOFF_MAX {
++                    eprintln!("WMHID {} queue: reopen failed: {error}; next try in {} ms", self.queue.name(), (self.backoff * 2).min(BACKOFF_MAX).as_millis());
++                }
++                self.backoff = (self.backoff * 2).min(BACKOFF_MAX);
++                self.retry_at = Some(now + self.backoff);
++                false
++            }
++        }
++    }
++    fn read_one(&mut self, decoder: &mut Decoder, out: &mut Vec<Event>, faults: &mut Vec<Fault>, health: &mut HidHealth, now: std::time::Instant) -> ReadOne {
++        let Some(source) = self.source.as_mut() else { return ReadOne::Empty };
++        let len = self.queue.record_len();
++        let mut buf = [0u8; 12];
++        loop {
++            match source.read_record_bytes(&mut buf[..len]) {
++                Ok(n) if n == len => {
++                    self.errors_in_row = 0;
++                    health.records += 1;
++                    match self.queue {
++                        Queue::Keyboard => decoder.keyboard_into(&buf[..len], out, faults),
++                        Queue::Mouse => decoder.mouse_into(&buf[..len], out, faults),
++                    }
++                    return ReadOne::Record;
++                }
++                Ok(0) => {
++                    faults.push(Fault::Closed { queue: self.queue });
++                    self.fail(now);
++                    return ReadOne::Failed;
++                }
++                Ok(n) => {
++                    faults.push(Fault::Short { queue: self.queue, len: n });
++                    return ReadOne::Record;
++                }
++                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
++                    self.errors_in_row = 0;
++                    return ReadOne::Empty;
++                }
++                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
++                Err(e) => {
++                    faults.push(Fault::Read { queue: self.queue, error: e.to_string() });
++                    self.errors_in_row += 1;
++                    if self.errors_in_row >= ERRORS_BEFORE_REOPEN {
++                        self.fail(now);
++                    }
++                    return ReadOne::Failed;
++                }
++            }
++        }
++    }
++}
++
+ /// Holds the keyboard character device for its console-grab lifetime, plus the
+ /// mouse device only when both queues were requested. No custom path or
+ /// userspace pipe is accepted as a native device.
++///
++/// Reading never ends the desktop: a full ring (sequence gap), a malformed, short or
++/// unknown record, a read error or a vanished node is dropped or repaired and said once in
++/// the log (`WMHID`), with a count line at most once a minute (`HidHealth`).
+ pub struct NativeHid {
+-    keyboard: std::fs::File,
+-    mouse: Option<std::fs::File>,
++    keyboard: Endpoint,
++    mouse: Option<Endpoint>,
+     decoder: Decoder,
++    health: HidHealth,
++    reported: [bool; 6],
++    summary_at: Option<std::time::Instant>,
++    summarised: HidHealth,
+ }
+ impl NativeHid {
+     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+     fn acquire(mode: InputMode) -> Result<Self, String> {
+         let (keyboard, mouse) = opened_queues(
+             mode,
+-            || open_character_queue("/dev/usb_hid_kbd"),
+-            || open_character_queue("/dev/usb_hid_mouse"),
++            || open_character_queue(Queue::Keyboard.path()),
++            || open_character_queue(Queue::Mouse.path()),
+         )?;
+-        Self::discard_until_idle(keyboard, mouse)
++        let mut hid = Self::discard_until_idle(keyboard, mouse)?;
++        hid.keyboard.opener = Some(Box::new(|| open_character_queue(Queue::Keyboard.path()).map(|f| Box::new(f) as Box<dyn RecordSource>)));
++        if let Some(mouse) = hid.mouse.as_mut() {
++            mouse.opener = Some(Box::new(|| open_character_queue(Queue::Mouse.path()).map(|f| Box::new(f) as Box<dyn RecordSource>)));
++        }
++        Ok(hid)
+     }
+     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+     pub fn open() -> Result<Self, String> {
+@@ -229,6 +489,18 @@
+     pub fn open_keyboard() -> Result<Self, String> {
+         Err("native SFHID requires aarch64-apple-darwin".into())
+     }
++    /// Any record sources (tests, a nested run): each with an opener for after a failure.
++    pub fn from_sources(keyboard: Box<dyn RecordSource>, keyboard_opener: Option<Opener>, mouse: Option<(Box<dyn RecordSource>, Option<Opener>)>) -> Self {
++        Self {
++            keyboard: Endpoint::new(Queue::Keyboard, keyboard, keyboard_opener),
++            mouse: mouse.map(|(source, opener)| Endpoint::new(Queue::Mouse, source, opener)),
++            decoder: Decoder::default(),
++            health: HidHealth::default(),
++            reported: [false; 6],
++            summary_at: None,
++            summarised: HidHealth::default(),
++        }
++    }
+     pub fn seat_caps(&self) -> SeatCaps {
+         SeatCaps { keyboard: true, pointer: self.mouse.is_some() }
+     }
+@@ -239,52 +511,282 @@
+             "SFHID keyboard queue opened; pointer is not advertised; keyboard event delivery still requires live qualification"
+         }
+     }
++    pub fn health(&self) -> HidHealth {
++        self.health
++    }
++    #[cfg(test)]
++    fn keyboard_fd(&self) -> Option<i32> {
++        self.keyboard.source.as_ref().and_then(|s| s.raw_fd())
++    }
+     // The queues retain pre-open events. Discard the bounded backlog before
+     // clients are connected; the operator must release keys before launch.
+     #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+-    fn discard_until_idle(keyboard: std::fs::File, mouse: Option<std::fs::File>) -> Result<Self, String> {
+-        let mut input = Self { keyboard, mouse, decoder: Decoder::default() };
++    fn discard_until_idle(mut keyboard: std::fs::File, mut mouse: Option<std::fs::File>) -> Result<Self, String> {
+         for _ in 0..128 {
+-            let k = read_record::<8>(&mut input.keyboard)?;
+-            let m = if let Some(mouse) = input.mouse.as_mut() {
++            let k = read_record::<8>(&mut keyboard)?;
++            let m = if let Some(mouse) = mouse.as_mut() {
+                 read_record::<12>(mouse)?
+             } else {
+                 None
+             };
+             if k.is_none() && m.is_none() {
+-                return Ok(input);
++                return Ok(Self::from_sources(Box::new(keyboard), None, mouse.map(|m| (Box::new(m) as Box<dyn RecordSource>, None))));
+             }
+         }
+         Err("SFHID queues did not reach an idle boundary during acquisition".into())
+     }
+-    pub fn drain(&mut self) -> Result<Vec<Event>, String> {
+-        let mut events = Vec::new();
+-        for _ in 0..64 {
+-            let k = read_record::<8>(&mut self.keyboard)?;
+-            let m = if let Some(mouse) = self.mouse.as_mut() {
+-                read_record::<12>(mouse)?
+-            } else {
+-                None
++    fn report(&mut self, faults: &mut Vec<Fault>) {
++        for fault in faults.drain(..) {
++            self.health.note(&fault);
++            let kind = fault.kind();
++            if !self.reported[kind] {
++                self.reported[kind] = true;
++                eprintln!("WMHID {} (said once; counted from now on)", fault.describe());
++            }
++        }
++        let now = std::time::Instant::now();
++        if self.health.faults() != self.summarised.faults() && self.summary_at.map_or(true, |at| now.duration_since(at) >= std::time::Duration::from_secs(60)) {
++            self.summary_at = Some(now);
++            self.summarised = self.health;
++            eprintln!("WMHID input faults so far (none ended the desktop): {}", self.health.summary());
++        }
++    }
++    /// Read whatever the queues hold now, alternating between them so that keys and pointer
++    /// keep their order; reopen a failed node when its back-off is over. Never fails.
++    pub fn poll(&mut self, out: &mut Vec<Event>) {
++        let now = std::time::Instant::now();
++        let before = out.len();
++        let mut faults = Vec::new();
++        if self.keyboard.revive(now, &mut self.health) {
++            self.decoder.forget(Queue::Keyboard, out);
++        }
++        if let Some(mouse) = self.mouse.as_mut() {
++            if mouse.revive(now, &mut self.health) {
++                self.decoder.forget(Queue::Mouse, out);
++            }
++        }
++        // The ring holds 64 records per queue; 256 turns are more than both can give.
++        for _ in 0..256 {
++            let k = self.keyboard.read_one(&mut self.decoder, out, &mut faults, &mut self.health, now);
++            let m = match self.mouse.as_mut() {
++                Some(mouse) => mouse.read_one(&mut self.decoder, out, &mut faults, &mut self.health, now),
++                None => ReadOne::Empty,
+             };
+-            if k.is_none() && m.is_none() {
++            if !matches!(k, ReadOne::Record) && !matches!(m, ReadOne::Record) {
+                 break;
+             }
+-            if let Some(k) = k {
+-                if let Some(event) = self.decoder.keyboard(&k)? {
+-                    events.push(event);
++        }
++        self.health.events += (out.len() - before) as u64;
++        if !faults.is_empty() || self.health.faults() != self.summarised.faults() {
++            self.report(&mut faults);
++        }
++    }
++    /// What is there now (the single-threaded callers: `chonkstep-darwin`). Faults are said in
++    /// the log and dropped; the result is never an error any more.
++    pub fn drain(&mut self) -> Result<Vec<Event>, String> {
++        let mut events = Vec::new();
++        self.poll(&mut events);
++        Ok(events)
++    }
++    /// Reads the queues on a thread of its own, so that a frame that takes long (a GPU wait,
++    /// a large upload) cannot let the kernel's 64-record rings overflow: see `InputThread`.
++    pub fn spawn(self) -> Result<InputThread, String> {
++        InputThread::spawn(self)
++    }
++}
++
++/// An event and when it was read from the device node (for the motion-to-screen latency).
++#[derive(Debug, Clone, Copy, PartialEq)]
++pub struct Stamped {
++    pub event: Event,
++    pub at: std::time::Instant,
++}
++
++/// Events waiting for the desktop. Bounded: after a stall of many seconds the oldest pointer
++/// motions are merged or dropped (counted), keys are kept.
++#[derive(Default)]
++struct Pending {
++    events: std::collections::VecDeque<Stamped>,
++    dropped: u64,
++    health: HidHealth,
++}
++const PENDING_SOFT: usize = 4096;
++const PENDING_HARD: usize = 16384;
++fn motion_only(event: &Event) -> Option<(Motion, u8)> {
++    match event {
++        Event::Pointer { motion, buttons, wheel: 0 } => Some((*motion, *buttons)),
++        _ => None,
++    }
++}
++impl Pending {
++    fn push(&mut self, stamped: Stamped) {
++        if self.events.len() >= PENDING_SOFT {
++            // Merge a motion into the motion before it (same buttons, no wheel).
++            if let (Some((motion, buttons)), Some(last)) = (motion_only(&stamped.event), self.events.back_mut()) {
++                if let Some((before, last_buttons)) = motion_only(&last.event) {
++                    let merged = match (before, motion) {
++                        (Motion::Absolute(..), Motion::Absolute(..)) => Some(motion),
++                        (Motion::Relative(ax, ay), Motion::Relative(bx, by)) => i8::try_from(i16::from(ax) + i16::from(bx)).ok().zip(i8::try_from(i16::from(ay) + i16::from(by)).ok()).map(|(x, y)| Motion::Relative(x, y)),
++                        _ => None,
++                    };
++                    if let (Some(merged), true) = (merged, last_buttons == buttons) {
++                        last.event = Event::Pointer { motion: merged, buttons, wheel: 0 };
++                        self.dropped += 1;
++                        return;
++                    }
+                 }
+             }
+-            if let Some(m) = m {
+-                events.push(self.decoder.mouse(&m)?);
+-            }
+         }
+-        Ok(events)
++        if self.events.len() >= PENDING_HARD {
++            self.events.pop_front();
++            self.dropped += 1;
++        }
++        self.events.push_back(stamped);
++    }
++}
++
++struct Shared {
++    pending: std::sync::Mutex<Pending>,
++    stop: std::sync::atomic::AtomicBool,
++    wake: std::fs::File,
++}
++impl Shared {
++    fn push(&self, events: impl IntoIterator<Item = Stamped>, health: Option<HidHealth>) {
++        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
++        let was_empty = pending.events.is_empty();
++        for stamped in events {
++            pending.push(stamped);
++        }
++        if let Some(health) = health {
++            pending.health = health;
++        }
++        let now_empty = pending.events.is_empty();
++        drop(pending);
++        if was_empty && !now_empty {
++            // Wakes the desktop's wait between frames (non-blocking: a full pipe is awake already).
++            let _ = std::io::Write::write(&mut &self.wake, &[1]);
++        }
++    }
++}
++
++/// The queues read on a thread of their own: every 1 ms while input arrives (4 ms after a
++/// quarter of a second without), whatever the desktop's frames are doing. The desktop takes
++/// what has accumulated once per loop turn (`take`), and its wait between frames ends when
++/// something arrives (`wake_fd`).
++pub struct InputThread {
++    shared: std::sync::Arc<Shared>,
++    wake_read: std::fs::File,
++    handle: Option<std::thread::JoinHandle<NativeHid>>,
++    caps: SeatCaps,
++    note: &'static str,
++}
++fn nonblocking_pipe() -> Result<(std::fs::File, std::fs::File), String> {
++    use std::os::fd::FromRawFd;
++    let mut fds = [0i32; 2];
++    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
++        return Err(format!("input wake pipe: {}", io::Error::last_os_error()));
++    }
++    for fd in fds {
++        unsafe {
++            libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK);
++            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
++        }
++    }
++    Ok(unsafe { (std::fs::File::from_raw_fd(fds[0]), std::fs::File::from_raw_fd(fds[1])) })
++}
++impl InputThread {
++    pub fn spawn(mut hid: NativeHid) -> Result<Self, String> {
++        let (wake_read, wake) = nonblocking_pipe()?;
++        let shared = std::sync::Arc::new(Shared { pending: Default::default(), stop: false.into(), wake });
++        let caps = hid.seat_caps();
++        let note = hid.qualification_note();
++        let thread_shared = shared.clone();
++        let handle = std::thread::Builder::new()
++            .name("sfhid-reader".into())
++            .spawn(move || {
++                let mut out = Vec::new();
++                let mut last_event = std::time::Instant::now() - std::time::Duration::from_secs(1);
++                while !thread_shared.stop.load(std::sync::atomic::Ordering::Acquire) {
++                    let faults = hid.health.faults();
++                    hid.poll(&mut out);
++                    let now = std::time::Instant::now();
++                    if !out.is_empty() || hid.health.faults() != faults {
++                        if !out.is_empty() {
++                            last_event = now;
++                        }
++                        thread_shared.push(out.drain(..).map(|event| Stamped { event, at: now }), Some(hid.health));
++                    }
++                    let quiet = now.duration_since(last_event) > std::time::Duration::from_millis(250);
++                    std::thread::sleep(std::time::Duration::from_millis(if quiet { 4 } else { 1 }));
++                }
++                hid
++            })
++            .map_err(|e| format!("input thread: {e}"))?;
++        Ok(Self { shared, wake_read, handle: Some(handle), caps, note })
++    }
++    pub fn seat_caps(&self) -> SeatCaps {
++        self.caps
++    }
++    pub fn qualification_note(&self) -> &'static str {
++        self.note
++    }
++    /// Everything read since the last call, oldest first.
++    pub fn take(&mut self) -> Vec<Stamped> {
++        let mut byte = [0u8; 64];
++        while matches!(Read::read(&mut self.wake_read, &mut byte), Ok(n) if n > 0) {}
++        let mut pending = self.shared.pending.lock().unwrap_or_else(|e| e.into_inner());
++        pending.events.drain(..).collect()
++    }
++    /// Readable when events are waiting.
++    pub fn wake_fd(&self) -> i32 {
++        std::os::fd::AsRawFd::as_raw_fd(&self.wake_read)
++    }
++    /// The reader's counts, and the events it could not hand on.
++    pub fn health(&self) -> HidHealth {
++        let pending = self.shared.pending.lock().unwrap_or_else(|e| e.into_inner());
++        HidHealth { backlog_dropped: pending.dropped, ..pending.health }
++    }
++    /// Events from elsewhere into the same queue, stamped now (the test instrument's timed
++    /// streams: they then take the path device events take).
++    pub fn injector(&self) -> Injector {
++        Injector { shared: self.shared.clone() }
++    }
++    /// Stop reading and close the device nodes (the keyboard's console grab ends).
++    pub fn stop(&mut self) -> Option<HidHealth> {
++        self.shared.stop.store(true, std::sync::atomic::Ordering::Release);
++        let hid = self.handle.take()?.join().ok()?;
++        let health = HidHealth { backlog_dropped: self.shared.pending.lock().map(|p| p.dropped).unwrap_or(0), ..hid.health };
++        eprintln!("WMHID final {}", health.summary());
++        Some(health)
++    }
++}
++impl Drop for InputThread {
++    fn drop(&mut self) {
++        let _ = self.stop();
++    }
++}
++/// Puts events into an `InputThread`'s queue as if read from a device node.
++#[derive(Clone)]
++pub struct Injector {
++    shared: std::sync::Arc<Shared>,
++}
++impl Injector {
++    /// The reader's counts as last handed on, and the events it could not hand on.
++    pub fn health(&self) -> HidHealth {
++        let pending = self.shared.pending.lock().unwrap_or_else(|e| e.into_inner());
++        HidHealth { backlog_dropped: pending.dropped, ..pending.health }
++    }
++    pub fn push(&self, event: Event) {
++        self.shared.push([Stamped { event, at: std::time::Instant::now() }], None);
+     }
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    /// The tests that check a descriptor is closed (EBADF) run one at a time: a descriptor
++    /// number freed by one test is soon reused by another's pipe.
++    static FD_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+     fn key(seq:u32,usage:u8,down:u8)->[u8;8]{let mut b=[0;8];b[..4].copy_from_slice(&seq.to_le_bytes());b[4]=usage;b[5]=down;b}
+     #[test]fn keys_modifiers_wrap_repeat_and_loss(){
+         let mut d=Decoder::default();
+@@ -305,6 +807,144 @@
+         b[..4].copy_from_slice(&2u32.to_le_bytes());b[9]=0x80;assert!(d.mouse(&b).is_err());
+     }
+ 
++    // DESK4: what the owner's hands did at 00:53Z on 15 November (menus, a window closed) ended
++    // the desktop with "SFHID sequence discontinuity". Real input must never do that.
++    #[test]
++    fn real_input_faults_never_end_the_session() {
++        let _fds = FD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
++        use std::io::Write;
++        let (kbd_r, mut kbd_w) = nonblock_pipe();
++        let (mouse_r, mut mouse_w) = nonblock_pipe();
++        let mut hid = NativeHid::discard_until_idle(kbd_r, Some(mouse_r)).unwrap();
++        // Shift and A held, then the ring overflowed: records 3..=69 never reached the reader
++        // (their releases among them); record 70 is a fresh B press.
++        kbd_w.write_all(&key(1, 0xe1, 1)).unwrap();
++        kbd_w.write_all(&key(2, 0x04, 1)).unwrap();
++        kbd_w.write_all(&key(70, 0x05, 1)).unwrap();
++        let events = hid.drain().expect("a sequence gap is not fatal");
++        assert_eq!(events, vec![
++            Event::Key { evdev: 42, down: true }, Event::Key { evdev: 30, down: true },
++            // held keys let go (lowest usage first), then the new press
++            Event::Key { evdev: 30, down: false }, Event::Key { evdev: 42, down: false },
++            Event::Key { evdev: 48, down: true },
++        ]);
++        // A key without a key code (LANG1 on a JIS/Korean keyboard), a malformed record and a
++        // short one: dropped; the next key still arrives.
++        kbd_w.write_all(&key(71, 0x90, 1)).unwrap();
++        kbd_w.write_all(&key(72, 0x05, 7)).unwrap();
++        let events = hid.drain().expect("an unknown key or a malformed record is not fatal");
++        assert!(events.is_empty(), "{events:?}");
++        kbd_w.write_all(&key(73, 0x05, 0)).unwrap();
++        assert_eq!(hid.drain().unwrap(), vec![Event::Key { evdev: 48, down: false }]);
++        // The pointer: a gap of 200 records with the button held; the next record has it.
++        let mut m = [0u8; 12];
++        m[..4].copy_from_slice(&5u32.to_le_bytes()); m[5] = 1; m[6] = 3;
++        mouse_w.write_all(&m).unwrap();
++        m[..4].copy_from_slice(&206u32.to_le_bytes()); m[6] = 2;
++        mouse_w.write_all(&m).unwrap();
++        m[..4].copy_from_slice(&207u32.to_le_bytes()); m[9] = 0x80;
++        mouse_w.write_all(&m).unwrap();
++        mouse_w.write_all(&[0u8; 5]).unwrap();
++        let events = hid.drain().expect("pointer faults are not fatal");
++        assert_eq!(events, vec![
++            Event::Pointer { motion: Motion::Relative(3, 0), buttons: 1, wheel: 0 },
++            Event::Pointer { motion: Motion::Relative(2, 0), buttons: 1, wheel: 0 },
++        ]);
++        let health = hid.health();
++        assert_eq!((health.gaps, health.lost, health.unsupported, health.malformed, health.short), (2, 267, 1, 2, 1), "{}", health.summary());
++    }
++
++    /// The kernel's ring as SFHIDEventQueue.cpp keeps it: 64 records, a full ring overwrites
++    /// the oldest, every record numbered.
++    #[derive(Default)]
++    struct Ring { records: std::collections::VecDeque<[u8; 12]>, sequence: u32 }
++    struct RingReader(std::sync::Arc<std::sync::Mutex<Ring>>);
++    impl RecordSource for RingReader {
++        fn read_record_bytes(&mut self, buf: &mut [u8]) -> io::Result<usize> {
++            match self.0.lock().unwrap().records.pop_front() {
++                Some(r) => { buf.copy_from_slice(&r[..buf.len()]); Ok(buf.len()) }
++                None => Err(io::ErrorKind::WouldBlock.into()),
++            }
++        }
++    }
++    fn ring_push_motion(ring: &std::sync::Mutex<Ring>) {
++        let mut ring = ring.lock().unwrap();
++        ring.sequence += 1;
++        let mut m = [0u8; 12];
++        m[..4].copy_from_slice(&ring.sequence.to_le_bytes()); m[6] = 1;
++        ring.records.push_back(m);
++        if ring.records.len() > 64 { ring.records.pop_front(); }
++    }
++    struct Idle;
++    impl RecordSource for Idle {
++        fn read_record_bytes(&mut self, _: &mut [u8]) -> io::Result<usize> { Err(io::ErrorKind::WouldBlock.into()) }
++    }
++    /// About 1000 records a second (a trackpad and a key or two); the desktop is stuck for 300 ms
++    /// in each frame.
++    fn producer(ring: std::sync::Arc<std::sync::Mutex<Ring>>, records: usize) -> std::thread::JoinHandle<()> {
++        std::thread::spawn(move || for _ in 0..records { ring_push_motion(&ring); std::thread::sleep(std::time::Duration::from_millis(1)); })
++    }
++    #[test]
++    fn the_reader_thread_keeps_up_while_the_desktop_is_stuck_in_a_frame() {
++        let _fds = FD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
++        // Read once per frame (how the desktop read before): the ring overflows.
++        let ring = std::sync::Arc::new(std::sync::Mutex::new(Ring::default()));
++        let mut hid = NativeHid::from_sources(Box::new(Idle), None, Some((Box::new(RingReader(ring.clone())), None)));
++        let feed = producer(ring.clone(), 600);
++        let mut got = 0;
++        while !feed.is_finished() { std::thread::sleep(std::time::Duration::from_millis(300)); got += hid.drain().unwrap().len(); }
++        feed.join().unwrap(); got += hid.drain().unwrap().len();
++        assert!(hid.health().gaps > 0 && got < 600, "once a frame: {} {}", got, hid.health().summary());
++        // On the reader thread: nothing lost, the desktop finds all of it after its long frame.
++        let ring = std::sync::Arc::new(std::sync::Mutex::new(Ring::default()));
++        let mut thread = NativeHid::from_sources(Box::new(Idle), None, Some((Box::new(RingReader(ring.clone())), None))).spawn().unwrap();
++        let feed = producer(ring.clone(), 600);
++        let mut events = Vec::new();
++        while !feed.is_finished() { std::thread::sleep(std::time::Duration::from_millis(300)); events.extend(thread.take()); }
++        feed.join().unwrap();
++        std::thread::sleep(std::time::Duration::from_millis(20));
++        events.extend(thread.take());
++        let health = thread.stop().unwrap();
++        assert_eq!((events.len(), health.gaps, health.lost), (600, 0, 0), "{}", health.summary());
++        assert!(events.windows(2).all(|w| w[0].at <= w[1].at));
++    }
++    #[test]
++    fn a_failing_node_is_reopened_with_back_off_and_the_wake_pipe_rings() {
++        let _fds = FD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
++        // Reads that fail (EIO), then a node that cannot be opened twice, then one that works.
++        struct Failing(u32);
++        impl RecordSource for Failing {
++            fn read_record_bytes(&mut self, _: &mut [u8]) -> io::Result<usize> { self.0 += 1; Err(io::Error::from_raw_os_error(libc::EIO)) }
++        }
++        let opens = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
++        let counter = opens.clone();
++        let (good_r, mut good_w) = nonblock_pipe();
++        let mut good = Some(good_r);
++        let opener: Opener = Box::new(move || {
++            let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
++            if n < 2 { return Err("ENOENT (the node is being republished)".into()); }
++            good.take().map(|f| Box::new(f) as Box<dyn RecordSource>).ok_or_else(|| "opened once already".to_string())
++        });
++        let mut hid = NativeHid::from_sources(Box::new(Failing(0)), Some(opener), None);
++        for _ in 0..3 { assert!(hid.drain().unwrap().is_empty()); }
++        assert_eq!(hid.health().read_errors, 3);
++        assert!(hid.keyboard.source.is_none(), "closed after three errors in a row");
++        let started = std::time::Instant::now();
++        let mut thread = hid.spawn().unwrap();
++        while opens.load(std::sync::atomic::Ordering::SeqCst) < 3 && started.elapsed() < std::time::Duration::from_secs(3) { std::thread::sleep(std::time::Duration::from_millis(5)); }
++        assert_eq!(opens.load(std::sync::atomic::Ordering::SeqCst), 3);
++        // 50 ms, then 100, then 200 ms of back-off before the third open
++        assert!(started.elapsed() >= std::time::Duration::from_millis(300), "{:?}", started.elapsed());
++        use std::io::Write;
++        good_w.write_all(&key(9, 0x04, 1)).unwrap();
++        let mut fds = [libc::pollfd { fd: thread.wake_fd(), events: libc::POLLIN, revents: 0 }];
++        assert_eq!(unsafe { libc::poll(fds.as_mut_ptr(), 1, 1000) }, 1, "the wake pipe rings when events arrive");
++        let events: Vec<Event> = thread.take().into_iter().map(|s| s.event).collect();
++        assert_eq!(events, vec![Event::Key { evdev: 30, down: true }]);
++        let health = thread.stop().unwrap();
++        assert_eq!((health.reopens, health.open_failures), (1, 2), "{}", health.summary());
++    }
++
+     fn args(v: &[&str]) -> Vec<String> {
+         v.iter().map(|s| (*s).to_string()).collect()
+     }
+@@ -369,6 +1009,7 @@
+     }
+     #[test]
+     fn open_flags_character_rejection_and_nofollow_do_not_use_hid_nodes() {
++        let _fds = FD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+         use std::os::fd::AsRawFd;
+         let dir = std::env::temp_dir().join(format!("sfhid-keyboard-host-{}", std::process::id()));
+         let _ = std::fs::remove_dir_all(&dir);
+@@ -392,13 +1033,14 @@
+     }
+     #[test]
+     fn acquisition_eagain_failure_and_keyboard_only_decode() {
++        let _fds = FD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+         use std::io::Write;
+         use std::os::fd::AsRawFd;
+         let (read, _write) = nonblock_pipe();
+         let idle = NativeHid::discard_until_idle(read, None).unwrap();
+         assert_eq!(idle.seat_caps(), SeatCaps { keyboard: true, pointer: false });
+         assert!(idle.qualification_note().contains("pointer is not advertised"));
+-        let fd = idle.keyboard.as_raw_fd();
++        let fd = idle.keyboard_fd().unwrap();
+         drop(idle);
+         assert!(fd_closed(fd), "keyboard fd stays open only while NativeHid owns the console grab");
+ 
+@@ -484,8 +1126,9 @@
+         kbd_w.write_all(&key(4, 0x04, 1)).unwrap();
+         assert!(only.drain().unwrap().is_empty(), "duplicate key-down is not a second event");
+         kbd_w.write_all(&key(5, 0x04, 2)).unwrap();
+-        assert!(only.drain().unwrap_err().contains("malformed SFHID keyboard record"));
+-        let fd = only.keyboard.as_raw_fd();
++        assert!(only.drain().unwrap().is_empty(), "a malformed record is dropped, not fatal");
++        assert_eq!(only.health().malformed, 1);
++        let fd = only.keyboard_fd().unwrap();
+         drop(only);
+         assert!(fd_closed(fd));
+ 
+diff -ruN '--exclude=.git' '--exclude=target' desk3-src/crates/wm-darwin/src/inject.rs desk4-next-002/source/crates/wm-darwin/src/inject.rs
+--- desk3-src/crates/wm-darwin/src/inject.rs	2026-11-14 13:37:20.715324778 -0800
++++ desk4-next-002/source/crates/wm-darwin/src/inject.rs	2026-11-14 18:38:57.411491348 -0800
+@@ -18,6 +18,16 @@
+ //!                                  a multi-finger swipe as a multitouch surface would report it
+ //!                                  (2..5 fingers, dx dy in panel pixels); synthetic like the rest
+ //! wait <milliseconds>              nothing for that long (at most 10 s)
++//! stream rel <dx> <dy> <count> <ms> pointer records from a thread of their own, one every <ms>
++//!                                  (1..100), as a device gives them, whatever the frames do; the
++//!                                  next step follows at once (put a `wait` after it)
++//! stream abs <x0> <y0> <x1> <y1> <count> <ms>
++//!                                  likewise, absolute, along the line from (x0,y0) to (x1,y1)
++//! stall <milliseconds>             the desktop's loop stops for that long (at most 5 s), as in a
++//!                                  frame that waits for the GPU; the input thread goes on reading
++//! fail                             the compositor ends with an error (the session's relaunch test)
++//! stats                            one line: the input thread's counts (records, gaps, ...), the
++//!                                  key events delivered, the motion-to-screen latency so far
+ //! capture <name>                   the frame as it was last rendered, to <name>.ppm in the directory
+ //!                                  (an error after 2 s without one: the display sleeps until a key)
+ //! dump <name>                      every window's own picture as the client gave it (no frame, nothing
+@@ -26,8 +36,9 @@
+ //!                                  desk's other surfaces (popups, layers, panels) with their rectangles
+ //! ```
+ //!
+-//! Events enter where the device nodes' events do (`Server::deliver_hid`), so a client sees
+-//! them through the seat exactly as it sees the keyboard and the trackpad. When the request is
++//! Events enter where the device nodes' events do: the input thread's queue (hid.rs
++//! `Injector`, since DESK4), so a client sees them through the seat exactly as it sees the
++//! keyboard and the trackpad, and the motion-to-screen latency (`WMLATENCY`) counts them. When the request is
+ //! finished a file `done` holds one line: the number of lines carried out and the errors.
+ //! Everything here is synthetic and labelled so (`WMINJECT ... input=synthetic-inject`);
+ //! nothing of it is evidence of a physical keyboard or trackpad. Without the variable the
+@@ -43,6 +54,10 @@
+ 
+ enum Step {
+     Event(Event),
++    Stream { events: Vec<Event>, every: Duration },
++    Stall(Duration),
++    Fail,
++    Stats,
+     Wait(Duration),
+     Capture(String),
+     Dump(String),
+@@ -58,6 +73,7 @@
+     done: usize,
+     errors: Vec<String>,
+     active: bool,
++    injector: Option<crate::hid::Injector>,
+ }
+ 
+ impl Inject {
+@@ -68,7 +84,12 @@
+             return None;
+         }
+         eprintln!("WMINJECT armed dir={} input=synthetic-inject (requested events; not physical input)", dir.display());
+-        Some(Self { dir, queue: VecDeque::new(), poll_at: Instant::now(), wait_until: None, buttons: 0, capture_since: None, done: 0, errors: Vec::new(), active: false })
++        Some(Self { dir, queue: VecDeque::new(), poll_at: Instant::now(), wait_until: None, buttons: 0, capture_since: None, done: 0, errors: Vec::new(), active: false, injector: None })
++    }
++    /// The input thread's queue: injected events take the device events' path.
++    pub fn with_injector(mut self, injector: crate::hid::Injector) -> Self {
++        self.injector = Some(injector);
++        self
+     }
+     fn parse(&mut self, text: &str) {
+         for (number, line) in text.lines().enumerate() {
+@@ -91,6 +112,27 @@
+                     let phase = match *phase { "begin" => SwipePhase::Begin, "update" => SwipePhase::Update, "end" => SwipePhase::End, _ => SwipePhase::Cancel };
+                     Step::Event(Event::Swipe { phase, fingers, dx, dy })
+                 }),
++                ["stream", "rel", x, y, count, every] => x.parse::<i8>().ok().zip(y.parse::<i8>().ok()).zip(count.parse::<usize>().ok().filter(|c| (1..=20_000).contains(c))).zip(every.parse::<u64>().ok().filter(|e| (1..=100).contains(e))).map(|(((dx, dy), count), every)| {
++                    let buttons = self.buttons;
++                    Step::Stream { events: vec![Event::Pointer { motion: Motion::Relative(dx, dy), buttons, wheel: 0 }; count], every: Duration::from_millis(every) }
++                }),
++                ["stream", "abs", x0, y0, x1, y1, count, every] => {
++                    let p = |v: &str| v.parse::<u16>().ok().map(f64::from);
++                    match (p(x0), p(y0), p(x1), p(y1), count.parse::<usize>().ok().filter(|c| (1..=20_000).contains(c)), every.parse::<u64>().ok().filter(|e| (1..=100).contains(e))) {
++                        (Some(x0), Some(y0), Some(x1), Some(y1), Some(count), Some(every)) => {
++                            let buttons = self.buttons;
++                            let events = (0..count).map(|i| {
++                                let f = if count == 1 { 1.0 } else { i as f64 / (count - 1) as f64 };
++                                Event::Pointer { motion: Motion::Absolute((x0 + (x1 - x0) * f).round() as u16, (y0 + (y1 - y0) * f).round() as u16), buttons, wheel: 0 }
++                            }).collect();
++                            Some(Step::Stream { events, every: Duration::from_millis(every) })
++                        }
++                        _ => None,
++                    }
++                }
++                ["stall", ms] => ms.parse::<u64>().ok().filter(|ms| *ms <= 5_000).map(|ms| Step::Stall(Duration::from_millis(ms))),
++                ["fail"] => Some(Step::Fail),
++                ["stats"] => Some(Step::Stats),
+                 ["wait", ms] => ms.parse::<u64>().ok().filter(|ms| *ms <= 10_000).map(|ms| Step::Wait(Duration::from_millis(ms))),
+                 ["capture", name] if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => Some(Step::Capture((*name).to_string())),
+                 ["dump", name] if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => Some(Step::Dump((*name).to_string())),
+@@ -131,9 +173,59 @@
+         self.wait_until = None;
+         match self.queue.front() {
+             Some(Step::Event(event)) => {
+-                server.deliver_hid(*event, ms)?;
++                match &self.injector {
++                    Some(injector) => injector.push(*event),
++                    None => {
++                        if let Err(error) = server.deliver_hid(*event, ms) {
++                            self.errors.push(format!("event not delivered: {error}"));
++                        }
++                    }
++                }
++                self.queue.pop_front();
++                self.done += 1;
++            }
++            Some(Step::Stream { .. }) => {
++                let Some(Step::Stream { events, every }) = self.queue.pop_front() else { unreachable!() };
++                self.done += 1;
++                match self.injector.clone() {
++                    Some(injector) => {
++                        eprintln!("WMINJECT stream records={} every_ms={} input=synthetic-inject (from a thread, as a device)", events.len(), every.as_millis());
++                        let spawned = std::thread::Builder::new().name("inject-stream".into()).spawn(move || {
++                            let start = Instant::now();
++                            for (i, event) in events.into_iter().enumerate() {
++                                let due = start + every * i as u32;
++                                if let Some(left) = due.checked_duration_since(Instant::now()) {
++                                    std::thread::sleep(left);
++                                }
++                                injector.push(event);
++                            }
++                        });
++                        if let Err(error) = spawned {
++                            self.errors.push(format!("stream: {error}"));
++                        }
++                    }
++                    None => self.errors.push("stream: no input thread here".into()),
++                }
++            }
++            Some(Step::Stall(time)) => {
++                let time = *time;
++                self.queue.pop_front();
++                self.done += 1;
++                eprintln!("WMINJECT stall ms={} (the desktop's loop stops; input=synthetic-inject)", time.as_millis());
++                std::thread::sleep(time);
++            }
++            Some(Step::Stats) => {
++                self.queue.pop_front();
++                self.done += 1;
++                let hid = self.injector.as_ref().map_or_else(|| "no input thread".to_string(), |i| i.health().summary());
++                let (keys, last) = server.hid_keys();
++                eprintln!("WMINJECT stats hid: {hid} | key_events_delivered={keys} last_key={last:?} | {}", server.latency.final_line().unwrap_or_else(|| "no motion latency samples".into()));
++            }
++            Some(Step::Fail) => {
+                 self.queue.pop_front();
+                 self.done += 1;
++                self.finish();
++                return Err("WMINJECT fail: an end with an error was requested (test of the session's relaunch)".into());
+             }
+             Some(Step::Wait(time)) => {
+                 self.wait_until = Some(now + *time);
+diff -ruN '--exclude=.git' '--exclude=target' desk3-src/crates/wm-darwin/src/input_latency.rs desk4-next-002/source/crates/wm-darwin/src/input_latency.rs
+--- desk3-src/crates/wm-darwin/src/input_latency.rs	1969-12-31 16:00:00.000000000 -0800
++++ desk4-next-002/source/crates/wm-darwin/src/input_latency.rs	2026-11-14 18:32:28.815857838 -0800
+@@ -0,0 +1,122 @@
++//! How long a pointer motion takes to reach the screen: from the moment the event was read
++//! from the device node (or injected, for tests) to the page flip of the first frame that
++//! draws the cursor there. The panel's own scan-out after the flip is not included.
++use std::time::{Duration, Instant};
++
++const BUCKETS: usize = 1001; // whole milliseconds, the last one is "1000 ms or more"
++
++pub(crate) struct MotionLatency {
++    /// The oldest motion not drawn yet.
++    pending: Option<Instant>,
++    /// The oldest motion in the frame on its way to the screen.
++    in_flight: Option<Instant>,
++    window: Vec<u32>,
++    histogram: Vec<u32>,
++    samples: u64,
++    max_us: u32,
++    logged_at: Instant,
++}
++impl Default for MotionLatency {
++    fn default() -> Self {
++        Self { pending: None, in_flight: None, window: Vec::new(), histogram: vec![0; BUCKETS], samples: 0, max_us: 0, logged_at: Instant::now() }
++    }
++}
++fn percentile(sorted: &[u32], p: f64) -> f64 {
++    if sorted.is_empty() {
++        return 0.0;
++    }
++    let index = ((sorted.len() - 1) as f64 * p).round() as usize;
++    f64::from(sorted[index]) / 1000.0
++}
++impl MotionLatency {
++    pub fn motion(&mut self, at: Instant) {
++        self.pending = Some(self.pending.map_or(at, |p| p.min(at)));
++    }
++    /// A frame was rendered; `in_flight`: it reaches the screen with a later flip.
++    pub fn rendered(&mut self, in_flight: bool) {
++        let Some(t) = self.pending.take() else { return };
++        if in_flight {
++            self.in_flight = Some(self.in_flight.map_or(t, |p| p.min(t)));
++        } else {
++            self.sample(t.elapsed());
++        }
++    }
++    pub fn presented(&mut self) {
++        if let Some(t) = self.in_flight.take() {
++            self.sample(t.elapsed());
++        }
++    }
++    fn sample(&mut self, d: Duration) {
++        let us = d.as_micros().min(u128::from(u32::MAX)) as u32;
++        if self.window.len() < 100_000 {
++            self.window.push(us);
++        }
++        self.histogram[((us / 1000) as usize).min(BUCKETS - 1)] += 1;
++        self.samples += 1;
++        self.max_us = self.max_us.max(us);
++    }
++    fn line(sorted: &[u32], what: &str) -> String {
++        format!(
++            "WMLATENCY pointer motion->flip {what} n={} p50_ms={:.1} p90_ms={:.1} p99_ms={:.1} max_ms={:.1} (read from the queue or injected -> page flip showing the cursor; scan-out not included)",
++            sorted.len(), percentile(sorted, 0.5), percentile(sorted, 0.9), percentile(sorted, 0.99), sorted.last().map_or(0.0, |v| f64::from(*v) / 1000.0)
++        )
++    }
++    /// A line every 10 s while the pointer moves.
++    pub fn maybe_log(&mut self) {
++        if self.window.is_empty() || self.logged_at.elapsed() < Duration::from_secs(10) {
++            return;
++        }
++        let mut sorted = std::mem::take(&mut self.window);
++        sorted.sort_unstable();
++        eprintln!("{} window_s={:.1}", Self::line(&sorted, "last"), self.logged_at.elapsed().as_secs_f64());
++        self.logged_at = Instant::now();
++    }
++    /// The whole run (whole milliseconds).
++    pub fn final_line(&self) -> Option<String> {
++        if self.samples == 0 {
++            return None;
++        }
++        let at = |p: f64| {
++            let target = ((self.samples as f64) * p).ceil().max(1.0) as u64;
++            let mut seen = 0u64;
++            for (ms, count) in self.histogram.iter().enumerate() {
++                seen += u64::from(*count);
++                if seen >= target {
++                    return ms;
++                }
++            }
++            BUCKETS - 1
++        };
++        Some(format!(
++            "WMLATENCY pointer motion->flip total n={} p50_ms<={} p90_ms<={} p99_ms<={} max_ms={:.1}",
++            self.samples, at(0.5) + 1, at(0.9) + 1, at(0.99) + 1, f64::from(self.max_us) / 1000.0
++        ))
++    }
++    #[cfg(test)]
++    pub fn samples(&self) -> u64 {
++        self.samples
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn a_motion_counts_from_its_read_to_the_flip_that_shows_it() {
++        let mut l = MotionLatency::default();
++        let read = Instant::now();
++        l.motion(read);
++        l.motion(read + Duration::from_millis(1));
++        std::thread::sleep(Duration::from_millis(5));
++        l.rendered(true);
++        assert_eq!(l.samples(), 0, "nothing on the screen before the flip");
++        std::thread::sleep(Duration::from_millis(5));
++        l.presented();
++        assert_eq!(l.samples(), 1, "two motions in one frame are one sample, from the older");
++        assert!(l.max_us >= 10_000);
++        l.presented();
++        l.rendered(false);
++        assert_eq!(l.samples(), 1, "no motion, no sample");
++        assert!(l.final_line().unwrap().contains("n=1"));
++    }
++}
+diff -ruN '--exclude=.git' '--exclude=target' desk3-src/crates/wm-darwin/src/input.rs desk4-next-002/source/crates/wm-darwin/src/input.rs
+--- desk3-src/crates/wm-darwin/src/input.rs	2026-11-14 13:00:45.794596158 -0800
++++ desk4-next-002/source/crates/wm-darwin/src/input.rs	2026-11-14 18:33:31.198758249 -0800
+@@ -264,7 +264,8 @@
+                                     else {s.input.as_ref().unwrap().keyboard.retire_forwarded_key((evdev+8).into());}
+                                     return FilterResult::Intercept(());
+                                 }
+-                                Err(e)=>{s.wm.backend_mut().input_fault=Some(e);return FilterResult::Intercept(());}
++                                // A key binding that fails is said and dropped: a key must not end the desktop.
++                                Err(e)=>{eprintln!("WMINPUT key binding failed (not fatal): {e}");return FilterResult::Intercept(());}
+                                 Ok(false)=>{}
+                             }
+                             if s.wm.backend().keyboard_grabbed {
+diff -ruN '--exclude=.git' '--exclude=target' desk3-src/crates/wm-darwin/src/lib.rs desk4-next-002/source/crates/wm-darwin/src/lib.rs
+--- desk3-src/crates/wm-darwin/src/lib.rs	2026-11-14 13:19:33.933188661 -0800
++++ desk4-next-002/source/crates/wm-darwin/src/lib.rs	2026-11-14 18:32:44.739736475 -0800
+@@ -38,11 +38,13 @@
+             }
+             None
+         }
++        pub fn with_injector(self, _: crate::hid::Injector) -> Self { self }
+         pub fn step(&mut self, _: &mut crate::server::Server, _: u32) -> Result<(), String> { Ok(()) }
+         pub fn after_repaint(&mut self, _: &mut crate::server::Server) -> Result<(), String> { Ok(()) }
+     }
+ }
+ mod input;
++mod input_latency;
+ pub mod kms;
+ mod layers;
+ pub mod launch_audit;
+diff -ruN '--exclude=.git' '--exclude=target' desk3-src/crates/wm-darwin/src/scene.rs desk4-next-002/source/crates/wm-darwin/src/scene.rs
+--- desk3-src/crates/wm-darwin/src/scene.rs	2026-11-14 13:36:46.024090780 -0800
++++ desk4-next-002/source/crates/wm-darwin/src/scene.rs	2026-11-14 18:33:31.201385752 -0800
+@@ -548,12 +548,13 @@
+     }
+     pub fn queue_shell_motion(&mut self,id:u64,local:Point){
+         if !self.shells.get(&id).is_some_and(|s|s.mapped){return;}
+-        if self.shell_motion.len()>=256 {self.input_fault=Some("shell motion queue overflow".into());return;}
++        // Only the latest motion matters to a shell surface: a full queue forgets the oldest.
++        if self.shell_motion.len()>=256 {self.shell_motion.pop_front();}
+         self.shell_motion.push_back((id,local));
+     }
+     pub fn queue_shell_click(&mut self,id:u64,local:Point,button:MouseButton,pressed:bool){
+         if !self.shells.get(&id).is_some_and(|s|s.mapped){return;}
+-        if self.shell_clicks.len()>=256 {self.input_fault=Some("shell click queue overflow".into());return;}
++        if self.shell_clicks.len()>=256 {eprintln!("WMINPUT shell click queue full: the oldest click dropped (not fatal)");self.shell_clicks.pop_front();}
+         self.shell_clicks.push_back((id,local,button,pressed));
+     }
+     pub fn add(&mut self, surface: ToplevelSurface) -> u64 {
+diff -ruN '--exclude=.git' '--exclude=target' desk3-src/crates/wm-darwin/src/server.rs desk4-next-002/source/crates/wm-darwin/src/server.rs
+--- desk3-src/crates/wm-darwin/src/server.rs	2026-11-14 14:16:00.536047871 -0800
++++ desk4-next-002/source/crates/wm-darwin/src/server.rs	2026-11-14 18:32:44.748091209 -0800
+@@ -128,6 +128,13 @@
+     held: HashMap<u64, (wl_buffer::WlBuffer, u64)>,
+     /// Replaced client buffers, released once a frame without them is rendered.
+     release_after_frame: Vec<wl_buffer::WlBuffer>,
++    /// Pointer motion to the flip that shows it (input_latency.rs).
++    pub(crate) latency: crate::input_latency::MotionLatency,
++    /// Readable when the input thread has events (hid.rs `InputThread::wake_fd`): ends the
++    /// wait between frames at once.
++    input_wake: Option<i32>,
++    /// Events the desktop could not use (said in the log, never fatal).
++    input_refused: u64,
+     /// The dma-buf behind each imported id (keeps its fd open: fence polls, checks).
+     external_dmabufs: HashMap<u64, Dmabuf>,
+     /// Committed dma-bufs whose rendering may not be finished: (id, since).
+@@ -295,6 +302,9 @@
+             external_refs: HashMap::new(),
+             held: HashMap::new(),
+             release_after_frame: Vec::new(),
++            latency: Default::default(),
++            input_wake: None,
++            input_refused: 0,
+             external_dmabufs: HashMap::new(),
+             pending_fences: Vec::new(),
+             wait_for_fences: std::env::var("CHONKSTEP_DARWIN_DMABUF_WAIT").map_or(true, |v| v != "off"),
+@@ -547,6 +557,8 @@
+         }
+         let stats = self.renderer.render_frame(self.wm.backend_mut(), presenter)?;
+         self.wm.backend_mut().dirty = false;
++        self.latency.rendered(self.renderer.busy());
++        self.latency.maybe_log();
+         // The frame just rendered no longer samples these client buffers.
+         for buffer in self.release_after_frame.drain(..) {
+             buffer.release();
+@@ -664,6 +676,7 @@
+     }
+     fn presented(&mut self, presented: &crate::render::Presented, time_ms: u32) {
+         self.frames.record_presented(presented);
++        self.latency.presented();
+         for callback in self.awaiting_flip.drain(..) {
+             callback.done(time_ms);
+         }
+@@ -682,6 +695,12 @@
+     /// `WMEXT` line per window showing a client dma-buf.
+     pub fn log_final_stats(&mut self) {
+         self.log_frames(true);
++        if let Some(line) = self.latency.final_line() {
++            eprintln!("{line}");
++        }
++        if self.input_refused > 0 {
++            eprintln!("WMINPUT events refused in all: {} (none ended the desktop)", self.input_refused);
++        }
+         self.log_external_windows();
+         if self.dmabuf_global.is_some() {
+             let d = self.dmabuf_stats;
+@@ -746,11 +765,19 @@
+             let fence = self.pending_fences.first().and_then(|(id, _)| {
+                 self.external_dmabufs.get(id)?.handles().next().map(|h| std::os::fd::AsRawFd::as_raw_fd(&h))
+             });
+-            match fence {
+-                Some(fd) if self.wait_for_fences => {
+-                    let _ = crate::kms::poll_readable(fd, Some(max));
+-                }
+-                _ => std::thread::sleep(max),
++            // Input ends the wait too, so that the pointer moves with the next frame.
++            let mut fds: Vec<libc::pollfd> = Vec::with_capacity(2);
++            if let Some(fd) = fence.filter(|_| self.wait_for_fences) {
++                fds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
++            }
++            if let Some(fd) = self.input_wake {
++                fds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
++            }
++            if fds.is_empty() {
++                std::thread::sleep(max);
++            } else {
++                let ms = max.as_micros().div_ceil(1000).min(1000) as libc::c_int;
++                let _ = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
+             }
+             return Ok(());
+         }
+@@ -759,6 +786,22 @@
+         }
+         Ok(())
+     }
++    /// The input thread's wake descriptor (`InputThread::wake_fd`).
++    pub fn set_input_wake(&mut self, fd: i32) {
++        self.input_wake = Some(fd);
++    }
++    /// A pointer event read at `at` moved the pointer (for the motion-to-screen latency).
++    pub fn note_pointer_motion(&mut self, at: std::time::Instant) {
++        self.latency.motion(at);
++    }
++    /// An input event the desktop could not use: said in the log (the first ten, then every
++    /// hundredth), never the end of the desktop.
++    pub fn note_input_refused(&mut self, error: &str) {
++        self.input_refused += 1;
++        if self.input_refused <= 10 || self.input_refused % 100 == 0 {
++            eprintln!("WMINPUT event refused (not fatal; {} so far): {error}", self.input_refused);
++        }
++    }
+     /// A frame is on its way to the screen.
+     pub fn frame_in_flight(&self) -> bool {
+         self.renderer.busy()

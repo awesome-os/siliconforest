@@ -1,0 +1,41 @@
+--- a/userland/AVFoundation/AVAssetReader.m
++++ b/userland/AVFoundation/AVAssetReader.m
+@@ -139,6 +139,7 @@
+     CMAudioFormatDescriptionRef _outDesc;
+     int64_t _audioFrame, _audioEnd;
+     BOOL _queuedAny;
++    CMTime _mediaTimelineOffset;
+ }
+ 
+ + (instancetype)assetReaderTrackOutputWithTrack:(AVAssetTrack *)track outputSettings:(NSDictionary<NSString *, id> *)outputSettings
+@@ -180,6 +181,21 @@
+     _range = range;
+     CMTime assetEnd = movie->timescale ? CMTimeMake((int64_t)movie->duration, (int32_t)movie->timescale) : kCMTimeZero;
+     _wholeAsset = CMTimeCompare(CMTimeRangeGetEnd(range), assetEnd) >= 0 || CMTIME_IS_POSITIVE_INFINITY(range.duration);
++    _mediaTimelineOffset = kCMTimeZero;
++    /* A complete compressed video track commonly has one unity-rate edit
++     * removing its CTTS/decode-delay lead. Stored samples use media time;
++     * AVAssetReader output uses the asset timeline, as Native does. Do not
++     * turn this into an assumed general trim/repeated-edit implementation. */
++    if ([self _finchIsVideo] && _wholeAsset && CMTimeCompare(range.start, kCMTimeZero) == 0 &&
++        _t->editCount == 1 && _t->edits[0].rate == 1.0 && _t->edits[0].mediaTime >= 0) {
++        int64_t firstPresentation = INT64_MAX;
++        for (size_t i = 0; i < _t->sampleCount; i++) {
++            int64_t pts = _t->samples[i].decodeTime + _t->samples[i].compositionOffset;
++            if (pts < firstPresentation) firstPresentation = pts;
++        }
++        if (firstPresentation == _t->edits[0].mediaTime)
++            _mediaTimelineOffset = CMTimeMake(-_t->edits[0].mediaTime, (int32_t)_t->timescale);
++    }
+     if (_settings && [self _finchIsAudio])
+         [self _finchSetUpConverter];
+ }
+@@ -248,6 +264,8 @@
+                 CMSampleTimingInfo timing = {CMTimeMake(s.duration, (int32_t)_t->timescale),
+                                              CMTimeMake(s.decodeTime + s.compositionOffset, (int32_t)_t->timescale),
+                                              CMTimeMake(s.decodeTime, (int32_t)_t->timescale)};
++                timing.presentationTimeStamp = CMTimeAdd(timing.presentationTimeStamp, _mediaTimelineOffset);
++                timing.decodeTimeStamp = CMTimeAdd(timing.decodeTimeStamp, _mediaTimelineOffset);
+                 if (!s.compositionOffset)
+                     timing.decodeTimeStamp = kCMTimeInvalid;
+                 size_t size = s.size;

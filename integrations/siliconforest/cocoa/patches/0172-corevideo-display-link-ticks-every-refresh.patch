@@ -1,0 +1,120 @@
+--- a/src/Frameworks/CoreVideo/CVDisplayLink.m
++++ b/src/Frameworks/CoreVideo/CVDisplayLink.m
+@@ -3,6 +3,8 @@
+ #include <mach/mach_time.h>
+ #include <pthread.h>
+ #include <dlfcn.h>
++#include <mach/mach.h>
++#include <mach/thread_policy.h>
+ 
+ extern CGDirectDisplayID CGMainDisplayID(void);
+ 
+@@ -77,6 +79,27 @@
+ 
+ static void displayLinkCall(CVDisplayLink *link, CVTimeStamp *now, CVTimeStamp *out) {
+     CVOptionFlags flagsOut = 0;
++    // (TERM11) SF_CV_TRACE=1: every tick, the time it stands for and when it ran (ms, host clock)
++    static int trace = -1;
++    if (trace < 0)
++        trace = getenv("SF_CV_TRACE") != NULL;
++    if (trace) {
++        static mach_timebase_info_data_t tb;
++        if (tb.denom == 0)
++            mach_timebase_info(&tb);
++        // to a file of this process in the directory SF_CV_TRACE names (Firefox's GPU process has no stderr)
++        static FILE *traceFile;
++        if (traceFile == NULL) {
++            char path[512];
++            snprintf(path, sizeof path, "%s/cvtick-%d.txt", getenv("SF_CV_TRACE"), (int)getpid());
++            traceFile = fopen(path, "a");
++            if (traceFile == NULL)
++                traceFile = stderr;
++        }
++        fprintf(traceFile, "CVTICK at=%.2f ran=%.2f \n", now->hostTime * (double)tb.numer / tb.denom / 1e6,
++                mach_absolute_time() * (double)tb.numer / tb.denom / 1e6);
++        fflush(traceFile);
++    }
+     NSAutoreleasePool *pool = [NSAutoreleasePool new];
+     if (link->_callback != NULL)
+         link->_callback(link, now, out, 0, &flagsOut, link->_userInfo);
+@@ -84,8 +107,13 @@
+ }
+ 
+ // one tick on the display clock; 0 when the clock knows no flip yet (the caller ticks on its timer instead)
++/* (TERM11, the owner's "not buttery smooth"; FXPERF2's measurement) The link ticks once at every refresh, on the
++ * display's phase (the last reported flip plus whole refreshes), as a macOS CVDisplayLink does. It waited for a
++ * pending frame's flip (up to two refreshes after its commit): with a commit-to-flip time above one refresh it ticked
++ * every second refresh. A link that wakes more than half a refresh late ticks for the refresh that just passed, it does
++ * not catch up with a burst. SF_CV_TRACE=<dir>: every tick to <dir>/cvtick-<pid>.txt. */
+ static int displayLinkClockTick(CVDisplayLink *link, unsigned generation, uint64_t *last, uint64_t base) {
+-    uint64_t presented, refreshNs, counter, since;
++    uint64_t presented, refreshNs, counter, since, period, next, now;
+     int pending;
+     static mach_timebase_info_data_t tb;
+ 
+@@ -93,33 +121,28 @@
+         mach_timebase_info(&tb);
+     if (!sfDisplayClock(&presented, &refreshNs, &counter, &pending, &since))
+         return 0;
+-    uint64_t period = (uint64_t)((double)refreshNs * tb.denom / tb.numer);
++    period = (uint64_t)((double)refreshNs * tb.denom / tb.numer);
++    if (period == 0)
++        return 0;
+     sfMeasuredRefreshSeconds = refreshNs / 1e9;
+-    // the display's next flip after the last tick, on its phase
+-    uint64_t next = presented, now = mach_absolute_time();
+-    if (next + period <= now)
+-        next += ((now - next) / period) * period;
+-    while (next <= *last + period / 2 || next <= now)
+-        next += period;
+-    // a frame of ours waiting for its flip: tick at that flip (at most two refreshes after its commit)
+-    uint64_t deadline = next;
+-    if (pending > 0 && since != 0 && since + 2 * period > deadline)
+-        deadline = since + 2 * period;
+-    int moved = sfDisplayClockWait(counter, deadline);
++    now = mach_absolute_time();
++    // the first refresh more than half a refresh after the last tick
++    uint64_t after = *last + period / 2;
++    if (after > presented)
++        next = presented + ((after - presented) / period + 1) * period;
++    else
++        next = presented + period;
++    // far behind (a stall, or the first tick): the refresh that just passed
++    if (next + period / 2 < now)
++        next = presented + ((now - presented) / period) * period;
++    if (next > now)
++        mach_wait_until(next);
+     if (!link->_running || link->_generation != generation)
+         return 1;
+-    uint64_t tick = next;
+-    if (moved) {
+-        sfDisplayClock(&presented, &refreshNs, &counter, &pending, &since);
+-        // the report of a flip the timer already ticked for (its prediction came first): no second tick
+-        if (presented <= *last + period / 2)
+-            return 1;
+-        tick = presented;
+-    }
+     CVTimeStamp tsNow, tsOut;
+-    fillTimeStampAt(&tsNow, tick, period, base);
+-    fillTimeStampAt(&tsOut, tick + period, period, base);
+-    *last = tick;
++    fillTimeStampAt(&tsNow, next, period, base);
++    fillTimeStampAt(&tsOut, next + period, period, base);
++    *last = next;
+     displayLinkCall(link, &tsNow, &tsOut);
+     return 1;
+ }
+@@ -133,6 +156,13 @@
+     sfFindDisplayClock();
+     mach_timebase_info(&tb);
+     period = (uint64_t)(1e9 / 60.0 * tb.denom / tb.numer);
++    /* (TERM11) the link's thread runs as a display link's does on macOS, under a time constraint (a refresh period,
++     * ~2 ms of work within ~4 ms): at the default priority it woke more than half a refresh late now and then while
++     * Firefox's processes kept the cores busy, and a refresh went without a frame */
++    thread_time_constraint_policy_data_t policy = { (uint32_t)period, (uint32_t)(period / 8), (uint32_t)(period / 4), 1 };
++    if (thread_policy_set(mach_thread_self(), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&policy,
++                          THREAD_TIME_CONSTRAINT_POLICY_COUNT) != KERN_SUCCESS)
++        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+     while (link->_running && link->_generation == generation) {
+         if (sfDisplayClock != NULL && displayLinkClockTick(link, generation, &last, start))
+             continue;

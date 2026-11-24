@@ -1,0 +1,653 @@
+--- a/src/Frameworks/AppKit/SFCUIPrivate.h
++++ b/src/Frameworks/AppKit/SFCUIPrivate.h
+@@ -0,0 +1,177 @@
++/* SPDX-License-Identifier: MIT OR Apache-2.0 */
++/* Taken from Finch (userland/CoreUI/CUIPrivate.h, commit 2d9b1bb) for this AppKit's named colours from an
++   application's asset catalog (docs/roadmap/issues/SF-AA-activity-monitor.md, "Taken from Finch"). The bitmap,
++   raw data and link declarations are left out (only colours are read here). */
++/*
++ * Finch's CoreUI internals: the compiled asset catalog reader in C
++ * (CUIStore.c: the BOM container and the catalog's trees; CUIRendition.c:
++ * CSI renditions and their payloads; CUIDeepmap.c: the deepmap2 codec), under
++ * the Objective-C API in CUICatalog.m. docs/design/ASSETS.md describes the
++ * format.
++ */
++#ifndef SFCUIPRIVATE_H
++#define SFCUIPRIVATE_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++/* Rendition key attributes, as the KEYFORMAT block numbers them (kCRTheme...Name). */
++enum {
++	CUI_ATTR_ELEMENT = 1,
++	CUI_ATTR_PART = 2,
++	CUI_ATTR_SIZE = 3,
++	CUI_ATTR_DIRECTION = 4,
++	CUI_ATTR_VALUE = 6,
++	CUI_ATTR_APPEARANCE = 7,
++	CUI_ATTR_DIMENSION1 = 8,
++	CUI_ATTR_DIMENSION2 = 9,
++	CUI_ATTR_STATE = 10,
++	CUI_ATTR_LAYER = 11,
++	CUI_ATTR_SCALE = 12,
++	CUI_ATTR_LOCALIZATION = 13,
++	CUI_ATTR_PRESENTATION_STATE = 14,
++	CUI_ATTR_IDIOM = 15,
++	CUI_ATTR_SUBTYPE = 16,
++	CUI_ATTR_IDENTIFIER = 17,
++	CUI_ATTR_PREVIOUS_VALUE = 18,
++	CUI_ATTR_PREVIOUS_STATE = 19,
++	CUI_ATTR_SIZE_CLASS_H = 20,
++	CUI_ATTR_SIZE_CLASS_V = 21,
++	CUI_ATTR_MEMORY_CLASS = 22,
++	CUI_ATTR_GRAPHICS_CLASS = 23,
++	CUI_ATTR_GAMUT = 24,
++	CUI_ATTR_DEPLOYMENT = 25,
++	CUI_ATTR_GLYPH_WEIGHT = 26,
++	CUI_ATTR_GLYPH_SIZE = 27,
++	CUI_ATTR_MAX = 32
++};
++
++typedef struct {
++	uint16_t v[CUI_ATTR_MAX];
++} cui_key;
++
++typedef struct {
++	cui_key key;
++	const uint8_t *csi;
++	uint32_t len;
++	uint32_t index;  /* in the tree's order */
++} cui_rendition;
++
++typedef struct {
++	char *name;
++	cui_key attrs;  /* the facet's rendition key token */
++	uint32_t mask;  /* which attributes the token sets */
++} cui_facet;
++
++typedef struct {
++	char *name;
++	uint16_t id;
++} cui_appearance;
++
++typedef struct cui_store {
++	void *map;
++	size_t size;
++	bool mapped;
++	const uint8_t *data;
++	/* CARHEADER */
++	uint32_t coreui_version, storage_version, timestamp, rendition_count, schema, colorspace, key_semantics;
++	char main_version[129], version_string[257];
++	/* KEYFORMAT */
++	uint32_t nattrs, attrs[CUI_ATTR_MAX];
++	cui_rendition *rends;  /* by identifier, then in the tree's order */
++	size_t nrends;
++	cui_facet *facets;  /* sorted by name, as the tree is */
++	size_t nfacets;
++	cui_appearance *apps;
++	size_t napps;
++} cui_store;
++
++cui_store *cui_store_open(const char *path);
++cui_store *cui_store_open_bytes(const void *bytes, size_t len);
++void cui_store_free(cui_store *s);
++const cui_facet *cui_store_facet(const cui_store *s, const char *name);
++/* true and the id when the catalog lists the appearance */
++bool cui_store_appearance(const cui_store *s, const char *name, uint16_t *id);
++const char *cui_store_appearance_name(const cui_store *s, uint16_t id);
++/* the renditions with an identifier: [*first, *first + count) */
++size_t cui_store_renditions_for_identifier(const cui_store *s, uint16_t ident, size_t *first);
++const cui_rendition *cui_store_rendition_with_key(const cui_store *s, const cui_key *key);
++
++/* MARK: CSI renditions */
++
++/* Layouts (the CSI header's) */
++enum {
++	CUI_LAYOUT_GRADIENT = 6,
++	CUI_LAYOUT_EFFECT = 7,
++	CUI_LAYOUT_VECTOR = 9,
++	CUI_LAYOUT_DATA = 1000,
++	CUI_LAYOUT_EXTERNAL_LINK = 1001,
++	CUI_LAYOUT_LAYER_STACK = 1002,
++	CUI_LAYOUT_INTERNAL_LINK = 1003,
++	CUI_LAYOUT_PACKED_IMAGE = 1004,
++	CUI_LAYOUT_NAME_LIST = 1005,
++	CUI_LAYOUT_TEXTURE = 1007,
++	CUI_LAYOUT_COLOR = 1009,
++	CUI_LAYOUT_MULTISIZE_IMAGE_SET = 1010,
++	CUI_LAYOUT_VECTOR_GLYPH = 1017,
++	CUI_LAYOUT_ICON_STACK = 1019,
++	CUI_LAYOUT_ICON_GROUP = 1020,
++	CUI_LAYOUT_NAMED_GRADIENT = 1021,
++};
++
++/* TLV types in the CSI header's extension area */
++enum {
++	CUI_TLV_SLICES = 1001,
++	CUI_TLV_METRICS = 1003,
++	CUI_TLV_BLEND = 1004,
++	CUI_TLV_UTI = 1005,
++	CUI_TLV_EXIF = 1006,
++	CUI_TLV_ROWBYTES = 1007,
++	CUI_TLV_LINK = 1010,
++};
++
++#define CUI_FOURCC(a, b, c, d) ((uint32_t)(a) << 24 | (uint32_t)(b) << 16 | (uint32_t)(c) << 8 | (uint32_t)(d))
++
++typedef struct {
++	uint32_t version, flags, width, height, scale100, pixel_format, colorspace;
++	uint16_t layout;
++	char name[129];
++	const uint8_t *tlv;
++	uint32_t tlv_len;
++	const uint8_t *data;
++	uint32_t data_len;
++} cui_csi;
++
++bool cui_csi_parse(const uint8_t *p, uint32_t len, cui_csi *out);
++const uint8_t *cui_csi_tlv(const cui_csi *c, uint32_t type, uint32_t *len);
++/* rendition flags: bit 2 vector-based, bits 3-4 template rendering mode */
++static inline bool cui_csi_is_vector(const cui_csi *c) { return (c->flags >> 2) & 1; }
++static inline unsigned cui_csi_template_mode(const cui_csi *c) { return (c->flags >> 3) & 3; }
++
++typedef struct {
++	uint8_t *pixels;  /* malloc'd */
++	size_t width, height, rowbytes;
++	unsigned bpp;      /* bytes per pixel */
++	uint32_t format;   /* 'ARGB' (BGRA, premultiplied), 'GA8 ', 'RGBW' (RGBA half floats) */
++	bool opaque;
++	bool native;      /* stored uncompressed: CoreUI hands these out as they are */
++} cui_bitmap;
++
++
++/* raw data ('DWAR'), decompressed when it is LZFSE; malloc'd */
++
++/* colour ('COLR'): the colour space id, components (up to 8) and the system colour name, if any */
++bool cui_csi_color(const cui_csi *c, unsigned *space, double *comps, unsigned *ncomps, char *sysname, size_t sysname_len);
++/* an internal link ('INLK'): the atlas key's attributes and the frame in it */
++
++/* the image layout a bitmap rendition had before packing (the CSI's own when not linked) */
++
++
++/* MARK: Codecs */
++
++bool cui_lz_decode(const uint8_t *src, size_t srclen, uint8_t *dst, size_t n);
++unsigned cui_deepmap2_format(const uint8_t *src, size_t len);
++bool cui_deepmap2_decode(const uint8_t *src, size_t len, uint8_t *dst, size_t rowbytes, size_t width, size_t height);
++
++#endif
+--- a/src/Frameworks/AppKit/SFCUIStore.m
++++ b/src/Frameworks/AppKit/SFCUIStore.m
+@@ -0,0 +1,377 @@
++/* SPDX-License-Identifier: MIT OR Apache-2.0 */
++/* Taken from Finch (userland/CoreUI/CUIStore.c, commit 2d9b1bb) for this AppKit's named colours from an
++   application's asset catalog (docs/roadmap/issues/SF-AA-activity-monitor.md, "Taken from Finch"). Unchanged but for the header's name. */
++/*
++ * The compiled asset catalog container. A .car file is a BOM store (the
++ * "Bill of Materials" format of installer receipts): a big-endian header,
++ * an index of blocks (offset, length) and named variables pointing at
++ * blocks. Some variables are B+ trees ("tree" blocks over pages of
++ * value/key block pairs, leaves chained left to right). The catalog's:
++ *
++ *   CARHEADER       "RATC": CoreUI and storage versions, rendition count,
++ *                   version strings, schema, colour space (little-endian)
++ *   KEYFORMAT       "tmfk": the rendition key's attributes, in key order
++ *   RENDITIONS      tree: key = one u16 per KEYFORMAT attribute, value = a
++ *                   CSI rendition (CUIRendition.c)
++ *   FACETKEYS       tree: key = a name, value = its key token (hot spot,
++ *                   count, then attribute/value u16 pairs)
++ *   APPEARANCEKEYS  tree: key = an appearance name, value = its u16 id
++ *   BITMAPKEYS, EXTENDED_METADATA, ...  not needed to look things up
++ *
++ * docs/design/ASSETS.md has the details.
++ */
++#include "SFCUIPrivate.h"
++#include <fcntl.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++static uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
++static uint16_t be16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
++static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
++static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
++
++typedef struct {
++	const uint8_t *d;
++	size_t size;
++	uint32_t index_off, nblocks;
++	uint32_t vars_off, vars_len;
++} bom;
++
++static bool
++bom_block(const bom *b, uint32_t i, const uint8_t **p, uint32_t *len)
++{
++	if (i >= b->nblocks)
++		return false;
++	const uint8_t *e = b->d + b->index_off + 4 + 8 * (size_t)i;
++	uint32_t a = be32(e), l = be32(e + 4);
++	if ((size_t)a > b->size || (size_t)l > b->size - a)
++		return false;
++	*p = b->d + a, *len = l;
++	return true;
++}
++
++static bool
++bom_var(const bom *b, const char *name, const uint8_t **p, uint32_t *len)
++{
++	const uint8_t *v = b->d + b->vars_off, *end = v + b->vars_len;
++	if (b->vars_len < 4)
++		return false;
++	uint32_t n = be32(v);
++	v += 4;
++	size_t nl = strlen(name);
++	for (uint32_t i = 0; i < n && v + 5 <= end; i++) {
++		uint32_t block = be32(v);
++		uint8_t l = v[4];
++		if (v + 5 + l > end)
++			break;
++		if (l == nl && memcmp(v + 5, name, nl) == 0)
++			return bom_block(b, block, p, len);
++		v += 5 + l;
++	}
++	return false;
++}
++
++typedef void (*tree_fn)(void *ctx, const uint8_t *key, uint32_t klen, uint32_t inline_key, const uint8_t *val, uint32_t vlen);
++
++/* Walk a BOM tree's leaves in order; keys are blocks unless inline (then the u32 is passed). */
++static bool
++bom_tree(const bom *b, const char *name, bool inline_keys, tree_fn fn, void *ctx)
++{
++	const uint8_t *t;
++	uint32_t tl;
++	if (!bom_var(b, name, &t, &tl) || tl < 21 || memcmp(t, "tree", 4) != 0)
++		return false;
++	const uint8_t *p;
++	uint32_t pl;
++	if (!bom_block(b, be32(t + 8), &p, &pl) || pl < 12)
++		return false;
++	for (int depth = 0; !be16(p); depth++) {  /* down the leftmost branch */
++		if (depth > 64 || be16(p + 2) == 0 || pl < 20 || !bom_block(b, be32(p + 12), &p, &pl) || pl < 12)
++			return false;
++	}
++	for (int pages = 0; pages < 1 << 20; pages++) {
++		uint16_t n = be16(p + 2);
++		if (12 + 8 * (size_t)n > pl)
++			return false;
++		for (uint16_t i = 0; i < n; i++) {
++			const uint8_t *e = p + 12 + 8 * (size_t)i, *val, *key = NULL;
++			uint32_t vl, kl = 0;
++			if (!bom_block(b, be32(e), &val, &vl))
++				continue;
++			if (!inline_keys && !bom_block(b, be32(e + 4), &key, &kl))
++				continue;
++			fn(ctx, key, kl, be32(e + 4), val, vl);
++		}
++		uint32_t next = be32(p + 4);
++		if (!next || !bom_block(b, next, &p, &pl) || pl < 12)
++			break;
++	}
++	return true;
++}
++
++/* MARK: - Catalog trees */
++
++typedef struct {
++	cui_store *s;
++	size_t cap;
++} grow_ctx;
++
++static void
++rendition_fn(void *ctx, const uint8_t *key, uint32_t klen, uint32_t ik, const uint8_t *val, uint32_t vlen)
++{
++	grow_ctx *g = ctx;
++	cui_store *s = g->s;
++	if (klen < 2 * s->nattrs)
++		return;
++	if (s->nrends == g->cap) {
++		g->cap = g->cap ? 2 * g->cap : 256;
++		cui_rendition *r = realloc(s->rends, g->cap * sizeof *r);
++		if (!r)
++			return;
++		s->rends = r;
++	}
++	cui_rendition *r = &s->rends[s->nrends++];
++	memset(r, 0, sizeof *r);
++	for (uint32_t i = 0; i < s->nattrs; i++)
++		if (s->attrs[i] < CUI_ATTR_MAX)
++			r->key.v[s->attrs[i]] = le16(key + 2 * i);
++	r->csi = val, r->len = vlen, r->index = (uint32_t)(s->nrends - 1);
++}
++
++static void
++facet_fn(void *ctx, const uint8_t *key, uint32_t klen, uint32_t ik, const uint8_t *val, uint32_t vlen)
++{
++	grow_ctx *g = ctx;
++	cui_store *s = g->s;
++	if (vlen < 6)
++		return;
++	if (s->nfacets == g->cap) {
++		g->cap = g->cap ? 2 * g->cap : 64;
++		cui_facet *f = realloc(s->facets, g->cap * sizeof *f);
++		if (!f)
++			return;
++		s->facets = f;
++	}
++	cui_facet *f = &s->facets[s->nfacets];
++	memset(f, 0, sizeof *f);
++	f->name = strndup((const char *)key, klen);
++	if (!f->name)
++		return;
++	uint16_t n = le16(val + 4);
++	for (uint16_t i = 0; i < n && 6 + 4 * (size_t)i + 4 <= vlen; i++) {
++		uint16_t a = le16(val + 6 + 4 * i), v = le16(val + 8 + 4 * i);
++		if (a < CUI_ATTR_MAX)
++			f->attrs.v[a] = v, f->mask |= 1u << a;
++	}
++	s->nfacets++;
++}
++
++static void
++appearance_fn(void *ctx, const uint8_t *key, uint32_t klen, uint32_t ik, const uint8_t *val, uint32_t vlen)
++{
++	grow_ctx *g = ctx;
++	cui_store *s = g->s;
++	if (vlen < 2)
++		return;
++	if (s->napps == g->cap) {
++		g->cap = g->cap ? 2 * g->cap : 8;
++		cui_appearance *a = realloc(s->apps, g->cap * sizeof *a);
++		if (!a)
++			return;
++		s->apps = a;
++	}
++	cui_appearance *a = &s->apps[s->napps];
++	a->name = strndup((const char *)key, klen);
++	a->id = le16(val);
++	if (a->name)
++		s->napps++;
++}
++
++static int
++rend_cmp(const void *a, const void *b)
++{
++	const cui_rendition *x = a, *y = b;
++	if (x->key.v[CUI_ATTR_IDENTIFIER] != y->key.v[CUI_ATTR_IDENTIFIER])
++		return x->key.v[CUI_ATTR_IDENTIFIER] < y->key.v[CUI_ATTR_IDENTIFIER] ? -1 : 1;
++	return x->index < y->index ? -1 : x->index > y->index;
++}
++
++static int
++facet_cmp(const void *a, const void *b)
++{
++	return strcmp(((const cui_facet *)a)->name, ((const cui_facet *)b)->name);
++}
++
++static bool
++load(cui_store *s)
++{
++	bom b = {.d = s->data, .size = s->size};
++	if (s->size < 32 || memcmp(s->data, "BOMStore", 8) != 0)
++		return false;
++	b.index_off = be32(s->data + 16);
++	uint32_t index_len = be32(s->data + 20);
++	b.vars_off = be32(s->data + 24), b.vars_len = be32(s->data + 28);
++	if ((size_t)b.index_off + 4 > s->size || (size_t)index_len > s->size - b.index_off ||
++	    (size_t)b.vars_off > s->size || (size_t)b.vars_len > s->size - b.vars_off)
++		return false;
++	b.nblocks = be32(s->data + b.index_off);
++	if ((size_t)b.nblocks * 8 + 4 > index_len)
++		b.nblocks = (index_len - 4) / 8;
++
++	const uint8_t *p;
++	uint32_t l;
++	if (!bom_var(&b, "CARHEADER", &p, &l) || l < 436 || memcmp(p, "RATC", 4) != 0)
++		return false;
++	s->coreui_version = le32(p + 4), s->storage_version = le32(p + 8), s->timestamp = le32(p + 12);
++	s->rendition_count = le32(p + 16);
++	memcpy(s->main_version, p + 20, 128);
++	memcpy(s->version_string, p + 148, 256);
++	s->schema = le32(p + 424), s->colorspace = le32(p + 428), s->key_semantics = le32(p + 432);
++
++	if (bom_var(&b, "KEYFORMAT", &p, &l) && l >= 12 && memcmp(p, "tmfk", 4) == 0) {
++		uint32_t n = le32(p + 8);
++		if (n > CUI_ATTR_MAX || 12 + 4 * (size_t)n > l)
++			return false;
++		s->nattrs = n;
++		for (uint32_t i = 0; i < n; i++)
++			s->attrs[i] = le32(p + 12 + 4 * i);
++	} else
++		return false;  /* every catalog actool has written since 10.9 has one */
++
++	grow_ctx g = {s, 0};
++	if (!bom_tree(&b, "RENDITIONS", false, rendition_fn, &g))
++		return false;
++	g.cap = 0;
++	bom_tree(&b, "FACETKEYS", false, facet_fn, &g);
++	g.cap = 0;
++	bom_tree(&b, "APPEARANCEKEYS", false, appearance_fn, &g);
++	if (s->nrends)
++		qsort(s->rends, s->nrends, sizeof *s->rends, rend_cmp);
++	if (s->nfacets)
++		qsort(s->facets, s->nfacets, sizeof *s->facets, facet_cmp);
++	return true;
++}
++
++cui_store *
++cui_store_open(const char *path)
++{
++	int fd = open(path, O_RDONLY | O_CLOEXEC);
++	if (fd < 0)
++		return NULL;
++	struct stat st;
++	cui_store *s = NULL;
++	if (fstat(fd, &st) == 0 && st.st_size >= 32) {
++		void *m = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
++		if (m != MAP_FAILED && (s = calloc(1, sizeof *s))) {
++			s->map = m, s->size = (size_t)st.st_size, s->mapped = true, s->data = m;
++			if (!load(s)) {
++				cui_store_free(s);
++				s = NULL;
++			}
++		} else if (m != MAP_FAILED)
++			munmap(m, (size_t)st.st_size);
++	}
++	close(fd);
++	return s;
++}
++
++cui_store *
++cui_store_open_bytes(const void *bytes, size_t len)
++{
++	cui_store *s = calloc(1, sizeof *s);
++	void *copy = malloc(len ? len : 1);
++	if (!s || !copy) {
++		free(s);
++		free(copy);
++		return NULL;
++	}
++	memcpy(copy, bytes, len);
++	s->map = copy, s->size = len, s->data = copy;
++	if (!load(s)) {
++		cui_store_free(s);
++		return NULL;
++	}
++	return s;
++}
++
++void
++cui_store_free(cui_store *s)
++{
++	if (!s)
++		return;
++	for (size_t i = 0; i < s->nfacets; i++)
++		free(s->facets[i].name);
++	for (size_t i = 0; i < s->napps; i++)
++		free(s->apps[i].name);
++	free(s->facets);
++	free(s->apps);
++	free(s->rends);
++	if (s->mapped)
++		munmap(s->map, s->size);
++	else
++		free(s->map);
++	free(s);
++}
++
++const cui_facet *
++cui_store_facet(const cui_store *s, const char *name)
++{
++	cui_facet k = {.name = (char *)name};
++	return s->nfacets ? bsearch(&k, s->facets, s->nfacets, sizeof k, facet_cmp) : NULL;
++}
++
++bool
++cui_store_appearance(const cui_store *s, const char *name, uint16_t *id)
++{
++	for (size_t i = 0; name && i < s->napps; i++)
++		if (strcmp(s->apps[i].name, name) == 0) {
++			*id = s->apps[i].id;
++			return true;
++		}
++	return false;
++}
++
++const char *
++cui_store_appearance_name(const cui_store *s, uint16_t id)
++{
++	for (size_t i = 0; i < s->napps; i++)
++		if (s->apps[i].id == id)
++			return s->apps[i].name;
++	return id == 0 ? "NSAppearanceNameSystem" : NULL;
++}
++
++size_t
++cui_store_renditions_for_identifier(const cui_store *s, uint16_t ident, size_t *first)
++{
++	size_t lo = 0, hi = s->nrends;
++	while (lo < hi) {
++		size_t mid = (lo + hi) / 2;
++		if (s->rends[mid].key.v[CUI_ATTR_IDENTIFIER] < ident)
++			lo = mid + 1;
++		else
++			hi = mid;
++	}
++	size_t end = lo;
++	while (end < s->nrends && s->rends[end].key.v[CUI_ATTR_IDENTIFIER] == ident)
++		end++;
++	*first = lo;
++	return end - lo;
++}
++
++const cui_rendition *
++cui_store_rendition_with_key(const cui_store *s, const cui_key *key)
++{
++	size_t first, n = cui_store_renditions_for_identifier(s, key->v[CUI_ATTR_IDENTIFIER], &first);
++	for (size_t i = first; i < first + n; i++) {
++		bool same = true;
++		for (uint32_t a = 0; a < s->nattrs && same; a++)
++			if (s->attrs[a] < CUI_ATTR_MAX)
++				same = s->rends[i].key.v[s->attrs[a]] == key->v[s->attrs[a]];
++		if (same)
++			return &s->rends[i];
++	}
++	return NULL;
++}
+--- a/src/Frameworks/AppKit/SFCUIRendition.m
++++ b/src/Frameworks/AppKit/SFCUIRendition.m
+@@ -0,0 +1,90 @@
++/* SPDX-License-Identifier: MIT OR Apache-2.0 */
++/* Taken from Finch (userland/CoreUI/CUIRendition.c, commit 2d9b1bb) for this AppKit's named colours from an
++   application's asset catalog (docs/roadmap/issues/SF-AA-activity-monitor.md, "Taken from Finch"). Only cui_csi_parse, cui_csi_tlv and cui_csi_color. */
++/*
++ * CSI renditions, the values of a catalog's RENDITIONS tree (little-endian):
++ *
++ *   0    "ISTC" (CTSI), version (1)
++ *   8    rendition flags (bit 2 vector-based, bits 3-4 template rendering
++ *        mode: 1 template, 2 automatic)
++ *   12   width, height in pixels; scale x 100
++ *   24   pixel format ('ARGB', 'GA8 ', 'RGBW', 'PDF ', 'SVG ', 'DATA', 'JPEG', 'HEIF', 0)
++ *   28   colour space id (1 sRGB, 2 gray gamma 2.2, 3 Display P3, 4 extended
++ *        sRGB, 5 extended linear sRGB, 6 extended gray)
++ *   32   modification time, u16 layout, u16 0, name[128]
++ *   168  TLV length, u32 1, u32 0, payload length
++ *   184  TLVs (type, length, value), then the payload
++ *
++ * Payloads: "MLEC" (CELM) bitmaps, "DWAR" (RAWD) raw data (PDF, SVG, data
++ * assets, JPEG/HEIF images), "RLOC" (COLR) colours. Image renditions in an
++ * atlas carry no payload but an "INLK" TLV naming the atlas and the frame.
++ */
++#include "SFCUIPrivate.h"
++#include <string.h>
++
++static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
++static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
++
++bool
++cui_csi_parse(const uint8_t *p, uint32_t len, cui_csi *c)
++{
++	memset(c, 0, sizeof *c);
++	if (len < 184 || memcmp(p, "ISTC", 4) != 0)
++		return false;
++	c->version = rd32(p + 4), c->flags = rd32(p + 8);
++	c->width = rd32(p + 12), c->height = rd32(p + 16), c->scale100 = rd32(p + 20);
++	c->pixel_format = rd32(p + 24), c->colorspace = rd32(p + 28) & 0xff;
++	c->layout = rd16(p + 36);
++	memcpy(c->name, p + 40, 128);
++	uint32_t tl = rd32(p + 168), dl = rd32(p + 180);
++	if (tl > len - 184)
++		return false;
++	c->tlv = p + 184, c->tlv_len = tl;
++	c->data = p + 184 + tl;
++	c->data_len = dl <= len - 184 - tl ? dl : len - 184 - tl;
++	return true;
++}
++
++const uint8_t *
++cui_csi_tlv(const cui_csi *c, uint32_t type, uint32_t *len)
++{
++	for (uint32_t o = 0; o + 8 <= c->tlv_len;) {
++		uint32_t t = rd32(c->tlv + o), l = rd32(c->tlv + o + 4);
++		if (l > c->tlv_len - o - 8)
++			break;
++		if (t == type) {
++			*len = l;
++			return c->tlv + o + 8;
++		}
++		o += 8 + l;
++	}
++	return NULL;
++}
++
++/* "RLOC", version, colour space (u8), flags (u8: 1 = system colour name follows), 0, count, doubles[count],
++ * then for a system colour: "RLOC", 1, name length, name. */
++bool
++cui_csi_color(const cui_csi *c, unsigned *space, double *comps, unsigned *ncomps, char *sysname, size_t sysname_len)
++{
++	if (c->data_len < 16 || memcmp(c->data, "RLOC", 4) != 0)
++		return false;
++	uint32_t n = rd32(c->data + 12);
++	if (n > 8 || 16 + 8 * (size_t)n > c->data_len)
++		return false;
++	*space = c->data[8];
++	for (uint32_t i = 0; i < n; i++)
++		memcpy(&comps[i], c->data + 16 + 8 * i, 8);
++	*ncomps = n;
++	if (sysname_len)
++		sysname[0] = 0;
++	const uint8_t *t = c->data + 16 + 8 * (size_t)n;
++	size_t rest = c->data_len - 16 - 8 * (size_t)n;
++	if ((c->data[9] & 1) && rest >= 12 && memcmp(t, "RLOC", 4) == 0) {
++		uint32_t l = rd32(t + 8);
++		if (l <= rest - 12 && l < sysname_len) {
++			memcpy(sysname, t + 12, l);
++			sysname[l] = 0;
++		}
++	}
++	return true;
++}

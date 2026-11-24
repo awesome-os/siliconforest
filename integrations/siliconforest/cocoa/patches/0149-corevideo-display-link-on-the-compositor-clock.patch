@@ -1,0 +1,149 @@
+--- a/src/Frameworks/CoreVideo/CVDisplayLink.m
++++ b/src/Frameworks/CoreVideo/CVDisplayLink.m
+@@ -2,6 +2,7 @@
+ 
+ #include <mach/mach_time.h>
+ #include <pthread.h>
++#include <dlfcn.h>
+ 
+ extern CGDirectDisplayID CGMainDisplayID(void);
+ 
+@@ -37,29 +38,120 @@
+     t->flags = sfTimeStampValid;
+ }
+ 
++/* (TERM9) In an application with windows the compositor reports when each frame it showed was flipped
++ * (libWindowServer's display clock, wp_presentation): the link ticks right after the flip that showed this
++ * application's last frame, with inNow = that flip and inOutputTime = the next one, so the application
++ * draws one frame per refresh, in step with the display. While a frame of ours waits for its flip the link
++ * waits for it (at most two refreshes); with nothing in flight it ticks on the display's phase (the last
++ * reported flip plus whole refreshes). Without the clock (no window server, an older compositor) it is the
++ * 60 Hz timer it was. SF_CV_TIMER=1 keeps the timer for comparisons. */
++typedef int (*sfDisplayClockFn)(uint64_t *, uint64_t *, uint64_t *, int *, uint64_t *);
++typedef int (*sfDisplayClockWaitFn)(uint64_t, uint64_t);
++
++static sfDisplayClockFn sfDisplayClock;
++static sfDisplayClockWaitFn sfDisplayClockWait;
++static double sfMeasuredRefreshSeconds;
++
++static void sfFindDisplayClock(void) {
++    static int looked;
++    if (looked)
++        return;
++    looked = 1;
++    if (getenv("SF_CV_TIMER") != NULL)
++        return;
++    sfDisplayClock = (sfDisplayClockFn)dlsym(RTLD_DEFAULT, "_windowServerDisplayClock");
++    sfDisplayClockWait = (sfDisplayClockWaitFn)dlsym(RTLD_DEFAULT, "_windowServerDisplayClockWait");
++    if (sfDisplayClock == NULL || sfDisplayClockWait == NULL)
++        sfDisplayClock = NULL;
++}
++
++static void fillTimeStampAt(CVTimeStamp *t, uint64_t host, uint64_t period, uint64_t base) {
++    memset(t, 0, sizeof *t);
++    t->videoTimeScale = sfTimeScale;
++    t->videoTime = (int64_t)((host - base) / (period ? period : 1)) * sfRefreshPeriod;
++    t->hostTime = host;
++    t->rateScalar = 1.0;
++    t->videoRefreshPeriod = sfRefreshPeriod;
++    t->flags = sfTimeStampValid;
++}
++
++static void displayLinkCall(CVDisplayLink *link, CVTimeStamp *now, CVTimeStamp *out) {
++    CVOptionFlags flagsOut = 0;
++    NSAutoreleasePool *pool = [NSAutoreleasePool new];
++    if (link->_callback != NULL)
++        link->_callback(link, now, out, 0, &flagsOut, link->_userInfo);
++    [pool release];
++}
++
++// one tick on the display clock; 0 when the clock knows no flip yet (the caller ticks on its timer instead)
++static int displayLinkClockTick(CVDisplayLink *link, unsigned generation, uint64_t *last, uint64_t base) {
++    uint64_t presented, refreshNs, counter, since;
++    int pending;
++    static mach_timebase_info_data_t tb;
++
++    if (tb.denom == 0)
++        mach_timebase_info(&tb);
++    if (!sfDisplayClock(&presented, &refreshNs, &counter, &pending, &since))
++        return 0;
++    uint64_t period = (uint64_t)((double)refreshNs * tb.denom / tb.numer);
++    sfMeasuredRefreshSeconds = refreshNs / 1e9;
++    // the display's next flip after the last tick, on its phase
++    uint64_t next = presented, now = mach_absolute_time();
++    if (next + period <= now)
++        next += ((now - next) / period) * period;
++    while (next <= *last + period / 2 || next <= now)
++        next += period;
++    // a frame of ours waiting for its flip: tick at that flip (at most two refreshes after its commit)
++    uint64_t deadline = next;
++    if (pending > 0 && since != 0 && since + 2 * period > deadline)
++        deadline = since + 2 * period;
++    int moved = sfDisplayClockWait(counter, deadline);
++    if (!link->_running || link->_generation != generation)
++        return 1;
++    uint64_t tick = next;
++    if (moved) {
++        sfDisplayClock(&presented, &refreshNs, &counter, &pending, &since);
++        // the report of a flip the timer already ticked for (its prediction came first): no second tick
++        if (presented <= *last + period / 2)
++            return 1;
++        tick = presented;
++    }
++    CVTimeStamp tsNow, tsOut;
++    fillTimeStampAt(&tsNow, tick, period, base);
++    fillTimeStampAt(&tsOut, tick + period, period, base);
++    *last = tick;
++    displayLinkCall(link, &tsNow, &tsOut);
++    return 1;
++}
++
+ static void *displayLinkThread(void *arg) {
+     CVDisplayLink *link = arg;
+     mach_timebase_info_data_t tb;
+-    uint64_t start = mach_absolute_time(), period, frame = 0;
++    uint64_t start = mach_absolute_time(), period, frame = 0, last = 0;
+     unsigned generation = link->_generation;
+ 
++    sfFindDisplayClock();
+     mach_timebase_info(&tb);
+     period = (uint64_t)(1e9 / 60.0 * tb.denom / tb.numer);
+     while (link->_running && link->_generation == generation) {
++        if (sfDisplayClock != NULL && displayLinkClockTick(link, generation, &last, start))
++            continue;
+         CVTimeStamp now, out;
+-        CVOptionFlags flagsOut = 0;
+ 
+         frame++;
+-        mach_wait_until(start + frame * period);
++        uint64_t at = start + frame * period;
++        // after ticks on the display clock the timer goes on from the last one
++        if (at <= last) {
++            frame = (last - start) / period + 1;
++            at = start + frame * period;
++        }
++        mach_wait_until(at);
+         if (!link->_running || link->_generation != generation)
+             break;
+         fillTimeStamp(&now, frame, start, period);
+         fillTimeStamp(&out, frame + 1, start, period);
+-
+-        NSAutoreleasePool *pool = [NSAutoreleasePool new];
+-        if (link->_callback != NULL)
+-            link->_callback(link, &now, &out, 0, &flagsOut, link->_userInfo);
+-        [pool release];
++        last = at;
++        displayLinkCall(link, &now, &out);
+     }
+     [link release];
+     return NULL;
+@@ -134,6 +226,9 @@
+ double CVDisplayLinkGetActualOutputVideoRefreshPeriod(CVDisplayLinkRef self) {
+     if (self == nil)
+         return 0;
++    // (TERM9) the refresh the compositor measured, once the link has run on its clock
++    if (sfMeasuredRefreshSeconds > 0)
++        return sfMeasuredRefreshSeconds;
+     return (double)sfRefreshPeriod / (double)sfTimeScale;
+ }
+ 

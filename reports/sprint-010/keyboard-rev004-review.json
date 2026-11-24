@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_REVIEW_NO_HARDWARE_NO_BUILD",
+  "frozen": {
+    "adapter_receipt": "integrations/puredarwin/m1-keyboard/adapter-source-validation.json 75a861139c1ab44a (revision 4)",
+    "source_set": "df1b54a89e578743f1e878259b53bee38a967f1ae0fc3eb7fefa8cc94af0643b, recomputed from owned_file_sha256; all 14 file hashes match the disk",
+    "patch": "metadata-revision004.patch d6a751958fc519da; touches only ADAPTER.md, PDM1SPIHID.cpp, m1kbd_hid.c, m1kbd_hid.h and test_hid_metadata.py",
+    "unchanged_vs_native003": "m1kbd_hw.h, m1kbd_board.c, m1kbd_pio.c, PDM1KeyboardHW.h/.cpp, PDM1SPIHID.h, CMakeLists.txt, Info.plist, test_adapter.py, and the root protocol engine"
+  },
+  "verdict": "APPROVE.",
+  "verified": [
+    "device_info: length 24..2038; count >= 3 with no upper bound (the count is never used to iterate or allocate; only interface 1 is requested); vendor 0x05ac and product 0x0341 exact; string descriptors never dereferenced. Distinct reasons: ARGUMENT -1, LENGTH -2, COUNT -3, VENDOR -4, PRODUCT -5. This fixes the confirmed attempt-002 cause (Linux: 'limiting the number of devices to 4').",
+    "interface_info: length 16..2038; interface_num must be 1 (INTERFACE -6), consistent with Linux registering the keyboard on interface (1); max_input 1..2038 (INPUT_SIZE -7); the name span is not required.",
+    "Diagnostic headers: m1kbd_device_metadata_header copies exactly 12 little-endian u16 words from the first 24 bytes, and m1kbd_interface_metadata_header copies the 6-byte prefix plus 5 words (16 bytes), only when n is large enough; otherwise the output is zeroed. IOLog and the V1 registry blobs contain only IDs, count, version, max sizes and offset/length/valid triples (metadataSpanValid is pure arithmetic). No string, serial or report bytes. static_asserts pin 24 and 16 bytes. Metadata is recorded on success and on failure; the failure paths still call fail() with the same phases.",
+    "Reference counts: recordBytes uses OSData::withBytes, setProperty and release; the scalar setProperty overloads create OSNumbers internally. Nothing leaks.",
+    "Once-only latch: static volatile UInt32 claimed with OSCompareAndSwap(0,1) in probe(), after the pdm1kbd=1 check and before super::probe. Re-matched instances (attempt-002 showed three runs) log 'probe refused' and return nullptr before any hardware access. The claim persists through start failure, as intended. The unique IOMatchCategory means no competing driver consumes the claim. The source test pins a single CAS with no reset path.",
+    "Tests here: test_hid_metadata 13/13 (including counts 3..65535, invalid spans accepted with a guard page proving no access past the fixed header, distinct reasons, and the probe-claim policy) and test_adapter 19/19."
+  ],
+  "next_runtime_expectations": "With count > 4 accepted, enumeration proceeds to interface info (2,1,512; id 1), where interface_num==1 and max_input are now logged numerically even on failure, then to the descriptor (0x10,1,512; at most 512 bytes) and IOHIDDevice publication. A failure at either step will now show its numeric header. No input or typing claim follows from enumeration alone.",
+  "notes": [
+    "If the probe claim is consumed by a probe whose super::probe returns nullptr, no hardware attempt happens that boot. This is fail-closed by design.",
+    "The kernel binary and KC still need the same binary-to-source checks as SDK003/KC003 once SDK004 is built."
+  ]
+}

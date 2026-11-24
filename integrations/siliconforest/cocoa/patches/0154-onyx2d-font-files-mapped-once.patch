@@ -1,0 +1,68 @@
+--- a/src/Frameworks/Onyx2D/O2DataProvider.m
++++ b/src/Frameworks/Onyx2D/O2DataProvider.m
+@@ -12,6 +12,12 @@
+ #import <Foundation/NSStream.h>
+ #import <Foundation/NSURL.h>
+ #import <Foundation/NSValue.h>
++#import <Foundation/NSDictionary.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
+ #import <string.h>
+ 
+ @implementation O2DataProvider
+@@ -44,8 +50,51 @@
+    return self;
+ }
+ 
++/* An installed font file is mapped once per process, read-only and shared with every provider
++ * that asks for it, as macOS keeps font data mapped from the file: pages are clean and shared
++ * with other processes, not a private copy each time. CoreText makes a graphics font from the
++ * file for each face record it uses: Firefox's fallback held ten private 30 MB copies of the
++ * CJK collection (304 MB) in its parent process. Other URLs are read as before. */
++static NSData *mappedFontFile(NSURL *url) {
++   static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
++   static NSMutableDictionary *mapped;
++   NSString *path;
++   const char *p;
++   NSData *data;
++
++   if(![url isFileURL] || (path=[url path])==nil || (p=[path fileSystemRepresentation])==NULL)
++    return nil;
++   if(strncmp(p,"/System/Library/Fonts/",22)!=0 && strncmp(p,"/Library/Fonts/",15)!=0 && strncmp(p,"/usr/share/fonts/",17)!=0)
++    return nil;
++   pthread_mutex_lock(&lock);
++   if(mapped==nil)
++    mapped=[[NSMutableDictionary alloc] init];
++   data=[[mapped objectForKey:path] retain];
++   if(data==nil){
++    int fd=open(p,O_RDONLY|O_CLOEXEC);
++    struct stat st;
++
++    if(fd>=0 && fstat(fd,&st)==0 && S_ISREG(st.st_mode) && st.st_size>=(off_t)(1<<20)){
++     void *bytes=mmap(NULL,(size_t)st.st_size,PROT_READ,MAP_PRIVATE,fd,0);
++
++     // kept for the life of the process (as the font server keeps its mapping): providers share it
++     if(bytes!=MAP_FAILED){
++      data=[[NSData alloc] initWithBytesNoCopy:bytes length:(NSUInteger)st.st_size freeWhenDone:NO];
++      [mapped setObject:data forKey:path];
++     }
++    }
++    if(fd>=0)
++     close(fd);
++   }
++   pthread_mutex_unlock(&lock);
++   return data;
++}
++
+ -initWithURL:(NSURL *)url {
+-   NSData *data=[[NSData alloc] initWithContentsOfURL:url];
++   NSData *data=mappedFontFile(url);
++
++   if(data==nil)
++    data=[[NSData alloc] initWithContentsOfURL:url];
+    id      result=[self initWithData:data];
+    
+    [data release];

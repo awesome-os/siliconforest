@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_LIBRARY_AND_RAM_RECORD_REVIEW_NO_HARDWARE",
+  "reviewed": {
+    "library": "/nix/store/5w1bfvwq.../usr/lib/libSystem.B.dylib, sha256 8ff49e0c2a5f1c6532101c7ed662632444cc97ae9669479090e7968deddd12ff, 4202078 bytes",
+    "patch": "integrations/puredarwin/m1-userspace-diagnostics/fix-root/vm-page-size-symbol.patch f51b1092 (fix/ copy identical)",
+    "recipe": "build-libsystem-pagesize.nix; root record reports/sprint-010/libsystem-pagesize-sdk-build-001.json",
+    "ram": "artifacts/m1-desktop-010/candidate-006/ramdisk.img 038f14ae + ramdisk.record.json (manifest, kernel and build record not yet present)"
+  },
+  "verdict": "APPROVE the one-line libSystem fix and the candidate-006 RAM root for a bounded RAM-only runtime test, once the concrete packet bindings are reviewed. The library differs from the RAM's current libSystem (432c7369) only in where vm_page_size comes from: libdyld's correctly initialised global instead of a stale local 4096. That is, however, a process-wide behaviour change (W1/W2) that only a run can qualify.",
+  "library": {
+    "provenance": "Patch: deletes exactly 'vm_size_t vm_page_size = 4096;' from src/Libraries/libSystem/stub/pd_libSystem_compat.c. Derivation pzjiy6qk vs vzr04lys (the producer of jll17vb2, whose libSystem.B.dylib is 432c7369, byte-equal to the RAM baseline file): identical inputDrvs; the only new input source is the patch (store copy f51b1092); env changes are only name/pname/out/patches. The output binary hashes to 8ff49e0c.",
+    "binary_diff": "Load-command names and dylibs used are unchanged (libdyld is the only LC_REEXPORT_DYLIB). Defined symbols: _vm_page_size (local __DATA,__data at 0x2b6800) is removed; an indirect entry '_vm_page_size (for _vm_page_size)' is added. Undefined: only _vm_page_size (from libdyld) is added. Export trie: still 2370 entries; exactly one change, '_vm_page_size' becomes '[re-export] _vm_page_size (from libdyld)'.",
+    "abi": "The new library imports 49 symbols, all from libdyld (old 48 plus _vm_page_size). Every one is exported by the retained /usr/lib/system/libdyld.dylib 428e224e (unchanged in RAM 006).",
+    "canonical_value": "libdyld 428e224e defines and exports _vm_page_size/_vm_page_mask/_vm_page_shift (__DATA,__common) and _mach_init. In _mach_init the stores at 0x5eda0 (shift), 0x5edbc (size) and 0x5edcc (mask) implement libsystem_kernel/mach/mach_init.c: vm_page_shift from USER_PAGE_SHIFT_64, vm_page_size = 1 << shift, vm_page_mask = size - 1. The attempt-003 probe read mask 16383 and shift 14 from these same globals, so libdyld's vm_page_size is 16384, consistent with getpagesize, sysconf and host_page_size."
+  },
+  "ram006": {
+    "record": "RAM_ROOT_STAGED_NOT_BOOTED, image sha 038f14ae (matches), base b1154b28, e2fsck 0, dump-back verified, no host mount. Payload = candidate-003's 304 entries, byte- and flag-identical (including return script ba4d2389 and page probe 856d742e), plus one entry: /usr/lib/libSystem.B.dylib from 5w1bfvwq, sha 8ff49e0c, replaces_sha256 432c7369, replaces_metadata {mode 0755, uid 0, gid 0, nlink 1}.",
+    "image": "Read-only debugfs (the image hash afterwards still matches the record): libSystem.B.dylib is 8ff49e0c, inode 8039, regular, 0755, uid/gid 0, Links 1. libdyld.dylib is 428e224e, identical to candidate-003. libSystem.dylib, libc.dylib and libm.dylib remain symlinks to 'libSystem.B.dylib'. darwin-desktop-test ba4d2389 and darwin-page-probe 856d742e are identical to 003.",
+    "stager": "The batch log shows the S1 signature (set_inode_field mode/uid/gid after rm/write) of the approved 55329c02 stager. The record does not carry the stager hash, so the build record should bind it."
+  },
+  "runtime_expectations_and_risks": [
+    {"id": "W1", "text": "57 libSystem functions read vm_page_size through the GOT slot (0x2981C8) now bound to libdyld. They include malloc (_create_scalable_szone, _mvm_allocate_pages, _mvm_deallocate_pages, _mvm_protect, large-entry paths, valloc/memalign), pthread (_pthread_allocate, guardsize, wqthread setup), dispatch heaps and I/O, os_alloc, mach_msg_server and asl. Before, all saw 4096; now all see 16384 in every process. This matches Apple's 16K arm64 behaviour, but it has never run here."},
+    {"id": "W2", "text": "Expected improvement: the 'can't mvm_protect(0) region for postlude guard page' warnings should disappear because guard pages become page-aligned. Consequence: guard pages may now actually be armed, so a latent heap overrun in PureDarwin userland that used to be silent could fault. A crash in that case is a finding to analyse, not proof the fix is wrong."},
+    {"id": "W3", "text": "Probe qualification: the page-probe JSON should report vm_page_size 16384 with mask 16383 and shift 14, and the vm_protect/mprotect observations may change. The return test (shell, compositor, client, statuses, footer) must still complete; compare against attempt 003/005 behaviour."}
+  ],
+  "conditions_before_hardware": [
+    "Review the concrete candidate-006 manifest and build record when assembled: which kernel/KC (expect an approved one, unchanged), RAM 038f14ae, the libSystem 8ff49e0c binding, the stager 55329c02 hash, the unchanged script and probe, and no virtual-input or keyboard metadata.",
+    "Keep the run bounded with verified Linux recovery, as before."
+  ],
+  "not_claimed": ["runtime correctness of the new libSystem", "page-size value at runtime", "absence of guard-page faults"],
+  "scope": "Read-only. No builds, hardware or image writes; debugfs dumps to scratch only."
+}

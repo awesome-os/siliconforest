@@ -1,0 +1,2144 @@
+diff --git a/crates/wm-darwin/src/capture.rs b/crates/wm-darwin/src/capture.rs
+index a8036f2..a4c8aa8 100644
+--- a/crates/wm-darwin/src/capture.rs
++++ b/crates/wm-darwin/src/capture.rs
+@@ -694,7 +694,9 @@ impl Server {
+     /// The PNG on the clipboard (`image/png`), served by the compositor.
+     fn offer_png(&mut self, png: Arc<Vec<u8>>) {
+         let Some(seat) = self.input.as_ref().map(|i| i.seat.clone()) else { return };
+-        smithay::wayland::selection::data_device::set_data_device_selection(&self.display_handle.clone(), &seat, vec!["image/png".into()], Some(png));
++        self.clipboard.desk_set();
++        let data = crate::clipboard::ClipData { items: vec![("image/png".into(), png.to_vec())] };
++        smithay::wayland::selection::data_device::set_data_device_selection(&self.display_handle.clone(), &seat, vec!["image/png".into()], Some(Arc::new(data)));
+     }
+     pub(crate) fn capture_dir_for_movies(&mut self) -> PathBuf {
+         location_dir(self.captures.options().location)
+diff --git a/crates/wm-darwin/src/clipboard.rs b/crates/wm-darwin/src/clipboard.rs
+new file mode 100644
+index 0000000..37db84f
+--- /dev/null
++++ b/crates/wm-darwin/src/clipboard.rs
+@@ -0,0 +1,155 @@
++//! The clipboard outlives the application that copied (DESK8; Firefox and AppKit asked for it). Wayland's
++//! clipboard is the copying client's: it sends the bytes when another client pastes, so when it quits (or
++//! loses its connection) the clipboard is empty. As a macOS pasteboard does, the desk keeps a copy: when a
++//! client sets the clipboard, the desk asks it at once for every type it offers (at most 12 types and 32 MiB,
++//! read by a thread within 3 s), and when that client's data source goes away without a new selection the
++//! desk offers the same types itself (`WMCLIP`). A client that clears the clipboard while it lives clears it.
++use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
++use std::sync::{Arc, Mutex};
++use std::time::{Duration, Instant};
++
++use smithay::wayland::selection::SelectionSource;
++
++/// What the desk serves itself: (mime type, bytes) in the order offered.
++#[derive(Debug, Default)]
++pub struct ClipData {
++    pub items: Vec<(String, Vec<u8>)>,
++}
++
++const MAX_TYPES: usize = 12;
++const MAX_BYTES: usize = 32 << 20;
++const READ_FOR: Duration = Duration::from_secs(3);
++
++#[derive(Default)]
++pub struct Keeper {
++    /// The client's source of the clipboard now, and the copy's number.
++    source: Option<SelectionSource>,
++    serial: u64,
++    /// (serial, the bytes read so far) - written by the reading thread.
++    captured: Arc<Mutex<(u64, Vec<(String, Vec<u8>)>)>>,
++    /// The desk serves the clipboard itself (the copying client went).
++    pub serving: bool,
++    pub kept: u32,
++}
++
++fn pipe() -> Option<(OwnedFd, OwnedFd)> {
++    let mut fds = [0; 2];
++    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
++        return None;
++    }
++    for fd in fds {
++        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
++    }
++    unsafe { libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK) };
++    Some(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
++}
++
++/// Read every pipe to its end (the writers closed them), within the deadline and the size limit.
++fn read_all(serial: u64, pipes: Vec<(String, OwnedFd)>, into: Arc<Mutex<(u64, Vec<(String, Vec<u8>)>)>>) {
++    let deadline = Instant::now() + READ_FOR;
++    let mut total = 0usize;
++    let mut done: Vec<(String, Vec<u8>)> = Vec::new();
++    for (mime, fd) in pipes {
++        let mut bytes = Vec::new();
++        let mut complete = false;
++        while Instant::now() < deadline && total + bytes.len() <= MAX_BYTES {
++            let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
++            let left = deadline.saturating_duration_since(Instant::now()).as_millis().max(1) as libc::c_int;
++            if unsafe { libc::poll(&mut pfd, 1, left) } <= 0 {
++                break;
++            }
++            let mut chunk = [0u8; 65536];
++            let n = unsafe { libc::read(fd.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
++            if n == 0 {
++                complete = true;
++                break;
++            }
++            if n < 0 {
++                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN) {
++                    continue;
++                }
++                break;
++            }
++            bytes.extend_from_slice(&chunk[..n as usize]);
++        }
++        if complete && total + bytes.len() <= MAX_BYTES {
++            total += bytes.len();
++            done.push((mime, bytes));
++        }
++    }
++    if let Ok(mut c) = into.lock() {
++        if c.0 == serial {
++            c.1 = done;
++        }
++    }
++}
++
++impl Keeper {
++    /// A client set the clipboard: its types are read now (nothing when the desk itself is the source).
++    pub fn copied(&mut self, source: SelectionSource) {
++        self.serial += 1;
++        self.serving = false;
++        let serial = self.serial;
++        if let Ok(mut c) = self.captured.lock() {
++            *c = (serial, Vec::new());
++        }
++        let mut pipes = Vec::new();
++        for mime in source.mime_types().into_iter().take(MAX_TYPES) {
++            let Some((read, write)) = pipe() else { break };
++            source.send(mime.clone(), write);
++            pipes.push((mime, read));
++        }
++        self.source = Some(source);
++        let into = self.captured.clone();
++        let _ = std::thread::Builder::new().name("clipboard-copy".into()).spawn(move || read_all(serial, pipes, into));
++    }
++    /// The desk set the clipboard itself (a screenshot): the client's copy is no longer the clipboard.
++    pub fn desk_set(&mut self) {
++        self.source = None;
++        self.serial += 1;
++        self.serving = false;
++    }
++    /// The clipboard was cleared or its source went. Returns the copy to serve when the source is gone
++    /// (its client quit or lost its connection); a live source that cleared it keeps it cleared.
++    pub fn cleared(&mut self) -> Option<Arc<ClipData>> {
++        let source = self.source.take()?;
++        if source.is_alive() {
++            return None;
++        }
++        self.take_copy()
++    }
++    /// The copy, when the source is gone (checked each turn: a source can go without a selection event).
++    pub fn orphaned(&mut self) -> Option<Arc<ClipData>> {
++        if self.source.as_ref().is_some_and(|s| !s.is_alive()) {
++            self.source = None;
++            return self.take_copy();
++        }
++        None
++    }
++    fn take_copy(&mut self) -> Option<Arc<ClipData>> {
++        let c = self.captured.lock().ok()?;
++        if c.0 != self.serial || c.1.is_empty() {
++            return None;
++        }
++        self.serving = true;
++        self.kept += 1;
++        Some(Arc::new(ClipData { items: c.1.clone() }))
++    }
++}
++
++impl crate::server::Server {
++    /// The desk offers the copy it kept of a clipboard whose client went.
++    pub(crate) fn clipboard_keep(&mut self, data: Arc<ClipData>) {
++        let Some(seat) = self.input.as_ref().map(|i| i.seat.clone()) else { return };
++        let mimes: Vec<String> = data.items.iter().map(|(m, _)| m.clone()).collect();
++        let bytes: usize = data.items.iter().map(|(_, b)| b.len()).sum();
++        eprintln!("WMCLIP the application that copied went: the desk keeps the clipboard ({} types, {bytes} bytes: {mimes:?})", mimes.len());
++        smithay::wayland::selection::data_device::set_data_device_selection(&self.display_handle.clone(), &seat, mimes, Some(data));
++    }
++    /// Once a turn: a clipboard source that went without a selection event.
++    pub(crate) fn clipboard_tick(&mut self) {
++        if let Some(data) = self.clipboard.orphaned() {
++            self.clipboard_keep(data);
++        }
++    }
++}
+diff --git a/crates/wm-darwin/src/desktop.rs b/crates/wm-darwin/src/desktop.rs
+index 3b779cd..d6a6668 100644
+--- a/crates/wm-darwin/src/desktop.rs
++++ b/crates/wm-darwin/src/desktop.rs
+@@ -105,6 +105,8 @@ impl crate::server::Server {
+     /// Error-path cleanup does not depend on rendering, input, or successful
+     /// Wayland dispatch. Call on the same loop that exclusively owns children.
+     pub fn begin_desktop_shutdown(&mut self) {
++        // DESK8: the applications with windows, for the next compositor (before anything closes)
++        self.session_ended();
+         if let Some(desktop) = self.desktop.as_mut() {
+             desktop.closing = true;
+             desktop.applications.begin_shutdown();
+diff --git a/crates/wm-darwin/src/desktop_entry.rs b/crates/wm-darwin/src/desktop_entry.rs
+index 87c9d44..08e4c6d 100644
+--- a/crates/wm-darwin/src/desktop_entry.rs
++++ b/crates/wm-darwin/src/desktop_entry.rs
+@@ -333,6 +333,13 @@ impl SessionIo for NativeIo<'_> {
+         // next frame can start in the same refresh interval.
+         let ms = self.elapsed().as_millis() as u32;
+         self.wait_error = self.server.idle_wait(Duration::from_millis(8), ms).err();
++        // DESK8: a flip came in the wait: its frame callbacks go to the clients now, not after the next
++        // turn's work and repaint
++        if std::mem::take(&mut self.server.flip_seen) && self.wait_error.is_none() {
++            if let Err(error) = self.display.flush_clients() {
++                self.wait_error = Some(error.to_string());
++            }
++        }
+     }
+     fn seal(&mut self, outcome: &Outcome) -> Result<(), String> {
+         self.server.log_final_stats();
+@@ -439,6 +446,11 @@ fn run_session(options: Options) -> Result<(), String> {
+     let mut server = Server::new_with_fonts(&display.handle(), selected.size, fonts.clone())?;
+     server.set_renderer_boxed(selected.renderer);
+     server.set_input_wake(input.wake_fd());
++    // DESK8: the applications with windows are kept for the next compositor, and this one opens again
++    // those the one before had (session_restore.rs)
++    server.enable_session_restore();
++    // DESK8: client requests end the wait between frames (policy `client_wake`)
++    server.set_client_wake(std::os::fd::AsRawFd::as_raw_fd(&display.backend().poll_fd()));
+     server.enable_frame_pacing();
+     if let Some(path) = &capture_socket {
+         if let Err(error) = server.captures.listen(path) {
+diff --git a/crates/wm-darwin/src/foreign.rs b/crates/wm-darwin/src/foreign.rs
+index 78e3aad..f71908c 100644
+--- a/crates/wm-darwin/src/foreign.rs
++++ b/crates/wm-darwin/src/foreign.rs
+@@ -181,12 +181,49 @@ impl Server {
+     /// again once it has ended; one that does not end is ended (SIGTERM at 5 s, SIGKILL at 12 s).
+     pub(crate) fn restart_orphan(&mut self, pid: i32) -> bool {
+         let Some(at) = self.foreign.orphans.iter().position(|(p, ..)| *p == pid) else { return false };
++        // DESK8 (FXQA's FX-032): only a process the desk opened is opened again; one started otherwise (a
++        // test's own instance with its own profile) would come back as the installed application with the
++        // owner's profile. It is left alone, and the person is told how to end it.
++        if !self.session_apps.desk_pids.contains(&pid) {
++            let name = self.foreign.orphans[at].2.clone();
++            eprintln!("WMORPHAN {name}({pid}) not opened by the desk: not restarted (its dock menu's Quit ends it)");
++            #[cfg(feature = "desktop-shell")]
++            self.show_desktop_notice(&format!("{name} (process {pid}) runs without a window and was not opened from the dock: it cannot be brought back from here. Right-click its dock tile > Quit to end it."));
++            return true;
++        }
+         let (pid, app_id, _) = self.foreign.orphans.remove(at);
+         eprintln!("WMORPHAN restart {app_id}({pid}): quit, then open again");
+         crate::macdesk::quit_mac_app(pid);
+         self.foreign.restarting.push((pid, app_id, std::time::Instant::now()));
+         true
+     }
++    /// DESK8: the dock tile's actions on one process (inject `app <pid> reopen|quit|restart`): the route for
++    /// an agent's own test instance, which never reaches another process of the same application.
++    #[cfg_attr(not(feature = "test-inject"), allow(dead_code))]
++    #[cfg(feature = "desktop-shell")]
++    pub(crate) fn app_action(&mut self, pid: i32, action: &str) -> String {
++        let orphan = self.foreign.orphans.iter().any(|(p, ..)| *p == pid);
++        let connected = crate::server::live_peers().iter().any(|p| p.pid == Some(pid));
++        match (action, orphan) {
++            ("restart", true) => {
++                self.restart_orphan(pid);
++                "ok leftover: quit, then opened again once it ended".into()
++            }
++            ("restart", false) => format!("error pid {pid} is not a leftover application (connected={connected})"),
++            ("quit", true) => {
++                self.quit_orphan(pid);
++                "ok leftover quit".into()
++            }
++            ("quit", false) => format!("ok {}", crate::macdesk::quit_mac_app(pid)),
++            (_, _) => {
++                if crate::macdesk::reopen(pid) {
++                    format!("ok reopen asked (connected={connected} leftover={orphan})")
++                } else {
++                    format!("error reopen not delivered (connected={connected} leftover={orphan})")
++                }
++            }
++        }
++    }
+     /// The pid of a leftover application with this app id.
+     pub(crate) fn orphan_pid(&self, app_id: &str) -> Option<i32> {
+         self.foreign.orphans.iter().find(|(_, id, _)| id.eq_ignore_ascii_case(app_id)).map(|(p, ..)| *p)
+@@ -222,6 +259,8 @@ impl Server {
+     /// Once a frame: new windows, changes, windows gone.
+     pub fn foreign_sync(&mut self) {
+         self.refresh_orphans();
++        #[cfg(feature = "desktop-shell")]
++        self.session_tick();
+         if self.foreign.listeners.is_empty() {
+             return;
+         }
+diff --git a/crates/wm-darwin/src/glrender.rs b/crates/wm-darwin/src/glrender.rs
+index 95dab0a..f1e1c3c 100644
+--- a/crates/wm-darwin/src/glrender.rs
++++ b/crates/wm-darwin/src/glrender.rs
+@@ -100,6 +100,9 @@ pub trait GlTarget {
+         None
+     }
+     fn set_pointer_thread(&mut self, _: bool) {}
++    /// A descriptor that ends a wait for a flip when it becomes readable (DESK8: the clients' requests, so
++    /// a commit made while a frame is on its way is read when it comes).
++    fn set_client_wake(&mut self, _: Option<libc::c_int>) {}
+ }
+ 
+ /// An external display's CRTC with its buffers and its own flips (DESK5).
+@@ -255,6 +258,8 @@ pub struct KmsTarget {
+     pointer: Option<std::sync::Arc<crate::pointer::PointerShared>>,
+     /// The test instrument's `cursorthread off` (before/after numbers).
+     pub thread_allowed: bool,
++    /// DESK8: the clients' requests end a wait for a flip (`set_client_wake`).
++    client_wake: Option<libc::c_int>,
+ }
+ /// The real display behind the flip queue, for the length of one call.
+ struct Live<'a> {
+@@ -499,6 +504,7 @@ impl KmsTarget {
+             wake: None,
+             pointer: None,
+             thread_allowed: std::env::var("CHONKSTEP_DARWIN_CURSOR_THREAD").map_or(true, |v| v != "0"),
++            client_wake: None,
+         })
+     }
+     fn core(&self) -> std::sync::MutexGuard<'_, KmsCore> {
+@@ -781,12 +787,26 @@ impl GlTarget for KmsTarget {
+             if let Some((r, _)) = &self.wake {
+                 fds.push(libc::pollfd { fd: std::os::fd::AsRawFd::as_raw_fd(r), events: libc::POLLIN, revents: 0 });
+             }
++            let client_at = self.client_wake.map(|fd| {
++                fds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
++                fds.len() - 1
++            });
+             let ms = left.as_micros().div_ceil(1000).min(1000) as libc::c_int;
+             let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
++            // a client's request (DESK8): the caller serves it now; a flip read meanwhile is kept for the next call
++            let client = client_at.is_some_and(|i| fds[i].revents & libc::POLLIN != 0);
++            if client_at.is_some_and(|i| fds[i].revents & (libc::POLLNVAL | libc::POLLERR) != 0) {
++                // never spin on a descriptor poll cannot watch
++                eprintln!("WMPOLICY client_wake: the display's descriptor cannot be polled in the flip wait: off");
++                self.client_wake = None;
++            }
+             if let Some((r, _)) = &self.wake {
+                 let mut byte = [0u8; 64];
+                 while matches!(std::io::Read::read(&mut &*r, &mut byte), Ok(k) if k > 0) {}
+             }
++            if client && fds[0].revents & libc::POLLIN == 0 {
++                return Ok(None);
++            }
+             if n <= 0 {
+                 // one more look (an event the thread took meanwhile), then the caller's timeout
+                 let mut c = self.core();
+@@ -890,6 +910,9 @@ impl GlTarget for KmsTarget {
+     fn set_pointer_thread(&mut self, on: bool) {
+         self.thread_allowed = on;
+     }
++    fn set_client_wake(&mut self, fd: Option<libc::c_int>) {
++        self.client_wake = fd;
++    }
+ }
+ impl Drop for KmsTarget {
+     fn drop(&mut self) {
+@@ -1418,6 +1441,9 @@ impl Renderer for GlRenderer {
+     fn set_pointer_thread(&mut self, on: bool) {
+         self.target.set_pointer_thread(on)
+     }
++    fn set_client_wake(&mut self, fd: Option<i32>) {
++        self.target.set_client_wake(fd)
++    }
+     fn commit(&mut self, cursor: Option<(Point, &DecorationBuffer, u64)>) -> Result<bool, String> {
+         let placement = match (cursor, self.target.cursor_plane()) {
+             (Some((origin, image, generation)), Some(size)) => match place_cursor(origin, (image.width, image.height), size, self.target.size()) {
+diff --git a/crates/wm-darwin/src/inject.rs b/crates/wm-darwin/src/inject.rs
+index 743b5e6..763397d 100644
+--- a/crates/wm-darwin/src/inject.rs
++++ b/crates/wm-darwin/src/inject.rs
+@@ -122,6 +122,16 @@ enum Step {
+     Dump(String),
+     /// `list <name>`: the text of `dump` only, no pictures (DESK6: cheap, for finding tiles and buttons).
+     List(String),
++    /// DESK8: `policy <key=value>...` the instrument's own setting of the desk's switches (policy.rs) until
++    /// `policy release` or the request's end.
++    Policy(Option<String>),
++    /// DESK8: `app <pid> reopen|quit|restart`: the dock tile's actions on ONE process (an agent's own test
++    /// instance; another process of the same application is never touched).
++    App(i32, &'static str),
++    /// DESK8: `close <window>`: the frame's close button for that window only (xdg_toplevel.close).
++    Close(u64),
++    /// DESK8: `dmabuf <window> <name>`: a GPU client's buffer and what the desk showed of it, as pictures.
++    Dmabuf(u64, String),
+ }
+ 
+ pub struct Inject {
+@@ -143,6 +153,8 @@ pub struct Inject {
+     owner_seen: bool,
+     /// The owner's theme and wallpaper while a `theme` step changed them (DESK7).
+     saved_look: Option<(Option<String>, Option<String>)>,
++    /// DESK8: a `policy` step pinned the switches: released at the request's end.
++    policy_pinned: bool,
+ }
+ 
+ impl Inject {
+@@ -153,7 +165,7 @@ impl Inject {
+             return None;
+         }
+         eprintln!("WMINJECT armed dir={} input=synthetic-inject (requested events; not physical input)", dir.display());
+-        Some(Self { dir, queue: VecDeque::new(), poll_at: Instant::now(), wait_until: None, buttons: 0, capture_since: None, done: 0, errors: Vec::new(), active: false, injector: None, burst: 0, owner_seat: false, owner_seen: false, saved_look: None })
++        Some(Self { dir, queue: VecDeque::new(), poll_at: Instant::now(), wait_until: None, buttons: 0, capture_since: None, done: 0, errors: Vec::new(), active: false, injector: None, burst: 0, owner_seat: false, owner_seen: false, saved_look: None, policy_pinned: false })
+     }
+     /// The input thread's queue: injected events take the device events' path.
+     pub fn with_injector(mut self, injector: crate::hid::Injector) -> Self {
+@@ -228,6 +240,11 @@ impl Inject {
+                 ["seat", which @ ("virtual" | "owner")] => Some(Step::Seat(*which == "owner")),
+                 ["target", window] => window.parse::<u64>().ok().map(Step::Target),
+                 ["list", name] if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => Some(Step::List((*name).to_string())),
++                ["policy", "release"] => Some(Step::Policy(None)),
++                ["policy", rest @ ..] if !rest.is_empty() && rest.iter().all(|w| w.contains('=')) => Some(Step::Policy(Some(rest.join("\n")))),
++                ["app", pid, action @ ("reopen" | "quit" | "restart")] => pid.parse::<i32>().ok().filter(|p| *p > 1).map(|pid| Step::App(pid, match *action { "reopen" => "reopen", "quit" => "quit", _ => "restart" })),
++                ["close", window] => window.parse::<u64>().ok().map(Step::Close),
++                ["dmabuf", window, name] if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => window.parse::<u64>().ok().map(|w| Step::Dmabuf(w, (*name).to_string())),
+                 _ => None,
+             };
+             match step {
+@@ -281,6 +298,7 @@ impl Inject {
+                 Some(Step::CursorThread(_)) => Some("cursorthread"),
+                 Some(Step::MainPrio(_)) => Some("mainprio"),
+                 Some(Step::Theme(Some(_))) => Some("theme"),
++                Some(Step::Policy(Some(_))) => Some("policy"),
+                 Some(Step::Seat(true)) => Some("seat owner"),
+                 Some(Step::Event(_)) | Some(Step::Stream { .. }) if self.owner_seat => {
+                     self.owner_seat = false;
+@@ -394,6 +412,52 @@ impl Inject {
+                 self.queue.pop_front();
+                 self.done += 1;
+             }
++            Some(Step::Policy(setting)) => {
++                match setting {
++                    Some(text) => {
++                        if let Err(error) = server.policy.pin(text) {
++                            self.errors.push(format!("policy: {error}"));
++                        }
++                        self.policy_pinned = true;
++                    }
++                    None => {
++                        server.policy.release();
++                        self.policy_pinned = false;
++                    }
++                }
++                self.queue.pop_front();
++                self.done += 1;
++            }
++            Some(Step::App(pid, action)) => {
++                let (pid, action) = (*pid, *action);
++                let answer = server.app_action(pid, action);
++                eprintln!("WMINJECT app pid={pid} {action}: {answer}");
++                if answer.starts_with("error") {
++                    self.errors.push(format!("app {pid} {action}: {answer}"));
++                }
++                self.queue.pop_front();
++                self.done += 1;
++            }
++            Some(Step::Close(window)) => {
++                let window = *window;
++                if server.wm.backend().windows.contains_key(&window) {
++                    let pid = server.wm.backend().windows.get(&window).and_then(|w| crate::server::peer_of(w.surface.wl_surface())).and_then(|p| p.pid);
++                    eprintln!("WMINJECT close window={window} pid={pid:?}: xdg_toplevel.close to that window only");
++                    server.wm.dispatch(wm_core::BackendEvent::CloseRequested(window));
++                } else {
++                    self.errors.push(format!("close: no window {window}"));
++                }
++                self.queue.pop_front();
++                self.done += 1;
++            }
++            Some(Step::Dmabuf(window, name)) => {
++                let (window, name) = (*window, name.clone());
++                if let Err(error) = server.dump_external(window, &self.dir, &name) {
++                    self.errors.push(format!("dmabuf {window}: {error}"));
++                }
++                self.queue.pop_front();
++                self.done += 1;
++            }
+             Some(Step::Motions(n)) => {
+                 self.burst = *n;
+                 self.queue.pop_front();
+@@ -453,6 +517,7 @@ impl Inject {
+                 eprintln!("WMINJECT stats hid: {hid} | key_events_delivered={keys} last_key={last:?} | {} | {} virtual_pointer={:?}", server.latency.final_line().unwrap_or_else(|| "no motion latency samples".into()), server.owner.describe(), server.virtual_position());
+                 eprintln!("{}", server.latency.flush_line(&server.pacer));
+                 eprintln!("WMPACE {} cursor_on_plane={}", server.pacer.take_leads(), server.wm.backend().cursor_on_plane);
++                eprintln!("WMPOLICY now {}", server.policy.now.text());
+                 eprintln!("{} | {}", server.loop_probe.take_line(), self.injector.as_ref().map_or_else(|| "no input thread".into(), |i| i.timing_line()));
+                 if let Some(line) = server.renderer_pointer_thread_line() {
+                     eprintln!("{line}");
+@@ -490,6 +555,9 @@ impl Inject {
+                 self.done += 1;
+             }
+             None => {
++                if std::mem::take(&mut self.policy_pinned) {
++                    server.policy.release();
++                }
+                 server.end_virtual_request(ms);
+                 let owner = server.owner.describe();
+                 self.finish_with(&owner);
+diff --git a/crates/wm-darwin/src/input.rs b/crates/wm-darwin/src/input.rs
+index 9df67ff..c4a95f5 100644
+--- a/crates/wm-darwin/src/input.rs
++++ b/crates/wm-darwin/src/input.rs
+@@ -843,8 +843,10 @@ impl Server {
+             Event::Swipe{..} if active=>return Err("the owner is active: a synthetic swipe would change his Space; refused".into()),
+             Event::Key{evdev,down}=>{
+                 let target=self.input.as_ref().unwrap().key_target.clone().filter(|s|smithay::reexports::wayland_server::Resource::is_alive(s));
+-                if target.is_none() && active {
+-                    return Err("the owner is active and the synthetic keys have no target window (press in it first, or `target <id>`): key not delivered".into());
++                // DESK8: never to whatever window has the focus (TERM8, 23:56Z: its target window had gone and its
++                // keys went into the desk's terminal): without a live target the instrument's keys are dropped
++                if target.is_none() {
++                    return Err(format!("the synthetic keys have no target window (press in it first, or `target <id>`; the last one is gone or none was pressed in this request{}): key not delivered", if active { "; the owner is active" } else { "" }));
+                 }
+                 if let Some(target)=target {
+                     let keyboard=self.input.as_ref().unwrap().keyboard.clone();
+@@ -884,6 +886,9 @@ impl Server {
+         if !held.is_empty(){eprintln!("WMINJECT the request ended with synthetic keys held {held:?}: let go");}
+         for evdev in held {let _=self.deliver_virtual(Event::Key{evdev,down:false},time);}
+         let Some(input)=self.input.as_mut() else{return;};
++        // DESK8: the next request presses in its window (or names it) before it types: a window pressed in by
++        // an earlier request, maybe another agent's, is not typed into
++        input.key_target=None;
+         if input.kb_lent.take().is_some() {
+             self.sync_input_focus();
+         }
+diff --git a/crates/wm-darwin/src/kms.rs b/crates/wm-darwin/src/kms.rs
+index 4cfeed2..50fe159 100644
+--- a/crates/wm-darwin/src/kms.rs
++++ b/crates/wm-darwin/src/kms.rs
+@@ -110,7 +110,7 @@ pub trait FlipSource {
+ 
+ /// Parse `struct drm_event` records: `{u32 type, u32 length}`; a vblank event
+ /// is 32 bytes with its sequence number at offset 24.
+-fn parse_events(buffer: &[u8], mut found: impl FnMut(u32, u32)) {
++fn parse_events(buffer: &[u8], mut found: impl FnMut(u32, u32, Option<Duration>)) {
+     let mut at = 0;
+     while at + 8 <= buffer.len() {
+         let word = |o: usize| u32::from_ne_bytes(buffer[at + o..at + o + 4].try_into().unwrap());
+@@ -118,7 +118,9 @@ fn parse_events(buffer: &[u8], mut found: impl FnMut(u32, u32)) {
+         if kind == DRM_EVENT_FLIP_COMPLETE {
+             let sequence = if length >= 32 && at + 28 <= buffer.len() { word(24) } else { 0 };
+             let crtc = if length >= 32 && at + 32 <= buffer.len() { word(28) } else { 0 };
+-            found(sequence, crtc);
++            // the kernel's time of the flip (drm_event_vblank tv_sec/tv_usec at 16/20)
++            let stamp = (length >= 32 && at + 24 <= buffer.len()).then(|| Duration::new(u64::from(word(16)), word(20).saturating_mul(1000).min(999_999_999)));
++            found(sequence, crtc, stamp.filter(|d| !d.is_zero()));
+         }
+         if length < 8 {
+             break;
+@@ -126,7 +128,65 @@ fn parse_events(buffer: &[u8], mut found: impl FnMut(u32, u32)) {
+         at += length;
+     }
+ }
+-fn read_flips(fd: c_int, mut found: impl FnMut(u32, u32)) -> Result<(), String> {
++/// DESK8: the flip's time from the kernel's event stamp when it is on a clock this process can read
++/// (CLOCK_MONOTONIC, else CLOCK_UPTIME_RAW on Darwin) and at most 100 ms old; else the time it was read
++/// (as before). Counted for `flip_clock_line` (how late the events are read, and whether the stamp was usable).
++pub fn flip_at(stamp: Option<Duration>) -> Instant {
++    use std::sync::atomic::Ordering::Relaxed;
++    let read = Instant::now();
++    let clock = |id: libc::clockid_t| {
++        let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++        (unsafe { libc::clock_gettime(id, &mut t) } == 0).then(|| Duration::new(t.tv_sec as u64, t.tv_nsec as u32))
++    };
++    let Some(stamp) = stamp.filter(|_| USE_FLIP_STAMPS.load(Relaxed)) else {
++        FLIP_CLOCK.unstamped.fetch_add(1, Relaxed);
++        return read;
++    };
++    #[cfg(target_os = "macos")]
++    let clocks = [(libc::CLOCK_MONOTONIC, 1usize), (libc::CLOCK_UPTIME_RAW, 2usize)];
++    #[cfg(not(target_os = "macos"))]
++    let clocks = [(libc::CLOCK_MONOTONIC, 1usize)];
++    for (id, which) in clocks {
++        let Some(now) = clock(id) else { continue };
++        if let Some(lag) = now.checked_sub(stamp).filter(|l| *l <= Duration::from_millis(100)) {
++            FLIP_CLOCK.matched[which - 1].fetch_add(1, Relaxed);
++            let us = lag.as_micros() as u64;
++            FLIP_CLOCK.lag_sum_us.fetch_add(us, Relaxed);
++            FLIP_CLOCK.lag_max_us.fetch_max(us, Relaxed);
++            return read.checked_sub(lag).unwrap_or(read);
++        }
++    }
++    FLIP_CLOCK.foreign.fetch_add(1, Relaxed);
++    read
++}
++/// The policy's `flip_stamps` (policy.rs): off = the time an event was read, as before DESK8.
++pub static USE_FLIP_STAMPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
++pub struct FlipClock {
++    matched: [std::sync::atomic::AtomicU64; 2],
++    foreign: std::sync::atomic::AtomicU64,
++    unstamped: std::sync::atomic::AtomicU64,
++    lag_sum_us: std::sync::atomic::AtomicU64,
++    lag_max_us: std::sync::atomic::AtomicU64,
++}
++pub static FLIP_CLOCK: FlipClock = FlipClock {
++    matched: [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)],
++    foreign: std::sync::atomic::AtomicU64::new(0),
++    unstamped: std::sync::atomic::AtomicU64::new(0),
++    lag_sum_us: std::sync::atomic::AtomicU64::new(0),
++    lag_max_us: std::sync::atomic::AtomicU64::new(0),
++};
++/// `flips stamped by CLOCK_MONOTONIC=N CLOCK_UPTIME_RAW=N other=N none=N, read after the stamp mean/max ms`
++/// since the last call.
++pub fn flip_clock_line() -> String {
++    use std::sync::atomic::Ordering::Relaxed;
++    let c = &FLIP_CLOCK;
++    let (m, u) = (c.matched[0].swap(0, Relaxed), c.matched[1].swap(0, Relaxed));
++    let (f, n) = (c.foreign.swap(0, Relaxed), c.unstamped.swap(0, Relaxed));
++    let (sum, max) = (c.lag_sum_us.swap(0, Relaxed), c.lag_max_us.swap(0, Relaxed));
++    let mean = if m + u > 0 { sum as f64 / (m + u) as f64 / 1000.0 } else { 0.0 };
++    format!("flip stamps: CLOCK_MONOTONIC={m} CLOCK_UPTIME_RAW={u} other_clock={f} none={n}, read after the stamp mean {mean:.2} max {:.2} ms", max as f64 / 1000.0)
++}
++fn read_flips(fd: c_int, mut found: impl FnMut(u32, u32, Option<Duration>)) -> Result<(), String> {
+     let mut buffer = [0u8; 256];
+     loop {
+         let n = unsafe { libc::read(fd, buffer.as_mut_ptr() as *mut c_void, buffer.len()) };
+@@ -137,9 +197,9 @@ fn read_flips(fd: c_int, mut found: impl FnMut(u32, u32)) -> Result<(), String>
+             return Err(os_error("read of the DRM event (card node)"));
+         }
+         let mut any = false;
+-        parse_events(&buffer[..n as usize], |sequence, crtc| {
++        parse_events(&buffer[..n as usize], |sequence, crtc, stamp| {
+             any = true;
+-            found(sequence, crtc)
++            found(sequence, crtc, stamp)
+         });
+         if any {
+             return Ok(());
+@@ -190,7 +250,7 @@ impl FlipSource for PollRead {
+                 return Ok(None);
+             }
+             let queued = &mut self.queued;
+-            read_flips(self.fd, |sequence, crtc| queued.push_back(Flip { sequence, at: Instant::now(), crtc }))?;
++            read_flips(self.fd, |sequence, crtc, stamp| queued.push_back(Flip { sequence, at: flip_at(stamp), crtc }))?;
+         }
+         Ok(self.queued.pop_front())
+     }
+@@ -209,7 +269,7 @@ impl FlipSource for InlineRead {
+     fn wait(&mut self, _: Option<Duration>) -> Result<Option<Flip>, String> {
+         if self.queued.is_empty() {
+             let queued = &mut self.queued;
+-            read_flips(self.fd, |sequence, crtc| queued.push_back(Flip { sequence, at: Instant::now(), crtc }))?;
++            read_flips(self.fd, |sequence, crtc, stamp| queued.push_back(Flip { sequence, at: flip_at(stamp), crtc }))?;
+         }
+         Ok(self.queued.pop_front())
+     }
+@@ -231,8 +291,8 @@ impl ReaderThread {
+             .name("drm-flip-events".into())
+             .spawn(move || loop {
+                 let mut failed = false;
+-                let result = read_flips(fd, |sequence, crtc| {
+-                    failed |= tx.send(Ok(Flip { sequence, at: Instant::now(), crtc })).is_err();
++                let result = read_flips(fd, |sequence, crtc, stamp| {
++                    failed |= tx.send(Ok(Flip { sequence, at: flip_at(stamp), crtc })).is_err();
+                 });
+                 if let Err(error) = result {
+                     let _ = tx.send(Err(error));
+@@ -1579,16 +1639,16 @@ mod tests {
+         buffer.extend(event(0x8000_0000, 48, 0));
+         buffer.extend(event(DRM_EVENT_FLIP_COMPLETE, 32, 42));
+         let mut seen = Vec::new();
+-        parse_events(&buffer, |s, _| seen.push(s));
++        parse_events(&buffer, |s, _, _| seen.push(s));
+         assert_eq!(seen, [41, 42]);
+         // A short flip event carries no sequence; a zero length cannot loop forever.
+         let mut seen = Vec::new();
+-        parse_events(&event(DRM_EVENT_FLIP_COMPLETE, 8, 0), |s, _| seen.push(s));
++        parse_events(&event(DRM_EVENT_FLIP_COMPLETE, 8, 0), |s, _, _| seen.push(s));
+         assert_eq!(seen, [0]);
+         let mut bad = event(1, 32, 0);
+         bad[4..8].copy_from_slice(&0u32.to_ne_bytes());
+-        parse_events(&bad, |_, _| panic!("no flip in this buffer"));
+-        parse_events(&[1, 2, 3], |_, _| panic!("too short"));
++        parse_events(&bad, |_, _, _| panic!("no flip in this buffer"));
++        parse_events(&[1, 2, 3], |_, _, _| panic!("too short"));
+         // the CRTC that flipped (drm_event_vblank.crtc_id at 28: the panel's and an external's)
+         let mut two = event(DRM_EVENT_FLIP_COMPLETE, 32, 5);
+         two[28..32].copy_from_slice(&42u32.to_ne_bytes());
+@@ -1596,10 +1656,37 @@ mod tests {
+         other[28..32].copy_from_slice(&77u32.to_ne_bytes());
+         two.extend(other);
+         let mut seen = Vec::new();
+-        parse_events(&two, |s, c| seen.push((s, c)));
++        parse_events(&two, |s, c, _| seen.push((s, c)));
+         assert_eq!(seen, [(5, 42), (9, 77)]);
+     }
+ 
++    #[test]
++    fn a_flip_takes_the_kernels_stamp_when_it_is_on_a_clock_we_read_and_recent() {
++        // the stamp (tv_sec/tv_usec at 16/20) is parsed
++        let mut e = event(DRM_EVENT_FLIP_COMPLETE, 32, 3);
++        e[16..20].copy_from_slice(&12u32.to_ne_bytes());
++        e[20..24].copy_from_slice(&500_000u32.to_ne_bytes());
++        let mut seen = Vec::new();
++        parse_events(&e, |_, _, stamp| seen.push(stamp));
++        assert_eq!(seen, [Some(Duration::new(12, 500_000_000))]);
++        let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
++        let now = Duration::new(t.tv_sec as u64, t.tv_nsec as u32);
++        flip_clock_line();
++        // 5 ms ago on CLOCK_MONOTONIC: the flip's Instant is about 5 ms before now
++        let before = Instant::now();
++        let at = flip_at(Some(now - Duration::from_millis(5)));
++        let ago = before.saturating_duration_since(at);
++        assert!(ago >= Duration::from_millis(4) && ago <= Duration::from_millis(7), "{ago:?}");
++        // a stamp on another clock (or very old) and none: the time it was read
++        let at = flip_at(Some(Duration::from_secs(1)));
++        assert!(at.elapsed() < Duration::from_millis(2));
++        let at = flip_at(None);
++        assert!(at.elapsed() < Duration::from_millis(2));
++        let line = flip_clock_line();
++        assert!(line.contains("CLOCK_MONOTONIC=1") && line.contains("other_clock=1") && line.contains("none=1"), "{line}");
++    }
++
+     /// A display that refuses the next `busy` flips and delivers the events it is given.
+     #[derive(Default)]
+     struct FakeDisplay {
+diff --git a/crates/wm-darwin/src/lib.rs b/crates/wm-darwin/src/lib.rs
+index a583126..6a280a8 100644
+--- a/crates/wm-darwin/src/lib.rs
++++ b/crates/wm-darwin/src/lib.rs
+@@ -3,6 +3,7 @@
+ 
+ pub use smithay;
+ mod activation;
++pub mod clipboard;
+ pub mod applications;
+ pub mod autopilot;
+ pub mod capture;
+@@ -55,6 +56,7 @@ pub mod owner;
+ pub mod displays;
+ pub mod pacing;
+ pub mod pixels;
++pub mod policy;
+ pub mod pointer;
+ pub mod cursor_thread;
+ mod popups;
+@@ -70,5 +72,6 @@ pub mod session_entry;
+ pub mod settings;
+ #[cfg(feature = "desktop-shell")]
+ mod session_signals;
++pub mod session_restore;
+ pub mod terminal_launch;
+ pub mod volume;
+diff --git a/crates/wm-darwin/src/macdesk.rs b/crates/wm-darwin/src/macdesk.rs
+index 4b0ce08..83d3ad4 100644
+--- a/crates/wm-darwin/src/macdesk.rs
++++ b/crates/wm-darwin/src/macdesk.rs
+@@ -284,6 +284,16 @@ pub enum MacKey {
+ /// appmenu.rs), which a windowless application still serves; SIGTERM only when it has no socket.
+ pub fn quit_mac_app(pid: i32) -> String {
+     let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/private/var/run/gpu-desktop"));
++    // DESK8: AppKit's own "quit" line (TERM8, cocoa 0143w/0144: -terminate:, the application's Quit path
++    // and its delegate run, with or without a window); an AppKit without it answers otherwise
++    match crate::appmenu::request(&runtime, pid, "quit") {
++        Ok(answer) if answer.starts_with("ok") => {
++            eprintln!("WMMAC quit pid={pid}: \"quit\" answered {answer:?}");
++            return format!("quit line answered {answer:?}");
++        }
++        Ok(answer) => eprintln!("WMMAC quit pid={pid}: \"quit\" not understood ({answer:?}): its menu's Quit"),
++        Err(_) => {}
++    }
+     let how = match crate::appmenu::fetch(&runtime, pid) {
+         Ok(menu) => match menu.items.iter().find(|i| i.key == "cmd+q" && !i.flags.contains('d')).or_else(|| menu.items.iter().find(|i| i.depth == 1 && i.title.starts_with("Quit"))) {
+             Some(item) => match crate::appmenu::request(&runtime, pid, &format!("invoke {}", item.id)) {
+@@ -302,8 +312,20 @@ pub fn quit_mac_app(pid: i32) -> String {
+ }
+ 
+ /// Ask an AppKit application to come forward (unhide, or open its untitled window).
+-#[cfg(target_os = "macos")]
+ pub fn reopen(pid: i32) -> bool {
++    // DESK8: AppKit's "reopen" line (TERM8, cocoa 0143w/0144: macOS's kAEReopenApplication - unhide, a
++    // minimised window back, else the delegate's untitled window); notify(3) when it is not understood
++    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/private/var/run/gpu-desktop"));
++    match crate::appmenu::request(&runtime, pid, "reopen") {
++        Ok(answer) if answer.starts_with("ok") => {
++            eprintln!("WMMAC reopen pid={pid}: \"reopen\" answered {answer:?}");
++            true
++        }
++        _ => reopen_notify(pid),
++    }
++}
++#[cfg(target_os = "macos")]
++fn reopen_notify(pid: i32) -> bool {
+     use std::ffi::{c_char, c_int};
+     extern "C" {
+         fn notify_register_check(name: *const c_char, token: *mut c_int) -> u32;
+@@ -323,7 +345,7 @@ pub fn reopen(pid: i32) -> bool {
+     ok
+ }
+ #[cfg(not(target_os = "macos"))]
+-pub fn reopen(pid: i32) -> bool {
++fn reopen_notify(pid: i32) -> bool {
+     eprintln!("WMMAC reopen pid={pid} posted=false (no notify(3) on this host)");
+     false
+ }
+@@ -845,6 +867,8 @@ impl Server {
+         match crate::settings::request_open(&path) {
+             Ok(()) => {
+                 eprintln!("WMMAC open {}", path.display());
++                // DESK8: opened by the desk: opened again after a relaunch (session_restore.rs)
++                self.session_apps.opened.insert(key.clone(), Instant::now());
+                 self.macdesk.launching = Some((key.clone(), Instant::now()));
+                 self.macdesk.opening.insert(key, Instant::now());
+             }
+diff --git a/crates/wm-darwin/src/pacing.rs b/crates/wm-darwin/src/pacing.rs
+index e6ab722..23ecb31 100644
+--- a/crates/wm-darwin/src/pacing.rs
++++ b/crates/wm-darwin/src/pacing.rs
+@@ -23,6 +23,10 @@ struct Window {
+     phase: [u32; 18],
+     last_commit: Option<Instant>,
+     intervals: Series,
++    /// DESK8, the FIFO: commits held for the next refresh, and how many of those holds ended on the
++    /// 40 ms timeout instead of a frame.
++    fifo_held: u64,
++    fifo_timeouts: u64,
+ }
+ 
+ #[derive(Default)]
+@@ -61,6 +65,18 @@ impl PacingTrace {
+             }
+         }
+     }
++    /// The window's newest commit has not been drawn into a frame yet (DESK8, the FIFO's test).
++    pub fn pending_unshown(&self, id: u64) -> bool {
++        self.windows.get(&id).is_some_and(|w| w.pending.is_some())
++    }
++    pub fn fifo_held(&mut self, id: u64) {
++        self.windows.entry(id).or_default().fifo_held += 1;
++    }
++    pub fn fifo_released(&mut self, id: u64, timeout: bool) {
++        if timeout {
++            self.windows.entry(id).or_default().fifo_timeouts += 1;
++        }
++    }
+     /// A frame was drawn (rendered or staged): the pending commits are in it.
+     pub fn drawn(&mut self) {
+         self.seq += 1;
+@@ -103,6 +119,7 @@ impl PacingTrace {
+     }
+     /// One line per window that committed since the last line.
+     pub fn take_lines(&mut self) -> Vec<String> {
++        let window_ms = self.logged.map_or(0, |t| t.elapsed().as_millis());
+         self.logged = Some(Instant::now());
+         let fence = std::mem::take(&mut self.fence_holds);
+         let mut lines = Vec::new();
+@@ -113,14 +130,19 @@ impl PacingTrace {
+             let ctf = w.commit_to_flip.take_sorted();
+             let iv = w.intervals.take_sorted();
+             lines.push(format!(
+-                "WMPACING window={id} app={:?} commits={} shown={} replaced_before_shown={} | {} | {} | commits by ms after the last flip {:?} | frames held for a fence={fence}",
+-                w.app_id, w.commits, w.shown, w.replaced, window_text(&ctf, "commit->flip"), window_text(&iv, "commit interval"), w.phase
++                "WMPACING over_ms={window_ms} window={id} app={:?} commits={} shown={} replaced_before_shown={} fifo_held={} fifo_timeouts={} | {} | {} | commits by ms after the last flip {:?} | frames held for a fence={fence}",
++                w.app_id, w.commits, w.shown, w.replaced, w.fifo_held, w.fifo_timeouts, window_text(&ctf, "commit->flip"), window_text(&iv, "commit interval"), w.phase
+             ));
+             w.commits = 0;
+             w.shown = 0;
+             w.replaced = 0;
++            w.fifo_held = 0;
++            w.fifo_timeouts = 0;
+             w.phase = [0; 18];
+         }
++        if !lines.is_empty() {
++            lines.push(format!("WMPACING {}", crate::kms::flip_clock_line()));
++        }
+         lines
+     }
+     /// Every 10 s while a GPU client commits.
+@@ -151,7 +173,9 @@ mod tests {
+         p.drawn();
+         p.frame_committed();
+         p.flipped(Instant::now());
+-        let line = p.take_lines().pop().unwrap();
+-        assert!(line.contains("commits=3 shown=2 replaced_before_shown=1"), "{line}");
++        let lines = p.take_lines();
++        let line = lines.iter().find(|l| l.contains("window=7")).unwrap();
++        assert!(line.contains("commits=3 shown=2 replaced_before_shown=1 fifo_held=0"), "{line}");
++        assert!(lines.last().unwrap().contains("flip stamps:"), "{lines:?}");
+     }
+ }
+diff --git a/crates/wm-darwin/src/policy.rs b/crates/wm-darwin/src/policy.rs
+new file mode 100644
+index 0000000..7e48095
+--- /dev/null
++++ b/crates/wm-darwin/src/policy.rs
+@@ -0,0 +1,189 @@
++//! The desk's switches that change without a compositor relaunch (DESK8). A relaunch ends every window on the
++//! desktop, so what is likely to be tuned or compared on the M1 is read from a file instead of being built in:
++//! `$XDG_STATE_HOME/chonkstep/policy` (`/private/var/db/desktop-state/chonkstep/policy` on SiliconForest), one
++//! `key=value` per line, `#` comments, read again within a second of a change (`WMPOLICY` says what changed).
++//! A key the file does not name keeps its default (or the environment's `CHONKSTEP_DARWIN_<KEY>=0|1`).
++//!
++//! | key | default | what |
++//! |---|---|---|
++//! | `fifo` | on | a GPU client's newer buffer waits for the next refresh instead of replacing one no frame showed yet (`server.rs` FIFO) |
++//! | `client_wake` | on | the loop wakes for client requests while it waits (a commit is read when it comes, not up to 8 ms later) |
++//! | `flip_time_callbacks` | on | frame callbacks carry the flip's time (CLOCK_MONOTONIC ms, wp_presentation's clock) and go out at the flip |
++//! | `flip_stamps` | on | a flip's time is the kernel's stamp of it (when on a clock we read), not when its event was read |
++//! | `restore` | on | applications the desk opened that had windows when the compositor before this one ended are opened again (`session_restore.rs`) |
++use std::path::PathBuf;
++use std::time::{Duration, Instant, SystemTime};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Switches {
++    pub fifo: bool,
++    pub client_wake: bool,
++    pub flip_time_callbacks: bool,
++    pub flip_stamps: bool,
++    pub restore: bool,
++}
++
++impl Switches {
++    const KEYS: [&'static str; 5] = ["fifo", "client_wake", "flip_time_callbacks", "flip_stamps", "restore"];
++    fn defaults() -> Self {
++        let env = |key: &str| std::env::var(format!("CHONKSTEP_DARWIN_{}", key.to_ascii_uppercase())).ok().and_then(|v| parse_bool(&v));
++        Self {
++            fifo: env("fifo").unwrap_or(true),
++            client_wake: env("client_wake").unwrap_or(true),
++            flip_time_callbacks: env("flip_time_callbacks").unwrap_or(true),
++            flip_stamps: env("flip_stamps").unwrap_or(true),
++            restore: env("restore").unwrap_or(true),
++        }
++    }
++    fn slot(&mut self, key: &str) -> Option<&mut bool> {
++        Some(match key {
++            "fifo" => &mut self.fifo,
++            "client_wake" => &mut self.client_wake,
++            "flip_time_callbacks" => &mut self.flip_time_callbacks,
++            "flip_stamps" => &mut self.flip_stamps,
++            "restore" => &mut self.restore,
++            _ => return None,
++        })
++    }
++    fn get(&self, key: &str) -> bool {
++        let mut copy = *self;
++        copy.slot(key).map(|v| *v).unwrap_or(false)
++    }
++    /// The file's text over the defaults; unknown keys and values are listed, not fatal.
++    pub fn parse(text: &str, base: Self) -> (Self, Vec<String>) {
++        let mut out = base;
++        let mut refused = Vec::new();
++        for line in text.lines() {
++            let line = line.split('#').next().unwrap_or("").trim();
++            if line.is_empty() {
++                continue;
++            }
++            let Some((key, value)) = line.split_once('=') else {
++                refused.push(line.to_string());
++                continue;
++            };
++            match (out.slot(key.trim()), parse_bool(value)) {
++                (Some(slot), Some(v)) => *slot = v,
++                _ => refused.push(line.to_string()),
++            }
++        }
++        (out, refused)
++    }
++    pub fn text(&self) -> String {
++        Self::KEYS.iter().map(|k| format!("{k}={}", if self.get(k) { "on" } else { "off" })).collect::<Vec<_>>().join(" ")
++    }
++}
++
++fn parse_bool(v: &str) -> Option<bool> {
++    match v.trim().to_ascii_lowercase().as_str() {
++        "1" | "on" | "yes" | "true" => Some(true),
++        "0" | "off" | "no" | "false" => Some(false),
++        _ => None,
++    }
++}
++
++pub struct Policy {
++    pub now: Switches,
++    defaults: Switches,
++    path: Option<PathBuf>,
++    checked: Option<Instant>,
++    stamp: Option<SystemTime>,
++    /// Set by the inject module (a test's own A/B); the file does not override it until `release`.
++    pinned: Option<Switches>,
++}
++
++impl Default for Policy {
++    fn default() -> Self {
++        let path = std::env::var_os("XDG_STATE_HOME").map(|d| PathBuf::from(d).join("chonkstep").join("policy"));
++        Self::with_path(path)
++    }
++}
++
++impl Policy {
++    pub fn with_path(path: Option<PathBuf>) -> Self {
++        let defaults = Switches::defaults();
++        let mut policy = Self { now: defaults, defaults, path, checked: None, stamp: None, pinned: None };
++        policy.tick();
++        eprintln!("WMPOLICY {} (file {})", policy.now.text(), policy.path.as_ref().map_or("none".into(), |p| p.display().to_string()));
++        policy
++    }
++    fn apply(&self) {
++        crate::kms::USE_FLIP_STAMPS.store(self.now.flip_stamps, std::sync::atomic::Ordering::Relaxed);
++    }
++    /// The file looked at once a second at most; a change is said in the log.
++    pub fn tick(&mut self) {
++        self.read_file();
++        self.apply();
++    }
++    fn read_file(&mut self) {
++        if self.checked.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
++            return;
++        }
++        self.checked = Some(Instant::now());
++        let Some(path) = &self.path else { return };
++        let stamp = std::fs::metadata(path).and_then(|m| m.modified()).ok();
++        if stamp == self.stamp {
++            return;
++        }
++        self.stamp = stamp;
++        let (read, refused) = Switches::parse(&std::fs::read_to_string(path).unwrap_or_default(), self.defaults);
++        if !refused.is_empty() {
++            eprintln!("WMPOLICY {}: lines not understood (ignored): {refused:?}", path.display());
++        }
++        if self.pinned.is_none() && read != self.now {
++            eprintln!("WMPOLICY {} ({})", read.text(), path.display());
++            self.now = read;
++        }
++    }
++    /// A test instrument's own setting, kept until `release` (inject `policy key=value`).
++    pub fn pin(&mut self, text: &str) -> Result<String, String> {
++        let (next, refused) = Switches::parse(text, self.pinned.unwrap_or(self.now));
++        if !refused.is_empty() {
++            return Err(format!("not understood: {refused:?} (keys: {})", Switches::KEYS.join(", ")));
++        }
++        self.pinned = Some(next);
++        self.now = next;
++        self.apply();
++        eprintln!("WMPOLICY {} (test instrument)", next.text());
++        Ok(next.text())
++    }
++    pub fn release(&mut self) {
++        if self.pinned.take().is_some() {
++            self.stamp = None;
++            self.checked = None;
++            self.now = self.defaults;
++            self.tick();
++            eprintln!("WMPOLICY {} (test instrument's setting released)", self.now.text());
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn the_policy_file_changes_switches_without_a_relaunch_and_a_test_pin_wins_until_released() {
++        let base = Switches { fifo: true, client_wake: true, flip_time_callbacks: true, flip_stamps: true, restore: true };
++        let (s, refused) = Switches::parse("# comment\nfifo=off\nrestore = 0\nbogus=1\nclient_wake=maybe\n", base);
++        assert!(!s.fifo && !s.restore && s.client_wake && s.flip_time_callbacks);
++        assert_eq!(refused, vec!["bogus=1".to_string(), "client_wake=maybe".to_string()]);
++        let dir = std::env::temp_dir().join(format!("desk8-policy-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("policy");
++        std::fs::write(&path, "fifo=off\n").unwrap();
++        let mut p = Policy::with_path(Some(path.clone()));
++        assert!(!p.now.fifo);
++        p.pin("fifo=on").unwrap();
++        assert!(p.now.fifo);
++        // the file changes while pinned: the pin stays
++        std::fs::write(&path, "fifo=off\nflip_time_callbacks=off\n").unwrap();
++        p.checked = None;
++        p.stamp = None;
++        p.tick();
++        assert!(p.now.fifo);
++        p.release();
++        assert!(!p.now.fifo && !p.now.flip_time_callbacks);
++        assert!(p.pin("nonsense=1").is_err());
++        std::fs::remove_dir_all(&dir).ok();
++    }
++}
+diff --git a/crates/wm-darwin/src/render.rs b/crates/wm-darwin/src/render.rs
+index 4f17baf..d3006ef 100644
+--- a/crates/wm-darwin/src/render.rs
++++ b/crates/wm-darwin/src/render.rs
+@@ -253,6 +253,8 @@ pub trait Renderer {
+         None
+     }
+     fn set_pointer_thread(&mut self, _: bool) {}
++    /// DESK8: a descriptor (the clients' requests) that ends a wait for a flip when readable.
++    fn set_client_wake(&mut self, _: Option<i32>) {}
+     fn commit(&mut self, cursor: Option<(wm_core::Point, &wm_theme_api::DecorationBuffer, u64)>) -> Result<bool, String> {
+         let _ = cursor;
+         Ok(false)
+diff --git a/crates/wm-darwin/src/scene.rs b/crates/wm-darwin/src/scene.rs
+index 74a12ec..6eb9004 100644
+--- a/crates/wm-darwin/src/scene.rs
++++ b/crates/wm-darwin/src/scene.rs
+@@ -698,6 +698,12 @@ impl CpuBackend {
+         self.stack.push(id);
+         self.dirty = true;
+     }
++    /// The client dma-buf each window shows (the renderer's import ids), by window (DESK8: what a frame drew).
++    pub fn external_ids(&self) -> Vec<(u64, u64)> {
++        let mut ids: Vec<(u64, u64)> = self.windows.iter().filter_map(|(id, w)| w.external.map(|e| (*id, e.id))).collect();
++        ids.sort_unstable();
++        ids
++    }
+     pub fn visible(&self, id: u64) -> bool {
+         self.windows
+             .get(&id)
+diff --git a/crates/wm-darwin/src/server.rs b/crates/wm-darwin/src/server.rs
+index 9fb311c..18bca33 100644
+--- a/crates/wm-darwin/src/server.rs
++++ b/crates/wm-darwin/src/server.rs
+@@ -28,6 +28,19 @@ use smithay::backend::allocator::{dmabuf::Dmabuf,Buffer as _,Format,Fourcc,Modif
+ use smithay::reexports::wayland_server::backend::ObjectId;
+ use crate::{scene::CpuBackend,presenter::Presenter,render::{Renderer,RendererKind,RendererRequest,FrameStats,FrameTotals}};
+ 
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++pub(crate) enum FifoWhy {
++    Frame,
++    Timeout,
++    Off,
++}
++/// A commit held for the next refresh (DESK8, the FIFO): released when the next frame is drawn.
++pub(crate) struct FifoHold {
++    barrier: smithay::wayland::compositor::Barrier,
++    since: std::time::Instant,
++    client: Option<Client>,
++}
++
+ #[derive(Default)]
+ pub struct Peer {
+     compositor: CompositorClientState,
+@@ -190,6 +203,16 @@ pub struct Server {
+     /// Readable when the input thread has events (hid.rs `InputThread::wake_fd`): ends the
+     /// wait between frames at once.
+     input_wake: Option<i32>,
++    /// DESK8: readable when a client has sent requests (the display's poll descriptor): with the policy's
++    /// `client_wake` the wait between frames ends for it, so a commit is read when it comes.
++    client_wake: Option<i32>,
++    /// DESK8: a flip completed in the wait: its frame callbacks are flushed to the clients at once.
++    pub(crate) flip_seen: bool,
++    /// DESK8: switches that change without a relaunch (`policy.rs`).
++    pub policy: crate::policy::Policy,
++    /// DESK8: a GPU client's newer buffer held for the next refresh while no frame has shown the one before
++    /// (one deep: commits after it wait behind it and the newest of them is applied with it).
++    fifo: HashMap<u64, FifoHold>,
+     /// Events the desktop could not use (said in the log, never fatal).
+     input_refused: u64,
+     /// The dma-buf behind each imported id (keeps its fd open: fence polls, checks).
+@@ -247,6 +270,10 @@ pub struct Server {
+     _xdg_output: smithay::wayland::output::OutputManagerState,
+     /// The windows told to a dock (`foreign.rs`).
+     pub(crate) foreign: crate::foreign::ForeignToplevels,
++    /// DESK8: the applications with windows, for the compositor after this one (`session_restore.rs`).
++    pub(crate) session_apps: crate::session_restore::SessionApps,
++    /// DESK8: the clipboard kept when the application that copied goes (`clipboard.rs`).
++    pub(crate) clipboard: crate::clipboard::Keeper,
+     /// Outputs besides the panel (displays.rs, DESK5).
+     pub(crate) extra_outputs: crate::displays::ExtraOutputs,
+     /// xdg_activation_v1 (`activation.rs`).
+@@ -390,6 +417,10 @@ impl Server {
+             cursor_plane_allowed: true,
+             staged_drag_pointer: None,
+             input_wake: None,
++            client_wake: None,
++            flip_seen: false,
++            policy: Default::default(),
++            fifo: HashMap::new(),
+             input_refused: 0,
+             external_dmabufs: HashMap::new(),
+             pending_fences: Vec::new(),
+@@ -424,6 +455,8 @@ impl Server {
+             _xdg_output: smithay::wayland::output::OutputManagerState::new_with_xdg_output::<Self>(dh),
+             activation: smithay::wayland::xdg_activation::XdgActivationState::new::<Self>(dh),
+             foreign: { let mut f = crate::foreign::ForeignToplevels::default(); f.create_global(dh); f },
++            session_apps: Default::default(),
++            clipboard: Default::default(),
+             extra_outputs: Default::default(),
+         })
+     }
+@@ -675,6 +708,9 @@ impl Server {
+     /// Frame callbacks are sent only after the presenter accepts the complete CPU frame.
+     /// Native SFGOP acceptance is a memory-store fence, not vblank or panel proof.
+     pub fn repaint(&mut self, presenter: &mut impl Presenter, time_ms: u32) -> Result<(), String> {
++        self.policy.tick();
++        self.fifo_tick();
++        self.clipboard_tick();
+         #[cfg(feature = "desktop-shell")]
+         self.service_desktop()?;
+         self.sync_input_focus();
+@@ -835,6 +871,11 @@ impl Server {
+                 callback.done(time_ms);
+             }
+         }
++        // DESK8: the commits held for this refresh (the FIFO) are applied now, after this frame's callbacks
++        // were taken: they are drawn into the next frame and their callbacks go out with its flip
++        if !self.fifo.is_empty() {
++            self.fifo_release(FifoWhy::Frame);
++        }
+         // the moment may have come already (a long render)
+         if self.renderer.staged() && self.commit_due.is_some_and(|(due, _)| std::time::Instant::now() >= due) {
+             let (due, blank) = self.commit_due.unwrap();
+@@ -1008,12 +1049,15 @@ impl Server {
+         self.selections_set
+     }
+     fn presented(&mut self, presented: &crate::render::Presented, time_ms: u32) {
++        // the flip's time on CLOCK_MONOTONIC (wp_presentation's clock)
++        let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
++        let now = std::time::Duration::new(now.tv_sec as u64, now.tv_nsec as u32);
++        let at = now.saturating_sub(presented.at.elapsed());
++        // DESK8: frame callbacks carry the flip's time (ms of the same clock), not the loop's
++        let time_ms = if self.policy.now.flip_time_callbacks { at.as_millis() as u32 } else { time_ms };
++        self.flip_seen = true;
+         if let Some(seq) = self.pacing.flipped(presented.at) {
+-            // the flip's time on CLOCK_MONOTONIC (wp_presentation's clock)
+-            let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+-            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
+-            let now = std::time::Duration::new(now.tv_sec as u64, now.tv_nsec as u32);
+-            let at = now.saturating_sub(presented.at.elapsed());
+             let refresh = smithay::wayland::presentation::Refresh::fixed(self.pacer.interval());
+             let (shown, waiting): (Vec<_>, Vec<_>) = self.feedback_drawn.drain(..).partition(|(s, _)| *s <= seq);
+             self.feedback_drawn = waiting;
+@@ -1121,6 +1165,10 @@ impl Server {
+             if let Some(fd) = self.input_wake {
+                 fds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
+             }
++            let client_at = self.client_wake.filter(|_| self.policy.now.client_wake).map(|fd| {
++                fds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
++                fds.len() - 1
++            });
+             // A frame waiting for its moment (late latching): wake for it on time; the last
+             // two milliseconds are slept precisely (poll counts whole milliseconds).
+             let mut max = max;
+@@ -1151,8 +1199,17 @@ impl Server {
+             } else {
+                 let ms = if precise.is_some() { (max.as_micros() / 1000).max(1) } else { max.as_micros().div_ceil(1000) }.min(1000) as libc::c_int;
+                 let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
++                if let Some(i) = client_at {
++                    if fds[i].revents & (libc::POLLNVAL | libc::POLLERR) != 0 {
++                        // never spin on a descriptor poll cannot watch
++                        eprintln!("WMPOLICY client_wake: the display's descriptor cannot be polled (revents {:#x}): off", fds[i].revents);
++                        self.client_wake = None;
++                        self.renderer.set_client_wake(None);
++                        return Ok(());
++                    }
++                }
+                 if n > 0 {
+-                    return Ok(()); // input or a fence: the loop decides again
++                    return Ok(()); // input, a fence or a client's request: the loop decides again
+                 }
+             }
+             if let Some(due) = precise {
+@@ -1163,11 +1220,77 @@ impl Server {
+             }
+             return Ok(());
+         }
++        self.renderer.set_client_wake(self.client_wake.filter(|_| self.policy.now.client_wake));
+         if let Some(presented) = self.renderer.poll_presented(max)? {
+             self.presented(&presented, time_ms);
+         }
+         Ok(())
+     }
++    /// DESK8, the FIFO: before a window's commit is applied. A GPU client's new buffer that would replace
++    /// one no frame has drawn yet waits (a blocker) for the next frame instead: each buffer a client commits
++    /// is shown for a refresh, as long as it commits no more than one a refresh on average. One deep: while
++    /// a commit waits, the client's later commits wait behind it, and when it is applied the newest of them
++    /// is applied with it (the ones between are replaced unseen, counted). Never for a commit answering a
++    /// resize, a window not visible, or with the display off.
++    fn fifo_pre_commit(&mut self, surface: &WlSurface) {
++        if !self.policy.now.fifo || self.power.off {
++            return;
++        }
++        let Some(id) = self.wm.backend().window_for_surface(surface) else { return };
++        if self.fifo.contains_key(&id) || !self.held.contains_key(&id) || !self.pacing.pending_unshown(id) {
++            return;
++        }
++        let new_buffer = with_states(surface, |s| match &s.cached_state.get::<SurfaceAttributes>().pending().buffer {
++            Some(BufferAssignment::NewBuffer(b)) => Some(b.id()),
++            _ => None,
++        });
++        if !new_buffer.is_some_and(|b| self.external_by_buffer.contains_key(&b)) {
++            return;
++        }
++        if self.wm.interactive_drag_active() || Self::client_behind(surface) || !self.wm.backend().visible(id) {
++            return;
++        }
++        let barrier = smithay::wayland::compositor::Barrier::new(false);
++        smithay::wayland::compositor::add_blocker(surface, barrier.clone());
++        self.fifo.insert(id, FifoHold { barrier, since: std::time::Instant::now(), client: surface.client() });
++        self.pacing.fifo_held(id);
++    }
++    /// Held commits whose frame did not come (no frame in 40 ms: a fence, the renderer, the display going
++    /// off) or the FIFO switched off: applied now.
++    fn fifo_tick(&mut self) {
++        if self.fifo.is_empty() {
++            return;
++        }
++        if !self.policy.now.fifo || self.power.off {
++            self.fifo_release(FifoWhy::Off);
++        } else if self.fifo.values().any(|h| h.since.elapsed() > std::time::Duration::from_millis(40)) {
++            self.fifo_release(FifoWhy::Timeout);
++        }
++    }
++    fn fifo_release(&mut self, why: FifoWhy) {
++        let holds: Vec<(u64, FifoHold)> = self.fifo.drain().collect();
++        let dh = self.display_handle.clone();
++        let mut clients: Vec<Client> = Vec::new();
++        for (id, hold) in holds {
++            hold.barrier.signal();
++            self.pacing.fifo_released(id, why == FifoWhy::Timeout);
++            if let Some(client) = hold.client {
++                if !clients.iter().any(|c| c.id() == client.id()) {
++                    clients.push(client);
++                }
++            }
++        }
++        // the held transactions (and any queued behind them) are applied: `commit` runs for them now
++        for client in clients {
++            if let Some(peer) = client.get_data::<Peer>() {
++                peer.compositor.blocker_cleared(self, &dh);
++            }
++        }
++    }
++    /// DESK8: the display's poll descriptor; readable when a client has sent requests.
++    pub fn set_client_wake(&mut self, fd: i32) {
++        self.client_wake = Some(fd);
++    }
+     /// Late latching on (the KMS output: flips give the blank's phase). `CHONKSTEP_DARWIN_LATCH=0`
+     /// turns it off (frames are then rendered as soon as the frame before has flipped).
+     pub fn enable_frame_pacing(&mut self) {
+@@ -1453,6 +1576,48 @@ impl Server {
+             if differing == 0 { "client-pixels-are-on-the-frame" } else { "DIFFERENT" }
+         );
+     }
++    /// DESK8: what a GPU client committed against what the desk showed of it, as pictures: the client's
++    /// dma-buf as it is now (`<name>-client.ppm`, the whole buffer) and the last frame's region of the window
++    /// (`<name>-shown.ppm`), plus the pixel comparison of `check_external_window` in the log.
++    #[cfg_attr(not(feature = "test-inject"), allow(dead_code))]
++    pub(crate) fn dump_external(&mut self, window: u64, dir: &std::path::Path, name: &str) -> Result<String, String> {
++        let (content, external) = self.wm.backend().windows.get(&window).and_then(|w| Some((w.content, w.external?))).ok_or("not a window showing a dma-buf")?;
++        self.check_external_window(window);
++        let dmabuf = self.external_dmabufs.get(&external.id).ok_or("its buffer is gone")?;
++        let (Some(fd), Some(offset), Some(stride)) = (dmabuf.handles().next(), dmabuf.offsets().next(), dmabuf.strides().next()) else {
++            return Err("no plane".into());
++        };
++        let (w, h) = (external.width as usize, external.height as usize);
++        let length = offset as usize + stride as usize * h;
++        let map = unsafe { libc::mmap(std::ptr::null_mut(), length, libc::PROT_READ, libc::MAP_SHARED, std::os::fd::AsRawFd::as_raw_fd(&fd), 0) };
++        if map == libc::MAP_FAILED {
++            return Err(format!("not mappable: {}", std::io::Error::last_os_error()));
++        }
++        let client = unsafe { std::slice::from_raw_parts(map as *const u8, length) };
++        let mut ppm = format!("P6\n{w} {h}\n255\n").into_bytes();
++        for y in 0..h {
++            let row = &client[offset as usize + y * stride as usize..][..w * 4];
++            ppm.extend(row.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0]]));
++        }
++        unsafe { libc::munmap(map, length) };
++        std::fs::write(dir.join(format!("{name}-client.ppm")), &ppm).map_err(|e| e.to_string())?;
++        let screen = wm_core::Backend::screen_size(self.wm.backend());
++        let visible = DRect::from_xywh(content.pos.x, content.pos.y, external.width, external.height).intersect(DRect::from_xywh(0, 0, screen.w, screen.h));
++        let mut shown_note = "no read-back".to_string();
++        if let (Ok(Some(frame)), false) = (self.renderer.read_back(), visible.is_empty()) {
++            let (vw, vh) = (visible.width() as usize, visible.height() as usize);
++            let mut ppm = format!("P6\n{vw} {vh}\n255\n").into_bytes();
++            for y in visible.y0..visible.y1 {
++                let at = (y as usize * screen.w as usize + visible.x0 as usize) * 4;
++                ppm.extend(frame[at..at + vw * 4].chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]));
++            }
++            std::fs::write(dir.join(format!("{name}-shown.ppm")), &ppm).map_err(|e| e.to_string())?;
++            shown_note = format!("shown {vw}x{vh} at {},{}", visible.x0, visible.y0);
++        }
++        let line = format!("WMDMABUF dump window={window} buffer={w}x{h} stride={stride} offset={offset} import={} at={},{} {shown_note} last_check={:?}", external.id, content.pos.x, content.pos.y, self.last_dmabuf_check);
++        eprintln!("{line}");
++        Ok(line)
++    }
+     /// The window stops showing its client buffer, if it held one. The buffer
+     /// is released to the client after the next rendered frame (`now`: at once).
+     fn drop_held(&mut self, window: u64, replacement: Option<&wl_buffer::WlBuffer>, now: bool) {
+@@ -1511,6 +1676,9 @@ impl Server {
+             }
+             self.drop_held(id, None, true);
+             self.external_commits.remove(&id);
++            if let Some(hold) = self.fifo.remove(&id) {
++                hold.barrier.signal();
++            }
+             self.pacing.gone(id);
+             for callback in self.feedback_pending.remove(&id).into_iter().flatten() {
+                 callback.discarded();
+@@ -2043,6 +2211,8 @@ impl XdgShellHandler for Server {
+     }
+     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+         self.announce_scale(surface.wl_surface());
++        // DESK8: the FIFO looks at every commit of a window before it is applied
++        smithay::wayland::compositor::add_pre_commit_hook::<Self, _>(surface.wl_surface(), |state, _, surface| state.fifo_pre_commit(surface));
+         self.wm.backend_mut().add(surface);
+     }
+     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+@@ -2200,24 +2370,35 @@ delegate_xdg_decoration!(Server);
+ delegate_output!(Server);
+ delegate_seat!(Server);
+ // Clipboard between clients, as `wm-wayland/src/selection.rs` does it on
+-// Linux, less what belongs to XWayland and persistence: the compositor never
+-// owns a selection, so `send_selection` has nothing to send.
++// Linux, less what belongs to XWayland. DESK8: the desk keeps a copy of a
++// client's clipboard and serves it when that client goes (`clipboard.rs`).
+ impl SelectionHandler for Server {
+-    /// A selection the compositor serves itself: a screenshot's PNG (`capture.rs`).
+-    type SelectionUserData = Option<Arc<Vec<u8>>>;
++    /// A selection the compositor serves itself: a screenshot's PNG (`capture.rs`), or the copy of a
++    /// clipboard whose application went (`clipboard.rs`).
++    type SelectionUserData = Option<Arc<crate::clipboard::ClipData>>;
+     fn new_selection(&mut self, target: SelectionTarget, source: Option<SelectionSource>, _: Seat<Self>) {
+-        if target == SelectionTarget::Clipboard && source.is_some() {
+-            self.selections_set += 1;
++        if target != SelectionTarget::Clipboard {
++            return;
++        }
++        match source {
++            Some(source) => {
++                self.selections_set += 1;
++                self.clipboard.copied(source);
++            }
++            None => {
++                if let Some(data) = self.clipboard.cleared() {
++                    self.clipboard_keep(data);
++                }
++            }
+         }
+     }
+     fn send_selection(&mut self, _: SelectionTarget, mime_type: String, fd: std::os::fd::OwnedFd, _: Seat<Self>, data: &Self::SelectionUserData) {
+-        if let (Some(data), "image/png") = (data.clone(), mime_type.as_str()) {
+-            // A reader that is slow must not hold the compositor: the bytes go from a thread.
+-            std::thread::spawn(move || {
+-                let mut file = std::fs::File::from(fd);
+-                let _ = std::io::Write::write_all(&mut file, &data);
+-            });
+-        }
++        let Some(bytes) = data.as_ref().and_then(|d| d.items.iter().find(|(m, _)| *m == mime_type).map(|(_, b)| b.clone())) else { return };
++        // A reader that is slow must not hold the compositor: the bytes go from a thread.
++        std::thread::spawn(move || {
++            let mut file = std::fs::File::from(fd);
++            let _ = std::io::Write::write_all(&mut file, &bytes);
++        });
+     }
+ }
+ impl DataDeviceHandler for Server {
+diff --git a/crates/wm-darwin/src/session_restore.rs b/crates/wm-darwin/src/session_restore.rs
+new file mode 100644
+index 0000000..c9ed21f
+--- /dev/null
++++ b/crates/wm-darwin/src/session_restore.rs
+@@ -0,0 +1,305 @@
++//! Applications open again after a compositor relaunch (DESK8). A relaunch ends every client's connection;
++//! with AppKit's cocoa 0143w (TERM8) an application whose connection ended ends itself, and before it the
++//! application lived on without a window (`foreign.rs` leftovers, DESK7). Either way its windows were gone.
++//!
++//! This compositor keeps `$XDG_RUNTIME_DIR/session-apps`: the applications that have windows now, one line
++//! each (pid, application id, bundle, windows, whether the desk opened it), rewritten when that changes and
++//! every 10 s, and once more when the compositor ends (with the session's end request, when there is one).
++//! The next compositor reads it once: an application the desk opened (the dock, the switcher, the launcher,
++//! a restore) that had a window when the compositor before ended, whose process has ended since, is opened
++//! again through the dock's own path (`open_application`), at most once. Nothing is signalled: a process
++//! still alive is left to the leftover handling. Not restored: a file older than 120 s, a compositor that
++//! ended for a power-off, reboot or log-out, applications started some other way (an agent's test instance
++//! started from a shell with its own profile; a `open` from a terminal), and with the policy's
++//! `restore=off`. Said in the log as `WMRESTORE`.
++use std::collections::{HashMap, HashSet};
++use std::path::PathBuf;
++use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
++
++pub const FILE: &str = "session-apps";
++const HEADER: &str = "# chonkstep-darwin session-apps v1";
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Record {
++    pub pid: i32,
++    pub app_id: String,
++    pub bundle: String,
++    pub windows: u32,
++    pub desk: bool,
++}
++
++/// The file's text: header, then a line per application.
++pub fn render(records: &[Record], writer: i32, now_ms: u128, ended: Option<&str>) -> String {
++    let mut text = format!("{HEADER} writer={writer} updated_unix_ms={now_ms} ended={}\n", ended.unwrap_or("-"));
++    for r in records {
++        text.push_str(&format!("{}\t{}\t{}\t{}\t{}\n", r.pid, r.app_id, r.bundle, r.windows, if r.desk { "desk" } else { "other" }));
++    }
++    text
++}
++
++/// (records, updated_unix_ms, ended) of a file's text; `None` when it is not one.
++pub fn parse(text: &str) -> Option<(Vec<Record>, u128, String)> {
++    let mut lines = text.lines();
++    let head = lines.next()?;
++    if !head.starts_with(HEADER) {
++        return None;
++    }
++    let field = |key: &str| head.split_whitespace().find_map(|w| w.strip_prefix(key)).map(str::to_string);
++    let updated = field("updated_unix_ms=")?.parse().ok()?;
++    let ended = field("ended=").unwrap_or_else(|| "-".into());
++    let records = lines
++        .filter_map(|line| {
++            let f: Vec<&str> = line.split('\t').collect();
++            (f.len() == 5).then_some(())?;
++            Some(Record { pid: f[0].parse().ok()?, app_id: f[1].to_string(), bundle: f[2].to_string(), windows: f[3].parse().ok()?, desk: f[4] == "desk" })
++        })
++        .collect();
++    Some((records, updated, ended))
++}
++
++/// The applications to open again, given the file of the compositor before, now, and a liveness test.
++/// Returns (to open, skipped with why).
++pub fn plan(text: &str, now_ms: u128, alive: impl Fn(i32) -> bool) -> (Vec<Record>, Vec<(Record, &'static str)>) {
++    let Some((records, updated, ended)) = parse(text) else { return (Vec::new(), Vec::new()) };
++    let stale = now_ms.saturating_sub(updated) > 120_000;
++    let session_ends = matches!(ended.as_str(), "reboot" | "poweroff" | "shutdown" | "logout");
++    let mut open = Vec::new();
++    let mut skipped = Vec::new();
++    let mut seen = HashSet::new();
++    for r in records.into_iter().filter(|r| r.windows > 0) {
++        let why = if stale {
++            Some("the file is older than 120 s")
++        } else if session_ends {
++            Some("the session ended (power-off, reboot or log-out)")
++        } else if !r.desk {
++            Some("not opened by the desk (a shell's or an agent's instance)")
++        } else if alive(r.pid) {
++            Some("still running (a leftover: its dock tile restarts it)")
++        } else if !seen.insert(r.app_id.to_ascii_lowercase()) {
++            Some("another process of the same application is opened already")
++        } else {
++            None
++        };
++        match why {
++            Some(why) => skipped.push((r, why)),
++            None => open.push(r),
++        }
++    }
++    (open, skipped)
++}
++
++pub fn unix_ms() -> u128 {
++    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis())
++}
++
++#[derive(Default)]
++pub struct SessionApps {
++    path: Option<PathBuf>,
++    written: Vec<Record>,
++    written_at: Option<Instant>,
++    checked: Option<Instant>,
++    /// The compositor before's file, read at start, until the restore ran.
++    previous: Option<String>,
++    started: Option<Instant>,
++    restore_done: bool,
++    /// Application ids (lower case) the desk asked to open, and when.
++    pub opened: HashMap<String, Instant>,
++    /// Processes the desk opened.
++    pub desk_pids: HashSet<i32>,
++    /// Application ids (lower case) opened again by the restore.
++    restored: HashSet<String>,
++}
++
++impl SessionApps {
++    /// At start: the file of the compositor before is moved aside and kept for the restore.
++    pub fn start(runtime: Option<PathBuf>) -> Self {
++        let path = runtime.map(|r| r.join(FILE));
++        let previous = path.as_ref().and_then(|p| {
++            let text = std::fs::read_to_string(p).ok()?;
++            let _ = std::fs::rename(p, p.with_extension("before"));
++            Some(text)
++        });
++        // the processes the desk before had opened stay desk-opened (a leftover of them may be restarted)
++        let desk_pids = previous.as_deref().and_then(parse).map(|(r, _, _)| r.into_iter().filter(|r| r.desk).map(|r| r.pid).collect()).unwrap_or_default();
++        Self { path, previous, desk_pids, started: Some(Instant::now()), ..Default::default() }
++    }
++    /// Whether the restore is due now (4 s after the start: the dock is up, applications that end with
++    /// their connection have ended), then once more at 10 s for those that ended later.
++    pub fn restore_due(&self) -> Option<bool> {
++        let since = self.started?.elapsed();
++        if self.previous.is_none() || since < Duration::from_secs(4) {
++            return None;
++        }
++        Some(since >= Duration::from_secs(10))
++    }
++    pub fn take_previous(&mut self, last: bool) -> Option<String> {
++        if last {
++            self.restore_done = true;
++            self.previous.take()
++        } else {
++            self.previous.clone()
++        }
++    }
++    /// The records now: written when they changed, and every 10 s (the next compositor judges the file's age).
++    pub fn update(&mut self, records: Vec<Record>, ended: Option<&str>) {
++        let now = Instant::now();
++        if ended.is_none() && self.checked.is_some_and(|t| now.duration_since(t) < Duration::from_secs(2)) {
++            return;
++        }
++        self.checked = Some(now);
++        let Some(path) = &self.path else { return };
++        let due = ended.is_some() || records != self.written || self.written_at.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(10));
++        if !due {
++            return;
++        }
++        let text = render(&records, std::process::id() as i32, unix_ms(), ended);
++        let part = path.with_extension("part");
++        if std::fs::write(&part, text).and_then(|()| std::fs::rename(&part, path)).is_ok() {
++            if records != self.written {
++                eprintln!("WMRESTORE applications with windows now: {:?}", records.iter().map(|r| format!("{}({}){}", r.app_id, r.pid, if r.desk { "" } else { " not desk-opened" })).collect::<Vec<_>>());
++            }
++            self.written = records;
++            self.written_at = Some(now);
++        }
++    }
++}
++
++#[cfg(feature = "desktop-shell")]
++impl crate::server::Server {
++    /// The session's applications file (the desktop session only; host tests keep none).
++    pub fn enable_session_restore(&mut self) {
++        let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
++        self.session_apps = SessionApps::start(runtime);
++    }
++    /// The applications with windows now (AppKit applications in a bundle: the desk's own clients are
++    /// started by the session).
++    fn session_records(&mut self) -> Vec<Record> {
++        let mut by_pid: std::collections::BTreeMap<i32, Record> = Default::default();
++        let now = Instant::now();
++        let windows: Vec<(i32, String)> = self
++            .wm
++            .backend()
++            .windows
++            .values()
++            .filter(|w| w.mapped || w.committed)
++            .filter_map(|w| {
++                let pid = crate::server::peer_of(w.surface.wl_surface())?.pid?;
++                let app = w.app_id.clone().or_else(|| w.last_app_id.clone()).filter(|a| !a.is_empty())?;
++                Some((pid, app))
++            })
++            .collect();
++        for (pid, app_id) in windows {
++            if let Some(r) = by_pid.get_mut(&pid) {
++                r.windows += 1;
++                continue;
++            }
++            let Some(bundle) = crate::macdesk::pid_path(pid).and_then(|p| wm_theme::app_icon::enclosing_bundle(&p)) else { continue };
++            let key = app_id.to_ascii_lowercase();
++            let s = &mut self.session_apps;
++            if !s.desk_pids.contains(&pid) && s.opened.get(&key).is_some_and(|at| now.duration_since(*at) < Duration::from_secs(60)) {
++                s.desk_pids.insert(pid);
++                s.opened.remove(&key);
++            }
++            let desk = s.desk_pids.contains(&pid);
++            by_pid.insert(pid, Record { pid, app_id, bundle: bundle.display().to_string(), windows: 1, desk });
++        }
++        by_pid.into_values().collect()
++    }
++    /// Once a frame (cheap: every 2 s): the file, and the restore when it is due.
++    pub(crate) fn session_tick(&mut self) {
++        if let Some(last) = self.session_apps.restore_due() {
++            if let Some(text) = self.session_apps.take_previous(last) {
++                if self.policy.now.restore {
++                    let (open, skipped) = plan(&text, unix_ms(), |pid| unsafe { libc::kill(pid, 0) } == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM));
++                    for r in open {
++                        if !self.session_apps.restored.insert(r.app_id.to_ascii_lowercase()) {
++                            continue;
++                        }
++                        eprintln!("WMRESTORE {}({}) had {} window(s) when the compositor before ended and has ended since: opened again", r.app_id, r.pid, r.windows);
++                        self.open_application(&r.app_id, None);
++                    }
++                    if last {
++                        for (r, why) in skipped {
++                            if !self.session_apps.restored.contains(&r.app_id.to_ascii_lowercase()) {
++                                eprintln!("WMRESTORE {}({}) not opened again: {why}", r.app_id, r.pid);
++                            }
++                        }
++                    }
++                } else if last {
++                    eprintln!("WMRESTORE off (policy restore=off): nothing opened again");
++                }
++            }
++        }
++        if self.session_apps.path.is_some() {
++            let records = self.session_records();
++            self.session_apps.update(records, None);
++        }
++    }
++    /// When the compositor ends: the file once more, with the session's end request (relaunch, reboot ...).
++    pub(crate) fn session_ended(&mut self) {
++        if self.session_apps.path.is_none() {
++            return;
++        }
++        let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
++        let word = runtime
++            .and_then(|r| std::fs::read_to_string(r.join("session-end-request")).ok())
++            .map(|t| t.trim().to_string())
++            .filter(|w| !w.is_empty() && w.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
++            .unwrap_or_else(|| "exit".into());
++        let records = self.session_records();
++        eprintln!("WMRESTORE the compositor ends ({word}): {} application(s) with windows recorded", records.iter().filter(|r| r.windows > 0).count());
++        self.session_apps.update(records, Some(&word));
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn rec(pid: i32, id: &str, windows: u32, desk: bool) -> Record {
++        Record { pid, app_id: id.into(), bundle: format!("/Applications/{id}.app"), windows, desk }
++    }
++    #[test]
++    fn after_a_relaunch_only_ended_desk_opened_applications_with_windows_open_again() {
++        let now = unix_ms();
++        let records = vec![
++            rec(10, "org.mozilla.firefox", 2, true),
++            rec(11, "com.apple.Terminal", 1, true),
++            rec(12, "org.mozilla.firefox", 1, false), // an agent's own instance from a shell
++            rec(13, "com.apple.ActivityMonitor", 0, true), // no window when it ended
++            rec(14, "com.apple.Terminal", 1, true),       // a second process of the same application
++        ];
++        let text = render(&records, 99, now - 3_000, Some("relaunch-next"));
++        assert_eq!(parse(&text).unwrap().0, records);
++        // 11 still runs (a leftover); 10 and 14 ended
++        let (open, skipped) = plan(&text, now, |pid| pid == 11);
++        assert_eq!(open.iter().map(|r| r.pid).collect::<Vec<_>>(), [10, 14]);
++        let why: Vec<(i32, &str)> = skipped.iter().map(|(r, w)| (r.pid, *w)).collect();
++        assert!(why.contains(&(11, "still running (a leftover: its dock tile restarts it)")), "{why:?}");
++        assert!(why.contains(&(12, "not opened by the desk (a shell's or an agent's instance)")), "{why:?}");
++        // the same application once only
++        let (open, _) = plan(&text, now, |_| false);
++        assert_eq!(open.iter().map(|r| r.pid).collect::<Vec<_>>(), [10, 11]);
++        // stale, or the machine going down: nothing
++        assert!(plan(&text, now + 200_000, |_| false).0.is_empty());
++        let down = render(&records, 99, now, Some("poweroff"));
++        assert!(plan(&down, now, |_| false).0.is_empty());
++        // a compositor that crashed (no end line) within the 120 s: restored
++        let crashed = render(&records, 99, now - 30_000, None);
++        assert_eq!(plan(&crashed, now, |_| false).0.len(), 2);
++        assert!(plan("not a session file", now, |_| false).0.is_empty());
++    }
++    #[test]
++    fn the_file_is_moved_aside_at_start_and_rewritten_on_change() {
++        let dir = std::env::temp_dir().join(format!("desk8-restore-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        std::fs::write(dir.join(FILE), render(&[rec(5, "a.b", 1, true)], 1, unix_ms(), Some("relaunch"))).unwrap();
++        let mut s = SessionApps::start(Some(dir.clone()));
++        assert!(s.previous.is_some() && !dir.join(FILE).exists() && dir.join("session-apps.before").exists());
++        s.update(vec![rec(7, "c.d", 1, false)], None);
++        let (records, _, ended) = parse(&std::fs::read_to_string(dir.join(FILE)).unwrap()).unwrap();
++        assert_eq!((records.len(), ended.as_str()), (1, "-"));
++        s.update(vec![rec(7, "c.d", 1, false)], Some("relaunch-next"));
++        assert_eq!(parse(&std::fs::read_to_string(dir.join(FILE)).unwrap()).unwrap().2, "relaunch-next");
++        std::fs::remove_dir_all(&dir).ok();
++    }
++}
+diff --git a/crates/wm-darwin/tests/wayland_dmabuf.rs b/crates/wm-darwin/tests/wayland_dmabuf.rs
+index 2a746e2..a3000e4 100644
+--- a/crates/wm-darwin/tests/wayland_dmabuf.rs
++++ b/crates/wm-darwin/tests/wayland_dmabuf.rs
+@@ -20,6 +20,7 @@ use wayland_client::{
+ };
+ use wayland_protocols::wp::linux_dmabuf::zv1::client::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
+ use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
++use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
+ use wm_core::Size;
+ use wm_darwin::presenter::Presenter;
+ use wm_darwin::render::{DmabufDesc, FrameStats, Renderer, RendererKind};
+@@ -37,21 +38,46 @@ struct Log {
+     imported: Vec<(u64, u32, u32, u32, u64, u32, u32)>,
+     released: Vec<u64>,
+     frames: u32,
++    /// DESK8: (window, import id) of every dma-buf each frame drew.
++    drawn: Vec<Vec<(u64, u64)>>,
+ }
+ /// Accepts linear XR24/AR24 like the GL renderer, draws with the CPU renderer.
+ struct Importing {
+     inner: Box<dyn Renderer>,
+     log: Arc<Mutex<Log>>,
+     next: u64,
++    /// DESK8: frames flip like a display's (busy until a flip 3 ms after the render), for presentation.
++    flips: bool,
++    in_flight: Option<Instant>,
++    sequence: u32,
+ }
+ impl Renderer for Importing {
+     fn kind(&self) -> RendererKind {
+         RendererKind::Gl
+     }
+     fn render_frame(&mut self, scene: &mut CpuBackend, presenter: &mut dyn Presenter) -> Result<FrameStats, String> {
+-        self.log.lock().unwrap().frames += 1;
++        let mut log = self.log.lock().unwrap();
++        log.frames += 1;
++        log.drawn.push(scene.external_ids());
++        drop(log);
++        if self.flips {
++            self.in_flight = Some(Instant::now());
++        }
+         self.inner.render_frame(scene, presenter)
+     }
++    fn busy(&self) -> bool {
++        self.in_flight.is_some()
++    }
++    fn poll_presented(&mut self, _: Duration) -> Result<Option<wm_darwin::render::Presented>, String> {
++        match self.in_flight {
++            Some(at) if at.elapsed() >= Duration::from_millis(3) => {
++                self.in_flight = None;
++                self.sequence += 1;
++                Ok(Some(wm_darwin::render::Presented { sequence: self.sequence, at: Instant::now(), latency: at.elapsed() }))
++            }
++            _ => Ok(None),
++        }
++    }
+     fn invalidate(&mut self) {
+         self.inner.invalidate()
+     }
+@@ -95,6 +121,11 @@ struct Client {
+     released: Vec<u32>,
+     created: u32,
+     failed: u32,
++    /// DESK8: wp_presentation, and each feedback's outcome by tag: Some((CLOCK_MONOTONIC ns, refresh ns,
++    /// sequence, flags)) when presented, None when discarded; the frame callbacks' times.
++    presentation: Option<wp_presentation::WpPresentation>,
++    feedback: Vec<(u32, Option<(u128, u32, u64, u32)>)>,
++    callback_times: Vec<u32>,
+ }
+ impl Dispatch<wl_registry::WlRegistry, ()> for Client {
+     fn event(s: &mut Self, r: &wl_registry::WlRegistry, e: wl_registry::Event, _: &(), _: &Connection, q: &QueueHandle<Self>) {
+@@ -103,6 +134,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Client {
+                 "wl_compositor" => s.compositor = Some(r.bind(name, version.min(5), q, ())),
+                 "xdg_wm_base" => s.shell = Some(r.bind(name, version.min(6), q, ())),
+                 "zwp_linux_dmabuf_v1" => s.dmabuf = Some((r.bind(name, version.min(3), q, ()), version)),
++                "wp_presentation" => s.presentation = Some(r.bind(name, 1, q, ())),
+                 _ => {}
+             }
+         }
+@@ -136,8 +168,9 @@ impl Dispatch<wl_buffer::WlBuffer, u32> for Client {
+ }
+ impl Dispatch<wl_callback::WlCallback, ()> for Client {
+     fn event(s: &mut Self, _: &wl_callback::WlCallback, e: wl_callback::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
+-        if let wl_callback::Event::Done { .. } = e {
++        if let wl_callback::Event::Done { callback_data } = e {
+             s.frames += 1;
++            s.callback_times.push(callback_data);
+         }
+     }
+ }
+@@ -156,6 +189,23 @@ impl Dispatch<xdg_surface::XdgSurface, ()> for Client {
+         }
+     }
+ }
++impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, u32> for Client {
++    fn event(s: &mut Self, _: &wp_presentation_feedback::WpPresentationFeedback, e: wp_presentation_feedback::Event, tag: &u32, _: &Connection, _: &QueueHandle<Self>) {
++        match e {
++            wp_presentation_feedback::Event::Presented { tv_sec_hi, tv_sec_lo, tv_nsec, refresh, seq_hi, seq_lo, flags } => {
++                let ns = ((u128::from(tv_sec_hi) << 32) | u128::from(tv_sec_lo)) * 1_000_000_000 + u128::from(tv_nsec);
++                let flags = match flags {
++                    wayland_client::WEnum::Value(f) => f.bits(),
++                    wayland_client::WEnum::Unknown(v) => v,
++                };
++                s.feedback.push((*tag, Some((ns, refresh, (u64::from(seq_hi) << 32) | u64::from(seq_lo), flags))));
++            }
++            wp_presentation_feedback::Event::Discarded => s.feedback.push((*tag, None)),
++            _ => {}
++        }
++    }
++}
++delegate_noop!(Client: ignore wp_presentation::WpPresentation);
+ delegate_noop!(Client: ignore wl_compositor::WlCompositor);
+ delegate_noop!(Client: ignore wl_surface::WlSurface);
+ delegate_noop!(Client: ignore xdg_toplevel::XdgToplevel);
+@@ -168,9 +218,19 @@ struct Harness {
+     state: Arc<Mutex<(usize, usize)>>,
+     /// Latest content check and the dma-buf counters.
+     checks: Arc<Mutex<(Option<(u64, u64, u8)>, wm_darwin::server::DmabufStats)>>,
++    /// DESK8: while set the server serves its clients but draws no frame.
++    paused: Arc<AtomicBool>,
+ }
+ impl Harness {
+     fn start(importing: bool) -> (Self, Connection) {
++        Self::start_policy(importing, "")
++    }
++    fn start_policy(importing: bool, policy: &'static str) -> (Self, Connection) {
++        Self::start_full(importing, policy, false)
++    }
++    fn start_full(importing: bool, policy: &'static str, flips: bool) -> (Self, Connection) {
++        let paused = Arc::new(AtomicBool::new(false));
++        let paused2 = paused.clone();
+         let (server, client) = UnixStream::pair().unwrap();
+         let stop = Arc::new(AtomicBool::new(false));
+         let log = Arc::new(Mutex::new(Log::default()));
+@@ -182,14 +242,19 @@ impl Harness {
+             let mut display = Display::<Server>::new().unwrap();
+             let mut server_state = Server::new(&display.handle(), Size::new(640, 480)).unwrap();
+             if importing {
+-                server_state.set_renderer_boxed(Box::new(Importing { inner: RendererKind::Damage.create_cpu(), log: log2, next: 0 }));
++                server_state.set_renderer_boxed(Box::new(Importing { inner: RendererKind::Damage.create_cpu(), log: log2, next: 0, flips, in_flight: None, sequence: 0 }));
+             }
+             assert_eq!(server_state.enable_dmabuf(&display.handle()).unwrap(), importing);
++            if !policy.is_empty() {
++                server_state.policy.pin(policy).unwrap();
++            }
+             Server::add_client(&mut display, server).unwrap();
+             let started = Instant::now();
+             while !stop2.load(Ordering::Acquire) && started.elapsed() < Duration::from_secs(20) {
+                 display.dispatch_clients(&mut server_state).unwrap();
+-                server_state.repaint(&mut Sink, started.elapsed().as_millis() as u32).unwrap();
++                if !paused2.load(Ordering::Acquire) {
++                    server_state.repaint(&mut Sink, started.elapsed().as_millis() as u32).unwrap();
++                }
+                 display.flush_clients().unwrap();
+                 let backend = server_state.wm.backend();
+                 *state2.lock().unwrap() =
+@@ -198,7 +263,7 @@ impl Harness {
+                 thread::sleep(Duration::from_millis(1));
+             }
+         });
+-        (Self { stop, thread: Some(handle), log, state, checks }, Connection::from_socket(client).unwrap())
++        (Self { stop, thread: Some(handle), log, state, checks, paused }, Connection::from_socket(client).unwrap())
+     }
+     fn wait(&self, what: &str, mut done: impl FnMut() -> bool) {
+         let started = Instant::now();
+@@ -441,3 +506,170 @@ fn window_content_is_checked_against_the_clients_buffer() {
+     // Regular files are always readable, so nothing ever waits on a fence here.
+     assert_eq!((stats.fence_waits, stats.fence_timeouts, stats.fence_poll_errors), (0, 0, 0));
+ }
++
++/// DESK8, the FIFO: a GPU client that commits twice before a frame could draw the first gets both drawn, one
++/// frame each (without it the first was replaced unseen); three in a burst: one deep, the newest of the
++/// later two follows the first.
++#[test]
++fn fifo_a_dmabuf_committed_before_the_one_before_was_drawn_waits_for_the_next_frame() {
++    for fifo in [true, false] {
++        let (h, connection) = Harness::start_policy(true, if fifo { "fifo=on" } else { "fifo=off" });
++        let mut queue = connection.new_event_queue();
++        let qh = queue.handle();
++        let mut client = Client::default();
++        connection.display().get_registry(&qh, ());
++        queue.roundtrip(&mut client).unwrap();
++        let (dmabuf, _) = client.dmabuf.clone().expect("zwp_linux_dmabuf_v1 advertised");
++        let surface = client.compositor.as_ref().unwrap().create_surface(&qh, ());
++        let xdg = client.shell.as_ref().unwrap().get_xdg_surface(&surface, &qh, ());
++        let _top = xdg.get_toplevel(&qh, ());
++        surface.commit();
++        queue.roundtrip(&mut client).unwrap();
++        let (w, hgt, stride) = (64i32, 32i32, 256u32);
++        let files: Vec<_> = (0..6).map(|_| fake_dmabuf(stride as usize * hgt as usize)).collect();
++        let buffers: Vec<wl_buffer::WlBuffer> = files
++            .iter()
++            .enumerate()
++            .map(|(i, file)| {
++                let params = dmabuf.create_params(&qh, ());
++                params.add(file.as_fd(), 0, 0, stride, 0, 0);
++                let b = params.create_immed(w, hgt, XR24, zwp_linux_buffer_params_v1::Flags::empty(), &qh, i as u32 + 1);
++                params.destroy();
++                b
++            })
++            .collect();
++        queue.roundtrip(&mut client).unwrap();
++        let commit = |b: &wl_buffer::WlBuffer| {
++            surface.attach(Some(b), 0, 0);
++            surface.damage_buffer(0, 0, w, hgt);
++            surface.frame(&qh, ());
++            surface.commit();
++        };
++        commit(&buffers[0]);
++        let started = Instant::now();
++        while client.frames < 1 {
++            queue.roundtrip(&mut client).unwrap();
++            assert!(started.elapsed() < Duration::from_secs(5));
++            thread::sleep(Duration::from_millis(2));
++        }
++        let shows = |log: &Log, import: u64| log.drawn.iter().filter(|f| f.iter().any(|(_, id)| *id == import)).count();
++        // import ids follow creation: buffer n is import n
++        let burst = |seq: &[usize], h: &Harness, queue: &mut wayland_client::EventQueue<Client>, client: &mut Client| {
++            h.paused.store(true, Ordering::Release);
++            for i in seq {
++                commit(&buffers[*i]);
++            }
++            queue.roundtrip(client).unwrap(); // the server has read the burst; no frame drawn meanwhile
++            h.paused.store(false, Ordering::Release);
++            let last = *seq.last().unwrap() as u64 + 1;
++            h.wait("the burst's last buffer to be drawn", || shows(&h.log.lock().unwrap(), last) > 0);
++        };
++        burst(&[1, 2], &h, &mut queue, &mut client);
++        let log = h.log.lock().unwrap();
++        if fifo {
++            assert!(shows(&log, 2) >= 1, "with the FIFO the first of two commits is drawn: {:?}", log.drawn);
++            // the two are drawn in consecutive frames, the second after the first
++            let first = log.drawn.iter().position(|f| f.iter().any(|(_, id)| *id == 2)).unwrap();
++            let second = log.drawn.iter().position(|f| f.iter().any(|(_, id)| *id == 3)).unwrap();
++            assert_eq!(second, first + 1, "{:?}", log.drawn);
++        } else {
++            assert_eq!(shows(&log, 2), 0, "without the FIFO the newer commit replaces the first unseen: {:?}", log.drawn);
++        }
++        drop(log);
++        // three before a frame: the first, then the newest (one deep: the middle one is replaced)
++        burst(&[3, 4, 5], &h, &mut queue, &mut client);
++        let log = h.log.lock().unwrap();
++        if fifo {
++            assert!(shows(&log, 4) >= 1 && shows(&log, 5) == 0 && shows(&log, 6) >= 1, "{:?}", log.drawn);
++        } else {
++            assert_eq!(shows(&log, 4) + shows(&log, 5), 0, "{:?}", log.drawn);
++        }
++    }
++}
++
++fn monotonic_ns() -> u128 {
++    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
++    t.tv_sec as u128 * 1_000_000_000 + t.tv_nsec as u128
++}
++
++/// DESK8: wp_presentation's feedback says when the flip that showed a buffer happened (CLOCK_MONOTONIC), the
++/// refresh, the flip's sequence, vsync + hardware completion; a buffer replaced before any frame showed it is
++/// discarded; the frame callback carries the same flip's time in ms. With the FIFO both buffers of a burst
++/// are presented, on consecutive flips.
++#[test]
++fn presentation_feedback_carries_the_flip_and_the_fifo_presents_every_buffer_of_a_burst() {
++    for fifo in [false, true] {
++        let (h, connection) = Harness::start_full(true, if fifo { "fifo=on" } else { "fifo=off" }, true);
++        let mut queue = connection.new_event_queue();
++        let qh = queue.handle();
++        let mut client = Client::default();
++        connection.display().get_registry(&qh, ());
++        queue.roundtrip(&mut client).unwrap();
++        let presentation = client.presentation.clone().expect("wp_presentation advertised");
++        let (dmabuf, _) = client.dmabuf.clone().unwrap();
++        let surface = client.compositor.as_ref().unwrap().create_surface(&qh, ());
++        let xdg = client.shell.as_ref().unwrap().get_xdg_surface(&surface, &qh, ());
++        let _top = xdg.get_toplevel(&qh, ());
++        surface.commit();
++        queue.roundtrip(&mut client).unwrap();
++        let (w, hgt, stride) = (64i32, 32i32, 256u32);
++        let files: Vec<_> = (0..3).map(|_| fake_dmabuf(stride as usize * hgt as usize)).collect();
++        let buffers: Vec<wl_buffer::WlBuffer> = files.iter().enumerate().map(|(i, file)| {
++            let params = dmabuf.create_params(&qh, ());
++            params.add(file.as_fd(), 0, 0, stride, 0, 0);
++            let b = params.create_immed(w, hgt, XR24, zwp_linux_buffer_params_v1::Flags::empty(), &qh, i as u32 + 1);
++            params.destroy();
++            b
++        }).collect();
++        queue.roundtrip(&mut client).unwrap();
++        let commit = |b: &wl_buffer::WlBuffer, tag: u32| {
++            surface.attach(Some(b), 0, 0);
++            surface.damage_buffer(0, 0, w, hgt);
++            surface.frame(&qh, ());
++            presentation.feedback(&surface, &qh, tag);
++            surface.commit();
++        };
++        let wait = |client: &mut Client, queue: &mut wayland_client::EventQueue<Client>, n: usize| {
++            let started = Instant::now();
++            while client.feedback.len() < n {
++                queue.roundtrip(client).unwrap();
++                assert!(started.elapsed() < Duration::from_secs(5), "feedback {n} did not arrive: {:?}", client.feedback);
++                thread::sleep(Duration::from_millis(1));
++            }
++        };
++        commit(&buffers[0], 1);
++        wait(&mut client, &mut queue, 1);
++        let now = monotonic_ns();
++        let (tag, Some((ns, refresh, seq, flags))) = client.feedback[0] else { panic!("{:?}", client.feedback) };
++        assert_eq!(tag, 1);
++        assert!(ns <= now && now - ns < 200_000_000, "the flip's time is recent: {ns} vs {now}");
++        assert!(refresh > 10_000_000 && refresh < 40_000_000, "refresh {refresh}");
++        assert!(seq >= 1);
++        assert_eq!(flags & 0x5, 0x5, "vsync (0x1) and hw_completion (0x4)");
++        // the frame callback: the same flip, in ms of the same clock
++        let started = Instant::now();
++        while client.callback_times.is_empty() {
++            queue.roundtrip(&mut client).unwrap();
++            assert!(started.elapsed() < Duration::from_secs(5));
++        }
++        let cb = u128::from(client.callback_times[0]);
++        let flip_ms = (ns / 1_000_000) & 0xffff_ffff;
++        assert!(cb.abs_diff(flip_ms) <= 1, "frame callback time {cb} = the flip's {flip_ms} ms");
++        // a burst of two before a frame
++        h.paused.store(true, Ordering::Release);
++        commit(&buffers[1], 2);
++        commit(&buffers[2], 3);
++        queue.roundtrip(&mut client).unwrap();
++        h.paused.store(false, Ordering::Release);
++        wait(&mut client, &mut queue, 3);
++        let outcome: Vec<(u32, bool)> = client.feedback[1..].iter().map(|(t, f)| (*t, f.is_some())).collect();
++        if fifo {
++            assert_eq!(outcome, [(2, true), (3, true)], "both presented");
++            let (Some(a), Some(b)) = (client.feedback[1].1, client.feedback[2].1) else { unreachable!() };
++            assert_eq!(b.2, a.2 + 1, "on consecutive flips: {a:?} {b:?}");
++        } else {
++            assert!(outcome.contains(&(2, false)) && outcome.contains(&(3, true)), "the replaced one discarded: {outcome:?}");
++        }
++    }
++}
+diff --git a/crates/wm-darwin/tests/wayland_shm.rs b/crates/wm-darwin/tests/wayland_shm.rs
+index 9999de5..457c269 100644
+--- a/crates/wm-darwin/tests/wayland_shm.rs
++++ b/crates/wm-darwin/tests/wayland_shm.rs
+@@ -784,7 +784,8 @@ fn explicit_packaged_startup_sends_no_wayland_key_or_held_chord(){
+ 
+ /// The clipboard between two clients: the focused one sets the selection,
+ /// the next one to be focused is offered it and reads the text through a
+-/// pipe the compositor hands to the owner. The compositor never holds the text.
++/// pipe the compositor hands to the owner. (DESK8: the desk also asks the owner
++/// for a copy of its own; the owner here never answers those, so none is kept.)
+ #[test]
+ #[cfg(feature="desktop-shell")]
+ fn a_selection_set_by_one_client_is_pasted_by_the_next_focused_one(){
+@@ -1831,3 +1832,43 @@ fn a_minimised_tile_lies_under_the_windows_and_an_activation_brings_the_window_b
+     assert_eq!(back.visible, 1, "the activation brought the minimised window back: {back:?}");
+     assert_eq!(back.shells, before.shells, "its tile went");
+ }
++
++/// DESK8: the clipboard outlives the application that copied. A copies text; the desk reads its own copy
++/// right away; A quits; B, focused, is offered the same types by the desk and pastes A's text.
++#[test]
++#[cfg(feature="desktop-shell")]
++fn the_clipboard_is_kept_when_the_application_that_copied_quits(){
++    let(h,a)=Harness::with_input(true);let(tx,rx)=mpsc::channel();h.tx.send(Request::Desktop(tx)).unwrap();rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
++    {
++        let(mut qa,mut ca,_sa,_xa,_ta)=map_client(&a,"copier-A");
++        qa.roundtrip(&mut ca).unwrap();
++        let source=ca.data_manager.as_ref().unwrap().create_data_source(&qa.handle(),());
++        source.offer("text/plain;charset=utf-8".into());source.offer("text/html".into());
++        ca.data_device.as_ref().unwrap().set_selection(Some(&source),0);
++        qa.roundtrip(&mut ca).unwrap();h.snapshot();qa.roundtrip(&mut ca).unwrap();
++        // the desk asks A for every type at once (its copy)
++        let started=Instant::now();
++        while ca.send_requests.len()<2 {qa.roundtrip(&mut ca).unwrap();h.snapshot();assert!(started.elapsed()<Duration::from_secs(3),"the desk asked for {:?}",ca.send_requests.iter().map(|(m,_)|m.clone()).collect::<Vec<_>>());}
++        for (mime,fd) in ca.send_requests.drain(..) {
++            let mut pipe=std::fs::File::from(fd);
++            pipe.write_all(if mime=="text/html"{b"<b>copied in A</b>".as_slice()}else{b"copied in A".as_slice()}).unwrap();
++        }
++        qa.roundtrip(&mut ca).unwrap();
++        std::thread::sleep(Duration::from_millis(200));
++        // A quits (its connection closes with everything in this block)
++        drop(source);
++    }
++    drop(a);
++    std::thread::sleep(Duration::from_millis(300));h.snapshot();
++    let(server,b)=UnixStream::pair().unwrap();h.tx.send(Request::AddClient(server)).unwrap();h.snapshot();let b=Connection::from_socket(b).unwrap();
++    let(mut qb,mut cb,_sb,_xb,_tb)=map_client(&b,"paster-B");
++    let started=Instant::now();
++    while cb.selection.is_none() {h.snapshot();qb.roundtrip(&mut cb).unwrap();assert!(started.elapsed()<Duration::from_secs(3),"B is offered the kept clipboard");std::thread::sleep(Duration::from_millis(10));}
++    let offer=cb.selection.clone().unwrap();
++    assert_eq!(cb.offered.iter().find(|(o,_)|*o==offer).unwrap().1,["text/plain;charset=utf-8","text/html"]);
++    let (mut read,write)=std::io::pipe().unwrap();
++    offer.receive("text/plain;charset=utf-8".into(),write.as_fd());drop(write);
++    qb.roundtrip(&mut cb).unwrap();h.snapshot();
++    let mut text=String::new();read.read_to_string(&mut text).unwrap();
++    assert_eq!(text,"copied in A");
++}

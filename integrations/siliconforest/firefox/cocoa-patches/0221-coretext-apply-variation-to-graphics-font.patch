@@ -1,0 +1,52 @@
+--- a/src/Frameworks/CoreText/CTFont.m
++++ b/src/Frameworks/CoreText/CTFont.m
+@@ -83,7 +83,13 @@
+ }
+ 
+ CTFontRef CTFontCreateWithGraphicsFont(CGFontRef cgFont,CGFloat size,const CGAffineTransform *matrix,CTFontDescriptorRef attributes) {
+-   KTFont *font=[[KTFont alloc] initWithFont:cgFont size:size>0 ? size : CTDefaultFontSize];
++   CFDictionaryRef variation=attributes ? CTFontDescriptorCopyAttribute(attributes,kCTFontVariationAttribute) : NULL;
++   CGFontRef varied=NULL;
++   if(variation && CFGetTypeID(variation)==CFDictionaryGetTypeID() && CFDictionaryGetCount(variation)>0)
++    varied=CGFontCreateCopyWithVariations(cgFont,variation);
++   KTFont *font=[[KTFont alloc] initWithFont:varied ? varied : cgFont size:size>0 ? size : CTDefaultFontSize];
++   if(varied)CGFontRelease(varied);
++   if(variation)CFRelease(variation);
+ 
+    if(matrix!=NULL)
+     font->_matrix=*matrix;
+@@ -145,7 +151,13 @@
+     // Size, matrix and rendering attributes must preserve the actual face.
+     // A memory/data font need not exist in the installed-font registry.
+     KTFont *kept=(KTFont *)CTFontCreateWithGraphicsFont([font graphicsFont],size,&transform,merged);
+-    kept->_ctFace=CTFaceRetain([font _ctFace]);
++    CFDictionaryRef previous=CTFontCopyAttribute(font,kCTFontVariationAttribute);
++    CFDictionaryRef requested=CTFontDescriptorCopyAttribute(merged,kCTFontVariationAttribute);
++    bool sameVariation=(!previous && !requested) || (previous && requested && CFEqual(previous,requested));
++    // A new variable instance needs metrics from its new graphics face.
++    if(sameVariation)kept->_ctFace=CTFaceRetain([font _ctFace]);
++    if(previous)CFRelease(previous);
++    if(requested)CFRelease(requested);
+     kept->_fromGraphicsFont=((KTFont *)font)->_fromGraphicsFont;
+     copy=kept;
+    }
+--- a/src/Frameworks/CoreText/KTFont.m
++++ b/src/Frameworks/CoreText/KTFont.m
+@@ -576,6 +576,17 @@
+    font->_ctFace=face;
+    font->_ctAttributes=extra ? CFDictionaryCreateCopy(NULL,extra) : NULL;
+    font->_fromGraphicsFont=NO;
++   CFDictionaryRef variation=extra ? CFDictionaryGetValue(extra,kCTFontVariationAttribute) : NULL;
++   if(variation && CFGetTypeID(variation)==CFDictionaryGetTypeID() && CFDictionaryGetCount(variation)>0){
++    CGFontRef varied=CGFontCreateCopyWithVariations(graphics,variation);
++    if(varied){
++     font->_font=varied;
++     CGFontRelease(graphics);
++     CTFaceRelease(face);
++     font->_ctFace=NULL;
++     font->_fromGraphicsFont=YES;
++    }
++   }
+    return font;
+ }
+ 

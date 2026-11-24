@@ -1,0 +1,377 @@
+--- a/userland/AudioToolbox/AudioFile.c
++++ b/userland/AudioToolbox/AudioFile.c
+@@ -7,6 +7,7 @@
+  * grows and when the file is closed.
+  */
+ #include <AudioToolbox/AudioToolbox.h>
++#include "SFAudioFFmpeg.h"
+ #include <AudioToolbox/AudioFileStream.h>
+ #include <CoreServices/CoreServices.h>
+ #include <errno.h>
+@@ -21,6 +22,7 @@
+ #define FINCH_AUDIO_FILE_ALIGN 4096
+ 
+ struct OpaqueAudioFileID {
++    UInt8 *compressedData;
+     AudioFileTypeID type;
+     int fd;
+     void *client;
+@@ -972,6 +974,7 @@
+ {
+     if (f->fd >= 0)
+         close(f->fd);
++    free(f->compressedData);
+     free(f->layout);
+     free(f->packets);
+     if (f->cookie)
+@@ -1003,8 +1006,18 @@
+ open_parsed(AudioFileID f, AudioFileTypeID hint)
+ {
+     AudioFileTypeID type = sniff(f);
+-    if (!type)
+-        return hint ? kAudioFileInvalidFileError : kAudioFileUnsupportedFileTypeError;
++    if (!type) {
++        if (f->writable) return kAudioFileOperationNotSupportedError;
++        SFCompressedFile compressed;
++        OSStatus status = SFCompressedOpen((AudioFile_ReadProc)raw_read, f, raw_size(f), &compressed);
++        if (status) return status;
++        f->type=compressed.type; f->format=compressed.format;
++        f->compressedData=compressed.data; f->dataSize=compressed.dataSize; f->dataOffset=0;
++        f->packets=compressed.packets; f->packetCount=compressed.packetCount;
++        f->maxPacketSize=compressed.maximumPacket; f->cookie=compressed.cookie;
++        f->packetInfo=compressed.packetInfo;
++        return noErr;
++    }
+     f->type = type == kAudioFileRF64Type ? kAudioFileWAVEType : type;
+     const Handler *h = handler_for(f->type);
+     OSStatus e = h->parse(f);
+@@ -1505,7 +1518,10 @@
+     if ((SInt64)want > inAudioFile->dataSize - inStartingByte)
+         want = (UInt32)(inAudioFile->dataSize - inStartingByte);
+     UInt32 asked = *ioNumBytes, got = 0;
+-    OSStatus e = raw_read(inAudioFile, inAudioFile->dataOffset + inStartingByte, want, outBuffer, &got);
++    OSStatus e;
++    if (inAudioFile->compressedData) {
++        memcpy(outBuffer,inAudioFile->compressedData+inStartingByte,want); got=want; e=noErr;
++    } else e = raw_read(inAudioFile, inAudioFile->dataOffset + inStartingByte, want, outBuffer, &got);
+     *ioNumBytes = got;
+     if (e)
+         return e;
+--- a/userland/AudioToolbox/AudioConverter.c
++++ b/userland/AudioToolbox/AudioConverter.c
+@@ -2,6 +2,7 @@
+ /* Audio sample conversion, Finch's. PCM and G.711 need no external codec.
+    Integer paths preserve bits; float paths follow the host's rounding and clipping. */
+ #include <AudioToolbox/AudioToolbox.h>
++#include "SFAudioFFmpeg.h"
+ #include <dispatch/dispatch.h>
+ #include <math.h>
+ #include <pthread.h>
+@@ -11,7 +12,8 @@
+ #include <string.h>
+ 
+ struct OpaqueAudioConverter {
+-    AudioStreamBasicDescription input, output;
++    SFDecoder *decoder;
++    AudioStreamBasicDescription compressed, input, output;
+     SInt32 *map;
+     UInt32 complexity, quality, primeMethod, dithering, ditherDepth;
+     Boolean hasDitherDepth, unbuffered;
+@@ -222,6 +224,14 @@
+     if (!input || !output || !result)
+         return -50;
+     *result = NULL;
++    bool compressedInput = SFCompressedFormat(input->mFormatID);
++    AudioStreamBasicDescription encoded = *input, pcm;
++    if (compressedInput) {
++        pcm=(AudioStreamBasicDescription){input->mSampleRate,kAudioFormatLinearPCM,
++            kAudioFormatFlagIsFloat|kAudioFormatFlagIsPacked,input->mChannelsPerFrame*4,1,
++            input->mChannelsPerFrame*4,input->mChannelsPerFrame,32,0};
++        input=&pcm;
++    }
+     if (!valid_format(input) || !valid_format(output))
+         return kAudioConverterErr_FormatNotSupported;
+     AudioConverterRef c = calloc(1, sizeof(*c));
+@@ -270,6 +280,10 @@
+     for (UInt32 i = 0; i < output->mChannelsPerFrame; i++)
+         c->map[i] = i < input->mChannelsPerFrame ? (SInt32)i :
+             (input->mChannelsPerFrame == 1 && output->mChannelsPerFrame == 2 ? 0 : -1);
++    if (compressedInput) {
++        c->compressed=encoded; c->decoder=SFDecoderNew(&encoded);
++        if (!c->decoder) { AudioConverterDispose(c); return kAudioConverterErr_FormatNotSupported; }
++    }
+     *result = c;
+     return noErr;
+ }
+@@ -303,6 +317,7 @@
+ {
+     if (!c)
+         return -50;
++    SFDecoderDispose(c->decoder);
+     free(c->inputList);
+     free(c->outputList);
+     free(c->srcSamples);
+@@ -319,6 +334,7 @@
+ {
+     if (!c)
+         return -50;
++    SFDecoderReset(c->decoder);
+     c->srcFrames = 0;
+     c->srcBaseFrame = 0;
+     c->srcTotalFrames = 0;
+@@ -476,8 +492,8 @@
+     return true;
+ }
+ 
+-OSStatus
+-AudioConverterConvertComplexBuffer(AudioConverterRef c, UInt32 frames, const AudioBufferList *input, AudioBufferList *output)
++static OSStatus
++convert_pcm(AudioConverterRef c, UInt32 frames, const AudioBufferList *input, AudioBufferList *output)
+ {
+     if (!c || !valid_buffers(&c->input, input, frames) || !valid_buffers(&c->output, output, frames))
+         return -50;
+@@ -504,8 +520,14 @@
+ }
+ 
+ OSStatus
++AudioConverterConvertComplexBuffer(AudioConverterRef c, UInt32 frames, const AudioBufferList *input, AudioBufferList *output) {
++    if (c && c->decoder) return kAudioConverterErr_OperationNotSupported;
++    return convert_pcm(c,frames,input,output);
++}
++OSStatus
+ AudioConverterConvertBuffer(AudioConverterRef c, UInt32 inputBytes, const void *input, UInt32 *outputBytes, void *output)
+ {
++    if (c && c->decoder) return kAudioConverterErr_OperationNotSupported;
+     if (!c || !input || !outputBytes || !output || planar(&c->input) || planar(&c->output))
+         return -50;
+     if (!*outputBytes)
+@@ -526,6 +548,12 @@
+ {
+     if (!c)
+         return -50;
++    if (c->decoder && property==kAudioConverterDecompressionMagicCookie) {
++        UInt32 n=0; OSStatus e=SFDecoderCopyCookie(c->decoder,&n,NULL);
++        if(size)*size=n; if(writable)*writable=true; return e;
++    }
++    if (c->decoder && (property==kAudioConverterPropertyCalculateInputBufferSize ||
++        property==kAudioConverterPropertyCalculateOutputBufferSize)) return kAudioConverterErr_PropertyNotSupported;
+     UInt32 n;
+     Boolean write = false;
+     switch (property) {
+@@ -563,6 +591,7 @@
+ {
+     if (!c || !size || !data)
+         return -50;
++    if (c->decoder && property==kAudioConverterDecompressionMagicCookie) return SFDecoderCopyCookie(c->decoder,size,data);
+     UInt32 need;
+     OSStatus status = AudioConverterGetPropertyInfo(c, property, &need, NULL);
+     if (status)
+@@ -573,7 +602,7 @@
+         return kAudioConverterErr_BadPropertySizeError;
+     UInt32 value = 0;
+     switch (property) {
+-        case kAudioConverterCurrentInputStreamDescription: memcpy(data, &c->input, need); return noErr;
++        case kAudioConverterCurrentInputStreamDescription: memcpy(data, c->decoder ? &c->compressed : &c->input, need); return noErr;
+         case kAudioConverterCurrentOutputStreamDescription: memcpy(data, &c->output, need); return noErr;
+         case kAudioConverterChannelMap: memcpy(data, c->map, need); *size = need; return noErr;
+         case kAudioConverterSampleRateConverterInitialPhase: memcpy(data, &c->initialPhase, need); return noErr;
+@@ -592,7 +621,7 @@
+             value = c->ditherDepth;
+             break;
+         case kAudioConverterPropertyMinimumInputBufferSize:
+-        case kAudioConverterPropertyMaximumInputPacketSize: value = c->input.mBytesPerFrame; break;
++        case kAudioConverterPropertyMaximumInputPacketSize: value = c->decoder ? (1u<<20) : c->input.mBytesPerFrame; break;
+         case kAudioConverterPropertyMinimumOutputBufferSize:
+         case kAudioConverterPropertyMaximumOutputPacketSize: value = c->output.mBytesPerFrame; break;
+         case kAudioConverterPropertyCalculateInputBufferSize: {
+@@ -634,6 +663,7 @@
+ {
+     if (!c || !data)
+         return -50;
++    if (c->decoder && property==kAudioConverterDecompressionMagicCookie) return SFDecoderCookie(c->decoder,size,data);
+     if (property == kAudioConverterChannelMap) {
+         if (size != c->output.mChannelsPerFrame * sizeof(SInt32))
+             return kAudioConverterErr_BadPropertySizeError;
+@@ -901,7 +931,7 @@
+                 (size_t)done * c->output.mBytesPerFrame;
+             c->outputList->mBuffers[i].mDataByteSize -= done * c->output.mBytesPerFrame;
+         }
+-        status = AudioConverterConvertComplexBuffer(c, frames, c->inputList, c->outputList);
++        status = convert_pcm(c, frames, c->inputList, c->outputList);
+         if (status)
+             break;
+         done += frames;
+@@ -920,6 +950,17 @@
+         output->mBuffers[i].mDataByteSize = done * c->output.mBytesPerFrame;
+ }
+ 
++struct SFDecodeInput { AudioConverterRef converter; AudioConverterComplexInputDataProc callback; void *user; };
++static OSStatus decode_input(AudioConverterRef converter, UInt32 *frames, AudioBufferList *data,
++    AudioStreamPacketDescription **descriptions, void *user) {
++    (void)converter; (void)descriptions;
++    struct SFDecodeInput *input=user;
++    return SFDecoderRead(input->converter->decoder,input->converter,input->callback,input->user,frames,data);
++}
++void SFCodecPrimeConverter(AudioConverterRef converter, uint64_t frames) {
++    if(converter)SFDecoderSkip(converter->decoder,frames);
++}
++
+ OSStatus
+ AudioConverterFillComplexBuffer(AudioConverterRef c, AudioConverterComplexInputDataProc callback, void *user,
+     UInt32 *packets, AudioBufferList *output, AudioStreamPacketDescription *descriptions)
+@@ -928,6 +969,8 @@
+         return -50;
+     if (c->unbuffered)
+         return kAudioConverterErr_OperationNotSupported;
++    struct SFDecodeInput compressedInput={c,callback,user};
++    if(c->decoder) {callback=decode_input;user=&compressedInput;}
+     UInt32 requested = *packets, done = 0;
+     OSStatus status = c->input.mSampleRate == c->output.mSampleRate ?
+         fill_pcm(c, callback, user, requested, output, &done) :
+--- a/userland/AudioToolbox/ExtendedAudioFile.c
++++ b/userland/AudioToolbox/ExtendedAudioFile.c
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: MIT OR Apache-2.0 */
+ /* High-level audio-file reads and writes over Finch's AudioFile and AudioConverter. */
+ #include <AudioToolbox/AudioToolbox.h>
++#include "SFAudioFFmpeg.h"
+ #include <CoreServices/CoreServices.h>
+ #include <limits.h>
+ #include <math.h>
+@@ -52,6 +53,7 @@
+ static bool
+ usable_file_format(const AudioStreamBasicDescription *a)
+ {
++    if (SFCompressedFormat(a->mFormatID)) return a->mSampleRate>0 && a->mChannelsPerFrame>0 && a->mChannelsPerFrame<=8;
+     return (a->mFormatID == kAudioFormatLinearPCM || a->mFormatID == kAudioFormatULaw || a->mFormatID == kAudioFormatALaw) &&
+         isfinite(a->mSampleRate) && a->mSampleRate > 0 && a->mChannelsPerFrame > 0 && a->mBytesPerFrame > 0 && a->mBytesPerPacket > 0 &&
+         a->mFramesPerPacket == 1 && a->mBytesPerFrame == a->mBytesPerPacket &&
+@@ -61,6 +63,11 @@
+ static OSStatus
+ file_length_frames(ExtAudioFileRef f, SInt64 *frames)
+ {
++    if (SFCompressedFormat(f->fileFormat.mFormatID)) {
++        AudioFilePacketTableInfo info; UInt32 size=sizeof(info);
++        OSStatus e=AudioFileGetProperty(f->file,kAudioFilePropertyPacketTableInfo,&size,&info);
++        if(!e)*frames=info.mNumberValidFrames; return e;
++    }
+     UInt64 bytes = 0;
+     UInt32 size = sizeof(bytes);
+     OSStatus e = AudioFileGetProperty(f->file, kAudioFilePropertyAudioDataByteCount, &size, &bytes);
+@@ -99,6 +106,18 @@
+     if (same_format(input, output)) {
+         AudioConverterDispose(check);
+         return noErr;
++    }
++    if (!f->writing && SFCompressedFormat(f->fileFormat.mFormatID)) {
++        UInt32 size=0;
++        if (!AudioFileGetPropertyInfo(f->file,kAudioFilePropertyMagicCookieData,&size,NULL) && size) {
++            void *cookie=malloc(size); if(!cookie){AudioConverterDispose(check);return -108;}
++            e=AudioFileGetProperty(f->file,kAudioFilePropertyMagicCookieData,&size,cookie);
++            if(!e)e=AudioConverterSetProperty(check,kAudioConverterDecompressionMagicCookie,size,cookie);
++            free(cookie); if(e){AudioConverterDispose(check);return e;}
++        }
++        AudioFilePacketTableInfo info; size=sizeof(info);
++        if(!AudioFileGetProperty(f->file,kAudioFilePropertyPacketTableInfo,&size,&info))
++            SFCodecPrimeConverter(check,(uint64_t)info.mPrimingFrames+f->position);
+     }
+     *result = check;
+     return noErr;
+@@ -122,6 +141,14 @@
+     if (!usable_file_format(&f->fileFormat)) {
+         free(f);
+         return kExtAudioFileError_InvalidDataFormat;
++    }
++    if (SFCompressedFormat(f->fileFormat.mFormatID)) {
++        f->clientFormat=(AudioStreamBasicDescription){f->fileFormat.mSampleRate,kAudioFormatLinearPCM,
++            kAudioFormatFlagIsFloat|kAudioFormatFlagIsPacked,4*f->fileFormat.mChannelsPerFrame,1,
++            4*f->fileFormat.mChannelsPerFrame,f->fileFormat.mChannelsPerFrame,32,0};
++        f->clientSet=true;
++        e=configure_converter(f,&f->clientFormat,&f->converter);
++        if(e){free(f);return e;}
+     }
+     *result = f;
+     return noErr;
+@@ -296,6 +323,7 @@
+     ExtAudioFileRef file;
+     void *buffer;
+     size_t capacity;
++    AudioStreamPacketDescription description;
+ };
+ 
+ struct ExtAudioFileWriteContext {
+@@ -314,9 +342,16 @@
+     UInt32 requested = *ioNumberDataPackets;
+     if (!requested)
+         return noErr;
+-    if (requested > UINT32_MAX / f->fileFormat.mBytesPerFrame)
++    if (f->fileFormat.mBytesPerFrame && requested > UINT32_MAX / f->fileFormat.mBytesPerFrame)
+         return kExtAudioFileError_InvalidPropertySize;
+     UInt32 capacity = requested * f->fileFormat.mBytesPerFrame;
++    bool compressed=SFCompressedFormat(f->fileFormat.mFormatID);
++    if(compressed) {
++        requested=1;
++        UInt32 size=sizeof(capacity);
++        OSStatus e=AudioFileGetProperty(f->file,kAudioFilePropertyMaximumPacketSize,&size,&capacity);
++        if(e)return e;
++    }
+     if (context->capacity < capacity) {
+         void *buffer = realloc(context->buffer, capacity);
+         if (!buffer)
+@@ -326,13 +361,14 @@
+     }
+     UInt32 packets = requested;
+     UInt32 bytes = capacity;
+-    OSStatus e = AudioFileReadPackets(f->file, false, &bytes, NULL, f->fileReadPosition, &packets, context->buffer);
++    OSStatus e = AudioFileReadPackets(f->file, false, &bytes, compressed ? &context->description : NULL, f->fileReadPosition, &packets, context->buffer);
+     if (e)
+         return e;
+     if (packets > requested || bytes > capacity)
+         return kAudioFileUnspecifiedError;
+     f->fileReadPosition += packets;
+     *ioNumberDataPackets = packets;
++    if(compressed && outDataPacketDescription)*outDataPacketDescription=&context->description;
+     ioData->mNumberBuffers = 1;
+     ioData->mBuffers[0] = (AudioBuffer){f->fileFormat.mChannelsPerFrame, bytes, context->buffer};
+     return noErr;
+@@ -529,7 +565,7 @@
+     ExtAudioFileRef f = inExtAudioFile;
+     if (f->writing)
+         return kExtAudioFileError_InvalidOperationOrder;
+-    if (f->fileFormat.mFramesPerPacket != 1 || !f->fileFormat.mBytesPerFrame)
++    if (!SFCompressedFormat(f->fileFormat.mFormatID) && (f->fileFormat.mFramesPerPacket != 1 || !f->fileFormat.mBytesPerFrame))
+         return kExtAudioFileError_InvalidDataFormat;
+     if (f->clientSet && f->clientFormat.mFormatID != kAudioFormatLinearPCM)
+         return kExtAudioFileError_NonPCMClientFormat;
+@@ -545,7 +581,13 @@
+         set_buffer_sizes(client, ioData, 0);
+         return noErr;
+     }
+-    if (f->converter && f->fileFormat.mSampleRate != client->mSampleRate) {
++    if (f->converter && (f->fileFormat.mSampleRate != client->mSampleRate || SFCompressedFormat(f->fileFormat.mFormatID))) {
++        if (SFCompressedFormat(f->fileFormat.mFormatID)) {
++            SInt64 length=0; OSStatus lengthStatus=file_length_frames(f,&length);
++            if(lengthStatus)return lengthStatus;
++            long double remaining=(long double)(length-f->position)*client->mSampleRate/f->fileFormat.mSampleRate;
++            if(remaining<actual)actual=remaining>0?(UInt32)remaining:0;
++        }
+         struct ExtAudioFileReadContext context = {f, NULL, 0};
+         UInt32 converted = actual;
+         OSStatus e = AudioConverterFillComplexBuffer(f->converter, read_converter_input, &context,
+@@ -711,8 +753,15 @@
+     f->seekPosition = inFrameOffset;
+     f->fileReadPosition = inFrameOffset;
+     f->clientFramesSinceSeek = 0;
+-    if (f->converter)
++    if (f->converter) {
+         AudioConverterReset(f->converter);
++        if(SFCompressedFormat(f->fileFormat.mFormatID)) {
++            AudioFilePacketTableInfo info; UInt32 size=sizeof(info);
++            e=AudioFileGetProperty(f->file,kAudioFilePropertyPacketTableInfo,&size,&info);
++            if(e)return e;
++            f->fileReadPosition=0; SFCodecPrimeConverter(f->converter,(uint64_t)info.mPrimingFrames+inFrameOffset);
++        }
++    }
+     return noErr;
+ }
+ 

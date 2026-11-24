@@ -1,0 +1,22 @@
+#!/bin/sh
+# qemu-net-up [interface]: QEMU's user network on the virtio interface, once. DHCP lease
+# (10.0.2.15, router 10.0.2.2, nameserver 10.0.2.3 in /etc/resolv.conf) with the lab's
+# sf-dhcp, then mdnsd, which libc name lookups talk to (as m1-bwfm's sf-net-up does in a root
+# without sf-netd; sf-netd itself is for the Wi-Fi interface and is not used here).
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+ifname=${1:-en0}
+# The interface gets its name late: the kernel waits about 100 s for a network configuration
+# daemon this root does not have before it names interfaces itself.
+i=0
+while sf-dhcp --up "$ifname" 2>&1 | grep -q "cannot mark"; do
+    i=$((i+1)); [ $i -lt 18 ] || { echo "qemu-net-up: no interface $ifname"; exit 1; }
+    sleep 10
+done
+sf-dhcp "$ifname" || { echo "qemu-net-up: no DHCP lease on $ifname"; exit 1; }
+if [ ! -S /var/run/mDNSResponder ]; then
+    mkdir -p /var/run /var/log
+    mdnsd -debug > /var/log/mdnsd.log 2>&1 &
+    i=0
+    while [ ! -S /var/run/mDNSResponder ] && [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done
+fi
+[ -S /var/run/mDNSResponder ] && echo "qemu-net-up: resolver ready" || { echo "qemu-net-up: resolver did not start"; exit 1; }

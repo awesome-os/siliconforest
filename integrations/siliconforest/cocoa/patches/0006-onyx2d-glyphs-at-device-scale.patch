@@ -1,0 +1,29 @@
+--- a/src/Frameworks/Onyx2D/O2Context_builtin.m
++++ b/src/Frameworks/Onyx2D/O2Context_builtin.m
+@@ -516,7 +516,16 @@
+    if(face==NULL)
+     return;
+ 
+-   if((ftError=FT_Set_Char_Size(face,0,gState->_pointSize*64,72.0,72.0))){
++   /* Glyphs are rasterised at the size they have on the surface: the point size times the
++    * scale of the user-to-device transform (a window's backing scale, 2 on a 200% display, and
++    * any scale the drawing code set). Positions already go through that transform; with the
++    * bitmaps left at the point size, text on a scaled surface was small glyphs spaced wide. */
++   O2Float deviceScale=sqrt(fabs(transform.a*transform.d-transform.b*transform.c));
++   if(!(deviceScale>0))
++    deviceScale=1;
++   FT_F26Dot6 deviceSize=(FT_F26Dot6)llround(gState->_pointSize*deviceScale*64);
++
++   if((ftError=FT_Set_Char_Size(face,0,deviceSize,72.0,72.0))){
+     NSLog(@"FT_Set_Char_Size returned %d",ftError);
+     return;
+    }
+@@ -526,7 +535,7 @@
+    O2Float userAdvance=0;
+ 
+    for(i=0;i<count;i++){
+-    O2GlyphCacheEntry *glyph=cachedGlyph(face,(FT_F26Dot6)(gState->_pointSize*64),glyphs[i]);
++    O2GlyphCacheEntry *glyph=cachedGlyph(face,deviceSize,glyphs[i]);
+ 
+     if(advances!=NULL)
+      point=O2PointApplyAffineTransform(NSMakePoint(_textMatrix.tx+userAdvance,_textMatrix.ty),transform);

@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "author": "Claude (parallel to the lead Codex goal; read-only analysis)",
+  "status": "READ_ONLY_GAP_ANALYSIS_NO_HARDWARE_NO_CODE_ADDED",
+  "question": "What does PureDarwin on this J293 (MacBookPro17,1, T8103) already have for IOKit, ifnet and PCI; what must a new Darwin netif driver plug into for the built-in Wi-Fi; how does that differ from the utun serial bridge that just passed; and what is missing for a real Wi-Fi interface?",
+  "constraints_honored": "No boot, SSH or Signal. No GPL Linux driver source or macOS kext copied, no firmware downloaded or read. m1n1, recovery, the GPU observer and the lead Codex network-link files were only read, not changed. The private saved ADT was parsed read-only for node names and compatible strings only; no MAC address, serial, calibration or module-instance value is reproduced here.",
+  "hardware_facts_from_saved_adt": {
+    "source": "runs/m1-desktop-010/network-link-attempt-005/guest/original-adt.bin (private, read-only; same machine)",
+    "pcie_controller": "/arm-io/apcie, compatible apcie,t8103, #ports=3. Only pci-bridge0 (compatible apcie-bridge, with a function-perst property) is present (also reports/sprint-010/pcie-init-scope-plan.json).",
+    "wifi_function": "/arm-io/apcie/pci-bridge0/wlan, compatible wlan-pcie,bcm4378 and wlan-pcie,bcm: a Broadcom BCM4378 FullMAC PCIe Wi-Fi.",
+    "bluetooth_function": "/arm-io/apcie/pci-bridge0/bluetooth-pcie, same bcm4378 compatible. Wi-Fi and Bluetooth share the chip, the bridge and its reset.",
+    "iommu": "/arm-io/dart-apcie0/mapper-apcie0-wlan, compatible iommu-mapper: the WLAN DMA must go through dart-apcie0.",
+    "board_identity": "/arm-io/wlan carries module-instance (used to pick the board-specific firmware, NVRAM and regulatory files). Value not reproduced.",
+    "debug": "/arm-io/uart2/wlan-debug exists.",
+    "usb_c_pcie": "apciec0/apciec1 (pciec-bridge) are the USB-C/Thunderbolt PCIe controllers, separate from the Wi-Fi path."
+  },
+  "already_present": {
+    "kernel_and_kc": {
+      "evidence": "Native50 KC member list in reports/sprint-010/trackpad-input-trace-kc-build-001.json (same 50 names as the qualified 02fe2d41 KC), the booted kernel strings, and the pinned sources under sources/puredarwin-m1-desktop/src",
+      "bsd_networking": "XNU with INET, BPF, Skywalk (kernel-pipe, user-pipe, flowswitch, netif nexus), utun, feth/if_fake and the ifnet KPI (net/kpi_interface.h: ifnet_allocate_extended, ifnet_attach, ifnet_input; IFNET_SUBFAMILY_WIFI=3 exists as an interface subfamily).",
+      "IONetworkingFamily": "com.apple.iokit.IONetworkingFamily is in the KC (IONetworkStack personality on IOResources). It provides IONetworkController/IOEthernetController, IONetworkInterface/IOEthernetInterface, output queues and IOMbufMemoryCursor. Its controllers attach an IOEthernetInterface that IONetworkStack names en<N> and hands to dlil as an ifnet.",
+      "IOPCIFamily": "com.apple.iokit.IOPCIFamily is in the KC (IOPCIBridge, IOPCI2PCIBridge, IOPCIDevice).",
+      "pci_host_drivers": "PDArmPCI and PDEcamPCI are in the KC but match only pci-host-ecam-generic (and qcom,pcie-sc8280xp). Nothing matches apcie,t8103, so on this machine no PCI host bridge starts and no IOPCIDevice nub is published.",
+      "existing_netif_drivers_in_kc": "IOVirtIONet (matches only IOPCIDevice, virtio-pci) and PDSg2002Eth (a Sophgo SG2002 GMAC platform driver; IOEthernetController subclass, attachInterface, outputPacket, physical-address DMA with kIOMemoryMapperNone). Neither binds on J293. PDSg2002Eth is the in-tree example of the classic IONetworkingFamily driver shape.",
+      "interrupts": "PDAppleARMPlatformExpert matches AppleARM. PDAppleAIC is an IOInterruptController for the AIC's wired interrupts. It has no MSI support.",
+      "skywalk_iokit": "XNU's iokit/bsddev/skywalk/IOSkywalkSupport.cpp is present; Apple's IOSkywalkFamily kext (used by macOS native NIC drivers) is not."
+    },
+    "runtime_observed_on_this_M1": {
+      "platform_and_interrupts": "console 6ba7f5a7 (network-link attempt 005): 'PDAppleARMPlatformExpert: processors are registered by xnu (AppleARMSMP)' and 'PDAppleAIC: up at 0x23b100000, 896 sources, 11 cpus (all masked)'. The same console has no PCIe or apcie line.",
+      "bsd_stack": "reports/sprint-010/network-base-hardware-attempt-001.json (4efed601): 18/18 required checks. lo0, UDP and TCP loopback, a BSD-mode feth pair with raw frames both ways over BPF, kernel ARP, IPv4 output across the pair, utun out and in, and cleanup all pass on the M1. The before and after interface lists show only lo0, gif0 and stf0; no en<N> exists.",
+      "utun_serial_bridge": "reports/sprint-010/network-link-hardware-attempt-005.json (5d866aed): 22/22. Real TCP and UDP echoes to a Linux QEMU/slirp backend through utun.",
+      "pcie_and_dart": "No PCIe initialization has run under PureDarwin. The DART survey (reports/sprint-010/dart-survey-attempt001-independent-qualification.json, cdc7f4bc) refused with zero DART reads because the APCIE PHY was still in reset. Whether DART MMIO needs PHY or port readiness is unresolved (dart-mmio-prerequisites-source-review.json, aa14f236)."
+    },
+    "source_tree_not_in_kc": {
+      "IO80211Family": "sources/puredarwin-m1-desktop/src/Kernel/Extensions/IO80211Family (PureDarwin, MPL-2.0 OR BSD-2-Clause). IO80211Controller subclasses IOEthernetController, takes a net80211 ieee80211com via attach80211() and answers apple80211 requests (apple80211_ioctl.h). IO80211Interface is the Ethernet-like interface it creates.",
+      "net80211": "IO80211Family/net80211 is OpenBSD's net80211 (BSD-licensed; OPENBSD_REVISION recorded), including the in-kernel WPA/RSN PAE (ieee80211_pae_input.c/output.c), CCMP/TKIP crypto, node and regulatory-domain code.",
+      "wifi_drivers": "PDQwx (OpenBSD qwx(4) for Qualcomm WCN6855 over IOPCIDevice, with pci and bus_dma glue in pd_qwx_glue.c) and PDRalinkUSB (OpenBSD run(4), ISC). These are the in-tree references for porting an OpenBSD Wi-Fi driver onto IO80211Family.",
+      "kc_status": "IO80211Family, PDQwx, PDRalinkUSB, PDE1000 and PDRealtek8111 are in the source extension list but not in the native50 KC. No Broadcom (bwfm) source exists anywhere in the lab tree."
+    }
+  },
+  "what_a_new_netif_driver_plugs_into": {
+    "summary": "A BCM4378 Wi-Fi interface on this Mac needs a five-layer stack. Only the top two (the BSD stack and, in source, IO80211Family/net80211) exist today.",
+    "layers": [
+      {"layer": "1. PCIe host bridge", "plugs_into": "An IOPCIBridge subclass matching IONameMatch apcie,t8103 on the IOPlatformDevice that PDAppleARMPlatformExpert publishes. It must provide config-space access, bring up port 0 (PMGR domains, shared PHY, APPCLK, PERST via function-perst, link training) and publish IOPCIDevice nubs for the BCM4378 functions.", "exists": false},
+      {"layer": "2. DMA mapping", "plugs_into": "An IOMapper for dart-apcie0 (child mapper-apcie0-wlan), so IODMACommand/IOMemoryDescriptor DMA from the PCIe function gets DART IOVAs. PDSg2002Eth's physical-address DMA (kIOMemoryMapperNone) is not valid behind a DART, and lab policy does not allow bypassing DART.", "exists": false},
+      {"layer": "3. Interrupts", "plugs_into": "MSI vectors from the apcie controller routed to AIC sources, exposed through the PCIe nub's interrupt specifiers. PDAppleAIC handles wired AIC interrupts only (currently all masked).", "exists": false},
+      {"layer": "4. Wi-Fi function driver", "plugs_into": "An IO80211Controller subclass (IOEthernetController underneath) matching the BCM4378 IOPCIDevice. It loads firmware into the chip, runs the FullMAC message rings (msgbuf) over PCIe shared memory with doorbells and MSI, and maps firmware events and commands onto net80211 (scan, join, keys) the way OpenBSD bwfm(4) does for FullMAC chips. Data frames are 802.3 Ethernet after association.", "exists": false},
+      {"layer": "5. Interface and BSD stack", "plugs_into": "IO80211Interface (IOEthernetInterface), named en<N> by IONetworkStack and attached to dlil as an IFT_ETHER ifnet, then the same ARP, IPv4, BPF and socket layers that network-base attempt001 exercised with feth and utun.", "exists": "framework in source (IO80211Family) and stack verified on the M1; not in the KC"}
+    ],
+    "alternatives_considered": {
+      "raw_ifnet_kpi": "A driver could call ifnet_allocate_extended/ifnet_attach directly (as feth does) instead of IONetworkingFamily. It still needs layers 1-4, and it would duplicate what IO80211Family already gives net80211 drivers.",
+      "skywalk_native_netif": "In-kernel Skywalk netif nexus KPIs exist (feth native mode uses them), but macOS NIC drivers reach them through IOSkywalkFamily, which PureDarwin lacks. That is not a shorter path for the first Wi-Fi interface."
+    }
+  },
+  "difference_from_utun_serial_bridge": {
+    "bridge_as_passed": "A user-space guest daemon owns utun 10.0.2.15 (peer 10.0.2.2) and pumps the DLNET001 codec over the existing serial console. Guest to host traffic is nonce-labelled hex lines; host to guest traffic is SPACE/LF-encoded bits with credit and ACK flow control. Packets reach a Linux QEMU/slirp backend through the M5 host process, which runs only in the network_link_experiment profile (integrations/puredarwin/m1-network-link/README.md).",
+    "differences": [
+      "Kernel vs user space: the bridge needs no new kernel code. utun, the BSD stack and the console TTY already exist. Wi-Fi needs four new kernel layers: PCIe host, DART mapper, MSI and a FullMAC driver.",
+      "Hardware: the bridge uses no device of its own; the serial console is already up. Wi-Fi drives real silicon. That means PCIe link-up on a shared PHY whose PMGR ancestors are shared with storage (ANS), DMA through dart-apcie0, firmware running on the chip, and a radio.",
+      "Firmware: none for the bridge. Wi-Fi needs Broadcom firmware, a board NVRAM file, a CLM regulatory blob and possibly calibration/txcap data selected by chip revision and module-instance.",
+      "Dependence on the controller: the bridge exists only while the M5 host runs the leased network_link_experiment backend. Wi-Fi would be independent of the M5 and would reach the real LAN and Internet.",
+      "Addressing and peer: the bridge peer is slirp (NAT, controlled address and ports). Wi-Fi needs 802.11 scan and association, WPA2 keys, then DHCP and DNS on a real network.",
+      "Interface type and naming: the bridge is a point-to-point utun (IFT_OTHER, no link layer). Wi-Fi is an Ethernet-type en<N> with ARP, which the feth checks in network-base attempt001 already exercised.",
+      "Throughput: the bridge's host-to-guest path spent 21062 console bytes to carry 1139 data bytes (about 18.5x overhead) on top of a serial link, and is meant for controlled tests. Wi-Fi DMA throughput would be orders of magnitude higher.",
+      "Risk profile: a bridge failure ends a user process. A Wi-Fi driver fault can affect the kernel, the shared PHY and storage power domains, and DMA isolation, so every hardware step needs its own gate and verified Linux recovery."
+    ],
+    "shared_ground": "Both end in the same BSD stack. A working Wi-Fi en<N> would reuse exactly the ARP, IPv4, BPF and socket paths that network-base attempt001 verified on the M1."
+  },
+  "missing_for_real_wifi": [
+    {"id": "W1", "piece": "apcie,t8103 PCIe host bridge driver (IOPCIBridge subclass)", "detail": "Port-0-only bring-up: PMGR clock domains [77,97,29], shared PHY clocks and reset, APPCLK, PERST via the ADT function-perst GPIO with the ADT refclk-to-PERST and PERST-to-config delays, link training, config space and BAR assignment, IOPCIDevice publication. m1n1's pcie_init is broad, writes shared PHY banks for all three ports and rewrites PMGR ancestors shared with ANS storage (pcie-init-scope-plan.json findings P1-P4). A scoped, reviewed Darwin implementation or a separately approved m1n1-side init is required. This task changes neither.", "existing_reference": "IOPCIFamily (KC), PDArmPCI/PDEcamPCI for the IOPCIBridge shape, saved ADT properties, the pinned m1n1 src/pcie.c as the read-only register-sequence reference."},
+    {"id": "W2", "piece": "DART IOMapper for dart-apcie0", "detail": "Stream and TTBR setup, page tables, IOVA allocation, TLB invalidation and fault reporting, bound to mapper-apcie0-wlan. Its MMIO prerequisites are unresolved (the DART survey refused with zero reads), so this follows W1's PHY and port readiness. No bypass.", "existing_reference": "IOMapper base class in XNU; IOPCIBridge mapper hooks; the read-only DART survey leaf and its decoder."},
+    {"id": "W3", "piece": "MSI to AIC routing", "detail": "Allocate apcie MSI vectors, map them to AIC sources, unmask only those sources and deliver to the function driver. PDAppleAIC is wired-only and currently masks everything. Interrupt behaviour under the m1n1 hypervisor must be checked before relying on it.", "existing_reference": "PDAppleAIC (IOInterruptController), saved ADT interrupt properties."},
+    {"id": "W4", "piece": "BCM4378 FullMAC function driver on IO80211Family", "detail": "Chip and backplane access, OTP/board identification, firmware/NVRAM/CLM download to chip RAM, msgbuf rings and doorbells, firmware events, iovar control, scan/join, key install and 802.3 data path, mapped onto net80211. Must be original code or a port of a permissively licensed design. OpenBSD bwfm(4) is an ISC-licensed FullMAC Broadcom driver with upstream Apple Silicon support; it is not in the lab tree and its support for this board was not verified here. GPL brcmfmac must not be copied. Bluetooth on the same chip must be left alone.", "existing_reference": "PDQwx (OpenBSD qwx on IO80211Family with pci and bus_dma glue) as the porting template."},
+    {"id": "W5", "piece": "Firmware, NVRAM, CLM and calibration blobs", "detail": "Broadcom/Apple proprietary and not redistributable. They are not in the tree and must not be downloaded. A copy already on Chris's own machine (for example the Linux side's extracted firmware) could be used only with his explicit authorization, staged privately, kept out of Git, and selected by chip revision plus module-instance.", "existing_reference": "none in tree"},
+    {"id": "W6", "piece": "IO80211Family + net80211 in the native KC", "detail": "IO80211Family and a Broadcom driver must be built with the pinned SDK for this KC and added to the native50 collection with review, just as the trackpad and keyboard modules were. Today neither IO80211Family nor any Wi-Fi driver is a KC member.", "existing_reference": "IO80211Family CMake target; native KC recipes."},
+    {"id": "W7", "piece": "Security association", "detail": "WPA2-PSK through net80211's in-kernel PAE (present in source) or the FullMAC firmware supplicant if the firmware offers it. WPA3-SAE is not in OpenBSD net80211. Keys and passphrases must never reach logs or receipts.", "existing_reference": "net80211 ieee80211_pae_* and crypto sources."},
+    {"id": "W8", "piece": "Userland control and configuration", "detail": "The RAM root has no ifconfig, Wi-Fi join tool, DHCP client or resolver configuration. Needed: a minimal tool using the apple80211 or net80211 ioctls (scan, join), interface address setup (the probes already do this with ioctls), a DHCP client, and DNS configuration. The lead's egress work includes DNS/HTTP validator code (network-and-gpu-safe-slices-progress-002.json); whether it covers resolver configuration was not checked here.", "existing_reference": "apple80211_ioctl.h, net80211 ieee80211_ioctl.h, the m1-network probe's ioctl helpers."},
+    {"id": "W9", "piece": "Regulatory and power", "detail": "Country code and CLM use, radio power state, sleep/wake, and keeping Bluetooth quiesced during port 0 reset.", "existing_reference": "net80211 regdomain code; ADT power properties."},
+    {"id": "W10", "piece": "Staged hardware evidence plan", "detail": "Separate reviewed boots, each ending in verified Linux: (a) read-only port 0 link and PHY state; (b) scoped port 0 bring-up and config-space read of vendor/device ID only; (c) DART mapping self-test with a harmless buffer; (d) MSI delivery; (e) firmware boot to a 'firmware alive' event without radio activity; (f) passive scan; (g) WPA2 association, DHCP and a bounded echo. No step may be inferred from a later one.", "existing_reference": "the existing bounded-cycle controller, criteria-before-boot and independent-review practice."}
+  ],
+  "first_concrete_driver_step_suggested": "W1(a) plus W2 groundwork in source only: an apcie,t8103 IOPCIBridge skeleton that matches and reports port 0 PHY, APPCLK, PERST and link-status registers read-only (no writes), aligned with the existing DART survey guard. It gives the first real PCIe evidence for this Mac under PureDarwin, without touching shared PHY or PMGR state. Any write-capable bring-up must wait for its own scope review.",
+  "not_claimed": [
+    "any PCIe, DART, MSI or Wi-Fi runtime result",
+    "that m1n1's pcie_init is safe or unsafe to run in this configuration (that remains the separate pcie-init-scope-plan question)",
+    "that OpenBSD bwfm supports every BCM4378 revision or firmware on this board",
+    "license clearance for any third-party source; only the license labels recorded in the tree are reported",
+    "Bluetooth"
+  ],
+  "evidence_sha256_prefixes": {
+    "reports/sprint-010/network-base-hardware-attempt-001.json": "4efed60167185fbe",
+    "reports/sprint-010/network-link-hardware-attempt-005.json": "5d866aed96b72d30",
+    "reports/sprint-010/pcie-init-scope-plan.json": "7be18d66910b2c5d",
+    "reports/sprint-010/dart-survey-attempt001-independent-qualification.json": "cdc7f4bc72458b14",
+    "reports/sprint-010/dart-mmio-prerequisites-source-review.json": "aa14f2367254d511",
+    "reports/sprint-010/dart-survey-phy-prerequisite-source-analysis.json": "9cab1db2ff87eb8d",
+    "reports/sprint-010/trackpad-input-trace-kc-build-001.json": "daed5024144b9631",
+    "integrations/puredarwin/m1-network-link/README.md": "6491f6c3b46a3a34",
+    "runs/m1-desktop-010/network-link-attempt-005/guest/console.bin": "6ba7f5a7c318a30e"
+  }
+}

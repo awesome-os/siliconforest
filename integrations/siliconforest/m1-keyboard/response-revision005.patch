@@ -1,0 +1,520 @@
+--- a/integrations/puredarwin/m1-keyboard/ADAPTER.md
++++ b/integrations/puredarwin/m1-keyboard/ADAPTER.md
+@@ -1,14 +1,16 @@
+ # J293 SPI keyboard adapter
+ 
+ This is an opt-in source candidate for the real J293 built-in keyboard. It is
+-not a working native keyboard result. Revision 3 was SDK/KC-built and root's
+-real M1 attempt002 reached a CRC-valid device-info response, then rejected its
+-metadata. Recovered Linux logs confirm a device count above four; the exact
+-count was not captured. Physical typing did not work. Revision 4 below is an
+-unbuilt source correction; further boots are explicitly on hold.
+-The unchanged board/PIO core passed 19 host tests and revision 4's
+-metadata/diagnostic guards passed 13, with undefined-behavior
+-sanitization. The earlier 17-test core is preserved in `attempts/core-001/`.
++not a working native keyboard result. Revision 4 was SDK/KC-built. Root's
++real M1 enum attempt003 accepted device metadata (count 5, 05ac:0341), then
++rejected a CRC-valid interface response whose ID did not echo the request.
++The one-probe-per-boot claim held. No descriptor or native input was established.
++Root verified Linux recovery; the original failed controller verdict remains
++unchanged. Revision 5 below is an unbuilt source correction; further boots
++remain on hold. The unchanged board/PIO core passed 19 host tests, metadata
++and key-policy checks passed 16, and the actual native wait method passed six
++host fake-transport checks, with undefined-behavior sanitization. The earlier
++17-test core is preserved in `attempts/core-001/`.
+ Root separately compiled that earlier core's ARM64 relocatable C objects with
+ the pinned PureDarwin SDK. Neither check
+ establishes a linked kext, hardware timing, IOHID enumeration or physical input.
+@@ -86,8 +88,10 @@
+ CS through 256 TX bytes, 200 us, and four RX status bytes; only
+ `ac 27 68 d5` is transport success. This is not a response, descriptor or input
+ event. Root's `native_protocol/dl_spi_hid.c` validates packet/message CRCs and
+-bounded reassembly. The adapter additionally matches request IDs and metadata
+-identity before any content reaches IOHID. Grok's separately owned `protocol/`
++bounded reassembly. The adapter additionally matches the single pending
++semantic request key and metadata identity before any content reaches IOHID.
++Request and response IDs are separate diagnostics, not pairing predicates.
++Grok's separately owned `protocol/`
+ engine is for independent comparison and is not selected in this kext target.
+ 
+ A shared 200-ms deadline bounds the entire transaction, including both halves
+@@ -152,6 +156,7 @@
+ ```sh
+ python3 integrations/puredarwin/m1-keyboard/test_adapter.py -v
+ python3 integrations/puredarwin/m1-keyboard/test_hid_metadata.py -v
++python3 integrations/puredarwin/m1-keyboard/test_request_policy.py -v
+ ```
+ 
+ The test compiles only the portable C files into a temporary host shared
+@@ -175,8 +180,8 @@
+ 16 native little-endian u32 fields declared by `m1kbd_observation` in
+ `m1kbd_hid.h`. The same header fields are printed to IOLog: outer flags/device,
+ fragment offset/remainder/length, validated message command/report/subdevice/id,
+-response/payload lengths and parser error. A pending request's expected identity
+-is printed too. Presence fields distinguish missing observations from observed
++response/payload lengths and parser error. The pending request key and outbound
++ID are printed separately. Presence fields distinguish missing observations from observed
+ zeros. CRC-failed outer fields remain explicitly untrusted; the adapter never
+ guesses a message header from fragment data. No message payload, metadata
+ string, serial, key bytes or pointer is copied to the diagnostic record. A
+@@ -233,3 +238,51 @@
+ No protocol CRC, framing, board/PIO, descriptor bound, quarantine or teardown
+ rule changes in revision 4. Root owns SDK004 and subsequent review. **No new
+ hardware boot is authorized by this source freeze; the user's hold remains.**
++
++## Revision 5 semantic pairing and one-use keys
++
++The full df1b revision-4 source set, selected protocol and receipt are archived
++unchanged in `attempts/native-004/`. Root reports enum attempt003 observed a
++CRC-valid interface response with flags 40, device d0, command 20, report 02,
++subdevice 01, response ID 0, response length 512 and payload length 31; the
++outbound ID was 1. No raw payload is included here. The pinned Linux reference
++`spi-hid-apple-core.c:149-150` describes a separate ID counter per message type,
++while line 309 assigns outbound IDs from one global counter. Its response
++dispatcher at lines 721-736 selects command/report/subdevice, with no echoed-ID
++comparison. The observation establishes that echo equality is invalid; it does
++not fully qualify all firmware counter behavior.
++
++Revision 5 removes ID equality and the ID argument from the matching helper.
++Both CRCs, framing/reassembly bounds, flags 40, device d0, command 20 and exact
++pending report/subdevice checks remain. Response length remains diagnostic;
++actual payload bounds and descriptor/metadata validation are unchanged. The
++first non-input response with the wrong semantic identity is still fatal;
++there is no fallback, retry or search for a later matching response. The
++one-second deadline and 1000-poll bound are unchanged.
++
++`usedRequestKeys` starts at zero once in instance initialization. Immediately
++before incrementing the outbound ID, encoding or sending, `m1kbd_claim_request`
++permits exactly these command-20 keys, each once: 01/d0 (device info), 02/01
++(keyboard interface info), and 10/01 (keyboard descriptor). The bits are 1, 2
++and 4 respectively. Unknown keys, repeats and invalid masks fail without
++modifying the mask or sending a request. Claims are never released, including
++after encode, transport, CRC or response failure. Enumeration is synchronous
++under the existing gate, with no timer running; the global atomic probe latch
++prevents a new instance from repeating the sequence. This supports semantic
++association for this bounded, single-outstanding enumeration only; it is not a
++general request protocol for retries, parallel requests or resume.
++
++Host tests exhaust unknown report/subdevice keys, exercise all six valid key
++orders and repeated claims, and reject every wrong semantic field. The
++`test_request_policy.py` harness compiles the actual `waitResponse` method body
++with the real C encoder/parser/claim helpers and fake transport/time/teardown.
++It checks differing response IDs, no writes or ID increments on invalid/repeated
++keys, permanently consumed claims on failure, first-wrong-response termination,
++background-input handling and both timeout limits. Source-policy checks tie the
++mask initialization and sole SPI request-write site to that method. These tests
++do not execute IOKit, MMIO, callback teardown or a native keyboard.
++
++Board/PIO, the root-owned protocol engine, metadata/descriptor bounds, global
++probe latch and lifecycle code are unchanged. Root owns SDK005/KC construction
++and any later authorized test. **Revision 5 source readiness does not authorize
++another boot or establish descriptor publication, input or physical typing.**
+--- a/integrations/puredarwin/m1-keyboard/PDM1SPIHID.cpp
++++ b/integrations/puredarwin/m1-keyboard/PDM1SPIHID.cpp
+@@ -63,11 +63,11 @@
+ {
+     transportLoop=nullptr; transportGate=nullptr; pollTimer=nullptr;
+     stopping=false; published=false; touchedHardware=false; gateAdded=false; timerAdded=false;
+-    descriptorLength=0; bzero(&identity,sizeof(identity)); nextID=0;
++    descriptorLength=0; bzero(&identity,sizeof(identity)); nextID=0; usedRequestKeys=0;
+     packetsRead=0; reportsDelivered=0; otherMessages=0;
+     bzero(&lastObservation,sizeof(lastObservation)); lastCountersUS=0;
+-    countersDirty=false; responseExpected=false;
+-    expectedReport=0; expectedSubdevice=0; expectedID=0;
++    countersDirty=false; requestPending=false;
++    pendingReport=0; pendingSubdevice=0; requestID=0;
+     bzero(packet,sizeof(packet)); bzero(descriptor,sizeof(descriptor)); dlsp_init(&wire);
+     return super::init(properties);
+ }
+@@ -163,8 +163,14 @@
+ bool PDM1SPIHID::waitResponse(uint8_t report, uint8_t subdevice, uint16_t responseLength,
+                             struct dlsp_message *message)
+ {
++    /* One synchronous request at a time, each semantic key once per instance.
++     * Never release a claim, even if encoding, transport or response fails.
++     * Firmware response IDs need not echo our outbound global counter. */
++    if (!m1kbd_claim_request(&usedRequestKeys,report,subdevice)) {
++        fail(M1KBD_STATE,"request-key"); return false;
++    }
+     uint8_t id=nextID++;
+-    responseExpected=true; expectedReport=report; expectedSubdevice=subdevice; expectedID=id;
++    requestPending=true; pendingReport=report; pendingSubdevice=subdevice; requestID=id;
+     if (dlsp_request(0xd0,0x20,report,subdevice,id,responseLength,nullptr,0,packet)!=0) {
+         fail(M1KBD_INVALID,"request-encode"); return false;
+     }
+@@ -178,10 +184,10 @@
+         if (e==DLSP_BOOT) { fail(M1KBD_STATE,"unexpected-reboot"); return false; }
+         if (e==DLSP_MESSAGE) {
+             if (message->flags==0x20) { otherMessages++; continue; }
+-            if (!m1kbd_response_matches(message,report,subdevice,id)) {
++            if (!m1kbd_response_matches(message,report,subdevice)) {
+                 fail(M1KBD_STATUS,"response-identity"); return false;
+             }
+-            responseExpected=false;
++            requestPending=false;
+             return true;
+         }
+         IOSleep(1);
+@@ -284,9 +290,9 @@
+           o->packet_available,o->packet_flags,o->packet_device,o->offset,o->remain,o->length,o->parser_error);
+     IOLog("PDM1SPIHID: last decoded message present=%u flags=%02x device=%02x command=%02x report=%02x subdevice=%02x id=%u response_length=%u payload_length=%u\n",
+           o->message_available,o->flags,o->device,o->command,o->report,o->subdevice,o->id,o->response_length,o->payload_length);
+-    if (responseExpected)
+-        IOLog("PDM1SPIHID: expected response device=d0 command=20 report=%02x subdevice=%02x id=%u\n",
+-              (unsigned)expectedReport,(unsigned)expectedSubdevice,(unsigned)expectedID);
++    if (requestPending)
++        IOLog("PDM1SPIHID: pending request device=d0 command=20 report=%02x subdevice=%02x request_id=%u (response id diagnostic only)\n",
++              (unsigned)pendingReport,(unsigned)pendingSubdevice,(unsigned)requestID);
+     IOLog("PDM1SPIHID: stopped at %s, error %d; no automatic retry\n",phase,error);
+     /* During init no producer exists. During a callback the workloop gate
+      * serializes this stop; no callback unmaps resources or frees itself. */
+--- a/integrations/puredarwin/m1-keyboard/PDM1SPIHID.h
++++ b/integrations/puredarwin/m1-keyboard/PDM1SPIHID.h
+@@ -35,7 +35,7 @@
+     uint8_t descriptor[DLSP_DESCRIPTOR_BYTES];
+     size_t descriptorLength;
+     struct m1kbd_identity identity;
+-    uint8_t nextID;
++    uint8_t nextID, usedRequestKeys;
+     IOWorkLoop *transportLoop;
+     IOCommandGate *transportGate;
+     IOTimerEventSource *pollTimer;
+@@ -43,8 +43,8 @@
+     uint64_t packetsRead, reportsDelivered, otherMessages;
+     struct m1kbd_observation lastObservation;
+     uint64_t lastCountersUS;
+-    bool countersDirty, responseExpected;
+-    uint8_t expectedReport, expectedSubdevice, expectedID;
++    bool countersDirty, requestPending;
++    uint8_t pendingReport, pendingSubdevice, requestID;
+     static void poll(OSObject *, IOTimerEventSource *);
+     static IOReturn startGated(OSObject *, void *, void *, void *, void *);
+     static IOReturn stopGated(OSObject *, void *, void *, void *, void *);
+--- a/integrations/puredarwin/m1-keyboard/m1kbd_hid.c
++++ b/integrations/puredarwin/m1-keyboard/m1kbd_hid.c
+@@ -44,10 +44,22 @@
+     out->max_input=u16(p+6); out->country=p[5];
+     return 0;
+ }
+-int m1kbd_response_matches(const struct dlsp_message *m, uint8_t report, uint8_t subdevice, uint8_t id)
++int m1kbd_claim_request(uint8_t *used, uint8_t report, uint8_t subdevice)
++{
++    uint8_t bit;
++    if (!used || (*used & ~7u)) return 0;
++    if (report==0x01 && subdevice==0xd0) bit=1;
++    else if (report==0x02 && subdevice==0x01) bit=2;
++    else if (report==0x10 && subdevice==0x01) bit=4;
++    else return 0;
++    if (*used & bit) return 0;
++    *used|=bit;
++    return 1;
++}
++int m1kbd_response_matches(const struct dlsp_message *m, uint8_t report, uint8_t subdevice)
+ {
+     return m && m->device==0xd0 && m->flags==0x40 && m->command==0x20 &&
+-        m->report==report && m->subdevice==subdevice && m->id==id;
++        m->report==report && m->subdevice==subdevice;
+ }
+ int m1kbd_keyboard_input(const struct dlsp_message *m, uint16_t maximum)
+ {
+--- a/integrations/puredarwin/m1-keyboard/m1kbd_hid.h
++++ b/integrations/puredarwin/m1-keyboard/m1kbd_hid.h
+@@ -13,7 +13,7 @@
+     M1KBD_META_COUNT=-3, M1KBD_META_VENDOR=-4, M1KBD_META_PRODUCT=-5,
+     M1KBD_META_INTERFACE=-6, M1KBD_META_INPUT_SIZE=-7
+ };
+-/* Called only on a CRC-validated, request-identity-matched message.
++/* Called only on a CRC-validated, semantically matched response.
+  * Failure leaves output unchanged and returns a metadata error above.
+  * Unused optional strings are never followed, copied, or required. */
+ int m1kbd_device_info(const uint8_t *, size_t, struct m1kbd_identity *);
+@@ -28,7 +28,16 @@
+ struct m1kbd_interface_metadata { uint8_t prefix[6]; uint16_t words[5]; };
+ int m1kbd_device_metadata_header(const uint8_t *, size_t, struct m1kbd_device_metadata *);
+ int m1kbd_interface_metadata_header(const uint8_t *, size_t, struct m1kbd_interface_metadata *);
+-int m1kbd_response_matches(const struct dlsp_message *, uint8_t report, uint8_t subdevice, uint8_t id);
++/* Serialized enumeration only: command is always 0x20. Claim exactly once
++ * before incrementing the outbound ID, encoding or sending. Bit 0: 01/d0,
++ * bit 1: 02/01, bit 2: 10/01. Zero-init once; never clear/retry a used key.
++ * Returns 1 on claim; null/invalid mask, unknown key or repeat returns 0
++ * without modifying the mask. This is an attempt limit, not a lock. */
++int m1kbd_claim_request(uint8_t *used, uint8_t report, uint8_t subdevice);
++/* IDs are per-message-type counters in the reference, not echoed request
++ * IDs. Match only a pending, single-use key after CRC/length validation.
++ * Response length and both IDs remain diagnostic, not pairing predicates. */
++int m1kbd_response_matches(const struct dlsp_message *, uint8_t report, uint8_t subdevice);
+ /* 1: eligible device-1 input, 0: another message, -1: malformed keyboard input.
+  * IOHID still validates the actual descriptor/report relationship. */
+ int m1kbd_keyboard_input(const struct dlsp_message *, uint16_t max_input);
+--- a/integrations/puredarwin/m1-keyboard/test_hid_metadata.py
++++ b/integrations/puredarwin/m1-keyboard/test_hid_metadata.py
+@@ -1,6 +1,7 @@
+ #!/usr/bin/env python3
+ """Host-only actual C metadata guards; no IOKit or native keyboard proof."""
+ import ctypes as C
++import itertools
+ import pathlib
+ import shutil
+ import struct
+@@ -49,7 +50,8 @@
+         cls.so=so
+         for name in ['device_info','interface_info']:
+             getattr(cls.lib,'m1kbd_'+name).argtypes=[C.POINTER(U8),C.c_size_t,C.POINTER(Identity)]
+-        cls.lib.m1kbd_response_matches.argtypes=[C.POINTER(Message),U8,U8,U8]
++        cls.lib.m1kbd_response_matches.argtypes=[C.POINTER(Message),U8,U8]
++        cls.lib.m1kbd_claim_request.argtypes=[C.POINTER(U8),U8,U8]
+         cls.lib.m1kbd_keyboard_input.argtypes=[C.POINTER(Message),C.c_uint16]
+         cls.lib.m1kbd_observe.argtypes=[C.POINTER(U8),C.c_size_t,C.POINTER(Message),C.c_uint,C.POINTER(Observation)]
+         cls.lib.m1kbd_device_metadata_header.argtypes=[C.POINTER(U8),C.c_size_t,C.POINTER(DeviceMetadata)]
+@@ -200,13 +202,69 @@
+         self.assertNotIn('hardware.',probe)
+         self.assertIn('return KERN_FAILURE;',text.split('pd_m1kbd_stop',1)[1].split('}',1)[0])
+ 
+-    def test_response_requires_all_request_identity_fields(self):
++    def test_response_requires_all_semantic_fields_not_ids_or_response_length(self):
+         m=Message(0xd0,0x40,0x20,0x10,1,7,512,None,0)
+-        self.assertEqual(self.lib.m1kbd_response_matches(C.byref(m),0x10,1,7),1)
+-        for key in ['device','flags','command','report','subdevice','id']:
++        self.assertEqual(self.lib.m1kbd_response_matches(C.byref(m),0x10,1),1)
++        for key in ['device','flags','command','report','subdevice']:
+             old=getattr(m,key); setattr(m,key,old^1)
+-            self.assertEqual(self.lib.m1kbd_response_matches(C.byref(m),0x10,1,7),0)
++            self.assertEqual(self.lib.m1kbd_response_matches(C.byref(m),0x10,1),0)
+             setattr(m,key,old)
++        for id_ in range(256):
++            for rsplen in (0,512,65535):
++                m.id=id_; m.response_length=rsplen
++                self.assertEqual(self.lib.m1kbd_response_matches(C.byref(m),0x10,1),1)
++        self.assertEqual(self.lib.m1kbd_response_matches(None,0x10,1),0)
++
++    def test_each_request_key_claimed_once_in_all_six_orders(self):
++        keys=((1,0xd0,1),(2,1,2),(0x10,1,4))
++        for order in itertools.permutations(keys):
++            used=U8(); expected=0
++            for report,subdevice,bit in order:
++                self.assertEqual(self.lib.m1kbd_claim_request(C.byref(used),report,subdevice),1)
++                expected|=bit
++                self.assertEqual(used.value,expected)
++                self.assertEqual(self.lib.m1kbd_claim_request(C.byref(used),report,subdevice),0)
++                self.assertEqual(used.value,expected)
++            self.assertEqual(used.value,7)
++
++    def test_unknown_request_keys_and_invalid_masks_do_not_change_state(self):
++        allowed={(1,0xd0),(2,1),(0x10,1)}
++        for mask in (0,1,3,7):
++            for report in range(256):
++                for subdevice in range(256):
++                    if (report,subdevice) in allowed: continue
++                    used=U8(mask)
++                    self.assertEqual(self.lib.m1kbd_claim_request(C.byref(used),report,subdevice),0)
++                    self.assertEqual(used.value,mask)
++        for mask in range(8,256):
++            for report,subdevice in allowed:
++                used=U8(mask)
++                self.assertEqual(self.lib.m1kbd_claim_request(C.byref(used),report,subdevice),0)
++                self.assertEqual(used.value,mask)
++        self.assertEqual(self.lib.m1kbd_claim_request(None,1,0xd0),0)
++
++    def test_native_single_use_guard_precedes_id_encoding_and_write(self):
++        # Wiring policy complements actual compiled waitResponse fake tests;
++        # neither executes IOKit, the kernel atomic latch or real hardware.
++        text=(HERE/'PDM1SPIHID.cpp').read_text()
++        self.assertEqual(text.count('usedRequestKeys'),2)  # Init and claim; no reset.
++        init=text.split('bool PDM1SPIHID::init',1)[1].split('IOService *PDM1SPIHID::probe',1)[0]
++        self.assertIn('usedRequestKeys=0;',init)
++        wait=text.split('bool PDM1SPIHID::waitResponse',1)[1].split('bool PDM1SPIHID::enumerate',1)[0]
++        claim=wait.index('if (!m1kbd_claim_request(&usedRequestKeys,report,subdevice))')
++        increment=wait.index('nextID++')
++        self.assertIn('return false;',wait[claim:increment])
++        self.assertLess(claim,increment)
++        self.assertLess(increment,wait.index('dlsp_request(0xd0,0x20,'))
++        self.assertLess(wait.index('dlsp_request('),wait.index('hardware.writePacket('))
++        self.assertEqual(text.count('hardware.writePacket('),1)
++        self.assertEqual(text.count('dlsp_request('),1)
++        enum=text.split('bool PDM1SPIHID::enumerate',1)[1].split('void PDM1SPIHID::poll',1)[0]
++        self.assertEqual(enum.count('waitResponse('),3)
++        for call in ('waitResponse(1,0xd0,0,','waitResponse(2,1,512,','waitResponse(0x10,1,512,'):
++            self.assertIn(call,enum)
++        self.assertNotIn('expected response',text)
++        self.assertIn('pending request',text)
+ 
+     def test_only_real_device_one_input_eligible_with_bounded_payload(self):
+         payload=(U8*16)()
+--- /dev/null
++++ b/integrations/puredarwin/m1-keyboard/test_request_policy.py
+@@ -0,0 +1,175 @@
++#!/usr/bin/env python3
++"""Actual waitResponse body with fake transport/time; no IOKit/hardware proof."""
++import pathlib
++import shutil
++import subprocess
++import tempfile
++import unittest
++
++HERE=pathlib.Path(__file__).resolve().parent
++
++# Compile the native method verbatim with minimal host peers. Portable request
++# encoding, response parsing, CRC checks and pairing/claim helpers are real C.
++# Hardware, time and failure teardown are fakes: no target/IOKit is executed.
++PREFIX=r'''
++#include "m1kbd_hid.h"
++#include "m1kbd_hw.h"
++#include <array>
++#include <cassert>
++#include <cstring>
++#include <vector>
++using Packet=std::array<uint8_t,DLSP_PACKET_BYTES>;
++static uint64_t nowUS=0;
++static void IOSleep(unsigned ms) { nowUS+=1000*ms; }
++struct PDM1KeyboardHW { static uint64_t clockUS() { return nowUS; } };
++struct FakeHW {
++    unsigned writes=0;
++    int error=0;
++    Packet sent{};
++    int writePacket(const uint8_t *p) {
++        ++writes; std::memcpy(sent.data(),p,sent.size()); return error;
++    }
++};
++struct PDM1SPIHID {
++    FakeHW hardware;
++    uint8_t usedRequestKeys=0, nextID=0;
++    uint8_t pendingReport=0, pendingSubdevice=0, requestID=0;
++    uint8_t packet[DLSP_PACKET_BYTES]{};
++    bool requestPending=false;
++    uint64_t otherMessages=0;
++    std::vector<Packet> incoming;
++    size_t consumed=0;
++    unsigned reads=0;
++    int error=0;
++    const char *phase="";
++    dlsp_state state{};
++    void fail(int e,const char *p) { error=e; phase=p; }
++    int receive(dlsp_message *m) {
++        ++reads;
++        if (consumed==incoming.size()) return DLSP_WAIT;
++        const auto &p=incoming[consumed++];
++        int e=dlsp_push(&state,p.data(),p.size(),m);
++        if (e==DLSP_INVALID) fail(M1KBD_INVALID,"packet-or-message");
++        return e;
++    }
++    bool waitResponse(uint8_t,uint8_t,uint16_t,dlsp_message *);
++};
++static Packet response(uint8_t report,uint8_t sub,uint8_t id=0,
++                       uint8_t device=0xd0,uint8_t cmd=0x20,uint16_t rsplen=0) {
++    Packet p{};
++    const uint8_t payload=0xa5; // Synthetic opaque payload, not metadata/key evidence.
++    assert(dlsp_request(device,cmd,report,sub,id,rsplen,&payload,1,p.data())==0);
++    return p;
++}
++static void outerCRC(Packet &p) {
++    auto crc=dlsp_crc16(p.data(),254); p[254]=uint8_t(crc); p[255]=uint8_t(crc>>8);
++}
++'''
++
++SUFFIX=r'''
++int main(int argc,char **argv) {
++    assert(argc==2);
++    const char *test=argv[1];
++    dlsp_message m{};
++    if (!std::strcmp(test,"non_echo")) {
++        PDM1SPIHID h;
++        for (auto key: std::array<std::array<uint8_t,2>,3>{{{{1,0xd0}},{{2,1}},{{0x10,1}}}}) {
++            h.incoming.push_back(response(key[0],key[1],0));
++            assert(h.waitResponse(key[0],key[1],key[0]==1?0:512,&m));
++            assert(m.id==0 && m.response_length==0 && !h.requestPending);
++            assert(h.requestID==h.hardware.sent[11]);
++            assert(h.requestID==h.hardware.writes-1);
++        }
++        assert(h.usedRequestKeys==7 && h.nextID==3 && h.hardware.writes==3);
++    } else if (!std::strcmp(test,"no_write")) {
++        PDM1SPIHID h;
++        assert(!h.waitResponse(2,0xd0,512,&m));
++        assert(!h.usedRequestKeys && !h.nextID && !h.hardware.writes);
++        assert(!std::strcmp(h.phase,"request-key"));
++        h.incoming.push_back(response(2,1));
++        assert(h.waitResponse(2,1,512,&m));
++        auto previous=h.hardware.sent;
++        assert(!h.waitResponse(2,1,512,&m));
++        assert(h.usedRequestKeys==2 && h.nextID==1 && h.hardware.writes==1);
++        assert(previous==h.hardware.sent && h.consumed==1);
++    } else if (!std::strcmp(test,"failure_burns_key")) {
++        for (unsigned kind=0;kind<3;kind++) {
++            PDM1SPIHID h;
++            if (kind==1) h.hardware.error=M1KBD_IO;
++            if (kind==2) { auto p=response(0x10,1); p[254]^=1; h.incoming.push_back(p); }
++            assert(!h.waitResponse(0x10,1,kind==0?513:512,&m));
++            assert(h.usedRequestKeys==4 && h.nextID==1);
++            assert(h.hardware.writes==(kind==0?0u:1u));
++            const auto writes=h.hardware.writes;
++            assert(!h.waitResponse(0x10,1,512,&m));
++            assert(h.hardware.writes==writes && h.nextID==1 && h.usedRequestKeys==4);
++        }
++    } else if (!std::strcmp(test,"first_response")) {
++        for (unsigned field=0;field<4;field++) {
++            PDM1SPIHID h;
++            auto wrong=response(field==0?1:2,field==1?2:1,0,field==2?1:0xd0,field==3?0x21:0x20);
++            h.incoming={wrong,response(2,1)};
++            assert(!h.waitResponse(2,1,512,&m));
++            assert(!std::strcmp(h.phase,"response-identity"));
++            assert(h.consumed==1 && h.hardware.writes==1 && h.usedRequestKeys==2);
++        }
++    } else if (!std::strcmp(test,"background")) {
++        PDM1SPIHID h;
++        auto input=response(1,0,99,1,0x10); input[0]=0x20; outerCRC(input);
++        h.incoming={input,response(2,1,0)};
++        assert(h.waitResponse(2,1,512,&m));
++        assert(h.otherMessages==1 && h.consumed==2 && h.hardware.writes==1);
++    } else if (!std::strcmp(test,"deadline")) {
++        for (bool input: {false,true}) {
++            PDM1SPIHID h;
++            if (input) {
++                auto p=response(1,0,0,1,0x10); p[0]=0x20; outerCRC(p);
++                h.incoming.assign(1001,p);
++            }
++            nowUS=0;
++            assert(!h.waitResponse(2,1,512,&m));
++            assert(!std::strcmp(h.phase,"response-timeout"));
++            assert(h.reads==1000 && nowUS<=1000000 && h.hardware.writes==1);
++            assert(h.usedRequestKeys==2 && h.nextID==1);
++            assert(!h.waitResponse(2,1,512,&m));
++            assert(h.hardware.writes==1 && h.reads==1000);
++        }
++    } else { assert(false); }
++}
++'''
++
++
++class RequestPolicyTests(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.temp=tempfile.TemporaryDirectory(prefix='m1kbd-request-policy-')
++        temp=pathlib.Path(cls.temp.name)
++        source=(HERE/'PDM1SPIHID.cpp').read_text()
++        body=source[source.index('bool PDM1SPIHID::waitResponse('):
++                    source.index('bool PDM1SPIHID::enumerate()')]
++        cpp=temp/'wait.cpp'; cpp.write_text(PREFIX+body+SUFFIX)
++        flags=['-O1','-g','-Wall','-Wextra','-Werror','-fsanitize=undefined','-fno-sanitize-recover=all']
++        objects=[]
++        for name in ('m1kbd_hid.c','native_protocol/dl_spi_hid.c'):
++            obj=temp/(pathlib.Path(name).stem+'.o'); objects.append(str(obj))
++            subprocess.run([shutil.which('cc'),'-std=c11',*flags,'-c',str(HERE/name),'-o',str(obj)],check=True)
++        cls.exe=temp/'wait-policy'
++        subprocess.run([shutil.which('c++'),'-std=c++17',*flags,'-I',str(HERE),str(cpp),
++                        *objects,'-o',str(cls.exe)],check=True)
++
++    @classmethod
++    def tearDownClass(cls): cls.temp.cleanup()
++
++    def case(self,name):
++        p=subprocess.run([str(self.exe),name],capture_output=True,text=True,timeout=10)
++        self.assertEqual(p.returncode,0,p.stderr)
++
++    def test_sequential_non_echo_ids_match_semantic_keys(self): self.case('non_echo')
++    def test_unknown_and_duplicate_keys_cannot_write_or_increment_id(self): self.case('no_write')
++    def test_encode_transport_and_crc_failures_burn_the_key(self): self.case('failure_burns_key')
++    def test_first_wrong_response_stops_without_searching_for_a_later_match(self): self.case('first_response')
++    def test_background_input_does_not_complete_request(self): self.case('background')
++    def test_deadline_and_poll_cap_survive_background_input_without_retries(self): self.case('deadline')
++
++
++if __name__=='__main__': unittest.main()

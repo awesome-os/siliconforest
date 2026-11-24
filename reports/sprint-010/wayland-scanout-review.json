@@ -1,0 +1,97 @@
+{
+ "report": "M1 Wayland scanout path review: wlroots puredarwin backend + PDGOP over IOGOPFramebuffer (software rendering, no GPU)",
+ "author_role": "independent reviewer (Claude), read-only source review; no edits",
+ "date": "2026-11-07",
+ "claim_class": "source_review_only",
+ "verdict": "The path is software rendering into the firmware framebuffer: pixman renders, then the puredarwin backend memcpy's rows into IOGOP's VRAM mapped through PDGOP. Ownership hand-off and user-client selectors are correct. Two concrete fixes are needed for correct M1 output, plus one recommended: (W1, required) the backend ignores pixel format and copies XRGB8888 raw into the 2101010 framebuffer, giving wrong colours; (W2, required/recommended) the VRAM user mapping is not write-combined on arm64 unless the framebuffer sets 'pd-vram-write-combine', which IOGOP never does, so it defaults to Device memory: slow, with an alignment-fault risk for unaligned stores; (W3, optional) the kernel IOFramebuffer VRAM map is InhibitCache on arm64. No GPU, vblank, mode-setting or hardware cursor is involved or claimed.",
+ "inputs_sha256 (sources/puredarwin-m1-bringup, unmodified files)": {
+  "src/Libraries/PDGOP/PDGOP.c": "05f8c59c17cd9e2ea17d0c31e436f3e164d141d0ae95b9751b0fe39d573020a4",
+  "src/Libraries/PDGOP/include/PDGOP.h": "c1b80e3bf0bd4ba640f503e8297749bc03ca3165c23e6e4c3478ff740449930a",
+  "wlroots backend/puredarwin/output.c": "e9bf3c6c382be0823d5ddb56d7e91f343dae841d8509ad57d130f0921388b0ce",
+  "wlroots backend/puredarwin/allocator.c": "40272943651d23865f83a0771596b6471c83a76b8d4dfbf8a39af681fc08b755",
+  "wlroots backend/puredarwin/backend.c": "62bb57b7dff41220aa75e5179d12c17e1aa80a033101cb40092c28c2eda7c384",
+  "wlroots backend/puredarwin/input.c": "d28ec2000274c3d31e6f4500b560b58419a95776793112d2b2b8da7422379f67",
+  "wlroots render/pixman/pixel_format.c": "2558baa7ab92742f3afcad4b67b419a923f44d610ac6737cff7dad5ce50c586d",
+  "wlroots types/output/output.c": "6b48991d10fa2968e44803fb58c4cca98e03179be41f6f2e209affa6af9fd3d0",
+  "wlroots types/output/render.c": "5c7e5e29e47018618a271dbac2a729d341c30f109762093667e7f494cf605dfd",
+  "src/Libraries/PDSurface/PDSurface.c": "84a2bf6c4878fc6e2d46a9b8ac8b3b91220ef37887a0effdb64d70ace1179049",
+  "IOGraphicsFamily/IOFramebufferUserClient.cpp": "e318d167513af5ec0eeab863c33dc8b26f7bd998efeb8061f691dc04c2788ac4",
+  "IOGraphicsFamily/IOFramebuffer.cpp": "1bb98e66478d5c414de6bf4234a0c3286be6ea6b1cdfb4ce9057e43bbda87fdd",
+  "xnu osfmk/arm/pmap/pmap.c": "b8b36888e5e2721c2b14e4e2b165ccab9727876b8b3a2285b80c873661abc121",
+  "nix/pkgs/wayland/wlroots.nix": "880162bd8e27b433f40e1135849a8395c1e4f898b8297ec1ba3f2c10104551c5",
+  "nix/pkgs/wayland/sway.nix": "0d92ac6ce40c98dee1a7296d5e7f0c2c7f9a3bdb852a849d4fa3f492cd32d4ec"
+ },
+ "path_as_built": [
+  "sway.nix sets WLR_BACKENDS=puredarwin and WLR_RENDERER=pixman by default; wlroots.nix builds -Dbackends=puredarwin -Drenderers=[] (pixman only, no GLES/Vulkan).",
+  "backend.c: PDSurfaceDeviceOpen and pd_virgl_open only find IOVirtIOGPU (PDSurface.c provider list), so on M1 both are absent: gpu == NULL, and the PureDarwin allocator declines => shm buffers and the copy path.",
+  "output.c puredarwin_output_create -> PDGOPOpen; output mode = framebuffer width x height, custom 60 Hz; 16 ms timer as the frame source (no vblank).",
+  "PDGOPOpen: matches IOVirtIOGPU, then IOGOPFramebuffer, then IOFramebuffer; IOServiceOpen type 0 (kIOFBServerConnectType); selector 2 extGetCurrentDisplayMode and selector 1 extGetPixelInformation (match IOFramebufferUserClient methodTemplate); maps kIOFBVRAMMemory (110 = IOGraphicsTypesPrivate.h). It stores width/height/stride/bpp/pixelType/masks[0..2], but not bitsPerComponent or the pixelFormat string.",
+  "output_commit copy path: memcpy of max_width*4 bytes per row from the wlroots buffer to the VRAM mapping, ignoring the buffer's DRM format and the framebuffer masks; pd_virgl_present only when gpu != NULL."
+ ],
+ "findings": [
+  {
+   "id": "W1",
+   "severity": "required",
+   "title": "pixel format mismatch: XRGB8888 copied raw into XRGB2101010 storage",
+   "fact": "With framebuffer-30bit.patch, PDGOP receives bpp 32 and masks 3ff00000/000ffc00/000003ff. The backend implements no get_primary_formats, so wlroots treats the output as able to display any format (output.c wlr_output_get_primary_formats returns NULL; render.c output_pick_format copies the render format) and uses the default render format DRM_FORMAT_XRGB8888 (types/output/output.c:354). The commit path then copies 8888 words unchanged into 2101010 storage: geometry is right (4 bytes/px), colours are wrong (each 10-bit field takes the wrong bit spans).",
+   "minimal_fix": "In the puredarwin backend only: (a) derive the framebuffer fourcc from PDGOP bpp + masks: (32, 00ff0000/0000ff00/000000ff) => DRM_FORMAT_XRGB8888; (32, 3ff00000/000ffc00/000003ff) => DRM_FORMAT_XRGB2101010; anything else => fail output creation with an explicit log, never guess. (b) Implement output get_primary_formats for WLR_BUFFER_CAP_DATA_PTR returning that fourcc (MOD_INVALID/LINEAR), and set the initial output render format to it (wlr_output_state_set_render_format before wlr_output_init), so the pixman renderer (which supports DRM_FORMAT_XRGB2101010 <-> PIXMAN_x2r10g10b10, pixel_format.c:88) renders native 2101010 and the existing row memcpy becomes correct. (c) In output_commit, memcpy only when the buffer format equals the framebuffer fourcc; if a compositor forces XRGB8888/ARGB8888 onto a 2101010 framebuffer, convert per pixel (8->10-bit expansion v10 = v<<2 | v>>6) or reject the commit with an error. No silent raw copy across formats."
+  },
+  {
+   "id": "W2",
+   "severity": "required for usable output (recommended at minimum)",
+   "title": "VRAM user mapping is not write-combined on arm64",
+   "fact": "IOFramebufferUserClient clientMemoryForType(kIOFBVRAMMemory) adds kIOMapWriteCombineCache on arm64 only if the framebuffer has the property 'pd-vram-write-combine'; nothing in the tree sets it (grep: only the reader). The framebuffer PA lies outside XNU-managed RAM, so pmap_cache_attributes returns VM_WIMG_IO unless ADT pmap-io-ranges says otherwise, and the default user mapping is Device memory. Consequences (source reasoning, not executed): every full-frame copy (2560x1600x4 = 16 MB per commit) runs at Device-memory store speed, and any unaligned or overlapping store a libc memmove may emit (or a partial-row/damage copy) can alignment-fault. The kernel's own console mapping of the same buffer is VM_WIMG_WCOMB (initialize_screen, HAS_UCNORMAL_MEM).",
+   "minimal_fix": "IOGOPFramebuffer sets property 'pd-vram-write-combine' = true for the firmware boot framebuffer (DRAM scanned by DCP; WC is the attribute the kernel console already uses), via the existing opt-in hook; no IOGraphics change. Separate from framebuffer-30bit.patch; it needs its own patch/review/build."
+  },
+  {
+   "id": "W3",
+   "severity": "optional / performance",
+   "title": "kernel IOFramebuffer VRAM map is InhibitCache on arm64",
+   "fact": "IOFramebuffer.cpp kIOFBMapCacheMode = kIOMapInhibitCache on non-x86, and fVramMap (used for newConsole.v_baseAddr at the console handoff) is mapped with it. After the handoff the kernel text console therefore paints and scrolls (video_scroll_up reads) through a Device mapping, which is slow but functionally consistent with display-010's buffer readback.",
+   "option": "Honour 'pd-vram-write-combine' for the kernel fVramMap too. Not required for Wayland correctness."
+  },
+  {
+   "id": "W4",
+   "severity": "ok",
+   "title": "ownership hand-off",
+   "fact": "IOServiceOpen type 0 => IOFramebuffer::newUserClient(kIOFBServerConnectType) => setPlatformConsole(0, kPEReleaseScreen) when this is the console framebuffer => gc_enable(FALSE): the kernel console stops painting while the compositor owns VRAM. disableConsoleOutput stays FALSE because serialmode has SERIALMODE_OUTPUT, so the UART mirror continues. A second server connection gets kIOReturnExclusiveAccess. On close, IOFramebuffer calls setPlatformConsole(0, kPEAcquireScreen) (console resume; Astra owns that owner-state patch)."
+  },
+  {
+   "id": "W5",
+   "severity": "minor",
+   "title": "PDGOPPresent is a virtio-only selector",
+   "fact": "PDGOPPresent calls selector 11 (kPDGPU_Present, virtio user client). On an IOGOP IOFramebufferUserClient, selector 11 is extSetGammaTable (expects 5 scalars), so the call fails argument validation (bad argument), with no gamma change. The wlroots IOGOP path does not call it; xf86-video-puredarwingop does (puredarwingop_drv.c:466). Gate it on the IOVirtIOGPU service class."
+  },
+  {
+   "id": "W6",
+   "severity": "dependency, not scanout",
+   "title": "input",
+   "fact": "The backend reads /dev/usb_hid_kbd and /dev/usb_hid_mouse (PDHIDEventQueue in IOHIDFamily). On M1 there is no internal-keyboard/trackpad driver in this tree; PDSerialHID ('listening for SOH lines on the serial console', attempt-006 log) is the only plausible source today. Not verified end-to-end."
+  },
+  {
+   "id": "W7",
+   "severity": "performance",
+   "title": "full-frame copies on one CPU",
+   "fact": "The copy path rewrites the whole 16 MB frame per commit by design (virtio drift note) on a single CPU (cpus=1) under the HV; plus pixman rendering of 2560x1600. Damage-limited copies for the IOGOP (non-virtio) case would cut this; not needed for correctness."
+  },
+  {
+   "id": "W8",
+   "severity": "config",
+   "title": "scale and physical size",
+   "fact": "There is no EDID or physical size and the boot framebuffer is 2x (retina); compositor config should set output scale 2. No real vblank: the 16 ms timer can tear."
+  }
+ ],
+ "no_gpu_claim": "Everything above is CPU/pixman rendering into the iBoot-initialized framebuffer that DCP already scans out. No AGX/GPU, display controller programming, mode set, vblank or hardware cursor is involved.",
+ "relation_to_display_010": "Root reports display-010 attempt-001 framebuffer readback (decoded buffer image, not a physical panel photo) contains the shell prompt and fresh nonce matching serial; that concerns the kernel console path (W3 applies to it), not this Wayland path.",
+ "not_claimed": [
+  "compile",
+  "run",
+  "physical panel output",
+  "colours on hardware",
+  "input works"
+ ],
+ "hardware_or_build_actions": "none",
+ "files_written": [
+  "reports/sprint-010/wayland-scanout-review.json"
+ ]
+}

@@ -1,0 +1,77 @@
+--- a/src/Frameworks/AppKit/NSEvent.subproj/NSEvent_mouse.h
++++ b/src/Frameworks/AppKit/NSEvent.subproj/NSEvent_mouse.h
+@@ -13,6 +13,8 @@
+     int _clickCount;
+     float _deltaX;
+     float _deltaY;
++    BOOL _sfPreciseScroll;
++    NSEventPhase _sfScrollPhase;
+     NSInteger _trackingNumber;
+     NSInteger _serial;
+     void *_userData;
+--- a/src/Frameworks/AppKit/NSEvent.subproj/NSEvent_mouse.m
++++ b/src/Frameworks/AppKit/NSEvent.subproj/NSEvent_mouse.m
+@@ -20,6 +20,14 @@
+         return self;
+ }
+ 
++// Private wire metadata is removed by NSApplication before modifierFlags reach clients.
++-(void)_sfSetPreciseScrolling:(BOOL)precise phase:(NSEventPhase)phase {
++    _sfPreciseScroll=(_type==NSScrollWheel)&&precise;
++    _sfScrollPhase=_sfPreciseScroll?phase:NSEventPhaseNone;
++}
++-(BOOL)hasPreciseScrollingDeltas {return _sfPreciseScroll;}
++-(NSEventPhase)phase {return _sfScrollPhase;}
++
+ - (NSInteger)clickCount {
+         return _clickCount;
+ }
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -32,6 +32,10 @@
+ #import <AppKit/NSMenu.h>
+ #import <AppKit/NSMenuItem.h>
+ #import <AppKit/NSEvent.h>
++@interface NSEvent(SFPreciseScrolling)
++-(void)_sfSetPreciseScrolling:(BOOL)precise phase:(NSEventPhase)phase;
++@end
++
+ #import <AppKit/NSModalSessionX.h>
+ #import <AppKit/NSNibLoading.h>
+ #import <AppKit/NSScreen.h>
+@@ -551,11 +555,16 @@
+                                 case NSScrollWheel: {
+                                     NSEvent *e = [NSEvent mouseEventWithType:NSScrollWheel
+                                                     location:NSMakePoint(me.x, me.y)
+-                                               modifierFlags:me.mods
++                                               modifierFlags:(me.mods&1u)?(me.mods&~7u):me.mods
+                                                       window:window
+                                                   clickCount:0
+                                                       deltaX:me.dx
+                                                       deltaY:me.dy];
++                                    if(me.mods&1u){
++                                        NSEventPhase phase=((me.mods&6u)==6u)?NSEventPhaseCancelled:((me.mods&4u)?NSEventPhaseEnded:((me.mods&2u)?NSEventPhaseBegan:NSEventPhaseChanged));
++                                        [e _sfSetPreciseScrolling:YES phase:phase];
++                                        if(getenv("SFFX_SCROLL_TRACE"))fprintf(stderr,"FXSCROLL precise=1 phase=%lu dx=%.6f dy=%.6f modifiers=%lu\n",(unsigned long)phase,(double)[e scrollingDeltaX],(double)[e scrollingDeltaY],(unsigned long)[e modifierFlags]);
++                                    }
+                                     [_display postEvent:e atStart:NO];
+                                     break;
+                                 }
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -3205,8 +3205,13 @@
+         NSRect visible=[documentView visibleRect];
+         float  direction=[documentView isFlipped]?-1:1;
+ 
+-        visible.origin.x+=[event deltaX]*[scrollView horizontalLineScroll]*3;
+-        visible.origin.y+=[event deltaY]*direction*[scrollView verticalLineScroll]*3;
++        if([event hasPreciseScrollingDeltas]){
++            visible.origin.x+=[event scrollingDeltaX];
++            visible.origin.y+=[event scrollingDeltaY]*direction;
++        }else{
++            visible.origin.x+=[event deltaX]*[scrollView horizontalLineScroll]*3;
++            visible.origin.y+=[event deltaY]*direction*[scrollView verticalLineScroll]*3;
++        }
+ 
+         // Something equivalent to this should be in scrollRectToVisible:
+         if(visible.origin.y<bounds.origin.y)

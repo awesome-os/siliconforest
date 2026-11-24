@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "author": "Claude (acting lead)",
+  "addends": "reports/sprint-010/shared-shell-return-attempt002-sigkill-exit-reason-analysis.json (original bytes unchanged)",
+  "status": "CORRECTION_CAUSE_STILL_NOT_ESTABLISHED",
+  "correction": "My original analysis called a code-signing page kill (cs_invalid_page with CS_KILL) the leading candidate. Grok's independent interpretation (reports/sprint-010/shared-shell-return-attempt002-exit-reason-interpretation.json) shows that path does not produce this record, and I verified it in pinned XNU. When cs_invalid_page reports cs_killed, vm_fault creates and installs OS_REASON_CODESIGNING / CODESIGNING_EXIT_REASON_INVALID_PAGE (osfmk/vm/vm_fault.c ~3105-3109). threadsignal(..., set_exitreason=TRUE) names its sender 'exc handler' (bsd/kern/kern_sig.c ~1815-1822). The attempt002 record (OS_REASON_SIGNAL, code 9, kcdata PID 14 and PROCNAME chonk-terminal-darwin) therefore excludes the code-signing page kill.",
+  "what_the_record_does_fit": "A psignal(SIGKILL) with a NULL reason executed while current_proc() was pid 14. That is either pid 14's own kill/killpg syscall targeting itself, or a kernel path on pid 14's own thread that calls psignal(p, SIGKILL) without a reason.",
+  "reasonless_SIGKILL_sites_reviewed_in_pinned_XNU": {
+    "plausible_in_victim_context": {
+      "self_kill_syscall": "kill(0 | 14 | -14, SIGKILL) from pid 14. No such call exists in app002 before pty-rx.bin creation, but libSystem and dyld initializers were not audited at binary level.",
+      "memorystatus_dirty_tracking": "kern_memorystatus.c ~3611-3616 and ~3721-3726: psignal(p, SIGKILL) when a dirty-state update finds the process marked for termination. These run in the caller's context if the process itself issues the memorystatus_control dirty call. Not shown to happen here.",
+      "process_policy_resource_terminate": "process_policy.c ~723-727: PROC_POLICY_RSRCACT_TERMINATE. Possible from resource-action callbacks; not expected 9 ms into a process's life."
+    },
+    "not_matching_this_record": {
+      "kern_exit.c ~2615-2620": "Kills traced children when their tracer exits (runs in the tracer's context).",
+      "kern_proc.c ~6712": "pid_resume memory-error path (runs in the resuming caller's context).",
+      "kern_memorystatus.c ~3877": "memorystatus_on_suspend (suspension path).",
+      "osfmk task_identity_token_try_sigkill": "A caller holding a task identity token (runs in that caller's context).",
+      "kern_guarded.c ~1304 vnguard": "Default policy flags have no SIGKILL, and no vnguard boot argument is set.",
+      "kern_proc.c ~3868/3896 csops MARKINVALID/MARKKILL": "Only in the caller's context. No userspace caller was found in the PureDarwin sources searched; not excluded at binary level."
+    }
+  },
+  "effect_on_candidate_003": "The revision006 serialized-launch test (B1) stays a valid behaviour test whatever the mechanism. Spawn-time CS flags (D2) remain a harmless live record. Grok notes cs_at_exit is expected to be ESRCH on this XNU.",
+  "not_claimed": ["the cause of the SIGKILL", "a fix"]
+}

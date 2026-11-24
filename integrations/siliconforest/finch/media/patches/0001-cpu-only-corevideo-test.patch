@@ -1,0 +1,38 @@
+Select original CPU checks; preserve color-space name ownership with available public APIs.
+--- a/userland/tests/corevideo-test.c
++++ b/userland/tests/corevideo-test.c
+@@ -24,6 +24,17 @@
+ extern CVReturn CVMetalBufferCacheCreateBufferFromImage(CFAllocatorRef, CVMetalBufferCacheRef, CVImageBufferRef, CVMetalBufferRef *);
+ 
+ /* A description with its pointers masked and the fill callbacks (pointers) left out. */
++
++/* Keep the comparison usable with PD's older public color-space name API. */
++static CFStringRef sf_copy_color_space_name(CGColorSpaceRef space)
++{
++    typedef CFStringRef (*CopyName)(CGColorSpaceRef);
++    CopyName copy = (CopyName)dlsym(RTLD_DEFAULT, "CGColorSpaceCopyName");
++    if (copy) return copy(space);
++    CFStringRef name = CGColorSpaceGetName(space);
++    return name ? CFRetain(name) : NULL;
++}
++
+ static void
+ show(const char *label, CFTypeRef x)
+ {
+@@ -391,7 +402,7 @@
+     for (size_t i = 0; i < sizeof pairs / sizeof pairs[0]; i++) {
+         CGColorSpaceRef cs = CVImageBufferCreateColorSpaceFromAttachments(
+             dict(2, kCVImageBufferColorPrimariesKey, pairs[i][0], kCVImageBufferTransferFunctionKey, pairs[i][1]));
+-        CFStringRef name = cs ? CGColorSpaceCopyName(cs) : NULL;
++        CFStringRef name = cs ? sf_copy_color_space_name(cs) : NULL;
+         char b[128] = "(none)";
+         if (name)
+             CFStringGetCString(name, b, sizeof b, kCFStringEncodingUTF8);
+@@ -495,6 +506,6 @@
+     descriptions();
+     four_char_codes();
+     colors();
+-    legacy_opengl();
++    /* CPU-only CLI comparison: do not create OpenGL contexts or Metal devices. */
+     return 0;
+ }

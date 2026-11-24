@@ -1,0 +1,427 @@
+--- a/linuxkpi/bsd/include/linux/dma-fence.h
++++ b/linuxkpi/bsd/include/linux/dma-fence.h
+@@ -39,9 +39,21 @@
+ 
+ struct dma_fence_ops;
+ 
++/*
++ * Linux 7.2 layout: the fence either borrows a lock (extern_lock, what
++ * dma_fence_init() callers passing a lock get) or uses the one embedded in it
++ * (inline_lock, DMA_FENCE_FLAG_INLINE_LOCK_BIT, when no lock is passed).
++ * `lock` is the pre-7.2 name of extern_lock and is kept as an alias so that
++ * code written against Linux 6.14 which reaches into its *own* fences keeps
++ * compiling; code that may see foreign fences must use dma_fence_spinlock().
++ */
+ struct dma_fence {
+-	spinlock_t *lock;
+-	const struct dma_fence_ops *ops;
++	union {
++		spinlock_t *extern_lock;
++		spinlock_t *lock;
++		spinlock_t inline_lock;
++	};
++	const struct dma_fence_ops __rcu *ops;
+ 	union {
+ 		struct list_head cb_list;
+ 		ktime_t timestamp;
+@@ -64,9 +76,11 @@
+ 	dma_fence_func_t func;
+ };
+ 
++/*
++ * As in Linux 7.2: no use_64bit_seqno (it is DMA_FENCE_FLAG_SEQNO64_BIT, set
++ * by dma_fence_init64()), no fence_value_str/timeline_value_str.
++ */
+ struct dma_fence_ops {
+-	bool use_64bit_seqno;
+-
+ 	const char * (*get_driver_name)(struct dma_fence *fence);
+ 	const char * (*get_timeline_name)(struct dma_fence *fence);
+ 	bool (*enable_signaling)(struct dma_fence *fence);
+@@ -74,13 +88,13 @@
+ 	signed long (*wait)(struct dma_fence *fence,
+ 			    bool intr, signed long timeout);
+ 	void (*release)(struct dma_fence *fence);
+-	void (*fence_value_str)(struct dma_fence *fence, char *str, int size);
+-	void (*timeline_value_str)(struct dma_fence *fence,
+-				   char *str, int size);
+ 	void (*set_deadline)(struct dma_fence *fence, ktime_t deadline);
+ };
+ 
+ enum dma_fence_flag_bits {
++	DMA_FENCE_FLAG_INITIALIZED_BIT,
++	DMA_FENCE_FLAG_INLINE_LOCK_BIT,
++	DMA_FENCE_FLAG_SEQNO64_BIT,
+ 	DMA_FENCE_FLAG_SIGNALED_BIT,
+ 	DMA_FENCE_FLAG_TIMESTAMP_BIT,
+ 	DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT,
+@@ -92,10 +106,22 @@
+ 
+ void dma_fence_init(struct dma_fence *fence, const struct dma_fence_ops *ops,
+     spinlock_t *lock, u64 context, u64 seqno);
++void dma_fence_init64(struct dma_fence *fence, const struct dma_fence_ops *ops,
++    spinlock_t *lock, u64 context, u64 seqno);
+ void dma_fence_release(struct kref *kref);
+ void dma_fence_free(struct dma_fence *fence);
+ void dma_fence_describe(struct dma_fence *fence, struct seq_file *seq);
++/*
++ * Linux 7.2 made the four dma_fence_signal*() functions return void and added
++ * dma_fence_check_and_signal*() for the callers that want to know.  They keep
++ * returning int here (0, or -EINVAL when the fence was signaled already) for
++ * the 6.14-level drivers in this tree; 7.2 callers ignore the value.
++ */
+ int dma_fence_signal(struct dma_fence *fence);
++bool dma_fence_check_and_signal(struct dma_fence *fence);
++bool dma_fence_check_and_signal_locked(struct dma_fence *fence);
++const char __rcu *dma_fence_driver_name(struct dma_fence *fence);
++const char __rcu *dma_fence_timeline_name(struct dma_fence *fence);
+ int dma_fence_signal_locked(struct dma_fence *fence);
+ int dma_fence_signal_timestamp(struct dma_fence *fence, ktime_t timestamp);
+ int dma_fence_signal_timestamp_locked(struct dma_fence *fence,
+@@ -122,8 +148,7 @@
+ struct dma_fence *dma_fence_get_rcu_safe(struct dma_fence __rcu **fencep);
+ bool dma_fence_is_signaled_locked(struct dma_fence *fence);
+ bool dma_fence_is_signaled(struct dma_fence *fence);
+-bool __dma_fence_is_later(uint64_t f1, uint64_t f2,
+-    const struct dma_fence_ops *ops);
++bool __dma_fence_is_later(struct dma_fence *fence, uint64_t f1, uint64_t f2);
+ bool dma_fence_is_later(struct dma_fence *f1, struct dma_fence *f2);
+ bool dma_fence_is_later_or_same(struct dma_fence *f1, struct dma_fence *f2);
+ struct dma_fence *dma_fence_later(struct dma_fence *f1, struct dma_fence *f2);
+@@ -139,6 +164,34 @@
+ 	return (dma_fence_is_array(fence) || dma_fence_is_chain(fence));
+ }
+ 
++static inline bool
++dma_fence_was_initialized(struct dma_fence *fence)
++{
++	return (fence != NULL &&
++	    test_bit(DMA_FENCE_FLAG_INITIALIZED_BIT, &fence->flags));
++}
++
++static inline bool
++dma_fence_test_signaled_flag(struct dma_fence *fence)
++{
++	return (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags));
++}
++
++/* the lock protecting the fence: the embedded one or the borrowed one */
++static inline spinlock_t *
++dma_fence_spinlock(struct dma_fence *fence)
++{
++	return (test_bit(DMA_FENCE_FLAG_INLINE_LOCK_BIT, &fence->flags) ?
++	    &fence->inline_lock : fence->extern_lock);
++}
++
++#define	dma_fence_lock_irqsave(fence, flags)	\
++	spin_lock_irqsave(dma_fence_spinlock(fence), flags)
++#define	dma_fence_unlock_irqrestore(fence, flags)	\
++	spin_unlock_irqrestore(dma_fence_spinlock(fence), flags)
++#define	dma_fence_assert_held(fence)	\
++	assert_spin_locked(dma_fence_spinlock(fence))
++
+ #define	dma_fence_begin_signalling() true
+ #define	dma_fence_end_signalling(cookie) do { (void)cookie; } while (0)
+ 
+--- a/drivers/dma-buf/dma-fence.c
++++ b/drivers/dma-buf/dma-fence.c
+@@ -135,9 +135,9 @@
+ 	if (fence == NULL)
+ 		return (-EINVAL);
+ 
+-	spin_lock(fence->lock);
++	spin_lock(dma_fence_spinlock(fence));
+ 	rv = dma_fence_signal_timestamp_locked(fence, timestamp);
+-	spin_unlock(fence->lock);
++	spin_unlock(dma_fence_spinlock(fence));
+ 	return (rv);
+ }
+ 
+@@ -161,9 +161,9 @@
+ 	if (fence == NULL)
+ 		return (-EINVAL);
+ 
+-	spin_lock(fence->lock);
++	spin_lock(dma_fence_spinlock(fence));
+ 	rv = dma_fence_signal_timestamp_locked(fence, ktime_get());
+-	spin_unlock(fence->lock);
++	spin_unlock(dma_fence_spinlock(fence));
+ 	return (rv);
+ }
+ 
+@@ -211,6 +211,13 @@
+ 	struct dma_fence *fence;
+ 
+ 	fence = container_of(kref, struct dma_fence, refcount);
++	/*
++	 * The embedded lock is a struct mtx here and owns kernel resources
++	 * once initialized; nothing may take it after the last reference is
++	 * gone, so it is torn down before the fence memory is released.
++	 */
++	if (test_bit(DMA_FENCE_FLAG_INLINE_LOCK_BIT, &fence->flags))
++		spin_lock_destroy(&fence->inline_lock);
+ 	if (fence->ops && fence->ops->release)
+ 		fence->ops->release(fence);
+ 	else
+@@ -235,7 +242,7 @@
+ {
+ 	bool was_enabled;
+ 
+-	spin_lock(fence->lock);
++	spin_lock(dma_fence_spinlock(fence));
+ 	was_enabled = test_and_set_bit(DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT,
+ 	    &fence->flags);
+ 	if (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags))
+@@ -246,7 +253,7 @@
+ 			dma_fence_signal_locked(fence);
+ 	}
+ out:
+-	spin_unlock(fence->lock);
++	spin_unlock(dma_fence_spinlock(fence));
+ }
+ 
+ /*
+@@ -267,7 +274,7 @@
+ 		return (-ENOENT);
+ 	}
+ 
+-	spin_lock(fence->lock);
++	spin_lock(dma_fence_spinlock(fence));
+ 	was_enabled = test_and_set_bit(DMA_FENCE_FLAG_ENABLE_SIGNAL_BIT,
+ 	    &fence->flags);
+ 
+@@ -286,7 +293,7 @@
+ 		list_add_tail(&cb->node, &fence->cb_list);
+ 	} else
+ 		INIT_LIST_HEAD(&cb->node);
+-	spin_unlock(fence->lock);
++	spin_unlock(dma_fence_spinlock(fence));
+ 
+ 	return (rv);
+ }
+@@ -299,9 +306,9 @@
+ {
+ 	int rv;
+ 
+-	spin_lock(fence->lock);
++	spin_lock(dma_fence_spinlock(fence));
+ 	rv = dma_fence_get_status_locked(fence);
+-	spin_unlock(fence->lock);
++	spin_unlock(dma_fence_spinlock(fence));
+ 	return (rv);
+ }
+ 
+@@ -313,11 +320,11 @@
+ {
+ 	int rv;
+ 
+-	spin_lock(fence->lock);
++	spin_lock(dma_fence_spinlock(fence));
+ 	rv = !list_empty(&cb->node);
+ 	if (rv)
+ 		list_del_init(&cb->node);
+-	spin_unlock(fence->lock);
++	spin_unlock(dma_fence_spinlock(fence));
+ 	return (rv);
+ }
+ 
+@@ -345,7 +352,7 @@
+ 	struct default_wait_cb cb;
+ 	signed long rv = timeout ? timeout : 1;
+ 
+-	spin_lock(fence->lock);
++	spin_lock(dma_fence_spinlock(fence));
+ 
+ 	if (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->flags))
+ 		goto out;
+@@ -364,11 +371,11 @@
+ 			__set_current_state(TASK_INTERRUPTIBLE);
+ 		else
+ 			__set_current_state(TASK_UNINTERRUPTIBLE);
+-		spin_unlock(fence->lock);
++		spin_unlock(dma_fence_spinlock(fence));
+ 
+ 		rv = schedule_timeout(rv);
+ 
+-		spin_lock(fence->lock);
++		spin_lock(dma_fence_spinlock(fence));
+ 		if (rv > 0 && intr && signal_pending(current))
+ 			rv = -ERESTARTSYS;
+ 	}
+@@ -377,7 +384,7 @@
+ 		list_del(&cb.base.node);
+ 	__set_current_state(TASK_RUNNING);
+ out:
+-	spin_unlock(fence->lock);
++	spin_unlock(dma_fence_spinlock(fence));
+ 	return (rv);
+ }
+ 
+@@ -475,21 +482,102 @@
+ /*
+  * Initialize a custom fence.
+  */
+-void
+-dma_fence_init(struct dma_fence *fence, const struct dma_fence_ops *ops,
+-    spinlock_t *lock, u64 context, u64 seqno)
++static void
++__dma_fence_init(struct dma_fence *fence, const struct dma_fence_ops *ops,
++    spinlock_t *lock, u64 context, u64 seqno, unsigned long flags)
+ {
+ 
+ 	kref_init(&fence->refcount);
+ 	INIT_LIST_HEAD(&fence->cb_list);
+-	fence->ops = ops;
+-	fence->lock = lock;
++	RCU_INIT_POINTER(fence->ops, ops);
+ 	fence->context = context;
+ 	fence->seqno = seqno;
+-	fence->flags = 0;
++	fence->flags = flags | BIT(DMA_FENCE_FLAG_INITIALIZED_BIT);
++	if (lock != NULL) {
++		fence->extern_lock = lock;
++	} else {
++		/* Linux 7.2: no lock given, use the one inside the fence */
++		memset(&fence->inline_lock, 0, sizeof(fence->inline_lock));
++		spin_lock_init(&fence->inline_lock);
++		fence->flags |= BIT(DMA_FENCE_FLAG_INLINE_LOCK_BIT);
++	}
+ 	fence->error = 0;
+ }
+ 
++void
++dma_fence_init(struct dma_fence *fence, const struct dma_fence_ops *ops,
++    spinlock_t *lock, u64 context, u64 seqno)
++{
++
++	__dma_fence_init(fence, ops, lock, context, seqno, 0UL);
++}
++
++/*
++ * Initialize a custom fence whose seqno is compared as 64 bit
++ * (Linux 7.2; replaces dma_fence_ops.use_64bit_seqno).
++ */
++void
++dma_fence_init64(struct dma_fence *fence, const struct dma_fence_ops *ops,
++    spinlock_t *lock, u64 context, u64 seqno)
++{
++
++	__dma_fence_init(fence, ops, lock, context, seqno,
++	    BIT(DMA_FENCE_FLAG_SEQNO64_BIT));
++}
++
++/*
++ * Driver and timeline name (Linux 7.2).  Linux detaches fence->ops once a
++ * fence without release/wait callbacks is signaled and reports a fixed name
++ * from then on; this implementation never detaches the ops (6.14-level code in
++ * this tree dereferences fence->ops of signaled fences), but reports the same
++ * fixed names so that 7.2 callers see the 7.2 strings.
++ */
++const char __rcu *
++dma_fence_driver_name(struct dma_fence *fence)
++{
++	const struct dma_fence_ops *ops;
++
++	ops = rcu_dereference(fence->ops);
++	if (!dma_fence_test_signaled_flag(fence) && ops != NULL)
++		return ((const char __rcu *)ops->get_driver_name(fence));
++	return ((const char __rcu *)"detached-driver");
++}
++
++const char __rcu *
++dma_fence_timeline_name(struct dma_fence *fence)
++{
++	const struct dma_fence_ops *ops;
++
++	ops = rcu_dereference(fence->ops);
++	if (!dma_fence_test_signaled_flag(fence) && ops != NULL)
++		return ((const char __rcu *)ops->get_timeline_name(fence));
++	return ((const char __rcu *)"signaled-timeline");
++}
++
++/*
++ * Signal the fence; true if it was signaled already (Linux 7.2).
++ */
++bool
++dma_fence_check_and_signal_locked(struct dma_fence *fence)
++{
++	bool was;
++
++	was = dma_fence_test_signaled_flag(fence);
++	dma_fence_signal_locked(fence);
++	return (was);
++}
++
++bool
++dma_fence_check_and_signal(struct dma_fence *fence)
++{
++	bool was;
++
++	spin_lock(dma_fence_spinlock(fence));
++	was = dma_fence_check_and_signal_locked(fence);
++	spin_unlock(dma_fence_spinlock(fence));
++	return (was);
++}
++
+ /*
+  * decreases refcount of the fence
+  */
+@@ -590,10 +678,10 @@
+  * return if f1 is chronologically later than f2
+  */
+ bool
+-__dma_fence_is_later(u64 f1, u64 f2, const struct dma_fence_ops *ops)
++__dma_fence_is_later(struct dma_fence *fence, u64 f1, u64 f2)
+ {
+ 
+-	if (ops->use_64bit_seqno)
++	if (test_bit(DMA_FENCE_FLAG_SEQNO64_BIT, &fence->flags))
+ 		return (f1 > f2);
+ 
+ 	return (int)(lower_32_bits(f1) - lower_32_bits(f2)) > 0;
+@@ -610,7 +698,7 @@
+ 	if (WARN_ON(f1->context != f2->context))
+ 		return (false);
+ 
+-	return (__dma_fence_is_later(f1->seqno, f2->seqno, f1->ops));
++	return (__dma_fence_is_later(f1, f1->seqno, f2->seqno));
+ }
+ 
+ bool
+@@ -643,7 +731,7 @@
+ dma_fence_get_status_locked(struct dma_fence *fence)
+ {
+ 
+-	assert_spin_locked(fence->lock);
++	dma_fence_assert_held(fence);
+ 	if (dma_fence_is_signaled_locked(fence))
+ 		return (fence->error ?: 1);
+ 	else
+--- a/drivers/dma-buf/dma-fence-chain.c
++++ b/drivers/dma-buf/dma-fence-chain.c
+@@ -149,7 +149,6 @@
+ }
+ 
+ const struct dma_fence_ops dma_fence_chain_ops = {
+-	.use_64bit_seqno = true,
+ 	.get_driver_name = dma_fence_chain_get_driver_name,
+ 	.get_timeline_name = dma_fence_chain_get_timeline_name,
+ 	.enable_signaling = dma_fence_chain_enable_signaling,
+@@ -178,7 +177,7 @@
+ 	rcu_assign_pointer(chain->prev, prev);
+ 	prev_chain = to_dma_fence_chain(prev);
+ 	if (prev_chain != NULL &&
+-	    __dma_fence_is_later(seqno, prev->seqno, prev->ops)) {
++	    __dma_fence_is_later(prev, seqno, prev->seqno)) {
+ 		chain->prev_seqno = prev->seqno;
+ 		context = prev->context;
+ 	} else {
+@@ -187,7 +186,7 @@
+ 		context = dma_fence_context_alloc(1);
+ 	}
+ 
+-	dma_fence_init(&chain->base, &dma_fence_chain_ops,
++	dma_fence_init64(&chain->base, &dma_fence_chain_ops,
+ 	    &chain->lock, context, seqno);
+ }
+ 

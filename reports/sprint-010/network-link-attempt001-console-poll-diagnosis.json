@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "prepared_utc": "2026-11-09T00:12:54.628641+00:00",
+  "status": "SOURCE_VERIFIED_CONSOLE_POLL_MISMATCH_RUNTIME_PATTERN_CONSISTENT",
+  "reviewer": "Codex /root/native_terminal",
+  "reported_runtime_input_from_root": "Attempt001 deadline, frames_out1/frames_in0/packets0 and no captured READY/TX; recovery verified Linux. Raw capture was not independently inspected here.",
+  "diagnosis": "Pinned ARM console supports d_select readiness but its major lacks the kqueue opt-in required by poll. The poll-created filter fails registration and maps to POLLNVAL; guest ignores that console result and waits solely for POLLOUT before its first write. Both queued READY and encoded OPEN can therefore remain unwritten until deadline. frames_out1 is a queue fact, not an actual transmitted frame.",
+  "evidence": [
+    {
+      "path": "integrations/puredarwin/m1-network-link/guest/net_link.c",
+      "line": 419,
+      "sha256": "5335db785360d6e0a445e08e81ed3f28ae460d1173b0070b334d58a94494e69d",
+      "fact": "READY and OPEN are queued; frames_out counts encoded/queued frames. Actual stdout writes require POLLOUT at477; console POLLNVAL is ignored."
+    },
+    {
+      "path": "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/kern/sys_generic.c",
+      "line": 1747,
+      "sha256": "4d50d6beb87bd71b9dc669e9154c8250f1394ec6806f716fa1caac1f9e4c1fc6",
+      "fact": "poll registers EV_POLL kqueue read/write filters; registration error maps to POLLNVAL at1791. No NOTE_LOWAT/data1 supplied."
+    },
+    {
+      "path": "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/vfs/vfs_vnops.c",
+      "line": 2003,
+      "sha256": "d45d4bf1d4e1e8079e1fb6c7275eb73e211833619c0b3f08ed3d637dc3d3e05a",
+      "fact": "vn_kqfilter routes character-device read/write filters through spec_kqfilter."
+    },
+    {
+      "path": "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/miscfs/specfs/spec_vnops.c",
+      "line": 968,
+      "sha256": "ab793e5aa1a332e8f10731b6d628eb76d2c4606fc86c7cb936571da043aac2f2",
+      "fact": "spec_kqfilter reads per-major CDEVSW_SELECT_KQUEUE; unflagged console uses EVFILTID_SPEC."
+    },
+    {
+      "path": "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/miscfs/specfs/spec_vnops.c",
+      "line": 3174,
+      "sha256": "ab793e5aa1a332e8f10731b6d628eb76d2c4606fc86c7cb936571da043aac2f2",
+      "fact": "filt_specattach rejects unflagged devices without explicit NOTE_LOWAT and data1, setting EINVAL."
+    },
+    {
+      "path": "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/dev/arm64/conf.c",
+      "line": 173,
+      "sha256": "c00c75c45463af2c6d2468a089b7cbea0fbb7f353061453bebb0c7bce26ad51d",
+      "fact": "console major0 uses cnselect; default km major12 uses ttselect. cdevsw_flags global array is zero initialized at224."
+    },
+    {
+      "path": "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/dev/arm/cons.c",
+      "line": 187,
+      "sha256": "9aa68a6defa10abf15807d7d91aeb2ce0c5366f06ac52bb974730ffa737099a4",
+      "fact": "cnselect delegates to the active constty device or km_tty[0], separately from cnwrite at128."
+    },
+    {
+      "path": "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/dev/arm/km.c",
+      "line": 180,
+      "sha256": "336ecfa5fca1ae98bb007800ab966a503b03b5ae2f9878485b4bf4856c92943c",
+      "fact": "kmwrite calls line-discipline l_write; kmstart/kmoutput drain console output."
+    },
+    {
+      "path": "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/kern/tty.c",
+      "line": 1642,
+      "sha256": "de57a5a52aa5dba2e484eb65a53fbc1ef70c567589490066e134b325a7145d35",
+      "fact": "ttyselect FWRITE returns a positive available count when queue<=lowat and TS_CONNECTED; read uses ttnread and selrecord."
+    },
+    {
+      "path": "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/kern/sys_generic.c",
+      "line": 1578,
+      "sha256": "4d50d6beb87bd71b9dc669e9154c8250f1394ec6806f716fa1caac1f9e4c1fc6",
+      "fact": "select selscan uses FREAD/FWRITE and calls fo_select at1654; it does not require vnode kqueue attach."
+    },
+    {
+      "path": "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/vfs/vfs_vnops.c",
+      "line": 1852,
+      "sha256": "d45d4bf1d4e1e8079e1fb6c7275eb73e211833619c0b3f08ed3d637dc3d3e05a",
+      "fact": "vn_select calls VNOP_SELECT; spec_select at spec_vnops920 calls actual cdev d_select."
+    },
+    {
+      "path": "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/kern/sys_socket.c",
+      "line": 297,
+      "sha256": "32423bf6b4cef5bd6b260023279052a74478a28eb2ce28ff484047b30a3c2cbc",
+      "fact": "soo_select implements socket soreadable/sowriteable and readiness wait registration."
+    },
+    {
+      "path": "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/vfs/vfs_vnops.c",
+      "line": 1334,
+      "sha256": "d45d4bf1d4e1e8079e1fb6c7275eb73e211833619c0b3f08ed3d637dc3d3e05a",
+      "fact": "vnode write maps FNONBLOCK to IO_NDELAY before device write; independent of poll registration."
+    }
+  ],
+  "registration_search": "Pinned XNU cdevsw_setkqueueok call sites found for oslog7/8 and PTY drivers, none console0/km12; cdevsw_flags0 is not explicitly initialized or set in inspected pinned XNU. No claim about a newly observed runtime flag/readiness value.",
+  "narrow_correction": "New isolated revision only: use select() for the same five endpoints, rebuild fd_sets and20ms timeval each iteration, guard every active FD against FD_SETSIZE, preserve queue/partial-write/EOF/SO_ERROR/deadline/cleanup logic. Do not assume POLLOUT from device write capability or replace it with speculative reads. No kernel/m1n1 change is needed for this source correction.",
+  "revision002_adapter_spot_check": {
+    "path": "integrations/puredarwin/m1-network-link/revisions/002/net_link.c",
+    "sha256": "6a302988aef3fb4ab4eea1d778599e3ed842c73e075182253e0e31d0b9a42ed9",
+    "function_line": 379,
+    "status": "NO_ADAPTER_ISSUE_FOUND_IN_SHORT_READ",
+    "facts": [
+      "Clears revents and rebuilds sets per call; skipsnegative/inactiveFDs.",
+      "Checks FD_SETSIZE before FD_SET; computesmaxFD+1 and freshly resets20ms timeval.",
+      "Maps read/write/exception readiness toexistinghandlers and propagateserrors/EINTR.",
+      "Console takes cdev d_select path; socket EOF remains read-ready and nonblockingconnect checks SO_ERROR."
+    ],
+    "limits": "No adapter tests or SDK build performed by this reviewer; root owns those and later packet/runtime gates."
+  },
+  "not_claimed": [
+    "Runtime POLLNVAL directly captured",
+    "Only possible cause established from all target state",
+    "Successful corrected target execution",
+    "Source edits, SDK build, SSH/hardware/boot/reset or GPU activity"
+  ]
+}

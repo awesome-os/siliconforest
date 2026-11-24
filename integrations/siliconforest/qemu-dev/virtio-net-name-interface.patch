@@ -1,0 +1,64 @@
+SiliconForest QEMU loop: name the virtio-net interface (en0) without configd.
+
+The minimal root has no InterfaceNamer, so the interface is attached and never named. As the
+lab Wi-Fi driver (m1-bwfm/SFBwfm.cpp) does, ask IONetworkStack to register every interface,
+from a short-lived kernel thread, until the interface has a BSD name (60 s at most).
+
+--- a/src/Kernel/Extensions/IOVirtIONet/IOVirtIONet.cpp	2026-11-11 21:43:17.951778219 -0800
++++ b/src/Kernel/Extensions/IOVirtIONet/IOVirtIONet.cpp	2026-11-11 21:43:17.960608587 -0800
+@@ -12,6 +12,40 @@
+ #include <IOKit/network/IONetworkMedium.h>
+ #include <IOKit/network/IOOutputQueue.h>
+ #include <libkern/OSByteOrder.h>
++#include <kern/thread.h>
++
++// There is no configd/InterfaceNamer in a minimal root, so nothing ever names this interface
++// (no en0). Ask IONetworkStack to name every published interface, which is what
++// IORegisterNetworkInterface does from userspace (as the lab's SFBwfm driver does).
++static void sf_virtio_net_name_thread(void *arg, wait_result_t)
++{
++    IOService *interface = (IOService *)arg;
++
++    for (int i = 0; i < 120; i++) {
++        OSObject *bsd = interface->copyProperty("BSD Name");
++        if (OSDynamicCast(OSString, bsd) != NULL) {
++            IOLog("IOVirtIONet: interface is %s\n", ((OSString *)bsd)->getCStringNoCopy());
++            bsd->release();
++            break;
++        }
++        OSSafeReleaseNULL(bsd);
++        OSDictionary *match = IOService::serviceMatching("IONetworkStack");
++        IOService *stack = match ? IOService::copyMatchingService(match) : NULL;
++        OSDictionary *cmd = OSDictionary::withCapacity(1);
++        OSNumber *all = OSNumber::withNumber((unsigned long long)2 /* kIONetworkStackRegisterInterfaceAll */, 32);
++        if (stack && cmd && all) {
++            cmd->setObject("IONetworkStackUserCommand", all);
++            stack->setProperties(cmd);
++        }
++        OSSafeReleaseNULL(all);
++        OSSafeReleaseNULL(cmd);
++        OSSafeReleaseNULL(stack);
++        OSSafeReleaseNULL(match);
++        IOSleep(500);
++    }
++    interface->release();
++    thread_terminate(current_thread());
++}
+ 
+ #define super IOEthernetController
+ OSDefineMetaClassAndStructors(IOVirtIONet, IOEthernetController);
+@@ -173,6 +207,14 @@
+     setLinkStatus(kIONetworkLinkValid | kIONetworkLinkActive, getCurrentMedium());
+ 
+     registerService();
++    if (fInterface) {
++        thread_t namer;
++        ((IOService *)fInterface)->retain();
++        if (kernel_thread_start(sf_virtio_net_name_thread, fInterface, &namer) == KERN_SUCCESS)
++            thread_deallocate(namer);
++        else
++            ((IOService *)fInterface)->release();
++    }
+     return true;
+ }
+ 

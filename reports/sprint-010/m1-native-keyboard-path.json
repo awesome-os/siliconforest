@@ -1,0 +1,131 @@
+{
+  "status": "SOURCE_AND_CAPTURED_TOPOLOGY_REVIEW_NATIVE_DARWIN_KEYBOARD_NOT_VERIFIED",
+  "scope": "Astra source-only investigation; no SSH, device access, register reads/writes or boot performed",
+  "reference_commit": "6a08a08e57558083f552733a5276d71b1a4d8ff6",
+  "reference_receipt": "reports/sprint-010/native-keyboard-source-acquisition.json",
+  "reference_verification": "All six local files independently match receipt SHA256 and Git blob identifiers",
+  "evidence": {
+    "original_adt": {
+      "path": "runs/m1-display-010/attempt-002/guest/original-adt.bin",
+      "sha256": "cc573a454eded057d6ebc3ab68abb552c4ab4eee2d8cf7aa150f57a2ec989dc1",
+      "bytes": 377476,
+      "nodes": 295
+    },
+    "linux_dtb": {
+      "container": "artifacts/m1-unattended-008/recovery/original-boot.bin",
+      "container_sha256": "54fa07e4f5cbeecd90e67e335657c40b33c25aede7015a84afb1427333b4f923",
+      "offset": "0x7f5c55",
+      "bytes": 78723,
+      "sha256": "fe1daa92035a6f03b1a389ccf5cc2dce3a7d01db2df0a36f8063a1126b87a0c3"
+    },
+    "linux_sysfs": "Root separately observed spi0.0 bound to spi-hid-apple-of and Apple SPI Keyboard 001C:05AC:0341.0001; no event node opened. This is Linux evidence, not Darwin enumeration.",
+    "linux_live_dt": "runs/m1-display-010/native-keyboard-linux-dt.json",
+    "linux_live_providers": "runs/m1-display-010/native-keyboard-linux-dt-providers.json",
+    "kc": {
+      "path": "/nix/store/azjjlc74x62gyaynx5ssn82qkhyrg999-puredarwin-kc-arm64-0.1/kernel",
+      "sha256": "7335c418494241a7c805d61172dcb690115dd61b6b57e833f883cdd6856f5c06",
+      "fileset_members": 50,
+      "status": "BUILT_NOT_BOOTED"
+    }
+  },
+  "selected_path": {
+    "board": "ADT target-type J293, compatible J293AP/MacBookPro17,1/AppleARM; arm-io,t8103",
+    "controller": "/arm-io/spi3 compatible spi-1,spimc, physical 0x23510c000 length 0x4000, AIC IRQ 617, clock-gate 52, clock-id 379",
+    "device": "/arm-io/spi3/ipd compatible hid-transport,spi; bootloader-type HIDDevice; keyboard and trackpad share this transport",
+    "gpio": "main GPIO 0x23c100000 pins 46..49 function 1; enable pin 195 GPIO output; nub GPIO 0x23d1f0000 pin 13 active-low input",
+    "timing": "Linux J293 DT: 120 MHz parent, 8 MHz SPI, mode 0, CS setup/hold 65 us, inactive 250 us",
+    "phandles": "ADT GPIO 0x77, nub GPIO 0x79, AIC 0x70. Linux phandles are different and must never be copied into the guest ADT.",
+    "power": [
+      {
+        "id": 33,
+        "name": "SIO_BUSIF",
+        "address": "0x23b7001c0",
+        "parents": []
+      },
+      {
+        "id": 34,
+        "name": "SIO",
+        "address": "0x23b7001c8",
+        "parents": [
+          33
+        ]
+      },
+      {
+        "id": 44,
+        "name": "SPI_P",
+        "address": "0x23b700218",
+        "parents": [
+          34
+        ]
+      },
+      {
+        "id": 52,
+        "name": "SPI3",
+        "address": "0x23b700258",
+        "parents": [
+          34,
+          44
+        ]
+      },
+      {
+        "id": 15,
+        "name": "GPIO",
+        "address": "0x23b700130",
+        "parents": []
+      },
+      {
+        "id": 147,
+        "name": "NUB_GPIO",
+        "address": "0x23d280080",
+        "parents": [],
+        "linux_always_on": true
+      }
+    ],
+    "exclusions": "spi0 is Touch Bar, spi2 is fingerprint, spi1 is firmware/NVRAM, spi4 is display; none are keyboard targets. No MTP node. m1n1 trace_keyboard.py explicitly targets 2021 models and its GPIO numbers are inapplicable."
+  },
+  "blockers": [
+    {
+      "finding": "Actual KC contains no Apple SPI, Apple GPIO IRQ-domain or SPI HID driver/personality",
+      "evidence": "50 fileset entries and 62 __PRELINK_INFO personalities inspected; no hid-transport,spi / spi-1,spimc / gpio,t8101 match"
+    },
+    {
+      "finding": "Apple arm-io descendants are not published by current generic platform bus walker",
+      "evidence": "sources/puredarwin-m1-desktop/src/Kernel/Extensions/PDArmPlatformExpert/PDArmPlatformExpert.cpp:172-177,201-214; xnu/iokit/Kernel/IOPlatformExpert.cpp:1752-1757",
+      "action": "A board-gated IOResources adapter may resolve exact gIODTPlane paths directly; do not assume an existing SPI provider"
+    },
+    {
+      "finding": "Current PDAppleBootCPUPMGR is CPU idle policy, not device-domain control",
+      "action": "Resolve and validate PMGR devices/ps-regs against the observed SPI3 and GPIO parent chain before MMIO; never reset or power down shared SIO parents"
+    },
+    {
+      "finding": "IOHID enumeration alone cannot produce input",
+      "action": "Read real SPI HID boot response, device/interface metadata and HID descriptor; publish an IOHIDDevice and submit only validated device-1 input reports"
+    }
+  ],
+  "console_route": {
+    "finding": "NO_KERNEL_HID does not suppress this tree's custom PDHID keyboard-to-console path",
+    "evidence": [
+      "xnu/config/MASTER.arm64.t8103:55 selects no_kernel_hid; xnu/iokit/Kernel/IOPMrootDomain.cpp:333 uses it for display-wrangler presence",
+      "IOHIDFamily/IOHIDFamily/IOHIDEventService.cpp:1794 calls PDHIDPushKeyboardEvent for keyboard usages without NO_KERNEL_HID guard",
+      "IOHIDFamily/IOHIDSystem/PDHIDEventQueue.cpp:388,454,477,538 queues actual key events and calls cons_cinput outside the queue lock",
+      "xnu/bsd/dev/arm/km.c:397-408 routes cons_cinput through tty line discipline",
+      "Actual KC symbol tables contain pd_hid_console_key, pd_hid_console_work, PDHIDPushKeyboardEvent and cons_cinput"
+    ],
+    "ownership": "Opening /dev/usb_hid_kbd grabs the queue and suppresses text-console feed; inventory must only stat it. Its historical usb name and serial virtual HID activity do not prove physical keyboard input.",
+    "recommendation": "Preserve NO_KERNEL_HID and the serial recovery path; implement missing physical transport rather than removing unrelated compile guards."
+  },
+  "implementation_contract": {
+    "owned": "integrations/puredarwin/m1-keyboard excluding root-owned inventory/ and Grok-owned protocol/",
+    "first_transport": "Serialized, bounded FIFO PIO; no SIO DMA, DART mappings, firmware uploads or quarantine changes. Poll active-low ready GPIO from a workloop timer; no fabricated GPIO interrupt success.",
+    "writes": "Board/property/range checks precede mapping/writes. Verify SIO_BUSIF/SIO and always-on NUB_GPIO; activate ordinary SPI_P/GPIO/SPI3 domains if needed, without releasing reset/disable and without power-down. BUSY bounded at 100 us; each RMW uses a fresh sample. GPIO RMW preserves unrelated bits and refuses every locked pin. Reset enable 1/0/1 with 5/5/50 ms from pinned Linux driver. Controller hardware IRQ mode with IE registers zero.",
+    "transactions": "One 256-byte RX packet, or 256-byte TX then 200 us then four-byte write status under one CS assertion; setup/hold/inactive delays preserved. A single transaction deadline bounds all FIFO waits. Invalid levels, underrun/overflow, incomplete bytes, status/CRC failure are failures.",
+    "lifetime": "One serialized owner; stop controller, disable local IRQ enables and deassert CS on failure. Never unmap while a workloop callback can run. Do not power down shared PMGR parents during cleanup.",
+    "protocol_handoff": "Native adapter selects root-owned native_protocol/dl_spi_hid.c. Grok protocol/ is an independent comparison implementation. Both are untouched by Astra."
+  },
+  "next_steps": [
+    "Root rebuilds the final SDK kext after the OSData ownership fix and compares its snapshot to adapter-source-validation.json.",
+    "Independent native IOHID/workloop and metadata review, then root KC inclusion/opt-in packet validation.",
+    "On the next root-authorized keyboard candidate, read-only inventory must not grab queues; distinguish descriptor publication and the one-time successful IOHID input log from actual physical typing and visible console response."
+  ],
+  "implementation_status": "BOARD_PIO_NATIVE_IOHID_SOURCE_IMPLEMENTED_HOST_TESTED_FINAL_SDK_BUILD_PENDING"
+}

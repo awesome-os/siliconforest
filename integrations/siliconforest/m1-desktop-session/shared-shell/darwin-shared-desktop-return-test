@@ -1,0 +1,81 @@
+#!/bin/sh
+# Finite real shared Shell, two explicitly requested managed terminals.
+# Closed lifecycle and PTY descriptor observations; no input injection or prompt.
+set -eu
+[ "$#" -eq 1 ] || exit 2
+nonce=$1
+case "$nonce" in ''|*[!0-9a-f]*) exit 2 ;; esac
+[ "${#nonce}" -eq 48 ] || exit 2
+prefix=${nonce%????}
+[ "${#prefix}" -eq 44 ] || exit 2
+app1=0001${prefix}
+app2=0002${prefix}
+runtime=/private/var/run/darwin-shared-desktop
+records=$runtime/session-$nonce
+mkdir -p "$runtime"
+chmod 0700 "$runtime"
+mkdir -m 0700 "$records"
+export XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=wayland-0
+export XKB_CONFIG_ROOT=/usr/share/X11/xkb TMPDIR=/private/tmp
+desktop=
+cleanup() {
+    trap - EXIT HUP INT TERM
+    # The finite native entry owns every app and its shutdown. Do not signal
+    # cached shell PIDs after an early reap. The independent host deadline
+    # and mandatory Linux recovery remain external requirements.
+    if [ -n "$desktop" ]; then wait "$desktop" 2>/dev/null || :; fi
+}
+trap cleanup EXIT
+trap 'exit 143' HUP INT TERM
+printf '\nDL23_DESKTOP_BEGIN_%s source=explicit_startup requested_terminals=2 physical_input_proven=false\n' "$nonce"
+enum_rc=0
+if /usr/bin/darwin-trackpad-enum --nonce "$nonce"; then :; else enum_rc=$?; fi
+printf 'DL23_DESKTOP_ENUM_%s rc=%s\n' "$nonce" "$enum_rc"
+case "$enum_rc" in 0) ;; 77) exit 77 ;; *) exit 1 ;; esac
+count=0
+while [ ! -c /dev/usb_hid_kbd ] || [ ! -c /dev/usb_hid_mouse ]; do
+    count=$((count + 1))
+    [ "$count" -le 100 ] || break
+    sleep 0.1
+done
+printf 'DL23_DESKTOP_ENDPOINT_WAIT_%s missing_checks=%s max_sleeps=100\n' "$nonce" "$count"
+gate_rc=0
+if /usr/bin/darwin-native-input-inventory --nonce "$nonce"; then :; else gate_rc=$?; fi
+printf 'DL23_DESKTOP_IDENTITY_%s rc=%s\n' "$nonce" "$gate_rc"
+case "$gate_rc" in 0) ;; 77) exit 77 ;; *) exit 1 ;; esac
+/usr/bin/chonkstep-darwin-desktop --run --socket "$runtime/wayland-0" --records "$records" --session "$nonce" --terminal /usr/bin/chonk-terminal-darwin --seconds 60 --font-regular /usr/share/darwin-desktop/DejaVuSans.ttf --font-bold /usr/share/darwin-desktop/DejaVuSans-Bold.ttf --input pdhid --startup-terminals 2 &
+desktop=$!
+printf 'DL23_DESKTOP_PID_%s pid=%s\n' "$nonce" "$desktop"
+# The finite native entry owns cleanup. Preserve its actual executable exit;
+# an inner successful seal alone cannot certify signal restoration.
+desktop_rc=0
+if wait "$desktop"; then :; else desktop_rc=$?; fi
+desktop=
+
+# Export on the failure path too: a dead app must not erase its diagnostics.
+# Wrappers delimit exact blocks for strict per-kind/per-instance decoders.
+failed=0
+printf 'DL23_SESSION_EXPORT_BEGIN_%s phase=closed\n' "$nonce"
+rc=0
+if /usr/bin/darwin-desktop-records --directory "$records" --nonce "$nonce" --kind session --phase closed; then :; else rc=$?; fi
+printf 'DL23_SESSION_EXPORT_END_%s rc=%s\n' "$nonce" "$rc"
+[ "$rc" -eq 0 ] || failed=1
+for instance in "$app1" "$app2"; do
+    printf 'DL23_APP_EXPORT_BEGIN_%s instance=%s phase=closed\n' "$nonce" "$instance"
+    terminal_rc=0
+    if /usr/bin/darwin-terminal-records --directory "$records/$instance" --nonce "$instance" --phase closed; then :; else terminal_rc=$?; fi
+    printf 'DL23_APP_TERMINAL_EXPORT_END_%s instance=%s rc=%s\n' "$nonce" "$instance" "$terminal_rc"
+    logs_rc=0
+    if /usr/bin/darwin-desktop-records --directory "$records/$instance" --nonce "$instance" --kind application --phase closed; then :; else logs_rc=$?; fi
+    printf 'DL23_APP_EXPORT_END_%s instance=%s terminal=%s logs=%s\n' "$nonce" "$instance" "$terminal_rc" "$logs_rc"
+    [ "$terminal_rc" -eq 0 ] && [ "$logs_rc" -eq 0 ] || failed=1
+done
+printf 'DL23_DESKTOP_CLOSED_EXPORT_%s failed=%s physical_input_proven=false\n' "$nonce" "$failed"
+printf 'DL23_DESKTOP_FINAL_STATUS_%s desktop=%s export_failed=%s\n' "$nonce" "$desktop_rc" "$failed"
+[ "$desktop_rc" -eq 0 ] && [ "$failed" -eq 0 ] || exit 1
+printf '\nCHONKSTEP SHARED SHELL MANAGED SESSION RETURNED\n'
+printf 'DL23_DESKTOP_RETURN_%s\n' "$nonce"
+/bin/uname -s
+/bin/uname -m
+/bin/uname -r
+printf 'DL23_DESKTOP_END_%s physical_input_proven=false\n' "$nonce"

@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_PATCH_REVIEW_NO_HARDWARE_NOT_APPLIED",
+  "patch": "integrations/puredarwin/m1-bringup/terminal-host-revision/001/terminal-host.patch, sha256 22567e1ed580ae5a",
+  "files": {
+    "host_progress.py": "78c25815 -> b260bff9",
+    "tools/m1_bringup_cycle.py": "1a6d716c -> cce9803f",
+    "test_host_progress.py": "bdc4d699 -> 8c8f058a",
+    "tests/test_m1_bringup_cycle.py": "978f1b7f -> 7afd7ea7",
+    "pinned_unchanged": "terminal_input_progress.py 2b8901e7, virtual_input_progress.py 689a8fb0"
+  },
+  "verdict": "APPROVE the patch for application ONLY after the real Darwin PTY smoke PASSes, as the manifest requires. The active host and controller remain 78c25815/1a6d716c until then.",
+  "verified": [
+    "Bindings: the live files equal the manifest 'before' hashes and the before/ copies. My own replay of the patch onto scratch copies of the four files yields exactly the four 'after' hashes, which also match the after/ copies.",
+    "Tests re-run on a scratch overlay with the patch applied: test_host_progress 41/41, test_terminal_input_progress 11/11, test_virtual_input_progress 18/18, tests.test_m1_bringup_cycle 20/20 (90 total), matching the validation logs.",
+    "Host: TERMINAL_INPUT_SHA is enforced at import. ConsoleSession requires boolean flags and makes terminal_input exclusive (desktop and not keyboard and not virtual_input). TerminalInput reuses the same advance_virtual path with the H1/H2 semantics: an observation failure cancels and the reader continues, while a write/ledger failure raises. Results go to terminal-input-result.json; console-result adds terminal_input_enabled.",
+    "terminal_input_enabled: the build record is parsed with object_pairs_hook=image.unique, so duplicate keys are refused. The experiment must equal {version 1, origin host_pdserialhid, command split_nonce_uname_v1, output [2560,1600]} with exact types. The presence of virtual_input_experiment or keyboard_experiment, even null, refuses. It requires the desktop opt-in, a hash-bound ramdisk, PDSerialHID and IOHIDFamily members, and no PDM1SPIHID. virtual_input_enabled and keyboard_enabled gain presence-conflict checks. The geometry gate (2560/1600/10240/30, integer types) is factored out and covers both input modes, still before the guest runs.",
+    "Controller: TERMINAL_HELPER_SHA is checked in verify() before reboot or serial open and recorded in verified-inputs. Both input helpers are re-hashed immediately before their per-attempt source snapshot is saved, which closes a check-to-snapshot window.",
+    "Cross-component strings match exactly: the terminal app prints 'DL11_TERMINAL_READY <n> origin=host_pdserialhid pty=ready keymap=xkb_v1 focus=own_surface frame=ready' and 'DL11_TERMINAL_RESPONSE <n> origin=pty_shell system=Darwin machine=arm64 release=25.5.0', which equal TerminalInput.READY/RESPONSE. Its error prefix 'darwin-wayland-terminal:' equals the helper's failure prefix. The helper's command output ('\\nDLT_<joined>\\n' then the uname lines) matches the app's CR-stripped response gate."
+  ],
+  "packet_notes": [
+    "Timing: typing is 242 reports at about 100 ms each (read-timeout ticks), so about 24 s plus response. The terminal --seconds (at most 120, with a 20 s readiness deadline from app start) and the host runtime must cover compositor start (IOFB about 120 s after boot), readiness and typing. Choose these in the packet and review them there.",
+    "The guest launcher must print DL11_TERMINAL_PRIME_<nonce> before starting the compositor, as in the qualified input run, and must launch the reviewed terminal binary. Both are packet-review items.",
+    "Evidence: terminal-input-result.json plus the console TX ledger (exact 16-byte-class reports), the terminal-records export (digest-checked), the paused-framebuffer pixels of the rendered grid and Linux recovery. A live capture cannot claim cleanup (K2, revision 2)."
+  ],
+  "not_claimed": ["application of the patch", "terminal runtime", "typing", "physical keyboard"],
+  "scope": "Read-only review. Patch replay and tests ran only in scratch copies; no live file changed and no hardware was used."
+}

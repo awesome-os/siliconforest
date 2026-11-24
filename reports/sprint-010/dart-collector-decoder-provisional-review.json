@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "reviewer": "Astra",
+  "status": "PROVISIONAL_CHANGES_REQUESTED_FINAL_COLLECTOR_FREEZE_PENDING",
+  "scope": "Source and host-only review. Production files untouched; SDK/build/runtime qualification remains root-owned. Findings bind only the recorded snapshots; collector tests/docs were still being finished during review.",
+  "snapshot_sha256": {
+    "integrations/puredarwin/m1-dart-survey/collector-native/dart_collector.c": "2b844182dd5551b5a662144f39e45f04c564573150e404aca506590d1d9a6b2e",
+    "integrations/puredarwin/m1-dart-survey/collector-native/dart_collector.h": "871468cd70b7d016bb8e52ea450e1848cc6c585201abbf78b30a3e57ffde05fc",
+    "integrations/puredarwin/m1-dart-survey/collector-native/collector_main.c": "d9eddabba1702f50f2ee492d399fa39d1d6286566209a80657a2546eccab986b",
+    "integrations/puredarwin/m1-dart-survey/collector-native/test_collector.c": "41977434f02ee679617195b7ec43a5805ab2004cba66dd6cc99555d2540853c1",
+    "integrations/puredarwin/m1-dart-survey/collector-native/test_collector.py": "3ef952041bb1a13f857d3184dbae33f914f499a9736589908649f0c2ded7580c",
+    "integrations/puredarwin/m1-dart-survey/decode_observation.py": "6079dfdf38ba77d0c6517b46d914616c0cf9ab05a29c5a1e40746e953aab07be",
+    "integrations/puredarwin/m1-dart-survey/test_decode_observation.py": "0f3823408703cef3175fcf87539225396cd16a06b7a92767cc0dd81e386068b3"
+  },
+  "decoder_freeze": "reports/sprint-010/dart-survey-decoder-source-001.json: both hashes match current files.",
+  "findings": [
+    {
+      "id": "C1",
+      "severity": "required_before_collector_approval",
+      "title": "C collector can emit SAMPLED for an impossible successful final guard",
+      "evidence": [
+        "collector-native/dart_collector.c:73-77 checks counts/profile but not final power/clocks.",
+        "collector-native/test_collector.c:188-189 explicitly expects success with power[0]=0 and clocks[0]=0xdeadbeef.",
+        "survey.c:28-44,79: a successful result completed all nine final guard reads; each final saved field necessarily passed.",
+        "decode_observation.py:38-41 already enforces these final guards."
+      ],
+      "reproduction": "Host-compiled actual dlc_validate accepted three otherwise valid success records with power[0]=0, PHY=0x8f (reset asserted), or PORT_STATUS=0. It returned 0 with result0 in each case; the frozen Python decoder rejected all three.",
+      "minimal_fix": "For result==DLS_SAMPLED, apply the same final power/clock predicates as survey.c and the Python decoder. Replace the success-corruption acceptance test with rejection tests for each of four power and five clock slots. Keep partial failure fields noncoherent: do not require all their stale/unread values to pass.",
+      "impact": "False collector success/exit0, though the current downstream decoder catches it. Not evidence of a hardware fault."
+    },
+    {
+      "id": "R1",
+      "severity": "required_for_claimed_exact_source_prefix_validation",
+      "title": "Both validators accept impossible refusal causes",
+      "evidence": [
+        "dart_collector.c:78-98 and decode_observation.py:42-54 check failure positions but do not require the latest NOT_READY guard value to fail; DLS_LIMIT has no cause check.",
+        "survey.c:31-43 returns NOT_READY immediately on the current saved field failure.",
+        "survey.h:DLS_MAX_READS=1024; normal exhaustive survey takes889 reads, so a zero-read DLS_LIMIT is not reachable from this frozen implementation."
+      ],
+      "reproduction": [
+        "version1,count0,reads1,regionPMGR,offset0x1b8,resultNOT_READY,power[0]=0xff is accepted by both validators, despite this freshly read guard passing.",
+        "version1,count0,reads0,regionNONE,offset0,resultLIMIT with all other bytes zero is accepted by both and classified REFUSED."
+      ],
+      "minimal_fix": "Validate the freshly read failing guard only for NOT_READY; do not impose coherence on earlier/unread fields. Reject impossible LIMIT records as malformed under this source version, or encode an explicitly source-derived reachable limit predicate. Also retain successful-prefix profile checks so a later stop cannot follow an already-failing page-shift/lock/stream check.",
+      "impact": "Malformed bytes can be mislabeled a genuine sampler refusal, but cannot become SAMPLED through these cases. Raw records should still be preserved with a malformed verdict."
+    },
+    {
+      "id": "D1",
+      "severity": "nonblocking_transport_strictness_recommendation",
+      "title": "Decoder accepts verdict-before-record ordering",
+      "evidence": [
+        "decode_observation.py:75-103 does not forbid new records after verdict or require provider completion before verdict."
+      ],
+      "reproduction": "Moved the existing valid SAMPLED verdict line before its provider BEGIN/HEX/END block; decode() still returned SAMPLED.",
+      "minimal_fix": "Require provider record first, optional instance second, verdict last, with no subsequent receipt records. Add reordered provider/instance/verdict and post-verdict record tests.",
+      "impact": "Nonce, exact bytes and digest are still checked; this is ordering hardening, not a demonstrated missing-data success."
+    }
+  ],
+  "verified_source_properties": {
+    "mig_header": {
+      "path": "/nix/store/iy73f9hyr3hcq2n1yhmbsyx2pkmblw09-puredarwin-tiny-iokit-mig-header-0.1/include/device_user.h",
+      "sha256": "2315eb7aaa9395eab01777f8bf5b22b6c1ae653492300d9ffa8fd18b8f413795",
+      "from_path_arity": 3,
+      "property_bytes_arity": 4,
+      "wire_buffer_bytes": 4096,
+      "library_archive_sha256": "c099fba1a5376cffd8d907e82aff4d6ee077764ac4eb144c45288da5948e6491"
+    },
+    "actual_kernel_semantics": "device.defs:198-217; IOUserClient.cpp:3432-3461 returns success plus null for absent path. Property getter:3708-3776 copies raw OSData bytes, missing property returns kIOReturnNoResources, insufficient capacity returns IPCError, successful copy returns actual byte count. It is not CF serialization or an IOConnect call.",
+    "main_wrapper": "collector_main.c uses PDIOKitLib.h plus the generated device_user.h; exactly one IOMasterPort attempt, one provider lookup/read and at most one optional instance lookup/read. No retry loop, iterator enumeration, IOServiceOpen, IOConnect, memory mapping, register access or registry mutation.",
+    "missing_and_mig": "Missing provider entry/property emits MISSING, MIG error emits MIG_ERROR, both exit1 without instance read. Decoder rejects every COPY line and missing/truncated provider data; no missing/MIG input is promoted to REFUSED or SAMPLED.",
+    "optional_instance": "No entry is allowed; if present, missing/error/malformed/different bytes disqualify. Equal instance bytes are compared byte-for-byte with provider. Provider survives kernel start refusal by the reviewed OSData copy on IOResources.",
+    "bounds": "CLI strict lowercase48 nonce; each raw read capped4096; valid V1 exactly764. Raw records chunk64 (last60), sequence indices and SHA256. Decoder caps console32MiB and receipt lines35, requires12 indexed chunks and byte digest, unique known keys, summary/raw agreement and initialization_proven=false. A malformed raw record is retained by collector but rejected by decoder.",
+    "cleanup": "Entry send right released immediately after every attempted property RPC including errors. No OOL allocation. IOMasterPort returned right remains until this finite process exits; kernel task cleanup reclaims it. Explicit release on main exit would improve ownership hygiene but is not a persistent leak/blocker here. Library IOMasterPort itself also obtains mach_host_self; its process-bounded behavior predates this collector.",
+    "output_failure": "fflush/ferror causes exit1 even after attempted verdict emission. A complete-looking raw transcript does not replace checking actual process completion/host evidence.",
+    "scope": "SAMPLED means a bounded noncoherent register observation, not initialized DART, a usable IOMapper, safe DMA, a mapping or device function."
+  },
+  "checks": {
+    "python_frozen_decoder": {
+      "command": "python3 -B integrations/puredarwin/m1-dart-survey/test_decode_observation.py -v",
+      "tests": 6,
+      "exit_code": 0
+    },
+    "collector_host_runner": {
+      "command": "python3 -B integrations/puredarwin/m1-dart-survey/collector-native/test_collector.py",
+      "exit_code": 0,
+      "groups": 6,
+      "real_sampler_fake_mmio_snapshots": 1698,
+      "compiled_mutants_killed": 8,
+      "ndebug_guard_negative": true,
+      "sanitizers": "ASan+UBSan; detect_leaks=0 per existing ptrace limitation",
+      "note": "Owner changed one test mutation while finishing tests; this is provisional run evidence, not final immutable freeze evidence."
+    },
+    "independent_counterexamples": "Compiled unchanged actual collector core as a temporary host shared library; compared its validator with frozen Python decoder. No SDK compiler, target executable or hardware used."
+  },
+  "final_approval_gate": [
+    "Claude freezes collector source/tests/docs with receipt and source-set hash.",
+    "Resolve C1 and exact-refusal model findings; root owns any decoder changes and new decoder freeze.",
+    "Recheck the final file hashes and focused tests, including collector-output to frozen-decoder roundtrip.",
+    "Root separately qualifies SDK linkage, delivered packet and any actual MIG/property collection."
+  ],
+  "not_performed": [
+    "No production edits, source-tree mutation, fetch or SDK/Nix build.",
+    "No hardware, SSH, IOConnect, MMIO, reset, DMA or device writes.",
+    "No delegation, outbound IPC or goal API."
+  ]
+}

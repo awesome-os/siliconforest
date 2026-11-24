@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SOURCE_REVIEW_NO_HARDWARE",
+  "reviewed_frozen_bytes": {
+    "integrations/puredarwin/m1-bringup/host_progress.py": "e3ffc5b33f1f3351855e7f8747abde050f23aca28e80931c0c2014e7cbe23709",
+    "tools/m1_bringup_cycle.py": "73db05cb2f85bc565875b6018c355641894f6bd0df597e5bacb77283fa256698",
+    "integrations/puredarwin/m1-bringup/virtual_input_progress.py": "8749b364bc8da21e7805eaff0fcefc86be66ff6ec81316f2901ac70f13825741",
+    "integrations/puredarwin/chonkstep-darwin/darwin-desktop-input-test": "f473208c924a9a62",
+    "diff_base": "Per-attempt snapshots from attempt-002: host a8d61ebe, controller 1464eced"
+  },
+  "verdict": "APPROVE for a future input packet, with one recommended change before the first input boot (H1). Payloads are fixed constants; guest lines only open barriers; every step is bounded, paced and single-use, with no retry. The same reader thread owns all writes, with a durable TX ledger written before each write. Close stops input. The controller pins and snapshots the helper; recovery is unchanged. Tests re-run here: helper 17/17, host 31/31, controller 18/18 (python3 -B -m unittest).",
+  "verified": [
+    "Helper payloads: keyboard() allows only all-release, Shift (mods 2) and A (usage 4, mods 0), always 7 values. pointer() allows only integer points inside 2560x1600 with buttons 0/1 and q = round-half-up((p+0.5)*32767/(extent-1)). Content point (201,124) gives q (2580,2551). With linear kernel scaling that lands at client-local about (200.49,100.49), inside the client's +/-1 window.",
+    "Barriers: PRIME (exact line) -> 5 priming lines -> await_ready; READY (exact text) -> A down/up; KEY pressed only after an A action was sent, released only after both were sent -> pointer move; POINTER_ENTER regex plus +/-1 check -> press/release; OBSERVED (exact) -> 6 fixed drag points -> complete. Any out-of-phase barrier, malformed or contradictory motion, or 'darwin-wayland-client-input:' line fails the schedule. Coordinates are validated, never taken from the guest. Deadlines: 30 s from PRIME and 10 s from READY, both below the client's 15 s observation window. Limits: at most 24 actions and 1024 bytes (16 actions, about 290 bytes, used), with at least 150 ms between sends.",
+    "Host: virtual_input_enabled requires the exact {version 1, origin host_pdserialhid, output [2560,1600], client [800,480], content_origin [1,24]} with integer types, plus the desktop opt-in and no keyboard opt-in. The KC must contain PDSerialHID and IOHIDFamily and must not contain PDM1SPIHID; pdm1kbd=1 stays off. BOOTARGS includes serial=3, which serial_keyboard_poll requires. The geometry gate (2560,1600,10240,30) runs after configure_display_console and before ConsoleSession/ProgressCapture, i.e. before the guest runs. The helper hash is enforced both at import and by the controller.",
+    "Ownership: advance_virtual is called only from the reader thread, on every read including empty reads (100 ms timeout), so pacing ticks without console traffic. It starts only after the fixed desktop command is sent and stops once finish is set. send() checks finish, writes and fsyncs the ledger before dev.write, requires a full write, and keeps the 16384-byte transmit cap. A failed or short final write raises, sets error and fails the schedule. Nothing is resent.",
+    "Close: finish.set -> join(3) -> require the worker has stopped -> cancel -> write virtual-input-result.json (origin label, actions, error, schedule_completed, physical claims false). This runs inside ProgressCapture.stop while the guest is paused, before diagnostics and the framebuffer read.",
+    "Controller: INPUT_HELPER_SHA is checked in verify() before reboot or any serial open; the helper is recorded in verified-inputs and snapshotted per attempt; the recovery path is unchanged. host_progress remains bound by the operator-supplied --launcher-sha256, as before.",
+    "Guest script f473208c: PRIME, then stat-only polling ([ -c ], no open or grab) for both nodes for up to 5 s (fails with NODES_MISSING), then 0.5 s of pacing, then the compositor exactly '--run --socket PATH --input pdhid', socket wait, the input client with --seconds 120, sleep 100 and kill -0. Teardown, END marker and no-exit-status semantics are the same as the qualified SSD script."
+  ],
+  "findings": [
+    {"id": "H1", "severity": "medium, evidence loss; recommended before the first input boot", "where": "host_progress.py advance_virtual / read", "text": "Every helper failure, including observation-side ones (input deadline, out-of-phase barrier, client error line), raises inside the reader. That ends console capture and draining for the rest of the run. The most likely first-run failures (W1 click not replayed, W3 no focus) then lose exactly the console tail needed to diagnose them: the client's error and the script's later lines. Suggest: on virtual.error, cancel injection and record the failure, keep reading, and raise only for write or ledger failures. Failing closed is preserved either way, because virtual-input-result.json records the error and no further bytes are sent."},
+    {"id": "H2", "severity": "low", "where": "virtual_input_progress.py:63-66", "text": "The 8192-byte check runs on 'unterminated tail + new chunk' before complete lines are split off. With 4096-byte reads it can only trip when a single console line longer than about 4 KB is in progress. The input script prints none, but kernel output is not under this code's control. Checking the remaining tail after splitting would match the stated intent ('unterminated/oversized line')."},
+    {"id": "H3", "severity": "note", "text": "A send that passes the finish check just before finish.set can complete afterwards. It is bounded by write_timeout 2 s, less than join 3 s, and is at most one line of 18 bytes or fewer, sent while the guest is paused in stop(). The guest never resumes before reset, so it cannot be delivered."},
+    {"id": "H4", "severity": "note", "text": "The last priming line (m 16385 16384 0) may arrive after the compositor's open-time drain. It moves the pointer to about (1280,800), outside the 802x513 frame. A stray Shift release with no press is ignored by the hid.rs decoder (keys.remove false). Neither can create a client observation."}
+  ],
+  "runtime_unknowns": [
+    "Whether PDSerialHID publishes both /dev/usb_hid_kbd and /dev/usb_hid_mouse within 5 s of the priming lines on this boot (lazy node publication has not been exercised over the M1 VUART).",
+    "Kernel absolute scaling and calibration from 0..32767 to the 0..65535 queue (IOHIDEventDriver calibration, any inherited AbsoluteAxisBoundsRemovalPercentage). The +/-1 px expectation assumes linear scaling.",
+    "Whether staged XKB data under /usr/share/X11/xkb lets the compositor build its keymap and seat; whether it focuses the new window and sends modifiers (W3); whether wm-core replays the content click (W1).",
+    "Whether a stopped or slow host reader can back-pressure guest console output through m1n1's VUART (relevant only to H1).",
+    "Whether the titlebar drag produces the expected (+200,+160) displacement: no client observation exists for it, so pixels must decide."
+  ],
+  "not_claimed": ["any input delivery", "physical keyboard or trackpad", "runtime"],
+  "scope": "Read-only source review plus local unit tests (no bytecode written). No hardware, SSH, builds or fetches."
+}

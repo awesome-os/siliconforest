@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "prepared_utc": "2026-11-09T01:28:27.719015+00:00",
+  "status": "SOURCE_DESIGN_ONLY_PRIVATE_ALLOCATION_FEASIBLE_GPU_PUBLICATION_BLOCKED",
+  "scope": "Original bounded design for a future private UAT allocation/validation adapter; no implementation or runtime claim.",
+  "constraints": {
+    "gpu_observer_boot_hold_preserved": true,
+    "hardware_ssh_boot_firmware_mmio_table_writes_performed": false,
+    "frozen_codec_modified": false,
+    "only_created_path": "reports/sprint-010/gpu-uat-adapter-design-001.json"
+  },
+  "provenance": {
+    "puredarwin_checkout": "sources/puredarwin-m1-bringup",
+    "pin": "e7aa00a60f0b56ef35aa24252e81467787bf71ea",
+    "selected_files": {
+      "src/Kernel/xnu/iokit/IOKit/IOBufferMemoryDescriptor.h": {
+        "sha256": "737c9b410709bf3a5ffb38ddc7000aeb8b908bb2581f98c3c90d7bacd19c1f18",
+        "matches_pinned_git_object": true
+      },
+      "src/Kernel/xnu/iokit/Kernel/IOBufferMemoryDescriptor.cpp": {
+        "sha256": "3167094ab5e0d9dbbc7fb4ad822f2fa4f71873870c9f601f5eb0bba0be301208",
+        "matches_pinned_git_object": true
+      },
+      "src/Kernel/xnu/iokit/Kernel/IOLib.cpp": {
+        "sha256": "188701b94397490aa64230b85011df9f761486d4aa888f18745afa3d1c082a70",
+        "matches_pinned_git_object": true
+      },
+      "src/Kernel/xnu/iokit/IOKit/IOMemoryDescriptor.h": {
+        "sha256": "f55ae31c85a90790731b943898a8ad8bf7123c96604b3b12a8f055d519f3189e",
+        "matches_pinned_git_object": true
+      },
+      "src/Kernel/xnu/iokit/Kernel/IOMemoryDescriptor.cpp": {
+        "sha256": "a83a0a152e67068765fde6d26462924ae7a2be6b8adea91ca45d5f3c2934ec71",
+        "matches_pinned_git_object": true
+      },
+      "src/Kernel/xnu/libkern/libkern/c++/OSPtr.h": {
+        "sha256": "bf9909387748721dd796a0466bf5b58c72fea51b77a32c7bcbec50be31764d3b",
+        "matches_pinned_git_object": true
+      },
+      "src/Kernel/xnu/config/IOKit.arm64.exports": {
+        "sha256": "dd975a53772382e446c4ea886fa2b1d29ed325f93f769fb240aa6d4d73b1b054",
+        "matches_pinned_git_object": true
+      },
+      "src/Kernel/xnu/config/IOKit.exports": {
+        "sha256": "cf3362f2bab09a5df2ced2db4758923c871664c135ef3e8930e4d9aabb356fe1",
+        "matches_pinned_git_object": true
+      },
+      "src/Kernel/xnu/config/Mach.exports": {
+        "sha256": "25848d1a4f1380ca69177f36035b0c7aa7d346e9a3c3f64aba53507fd4c8a981",
+        "matches_pinned_git_object": true
+      },
+      "src/Kernel/xnu/config/Libkern.exports": {
+        "sha256": "966e11651c8739635dd818eae22ad24054a2aedf5d466e6eac8ac224b1e92297",
+        "matches_pinned_git_object": true
+      }
+    },
+    "frozen_codec": {
+      "path": "integrations/puredarwin/m1-gpu-uat-codec",
+      "source_set_sha256": "b174c6022d2d5bf5425dabe77c4b229578ae0fa5c0cb9ea47ee980ed40dde835",
+      "receipt_sha256": "4fe56bbac0a6b493006e87b107a7fb848275b91a4018263c8d26c691a2b042cb",
+      "all_receipt_source_files_reverified": true
+    },
+    "t8103_fact": {
+      "path": "sources/linux-aurora-gpu-reference/drivers/gpu/drm/asahi/hw/t8103.rs",
+      "sha256": "e789d336377c8f07ae1d3473b419061d858aa0a53f2f2f9b6396433d7a76a9c6",
+      "acquisition_pin": "6a08a08e57558083f552733a5276d71b1a4d8ff6",
+      "lines": "11-17",
+      "fact": "G13; uat_ias=39; uat_oas=40",
+      "matches_prior_acquisition_receipt": true,
+      "new_full_git_object_verification": false,
+      "implementation_copied": false
+    }
+  },
+  "source_findings": [
+    {
+      "at": "iokit/IOKit/IOBufferMemoryDescriptor.h:248-269; iokit/Kernel/IOBufferMemoryDescriptor.cpp:243-355,564-578",
+      "finding": "Public inTaskWithPhysicalMask returns an owned descriptor. It may block or fail. MapperNone bypasses the system mapper; otherwise highestMask may constrain a mapped address instead of host physical memory."
+    },
+    {
+      "at": "iokit/Kernel/IOBufferMemoryDescriptor.cpp:248-257; iokit/Kernel/IOLib.cpp:708-805",
+      "finding": "Mask 0x0000000fffffc000 derives 16384-byte alignment and highestMask 0x0000000fffffffff. The private allocator selects zeroed VM allocations and physical restrictions. The adapter uses the public factory, never the private allocator or raw pmap APIs; actual returned PA still requires checking."
+    },
+    {
+      "at": "iokit/IOKit/IOMemoryDescriptor.h:425-440,752-764; iokit/Kernel/IOMemoryDescriptor.cpp:3636-3745,5024-5140",
+      "finding": "getPhysicalSegment must request MapperNone. prepare/complete require caller serialization and successful-call pairing. complete can panic if DMA references remain when the final wire count is removed. These APIs do not establish GPU quiescence."
+    },
+    {
+      "at": "iokit/Kernel/IOBufferMemoryDescriptor.cpp:318-323,735-790; libkern/libkern/c++/OSPtr.h:34-47,107",
+      "finding": "Nonpageable buffer initialization adds AutoPrepare internally. Balance only the adapter explicit successful prepare, then release its owner reference; do not manually drain wire counts. OSPtr may be raw or shared depending on build flags; establish exact ownership syntax in the pinned SDK build."
+    }
+  ],
+  "kpi_coverage": {
+    "source_exports_present": {
+      "config/IOKit.arm64.exports:176": "__ZN24IOBufferMemoryDescriptor22inTaskWithPhysicalMaskEP4taskjyy",
+      "config/IOKit.arm64.exports:184": "__ZN25IOGeneralMemoryDescriptor18getPhysicalSegmentEyPyj",
+      "config/IOKit.arm64.exports:187": "__ZN25IOGeneralMemoryDescriptor7prepareEj",
+      "config/IOKit.arm64.exports:188": "__ZN25IOGeneralMemoryDescriptor8completeEj",
+      "config/IOKit.exports:1252": "__ZN24IOBufferMemoryDescriptor14getBytesNoCopyEv",
+      "config/IOKit.exports:1739": "__ZNK18IOMemoryDescriptor9getLengthEv",
+      "config/IOKit.exports:1772": "__ZNK24IOBufferMemoryDescriptor11getCapacityEv",
+      "config/Libkern.exports:594,596": "OSObject retain/release",
+      "config/Libkern.exports:815": "_page_size",
+      "config/Mach.exports:22": "_kernel_task",
+      "config/IOKit.exports:50,51,54,58": "IOLock allocation/free/lock/unlock, if later serialization needs a mutex"
+    },
+    "expected_dependencies": [
+      "com.apple.kpi.iokit",
+      "com.apple.kpi.libkern",
+      "com.apple.kpi.mach"
+    ],
+    "limit": "Selected source declarations and export lists only. No new adapter SDK compilation, exact import table, KC resolution or target execution exists."
+  },
+  "proposed_private_contract": {
+    "initial_bounds": "At most 16 separately allocated table pages (262144 payload bytes), fitting the frozen codec 16-range bound without coalescing gaps. No mapped data pages in the first allocation-only slice. Metadata and immutable snapshots have separate explicit bounds; no large kernel-stack snapshots.",
+    "allocation": "Require runtime page_size==16384. Allocate exactly 16384 bytes in kernel_task with kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMemoryMapperNone and physicalMask=0x0000000fffffc000. No pageable, purgeable, user-shared or cache-override options. Calls run in a serialized context permitting sleep; allocation latency is not hard bounded by these APIs.",
+    "admission": [
+      "Require nonnull descriptor and kernel bytes, getLength()==getCapacity()==16384, and aligned kernel VA.",
+      "Call prepare(kIODirectionInOut) once; record ownership of that successful call only.",
+      "Query getPhysicalSegment(0,&length,kIOMemoryMapperNone); require nonzero PA, 16K alignment and segment length covering the full descriptor.",
+      "Use uint64_t and require PA <= (1ULL<<36)-16384 before computing the exclusive end. Reject overlap/duplicate PA against every live owned page, including quarantined records.",
+      "The 36-bit limit is conservative policy, not a claim that T8103 UAT has only 36 physical address bits. The frozen codec numeric field allows 48 bits; the acquired T8103 configuration records 40 output bits."
+    ],
+    "ownership": "Fixed slot plus nonreused generation token identifies each descriptor, CPU VA, PA, size, type and prepare state. Never accept a caller PA/range as ownership proof. No imported firmware/user tables, external descriptors, adopted TTBRs or inherited mappings. Refuse stale tokens, wrong owner, slot exhaustion and generation wrap. Keep raw pointer/PA access internal.",
+    "states": [
+      "EMPTY -> ALLOCATED_PRIVATE -> PREPARED_PRIVATE -> VALIDATED_PRIVATE",
+      "Validation failure retains a private owned object until explicit cleanup; it never becomes usable.",
+      "Before any exposure: call complete once for the owned successful prepare, then release the owned reference. If complete fails, quarantine without repeating completion or releasing storage.",
+      "Unknown or actual exposure forbids reclamation/reuse. A future publication path must establish hardware quiescence before release; absent that proof retain allocation and owner/module lifetime until reboot. This design provides no publication entry point."
+    ],
+    "validation_separation": "Under the same serialization boundary, take bounded immutable CPU snapshots of owned private pages. Build codec table ranges exclusively from live allocation records; require node PA, snapshot bytes, level and generation to correspond to those records. Roots remain detached CPU metadata. L1 passes only its eight entries while ownership covers its full 16K page. No data leaf is admitted in the first slice. A future data allocator must independently prove every full leaf range and disjoint ownership. Run the unchanged codec for format/graph validation, then recheck generations before accepting the private snapshot. Validation neither installs a mapping nor proves permissions/cache coherency.",
+    "cleanup": "Reject new operations after shutdown starts; no asynchronous callbacks in this initial slice. Complete/release every safely private allocation once, retain failed or potentially exposed allocations, report sticky failure and outstanding counts. Do not unload code retaining quarantined state. No automatic retry or substitute allocation with weaker constraints."
+  },
+  "blockers_before_implementation_or_use": [
+    {
+      "stage": "Private allocation-only implementation",
+      "remaining": "No missing factory/export was found in the inspected source. Still require a new separately reviewed source leaf, exact pinned SDK compile/import audit, ownership tests and allocation-failure handling. A bounded object count is not a guaranteed kernel allocation deadline."
+    },
+    {
+      "stage": "Any UAT publication or actual GPU mapping",
+      "remaining": "No established context/ASID ownership, GPU-visible physical-address contract, table permissions/cache-attribute policy, cache maintenance and CPU-to-GPU ordering sequence, translation invalidation/acknowledgement, firmware handshake, or reset/quiescence teardown contract. Generic prepare/complete and codec validation do not supply these. Do not implement a publication backend from this report."
+    },
+    {
+      "stage": "Any target validation",
+      "remaining": "Explicit GPU observer boot HOLD remains. This report grants no runtime, MMIO, firmware, table-write, boot or hardware authorization."
+    }
+  ],
+  "future_meaningful_tests": [
+    "Mocked allocator faults at every ownership transition, explicit prepare/complete call counts, repeated cleanup and quarantine preservation.",
+    "Zero/misaligned/duplicate PA, short segment, last valid 36-bit page and first invalid page, capacity/page-size mismatch, table slot/generation overflow and stale token rejection.",
+    "Owned-record versus supplied-range mismatch, invalid graph, mutable snapshot/generation mismatch, data leaf refusal and proof that no validation outcome invokes publication.",
+    "Pinned SDK compile and exact undefined-import/KPI audit; host tests alone remain insufficient for allocator or DMA runtime claims."
+  ],
+  "validation_this_report": "Reverified ten selected XNU files against exact pinned Git objects; reverified every frozen codec source receipt entry and selected T8103 acquired-file hash; checked mask arithmetic. No tests or binaries were represented as new runtime evidence."
+}

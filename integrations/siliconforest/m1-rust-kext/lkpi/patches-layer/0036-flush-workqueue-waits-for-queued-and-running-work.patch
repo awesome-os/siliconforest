@@ -1,0 +1,70 @@
+taskqueue: flush_workqueue()/drain_workqueue() wait for the queued and the running work
+
+Audit finding W1 (critical). taskqueue_drain_all() queued its barrier with priority
+USHRT_MAX (255 in the 8-bit field) while linux work has priority 0, so the barrier was
+inserted at the head: the flush returned after the item then running, with everything
+queued still to run. apple_rtkit_reinit() and the display driver's endpoint flush free
+what that work uses right after the flush. On queues with several threads an idle thread
+ran the barrier at once, so not even work running on another cpu was waited for. The
+barrier now goes to the tail, and the flush also waits for the items that were running
+when it began (not the caller's own item, if the flush is called from work on that
+queue). taskqueue_drain()'s wait loop sleeps 50 us per round instead of spinning
+on the queue lock (snooze(0) returns at once).
+
+--- a/src/Kernel/fbsdkpi/haiku/freebsd_network/taskqueue.c
++++ b/src/Kernel/fbsdkpi/haiku/freebsd_network/taskqueue.c
+@@ -138,7 +138,9 @@
+ 	TQ_LOCK(taskQueue);
+ 	while (task->ta_pending != 0 || task_is_running(taskQueue, task)) {
+ 		TQ_UNLOCK(taskQueue);
+-		snooze(0);
++		// snooze(0) does not sleep here: the waiter spun on the queue lock against the
++		// worker that needs it to finish
++		snooze(50);
+ 		TQ_LOCK(taskQueue);
+ 	}
+ 	TQ_UNLOCK(taskQueue);
+@@ -155,9 +157,41 @@
+ 		return;
+ 	}
+ 
+-	TASK_INIT(&t_barrier, USHRT_MAX, taskqueue_task_nop_fn, &t_barrier);
++	// What was running on the queue's other threads when the flush began: the barrier
++	// below only orders this caller behind what is queued, and on a queue with several
++	// threads an idle one runs it at once.
++	struct task *running[16];
++	int nrunning = 0;
++	struct taskqueue_busy *tb;
++
++	TQ_LOCK(taskQueue);
++	TAILQ_FOREACH(tb, &taskQueue->tq_active, tb_link) {
++		if (tb->tb_running != NULL && tb->tb_running != TB_DRAIN_WAITER
++				// not the caller's own work (its busy record is on this stack):
++				// work that flushes its own queue must not wait for itself
++				&& (uintptr_t)tb - (uintptr_t)&nrunning >= 16384
++				&& nrunning < (int)(sizeof(running) / sizeof(running[0])))
++			running[nrunning++] = tb->tb_running;
++	}
++	TQ_UNLOCK(taskQueue);
++
++	// The barrier goes behind everything already queued. Its priority was USHRT_MAX, which
++	// is 255 in the 8-bit ta_priority, and linux work has priority 0: the barrier went to
++	// the head, and flush_workqueue()/drain_workqueue() returned with the queued work
++	// still to run (the caller then freed what that work uses).
++	TASK_INIT(&t_barrier, 0, taskqueue_task_nop_fn, &t_barrier);
+ 	taskqueue_enqueue(taskQueue, &t_barrier);
+ 	taskqueue_drain(taskQueue, &t_barrier);
++
++	for (int i = 0; i < nrunning; i++) {
++		TQ_LOCK(taskQueue);
++		while (task_is_running(taskQueue, running[i])) {
++			TQ_UNLOCK(taskQueue);
++			snooze(50);
++			TQ_LOCK(taskQueue);
++		}
++		TQ_UNLOCK(taskQueue);
++	}
+ }
+ 
+ 
+

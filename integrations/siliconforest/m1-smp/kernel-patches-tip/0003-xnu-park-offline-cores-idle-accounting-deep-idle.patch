@@ -1,0 +1,447 @@
+xnu: park offline cores, idle accounting, deep idle (tip)
+
+../kernel-patches/0003 for SiliconForest c713d8fb. The only difference is the hunk in
+pexpert/pexpert/arm64/board_config.h: upstream put USE_APPLEARMSMP under
+!SILICONFOREST_NO_KERNEL_INTEGRITY, and XNU_ENABLE_PROCESSOR_EXIT goes inside the same condition.
+
+diff --git a/src/Kernel/xnu/bsd/dev/arm64/sysctl.c b/src/Kernel/xnu/bsd/dev/arm64/sysctl.c
+index 1c9f525e..8a4d0f6f 100644
+--- a/src/Kernel/xnu/bsd/dev/arm64/sysctl.c
++++ b/src/Kernel/xnu/bsd/dev/arm64/sysctl.c
+@@ -13,6 +13,7 @@
+ #include <kern/hvg_hypercall.h>
+ #include <vm/pmap.h>
+ #include <kern/zalloc.h>
++#include <kern/kalloc.h>
+ #include <libkern/libkern.h>
+ #include <pexpert/device_tree.h>
+ #include <kern/task.h>
+@@ -495,3 +496,47 @@ SYSCTL_ULONG(_debug, OID_AUTO, trap_telemetry_capacity_dropped_events,
+ #endif /* CONFIG_TELEMETRY && (DEBUG || DEVELOPMENT) */
+ 
+ 
++
++/*
++ * SiliconForest: per-core idle and offline accounting, and the deep idle switch
++ * (osfmk/arm64/cpu.c).
++ */
++extern int sf_cpu_stats_string(char *buf, int len);
++extern unsigned int sf_idle_deep;
++extern bool sf_cpu_park;
++
++SYSCTL_NODE(_machdep, OID_AUTO, sfcpu, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "SiliconForest CPU idle and offline");
++
++static int
++sysctl_sfcpu_stats SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	char *buf = kalloc_data(2048, Z_WAITOK | Z_ZERO);
++	int error;
++
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	(void)sf_cpu_stats_string(buf, 2048);
++	error = SYSCTL_OUT(req, buf, strlen(buf) + 1);
++	kfree_data(buf, 2048);
++	return error;
++}
++SYSCTL_PROC(_machdep_sfcpu, OID_AUTO, stats,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sfcpu_stats, "A", "per-core idle WFI and park counters");
++
++SYSCTL_UINT(_machdep_sfcpu, OID_AUTO, deep_wfi,
++    CTLFLAG_RW | CTLFLAG_LOCKED, &sf_idle_deep, 0,
++    "1: idle WFIs of 10 ms or more use CYC_OVRD WFI mode 3");
++
++static int
++sysctl_sfcpu_park SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2, oidp)
++	int value = sf_cpu_park ? 1 : 0;
++	return SYSCTL_OUT(req, &value, sizeof(value));
++}
++SYSCTL_PROC(_machdep_sfcpu, OID_AUTO, park,
++    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_sfcpu_park, "I", "1: offline cores are parked in WFI, not powered down");
+diff --git a/src/Kernel/xnu/iokit/Kernel/arm/AppleARMSMP.cpp b/src/Kernel/xnu/iokit/Kernel/arm/AppleARMSMP.cpp
+index 47d72139..03b1b28e 100644
+--- a/src/Kernel/xnu/iokit/Kernel/arm/AppleARMSMP.cpp
++++ b/src/Kernel/xnu/iokit/Kernel/arm/AppleARMSMP.cpp
+@@ -58,6 +58,8 @@ extern "C" void console_suspend();
+ extern "C" void console_resume();
+ // osfmk/arm/cpu_data_internal.h; start.s places the reset vector at this page
+ extern "C" unsigned int LowResetVectorBase;
++// osfmk/arm64/cpu.c: restarts a core that was parked rather than powered down
++extern "C" bool sf_cpu_unpark(int cpu);
+ 
+ static PassthruInterruptController *gCPUIC;
+ static IOPMGR *gPMGR;
+@@ -276,6 +278,15 @@ PE_cpu_start_internal(cpu_id_t target,
+ 
+ 	assert(cpu_id != cpu_number()); /* we can't be already on the CPU to be started */
+ 
++	/*
++	 * SiliconForest: a core that went offline by parking still has power and is not in
++	 * reset; releasing it from reset again would be wrong (and under the m1n1 hypervisor
++	 * would try to start a core that is already in the guest).
++	 */
++	if (sf_cpu_unpark((int)cpu_id)) {
++		return;
++	}
++
+ #if APPLEVIRTUALPLATFORM
+ 	/* When running virtualized, the reset vector address must be passed to PMGR explicitly */
+ 	extern vm_offset_t reset_vector_vaddr;
+diff --git a/src/Kernel/xnu/osfmk/arm/cpu_common.c b/src/Kernel/xnu/osfmk/arm/cpu_common.c
+index eadffaf4..1509d8af 100644
+--- a/src/Kernel/xnu/osfmk/arm/cpu_common.c
++++ b/src/Kernel/xnu/osfmk/arm/cpu_common.c
+@@ -694,7 +694,10 @@ cpu_exit_wait(int cpu_id)
+ {
+ #if !APPLEVIRTUALPLATFORM /* AVP doesn't provide an equivalent poll-for-powerdown operation */
+ #if USE_APPLEARMSMP
+-	if (!ml_is_quiescing()) {
++	// SiliconForest: a parked core (osfmk/arm64/cpu.c, sf_cpu_park) keeps its power, so its
++	// run state never reads 0; the sleep token below says it has stopped
++	extern bool sf_cpu_park;
++	if (!ml_is_quiescing() && !sf_cpu_park) {
+ 		// For runtime disable (non S2R) the CPU will shut down immediately.
+ 		ml_topology_cpu_t *cpu = &ml_get_topology_info()->cpus[cpu_id];
+ 		assert(cpu && cpu->cpu_IMPL_regs);
+diff --git a/src/Kernel/xnu/osfmk/arm64/cpu.c b/src/Kernel/xnu/osfmk/arm64/cpu.c
+index 51e25734..5d240cc8 100644
+--- a/src/Kernel/xnu/osfmk/arm64/cpu.c
++++ b/src/Kernel/xnu/osfmk/arm64/cpu.c
+@@ -118,6 +118,188 @@ extern void arm64_retention_wfi(void);
+ //  1 : normal
+ //  2 : overhead simulation (delay & flags)
+ TUNABLE(unsigned int, wfi, "wfi", 1);
++
++/*
++ * SiliconForest: parked cores, deep idle and the accounting for both.
++ *
++ * Parking. xnu takes a core offline (processor_exit, cluster power-down) by setting
++ * CYC_OVRD "ok to power down" with WFI retention disabled and executing WFI: the core loses
++ * power and the PMGR start bit later resets it into the reset vector. Where that state is
++ * not available the core cannot be reset: the m1n1 hypervisor refuses a CYC_OVRD write that
++ * disables WFI retention or masks FIQs (src/hv/hv_exc.c), and its PMGR start hook can only
++ * start a core that is not yet in the guest (hv_start_secondary). There the core is parked
++ * instead (sfcpupark, the default): it stays in WFI with its timer off and interrupts
++ * masked, having done everything else cpu_sleep() does, and PE_cpu_start_internal() wakes it
++ * with an IPI rather than through the power manager. It then re-enters arm_init_cpu() on
++ * its start-up stacks exactly as start_cpu would have sent it there after a reset; nothing
++ * was lost, so the register set-up between the reset vector and that point is not repeated.
++ * sfcpupark=0 selects xnu's own power-down path (not implemented by SFAppleBootCPUPMGR).
++ *
++ * Deep idle (sfidledeep / machdep.sfcpu.deep_wfi, off by default): before an idle WFI that
++ * the next timer leaves at least 10 ms long, select CYC_OVRD WFI mode 3 as Linux's
++ * cpuidle-apple "CPU PD" state does on this SoC (10 ms target residency), and put the
++ * register back on the way out. HAS_RETENTION_STATE's arm64_retention_wfi() already copes
++ * with the general registers being lost across WFI.
++ */
++struct sf_cpu_stat {
++	uint64_t idle_count;            /* idle WFIs left */
++	uint64_t idle_abs;              /* time between entering WFI and leaving idle */
++	uint64_t idle_short;            /* of them, shorter than 20 us: WFI did not wait */
++	uint64_t idle_deep;             /* entered in WFI mode 3 */
++	uint64_t idle_start;
++	uint64_t cyc_ovrd;              /* CYC_OVRD as first seen on this core, + 1 */
++	uint64_t cyc_ovrd_saved;
++	uint64_t park_count;            /* times parked */
++	uint64_t park_wakeups;          /* WFI returns while parked */
++	uint64_t unpark_count;
++	uint32_t parked;                /* in (or on the way into) the park loop */
++	uint32_t unpark;                /* asked to leave it */
++	uint32_t deep_armed;
++} __attribute__((aligned(128)));
++struct sf_cpu_stat sf_cpu_stats[MAX_CPUS];
++
++TUNABLE(bool, sf_cpu_park, "sfcpupark", true);
++TUNABLE_WRITEABLE(unsigned int, sf_idle_deep, "sfidledeep", 0);
++
++#define SF_CYC_OVRD             "S3_5_C15_C5_0"
++#define SF_CYC_OVRD_WFI_DEEP    (3ULL << 24)            /* m1n1 CYC_OVRD_WFI_MODE(3) */
++/* the hypervisor refuses a write with either set: DISABLE_WFI_RET, FIQ_MODE */
++#define SF_CYC_OVRD_REFUSED     ((1ULL << 0) | (3ULL << 20))
++#define SF_IPI_SR               "S3_5_C15_C1_1"
++
++extern void arm64_park_wfi(void);
++extern void __attribute__((noreturn)) arm64_park_restart(cpu_data_t *cpu_data_ptr);
++extern void ml_sf_park_quiet_timer(void);
++bool sf_cpu_unpark(int cpu);
++int sf_cpu_stats_string(char *buf, int len);
++
++static inline void
++sf_cpu_idle_enter(cpu_data_t *cdp)
++{
++	struct sf_cpu_stat *st = &sf_cpu_stats[cdp->cpu_number];
++	uint64_t now = mach_absolute_time();
++
++	if (__improbable(st->cyc_ovrd == 0)) {
++		st->cyc_ovrd = __builtin_arm_rsr64(SF_CYC_OVRD) + 1;
++	}
++	if (__improbable(sf_idle_deep != 0)) {
++		static uint64_t min_abs;
++		uint64_t pop = cdp->rtcPop;
++
++		if (min_abs == 0) {
++			nanoseconds_to_absolutetime(10 * NSEC_PER_MSEC, &min_abs);
++		}
++		if (pop > now && pop - now >= min_abs) {
++			uint64_t ovrd = __builtin_arm_rsr64(SF_CYC_OVRD);
++
++			if ((ovrd & SF_CYC_OVRD_REFUSED) == 0) {
++				st->cyc_ovrd_saved = ovrd;
++				__builtin_arm_wsr64(SF_CYC_OVRD, ovrd | SF_CYC_OVRD_WFI_DEEP);
++				__builtin_arm_isb(ISB_SY);
++				st->deep_armed = 1;
++				st->idle_deep++;
++			}
++		}
++	}
++	st->idle_start = now;
++}
++
++static inline void
++sf_cpu_idle_exit(cpu_data_t *cdp)
++{
++	struct sf_cpu_stat *st = &sf_cpu_stats[cdp->cpu_number];
++
++	if (__improbable(st->deep_armed)) {
++		st->deep_armed = 0;
++		__builtin_arm_wsr64(SF_CYC_OVRD, st->cyc_ovrd_saved);
++		__builtin_arm_isb(ISB_SY);
++	}
++	if (st->idle_start != 0) {
++		static uint64_t short_abs;
++		uint64_t waited = mach_absolute_time() - st->idle_start;
++
++		if (short_abs == 0) {
++			nanoseconds_to_absolutetime(20 * NSEC_PER_USEC, &short_abs);
++		}
++		st->idle_start = 0;
++		st->idle_count++;
++		st->idle_abs += waited;
++		if (waited < short_abs) {
++			st->idle_short++;
++		}
++	}
++}
++
++/* The offline core's last stop. Interrupts are masked and stay masked. */
++static void __attribute__((noreturn))
++sf_cpu_park_loop(cpu_data_t *cdp)
++{
++	struct sf_cpu_stat *st = &sf_cpu_stats[cdp->cpu_number];
++
++	/* a timer that fires here could only make every WFI return at once */
++	ml_sf_park_quiet_timer();
++	st->park_count++;
++	while (os_atomic_load(&st->unpark, acquire) == 0) {
++		arm64_park_wfi();
++		st->park_wakeups++;
++		/* take the IPI that woke us (or any other) off the line, as sleh_fiq would */
++		__builtin_arm_wsr64(SF_IPI_SR, 1);
++		__builtin_arm_isb(ISB_SY);
++	}
++	os_atomic_store(&st->unpark, 0, release);
++	st->unpark_count++;
++	arm64_park_restart(cdp);
++}
++
++/*
++ * Called by PE_cpu_start_internal() on the starting CPU, after cpu_start() has prepared the
++ * target's cpu data. True: the target was parked and has been told to restart, the power
++ * manager must not be asked to release it from reset.
++ */
++bool
++sf_cpu_unpark(int cpu)
++{
++	struct sf_cpu_stat *st;
++
++	if (!sf_cpu_park || cpu < 0 || cpu >= MAX_CPUS) {
++		return false;
++	}
++	st = &sf_cpu_stats[cpu];
++	if (os_atomic_load(&st->parked, acquire) == 0) {
++		return false;
++	}
++	os_atomic_store(&st->parked, 0, release);
++	os_atomic_store(&st->unpark, 1, release);
++	__builtin_arm_dsb(DSB_ISH);
++	disable_preemption();
++	ml_cpu_signal(ml_get_topology_info()->cpus[cpu].phys_id);
++	enable_preemption();
++	return true;
++}
++
++/* machdep.sfcpu.stats: one line per core */
++int
++sf_cpu_stats_string(char *buf, int len)
++{
++	int used = 0;
++
++	for (int cpu = 0; cpu < MAX_CPUS && used < len - 1; cpu++) {
++		const struct sf_cpu_stat *st = &sf_cpu_stats[cpu];
++		uint64_t idle_ns = 0;
++
++		if (st->idle_count == 0 && st->park_count == 0 && st->cyc_ovrd == 0) {
++			continue;
++		}
++		absolutetime_to_nanoseconds(st->idle_abs, &idle_ns);
++		used += scnprintf(buf + used, (size_t)(len - used),
++		    "cpu%d idle=%llu wfi_us=%llu short=%llu deep=%llu cyc_ovrd=0x%llx "
++		    "park=%llu parkwake=%llu unpark=%llu parked=%u\n",
++		    cpu, st->idle_count, idle_ns / NSEC_PER_USEC, st->idle_short, st->idle_deep,
++		    st->cyc_ovrd ? st->cyc_ovrd - 1 : 0,
++		    st->park_count, st->park_wakeups, st->unpark_count, st->parked);
++	}
++	return used;
++}
+ #if DEVELOPMENT || DEBUG
+ 
+ // wfi_flags
+@@ -345,11 +527,21 @@ cpu_sleep(void)
+ 		PE_cpu_machine_quiesce(cpu_data_ptr->cpu_id);
+ 	} else {
+ 		bool deep_sleep = PE_cpu_down(cpu_data_ptr->cpu_id);
++		if (sf_cpu_park) {
++			// before the sleep token: once cpu_exit_wait() has seen that, the
++			// core may be started again, and PE_cpu_start_internal() must find
++			// it parked
++			os_atomic_store(&sf_cpu_stats[cpu_data_ptr->cpu_number].parked, 1, release);
++		}
+ 		cpu_data_ptr->cpu_sleep_token = ARM_CPU_ON_SLEEP_PATH;
+ 		// hang CPU on spurious wakeup
+ 		cpu_data_ptr->cpu_reset_handler = (uintptr_t)0;
+ 		__builtin_arm_dsb(DSB_ISH);
+ 		CleanPoU_Dcache();
++		if (sf_cpu_park) {
++			(void)deep_sleep;
++			sf_cpu_park_loop(cpu_data_ptr);
++		}
+ #if APPLEVIRTUALPLATFORM
+ 		arm64_prepare_for_sleep(deep_sleep, cpu_data_ptr->cpu_number, ml_vtophys(reset_vector_vaddr));
+ #else /* APPLEVIRTUALPLATFORM */
+@@ -616,6 +808,7 @@ cpu_idle(void)
+ 		// <rdar://problem/15827409> CPU1 Stuck in WFIWT Because of MMU Prefetch
+ 		typhoon_prepare_for_wfi();
+ #endif
++		sf_cpu_idle_enter(cpu_data_ptr);
+ 		__builtin_arm_dsb(DSB_SY);
+ #if HAS_RETENTION_STATE
+ 		arm64_retention_wfi();
+@@ -670,6 +863,8 @@ cpu_idle_exit(boolean_t from_reset)
+ 
+ 	assert(exception_stack_pointer() != 0);
+ 
++	sf_cpu_idle_exit(cpu_data_ptr);
++
+ 	/* Back from WFI, unlock OSLAR and EDLAR. */
+ 	if (from_reset) {
+ 		configure_coresight_registers(cpu_data_ptr);
+diff --git a/src/Kernel/xnu/osfmk/arm64/machine_routines.c b/src/Kernel/xnu/osfmk/arm64/machine_routines.c
+index 2599f09c..09e2051c 100644
+--- a/src/Kernel/xnu/osfmk/arm64/machine_routines.c
++++ b/src/Kernel/xnu/osfmk/arm64/machine_routines.c
+@@ -2767,6 +2767,18 @@ _enable_virtual_timer(void)
+ #endif
+ }
+ 
++/*
++ * SiliconForest: a core parked offline (osfmk/arm64/cpu.c, sf_cpu_park_loop) switches its
++ * timer off; fiq_context_init() turns it back on when the core restarts.
++ */
++void ml_sf_park_quiet_timer(void);
++void
++ml_sf_park_quiet_timer(void)
++{
++	__builtin_arm_wsr64(KERNEL_CNTV_CTL_EL0, CNTV_CTL_EL0_IMASKED);
++	__builtin_arm_isb(ISB_SY);
++}
++
+ void
+ fiq_context_init(boolean_t enable_fiq __unused)
+ {
+diff --git a/src/Kernel/xnu/osfmk/arm64/machine_routines_asm.s b/src/Kernel/xnu/osfmk/arm64/machine_routines_asm.s
+index 864fb208..25db7295 100644
+--- a/src/Kernel/xnu/osfmk/arm64/machine_routines_asm.s
++++ b/src/Kernel/xnu/osfmk/arm64/machine_routines_asm.s
+@@ -1684,6 +1684,64 @@ LEXT(arm64_force_wfi_clock_gate)
+ 	ARM64_STACK_EPILOG EXT(arm64_force_wfi_clock_gate)
+ 
+ 
++/*
++ * SiliconForest: WFI for a core parked offline (osfmk/arm64/cpu.c, sf_cpu_park_loop).
++ * A core of this family can come back from WFI with its general registers cleared and
++ * only sp, pc and memory intact (see arm64_retention_wfi below), so the callee-saved
++ * registers go to the stack around it; the caller keeps the rest.
++ */
++	.text
++	.align 2
++	.globl EXT(arm64_park_wfi)
++LEXT(arm64_park_wfi)
++	ARM64_PROLOG
++	stp		x29, x30, [sp, #-96]!
++	stp		x19, x20, [sp, #16]
++	stp		x21, x22, [sp, #32]
++	stp		x23, x24, [sp, #48]
++	stp		x25, x26, [sp, #64]
++	stp		x27, x28, [sp, #80]
++	dsb		sy
++	isb		sy
++	wfi
++	isb		sy
++	ldp		x19, x20, [sp, #16]
++	ldp		x21, x22, [sp, #32]
++	ldp		x23, x24, [sp, #48]
++	ldp		x25, x26, [sp, #64]
++	ldp		x27, x28, [sp, #80]
++	ldp		x29, x30, [sp], #96
++	ret
++
++/*
++ * SiliconForest: restart a parked core. x0 = cpu data (KVA). Does what start_cpu and
++ * common_start (start.s) do for a core out of reset between loading its cpu data and
++ * entering arm_init_cpu(), less the translation and tunable set-up, which a parked core
++ * never lost: thread registers, exception stack on SP_EL1, interrupt stack on SP_EL0.
++ */
++	.text
++	.align 2
++	.globl EXT(arm64_park_restart)
++LEXT(arm64_park_restart)
++	ARM64_PROLOG
++	msr		DAIFSet, #(DAIFSC_ALL)
++	mov		x21, x0
++	ldr		x1, [x21, CPU_TPIDR_EL0]
++	msr		TPIDR_EL0, x1
++	msr		TPIDRRO_EL0, xzr
++	ldr		x1, [x21, CPU_EXCEPSTACK_TOP]
++	msr		SPSel, #1
++	mov		sp, x1
++	ldr		x1, [x21, CPU_INTSTACK_TOP]
++	msr		SPSel, #0
++	mov		sp, x1
++	msr		TPIDR_EL1, xzr
++	mov		x0, x21
++	mov		x1, #0
++	mov		fp, #0
++	mov		lr, #0
++	b		EXT(arm_init_cpu)
++
+ #if HAS_RETENTION_STATE
+ 	.text
+ 	.align 2
+diff --git a/src/Kernel/xnu/pexpert/pexpert/arm64/board_config.h b/src/Kernel/xnu/pexpert/pexpert/arm64/board_config.h
+index 30aa4198..1142f492 100644
+--- a/src/Kernel/xnu/pexpert/pexpert/arm64/board_config.h
++++ b/src/Kernel/xnu/pexpert/pexpert/arm64/board_config.h
+@@ -174,6 +174,7 @@
+ // SiliconForest has no AppleARMSMP, its platform expert's IOCPUs start the cores
+ #if !defined(SILICONFOREST_NO_KERNEL_INTEGRITY)
+ #define USE_APPLEARMSMP                1
++#define XNU_ENABLE_PROCESSOR_EXIT      1 /* processor_exit() parks the core: osfmk/arm64/cpu.c, sf_cpu_park */
+ #endif
+ 
+ 

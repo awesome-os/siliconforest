@@ -1,0 +1,1138 @@
+/*
+ * sf-dhcp - minimal DHCPv4 client for the SiliconForest RAM root.
+ *
+ * Copyright (c) 2026 darwin-lab. SPDX-License-Identifier: ISC
+ *
+ * sf-dhcp [--up] [IFNAME]
+ *     One shot: DISCOVER/OFFER/REQUEST/ACK over BPF on one Ethernet-like interface, then
+ *     execs /bin/netsetup, which sets the address, default route and resolver.
+ *
+ * sf-dhcp --daemon [--renew-after S] [--lease-cap S] [--exit-with-parent] [IFNAME]
+ *     Lease daemon: the same exchange, then it stays and keeps the lease. It renews at T1
+ *     (unicast, from a UDP socket on the leased address), rebinds at T2 (broadcast over BPF),
+ *     starts over on NAK or expiry, and after the link was lost and came back it confirms the
+ *     address with INIT-REBOOT before falling back to DISCOVER. netsetup runs only when the
+ *     address, mask, router or name server changed. --renew-after and --lease-cap are test
+ *     hooks: the first overrides T1, the second caps the lease time as this client sees it.
+ *     The current lease is kept in /var/run/sf-dhcp.IFNAME.lease for whoever supervises this.
+ */
+#include <sys/types.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <sys/sockio.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <net/bpf.h>
+#include <net/if.h>
+#include <net/if_dl.h>
+#include <net/if_media.h>
+#include <net/route.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <ifaddrs.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+#define DHCP_MAGIC 0x63825363u
+
+#define DHCPDISCOVER 1
+#define DHCPOFFER 2
+#define DHCPREQUEST 3
+#define DHCPACK 5
+#define DHCPNAK 6
+
+struct lease {
+    uint32_t addr, mask, router, dns, server, secs;
+    int type;
+    uint32_t t1, t2;        /* options 58 and 59, 0 when the server sent none */
+};
+
+/* What varies between the kinds of request; all zero is the one-shot DISCOVER. */
+struct msg {
+    uint32_t ipsrc;         /* IP source, 0 before an address is held */
+    uint32_t ciaddr;        /* set when renewing or rebinding */
+    uint32_t reqaddr;       /* option 50 */
+    uint32_t server;        /* option 54 */
+    int nobroadcast;        /* clear the broadcast flag: the reply can come to our address */
+    int daemon;             /* also ask for options 58 and 59 */
+};
+
+static uint16_t csum(const uint8_t *p, size_t n)
+{
+    uint32_t s = 0;
+    for (; n > 1; p += 2, n -= 2)
+        s += (uint32_t)((p[0] << 8) | p[1]);
+    if (n)
+        s += (uint32_t)(p[0] << 8);
+    while (s >> 16)
+        s = (s & 0xffff) + (s >> 16);
+    return (uint16_t)~s;
+}
+
+static void put32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
+static uint32_t get32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3]; }
+
+static int get_mac(const char *ifname, uint8_t mac[6])
+{
+    struct ifaddrs *ifa, *p;
+    int ok = -1;
+
+    if (getifaddrs(&ifa) != 0)
+        return -1;
+    for (p = ifa; p != NULL; p = p->ifa_next) {
+        if (p->ifa_addr != NULL && p->ifa_addr->sa_family == AF_LINK && strcmp(p->ifa_name, ifname) == 0) {
+            struct sockaddr_dl *dl = (struct sockaddr_dl *)(void *)p->ifa_addr;
+            if (dl->sdl_alen == 6) {
+                memcpy(mac, LLADDR(dl), 6);
+                ok = 0;
+            }
+        }
+    }
+    freeifaddrs(ifa);
+    return ok;
+}
+
+static int bpf_open(const char *ifname, u_int *blen)
+{
+    struct ifreq ifr;
+    struct timeval tv = { 1, 0 };
+    u_int one = 1;
+    char path[32];
+    int fd = -1;
+
+    for (int i = 0; i < 32 && fd < 0; i++) {
+        snprintf(path, sizeof(path), "/dev/bpf%d", i);
+        fd = open(path, O_RDWR);
+    }
+    if (fd < 0)
+        return -1;
+    memset(&ifr, 0, sizeof(ifr));
+    strlcpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
+    if (ioctl(fd, BIOCGBLEN, blen) < 0 || ioctl(fd, BIOCSETIF, &ifr) < 0 ||
+        ioctl(fd, BIOCIMMEDIATE, &one) < 0 || ioctl(fd, BIOCSHDRCMPLT, &one) < 0 ||
+        ioctl(fd, BIOCSRTIMEOUT, &tv) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+/* BPF refuses to send on an interface that is not IFF_UP ("Network is down"). */
+static int if_up(const char *ifname)
+{
+    struct ifreq ifr;
+    int s = socket(AF_INET, SOCK_DGRAM, 0), rc = -1;
+
+    if (s < 0)
+        return -1;
+    memset(&ifr, 0, sizeof(ifr));
+    strlcpy(ifr.ifr_name, ifname, sizeof(ifr.ifr_name));
+    if (ioctl(s, SIOCGIFFLAGS, &ifr) == 0) {
+        if (ifr.ifr_flags & IFF_UP) {
+            rc = 0;
+        } else {
+            ifr.ifr_flags |= IFF_UP;
+            rc = ioctl(s, SIOCSIFFLAGS, &ifr);
+        }
+    }
+    close(s);
+    return rc;
+}
+
+/* Builds an Ethernet/IP/UDP/BOOTP frame. Returns its length; the BOOTP part starts at f + 42. */
+static size_t build_msg(uint8_t *f, const uint8_t mac[6], uint32_t xid, int type, const struct msg *q)
+{
+    uint8_t *ip = f + 14, *udp = ip + 20, *b = udp + 8, *o;
+    size_t blen, ulen;
+
+    memset(f, 0, 600);
+    memset(f, 0xff, 6);
+    memcpy(f + 6, mac, 6);
+    f[12] = 0x08; f[13] = 0x00;
+
+    b[0] = 1; b[1] = 1; b[2] = 6;               /* BOOTREQUEST, Ethernet */
+    put32(b + 4, xid);
+    if (!q->nobroadcast)
+        b[10] = 0x80;                           /* broadcast flag */
+    put32(b + 12, q->ciaddr);
+    memcpy(b + 28, mac, 6);
+    put32(b + 236, DHCP_MAGIC);
+    o = b + 240;
+    *o++ = 53; *o++ = 1; *o++ = (uint8_t)type;
+    *o++ = 61; *o++ = 7; *o++ = 1; memcpy(o, mac, 6); o += 6;
+    if (q->reqaddr) {
+        *o++ = 50; *o++ = 4; put32(o, q->reqaddr); o += 4;
+    }
+    if (q->server) {
+        *o++ = 54; *o++ = 4; put32(o, q->server); o += 4;
+    }
+    if (q->daemon) {
+        *o++ = 55; *o++ = 6; *o++ = 1; *o++ = 3; *o++ = 6; *o++ = 51; *o++ = 58; *o++ = 59;
+    } else {
+        *o++ = 55; *o++ = 4; *o++ = 1; *o++ = 3; *o++ = 6; *o++ = 51;
+    }
+    *o++ = 255;
+    blen = (size_t)(o - b);
+    if (blen < 300)
+        blen = 300;
+    ulen = 8 + blen;
+
+    udp[0] = 0; udp[1] = 68; udp[2] = 0; udp[3] = 67;
+    udp[4] = (uint8_t)(ulen >> 8); udp[5] = (uint8_t)ulen;      /* checksum 0: not used */
+
+    ip[0] = 0x45; ip[2] = (uint8_t)((20 + ulen) >> 8); ip[3] = (uint8_t)(20 + ulen);
+    ip[8] = 64; ip[9] = 17;
+    put32(ip + 12, q->ipsrc);
+    put32(ip + 16, 0xffffffffu);
+    {
+        uint16_t c = csum(ip, 20);
+        ip[10] = (uint8_t)(c >> 8); ip[11] = (uint8_t)c;
+    }
+    return 14 + 20 + ulen;
+}
+
+/* The one-shot frames: DISCOVER, and the REQUEST that selects an offer (options 50 and 54). */
+static size_t build(uint8_t *f, const uint8_t mac[6], uint32_t xid, int type, const struct lease *l)
+{
+    struct msg q;
+
+    memset(&q, 0, sizeof(q));
+    if (type == DHCPREQUEST) {
+        q.reqaddr = l->addr;
+        q.server = l->server;
+    }
+    return build_msg(f, mac, xid, type, &q);
+}
+
+/* Parses a BOOTP reply of n bytes; fills l and returns the DHCP message type, or 0. */
+static int parse_bootp(const uint8_t *b, size_t n, const uint8_t mac[6], uint32_t xid, struct lease *l)
+{
+    const uint8_t *o, *end = b + n;
+
+    if (n < 240)
+        return 0;
+    if (b[0] != 2 || get32(b + 4) != xid || memcmp(b + 28, mac, 6) != 0 || get32(b + 236) != DHCP_MAGIC)
+        return 0;
+    memset(l, 0, sizeof(*l));
+    l->addr = get32(b + 16);
+    for (o = b + 240; o < end && *o != 255;) {
+        uint8_t code = *o++, len;
+        if (code == 0)
+            continue;
+        if (o >= end)
+            break;
+        len = *o++;
+        if (o + len > end)
+            break;
+        if (code == 53 && len >= 1) l->type = o[0];
+        if (code == 1 && len >= 4) l->mask = get32(o);
+        if (code == 3 && len >= 4) l->router = get32(o);
+        if (code == 6 && len >= 4) l->dns = get32(o);
+        if (code == 54 && len >= 4) l->server = get32(o);
+        if (code == 51 && len >= 4) l->secs = get32(o);
+        if (code == 58 && len >= 4) l->t1 = get32(o);
+        if (code == 59 && len >= 4) l->t2 = get32(o);
+        o += len;
+    }
+    return l->type;
+}
+
+/* Parses one captured frame; fills l and returns the DHCP message type, or 0. */
+static int parse(const uint8_t *f, size_t n, const uint8_t mac[6], uint32_t xid, struct lease *l)
+{
+    const uint8_t *ip, *udp;
+    size_t ihl;
+
+    if (n < 14 + 20 + 8 + 240 || f[12] != 0x08 || f[13] != 0x00)
+        return 0;
+    ip = f + 14;
+    ihl = (size_t)(ip[0] & 0xf) * 4;
+    if ((ip[0] >> 4) != 4 || ip[9] != 17 || ihl < 20 || n < 14 + ihl + 8 + 240)
+        return 0;
+    udp = ip + ihl;
+    if (udp[2] != 0 || udp[3] != 68)
+        return 0;
+    return parse_bootp(udp + 8, n - (14 + ihl + 8), mac, xid, l);
+}
+
+static int wait_for(int fd, uint8_t *buf, u_int blen, const uint8_t mac[6], uint32_t xid, int want, struct lease *l, int seconds)
+{
+    time_t end = time(NULL) + seconds;
+
+    while (time(NULL) <= end) {
+        ssize_t n = read(fd, buf, blen);
+        uint8_t *p = buf;
+
+        if (n <= 0)
+            continue;
+        while (p < buf + n) {
+            struct bpf_hdr *h = (struct bpf_hdr *)(void *)p;
+            int t = parse(p + h->bh_hdrlen, h->bh_caplen, mac, xid, l);
+
+            if (t == want)
+                return 0;
+            if (t == 6) {
+                fprintf(stderr, "sf-dhcp: server sent NAK\n");
+                return -1;
+            }
+            p += BPF_WORDALIGN(h->bh_hdrlen + h->bh_caplen);
+        }
+    }
+    return -1;
+}
+
+static const char *ipstr(uint32_t a, char *s)
+{
+    snprintf(s, 16, "%u.%u.%u.%u", a >> 24, (a >> 16) & 255, (a >> 8) & 255, a & 255);
+    return s;
+}
+
+static int oneshot(const char *ifname)
+{
+    uint8_t mac[6], frame[600], *buf;
+    struct lease offer, ack;
+    char a[16], m[16], r[16], d[16], s[16];
+    uint32_t xid;
+    u_int blen = 0;
+    int fd, got = 0;
+
+    if (get_mac(ifname, mac) != 0) {
+        fprintf(stderr, "sf-dhcp: no link address for %s\n", ifname);
+        return 1;
+    }
+    fd = bpf_open(ifname, &blen);
+    if (fd < 0 || (buf = malloc(blen)) == NULL) {
+        fprintf(stderr, "sf-dhcp: cannot open bpf on %s: %s\n", ifname, strerror(errno));
+        return 1;
+    }
+    xid = ((uint32_t)mac[2] << 24 | (uint32_t)mac[3] << 16 | (uint32_t)mac[4] << 8 | mac[5]) ^ (uint32_t)time(NULL) ^ ((uint32_t)getpid() << 8);
+    printf("sf-dhcp: %s %02x:%02x:%02x:%02x:%02x:%02x xid %08x\n", ifname, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], xid);
+
+    for (int try = 0; try < 6 && !got; try++) {
+        size_t n = build(frame, mac, xid, 1, NULL);
+
+        if (write(fd, frame, n) != (ssize_t)n) {
+            fprintf(stderr, "sf-dhcp: discover write: %s\n", strerror(errno));
+            sleep(1);
+            continue;
+        }
+        printf("sf-dhcp: DISCOVER sent (try %d)\n", try + 1);
+        if (wait_for(fd, buf, blen, mac, xid, 2, &offer, 4) != 0)
+            continue;
+        printf("sf-dhcp: OFFER %s from %s\n", ipstr(offer.addr, a), ipstr(offer.server, s));
+        n = build(frame, mac, xid, 3, &offer);
+        if (write(fd, frame, n) != (ssize_t)n)
+            continue;
+        if (wait_for(fd, buf, blen, mac, xid, 5, &ack, 4) == 0)
+            got = 1;
+    }
+    close(fd);
+    if (!got) {
+        fprintf(stderr, "sf-dhcp: no lease\n");
+        return 1;
+    }
+    if (ack.mask == 0)
+        ack.mask = 0xffffff00u;
+    printf("SF_DHCP_LEASE addr=%s mask=%s router=%s dns=%s lease=%us\n", ipstr(ack.addr, a), ipstr(ack.mask, m),
+           ipstr(ack.router, r), ipstr(ack.dns ? ack.dns : ack.router, d), ack.secs);
+    fflush(stdout);
+    {
+        /* netsetup defaults the broadcast address to a fixed test network; pass the real one */
+        char bc[16];
+        ipstr(ack.addr | ~ack.mask, bc);
+        execl("/bin/netsetup", "netsetup", ifname, a, m, r, d, bc, (char *)NULL);
+    }
+    fprintf(stderr, "sf-dhcp: exec netsetup: %s\n", strerror(errno));
+    return 1;
+}
+
+/* ------------------------------------------------------------------------------------------
+ * Daemon mode
+ * ------------------------------------------------------------------------------------------ */
+
+/*
+ * The 802.11 state request wifiutil uses (SiliconForest IO80211Family/apple80211_ioctl.h, which is
+ * not in the SDK). Only the state request is needed here, so its two structures are repeated.
+ */
+struct sf_a80211req {
+    char req_if_name[16];
+    int req_type;
+    int req_val;
+    uint32_t req_len;
+    void *req_data;
+};
+struct sf_a80211_state {
+    uint32_t version;
+    uint32_t state;
+};
+#define SF_SIOCGA80211 _IOWR('i', 201, struct sf_a80211req)
+#define SF_A80211_IOC_STATE 13
+#define SF_A80211_S_RUN 4
+
+enum dstate { S_INIT, S_NOLINK, S_REBOOT, S_BOUND, S_RENEW, S_REBIND, S_COUNT };
+static const char *const dnames[S_COUNT] = { "INIT", "NOLINK", "REBOOT", "BOUND", "RENEW", "REBIND" };
+
+struct dctx {
+    const char *ifname;
+    uint32_t renew_after;       /* --renew-after, 0 when not given */
+    uint32_t lease_cap;         /* --lease-cap, 0 when not given */
+    pid_t parent;               /* --exit-with-parent, 0 when not given */
+    uint8_t mac[6];
+    uint32_t xid;
+    int bpf;
+    uint8_t *buf;
+    u_int blen;
+    int udp;
+    enum dstate state;
+    struct lease cur;           /* the lease held; addr 0 when none */
+    struct lease applied;       /* what netsetup was last run with; addr 0 when nothing */
+    int64_t t1, t2, expiry;     /* on the clock of now_s() */
+    char leasepath[64];
+};
+
+static volatile sig_atomic_t stopping;
+
+static void on_signal(int sig)
+{
+    (void)sig;
+    stopping = 1;
+}
+
+/* Seconds on a clock that does not jump when the date is set. */
+static int64_t now_s(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) == 0)
+        return (int64_t)ts.tv_sec;
+    return (int64_t)time(NULL);
+}
+
+static int should_stop(const struct dctx *d)
+{
+    if (stopping)
+        return 1;
+    /* a supervisor that died without stopping us would start a second daemon beside this one */
+    if (d->parent != 0 && getppid() != d->parent)
+        return 1;
+    return 0;
+}
+
+/* Sleeps up to n seconds; returns early (nonzero) when asked to stop. */
+static int nap(const struct dctx *d, int n)
+{
+    for (int i = 0; i < n && !should_stop(d); i++)
+        sleep(1);
+    return should_stop(d);
+}
+
+/*
+ * Link state without ifconfig. For a Wi-Fi interface the driver's 802.11 state must be RUN
+ * (the request wifiutil info shows as "state: running"), and the data port only opens once the
+ * key handshake is done, which the driver reports as an active link: SIOCGIFMEDIA with
+ * IFM_ACTIVE. Other interfaces have only the media status. If RUN is reported but the media
+ * status stays inactive, RUN is believed after a grace period, so a driver that never reports
+ * an active medium cannot keep this client from trying.
+ */
+static int link_up(const char *ifname)
+{
+    static int64_t run_since = -1;
+    static int warned;
+    struct sf_a80211req req;
+    struct sf_a80211_state st;
+    struct ifmediareq mr;
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    int wifi, running = 0, media_valid, media_active = 0;
+
+    if (s < 0)
+        return 1;
+    memset(&req, 0, sizeof(req));
+    memset(&st, 0, sizeof(st));
+    strlcpy(req.req_if_name, ifname, sizeof(req.req_if_name));
+    req.req_type = SF_A80211_IOC_STATE;
+    req.req_len = sizeof(st);
+    req.req_data = &st;
+    wifi = ioctl(s, SF_SIOCGA80211, &req) == 0;
+    if (wifi)
+        running = st.state == SF_A80211_S_RUN;
+
+    memset(&mr, 0, sizeof(mr));
+    strlcpy(mr.ifm_name, ifname, sizeof(mr.ifm_name));
+    media_valid = ioctl(s, SIOCGIFMEDIA, &mr) == 0 && (mr.ifm_status & IFM_AVALID);
+    if (media_valid)
+        media_active = (mr.ifm_status & IFM_ACTIVE) != 0;
+    close(s);
+
+    if (!wifi)
+        return media_valid ? media_active : 1;
+    if (!running) {
+        run_since = -1;
+        return 0;
+    }
+    if (!media_valid || media_active) {
+        run_since = -1;
+        return 1;
+    }
+    if (run_since < 0)
+        run_since = now_s();
+    if (now_s() - run_since < 10)
+        return 0;
+    if (!warned) {
+        warned = 1;
+        printf("sf-dhcp: %s 802.11 state is running but the medium is not active; trusting the state\n", ifname);
+    }
+    return 1;
+}
+
+static void set_state(struct dctx *d, enum dstate next, const char *why)
+{
+    if (d->state != next)
+        printf("sf-dhcp: %s state %s -> %s (%s)\n", d->ifname, dnames[d->state], dnames[next], why);
+    d->state = next;
+}
+
+/* Only frames to the DHCP client port reach the buffer; without this every packet would. */
+static void bpf_filter(int fd)
+{
+    static struct bpf_insn insns[] = {
+        BPF_STMT(BPF_LD + BPF_H + BPF_ABS, 12),
+        BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, 0x0800, 0, 8),
+        BPF_STMT(BPF_LD + BPF_B + BPF_ABS, 23),
+        BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, 17, 0, 6),
+        BPF_STMT(BPF_LD + BPF_H + BPF_ABS, 20),
+        BPF_JUMP(BPF_JMP + BPF_JSET + BPF_K, 0x1fff, 4, 0),
+        BPF_STMT(BPF_LDX + BPF_B + BPF_MSH, 14),
+        BPF_STMT(BPF_LD + BPF_H + BPF_IND, 16),
+        BPF_JUMP(BPF_JMP + BPF_JEQ + BPF_K, 68, 0, 1),
+        BPF_STMT(BPF_RET + BPF_K, (u_int)-1),
+        BPF_STMT(BPF_RET + BPF_K, 0),
+    };
+    struct bpf_program prog = { sizeof(insns) / sizeof(insns[0]), insns };
+
+    if (ioctl(fd, BIOCSETF, &prog) < 0)
+        printf("sf-dhcp: bpf filter not set: %s\n", strerror(errno));
+}
+
+static void bpf_shut(struct dctx *d)
+{
+    if (d->bpf >= 0)
+        close(d->bpf);
+    d->bpf = -1;
+    free(d->buf);
+    d->buf = NULL;
+}
+
+static int bpf_need(struct dctx *d)
+{
+    if (d->bpf >= 0)
+        return 0;
+    if (if_up(d->ifname) != 0)
+        printf("sf-dhcp: cannot mark %s up: %s\n", d->ifname, strerror(errno));
+    d->bpf = bpf_open(d->ifname, &d->blen);
+    if (d->bpf < 0 || (d->buf = malloc(d->blen)) == NULL) {
+        printf("sf-dhcp: cannot open bpf on %s: %s\n", d->ifname, strerror(errno));
+        bpf_shut(d);
+        return -1;
+    }
+    bpf_filter(d->bpf);
+    return 0;
+}
+
+static void udp_shut(struct dctx *d)
+{
+    if (d->udp >= 0)
+        close(d->udp);
+    d->udp = -1;
+}
+
+/* A socket on the leased address and the client port, for the unicast renewal. */
+static int udp_need(struct dctx *d)
+{
+    struct sockaddr_in sin;
+    int one = 1;
+
+    if (d->udp >= 0)
+        return 0;
+    d->udp = socket(AF_INET, SOCK_DGRAM, 0);
+    if (d->udp < 0)
+        return -1;
+    setsockopt(d->udp, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    memset(&sin, 0, sizeof(sin));
+    sin.sin_len = sizeof(sin);
+    sin.sin_family = AF_INET;
+    sin.sin_port = htons(68);
+    sin.sin_addr.s_addr = htonl(d->cur.addr);
+    if (bind(d->udp, (struct sockaddr *)&sin, sizeof(sin)) < 0) {
+        printf("sf-dhcp: bind to the leased address: %s\n", strerror(errno));
+        udp_shut(d);
+        return -1;
+    }
+    return 0;
+}
+
+static int bpf_send(struct dctx *d, int type, const struct msg *q)
+{
+    uint8_t frame[600];
+    size_t n = build_msg(frame, d->mac, d->xid, type, q);
+
+    if (write(d->bpf, frame, n) != (ssize_t)n) {
+        printf("sf-dhcp: bpf write: %s\n", strerror(errno));
+        bpf_shut(d);            /* reopened on the next try, after a pause */
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * Waits up to `seconds` for a reply to the current xid whose type is want or NAK, from the BPF
+ * descriptor and, when it is open, the UDP socket. Returns the type, 0 on timeout, -1 when
+ * asked to stop. The BPF read itself times out after one second.
+ */
+static int await(struct dctx *d, int want, struct lease *l, int seconds)
+{
+    int64_t end = now_s() + seconds;
+
+    do {
+        if (should_stop(d))
+            return -1;
+        if (d->udp >= 0) {
+            struct pollfd pfd = { d->udp, POLLIN, 0 };
+
+            if (poll(&pfd, 1, d->bpf >= 0 ? 100 : 1000) > 0 && (pfd.revents & POLLIN)) {
+                uint8_t pkt[1500];
+                ssize_t n = recv(d->udp, pkt, sizeof(pkt), 0);
+                int t = n > 0 ? parse_bootp(pkt, (size_t)n, d->mac, d->xid, l) : 0;
+
+                if (t == want || t == DHCPNAK)
+                    return t;
+            }
+        }
+        if (d->bpf >= 0) {
+            ssize_t n = read(d->bpf, d->buf, d->blen);
+            uint8_t *p = d->buf;
+
+            while (n > 0 && p < d->buf + n) {
+                struct bpf_hdr *h = (struct bpf_hdr *)(void *)p;
+                int t = parse(p + h->bh_hdrlen, h->bh_caplen, d->mac, d->xid, l);
+
+                if (t == want || t == DHCPNAK)
+                    return t;
+                p += BPF_WORDALIGN(h->bh_hdrlen + h->bh_caplen);
+            }
+            if (n < 0 && errno != EINTR && errno != EAGAIN) {
+                printf("sf-dhcp: bpf read: %s\n", strerror(errno));
+                bpf_shut(d);
+                if (d->udp < 0)
+                    sleep(1);
+            }
+        } else if (d->udp < 0) {
+            sleep(1);
+        }
+    } while (now_s() < end);
+    return 0;
+}
+
+static void new_xid(struct dctx *d)
+{
+    d->xid = d->xid * 1103515245u + 12345u + (uint32_t)now_s();
+}
+
+static void write_lease_file(const struct dctx *d)
+{
+    char tmp[80], a[16], m[16], r[16], n[16], s[16];
+    FILE *f;
+
+    snprintf(tmp, sizeof(tmp), "%s.new", d->leasepath);
+    f = fopen(tmp, "w");
+    if (f == NULL)
+        return;
+    fprintf(f, "addr=%s mask=%s router=%s dns=%s server=%s lease=%u\n", ipstr(d->cur.addr, a), ipstr(d->cur.mask, m),
+            ipstr(d->cur.router, r), ipstr(d->cur.dns, n), ipstr(d->cur.server, s), d->cur.secs);
+    fclose(f);
+    rename(tmp, d->leasepath);
+}
+
+static void sa_in(struct sockaddr_in *sin, uint32_t a)
+{
+    memset(sin, 0, sizeof(*sin));
+    sin->sin_len = sizeof(*sin);
+    sin->sin_family = AF_INET;
+    sin->sin_addr.s_addr = htonl(a);
+}
+
+/* Takes back what netsetup set: the address and the default route. netsetup only ever adds. */
+static void deconfigure(struct dctx *d, const char *why)
+{
+    char a[16];
+    struct ifreq ifr;
+    struct {
+        struct rt_msghdr hdr;
+        struct sockaddr_in dst, gw, mask;
+    } rt;
+    int s;
+
+    unlink(d->leasepath);
+    udp_shut(d);
+    if (d->applied.addr == 0)
+        return;
+    printf("sf-dhcp: %s removing %s (%s)\n", d->ifname, ipstr(d->applied.addr, a), why);
+    if (d->applied.router != 0 && (s = socket(PF_ROUTE, SOCK_RAW, AF_INET)) >= 0) {
+        memset(&rt, 0, sizeof(rt));
+        rt.hdr.rtm_msglen = sizeof(rt);
+        rt.hdr.rtm_version = RTM_VERSION;
+        rt.hdr.rtm_type = RTM_DELETE;
+        rt.hdr.rtm_flags = RTF_UP | RTF_GATEWAY | RTF_STATIC;
+        rt.hdr.rtm_addrs = RTA_DST | RTA_GATEWAY | RTA_NETMASK;
+        rt.hdr.rtm_pid = getpid();
+        rt.hdr.rtm_seq = 1;
+        sa_in(&rt.dst, 0);
+        sa_in(&rt.gw, d->applied.router);
+        sa_in(&rt.mask, 0);
+        if (write(s, &rt, sizeof(rt)) < 0 && errno != ESRCH)
+            printf("sf-dhcp: delete default route: %s\n", strerror(errno));
+        close(s);
+    }
+    if ((s = socket(AF_INET, SOCK_DGRAM, 0)) >= 0) {
+        struct sockaddr_in sin;
+
+        memset(&ifr, 0, sizeof(ifr));
+        strlcpy(ifr.ifr_name, d->ifname, sizeof(ifr.ifr_name));
+        sa_in(&sin, d->applied.addr);
+        memcpy(&ifr.ifr_addr, &sin, sizeof(sin));
+        if (ioctl(s, SIOCDIFADDR, &ifr) < 0)
+            printf("sf-dhcp: remove address: %s\n", strerror(errno));
+        close(s);
+    }
+    memset(&d->applied, 0, sizeof(d->applied));
+}
+
+static int run_netsetup(const struct dctx *d, const struct lease *l)
+{
+    char a[16], m[16], r[16], n[16], bc[16];
+    int status = 0;
+    pid_t pid;
+
+    ipstr(l->addr, a);
+    ipstr(l->mask, m);
+    ipstr(l->router, r);
+    ipstr(l->dns, n);
+    ipstr(l->addr | ~l->mask, bc);
+    fflush(stdout);
+    pid = fork();
+    if (pid < 0)
+        return -1;
+    if (pid == 0) {
+        execl("/bin/netsetup", "netsetup", d->ifname, a, m, r, n, bc, (char *)NULL);
+        fprintf(stderr, "sf-dhcp: exec netsetup: %s\n", strerror(errno));
+        _exit(127);
+    }
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR)
+            return -1;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+}
+
+/* Takes an ACK as the lease: sets the timers and configures the system if anything changed. */
+static void accept_lease(struct dctx *d, const struct lease *ack, const char *how)
+{
+    struct lease l = *ack;
+    char a[16], m[16], r[16], n[16];
+    uint32_t t1, t2;
+    int64_t now = now_s();
+    int changed;
+
+    if (l.mask == 0)
+        l.mask = 0xffffff00u;
+    if (l.dns == 0)
+        l.dns = l.router;
+    if (l.server == 0)
+        l.server = d->cur.server;
+    if (l.secs == 0)
+        l.secs = 3600;
+    if (d->lease_cap != 0 && l.secs > d->lease_cap)
+        l.secs = d->lease_cap;
+    /* options 58 and 59 when they make sense for this lease, else the RFC 2131 defaults */
+    t1 = l.t1 != 0 && l.t1 < l.secs ? l.t1 : l.secs / 2;
+    t2 = l.t2 != 0 && l.t2 < l.secs && l.t2 > t1 ? l.t2 : (uint32_t)((uint64_t)l.secs * 7 / 8);
+    if (d->renew_after != 0)
+        t1 = d->renew_after;
+    if (t1 >= l.secs)
+        t1 = l.secs / 2;
+    if (t2 <= t1)
+        t2 = t1 + (l.secs - t1) / 2;
+    d->cur = l;
+    d->t1 = now + t1;
+    d->t2 = now + t2;
+    d->expiry = now + l.secs;
+    if (l.secs == 0xffffffffu)      /* infinite: nothing to renew */
+        d->t1 = d->t2 = d->expiry = INT64_MAX;
+
+    changed = d->applied.addr != l.addr || d->applied.mask != l.mask || d->applied.router != l.router ||
+              d->applied.dns != l.dns;
+    printf("sf-dhcp: %s %s %s lease=%us t1=%us t2=%us server=%s%s\n", d->ifname, how, ipstr(l.addr, a), l.secs, t1, t2,
+           ipstr(l.server, n), changed ? "" : " (configuration unchanged)");
+    if (changed) {
+        int rc;
+
+        if (d->applied.addr != 0 && (d->applied.addr != l.addr || d->applied.mask != l.mask || d->applied.router != l.router))
+            deconfigure(d, "configuration changed");
+        printf("SF_DHCP_LEASE addr=%s mask=%s router=%s dns=%s lease=%us\n", ipstr(l.addr, a), ipstr(l.mask, m),
+               ipstr(l.router, r), ipstr(l.dns, n), l.secs);
+        rc = run_netsetup(d, &l);
+        if (rc != 0)
+            printf("sf-dhcp: netsetup returned %d\n", rc);
+        d->applied = l;
+    }
+    write_lease_file(d);
+}
+
+static void drop_lease(struct dctx *d, const char *why)
+{
+    deconfigure(d, why);
+    memset(&d->cur, 0, sizeof(d->cur));
+}
+
+/* One DISCOVER/OFFER/REQUEST/ACK round. Returns 1 with the lease taken, 0 without, -1 to stop. */
+static int discover(struct dctx *d, int try)
+{
+    struct lease offer, ack;
+    struct msg q;
+    char a[16], s[16];
+    int t;
+
+    if (bpf_need(d) != 0)
+        return 0;
+    /* one xid for a run of tries, so an offer that took longer than one wait still counts */
+    if (try == 1)
+        new_xid(d);
+    memset(&q, 0, sizeof(q));
+    q.daemon = 1;
+    if (bpf_send(d, DHCPDISCOVER, &q) != 0)
+        return 0;
+    printf("sf-dhcp: DISCOVER sent (try %d)\n", try);
+    t = await(d, DHCPOFFER, &offer, 4);
+    if (t != DHCPOFFER)
+        return t < 0 ? -1 : 0;
+    printf("sf-dhcp: OFFER %s from %s\n", ipstr(offer.addr, a), ipstr(offer.server, s));
+    q.reqaddr = offer.addr;
+    q.server = offer.server;
+    if (bpf_send(d, DHCPREQUEST, &q) != 0)
+        return 0;
+    t = await(d, DHCPACK, &ack, 4);
+    if (t == DHCPNAK)
+        printf("sf-dhcp: server sent NAK\n");
+    if (t != DHCPACK)
+        return t < 0 ? -1 : 0;
+    if (ack.server == 0)
+        ack.server = offer.server;
+    accept_lease(d, &ack, "BOUND");
+    return 1;
+}
+
+/* How long to wait for an answer before asking again: half of what is left, at least `floor`. */
+static int retry_wait(const struct dctx *d, int64_t until)
+{
+    int64_t left = until - now_s(), w = left / 2;
+    int floor = d->renew_after != 0 || d->lease_cap != 0 ? 5 : 60;
+
+    if (w < floor)
+        w = floor;
+    if (w > left)
+        w = left;
+    if (w < 1)
+        w = 1;
+    return w > 3600 ? 3600 : (int)w;
+}
+
+static int daemon_main(struct dctx *d)
+{
+    struct sigaction sa;
+    int tries = 0;
+
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_signal;          /* no SA_RESTART: a blocked read returns */
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+
+    d->bpf = d->udp = -1;
+    snprintf(d->leasepath, sizeof(d->leasepath), "/var/run/sf-dhcp.%s.lease", d->ifname);
+    unlink(d->leasepath);
+    if (if_up(d->ifname) != 0)
+        printf("sf-dhcp: cannot mark %s up: %s\n", d->ifname, strerror(errno));
+    /* the interface may still be on its way: the driver loads its firmware after the root mounts */
+    for (int i = 0; get_mac(d->ifname, d->mac) != 0; i++) {
+        if (i == 0)
+            printf("sf-dhcp: waiting for a link address on %s\n", d->ifname);
+        if (nap(d, 2))
+            return 0;
+    }
+    d->xid = ((uint32_t)d->mac[2] << 24 | (uint32_t)d->mac[3] << 16 | (uint32_t)d->mac[4] << 8 | d->mac[5]) ^
+             (uint32_t)time(NULL) ^ ((uint32_t)getpid() << 8);
+    printf("sf-dhcp: %s %02x:%02x:%02x:%02x:%02x:%02x daemon pid %d", d->ifname, d->mac[0], d->mac[1], d->mac[2],
+           d->mac[3], d->mac[4], d->mac[5], (int)getpid());
+    if (d->renew_after != 0)
+        printf(" renew-after=%us", d->renew_after);
+    if (d->lease_cap != 0)
+        printf(" lease-cap=%us", d->lease_cap);
+    printf("\n");
+    d->state = S_INIT;
+
+    while (!should_stop(d)) {
+        switch (d->state) {
+        case S_NOLINK:
+            bpf_shut(d);
+            udp_shut(d);
+            if (!link_up(d->ifname)) {
+                nap(d, 2);
+                break;
+            }
+            if (d->cur.addr != 0 && now_s() < d->expiry) {
+                set_state(d, S_REBOOT, "link is back, confirming the address");
+            } else {
+                if (d->cur.addr != 0)
+                    drop_lease(d, "lease expired while the link was down");
+                tries = 0;
+                set_state(d, S_INIT, "link is up");
+            }
+            break;
+
+        case S_INIT: {
+            int rc;
+
+            if (!link_up(d->ifname)) {
+                set_state(d, S_NOLINK, "no link");
+                break;
+            }
+            rc = discover(d, ++tries);
+            if (rc > 0) {
+                tries = 0;
+                bpf_shut(d);
+                set_state(d, S_BOUND, "lease acquired");
+            } else if (rc == 0 && tries >= 6) {
+                /* six quick rounds as the one-shot does, then slower: 8, 16, 32, 60 seconds */
+                int wait = tries >= 9 ? 60 : 8 << (tries - 6);
+
+                if (tries == 6)
+                    printf("sf-dhcp: %s no lease yet, retrying more slowly\n", d->ifname);
+                for (int i = 0; i < wait && !should_stop(d) && link_up(d->ifname); i += 2)
+                    nap(d, 2);
+            } else if (rc == 0 && d->bpf < 0) {
+                nap(d, 2);
+            }
+            break;
+        }
+
+        case S_REBOOT: {
+            /* INIT-REBOOT: option 50 with the old address, no server identifier, ciaddr zero */
+            struct lease ack;
+            struct msg q;
+            int t = 0;
+
+            memset(&q, 0, sizeof(q));
+            q.daemon = 1;
+            q.reqaddr = d->cur.addr;
+            new_xid(d);
+            for (int i = 0; i < 2 && t == 0 && bpf_need(d) == 0; i++) {
+                if (bpf_send(d, DHCPREQUEST, &q) != 0) {
+                    nap(d, 1);
+                    continue;
+                }
+                t = await(d, DHCPACK, &ack, 4);
+            }
+            if (t < 0)
+                break;
+            if (t == DHCPACK) {
+                accept_lease(d, &ack, "REBOOTED");
+                bpf_shut(d);
+                set_state(d, S_BOUND, "address confirmed");
+            } else {
+                if (t == DHCPNAK)
+                    drop_lease(d, "NAK to INIT-REBOOT");
+                /* without an answer the configuration stays until DISCOVER says otherwise */
+                tries = 0;
+                set_state(d, S_INIT, t == DHCPNAK ? "address refused" : "no answer to INIT-REBOOT");
+            }
+            break;
+        }
+
+        case S_BOUND:
+            if (!link_up(d->ifname)) {
+                set_state(d, S_NOLINK, "link lost");
+            } else if (now_s() >= d->t1) {
+                new_xid(d);
+                set_state(d, S_RENEW, "T1 reached");
+            } else {
+                int64_t left = d->t1 - now_s();
+
+                nap(d, left < 2 ? (int)left : 2);
+            }
+            break;
+
+        case S_RENEW: {
+            /* REQUEST with ciaddr, unicast to the server that gave the lease */
+            struct lease ack;
+            struct msg q;
+            struct sockaddr_in to;
+            uint8_t frame[600];
+            size_t n;
+            int t, sent = 0, wait;
+
+            if (!link_up(d->ifname)) {
+                set_state(d, S_NOLINK, "link lost");
+                break;
+            }
+            if (now_s() >= d->t2) {
+                udp_shut(d);
+                set_state(d, S_REBIND, "T2 reached");
+                break;
+            }
+            memset(&q, 0, sizeof(q));
+            q.daemon = 1;
+            q.nobroadcast = 1;
+            q.ipsrc = d->cur.addr;
+            q.ciaddr = d->cur.addr;
+            n = build_msg(frame, d->mac, d->xid, DHCPREQUEST, &q);
+            /* the reply is also read from BPF, in case the socket never sees it */
+            bpf_need(d);
+            if (d->cur.server != 0 && udp_need(d) == 0) {
+                sa_in(&to, d->cur.server);
+                to.sin_port = htons(67);
+                if (sendto(d->udp, frame + 42, n - 42, 0, (struct sockaddr *)&to, sizeof(to)) == (ssize_t)(n - 42))
+                    sent = 1;
+                else
+                    printf("sf-dhcp: renew sendto: %s\n", strerror(errno));
+            }
+            if (!sent) {
+                /* no usable socket or server address: ask everyone now instead of waiting for T2 */
+                udp_shut(d);
+                set_state(d, S_REBIND, "cannot renew by unicast");
+                break;
+            }
+            wait = retry_wait(d, d->t2);
+            for (t = 0; t == 0 && wait > 0 && link_up(d->ifname); wait -= 2)
+                t = await(d, DHCPACK, &ack, wait < 2 ? wait : 2);
+            if (t < 0)
+                break;
+            if (t == DHCPACK) {
+                accept_lease(d, &ack, "RENEWED");
+                udp_shut(d);
+                bpf_shut(d);
+                set_state(d, S_BOUND, "lease renewed");
+            } else if (t == DHCPNAK) {
+                drop_lease(d, "NAK to renewal");
+                tries = 0;
+                set_state(d, S_INIT, "lease refused");
+            }
+            break;
+        }
+
+        case S_REBIND: {
+            /* the same REQUEST to everyone; the answer still comes to the address held */
+            struct lease ack;
+            struct msg q;
+            int t, wait;
+
+            if (!link_up(d->ifname)) {
+                set_state(d, S_NOLINK, "link lost");
+                break;
+            }
+            if (now_s() >= d->expiry) {
+                drop_lease(d, "lease expired");
+                tries = 0;
+                set_state(d, S_INIT, "lease expired");
+                break;
+            }
+            memset(&q, 0, sizeof(q));
+            q.daemon = 1;
+            q.nobroadcast = 1;
+            q.ipsrc = d->cur.addr;
+            q.ciaddr = d->cur.addr;
+            if (bpf_need(d) != 0 || bpf_send(d, DHCPREQUEST, &q) != 0) {
+                nap(d, 2);
+                break;
+            }
+            wait = retry_wait(d, d->expiry);
+            for (t = 0; t == 0 && wait > 0 && link_up(d->ifname); wait -= 2)
+                t = await(d, DHCPACK, &ack, wait < 2 ? wait : 2);
+            if (t < 0)
+                break;
+            if (t == DHCPACK) {
+                accept_lease(d, &ack, "REBOUND");
+                bpf_shut(d);
+                set_state(d, S_BOUND, "lease rebound");
+            } else if (t == DHCPNAK) {
+                drop_lease(d, "NAK to rebind");
+                tries = 0;
+                set_state(d, S_INIT, "lease refused");
+            }
+            break;
+        }
+
+        default:
+            d->state = S_INIT;
+            break;
+        }
+    }
+    /* the address stays configured: a restarted daemon is offered the same one */
+    printf("sf-dhcp: %s daemon stopping in state %s\n", d->ifname, dnames[d->state]);
+    unlink(d->leasepath);
+    bpf_shut(d);
+    udp_shut(d);
+    return 0;
+}
+
+static void usage(void)
+{
+    fprintf(stderr, "usage: sf-dhcp [--up] [IFNAME]\n"
+                    "       sf-dhcp --daemon [--renew-after SECONDS] [--lease-cap SECONDS] [--exit-with-parent] [IFNAME]\n");
+}
+
+int main(int argc, char **argv)
+{
+    static struct dctx d;
+    const char *ifname = "en0";
+    int uponly = 0, daemon_mode = 0, i;
+
+    for (i = 1; i < argc && strncmp(argv[i], "--", 2) == 0; i++) {
+        if (strcmp(argv[i], "--up") == 0) {
+            uponly = 1;
+        } else if (strcmp(argv[i], "--daemon") == 0) {
+            daemon_mode = 1;
+        } else if (strcmp(argv[i], "--exit-with-parent") == 0) {
+            d.parent = getppid();
+        } else if (strcmp(argv[i], "--renew-after") == 0 && i + 1 < argc) {
+            d.renew_after = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else if (strcmp(argv[i], "--lease-cap") == 0 && i + 1 < argc) {
+            d.lease_cap = (uint32_t)strtoul(argv[++i], NULL, 10);
+        } else {
+            usage();
+            return 2;
+        }
+    }
+    if (i < argc)
+        ifname = argv[i];
+
+    if (daemon_mode && !uponly) {
+        d.ifname = ifname;
+        return daemon_main(&d);
+    }
+    if (if_up(ifname) != 0)
+        fprintf(stderr, "sf-dhcp: cannot mark %s up: %s\n", ifname, strerror(errno));
+    if (uponly) {
+        printf("sf-dhcp: %s marked up\n", ifname);
+        return 0;
+    }
+    return oneshot(ifname);
+}

@@ -1,0 +1,20 @@
+SiliconForest QEMU loop: publish /dev/usb_hid_kbd for a generic USB HID keyboard.
+
+On the arm64 `virt` target QEMU's usb-kbd is driven by SFUSBHIDDevice (probe score 6000, above
+the boot-keyboard personality whose start() publishes the node). It registers an LED handler,
+which runs sf_hid_kbd_setup() and so sets gKbdLock, and from then on SFHIDPushKeyboardEvent()
+never calls SFHIDPublishKeyboardDevice(): keys reach the console, but /dev/usb_hid_kbd never
+exists (the mouse path publishes on its first event, so /dev/usb_hid_mouse does). Publish
+while there is no node, as the mouse path does.
+
+--- a/src/Kernel/Extensions/IOHIDFamily/IOHIDSystem/SFHIDEventQueue.cpp
++++ b/src/Kernel/Extensions/IOHIDFamily/IOHIDSystem/SFHIDEventQueue.cpp
+@@ -541,7 +541,7 @@
+     UInt32 slot;
+     bool kick;
+ 
+-    if (!gKbdLock) SFHIDPublishKeyboardDevice();
++    if (!gKbdLock || !gKbdNode) SFHIDPublishKeyboardDevice();
+     if (!sf_hid_kbd_setup()) return;
+ 
+     event.sequence = ++gKbdSequence;

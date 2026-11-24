@@ -1,0 +1,86 @@
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -1589,6 +1589,20 @@
+     }
+ }
+ 
++static struct wsWindow *popupParentFor(struct wsWindow *window);
++
++/* (TERM10, FX-022) The desk takes linux-dmabuf buffers for toplevels only: a popup's or a layer surface's buffer is
++ * read as shared memory, and a dma-buf there was refused ("SHM access failed: NotManaged"), so Firefox's menu panel
++ * (a popup with GPU layers) never appeared. Such windows present through the CPU frames. */
++static int sfGPURoleTakesDmabuf(struct wsWindow *window){
++    uint32_t layer;
++    if(window->popup!=NULL||window->layerSurface!=NULL||window->surfaceRole==WS_ROLE_POPUP||window->surfaceRole==WS_ROLE_LAYER)return 0;
++    if(window->toplevel!=NULL)return 1;
++    // not shown yet: the role its level will give it
++    if(layerForWindowLevel(window->level,&layer))return 0;
++    return !(window->level==kWSPopUpMenuLevel&&!wsStyleWantsServerFrame(window->style));
++}
++
+ // copies what AppKit has finished drawing into a free frame and puts it on the surface, the caller commits
+ static int windowPresent(struct wsWindow *window) {
+     pthread_mutex_lock(&ws.pixelsLock);
+@@ -1598,7 +1612,7 @@
+     }
+ 
+     windowTrimFrames(window);
+-    int gpu=window->gpuPresenter&&!window->gpuPresenter->failed&&window->gpuPresenter->count>0&&ws.dmabuf;
++    int gpu=window->gpuPresenter&&!window->gpuPresenter->failed&&window->gpuPresenter->count>0&&ws.dmabuf&&sfGPURoleTakesDmabuf(window);
+     struct wsFrame *frame = windowFreeFrame(window, window->pixelsW, window->pixelsH, gpu);
+     if (frame == NULL) {
+         pthread_mutex_unlock(&ws.pixelsLock);
+@@ -3000,6 +3014,16 @@
+     best = windowForID(ws.pointerWindowID);
+     if (best == NULL || best == window || best->xdgSurface == NULL || !best->attached)
+         best = windowForID(ws.focusWindowID);
++    /* (TERM10, FX-022) the pointer can be on the popup itself and the keyboard nowhere of ours (Firefox's menu
++     * panel, shown again): a menu is still a popup, of the application's active window or any mapped window of it.
++     * Made a toplevel instead it was placed and focused as a window (its parent lost the keyboard and Firefox closed
++     * the menu at once) and later changed role again on a fresh surface. */
++    if (best == NULL || best == window || best->xdgSurface == NULL || !best->attached)
++        best = windowForID(ws.activeAppWindowID);
++    if (best == NULL || best == window || best->xdgSurface == NULL || !best->attached || best->toplevel == NULL)
++        for (best = ws.windows; best != NULL; best = best->next)
++            if (best != window && best->toplevel != NULL && best->attached && best->state != HIDDEN && best->state != MINIMIZED)
++                break;
+     if (best == NULL || best == window || best->xdgSurface == NULL || !best->attached)
+         return NULL;
+     return best;
+@@ -3651,7 +3675,10 @@
+                  * altogether, and the next flush makes a new one where the
+                  * window then is. */
+                 windowUnmap(window);
+-                if (window->popup != NULL) {
++                /* (TERM10) a menu-level window that had to be a toplevel (no window of ours was up) does not keep
++                 * that role: its next showing is a popup again if it can be */
++                if (window->popup != NULL || (window->toplevel != NULL && window->level == kWSPopUpMenuLevel &&
++                                              !wsStyleWantsServerFrame(window->style))) {
+                     windowDestroyRole(window);
+                     window->configured = 0;
+                     // what it shows next has to be drawn and flushed after this
+@@ -4798,12 +4825,24 @@
+     if(!enabled||strcmp(enabled,"1")||!ensureConnected()||!ws.dmabuf)return 0;
+     pthread_mutex_lock(&ws.pixelsLock);
+     struct wsWindow *window=windowForID(windowID);int good=0;
++    // (TERM10) a window the compositor shows as a popup or layer surface takes only shared-memory buffers: AppKit
++    // reads such a window's layers back into its backing store instead
++    if(window&&!sfGPURoleTakesDmabuf(window)){pthread_mutex_unlock(&ws.pixelsLock);return 0;}
+     if(window){
+         if(!window->gpuPresenter&&surface)window->gpuPresenter=sfGPUCreate();
+         good=sfGPUSetLayer(window->gpuPresenter,key,surface,sx,sy,sw,sh,dx,dy,dw,dh);
+     }
+     pthread_mutex_unlock(&ws.pixelsLock);return good;
+ }
++// (TERM10) whether a window's layers can go to the GPU presenter at all (no: a popup or layer surface, which the desk
++// takes as shared memory only): AppKit asks before it copies a frame for it, and reads the layers back instead
++int _windowServerSFFXTakesGPULayers(int windowID){
++    const char *enabled=getenv("SFFX_GPU_PRESENT");
++    if(!enabled||strcmp(enabled,"1")||!ensureConnected()||!ws.dmabuf)return 0;
++    pthread_mutex_lock(&ws.pixelsLock);
++    struct wsWindow *window=windowForID(windowID);int good=window&&sfGPURoleTakesDmabuf(window);
++    pthread_mutex_unlock(&ws.pixelsLock);return good;
++}
+ int _windowServerSFFXGPUStats(int windowID,uint64_t values[4]){
+     pthread_mutex_lock(&ws.pixelsLock);
+     struct wsWindow *window=windowForID(windowID);int good=window&&window->gpuPresenter;

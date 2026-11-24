@@ -1,0 +1,2369 @@
+--- a/src/Frameworks/AppKit/SFCUIPrivate.h
++++ b/src/Frameworks/AppKit/SFCUIPrivate.h
+@@ -159,13 +159,17 @@
+ } cui_bitmap;
+ 
+ 
++bool cui_csi_decode_bitmap(const cui_csi *c, cui_bitmap *out);
+ /* raw data ('DWAR'), decompressed when it is LZFSE; malloc'd */
++uint8_t *cui_csi_raw_data(const cui_csi *c, size_t *len);
+ 
+ /* colour ('COLR'): the colour space id, components (up to 8) and the system colour name, if any */
+ bool cui_csi_color(const cui_csi *c, unsigned *space, double *comps, unsigned *ncomps, char *sysname, size_t sysname_len);
+ /* an internal link ('INLK'): the atlas key's attributes and the frame in it */
++bool cui_csi_link(const cui_csi *c, cui_key *key, uint32_t frame[4], unsigned *layout);
+ 
+ /* the image layout a bitmap rendition had before packing (the CSI's own when not linked) */
++unsigned cui_csi_image_layout(const cui_csi *c);
+ 
+ 
+ /* MARK: Codecs */
+--- a/src/Frameworks/AppKit/SFCUIRendition.m
++++ b/src/Frameworks/AppKit/SFCUIRendition.m
+@@ -1,6 +1,9 @@
+ /* SPDX-License-Identifier: MIT OR Apache-2.0 */
+ /* Taken from Finch (userland/CoreUI/CUIRendition.c, commit 2d9b1bb) for this AppKit's named colours from an
+-   application's asset catalog (docs/roadmap/issues/SF-AA-activity-monitor.md, "Taken from Finch"). Only cui_csi_parse, cui_csi_tlv and cui_csi_color. */
++   application's asset catalog (docs/roadmap/issues/SF-AA-activity-monitor.md, "Taken from Finch"). cui_csi_parse, cui_csi_tlv
++   and cui_csi_color (cocoa 0105); since cocoa 0111 also the bitmaps (uncompressed, RLE, zip, LZVN, LZFSE, deepmap2), raw
++   data, internal links and the image layout, unchanged but for zlib and libcompression, which are looked up at run time
++   (SFCUICodecs.h): this AppKit does not link them. */
+ /*
+  * CSI renditions, the values of a catalog's RENDITIONS tree (little-endian):
+  *
+@@ -20,6 +23,8 @@
+  * atlas carry no payload but an "INLK" TLV naming the atlas and the frame.
+  */
+ #include "SFCUIPrivate.h"
++#include "SFCUICodecs.h"
++#include <stdlib.h>
+ #include <string.h>
+ 
+ static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+@@ -88,3 +93,244 @@
+ 	}
+ 	return true;
+ }
++
++/* MARK: - Bitmaps (cocoa 0111) */
++
++static unsigned
++format_bpp(uint32_t f)
++{
++	switch (f) {
++	case CUI_FOURCC('A', 'R', 'G', 'B'): return 4;
++	case CUI_FOURCC('G', 'A', '8', ' '): return 2;
++	case CUI_FOURCC('R', 'G', 'B', 'W'): return 8;
++	case CUI_FOURCC('G', 'A', '1', '6'): return 4;
++	}
++	return 0;
++}
++
++/* Apple's run-length rows: a u32 per run, high bit set for a repeated element, low 24 bits the count. */
++static bool
++rle_row(const uint8_t *p, const uint8_t *end, uint8_t *dst, size_t count, unsigned esize)
++{
++	size_t x = 0;
++	while (x < count) {
++		if (end - p < 4)
++			return false;
++		uint32_t ctl = rd32(p);
++		size_t n = ctl & 0xffffff;
++		p += 4;
++		if (n > count - x)
++			n = count - x;
++		if (ctl & 0x80000000u) {
++			if ((size_t)(end - p) < esize)
++				return false;
++			for (size_t i = 0; i < n; i++)
++				memcpy(dst + (x + i) * esize, p, esize);
++			p += esize;
++		} else {
++			if ((size_t)(end - p) < n * esize)
++				return false;
++			memcpy(dst + x * esize, p, n * esize);
++			p += (ctl & 0xffffff) * (size_t)esize;
++		}
++		x += n;
++	}
++	return true;
++}
++
++static bool
++rle_decode(const uint8_t *src, size_t len, uint8_t *dst, size_t rowbytes, size_t rows)
++{
++	if (len < 12)
++		return false;
++	uint32_t type = rd32(src), w = rd32(src + 4), h = rd32(src + 8);
++	unsigned esize = type < 3 ? 1 : type == 3 ? 2 : 4;
++	size_t count = type == 6 ? 4 * (size_t)w : type == 5 ? 2 * (size_t)w : w;
++	if (h < rows || 12 + 4 * (size_t)h > len || count * esize > rowbytes)
++		return false;
++	for (size_t y = 0; y < rows; y++) {
++		uint32_t off = rd32(src + 12 + 4 * y);
++		if (off >= len || !rle_row(src + off, src + len, dst + y * rowbytes, count, esize))
++			return false;
++	}
++	return true;
++}
++
++static bool
++inflate_all(const uint8_t *src, size_t len, uint8_t *dst, size_t n)
++{
++	z_stream z;
++	memset(&z, 0, sizeof z);
++	if (inflateInit2(&z, 15 + 32) != Z_OK)  /* gzip or zlib */
++		return false;
++	z.next_in = (Bytef *)src, z.avail_in = (uInt)len;
++	z.next_out = dst, z.avail_out = (uInt)n;
++	int r = inflate(&z, Z_FINISH);
++	size_t got = n - z.avail_out;
++	inflateEnd(&z);
++	return (r == Z_STREAM_END || r == Z_OK || r == Z_BUF_ERROR) && got == n;
++}
++
++/* One block of rows, compressed as the CELM header says. */
++/* Rows stored srcrow bytes apart (the rendition's row bytes) into rows rowbytes apart. */
++static bool
++unpad(const uint8_t *src, size_t srcrow, uint8_t *dst, size_t rowbytes, size_t rows)
++{
++	for (size_t y = 0; y < rows; y++)
++		memmove(dst + y * rowbytes, src + y * srcrow, rowbytes);
++	return true;
++}
++
++static bool
++decode_block(uint32_t comp, const uint8_t *src, size_t len, uint8_t *dst, size_t rowbytes, size_t srcrow, size_t w,
++             size_t rows, unsigned bpp)
++{
++	size_t n = srcrow * rows;
++	bool ok;
++	uint8_t *tmp;
++	switch (comp) {
++	case 0:  /* uncompressed */
++		return len >= n && unpad(src, srcrow, dst, rowbytes, rows);
++	case 1:  /* RLE */
++		return rle_decode(src, len, dst, rowbytes, rows);
++	case 2:  /* zip */
++	case 3:  /* LZVN */
++	case 4:  /* LZFSE */
++		if (!(tmp = malloc(n ? n : 1)))
++			return false;
++		ok = comp == 2 ? inflate_all(src, len, tmp, n) : cui_lz_decode(src, len, tmp, n);
++		if (ok)
++			unpad(tmp, srcrow, dst, rowbytes, rows);
++		free(tmp);
++		return ok;
++	case 11:  /* deepmap2, behind a 16-byte header: version, format, length, 0 */
++		if (len < 16 || rd32(src) >= 2)
++			return false;
++		{
++			size_t dl = rd32(src + 8) <= len - 16 ? rd32(src + 8) : len - 16;
++			return cui_deepmap2_decode(src + 16, dl, dst, rowbytes, w, rows);
++		}
++	}
++	return false;
++}
++
++bool
++cui_csi_decode_bitmap(const cui_csi *c, cui_bitmap *out)
++{
++	memset(out, 0, sizeof *out);
++	unsigned bpp = format_bpp(c->pixel_format);
++	if (!bpp || !c->width || !c->height || c->data_len < 16 || memcmp(c->data, "MLEC", 4) != 0)
++		return false;
++	uint32_t flags = rd32(c->data + 4), comp = rd32(c->data + 8), length = rd32(c->data + 12);
++	size_t w = c->width, h = c->height, rowbytes = w * bpp, srcrow = rowbytes;
++	uint32_t tl;
++	const uint8_t *t = cui_csi_tlv(c, CUI_TLV_ROWBYTES, &tl);  /* stored rows may be padded */
++	if (t && tl >= 4 && rd32(t) >= rowbytes)
++		srcrow = rd32(t);
++	uint8_t *px = calloc(h, rowbytes);
++	if (!px)
++		return false;
++	const uint8_t *p = c->data + 16, *end = c->data + c->data_len;
++	bool ok = true;
++	if (flags & 1) {  /* chunks of rows: "KCBC", 0, 0, rows, length */
++		size_t y = 0;
++		for (uint32_t i = 0; ok && i < length && y < h; i++) {
++			if (end - p < 20 || memcmp(p, "KCBC", 4) != 0) {
++				ok = false;
++				break;
++			}
++			size_t rows = rd32(p + 12), cl = rd32(p + 16);
++			if (cl > (size_t)(end - p - 20) || rows > h - y)
++				ok = false;
++			else
++				ok = decode_block(comp, p + 20, cl, px + y * rowbytes, rowbytes, srcrow, w, rows, bpp);
++			y += rows;
++			p += 20 + cl;
++		}
++		ok = ok && y == h;
++	} else {
++		size_t l = length <= (size_t)(end - p) ? length : (size_t)(end - p);
++		ok = decode_block(comp, p, l, px, rowbytes, srcrow, w, h, bpp);
++	}
++	if (!ok) {
++		free(px);
++		return false;
++	}
++	out->pixels = px, out->width = w, out->height = h, out->rowbytes = rowbytes, out->bpp = bpp;
++	out->format = c->pixel_format;
++	out->opaque = (flags >> 1) & 1;
++	out->native = comp == 0;
++	return true;
++}
++
++/* MARK: - Raw data, links */
++
++uint8_t *
++cui_csi_raw_data(const cui_csi *c, size_t *len)
++{
++	if (c->data_len < 12 || memcmp(c->data, "DWAR", 4) != 0)
++		return NULL;
++	uint32_t flags = rd32(c->data + 4), l = rd32(c->data + 8);
++	if (l > c->data_len - 12)
++		l = c->data_len - 12;
++	const uint8_t *src = c->data + 12;
++	if ((flags & 1) && l >= 4 && memcmp(src, "bvx", 3) == 0) {  /* LZFSE */
++		for (size_t cap = 4 * (size_t)l + 4096; cap < ((size_t)1 << 31); cap *= 4) {
++			uint8_t *out = malloc(cap);
++			if (!out)
++				return NULL;
++			size_t n = compression_decode_buffer(out, cap, src, l, NULL, COMPRESSION_LZFSE);
++			if (n && n < cap) {
++				*len = n;
++				return out;
++			}
++			free(out);
++			if (!n)
++				return NULL;
++		}
++		return NULL;
++	}
++	uint8_t *out = malloc(l ? l : 1);
++	if (out) {
++		memcpy(out, src, l);
++		*len = l;
++	}
++	return out;
++}
++
++/* "RLOC", version, colour space (u8), flags (u8: 1 = system colour name follows), 0, count, doubles[count],
++ * then for a system colour: "RLOC", 1, name length, name. */
++/* "KLNI" (INLK), 0, the frame (x, y, width, height), u16 layout, u32 key length, (attribute, value) u16 pairs */
++bool
++cui_csi_link(const cui_csi *c, cui_key *key, uint32_t frame[4], unsigned *layout)
++{
++	uint32_t l;
++	const uint8_t *p = cui_csi_tlv(c, CUI_TLV_LINK, &l);
++	if (!p || l < 30 || memcmp(p, "KLNI", 4) != 0)
++		return false;
++	for (int i = 0; i < 4; i++)
++		frame[i] = rd32(p + 8 + 4 * i);
++	if (layout)
++		*layout = rd16(p + 24);
++	uint32_t kl = rd32(p + 26);
++	if (kl > l - 30)
++		kl = l - 30;
++	memset(key, 0, sizeof *key);
++	for (uint32_t o = 0; o + 4 <= kl; o += 4) {
++		uint16_t a = rd16(p + 30 + o), v = rd16(p + 32 + o);
++		if (a && a < CUI_ATTR_MAX)
++			key->v[a] = v;
++	}
++	return true;
++}
++
++unsigned
++cui_csi_image_layout(const cui_csi *c)
++{
++	cui_key k;
++	uint32_t f[4];
++	unsigned layout;
++	if (c->layout == CUI_LAYOUT_INTERNAL_LINK && cui_csi_link(c, &k, f, &layout))
++		return layout;
++	return c->layout;
++}
+--- a/src/Frameworks/AppKit/SFCUICodecs.h
++++ b/src/Frameworks/AppKit/SFCUICodecs.h
+@@ -0,0 +1,63 @@
++/* SPDX-License-Identifier: MIT
++ * SiliconForest (cocoa 0111): the two codec libraries the asset catalog's bitmaps need, found at run time
++ * (this AppKit is not linked against them, and a root without /usr/lib/libcompression.dylib still runs:
++ * its compressed images are then not read). zlib's types come from the SDK's header; libcompression's
++ * names and values are macOS's public ones.
++ */
++#ifndef SFCUICODECS_H
++#define SFCUICODECS_H
++#include <dlfcn.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <zlib.h>
++
++typedef enum {
++    COMPRESSION_LZ4 = 0x100,
++    COMPRESSION_ZLIB = 0x205,
++    COMPRESSION_LZMA = 0x306,
++    COMPRESSION_LZ4_RAW = 0x101,
++    COMPRESSION_BROTLI = 0xB02,
++    COMPRESSION_LZFSE = 0x801,
++    COMPRESSION_LZBITMAP = 0x702,
++} compression_algorithm;
++
++static inline void *sf_cui_symbol(const char *library, const char *name)
++{
++    void *h = dlopen(library, RTLD_LAZY | RTLD_LOCAL);
++    return h ? dlsym(h, name) : NULL;
++}
++
++static inline size_t sf_compression_decode_buffer(uint8_t *dst, size_t dst_size, const uint8_t *src, size_t src_size,
++                                                  void *scratch, compression_algorithm algorithm)
++{
++    static size_t (*fn)(uint8_t *, size_t, const uint8_t *, size_t, void *, compression_algorithm);
++    static int looked;
++    if (!looked) {
++        fn = (size_t (*)(uint8_t *, size_t, const uint8_t *, size_t, void *, compression_algorithm))
++            sf_cui_symbol("/usr/lib/libcompression.dylib", "compression_decode_buffer");
++        looked = 1;
++    }
++    return fn ? fn(dst, dst_size, src, src_size, scratch, algorithm) : 0;
++}
++#define compression_decode_buffer sf_compression_decode_buffer
++
++static inline int sf_inflateInit2_(z_streamp strm, int windowBits, const char *version, int stream_size)
++{
++    int (*fn)(z_streamp, int, const char *, int) = (int (*)(z_streamp, int, const char *, int))sf_cui_symbol("/usr/lib/libz.1.dylib", "inflateInit2_");
++    return fn ? fn(strm, windowBits, version, stream_size) : Z_VERSION_ERROR;
++}
++static inline int sf_inflate(z_streamp strm, int flush)
++{
++    int (*fn)(z_streamp, int) = (int (*)(z_streamp, int))sf_cui_symbol("/usr/lib/libz.1.dylib", "inflate");
++    return fn ? fn(strm, flush) : Z_STREAM_ERROR;
++}
++static inline int sf_inflateEnd(z_streamp strm)
++{
++    int (*fn)(z_streamp) = (int (*)(z_streamp))sf_cui_symbol("/usr/lib/libz.1.dylib", "inflateEnd");
++    return fn ? fn(strm) : Z_STREAM_ERROR;
++}
++#undef inflateInit2
++#define inflateInit2(strm, windowBits) sf_inflateInit2_((strm), (windowBits), ZLIB_VERSION, (int)sizeof(z_stream))
++#define inflate sf_inflate
++#define inflateEnd sf_inflateEnd
++#endif
+--- a/src/Frameworks/AppKit/SFCUIDeepmap.m
++++ b/src/Frameworks/AppKit/SFCUIDeepmap.m
+@@ -0,0 +1,352 @@
++/* SPDX-License-Identifier: MIT OR Apache-2.0 */
++/* Taken from Finch (userland/CoreUI/CUIDeepmap.c, commit 2d9b1bb), unchanged but for its includes (libcompression through
++   SFCUICodecs.h), for this AppKit's images from an application's asset catalog (cocoa 0111; docs/roadmap/issues/
++   SF-AA-activity-monitor.md, "Taken from Finch"). */
++/*
++ * Deepmap2: the lossless image codec actool uses for most bitmaps in compiled
++ * asset catalogs (CSI compression type 11). Written from Finch's own analysis
++ * of real catalogs; docs/design/ASSETS.md describes the format.
++ *
++ * A stream is a 12-byte header ("dmp2", encoding, flag, 10, pixel format,
++ * tile width and height as u16), a palette for the palette encoding, then
++ * each tile as a u32 length and its bytes, left to right, top to bottom.
++ * Encodings:
++ *   1 none      the pixels, untiled
++ *   2 default   per-pixel alpha plane, a predictor per row, and the colour as
++ *               reversible YCoCg (gray: Y) in 16-bit residuals split into a
++ *               high-byte and a low-byte plane, all LZVN or LZFSE compressed
++ *   3 lossless  the pixels, LZVN or LZFSE compressed
++ *   4 palette   up to 256 colours and a byte per pixel (plus an alpha plane
++ *               when the entries are 3 bytes), LZVN or LZFSE compressed
++ * Small payloads (under 4 KiB decoded) are raw LZVN streams; larger ones are
++ * LZFSE ("bvx2"). Raw LZVN is decoded by wrapping it in an LZFSE "bvxn"
++ * block, which every libcompression understands.
++ */
++#include "SFCUIPrivate.h"
++#include "SFCUICodecs.h"
++#include <stdlib.h>
++#include <string.h>
++
++enum { DM_NONE = 1, DM_DEFAULT = 2, DM_LOSSLESS = 3, DM_PALETTE = 4 };
++
++/* Bytes per pixel of the formats: gray, gray+alpha, RGB, RGBA in 8 bits and in half floats. */
++static unsigned
++dm_pixel_size(unsigned fmt)
++{
++	switch (fmt) {
++	case 1: return 1;
++	case 2: return 2;
++	case 3: return 3;
++	case 4: return 4;
++	case 17: return 2;
++	case 18: return 4;
++	case 19: return 6;
++	case 20: return 8;
++	}
++	return 0;
++}
++
++static bool dm_has_alpha(unsigned fmt) { return fmt == 2 || fmt == 4 || fmt == 18 || fmt == 20; }
++static bool dm_is_gray(unsigned fmt) { return fmt == 1 || fmt == 2 || fmt == 17 || fmt == 18; }
++
++static uint16_t rd16(const uint8_t *p) { return (uint16_t)(p[0] | p[1] << 8); }
++static uint32_t rd32(const uint8_t *p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
++
++/* Decode an LZVN (raw) or LZFSE (bvx-framed) payload of exactly n bytes. */
++bool
++cui_lz_decode(const uint8_t *src, size_t srclen, uint8_t *dst, size_t n)
++{
++	if (srclen >= 4 && src[0] == 'b' && src[1] == 'v' && src[2] == 'x')
++		return compression_decode_buffer(dst, n, src, srclen, NULL, COMPRESSION_LZFSE) == n;
++	/* raw LZVN: frame it as one "bvxn" block */
++	uint8_t *blk = malloc(srclen + 16);
++	if (!blk)
++		return false;
++	memcpy(blk, "bvxn", 4);
++	uint32_t w = (uint32_t)n, l = (uint32_t)srclen;
++	for (int i = 0; i < 4; i++)
++		blk[4 + i] = (uint8_t)(w >> (8 * i)), blk[8 + i] = (uint8_t)(l >> (8 * i));
++	memcpy(blk + 12, src, srclen);
++	memcpy(blk + 12 + srclen, "bvx$", 4);
++	/* one spare byte: a decoder that fills the buffer exactly reports n */
++	uint8_t *tmp = malloc(n + 1);
++	size_t got = tmp ? compression_decode_buffer(tmp, n + 1, blk, srclen + 16, NULL, COMPRESSION_LZFSE) : 0;
++	if (got == n)
++		memcpy(dst, tmp, n);
++	free(tmp);
++	free(blk);
++	return got == n;
++}
++
++typedef struct {
++	unsigned fmt, encoding, flag, depth;
++	unsigned tile_w, tile_h;
++	unsigned npal, pal_entry;
++	uint8_t pal[256 * 4];
++} dm_header;
++
++/* MARK: - Default encoding */
++
++/* The 16-bit values of one row from the high- and low-byte planes, sign in the low bit. */
++static void
++row_values(int16_t *out, size_t n, const uint8_t *hi, const uint8_t *lo)
++{
++	for (size_t i = 0; i < n; i++) {
++		unsigned v = (unsigned)lo[i] | (unsigned)hi[i] << 8;
++		int m = (int)(v >> 1);
++		out[i] = (int16_t)((lo[i] & 1) ? -m : m);
++	}
++}
++
++/* Undo the row predictor: 0 none, 1 Paeth (chosen on the first channel), 2 left, 3 up, 4 mean. */
++static void
++unpredict(int pred, const int16_t *res, const int16_t *prev, int16_t *out, size_t n)
++{
++	switch (pred) {
++	case 1:
++		for (size_t i = 0; i < 3 && i < n; i++)
++			out[i] = (int16_t)(res[i] + prev[i]);
++		for (size_t i = 3; i + 2 < n; i += 3) {
++			int a = out[i - 3], b = prev[i], c = prev[i - 3];
++			int pa = abs(b - c), pb = abs(a - c);
++			const int16_t *src = pa > pb ? prev + i : out + i - 3;
++			out[i] = (int16_t)(res[i] + (pa > pb ? b : a));
++			out[i + 1] = (int16_t)(res[i + 1] + src[1]);
++			out[i + 2] = (int16_t)(res[i + 2] + src[2]);
++		}
++		break;
++	case 2:
++		for (size_t i = 0; i < n; i++)
++			out[i] = (int16_t)(res[i] + (i >= 3 ? out[i - 3] : 0));
++		break;
++	case 3:
++		for (size_t i = 0; i < n; i++)
++			out[i] = (int16_t)(res[i] + prev[i]);
++		break;
++	case 4:
++		for (size_t i = 0; i < n; i++) {
++			if (i < 3) {
++				out[i] = (int16_t)(res[i] + prev[i]);
++				continue;
++			}
++			int t = out[i - 3] + prev[i] + 1;
++			t += (int)((unsigned)t >> 31);
++			out[i] = (int16_t)(res[i] + (t >> 1));
++		}
++		break;
++	default:
++		memcpy(out, res, n * sizeof *out);
++		break;
++	}
++}
++
++/* Reversible YCoCg to the stored channel order; chroma is kept halved when the stream's flag is set. */
++static inline void
++ycocg(const int16_t *ycc, unsigned shift, int *c0, int *c1, int *c2)
++{
++	int y = ycc[0];
++	int co = (int)((uint16_t)ycc[1]) << shift, cg = (int)((uint16_t)ycc[2]) << shift;
++	int hcg = (int16_t)(cg + ((cg & 0x8000) >> 15)) >> 1;
++	int t = y - hcg;
++	int g = cg + t;
++	int hco = (int16_t)(co + ((co & 0x8000) >> 15)) >> 1;
++	int b = t - hco;
++	*c0 = b + co, *c1 = g, *c2 = b;
++}
++
++static uint16_t
++half(float f)
++{
++	_Float16 h = (_Float16)f;
++	uint16_t u;
++	memcpy(&u, &h, 2);
++	return u;
++}
++
++static void
++convert_row(const dm_header *h, const uint8_t *alpha, const int16_t *ycc, uint8_t *dst, size_t w)
++{
++	unsigned shift = h->flag ? 1 : 0;
++	float k = 1.0f / (float)(1u << (h->depth - 1));
++	for (size_t x = 0; x < w; x++, ycc += 3) {
++		int c0, c1, c2;
++		switch (h->fmt) {
++		case 1: dst[x] = (uint8_t)ycc[0]; break;
++		case 2:
++			dst[2 * x] = (uint8_t)ycc[0];
++			dst[2 * x + 1] = alpha[x];
++			break;
++		case 3:
++		case 4: {
++			ycocg(ycc, shift, &c0, &c1, &c2);
++			uint8_t *p = dst + x * (h->fmt == 4 ? 4 : 3);
++			p[0] = (uint8_t)c0, p[1] = (uint8_t)c1, p[2] = (uint8_t)c2;
++			if (h->fmt == 4)
++				p[3] = alpha[x];
++			break;
++		}
++		case 17:
++		case 18: {
++			uint16_t *p = (uint16_t *)(dst + x * (h->fmt == 18 ? 4 : 2));
++			p[0] = half((float)ycc[0] * k);
++			if (h->fmt == 18) {
++				float a = (float)alpha[x] * (1.0f / 255);
++				p[1] = half(a >= 1 ? 1 : a);
++			}
++			break;
++		}
++		default: { /* 19, 20 */
++			ycocg(ycc, shift, &c0, &c1, &c2);
++			uint16_t *p = (uint16_t *)(dst + x * (h->fmt == 20 ? 8 : 6));
++			p[0] = half((float)(int16_t)c0 * k);
++			p[1] = half((float)(int16_t)c1 * k);
++			p[2] = half((float)(int16_t)c2 * k);
++			if (h->fmt == 20) {
++				float a = (float)alpha[x] * (1.0f / 255);
++				p[3] = half(a >= 1 ? 1 : a);
++			}
++			break;
++		}
++		}
++	}
++}
++
++static bool
++decode_default(const dm_header *h, const uint8_t *src, size_t len, uint8_t *dst, size_t rowbytes, size_t w, size_t hgt)
++{
++	size_t planes = dm_is_gray(h->fmt) ? 1 : 3;
++	size_t asize = dm_has_alpha(h->fmt) ? w * hgt : 0;
++	size_t raw = asize + hgt + 2 * planes * w * hgt;
++	size_t rawpad = (raw + 15) & ~(size_t)15;
++	uint8_t *buf = malloc(rawpad);
++	int16_t *rows = calloc(3 * 3 * w + 3, sizeof(int16_t));
++	bool ok = buf && rows && cui_lz_decode(src, len, buf, rawpad);
++	if (ok) {
++		const uint8_t *alpha = buf, *preds = buf + asize, *hi = preds + hgt, *lo = hi + planes * w * hgt;
++		int16_t *prev = rows, *cur = rows + 3 * w, *res = rows + 6 * w;
++		int16_t *vals = planes == 3 ? res : cur;  /* gray rows widen to Y,0,0 */
++		for (size_t y = 0; y < hgt; y++) {
++			memcpy(prev, cur, 3 * w * sizeof(int16_t));
++			if (planes == 3)
++				row_values(res, 3 * w, hi + y * 3 * w, lo + y * 3 * w);
++			else {
++				row_values(vals, w, hi + y * w, lo + y * w);
++				for (size_t x = w; x-- > 0;)
++					res[3 * x] = vals[x], res[3 * x + 1] = 0, res[3 * x + 2] = 0;
++			}
++			unpredict(preds[y], res, prev, cur, 3 * w);
++			convert_row(h, alpha + y * w, cur, dst + y * rowbytes, w);
++		}
++	}
++	free(buf);
++	free(rows);
++	return ok;
++}
++
++/* MARK: - Lossless and palette */
++
++static bool
++decode_lossless(const dm_header *h, const uint8_t *src, size_t len, uint8_t *dst, size_t rowbytes, size_t w, size_t hgt)
++{
++	size_t bpp = dm_pixel_size(h->fmt), n = w * hgt * bpp;
++	uint8_t *buf = malloc(n ? n : 1);
++	bool ok = buf && cui_lz_decode(src, len, buf, n);
++	for (size_t y = 0; ok && y < hgt; y++)
++		memcpy(dst + y * rowbytes, buf + y * w * bpp, w * bpp);
++	free(buf);
++	return ok;
++}
++
++static bool
++decode_palette(const dm_header *h, const uint8_t *src, size_t len, uint8_t *dst, size_t rowbytes, size_t w, size_t hgt)
++{
++	size_t np = w * hgt;
++	bool split = h->pal_entry == 3;            /* 3-byte entries: an alpha plane, then the indexes */
++	bool wide = !split && h->npal > 256;       /* 16-bit indexes */
++	size_t n = (split || wide) ? 2 * np : np;
++	uint8_t *buf = malloc(n ? n : 1);
++	bool ok = buf && cui_lz_decode(src, len, buf, n);
++	for (size_t y = 0; ok && y < hgt; y++)
++		for (size_t x = 0; x < w; x++) {
++			size_t i = y * w + x;
++			unsigned idx = wide ? rd16(buf + 2 * i) : split ? buf[np + i] : buf[i];
++			if (!split && idx >= h->npal) {
++				ok = false;
++				break;
++			}
++			uint8_t *p = dst + y * rowbytes + 4 * x;
++			memcpy(p, h->pal + 4 * (idx & 255), 4);
++			if (split)
++				p[3] = buf[i];
++		}
++	free(buf);
++	return ok;
++}
++
++/* MARK: - Streams */
++
++static size_t
++read_header(dm_header *h, const uint8_t *p, size_t len)
++{
++	if (len < 12 || memcmp(p, "dmp2", 4) != 0)
++		return 0;
++	memset(h, 0, sizeof *h);
++	h->encoding = p[4], h->flag = p[5], h->depth = p[6], h->fmt = p[7];
++	h->tile_w = rd16(p + 8), h->tile_h = rd16(p + 10);
++	if (h->depth == 0 || h->depth > 16)
++		h->depth = 10;
++	if (h->encoding != DM_PALETTE)
++		return 12;
++	if (len < 16 || h->fmt != 4)
++		return 0;
++	h->npal = rd16(p + 12), h->pal_entry = rd16(p + 14);
++	if (h->npal > 256 || (h->pal_entry != 3 && h->pal_entry != 4) || len < 16 + 4 * (size_t)h->npal)
++		return 0;
++	memcpy(h->pal, p + 16, 4 * (size_t)h->npal);
++	return 16 + 4 * (size_t)h->npal;
++}
++
++unsigned
++cui_deepmap2_format(const uint8_t *src, size_t len)
++{
++	return len >= 8 && memcmp(src, "dmp2", 4) == 0 ? src[7] : 0;
++}
++
++bool
++cui_deepmap2_decode(const uint8_t *src, size_t len, uint8_t *dst, size_t rowbytes, size_t width, size_t height)
++{
++	dm_header h;
++	size_t off = read_header(&h, src, len);
++	unsigned bpp = off ? dm_pixel_size(h.fmt) : 0;
++	if (!bpp || h.encoding < DM_NONE || h.encoding > DM_PALETTE)
++		return false;
++	src += off, len -= off;
++	if (h.encoding == DM_NONE) {
++		if (len < width * height * bpp)
++			return false;
++		for (size_t y = 0; y < height; y++)
++			memcpy(dst + y * rowbytes, src + y * width * bpp, width * bpp);
++		return true;
++	}
++	if (!h.tile_w || !h.tile_h)
++		return false;
++	for (size_t ty = 0; ty < height; ty += h.tile_h)
++		for (size_t tx = 0; tx < width; tx += h.tile_w) {
++			if (len < 4)
++				return false;
++			size_t tl = rd32(src);
++			src += 4, len -= 4;
++			if (tl > len)
++				return false;
++			size_t tw = width - tx < h.tile_w ? width - tx : h.tile_w;
++			size_t th = height - ty < h.tile_h ? height - ty : h.tile_h;
++			uint8_t *d = dst + ty * rowbytes + tx * bpp;
++			bool ok = h.encoding == DM_DEFAULT    ? decode_default(&h, src, tl, d, rowbytes, tw, th)
++			          : h.encoding == DM_LOSSLESS ? decode_lossless(&h, src, tl, d, rowbytes, tw, th)
++			                                      : decode_palette(&h, src, tl, d, rowbytes, tw, th);
++			if (!ok)
++				return false;
++			src += tl, len -= tl;
++		}
++	return true;
++}
+--- a/src/Frameworks/AppKit/SFCUIImage.m
++++ b/src/Frameworks/AppKit/SFCUIImage.m
+@@ -0,0 +1,244 @@
++/* SPDX-License-Identifier: MIT OR Apache-2.0 */
++/* Copyright (c) 2026 The Finch Project contributors. */
++/*
++ * SiliconForest (cocoa 0111): +[NSImage imageNamed:] finds an image of the application's asset catalog
++ * (Contents/Resources/Assets.car) when its bundle has no image file of that name, as macOS's does.
++ * The choice of rendition (best_rendition, with its scores) and the making of a CGImage from a bitmap
++ * rendition (image_from_csi) are taken from Finch's userland/CoreUI/CUICatalog.m at 2d9b1bb
++ * (docs/roadmap/issues/SF-AA-activity-monitor.md, "Taken from Finch"); changed here: device colour
++ * spaces (Onyx2D has no named ones), a rendition packed into an atlas is cut out of it as Finch's
++ * CUINamedImage does, and vector (PDF) renditions are not drawn. The lookup itself is ours.
++ */
++#import <AppKit/NSImage.h>
++#import <AppKit/NSScreen.h>
++#import <Foundation/Foundation.h>
++#import <CoreGraphics/CoreGraphics.h>
++#include "SFCUIPrivate.h"
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++static BOOL
++is_bitmap_layout(unsigned layout)
++{
++    return (layout >= 10 && layout < 1000 && layout != CUI_LAYOUT_GRADIENT && layout != CUI_LAYOUT_EFFECT) ||
++           layout == CUI_LAYOUT_INTERNAL_LINK;
++}
++
++typedef struct {
++    double scale;
++    long idiom, gamut, direction;
++    unsigned long subtype;
++    uint16_t appearance;
++} query;
++
++static int
++pref(unsigned have, unsigned want)
++{
++    return have == want ? 2 : have == 0 ? 1 : 0;
++}
++
++static int
++scale_score(unsigned have, double want)
++{
++    unsigned w = (unsigned)ceil(want);
++    if (have == w)
++        return 1000;
++    if (have && have < w)
++        return 500 + (int)have;
++    if (!have)
++        return 400;
++    return 300 - (int)have;
++}
++
++#define NSCORES 12
++
++static int
++compare_scores(const int *a, const int *b)
++{
++    for (int j = 0; j < NSCORES; j++)
++        if (a[j] != b[j])
++            return a[j] > b[j] ? 1 : -1;
++    return 0;
++}
++
++/* (Finch) the best image rendition for a name; images may come from any part under the name's identifier */
++static const cui_rendition *
++best_rendition(cui_store *s, const cui_facet *f, const query *q, cui_csi *out)
++{
++    size_t first, n = cui_store_renditions_for_identifier(s, f->attrs.v[CUI_ATTR_IDENTIFIER], &first);
++    const cui_rendition *best = NULL;
++    int bscore[NSCORES] = {0};
++    for (size_t i = first; i < first + n; i++) {
++        const cui_rendition *r = &s->rends[i];
++        const uint16_t *k = r->key.v;
++        BOOL ok = YES;
++        for (int a = 0; a < CUI_ATTR_MAX && ok; a++)
++            if (((f->mask >> a) & 1) && a != CUI_ATTR_PART)
++                ok = k[a] == f->attrs.v[a];
++        if (!ok || k[CUI_ATTR_APPEARANCE] != q->appearance)
++            continue;
++        int sc[NSCORES];
++        sc[0] = k[CUI_ATTR_PART] == ((f->mask >> CUI_ATTR_PART) & 1 ? f->attrs.v[CUI_ATTR_PART] : 0);
++        sc[1] = 2 * scale_score(k[CUI_ATTR_SCALE], q->scale);
++        sc[2] = pref(k[CUI_ATTR_IDIOM], (unsigned)q->idiom);
++        sc[3] = pref(k[CUI_ATTR_SUBTYPE], (unsigned)q->subtype);
++        sc[4] = pref(k[CUI_ATTR_GAMUT], (unsigned)q->gamut);
++        if (!sc[2] || !sc[3] || !sc[4])
++            continue;
++        sc[5] = k[CUI_ATTR_DIRECTION] == q->direction ? 2 : k[CUI_ATTR_DIRECTION] == 0 ? 1 : 0;
++        sc[6] = k[CUI_ATTR_LOCALIZATION] == 0;
++        sc[7] = k[CUI_ATTR_DEPLOYMENT];
++        sc[8] = (k[CUI_ATTR_SIZE_CLASS_H] == 0) + (k[CUI_ATTR_SIZE_CLASS_V] == 0) + (k[CUI_ATTR_MEMORY_CLASS] == 0) +
++                (k[CUI_ATTR_GRAPHICS_CLASS] == 0) + (k[CUI_ATTR_GLYPH_WEIGHT] == 0) + (k[CUI_ATTR_GLYPH_SIZE] == 0);
++        sc[9] = (k[CUI_ATTR_STATE] == 0) + (k[CUI_ATTR_VALUE] == 0) + (k[CUI_ATTR_DIMENSION1] == 0) +
++                (k[CUI_ATTR_LAYER] == 0) + (k[CUI_ATTR_PRESENTATION_STATE] == 0) + (k[CUI_ATTR_PREVIOUS_STATE] == 0) +
++                (k[CUI_ATTR_PREVIOUS_VALUE] == 0) + (k[CUI_ATTR_SIZE] == 0);
++        sc[10] = k[CUI_ATTR_DIMENSION2];
++        sc[11] = 1;
++        if (compare_scores(sc, bscore) <= 0)
++            continue;
++        cui_csi c;
++        if (!cui_csi_parse(r->csi, r->len, &c) || !is_bitmap_layout(c.layout))
++            continue;
++        best = r;
++        *out = c;
++        memcpy(bscore, sc, sizeof sc);
++    }
++    return best;
++}
++
++static void
++release_pixels(void *info, const void *data, size_t size)
++{
++    free((void *)data);
++}
++
++/* (Finch's FinchCUICreateImageFromCSI) RGBA or gray and alpha, premultiplied; the alpha skipped when opaque */
++static CGImageRef
++image_from_csi(const cui_csi *c)
++{
++    if (c->pixel_format == CUI_FOURCC('J', 'P', 'E', 'G')) {
++        size_t len;
++        uint8_t *raw = cui_csi_raw_data(c, &len);
++        if (!raw)
++            return NULL;
++        CFDataRef d = CFDataCreateWithBytesNoCopy(NULL, raw, (CFIndex)len, kCFAllocatorMalloc);
++        CGImageSourceRef src = CGImageSourceCreateWithData(d, NULL);
++        CGImageRef im = src ? CGImageSourceCreateImageAtIndex(src, 0, NULL) : NULL;
++        if (src)
++            CFRelease(src);
++        CFRelease(d);
++        return im;
++    }
++    cui_bitmap b;
++    if (!cui_csi_decode_bitmap(c, &b))
++        return NULL;
++    CGColorSpaceRef cs;
++    CGBitmapInfo info;
++    size_t bpp;
++    if (b.format == CUI_FOURCC('A', 'R', 'G', 'B')) {
++        /* BGRA in memory, premultiplied */
++        cs = CGColorSpaceCreateDeviceRGB();
++        info = kCGBitmapByteOrder32Little | (b.opaque ? kCGImageAlphaNoneSkipFirst : kCGImageAlphaPremultipliedFirst);
++        bpp = 32;
++    } else if (b.format == CUI_FOURCC('G', 'A', '8', ' ')) {
++        /* gray and alpha: made RGBA, which every Onyx2D path draws */
++        uint8_t *rgba = malloc(b.width * b.height * 4);
++        if (!rgba) {
++            free(b.pixels);
++            return NULL;
++        }
++        for (size_t y = 0; y < b.height; y++)
++            for (size_t x = 0; x < b.width; x++) {
++                const uint8_t *p = b.pixels + y * b.rowbytes + 2 * x;
++                uint8_t *o = rgba + 4 * (y * b.width + x);
++                o[0] = o[1] = o[2] = p[0];
++                o[3] = p[1];
++            }
++        free(b.pixels);
++        b.pixels = rgba, b.rowbytes = b.width * 4;
++        cs = CGColorSpaceCreateDeviceRGB();
++        info = (CGBitmapInfo)(b.opaque ? kCGImageAlphaNoneSkipLast : kCGImageAlphaPremultipliedLast);
++        bpp = 32;
++    } else {
++        free(b.pixels);     /* half-float renditions ('GA16', 'RGBW') are not drawn here */
++        return NULL;
++    }
++    CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, b.pixels, b.rowbytes * b.height, release_pixels);
++    CGImageRef im = CGImageCreate(b.width, b.height, 8, bpp, b.rowbytes, cs, info, dp, NULL, true, kCGRenderingIntentDefault);
++    CGDataProviderRelease(dp);
++    CGColorSpaceRelease(cs);
++    return im;
++}
++
++static cui_store *
++catalog_of_bundle(NSBundle *bundle)
++{
++    static NSMutableDictionary *catalogs;
++    NSString *key = [bundle bundlePath];
++    if (key == nil)
++        return NULL;
++    @synchronized([NSImage class]) {
++        if (catalogs == nil)
++            catalogs = [[NSMutableDictionary alloc] init];
++        id v = [catalogs objectForKey:key];
++        if (v == nil) {
++            NSString *path = [bundle pathForResource:@"Assets" ofType:@"car"];
++            cui_store *store = path ? cui_store_open([path fileSystemRepresentation]) : NULL;
++            v = store ? (id)[NSValue valueWithPointer:store] : (id)[NSNull null];
++            [catalogs setObject:v forKey:key];
++        }
++        return [v isKindOfClass:[NSValue class]] ? [v pointerValue] : NULL;
++    }
++}
++
++@implementation NSImage (SFCatalogImages)
++
+++ (NSImage *)_sfCatalogImageNamed:(NSString *)name
++{
++    cui_store *store = name ? catalog_of_bundle([NSBundle mainBundle]) : NULL;
++    const cui_facet *facet = store ? cui_store_facet(store, [name UTF8String]) : NULL;
++    if (facet == NULL)
++        return nil;
++    CGFloat backing = [[NSScreen mainScreen] backingScaleFactor];
++    query q = { backing > 1 ? backing : 1, 0, 0, 0, 0, 0 };
++    uint16_t aqua = 0;
++    cui_csi csi;
++    const cui_rendition *r = NULL;
++    if (cui_store_appearance(store, "NSAppearanceNameAqua", &aqua)) {
++        q.appearance = aqua;
++        r = best_rendition(store, facet, &q, &csi);
++    }
++    if (r == NULL) {
++        q.appearance = 0;
++        r = best_rendition(store, facet, &q, &csi);
++    }
++    if (r == NULL)
++        return nil;
++    CGImageRef cg = NULL;
++    if (csi.layout == CUI_LAYOUT_INTERNAL_LINK) {
++        cui_key key;
++        uint32_t frame[4];
++        const cui_rendition *atlas = cui_csi_link(&csi, &key, frame, NULL) ? cui_store_rendition_with_key(store, &key) : NULL;
++        cui_csi ac;
++        CGImageRef whole = (atlas && cui_csi_parse(atlas->csi, atlas->len, &ac)) ? image_from_csi(&ac) : NULL;
++        if (whole) {
++            /* the frame's origin is the atlas's bottom left */
++            cg = CGImageCreateWithImageInRect(whole, CGRectMake(frame[0], (CGFloat)CGImageGetHeight(whole) - frame[1] - frame[3], frame[2], frame[3]));
++            CGImageRelease(whole);
++        }
++    } else {
++        cg = image_from_csi(&csi);
++    }
++    if (cg == NULL)
++        return nil;
++    double scale = csi.scale100 ? csi.scale100 / 100.0 : 1;
++    NSImage *image = [[[NSImage alloc] initWithCGImage:cg size:NSMakeSize(CGImageGetWidth(cg) / scale, CGImageGetHeight(cg) / scale)] autorelease];
++    CGImageRelease(cg);
++    if (cui_csi_template_mode(&csi) == 1)
++        [image setTemplate:YES];
++    return image;
++}
++
++@end
+--- a/src/Frameworks/AppKit/NSImage.m
++++ b/src/Frameworks/AppKit/NSImage.m
+@@ -57,6 +57,10 @@
+ +(NSImage *)_sfSymbolImageNamed:(NSString *)name;
+ @end
+ 
++@interface NSImage (SFCatalogImages)
+++(NSImage *)_sfCatalogImageNamed:(NSString *)name;
++@end
++
+ @implementation NSImage
+ 
+ // SF Symbols are not here: a few names have our own drawings (NSSymbolImages.m), an unknown name gives nil as on macOS
+@@ -150,6 +154,12 @@
+     }
+    }
+ 
++   // (cocoa 0111) an image of the application's asset catalog, as on macOS (SFCUIImage.m)
++   if(image==nil && name!=nil){
++    image=[self _sfCatalogImageNamed:name];
++    [image setName:name];
++   }
++
+    // the application icon comes from NSApplication, which loads it from the bundle or a default
+    if(image==nil && [name isEqualToString:NSImageNameApplicationIcon])
+     image=[NSApp applicationIconImage];
+--- a/src/Frameworks/AppKit/SFSymbolGlyphs.m
++++ b/src/Frameworks/AppKit/SFSymbolGlyphs.m
+@@ -0,0 +1,1340 @@
++/* SPDX-License-Identifier: MIT OR Apache-2.0 */
++/* Copyright (c) 2026 The Finch Project contributors. */
++/*
++ * SiliconForest (cocoa 0111; docs/roadmap/issues/SF-AA-activity-monitor.md, "Taken from Finch"): the symbol
++ * glyphs of Finch's userland/AppKit/NSSystemImages.m at 2d9b1bb (its drawing helpers, the glyph table with
++ * Apple's symbol names, the name parser with its .fill/.circle/.square/.slash/.badge modifiers, the stroke per
++ * weight), Finch's own artwork drawn in code: SF Symbols are Apple's font and are not here. Changed: the image
++ * is drawn into a bitmap at three pixels a point (this AppKit has no drawing-handler images; SFSymbolImage
++ * below, in place of Finch's symbol_image), with the same transforms, enclosures, slash and badges; the
++ * system images (NSImageName...Template) of that file are not taken. Our own five drawings
++ * (NSSymbolImages.m) are asked first.
++ */
++#import <AppKit/AppKit.h>
++#import <AppKit/NSImageSymbolConfiguration.h>
++#import <objc/runtime.h>
++#include <dispatch/dispatch.h>
++#include <math.h>
++
++#ifndef NSLineCapStyleRound
++#define NSLineCapStyleRound NSRoundLineCapStyle
++#define NSLineJoinStyleRound NSRoundLineJoinStyle
++#endif
++#ifndef NSWindingRuleEvenOdd
++#define NSWindingRuleEvenOdd NSEvenOddWindingRule
++#define NSWindingRuleNonZero NSNonZeroWindingRule
++#endif
++
++typedef void (^Drawer)(NSRect r);
++#import <objc/runtime.h>
++
++typedef void (^Drawer)(NSRect r);
++
++/* MARK: Drawing helpers (points, origin at the bottom left) */
++
++/* (symbol images set it for their weight while they draw) */
++static CGFloat kStroke = 1.5;
++
++static NSBezierPath *
++stroke_path(void)
++{
++    NSBezierPath *p = [NSBezierPath bezierPath];
++    p.lineWidth = kStroke;
++    p.lineCapStyle = NSLineCapStyleRound;
++    p.lineJoinStyle = NSLineJoinStyleRound;
++    return p;
++}
++
++static void
++line(CGFloat x1, CGFloat y1, CGFloat x2, CGFloat y2)
++{
++    NSBezierPath *p = stroke_path();
++    [p moveToPoint:NSMakePoint(x1, y1)];
++    [p lineToPoint:NSMakePoint(x2, y2)];
++    [p stroke];
++}
++
++/* A polyline (closed: a polygon) through n points given as x, y pairs; filled or stroked. */
++static void
++poly(BOOL closed, BOOL fill, int n, const CGFloat *xy)
++{
++    NSBezierPath *p = stroke_path();
++    [p moveToPoint:NSMakePoint(xy[0], xy[1])];
++    for (int i = 1; i < n; i++)
++        [p lineToPoint:NSMakePoint(xy[2 * i], xy[2 * i + 1])];
++    if (closed)
++        [p closePath];
++    if (fill)
++        [p fill];
++    else
++        [p stroke];
++}
++#define POLY(closed, fill, ...)                                          \
++    do {                                                                 \
++        const CGFloat pts_[] = {__VA_ARGS__};                            \
++        poly(closed, fill, (int)(sizeof pts_ / sizeof pts_[0] / 2), pts_); \
++    } while (0)
++
++static void
++circle(CGFloat cx, CGFloat cy, CGFloat radius, BOOL fill)
++{
++    NSBezierPath *p = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(cx - radius, cy - radius, 2 * radius, 2 * radius)];
++    p.lineWidth = kStroke;
++    if (fill)
++        [p fill];
++    else
++        [p stroke];
++}
++
++static void
++rrect(CGFloat x, CGFloat y, CGFloat w, CGFloat h, CGFloat radius, BOOL fill)
++{
++    NSBezierPath *p = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(x, y, w, h) xRadius:radius yRadius:radius];
++    p.lineWidth = kStroke;
++    p.lineJoinStyle = NSLineJoinStyleRound;
++    if (fill)
++        [p fill];
++    else
++        [p stroke];
++}
++
++static void
++arc(CGFloat cx, CGFloat cy, CGFloat radius, CGFloat from, CGFloat to, BOOL clockwise)
++{
++    NSBezierPath *p = stroke_path();
++    [p appendBezierPathWithArcWithCenter:NSMakePoint(cx, cy) radius:radius startAngle:from endAngle:to clockwise:clockwise];
++    [p stroke];
++}
++
++/* Text centred in a rect, in the system font. */
++static void
++text(NSString *s, NSRect r, CGFloat size, NSFontWeight weight, NSFontTraitMask traits, NSColor *color)
++{
++    NSFont *f = [NSFont systemFontOfSize:size weight:weight];
++    if (traits)
++        f = [[NSFontManager sharedFontManager] convertFont:f toHaveTrait:traits] ?: f;
++    NSDictionary *a = @{NSFontAttributeName : f, NSForegroundColorAttributeName : color ?: [NSColor blackColor]};
++    NSSize ts = [s sizeWithAttributes:a];
++    [s drawAtPoint:NSMakePoint(NSMidX(r) - ts.width / 2, NSMidY(r) - ts.height / 2) withAttributes:a];
++}
++
++static NSColor *
++rgb(unsigned hex)
++{
++    return [NSColor colorWithSRGBRed:((hex >> 16) & 0xff) / 255.0 green:((hex >> 8) & 0xff) / 255.0 blue:(hex & 0xff) / 255.0 alpha:1];
++}
++
++/* The icons' palette: ink, paper, manila, a muted green, amber, brick, slate blue, graphite. */
++#define INK rgb(0x2b2a27)
++#define PAPER rgb(0xf4f0e6)
++#define MANILA rgb(0xd8b57a)
++#define MANILA_DARK rgb(0xb8924f)
++#define GREEN rgb(0x3f7a5c)
++#define AMBER rgb(0xe0a63a)
++#define BRICK rgb(0xc4553f)
++#define SLATE rgb(0x4d7192)
++#define GRAPHITE rgb(0x8a8e92)
++
++/* MARK: Template glyphs */
++
++static void
++chevron(NSRect r, int dir) /* 0 left, 1 right, 2 up, 3 down */
++{
++    CGFloat w = r.size.width, h = r.size.height, cx = w / 2, cy = h / 2, a = MIN(w, h) * 0.28;
++    switch (dir) {
++    case 0: POLY(NO, NO, cx + a / 1.6, cy + a * 1.3, cx - a / 1.6, cy, cx + a / 1.6, cy - a * 1.3); break;
++    case 1: POLY(NO, NO, cx - a / 1.6, cy + a * 1.3, cx + a / 1.6, cy, cx - a / 1.6, cy - a * 1.3); break;
++    case 2: POLY(NO, NO, cx - a * 1.3, cy - a / 1.6, cx, cy + a / 1.6, cx + a * 1.3, cy - a / 1.6); break;
++    default: POLY(NO, NO, cx - a * 1.3, cy + a / 1.6, cx, cy - a / 1.6, cx + a * 1.3, cy + a / 1.6); break;
++    }
++}
++
++static void
++triangle(NSRect r, int dir, CGFloat inset)
++{
++    CGFloat x0 = inset, y0 = inset, x1 = r.size.width - inset, y1 = r.size.height - inset;
++    CGFloat mx = (x0 + x1) / 2, my = (y0 + y1) / 2;
++    switch (dir) {
++    case 0: POLY(YES, YES, x1, y1, x0, my, x1, y0); break;
++    case 1: POLY(YES, YES, x0, y1, x1, my, x0, y0); break;
++    case 2: POLY(YES, YES, x0, y0, mx, y1, x1, y0); break;
++    default: POLY(YES, YES, x0, y1, mx, y0, x1, y1); break;
++    }
++}
++
++static void
++plus(CGFloat cx, CGFloat cy, CGFloat a)
++{
++    line(cx - a, cy, cx + a, cy);
++    line(cx, cy - a, cx, cy + a);
++}
++
++static void
++cross(CGFloat cx, CGFloat cy, CGFloat a)
++{
++    line(cx - a, cy - a, cx + a, cy + a);
++    line(cx - a, cy + a, cx + a, cy - a);
++}
++
++static void
++gear(CGFloat cx, CGFloat cy, CGFloat outer, int teeth, BOOL fill)
++{
++    NSBezierPath *p = stroke_path();
++    CGFloat inner = outer * 0.78;
++    for (int i = 0; i < teeth * 2; i++) {
++        CGFloat a0 = M_PI * i / teeth, a1 = M_PI * (i + 1) / teeth;
++        CGFloat rad = (i % 2) ? inner : outer;
++        NSPoint q0 = NSMakePoint(cx + rad * cos(a0), cy + rad * sin(a0)), q1 = NSMakePoint(cx + rad * cos(a1), cy + rad * sin(a1));
++        if (i == 0)
++            [p moveToPoint:q0];
++        else
++            [p lineToPoint:q0];
++        [p lineToPoint:q1];
++    }
++    [p closePath];
++    [p appendBezierPathWithOvalInRect:NSMakeRect(cx - outer * 0.32, cy - outer * 0.32, outer * 0.64, outer * 0.64)];
++    p.windingRule = NSWindingRuleEvenOdd;
++    if (fill)
++        [p fill];
++    else
++        [p stroke];
++}
++
++static void
++magnifier(CGFloat cx, CGFloat cy, CGFloat radius)
++{
++    circle(cx, cy, radius, NO);
++    line(cx + radius * 0.72, cy - radius * 0.72, cx + radius * 1.6, cy - radius * 1.6);
++}
++
++static void
++person(CGFloat cx, CGFloat y, CGFloat scale, BOOL fill)
++{
++    circle(cx, y + scale * 1.45, scale * 0.45, fill);
++    NSBezierPath *p = stroke_path();
++    [p appendBezierPathWithArcWithCenter:NSMakePoint(cx, y) radius:scale * 0.85 startAngle:0 endAngle:180];
++    [p closePath];
++    if (fill)
++        [p fill];
++    else
++        [p stroke];
++}
++
++static void
++folder_outline(CGFloat x, CGFloat y, CGFloat w, CGFloat h, BOOL fill)
++{
++    CGFloat tab = w * 0.38, th = h * 0.16;
++    NSBezierPath *p = stroke_path();
++    [p moveToPoint:NSMakePoint(x, y)];
++    [p lineToPoint:NSMakePoint(x, y + h)];
++    [p lineToPoint:NSMakePoint(x + tab, y + h)];
++    [p lineToPoint:NSMakePoint(x + tab + th, y + h - th)];
++    [p lineToPoint:NSMakePoint(x + w, y + h - th)];
++    [p lineToPoint:NSMakePoint(x + w, y)];
++    [p closePath];
++    if (fill)
++        [p fill];
++    else
++        [p stroke];
++}
++
++static void
++speaker(CGFloat x, CGFloat cy, CGFloat h)
++{
++    POLY(YES, YES, x, cy - h * 0.2, x + h * 0.25, cy - h * 0.2, x + h * 0.55, cy - h * 0.5, x + h * 0.55, cy + h * 0.5, x + h * 0.25,
++         cy + h * 0.2, x, cy + h * 0.2);
++}
++
++static void
++waves(CGFloat x, CGFloat cy, int n)
++{
++    for (int i = 0; i < n; i++)
++        arc(x, cy, 3 + 3.5 * i, -45, 45, NO);
++}
++
++static void
++lines(NSRect r, int count, int align) /* text alignment glyphs: 0 left, 1 centre, 2 right, 3 justified */
++{
++    CGFloat w = r.size.width - 3, gap = (r.size.height - 3) / (count - 1);
++    for (int i = 0; i < count; i++) {
++        CGFloat y = 1.5 + i * gap, len = (align == 3 || i % 2 == 0) ? w : w * 0.65;
++        CGFloat x = align == 0 || align == 3 ? 1.5 : align == 1 ? 1.5 + (w - len) / 2 : 1.5 + w - len;
++        line(x, y, x + len, y);
++    }
++}
++
++static void
++clock_face(CGFloat cx, CGFloat cy, CGFloat radius)
++{
++    circle(cx, cy, radius, NO);
++    line(cx, cy, cx, cy + radius * 0.6);
++    line(cx, cy, cx + radius * 0.45, cy);
++}
++
++static void
++lock(NSRect r, BOOL open)
++{
++    CGFloat bw = 13, bh = 9, bx = 1.5;
++    rrect(bx, 1, bw, bh, 2, YES);
++    NSBezierPath *p = stroke_path();
++    CGFloat sx = open ? bx + bw - 1 : bx + 2.5, sw = bw - 5;
++    [p moveToPoint:NSMakePoint(sx, bh + 1)];
++    [p lineToPoint:NSMakePoint(sx, bh + 4)];
++    [p appendBezierPathWithArcWithCenter:NSMakePoint(sx + sw / 2, bh + 4) radius:sw / 2 startAngle:180 endAngle:0 clockwise:YES];
++    if (!open)
++        [p lineToPoint:NSMakePoint(sx + sw, bh + 1)];
++    [p stroke];
++}
++
++static void
++refresh(CGFloat cx, CGFloat cy, CGFloat radius)
++{
++    arc(cx, cy, radius, 100, 400, NO);
++    CGFloat ex = cx + radius * cos(100 * M_PI / 180), ey = cy + radius * sin(100 * M_PI / 180);
++    POLY(YES, YES, ex - 1, ey + 3.5, ex + 3.5, ey, ex - 1, ey - 3.5);
++}
++
++static void
++envelope(CGFloat x, CGFloat y, CGFloat w, CGFloat h)
++{
++    rrect(x, y, w, h, 1.5, NO);
++    POLY(NO, NO, x, y + h, x + w / 2, y + h * 0.4, x + w, y + h);
++}
++
++/* MARK: Icons (32 points) */
++
++static void
++icon_folder(NSRect r, NSColor *body, void (^mark)(void))
++{
++    /* an archival folder: a manila back with its tab, a front leaf slightly lower */
++    [MANILA_DARK setFill];
++    folder_outline(3, 5, 26, 22, YES);
++    [body setFill];
++    rrect(3, 4, 26, 18, 1.5, YES);
++    [[MANILA_DARK colorWithAlphaComponent:0.6] setStroke];
++    line(6, 18, 26, 18);
++    if (mark)
++        mark();
++}
++
++static void
++icon_person(CGFloat cx, CGFloat y, CGFloat scale, NSColor *color)
++{
++    [color setFill];
++    person(cx, y, scale, YES);
++}
++
++static void
++icon_disc(NSColor *fill, NSColor *edge)
++{
++    [fill setFill];
++    circle(16, 16, 13.5, YES);
++    [edge setStroke];
++    circle(16, 16, 13.5, NO);
++}
++
++static void
++globe(CGFloat cx, CGFloat cy, CGFloat radius)
++{
++    circle(cx, cy, radius, NO);
++    NSBezierPath *m = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(cx - radius * 0.45, cy - radius, radius * 0.9, radius * 2)];
++    m.lineWidth = kStroke * 0.8;
++    [m stroke];
++    line(cx - radius, cy, cx + radius, cy);
++    line(cx - radius * 0.86, cy + radius * 0.5, cx + radius * 0.86, cy + radius * 0.5);
++    line(cx - radius * 0.86, cy - radius * 0.5, cx + radius * 0.86, cy - radius * 0.5);
++}
++
++static void
++document(CGFloat x, CGFloat y, CGFloat w, CGFloat h)
++{
++    CGFloat fold = w * 0.3;
++    [PAPER setFill];
++    [INK setStroke];
++    NSBezierPath *p = stroke_path();
++    p.lineWidth = 1;
++    [p moveToPoint:NSMakePoint(x, y)];
++    [p lineToPoint:NSMakePoint(x, y + h)];
++    [p lineToPoint:NSMakePoint(x + w - fold, y + h)];
++    [p lineToPoint:NSMakePoint(x + w, y + h - fold)];
++    [p lineToPoint:NSMakePoint(x + w, y)];
++    [p closePath];
++    [p fill];
++    [p stroke];
++    [[INK colorWithAlphaComponent:0.35] setStroke];
++    for (CGFloat ly = y + h * 0.25; ly < y + h - fold - 1; ly += 3)
++        line(x + 2.5, ly, x + w - 2.5, ly);
++}
++
++static void
++trash(BOOL full)
++{
++    [GRAPHITE setFill];
++    POLY(YES, YES, 8, 3, 24, 3, 26, 24, 6, 24);
++    [INK setStroke];
++    POLY(YES, NO, 8, 3, 24, 3, 26, 24, 6, 24);
++    rrect(4.5, 24, 23, 3, 1, NO);
++    [[INK colorWithAlphaComponent:0.5] setStroke];
++    for (int i = 0; i < 3; i++)
++        line(11 + 5 * i, 6, 11.5 + 5 * i, 21);
++    if (full) {
++        [PAPER setFill];
++        [INK setStroke];
++        POLY(YES, YES, 9, 26, 14, 30, 19, 27, 24, 30, 23, 26);
++        POLY(YES, NO, 9, 26, 14, 30, 19, 27, 24, 30, 23, 26);
++    }
++}
++
++/* MARK: The table */
++
++typedef struct {
++    NSString *name;
++    CGFloat w, h;
++    BOOL isTemplate;
++    Drawer draw;
++} SystemImage;
++
++
++/* MARK: - Symbol images
++ *
++ * +imageWithSystemSymbolName: and friends: Finch's own glyphs (SF Symbols are Apple's
++ * artwork) under the symbol names apps use, drawn in the same ink line style. A name is
++ * read as a base glyph and Apple's modifiers: ".fill" (the glyph's filled form),
++ * ".circle" or ".square" (enclosed; with ".fill", a filled shape with the glyph knocked
++ * out), ".slash" (struck through) and ".badge.plus" / ".badge.minus" / ".badge.checkmark"
++ * (a small mark at the corner) or ".badge." and another glyph's name (that glyph, small,
++ * at the corner). Names with no glyph give nil, as Apple's unknown names
++ * do. Sizes follow the configuration as Apple's do: a glyph's size at 13 points scaled
++ * with the point size and by the scale (small 0.82, large 1.29); the weight sets the
++ * stroke.
++ */
++
++typedef void (^SymbolDrawer)(CGFloat w, CGFloat h, BOOL fill);
++
++typedef struct {
++    CGFloat w, h; /* at 13 points */
++    __unsafe_unretained NSString *label;
++    SymbolDrawer draw;
++    BOOL privateOnly; /* Apple's private symbols: only +_imageWithSystemSymbolName: gives them */
++} SymbolGlyph;
++
++static void
++shape(BOOL fill, NSBezierPath *p)
++{
++    p.lineWidth = kStroke;
++    p.lineJoinStyle = NSLineJoinStyleRound;
++    p.lineCapStyle = NSLineCapStyleRound;
++    if (fill)
++        [p fill];
++    else
++        [p stroke];
++}
++
++static NSBezierPath *
++star_path(CGFloat cx, CGFloat cy, CGFloat outer)
++{
++    NSBezierPath *p = [NSBezierPath bezierPath];
++    for (int i = 0; i < 10; i++) {
++        CGFloat a = M_PI / 2 + i * M_PI / 5, r = i % 2 ? outer * 0.45 : outer;
++        NSPoint q = NSMakePoint(cx + r * cos(a), cy + r * sin(a));
++        if (i == 0)
++            [p moveToPoint:q];
++        else
++            [p lineToPoint:q];
++    }
++    [p closePath];
++    return p;
++}
++
++static NSBezierPath *
++heart_path(CGFloat w, CGFloat h)
++{
++    NSBezierPath *p = [NSBezierPath bezierPath];
++    [p moveToPoint:NSMakePoint(w / 2, 1.5)];
++    [p curveToPoint:NSMakePoint(1, h * 0.62) controlPoint1:NSMakePoint(w * 0.25, h * 0.3) controlPoint2:NSMakePoint(1, h * 0.42)];
++    [p curveToPoint:NSMakePoint(w / 2, h * 0.72) controlPoint1:NSMakePoint(1, h * 0.95) controlPoint2:NSMakePoint(w * 0.42, h * 0.98)];
++    [p curveToPoint:NSMakePoint(w - 1, h * 0.62) controlPoint1:NSMakePoint(w * 0.58, h * 0.98) controlPoint2:NSMakePoint(w - 1, h * 0.95)];
++    [p curveToPoint:NSMakePoint(w / 2, 1.5) controlPoint1:NSMakePoint(w - 1, h * 0.42) controlPoint2:NSMakePoint(w * 0.75, h * 0.3)];
++    [p closePath];
++    return p;
++}
++
++static NSBezierPath *
++doc_path(CGFloat x, CGFloat y, CGFloat w, CGFloat h)
++{
++    CGFloat fold = w * 0.35;
++    NSBezierPath *p = [NSBezierPath bezierPath];
++    [p moveToPoint:NSMakePoint(x, y)];
++    [p lineToPoint:NSMakePoint(x, y + h)];
++    [p lineToPoint:NSMakePoint(x + w - fold, y + h)];
++    [p lineToPoint:NSMakePoint(x + w, y + h - fold)];
++    [p lineToPoint:NSMakePoint(x + w, y)];
++    [p closePath];
++    return p;
++}
++
++static void
++arrow(CGFloat x1, CGFloat y1, CGFloat x2, CGFloat y2, CGFloat head)
++{
++    line(x1, y1, x2, y2);
++    CGFloat a = atan2(y2 - y1, x2 - x1);
++    POLY(NO, NO, x2 - head * cos(a - 0.6), y2 - head * sin(a - 0.6), x2, y2, x2 - head * cos(a + 0.6), y2 - head * sin(a + 0.6));
++}
++
++/* A curved arrow round (cx, cy), from `from` to `to` degrees, the head at `to`. */
++static void
++curved_arrow(CGFloat cx, CGFloat cy, CGFloat r, CGFloat from, CGFloat to)
++{
++    BOOL cw = to < from;
++    arc(cx, cy, r, from, to, cw);
++    CGFloat a = to * M_PI / 180, ex = cx + r * cos(a), ey = cy + r * sin(a);
++    CGFloat tangent = a + (cw ? -M_PI / 2 : M_PI / 2), head = r * 0.55;
++    POLY(YES, YES, ex + head * cos(tangent), ey + head * sin(tangent), ex + head * 0.55 * cos(a), ey + head * 0.55 * sin(a),
++         ex - head * 0.55 * cos(a), ey - head * 0.55 * sin(a));
++}
++
++static NSDictionary<NSString *, NSValue *> *
++symbol_glyphs(void)
++{
++    static NSMutableDictionary *t;
++    static dispatch_once_t once;
++    dispatch_once(&once, ^{
++        t = [NSMutableDictionary new];
++        void (^add)(NSString *, CGFloat, CGFloat, NSString *, SymbolDrawer) = ^(NSString *n, CGFloat w, CGFloat h, NSString *label,
++                                                                                SymbolDrawer d) {
++            SymbolGlyph *g = calloc(1, sizeof *g);
++            g->w = w, g->h = h;
++            g->label = [label copy];
++            g->draw = [d copy];
++            t[n] = [NSValue valueWithPointer:g];
++        };
++        void (^alias)(NSString *, NSString *) = ^(NSString *n, NSString *to) { t[n] = t[to]; };
++
++        /* marks */
++        add(@"plus", 14, 13, @"add", ^(CGFloat w, CGFloat h, BOOL f) { plus(w / 2, h / 2, w / 2 - 1.5); });
++        add(@"minus", 14, 4, @"remove", ^(CGFloat w, CGFloat h, BOOL f) { line(1.5, h / 2, w - 1.5, h / 2); });
++        add(@"xmark", 12, 12, @"close", ^(CGFloat w, CGFloat h, BOOL f) { cross(w / 2, h / 2, w / 2 - 1.5); });
++        alias(@"multiply", @"xmark");
++        add(@"equal", 13, 8, nil, ^(CGFloat w, CGFloat h, BOOL f) {
++            line(1.5, 1.5, w - 1.5, 1.5);
++            line(1.5, h - 1.5, w - 1.5, h - 1.5);
++        });
++        add(@"divide", 15, 12, nil, ^(CGFloat w, CGFloat h, BOOL f) {
++            line(1.5, h / 2, w - 1.5, h / 2);
++            [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(w / 2 - 1, 0, 2, 2)] fill];
++            [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(w / 2 - 1, h - 2, 2, 2)] fill];
++        });
++        add(@"percent", 16, 15, nil, ^(CGFloat w, CGFloat h, BOOL f) {
++            line(3, 1.5, w - 3, h - 1.5);
++            shape(NO, [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(1, h - 6, 4, 4)]);
++            shape(NO, [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(w - 5, 2, 4, 4)]);
++        });
++        add(@"plusminus", 12, 13, @"plus or minus", ^(CGFloat w, CGFloat h, BOOL f) {
++            plus(w / 2, h - 4, 3.5);
++            line(2, 1.5, w - 2, 1.5);
++        });
++        add(@"plus.forwardslash.minus", 17, 14, nil, ^(CGFloat w, CGFloat h, BOOL f) {
++            plus(4, h - 4, 2.5);
++            line(5, 1.5, w - 5, h - 1.5);
++            line(w - 6, 4, w - 1, 4);
++        });
++        add(@"delete.left", 17, 14, @"delete", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(YES, NO, 1, h / 2, 6, h - 1.5, w - 1.5, h - 1.5, w - 1.5, 1.5, 6, 1.5);
++            cross(w * 0.64, h / 2, 2.5);
++        });
++        alias(@"delete.backward", @"delete.left");
++        add(@"checkmark", 14, 13, @"checkmark", ^(CGFloat w, CGFloat h, BOOL f) { POLY(NO, NO, 1.5, h * 0.48, w * 0.38, 1.5, w - 1.5, h - 1.5); });
++        add(@"exclamationmark", 4, 14, @"alert", ^(CGFloat w, CGFloat h, BOOL f) {
++            line(w / 2, h * 0.38, w / 2, h - 1.5);
++            circle(w / 2, 1.8, 1, YES);
++        });
++        add(@"questionmark", 10, 15, @"help", ^(CGFloat w, CGFloat h, BOOL f) {
++            arc(w / 2, h * 0.7, w / 2 - 1.5, 160, -60, YES);
++            line(w / 2 + (w / 2 - 1.5) * 0.5, h * 0.7 - (w / 2 - 1.5) * 0.86, w / 2, h * 0.38);
++            circle(w / 2, 1.8, 1, YES);
++        });
++        add(@"info", 6, 14, @"info", ^(CGFloat w, CGFloat h, BOOL f) {
++            line(w / 2, 1.5, w / 2, h * 0.62);
++            line(w / 2 - 2, 1.5, w / 2 + 2, 1.5);
++            circle(w / 2, h - 2, 1.1, YES);
++        });
++        add(@"ellipsis", 16, 4, @"more", ^(CGFloat w, CGFloat h, BOOL f) {
++            for (int i = 0; i < 3; i++)
++                circle(2.5 + i * (w - 5) / 2, h / 2, 1.4, YES);
++        });
++        add(@"star", 17, 16, @"favorite", ^(CGFloat w, CGFloat h, BOOL f) { shape(f, star_path(w / 2, h / 2 - 0.5, w / 2 - 1)); });
++        add(@"heart", 16, 14, @"love", ^(CGFloat w, CGFloat h, BOOL f) { shape(f, heart_path(w, h)); });
++        add(@"circle", 15, 15, @"circle", ^(CGFloat w, CGFloat h, BOOL f) {
++            NSBezierPath *p = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(1, 1, w - 2, h - 2)];
++            shape(f, p);
++        });
++        add(@"square", 15, 15, @"square", ^(CGFloat w, CGFloat h, BOOL f) {
++            shape(f, [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(1, 1, w - 2, h - 2) xRadius:3 yRadius:3]);
++        });
++        add(@"rectangle", 18, 13, @"rectangle", ^(CGFloat w, CGFloat h, BOOL f) {
++            shape(f, [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(1, 1.5, w - 2, h - 3) xRadius:2.5 yRadius:2.5]);
++        });
++
++        /* directions */
++        void (^chev)(NSString *, int) = ^(NSString *n, int dir) {
++            BOOL vertical = dir >= 2;
++            add(n, vertical ? 14 : 10, vertical ? 9 : 14, n, ^(CGFloat w, CGFloat h, BOOL f) { chevron(NSMakeRect(0, 0, w, h), dir); });
++        };
++        chev(@"chevron.left", 0), chev(@"chevron.right", 1), chev(@"chevron.up", 2), chev(@"chevron.down", 3);
++        alias(@"chevron.backward", @"chevron.left"), alias(@"chevron.forward", @"chevron.right");
++        alias(@"chevron.compact.left", @"chevron.left"), alias(@"chevron.compact.right", @"chevron.right");
++        alias(@"chevron.compact.up", @"chevron.up"), alias(@"chevron.compact.down", @"chevron.down");
++        add(@"arrow.up", 12, 15, @"up", ^(CGFloat w, CGFloat h, BOOL f) { arrow(w / 2, 1.5, w / 2, h - 1.5, 5); });
++        add(@"arrow.down", 12, 15, @"down", ^(CGFloat w, CGFloat h, BOOL f) { arrow(w / 2, h - 1.5, w / 2, 1.5, 5); });
++        add(@"arrow.left", 15, 12, @"back", ^(CGFloat w, CGFloat h, BOOL f) { arrow(w - 1.5, h / 2, 1.5, h / 2, 5); });
++        add(@"arrow.right", 15, 12, @"forward", ^(CGFloat w, CGFloat h, BOOL f) { arrow(1.5, h / 2, w - 1.5, h / 2, 5); });
++        alias(@"arrow.backward", @"arrow.left"), alias(@"arrow.forward", @"arrow.right");
++        add(@"arrow.left.arrow.right", 17, 14, @"swap", ^(CGFloat w, CGFloat h, BOOL f) {
++            arrow(1.5, h * 0.7, w - 1.5, h * 0.7, 4);
++            arrow(w - 1.5, h * 0.3, 1.5, h * 0.3, 4);
++        });
++        add(@"arrow.up.arrow.down", 15, 15, @"sort", ^(CGFloat w, CGFloat h, BOOL f) {
++            arrow(w * 0.3, 1.5, w * 0.3, h - 1.5, 4);
++            arrow(w * 0.7, h - 1.5, w * 0.7, 1.5, 4);
++        });
++        add(@"arrow.clockwise", 15, 16, @"refresh", ^(CGFloat w, CGFloat h, BOOL f) { curved_arrow(w / 2, h / 2, w / 2 - 2, 120, -200); });
++        add(@"arrow.counterclockwise", 15, 16, @"undo", ^(CGFloat w, CGFloat h, BOOL f) { curved_arrow(w / 2, h / 2, w / 2 - 2, 60, 380); });
++        add(@"arrow.uturn.backward", 16, 14, @"undo", ^(CGFloat w, CGFloat h, BOOL f) {
++            arc(w * 0.55, h * 0.5, h * 0.35, 90, -90, YES);
++            line(w * 0.55, h * 0.85, w * 0.15, h * 0.85);
++            arrow(w * 0.55, h * 0.15, w * 0.3, h * 0.15, 0.1);
++            POLY(NO, NO, w * 0.32, h - 0.5, w * 0.12, h * 0.85, w * 0.32, h * 0.7);
++            line(w * 0.55, h * 0.15, w * 0.35, h * 0.15);
++        });
++        add(@"arrow.uturn.forward", 16, 14, @"redo", ^(CGFloat w, CGFloat h, BOOL f) {
++            arc(w * 0.45, h * 0.5, h * 0.35, 90, 270, NO);
++            line(w * 0.45, h * 0.85, w * 0.85, h * 0.85);
++            POLY(NO, NO, w * 0.68, h - 0.5, w * 0.88, h * 0.85, w * 0.68, h * 0.7);
++            line(w * 0.45, h * 0.15, w * 0.65, h * 0.15);
++        });
++        alias(@"arrow.uturn.left", @"arrow.uturn.backward"), alias(@"arrow.uturn.right", @"arrow.uturn.forward");
++        add(@"rotate.left", 15, 16, @"rotate left", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1.5, w * 0.6, h * 0.5, 1.5, NO);
++            curved_arrow(w * 0.55, h * 0.55, w * 0.38, 0, 110);
++        });
++        add(@"rotate.right", 15, 16, @"rotate right", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(w * 0.4 - 1.5, 1.5, w * 0.6, h * 0.5, 1.5, NO);
++            curved_arrow(w * 0.45, h * 0.55, w * 0.38, 180, 70);
++        });
++        void (^tri)(NSString *, int) = ^(NSString *n, int dir) {
++            add(n, 12, 12, n, ^(CGFloat w, CGFloat h, BOOL f) { triangle(NSMakeRect(0, 0, w, h), dir, 2); });
++        };
++        tri(@"arrowtriangle.left", 0), tri(@"arrowtriangle.right", 1), tri(@"arrowtriangle.up", 2), tri(@"arrowtriangle.down", 3);
++
++        /* media */
++        add(@"play", 13, 15, @"play", ^(CGFloat w, CGFloat h, BOOL f) { shape(f, ({
++                                                                          NSBezierPath *p = [NSBezierPath bezierPath];
++                                                                          [p moveToPoint:NSMakePoint(2, 1.5)];
++                                                                          [p lineToPoint:NSMakePoint(w - 1.5, h / 2)];
++                                                                          [p lineToPoint:NSMakePoint(2, h - 1.5)];
++                                                                          [p closePath];
++                                                                          p;
++                                                                      })); });
++        add(@"pause", 12, 15, @"pause", ^(CGFloat w, CGFloat h, BOOL f) {
++            shape(f, [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(1.5, 1.5, w * 0.3, h - 3) xRadius:1 yRadius:1]);
++            shape(f, [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(w - 1.5 - w * 0.3, 1.5, w * 0.3, h - 3) xRadius:1 yRadius:1]);
++        });
++        add(@"stop", 13, 13, @"stop", ^(CGFloat w, CGFloat h, BOOL f) {
++            shape(f, [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(1.5, 1.5, w - 3, h - 3) xRadius:2 yRadius:2]);
++        });
++        /* a hammer: a head across the top, a handle down and to the left */
++        add(@"hammer", 18, 17, @"build", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(YES, f, w * 0.30, h - 1.5, w * 0.70, h - 1.5, w - 1.5, h - 4.5, w - 1.5, h - 7, w * 0.30, h - 7);
++            POLY(YES, f, w * 0.50, h - 7, w * 0.62, h - 7, w * 0.30, 1.5, w * 0.18, 1.5);
++        });
++        /* a window with its bottom third (a pane) marked */
++        add(@"rectangle.bottomthird.inset", 18, 14, @"pane", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1, w - 3, h - 2, 2, NO);
++            rrect(3.5, 3, w - 7, (h - 6) / 3, 1, f);
++        });
++        add(@"backward", 18, 12, @"rewind", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(YES, f, w / 2, 1.5, 1.5, h / 2, w / 2, h - 1.5);
++            POLY(YES, f, w - 1.5, 1.5, w / 2, h / 2, w - 1.5, h - 1.5);
++        });
++        add(@"forward", 18, 12, @"fast forward", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(YES, f, 1.5, 1.5, w / 2, h / 2, 1.5, h - 1.5);
++            POLY(YES, f, w / 2, 1.5, w - 1.5, h / 2, w / 2, h - 1.5);
++        });
++        void (^spk)(NSString *, int) = ^(NSString *n, int levels) {
++            add(n, 13 + 4 * levels, 14, @"volume", ^(CGFloat w, CGFloat h, BOOL f) {
++                NSBezierPath *p = [NSBezierPath bezierPath];
++                [p moveToPoint:NSMakePoint(1.5, h * 0.35)];
++                [p lineToPoint:NSMakePoint(4.5, h * 0.35)];
++                [p lineToPoint:NSMakePoint(9, 1.5)];
++                [p lineToPoint:NSMakePoint(9, h - 1.5)];
++                [p lineToPoint:NSMakePoint(4.5, h * 0.65)];
++                [p lineToPoint:NSMakePoint(1.5, h * 0.65)];
++                [p closePath];
++                shape(f, p);
++                waves(10, h / 2, levels);
++            });
++        };
++        spk(@"speaker", 0), spk(@"speaker.wave.1", 1), spk(@"speaker.wave.2", 2), spk(@"speaker.wave.3", 3);
++        add(@"film", 17, 14, @"film", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1, w - 3, h - 2, 2, f);
++            line(w * 0.28, 1, w * 0.28, h - 1);
++            line(w * 0.72, 1, w * 0.72, h - 1);
++            line(1.5, h / 2, w * 0.28, h / 2);
++            line(w * 0.72, h / 2, w - 1.5, h / 2);
++        });
++        add(@"camera", 18, 14, @"camera", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1, w - 3, h * 0.72, 2.5, f);
++            POLY(NO, NO, w * 0.32, h * 0.72 + 1, w * 0.4, h - 1.5, w * 0.6, h - 1.5, w * 0.68, h * 0.72 + 1);
++            circle(w / 2, h * 0.38, h * 0.22, NO);
++        });
++        add(@"camera.filters", 16, 15, @"filters", ^(CGFloat w, CGFloat h, BOOL f) {
++            circle(w * 0.5, h * 0.66, w * 0.27, NO);
++            circle(w * 0.33, h * 0.36, w * 0.27, NO);
++            circle(w * 0.67, h * 0.36, w * 0.27, NO);
++        });
++        add(@"photo", 18, 14, @"photo", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1, w - 3, h - 2, 2, f);
++            POLY(NO, NO, 2.5, 3, w * 0.38, h * 0.5, w * 0.58, h * 0.3, w * 0.72, h * 0.45, w - 2.5, 3);
++            circle(w * 0.7, h * 0.7, 1.5, YES);
++        });
++        add(@"photo.on.rectangle", 19, 15, @"photos", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1, w - 6, h - 5, 2, f);
++            POLY(NO, NO, 4.5, h - 3.5, w - 1.5, h - 3.5, w - 1.5, 4);
++            POLY(NO, NO, 2.5, 3, w * 0.33, h * 0.42, w * 0.5, h * 0.26, w - 6.5, 3);
++        });
++        add(@"pip", 18, 14, @"picture in picture", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1, w - 3, h - 2, 2, NO);
++            rrect(w * 0.5, 3, w * 0.38, h * 0.4, 1, YES);
++        });
++        add(@"aspectratio", 17, 14, @"aspect ratio", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1, w - 3, h - 2, 2, f);
++            POLY(NO, NO, 4.5, h * 0.42, 4.5, h - 4, 8, h - 4);
++            POLY(NO, NO, w - 4.5, h * 0.58, w - 4.5, 4, w - 8, 4);
++        });
++
++        /* documents and files */
++        add(@"doc", 14, 16, @"document", ^(CGFloat w, CGFloat h, BOOL f) {
++            shape(f, doc_path(1.5, 1, w - 3, h - 2));
++            if (!f)
++                POLY(NO, NO, w - 1.5 - (w - 3) * 0.35, h - 1, w - 1.5 - (w - 3) * 0.35, h - 1 - (w - 3) * 0.35, w - 1.5, h - 1 - (w - 3) * 0.35);
++        });
++        alias(@"document", @"doc");
++        add(@"doc.on.doc", 16, 17, @"copy", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(NO, NO, 4.5, h - 1.5, w - 1.5, h - 1.5, w - 1.5, 5);
++            shape(f, doc_path(1.5, 1, w - 5, h - 4));
++        });
++        alias(@"document.on.document", @"doc.on.doc");
++        add(@"doc.on.clipboard", 15, 17, @"paste", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1, w - 3, h - 3, 2, f);
++            rrect(w * 0.32, h - 3.5, w * 0.36, 3, 1, YES);
++        });
++        alias(@"document.on.clipboard", @"doc.on.clipboard");
++        alias(@"clipboard", @"doc.on.clipboard");
++        add(@"folder", 18, 14, @"folder", ^(CGFloat w, CGFloat h, BOOL f) { folder_outline(1.5, 1.5, w - 3, h - 3, f); });
++        add(@"tray", 17, 14, @"tray", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(NO, f, 1.5, h * 0.45, 1.5, 1.5, w - 1.5, 1.5, w - 1.5, h * 0.45);
++            POLY(NO, NO, 1.5, h * 0.45, w * 0.35, h * 0.45, w * 0.4, h * 0.3, w * 0.6, h * 0.3, w * 0.65, h * 0.45, w - 1.5, h * 0.45);
++            POLY(NO, NO, 1.5, h * 0.45, 4, h - 1.5, w - 4, h - 1.5, w - 1.5, h * 0.45);
++        });
++        add(@"trash", 15, 17, @"trash", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(YES, f, 3, 1.5, w - 3, 1.5, w - 2, h - 4, 2, h - 4);
++            line(1, h - 4, w - 1, h - 4);
++            POLY(NO, NO, w * 0.35, h - 4, w * 0.35, h - 1.5, w * 0.65, h - 1.5, w * 0.65, h - 4);
++        });
++        add(@"square.and.arrow.up", 15, 18, @"Share", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(NO, NO, w * 0.3, h * 0.6, 1.5, h * 0.6, 1.5, 1.5, w - 1.5, 1.5, w - 1.5, h * 0.6, w * 0.7, h * 0.6);
++            arrow(w / 2, h * 0.3, w / 2, h - 1.5, 4);
++        });
++        add(@"square.and.arrow.down", 15, 18, @"Save", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(NO, NO, w * 0.3, h * 0.6, 1.5, h * 0.6, 1.5, 1.5, w - 1.5, 1.5, w - 1.5, h * 0.6, w * 0.7, h * 0.6);
++            arrow(w / 2, h - 1.5, w / 2, h * 0.3, 4);
++        });
++        add(@"square.and.arrow.up.on.square", 17, 19, @"Share", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1.5, w - 6, h * 0.55, 2, NO);
++            POLY(NO, NO, 4.5, h * 0.55 + 1.5, 4.5, h * 0.65, w - 1.5, h * 0.65, w - 1.5, 4.5, w - 4.5, 4.5);
++            arrow(w * 0.42, h * 0.3, w * 0.42, h - 1.5, 3.5);
++        });
++        add(@"square.and.pencil", 17, 16, @"compose", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(NO, NO, w * 0.55, h - 2.5, 1.5, h - 2.5, 1.5, 1.5, w - 3.5, 1.5, w - 3.5, h * 0.45);
++            POLY(YES, f, w * 0.38, h * 0.4, w - 3, h - 1.5, w - 1, h - 3.5, w * 0.48, h * 0.3, w * 0.35, h * 0.27);
++        });
++        add(@"plus.square.on.square", 17, 17, @"duplicate", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(NO, NO, 4.5, h - 1.5, w - 1.5, h - 1.5, w - 1.5, 4.5);
++            rrect(1.5, 1.5, w - 5, h - 5, 2, f);
++            plus((w - 2) / 2, (h - 2) / 2, w * 0.18);
++        });
++        add(@"printer", 17, 16, @"print", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, h * 0.3, w - 3, h * 0.42, 2, f);
++            POLY(NO, NO, w * 0.25, h * 0.72, w * 0.25, h - 1.5, w * 0.75, h - 1.5, w * 0.75, h * 0.72);
++            POLY(YES, NO, w * 0.25, 1.5, w * 0.75, 1.5, w * 0.75, h * 0.42, w * 0.25, h * 0.42);
++        });
++        add(@"book", 17, 14, @"book", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(YES, f, w / 2, 2, w / 2, h - 1.5, 1.5, h - 1, 1.5, 1.5);
++            POLY(YES, f, w / 2, 2, w / 2, h - 1.5, w - 1.5, h - 1, w - 1.5, 1.5);
++        });
++        add(@"bookmark", 11, 15, @"bookmark", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(YES, f, 1.5, h - 1.5, w - 1.5, h - 1.5, w - 1.5, 1.5, w / 2, h * 0.3, 1.5, 1.5);
++        });
++        add(@"tag", 15, 15, @"tag", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(YES, f, 1.5, h * 0.55, w * 0.45, 1.5, w - 1.5, h * 0.55, w - 1.5, h - 1.5, w * 0.45, h - 1.5);
++            circle(w * 0.72, h * 0.75, 1.2, !f);
++        });
++        add(@"paperclip", 9, 17, @"attachment", ^(CGFloat w, CGFloat h, BOOL f) {
++            NSBezierPath *p = stroke_path();
++            [p moveToPoint:NSMakePoint(w * 0.7, h * 0.3)];
++            [p lineToPoint:NSMakePoint(w * 0.7, h * 0.75)];
++            [p appendBezierPathWithArcWithCenter:NSMakePoint(w * 0.5, h * 0.75) radius:w * 0.2 startAngle:0 endAngle:180];
++            [p lineToPoint:NSMakePoint(w * 0.3, h * 0.2)];
++            [p appendBezierPathWithArcWithCenter:NSMakePoint(w * 0.5, h * 0.2) radius:w * 0.2 startAngle:180 endAngle:360];
++            [p lineToPoint:NSMakePoint(w * 0.7, h * 0.65)];
++            [p stroke];
++        });
++        add(@"link", 16, 16, @"link", ^(CGFloat w, CGFloat h, BOOL f) {
++            NSAffineTransform *t = [NSAffineTransform transform];
++            [t translateXBy:w / 2 yBy:h / 2];
++            [t rotateByDegrees:45];
++            [NSGraphicsContext saveGraphicsState];
++            [t concat];
++            rrect(-w * 0.45, -2.5, w * 0.5, 5, 2.5, NO);
++            rrect(-w * 0.05, -2.5, w * 0.5, 5, 2.5, NO);
++            [NSGraphicsContext restoreGraphicsState];
++        });
++        add(@"signature", 18, 13, @"signature", ^(CGFloat w, CGFloat h, BOOL f) {
++            NSBezierPath *p = stroke_path();
++            [p moveToPoint:NSMakePoint(1.5, h * 0.35)];
++            [p curveToPoint:NSMakePoint(w * 0.4, h * 0.45) controlPoint1:NSMakePoint(w * 0.15, h) controlPoint2:NSMakePoint(w * 0.3, h * 0.9)];
++            [p curveToPoint:NSMakePoint(w - 1.5, h * 0.55) controlPoint1:NSMakePoint(w * 0.5, 0) controlPoint2:NSMakePoint(w * 0.75, h * 0.9)];
++            [p stroke];
++            line(1.5, 1.5, w - 1.5, 1.5);
++        });
++
++        /* tools and controls */
++        add(@"gear", 17, 16, @"settings", ^(CGFloat w, CGFloat h, BOOL f) { gear(w / 2, h / 2, h / 2 - 0.5, 8, f); });
++        alias(@"gearshape", @"gear");
++        add(@"gearshape.2", 19, 17, @"settings", ^(CGFloat w, CGFloat h, BOOL f) {
++            gear(w * 0.38, h * 0.4, h * 0.36, 8, f);
++            gear(w * 0.75, h * 0.75, h * 0.24, 6, f);
++        });
++        add(@"magnifyingglass", 16, 15, @"Search", ^(CGFloat w, CGFloat h, BOOL f) { magnifier(w * 0.4, h * 0.6, h * 0.34); });
++        add(@"plus.magnifyingglass", 16, 15, @"zoom in", ^(CGFloat w, CGFloat h, BOOL f) {
++            magnifier(w * 0.4, h * 0.6, h * 0.34);
++            plus(w * 0.4, h * 0.6, h * 0.16);
++        });
++        add(@"minus.magnifyingglass", 16, 15, @"zoom out", ^(CGFloat w, CGFloat h, BOOL f) {
++            magnifier(w * 0.4, h * 0.6, h * 0.34);
++            line(w * 0.4 - h * 0.16, h * 0.6, w * 0.4 + h * 0.16, h * 0.6);
++        });
++        add(@"slider.horizontal.3", 17, 15, @"adjust", ^(CGFloat w, CGFloat h, BOOL f) {
++            CGFloat knobs[3] = {0.65, 0.3, 0.55};
++            for (int i = 0; i < 3; i++) {
++                CGFloat y = 2 + i * (h - 4) / 2;
++                line(1.5, y, w - 1.5, y);
++                circle(1.5 + knobs[i] * (w - 3), y, 1.8, YES);
++            }
++        });
++        add(@"slider.horizontal.below.rectangle", 17, 16, @"adjust", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, h * 0.42, w - 3, h * 0.55, 2, f);
++            line(1.5, 2.5, w - 1.5, 2.5);
++            circle(w * 0.6, 2.5, 1.8, YES);
++        });
++        add(@"list.bullet", 17, 13, @"list", ^(CGFloat w, CGFloat h, BOOL f) {
++            for (int i = 0; i < 3; i++) {
++                CGFloat y = 2 + i * (h - 4) / 2;
++                circle(2, y, 1.2, YES);
++                line(5.5, y, w - 1.5, y);
++            }
++        });
++        add(@"line.3.horizontal", 16, 11, @"menu", ^(CGFloat w, CGFloat h, BOOL f) {
++            for (int i = 0; i < 3; i++)
++                line(1.5, 1.5 + i * (h - 3) / 2, w - 1.5, 1.5 + i * (h - 3) / 2);
++        });
++        add(@"line.3.horizontal.decrease", 16, 11, @"filter", ^(CGFloat w, CGFloat h, BOOL f) {
++            for (int i = 0; i < 3; i++)
++                line(1.5 + i * 2.5, h - 1.5 - i * (h - 3) / 2, w - 1.5 - i * 2.5, h - 1.5 - i * (h - 3) / 2);
++        });
++        add(@"square.grid.2x2", 15, 15, @"grid", ^(CGFloat w, CGFloat h, BOOL f) {
++            for (int i = 0; i < 4; i++)
++                rrect(1.5 + (i % 2) * (w / 2), 1.5 + (i / 2) * (h / 2), w / 2 - 3, h / 2 - 3, 1.5, f);
++        });
++        alias(@"rectangle.grid.2x2", @"square.grid.2x2");
++        add(@"sidebar.leading", 18, 14, @"sidebar", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1, w - 3, h - 2, 2, NO);
++            line(w * 0.36, 1, w * 0.36, h - 1);
++        });
++        alias(@"sidebar.left", @"sidebar.leading");
++        add(@"sidebar.trailing", 18, 14, @"sidebar", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1, w - 3, h - 2, 2, NO);
++            line(w * 0.64, 1, w * 0.64, h - 1);
++        });
++        alias(@"sidebar.right", @"sidebar.trailing");
++        add(@"pencil", 15, 15, @"edit", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(YES, f, 1.5, 1.5, 2.5, 5, w - 4, h - 1.5, w - 1.5, h - 4, 5, 2.5);
++        });
++        add(@"scissors", 15, 16, @"cut", ^(CGFloat w, CGFloat h, BOOL f) {
++            circle(w * 0.28, 3.5, 2.2, f);
++            circle(w * 0.72, 3.5, 2.2, f);
++            line(w * 0.38, 5.5, w * 0.75, h - 1.5);
++            line(w * 0.62, 5.5, w * 0.25, h - 1.5);
++        });
++        add(@"lock", 13, 17, @"lock", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1.5, w - 3, h * 0.5, 2, f);
++            arc(w / 2, h * 0.52 + 1.5, w / 2 - 3.5, 0, 180, NO);
++            line(3.5, h * 0.52, 3.5, h * 0.52 + 1.5);
++            line(w - 3.5, h * 0.52, w - 3.5, h * 0.52 + 1.5);
++        });
++        add(@"lock.open", 16, 17, @"unlock", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1.5, w * 0.65, h * 0.5, 2, f);
++            arc(w * 0.72, h * 0.62 + 1.5, w * 0.22, 0, 180, NO);
++            line(w * 0.5, h * 0.52, w * 0.5, h * 0.62 + 1.5);
++        });
++        add(@"key", 17, 12, @"key", ^(CGFloat w, CGFloat h, BOOL f) {
++            circle(4.5, h / 2, 3, f);
++            line(7.5, h / 2, w - 1.5, h / 2);
++            line(w - 4, h / 2, w - 4, 2.5);
++        });
++        add(@"eye", 18, 12, @"show", ^(CGFloat w, CGFloat h, BOOL f) {
++            NSBezierPath *p = stroke_path();
++            [p moveToPoint:NSMakePoint(1.5, h / 2)];
++            [p curveToPoint:NSMakePoint(w - 1.5, h / 2) controlPoint1:NSMakePoint(w * 0.3, h + 2) controlPoint2:NSMakePoint(w * 0.7, h + 2)];
++            [p curveToPoint:NSMakePoint(1.5, h / 2) controlPoint1:NSMakePoint(w * 0.7, -2) controlPoint2:NSMakePoint(w * 0.3, -2)];
++            shape(f, p);
++            circle(w / 2, h / 2, 2.5, !f);
++        });
++        add(@"fan", 16, 16, @"fan", ^(CGFloat w, CGFloat h, BOOL f) {
++            for (int i = 0; i < 3; i++) {
++                NSAffineTransform *t = [NSAffineTransform transform];
++                [t translateXBy:w / 2 yBy:h / 2];
++                [t rotateByDegrees:i * 120];
++                [NSGraphicsContext saveGraphicsState];
++                [t concat];
++                NSBezierPath *p = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(-2, 1, 4, h / 2 - 2)];
++                shape(f, p);
++                [NSGraphicsContext restoreGraphicsState];
++            }
++            circle(w / 2, h / 2, 1.2, YES);
++        });
++        add(@"wind", 17, 13, @"wind", ^(CGFloat w, CGFloat h, BOOL f) {
++            arc(w * 0.7, h * 0.75, 2.5, 270, 170, NO);
++            line(1.5, h * 0.75 - 2.5, w * 0.7, h * 0.75 - 2.5);
++            line(1.5, h * 0.48, w - 1.5, h * 0.48);
++            arc(w * 0.62, h * 0.22, 2.5, 90, 190, YES);
++            line(1.5, h * 0.22 + 2.5, w * 0.62, h * 0.22 + 2.5);
++        });
++        add(@"mug", 17, 15, @"mug", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1.5, w * 0.68, h - 4, 2, f);
++            arc(w * 0.72, h * 0.5, 3, -90, 90, NO);
++        });
++        add(@"cross", 12, 16, @"cross", ^(CGFloat w, CGFloat h, BOOL f) {
++            line(w / 2, 1.5, w / 2, h - 1.5);
++            line(1.5, h * 0.66, w - 1.5, h * 0.66);
++        });
++        add(@"translate", 18, 16, @"translate", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, h * 0.3, w * 0.55, h * 0.65, 2, NO);
++            text(@"A", NSMakeRect(1.5, h * 0.3, w * 0.55, h * 0.65), h * 0.5, NSFontWeightSemibold, 0, nil);
++            rrect(w * 0.45, 1.5, w * 0.5, h * 0.55, 2, f);
++        });
++
++        /* people, places, communication */
++        /* head and shoulders, from the bottom of the box */
++        void (^bust)(CGFloat, CGFloat, CGFloat, BOOL) = ^(CGFloat cx, CGFloat bottom, CGFloat width, BOOL f) {
++            circle(cx, bottom + width * 0.82, width * 0.26, f);
++            NSBezierPath *body = stroke_path();
++            [body appendBezierPathWithArcWithCenter:NSMakePoint(cx, bottom) radius:width / 2 startAngle:0 endAngle:180];
++            [body closePath];
++            shape(f, body);
++        };
++        add(@"person", 14, 15, @"person", ^(CGFloat w, CGFloat h, BOOL f) { bust(w / 2, 1.5, w - 3, f); });
++        add(@"person.crop.circle", 15, 15, @"account", ^(CGFloat w, CGFloat h, BOOL f) {
++            CGContextRef cg = [NSGraphicsContext currentContext].CGContext;
++            NSBezierPath *ring = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(1, 1, w - 2, h - 2)];
++            ring.lineWidth = kStroke;
++            CGContextSaveGState(cg);
++            [ring addClip];
++            if (f) {
++                CGContextBeginTransparencyLayer(cg, NULL);
++                [ring fill];
++                CGContextSetBlendMode(cg, kCGBlendModeClear);
++                bust(w / 2, 1, w * 0.6, YES);
++                CGContextEndTransparencyLayer(cg);
++            } else {
++                bust(w / 2, 1, w * 0.6, NO);
++            }
++            CGContextRestoreGState(cg);
++            if (!f)
++                [ring stroke];
++        });
++        add(@"person.2", 19, 14, @"people", ^(CGFloat w, CGFloat h, BOOL f) {
++            circle(w * 0.35, h * 0.72, h * 0.2, f);
++            arc(w * 0.35, 1.5, w * 0.3, 0, 180, NO);
++            circle(w * 0.72, h * 0.68, h * 0.17, f);
++            arc(w * 0.75, 3, w * 0.22, 0, 120, NO);
++        });
++        add(@"house", 17, 15, @"home", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(NO, NO, 1.5, h * 0.5, w / 2, h - 1.5, w - 1.5, h * 0.5);
++            POLY(NO, f, 3.5, h * 0.55, 3.5, 1.5, w - 3.5, 1.5, w - 3.5, h * 0.55);
++        });
++        add(@"globe", 15, 15, @"globe", ^(CGFloat w, CGFloat h, BOOL f) { globe(w / 2, h / 2, w / 2 - 1); });
++        add(@"mappin.and.ellipse", 16, 16, @"location", ^(CGFloat w, CGFloat h, BOOL f) {
++            NSBezierPath *e = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(1.5, 1, w - 3, 4)];
++            e.lineWidth = kStroke;
++            [e stroke];
++            circle(w / 2, h * 0.7, h * 0.2, f);
++            line(w / 2, h * 0.5, w / 2, 3);
++        });
++        add(@"envelope", 18, 13, @"mail", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1.5, w - 3, h - 3, 2, f);
++            POLY(NO, NO, 1.5, h - 2, w / 2, h * 0.4, w - 1.5, h - 2);
++        });
++        add(@"paperplane", 16, 16, @"send", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(YES, f, 1.5, h * 0.55, w - 1.5, h - 1.5, w * 0.6, 1.5, w * 0.45, h * 0.42);
++        });
++        add(@"bubble.left", 16, 15, @"message", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 4, w - 3, h - 5.5, 5, f);
++            POLY(YES, f, 3, 5, 2, 1, 7, 4.5);
++        });
++        alias(@"message", @"bubble.left");
++        add(@"exclamationmark.bubble", 16, 15, @"feedback", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 4, w - 3, h - 5.5, 5, f);
++            POLY(YES, f, 3, 5, 2, 1, 7, 4.5);
++            line(w / 2, h * 0.5, w / 2, h - 4);
++            circle(w / 2, 6.5, 0.9, YES);
++        });
++        add(@"phone", 15, 15, @"phone", ^(CGFloat w, CGFloat h, BOOL f) {
++            NSBezierPath *p = stroke_path();
++            [p moveToPoint:NSMakePoint(3, h - 1.5)];
++            [p curveToPoint:NSMakePoint(w - 1.5, 3) controlPoint1:NSMakePoint(0, h * 0.4) controlPoint2:NSMakePoint(w * 0.4, 0)];
++            [p lineToPoint:NSMakePoint(w - 4, 6)];
++            [p lineToPoint:NSMakePoint(6, h - 4)];
++            [p closePath];
++            shape(f, p);
++        });
++        add(@"bell", 15, 16, @"notifications", ^(CGFloat w, CGFloat h, BOOL f) {
++            NSBezierPath *p = stroke_path();
++            [p moveToPoint:NSMakePoint(1.5, 3.5)];
++            [p lineToPoint:NSMakePoint(w - 1.5, 3.5)];
++            [p curveToPoint:NSMakePoint(w / 2, h - 1.5) controlPoint1:NSMakePoint(w * 0.75, 6) controlPoint2:NSMakePoint(w * 0.85, h - 1.5)];
++            [p curveToPoint:NSMakePoint(1.5, 3.5) controlPoint1:NSMakePoint(w * 0.15, h - 1.5) controlPoint2:NSMakePoint(w * 0.25, 6)];
++            shape(f, p);
++            line(w * 0.4, 1, w * 0.6, 1);
++        });
++        add(@"calendar", 16, 15, @"calendar", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1.5, w - 3, h - 3, 2, f);
++            line(1.5, h * 0.7, w - 1.5, h * 0.7);
++            line(w * 0.3, h - 3, w * 0.3, h - 0.5);
++            line(w * 0.7, h - 3, w * 0.7, h - 0.5);
++        });
++        add(@"clock", 15, 15, @"clock", ^(CGFloat w, CGFloat h, BOOL f) { clock_face(w / 2, h / 2, w / 2 - 1); });
++        add(@"calendar.badge.clock", 17, 16, @"schedule", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 3, w - 6, h - 4.5, 2, f);
++            line(1.5, h * 0.72, w - 4.5, h * 0.72);
++            clock_face(w - 4.5, 4.5, 4);
++        });
++
++        /* weather, devices, the rest */
++        add(@"sun.max", 17, 17, @"brightness", ^(CGFloat w, CGFloat h, BOOL f) {
++            circle(w / 2, h / 2, w * 0.2, f);
++            for (int i = 0; i < 8; i++) {
++                CGFloat a = i * M_PI / 4;
++                line(w / 2 + w * 0.32 * cos(a), h / 2 + h * 0.32 * sin(a), w / 2 + w * 0.44 * cos(a), h / 2 + h * 0.44 * sin(a));
++            }
++        });
++        add(@"moon", 14, 15, @"night", ^(CGFloat w, CGFloat h, BOOL f) {
++            NSBezierPath *p = stroke_path();
++            [p appendBezierPathWithArcWithCenter:NSMakePoint(w / 2, h / 2) radius:w / 2 - 1 startAngle:60 endAngle:290];
++            [p curveToPoint:NSMakePoint(w / 2 + (w / 2 - 1) * 0.5, h / 2 + (w / 2 - 1) * 0.86)
++              controlPoint1:NSMakePoint(w * 0.35, h * 0.3) controlPoint2:NSMakePoint(w * 0.35, h * 0.75)];
++            shape(f, p);
++        });
++        add(@"bolt", 11, 16, @"power", ^(CGFloat w, CGFloat h, BOOL f) {
++            POLY(YES, f, w * 0.62, h - 1.5, 1.5, h * 0.42, w * 0.48, h * 0.42, w * 0.38, 1.5, w - 1.5, h * 0.58, w * 0.52, h * 0.58);
++        });
++        add(@"cloud", 18, 13, @"cloud", ^(CGFloat w, CGFloat h, BOOL f) {
++            NSBezierPath *p = stroke_path();
++            [p moveToPoint:NSMakePoint(4, 1.5)];
++            [p lineToPoint:NSMakePoint(w - 4, 1.5)];
++            [p appendBezierPathWithArcWithCenter:NSMakePoint(w - 4, 4.5) radius:3 startAngle:-90 endAngle:90];
++            [p appendBezierPathWithArcWithCenter:NSMakePoint(w * 0.55, h * 0.6) radius:h * 0.32 startAngle:20 endAngle:170];
++            [p appendBezierPathWithArcWithCenter:NSMakePoint(4.5, 4.5) radius:3 startAngle:90 endAngle:270];
++            [p closePath];
++            shape(f, p);
++        });
++        alias(@"icloud", @"cloud");
++        add(@"icloud.and.arrow.down", 18, 15, @"download", ^(CGFloat w, CGFloat h, BOOL f) {
++            NSBezierPath *p = stroke_path();
++            [p moveToPoint:NSMakePoint(5, 4)];
++            [p appendBezierPathWithArcWithCenter:NSMakePoint(4.5, 7) radius:3 startAngle:270 endAngle:90 clockwise:YES];
++            [p appendBezierPathWithArcWithCenter:NSMakePoint(w * 0.55, h * 0.68) radius:h * 0.28 startAngle:170 endAngle:20 clockwise:YES];
++            [p appendBezierPathWithArcWithCenter:NSMakePoint(w - 4, 7) radius:3 startAngle:90 endAngle:-90 clockwise:YES];
++            [p stroke];
++            arrow(w / 2, h * 0.55, w / 2, 1.5, 3.5);
++        });
++        add(@"wifi", 17, 13, @"Wi-Fi", ^(CGFloat w, CGFloat h, BOOL f) {
++            for (int i = 1; i <= 3; i++)
++                arc(w / 2, 2, i * (h - 3) / 3, 45, 135, NO);
++            circle(w / 2, 2, 1.3, YES);
++        });
++        add(@"mic", 11, 16, @"microphone", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(w / 2 - 2.5, h * 0.38, 5, h * 0.6, 2.5, f);
++            arc(w / 2, h * 0.55, w / 2 - 1, 200, 340, NO);
++            line(w / 2, h * 0.2, w / 2, 1);
++        });
++        add(@"video", 19, 12, @"video", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1.5, w * 0.65, h - 3, 2, f);
++            POLY(YES, f, w * 0.65 + 2, h * 0.4, w - 1.5, 2, w - 1.5, h - 2, w * 0.65 + 2, h * 0.6);
++        });
++        add(@"keyboard", 19, 13, @"keyboard", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1.5, w - 3, h - 3, 2, f);
++            line(w * 0.3, 4, w * 0.7, 4);
++            for (int i = 0; i < 4; i++)
++                circle(4.5 + i * (w - 9) / 3, h * 0.62, 0.8, YES);
++        });
++        add(@"calculator", 13, 16, nil, ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1.5, w - 3, h - 3, 2.5, f);
++            /* the display, then keys in three rows of two */
++            CGContextRef cg = [NSGraphicsContext currentContext].CGContext;
++            if (f) {
++                CGContextSaveGState(cg);
++                CGContextSetBlendMode(cg, kCGBlendModeClear);
++            }
++            rrect(3.5, h * 0.66, w - 7, h * 0.16, 0.8, YES);
++            for (int row = 0; row < 3; row++)
++                for (int col = 0; col < 2; col++)
++                    circle(w * (col ? 0.66 : 0.34), h * (0.5 - row * 0.15), 0.95, YES);
++            if (f)
++                CGContextRestoreGState(cg);
++        });
++        ((SymbolGlyph *)[t[@"calculator"] pointerValue])->privateOnly = YES;
++        add(@"display", 18, 15, @"display", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, h * 0.28, w - 3, h * 0.7, 2, f);
++            line(w * 0.35, 1, w * 0.65, 1);
++            line(w / 2, 1, w / 2, h * 0.28);
++        });
++        add(@"textformat.size.smaller", 15, 13, @"smaller text", ^(CGFloat w, CGFloat h, BOOL f) {
++            text(@"A", NSMakeRect(0, 0, w * 0.55, h), h * 0.75, NSFontWeightMedium, 0, nil);
++            text(@"A", NSMakeRect(w * 0.5, 0, w * 0.5, h * 0.8), h * 0.5, NSFontWeightMedium, 0, nil);
++        });
++        add(@"textformat.size.larger", 15, 13, @"larger text", ^(CGFloat w, CGFloat h, BOOL f) {
++            text(@"A", NSMakeRect(0, 0, w * 0.5, h * 0.8), h * 0.5, NSFontWeightMedium, 0, nil);
++            text(@"A", NSMakeRect(w * 0.45, 0, w * 0.55, h), h * 0.75, NSFontWeightMedium, 0, nil);
++        });
++        add(@"character.textbox", 16, 16, @"text box", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1.5, w - 3, h - 3, 3, f);
++            text(@"A", NSMakeRect(1.5, 1.5, w - 3, h - 3), h * 0.55, NSFontWeightMedium, 0, nil);
++        });
++        add(@"hand.thumbsup", 15, 15, @"like", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1.5, 3, h * 0.55, 1, f);
++            POLY(YES, f, 6, 1.5, w - 2.5, 1.5, w - 1.5, h * 0.55, w * 0.62, h * 0.6, w * 0.62, h - 1.5, w * 0.5, h - 1.5, 6, h * 0.55);
++        });
++        add(@"hand.thumbsdown", 15, 15, @"dislike", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, h * 0.45 - 1.5, 3, h * 0.55, 1, f);
++            POLY(YES, f, 6, h - 1.5, w - 2.5, h - 1.5, w - 1.5, h * 0.45, w * 0.62, h * 0.4, w * 0.62, 1.5, w * 0.5, 1.5, 6, h * 0.45);
++        });
++        add(@"filemenu.and.selection", 17, 15, @"menu", ^(CGFloat w, CGFloat h, BOOL f) {
++            rrect(1.5, 1.5, w - 3, h - 3, 2, NO);
++            line(1.5, h - 4.5, w - 1.5, h - 4.5);
++            rrect(3.5, h * 0.35, w - 7, 3.5, 1, YES);
++        });
++    });
++    return t;
++}
++
++/* A name read as a base glyph and its modifiers. */
++typedef struct {
++    SymbolGlyph *glyph;
++    BOOL fill, slash;
++    int enclosure; /* 0 none, 1 circle, 2 square */
++    int badge;     /* 0 none, 1 plus, 2 minus, 3 checkmark, 4 another glyph */
++    SymbolGlyph *badgeGlyph;
++} ParsedSymbol;
++
++static BOOL
++parse_symbol(NSString *name, ParsedSymbol *out)
++{
++    memset(out, 0, sizeof *out);
++    NSDictionary *glyphs = symbol_glyphs();
++    NSMutableArray *parts = [[[name componentsSeparatedByString:@"."] mutableCopy] autorelease];
++    for (;;) {
++        NSString *joined = [parts componentsJoinedByString:@"."];
++        SymbolGlyph *g = [glyphs[joined] pointerValue];
++        if (g) {
++            out->glyph = g;
++            return YES;
++        }
++        if (parts.count < 2)
++            return NO;
++        NSString *last = parts.lastObject, *before = parts[parts.count - 2];
++        if ([last isEqual:@"fill"] && !out->fill && !out->enclosure)
++            out->fill = YES;
++        else if (([last isEqual:@"circle"] || [last isEqual:@"square"]) && !out->enclosure)
++            out->enclosure = [last isEqual:@"circle"] ? 1 : 2;
++        else if ([last isEqual:@"slash"] && !out->slash)
++            out->slash = YES;
++        else if ([before isEqual:@"badge"] && !out->badge &&
++                 ([last isEqual:@"plus"] || [last isEqual:@"minus"] || [last isEqual:@"checkmark"])) {
++            out->badge = [last isEqual:@"plus"] ? 1 : [last isEqual:@"minus"] ? 2 : 3;
++            [parts removeLastObject];
++        } else if ([before isEqual:@"badge"] && !out->badge && glyphs[last]) {
++            /* a small glyph at the corner (doc.badge.gearshape) */
++            out->badge = 4;
++            out->badgeGlyph = [glyphs[last] pointerValue];
++            [parts removeLastObject];
++        } else
++            return NO;
++        [parts removeLastObject];
++    }
++}
++
++/* The stroke for a weight, at 13 points. */
++static CGFloat
++weight_stroke(NSFontWeight weight)
++{
++    if (weight <= NSFontWeightUltraLight)
++        return 0.6;
++    if (weight <= NSFontWeightThin)
++        return 0.85;
++    if (weight <= NSFontWeightLight)
++        return 1.15;
++    if (weight <= NSFontWeightRegular)
++        return 1.45;
++    if (weight <= NSFontWeightMedium)
++        return 1.65;
++    if (weight <= NSFontWeightSemibold)
++        return 1.9;
++    if (weight <= NSFontWeightBold)
++        return 2.15;
++    if (weight <= NSFontWeightHeavy)
++        return 2.5;
++    return 2.85;
++}
++
++@interface NSImageSymbolConfiguration (FinchSymbols)
++- (void)_finchPointSize:(CGFloat *)pointSize weight:(NSFontWeight *)weight hasWeight:(BOOL *)hasWeight scale:(NSImageSymbolScale *)scale;
++@end
++
++
++/* (SiliconForest) Finch's symbol_image, drawn into a bitmap */
++NSImage *
++SFFinchSymbolImage(NSString *name, NSImageSymbolConfiguration *config)
++{
++    ParsedSymbol ps;
++    if (![name isKindOfClass:[NSString class]] || !parse_symbol(name, &ps))
++        return nil;
++    if (ps.glyph->privateOnly || (ps.badgeGlyph && ps.badgeGlyph->privateOnly))
++        return nil;
++    CGFloat pointSize = 0;
++    NSFontWeight weight = NSFontWeightRegular;
++    BOOL hasWeight = NO;
++    NSImageSymbolScale scale = (NSImageSymbolScale)0;
++    if (config)
++        [config _finchPointSize:&pointSize weight:&weight hasWeight:&hasWeight scale:&scale];
++    if (pointSize <= 0)
++        pointSize = 13;
++    CGFloat k = (1.148 * pointSize + 1.07) / (1.148 * 13 + 1.07) *
++                (scale == NSImageSymbolScaleSmall ? 0.82 : scale == NSImageSymbolScaleLarge ? 1.29 : 1);
++    SymbolGlyph *g = ps.glyph;
++    CGFloat gw = g->w, gh = g->h;
++    if (ps.enclosure)
++        gw = gh = MAX(15, MAX(g->w, g->h) + 3);
++    NSSize size = NSMakeSize(round(gw * k), round(gh * k));
++    CGFloat stroke = weight_stroke(hasWeight ? weight : NSFontWeightRegular);
++    ParsedSymbol p = ps;
++    const CGFloat px = 3;
++    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:(NSInteger)(size.width * px)
++                                                                    pixelsHigh:(NSInteger)(size.height * px) bitsPerSample:8
++                                                               samplesPerPixel:4 hasAlpha:YES isPlanar:NO
++                                                                colorSpaceName:NSDeviceRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
++    NSGraphicsContext *context = [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
++    NSRect dst = NSMakeRect(0, 0, size.width, size.height);
++    [NSGraphicsContext saveGraphicsState];
++    [NSGraphicsContext setCurrentContext:context];
++    {
++        CGFloat saved = kStroke;
++        kStroke = stroke;
++        NSAffineTransform *t = [NSAffineTransform transform];
++        [t scaleBy:px];
++        [t translateXBy:dst.origin.x yBy:dst.origin.y];
++        [t scaleXBy:dst.size.width / gw yBy:dst.size.height / gh];
++        [t concat];
++        [[NSColor blackColor] set];
++        CGContextRef cg = (CGContextRef)[context graphicsPort];
++        if (p.enclosure) {
++            NSBezierPath *outline = p.enclosure == 1 ? [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(1, 1, gw - 2, gh - 2)]
++                                                     : [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(1, 1, gw - 2, gh - 2)
++                                                                                      xRadius:3.5
++                                                                                      yRadius:3.5];
++            [outline setLineWidth:kStroke];
++            if (p.fill) {
++                CGContextBeginTransparencyLayer(cg, NULL);
++                [outline fill];
++                CGContextSetBlendMode(cg, kCGBlendModeClear);
++            } else {
++                [outline stroke];
++            }
++            CGFloat s = 0.55 * MIN(gw / g->w, gh / g->h);
++            NSAffineTransform *in = [NSAffineTransform transform];
++            [in translateXBy:(gw - g->w * s) / 2 yBy:(gh - g->h * s) / 2];
++            [in scaleBy:s];
++            [NSGraphicsContext saveGraphicsState];
++            [in concat];
++            kStroke = stroke / s * 0.9;
++            g->draw(g->w, g->h, NO);
++            [NSGraphicsContext restoreGraphicsState];
++            kStroke = stroke;
++            if (p.fill)
++                CGContextEndTransparencyLayer(cg);
++        } else {
++            g->draw(g->w, g->h, p.fill);
++        }
++        if (p.slash) {
++            CGContextSaveGState(cg);
++            CGContextSetBlendMode(cg, kCGBlendModeClear);
++            line(1, gh, gw, 1);
++            CGContextRestoreGState(cg);
++            line(1.5, gh - 0.5, gw - 0.5, 1.5);
++        }
++        if (p.badge == 4) {
++            SymbolGlyph *b = p.badgeGlyph;
++            CGFloat r = MIN(gw, gh) * 0.3, cx = gw - r, cy = r;
++            CGContextSaveGState(cg);
++            CGContextSetBlendMode(cg, kCGBlendModeClear);
++            circle(cx, cy, r + 1.2, YES);
++            CGContextRestoreGState(cg);
++            CGFloat s = 2 * r / MAX(b->w, b->h);
++            NSAffineTransform *in = [NSAffineTransform transform];
++            [in translateXBy:cx - b->w * s / 2 yBy:cy - b->h * s / 2];
++            [in scaleBy:s];
++            [NSGraphicsContext saveGraphicsState];
++            [in concat];
++            kStroke = stroke / s * 0.8;
++            b->draw(b->w, b->h, p.fill);
++            [NSGraphicsContext restoreGraphicsState];
++            kStroke = stroke;
++        } else if (p.badge) {
++            CGFloat r = MIN(gw, gh) * 0.24, cx = gw - r, cy = r;
++            CGContextSaveGState(cg);
++            CGContextSetBlendMode(cg, kCGBlendModeClear);
++            circle(cx, cy, r + 1, YES);
++            CGContextRestoreGState(cg);
++            circle(cx, cy, r, YES);
++            CGContextSaveGState(cg);
++            CGContextSetBlendMode(cg, kCGBlendModeClear);
++            kStroke = stroke * 0.8;
++            if (p.badge == 1)
++                plus(cx, cy, r * 0.55);
++            else if (p.badge == 2)
++                line(cx - r * 0.55, cy, cx + r * 0.55, cy);
++            else
++                POLY(NO, NO, cx - r * 0.5, cy, cx - r * 0.1, cy - r * 0.45, cx + r * 0.55, cy + r * 0.45);
++            CGContextRestoreGState(cg);
++        }
++        kStroke = saved;
++    }
++    [context flushGraphics];
++    [NSGraphicsContext restoreGraphicsState];
++    [rep setSize:size];
++    NSImage *im = [[[NSImage alloc] initWithSize:size] autorelease];
++    [im addRepresentation:rep];
++    [rep release];
++    [im setTemplate:YES];
++    return im;
++}
+--- a/src/Frameworks/AppKit/NSSymbolImages.m
++++ b/src/Frameworks/AppKit/NSSymbolImages.m
+@@ -8,6 +8,7 @@
+ // on macOS. They are template images (the shape is what counts, the colour is the control's).
+ // First users: Apple's Activity Monitor (its toolbar's Stop, Info and action buttons, the inspector's
+ // link to a parent process).
++#import <AppKit/NSImageSymbolConfiguration.h>
+ #import <AppKit/NSImage.h>
+ #import <AppKit/NSBitmapImageRep.h>
+ #import <AppKit/NSGraphicsContext.h>
+@@ -117,6 +118,8 @@
+     [NSGraphicsContext restoreGraphicsState];
+ }
+ 
++NSImage *SFFinchSymbolImage(NSString *name, NSImageSymbolConfiguration *config);
++
+ @implementation NSImage (SFSymbolImages)
+ 
+ + (NSImage *)_sfSymbolImageNamed:(NSString *)name {
+@@ -137,7 +140,7 @@
+         if ([name isEqualToString:[NSString stringWithUTF8String:table[i].name]])
+             draw = table[i].draw;
+     if (draw == NULL)
+-        return nil;
++        return SFFinchSymbolImage(name, nil);   // (cocoa 0111) Finch's glyphs, SFSymbolGlyphs.m
+     if ((image = [made objectForKey:name]) != nil)
+         return [[image copy] autorelease];
+ 
+--- a/src/Frameworks/AppKit/NSImageSymbolConfiguration.m
++++ b/src/Frameworks/AppKit/NSImageSymbolConfiguration.m
+@@ -17,6 +17,14 @@
+     BOOL _hasWeight;
+ }
+ 
++// (cocoa 0111) what the symbol glyphs (SFSymbolGlyphs.m, Finch's) read of a configuration
++- (void)_finchPointSize:(CGFloat *)pointSize weight:(NSFontWeight *)weight hasWeight:(BOOL *)hasWeight scale:(NSImageSymbolScale *)scale {
++    *pointSize = _pointSize;
++    *weight = _weight;
++    *hasWeight = _hasWeight;
++    *scale = _scale;
++}
++
+ + (instancetype)configurationWithPointSize:(CGFloat)pointSize weight:(NSFontWeight)weight {
+     return [self configurationWithPointSize:pointSize weight:weight scale:0];
+ }

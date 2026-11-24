@@ -1,0 +1,68 @@
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -2018,8 +2018,14 @@
+        } else {
+            // All of our clipping done by the context is rounded - so we need to do the same
+            // here else we might get some artifact on clipping borders
++           // in device pixels: at a scale of 1.5 a rect of whole points ends inside a pixel, which the
++           // views behind fill (the clip is rounded out) and the view itself only partly covers
++           CGFloat s=backingScale(self);
++
+            rect = [self convertRect:rect toView:nil];
++           rect = NSMakeRect(rect.origin.x*s,rect.origin.y*s,rect.size.width*s,rect.size.height*s);
+            rect = NSIntegralRect(rect);
++           rect = NSMakeRect(rect.origin.x/s,rect.origin.y/s,rect.size.width/s,rect.size.height/s);
+            rect = [self convertRect:rect fromView:nil];
+            _invalidRectCount++;
+            _invalidRects=NSZoneRealloc(NULL,_invalidRects,sizeof(NSRect)*_invalidRectCount);
+@@ -2303,7 +2309,27 @@
+ 
+ -(void)_displayIfNeededWithoutViewWillDraw {
+    if([self needsDisplay]){
+-    [self displayRect:unionOfInvalidRects(self)];
++    // a few rects far apart (a cursor row and a status line) are drawn one at a time: drawing
++    // their union would redraw every row in between
++    int  count=_invalidRectCount;
++    BOOL drawn=NO;
++
++    if(count>=2 && count<=16){
++     NSRect all=unionOfInvalidRects(self),rects[16];
++     CGFloat area=0;
++
++     for(int i=0;i<count;i++){
++      rects[i]=_invalidRects[i];
++      area+=rects[i].size.width*rects[i].size.height;
++     }
++     if(area*2<all.size.width*all.size.height){
++      for(int i=0;i<count;i++)
++       [self displayRect:rects[i]];
++      drawn=YES;
++     }
++    }
++    if(!drawn)
++     [self displayRect:unionOfInvalidRects(self)];
+     clearNeedsDisplay(self);
+    }
+ 
+@@ -2416,12 +2442,15 @@
+ 
+        CGContextClipToRect(graphicsPort,rect);
+ 
+-       const NSRect *rects;
+-       NSUInteger rectsCount;
+-       [self getRectsBeingDrawn:&rects count:&rectsCount];
+-       // If there is only one rect, it's the visible rect - it's already clipped
+-       if (rectsCount > 1)
+-           CGContextClipToRects(graphicsPort, rects, rectsCount);
++       // Onyx2D clips to a rectangle only (a list of rects becomes their bounding box), so every
++       // view behind this one has painted all of rect: a view that fills only the rects it is told
++       // (Terminal fills -getRectsBeingDrawn: with its background) must be told rect, or the rows
++       // between two dirty rects keep what the views behind painted. Sparse dirty rects are
++       // displayed one at a time instead (-_displayIfNeededWithoutViewWillDraw).
++       clearRectsBeingRedrawn(self);
++       _rectsBeingRedrawn=NSZoneCalloc(NULL,1,sizeof(NSRect));
++       _rectsBeingRedrawn[0]=rect;
++       _rectsBeingRedrawnCount=1;
+ 
+       // [_window dirtyRect:[self convertRect:rect toView:nil]];
+        if ([NSGraphicsContext inQuartzDebugMode]) {

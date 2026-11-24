@@ -1,0 +1,40 @@
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -2610,6 +2610,24 @@
+                                                                      contextInfo:NULL];
+ }
+ 
++/* (TERM11) The desk's Quit (the dock tile's, the switcher's): macOS's quit Apple event (kAEQuitApplication) asks the
++ * delegate -applicationShouldTerminate: and only on NSTerminateNow goes on with -terminate:; NSTerminateCancel leaves
++ * the quitting to the delegate, NSTerminateLater waits for -replyToApplicationShouldTerminate:. Firefox replaces
++ * -terminate: by a method that only posts NSApplicationWillTerminateNotification (it expects its delegate to have been
++ * asked, and quits itself from there): a windowless Firefox told to quit with -terminate: alone stayed alive. An
++ * application with open documents goes through -terminate:, which reviews them first. */
++-(void)_sfQuitFromDesk {
++   if([[[NSDocumentController sharedDocumentController] documents] count]==0 &&
++      [_delegate respondsToSelector:@selector(applicationShouldTerminate:)]){
++    NSApplicationTerminateReply reply=[_delegate applicationShouldTerminate:self];
++
++    if(reply==NSTerminateNow)
++     [self terminate:nil];
++    return;
++   }
++   [self terminate:nil];
++}
++
+ -(void)_documentController:(NSDocumentController *)docController didCloseAll:(BOOL)didCloseAll contextInfo:(void *)info
+ {
+   // callback method for terminate:
+--- a/src/Frameworks/AppKit/NSWindowMenuStrip.m
++++ b/src/Frameworks/AppKit/NSWindowMenuStrip.m
+@@ -388,8 +388,9 @@
+         dispatch_async(dispatch_get_main_queue(), ^{ [NSApp performSelector:@selector(_reopen)]; });
+         return @"ok\n";
+     }
++    // (TERM11) as macOS's quit Apple event: the delegate is asked first (NSApplication -_sfQuitFromDesk)
+     if ([verb isEqualToString:@"quit"]) {
+-        dispatch_async(dispatch_get_main_queue(), ^{ [NSApp terminate:nil]; });
++        dispatch_async(dispatch_get_main_queue(), ^{ [NSApp performSelector:@selector(_sfQuitFromDesk)]; });
+         return @"ok\n";
+     }
+     if ([verb isEqualToString:@"menubar"]) {

@@ -1,0 +1,29 @@
+dma-buf: dma_buf_fd() does not take a reference on a file that is being freed
+
+Audit finding D4. The dma-buf and its file have separate counts here (in linux
+dma_buf_put() is fput()). The last fput() of the file on one cpu drops f_count to zero and
+only then takes db->lock to clear db->file; an export of the same buffer on another cpu
+in that window found db->file, raised the count from zero and installed a descriptor on a
+file that was freed a moment later (use after free; with the last reference dropped from
+the poll work item, a second release and a double free of the buffer). The reference is
+now taken only if the count is not zero; otherwise a new file is made, and the old file's
+release, which checks db->file == filp, leaves it alone.
+
+--- a/src/Kernel/fbsdkpi/drm/src/sf_dma_buf.c
++++ b/src/Kernel/fbsdkpi/drm/src/sf_dma_buf.c
+@@ -151,9 +151,12 @@
+ 		return fd;
+ 	mutex_lock(&db->lock);
+ 	filp = db->file;
+-	if (filp != NULL) {
++	// a file whose last reference is being dropped on another cpu is still db->file until
++	// its release takes db->lock: taking a reference on it then would hand out a
++	// descriptor to a file that is freed a moment later. such a file counts as absent,
++	// and its release leaves the new db->file alone.
++	if (filp != NULL && refcount_acquire_if_not_zero(&filp->f_count)) {
+ 		// the existing file already holds a buffer reference
+-		refcount_acquire(&filp->f_count);
+ 		mutex_unlock(&db->lock);
+ 		dma_buf_put(db);
+ 	} else {
+

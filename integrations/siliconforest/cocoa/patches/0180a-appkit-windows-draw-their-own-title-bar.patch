@@ -1,0 +1,298 @@
+--- a/src/Frameworks/AppKit/NSWindow-Private.h
++++ b/src/Frameworks/AppKit/NSWindow-Private.h
+@@ -16,6 +16,13 @@
+ // whether a window of this style leaves its frame to the compositor (server-side decoration)
+ APPKIT_EXPORT BOOL NSWindowFrameIsDrawnByServer(unsigned styleMask);
+ 
++@interface NSWindow (SFClientTitlebar)
++// (TERM12, FX-002) AppKit draws this window's title bar controls over a full-size content view (the compositor only
++// its edges); whether the compositor draws the frame, for this window
++-(BOOL)_sfDrawsOwnTitlebar;
++-(BOOL)_sfFrameIsDrawnByServer;
++@end
++
+ @interface NSWindow (NSWindow_private)
+ - (CGWindow *)platformWindow;
+ - (CGContextRef)cgContext;
+--- a/src/Frameworks/AppKit/NSWindow.m
++++ b/src/Frameworks/AppKit/NSWindow.m
+@@ -1303,7 +1303,7 @@
+     [self _updateWSState];
+     // the title bar is ours to draw, so a later title change has to repaint it (not where the
+     // compositor draws it: then the whole window drew again for nothing)
+-    if(!NSWindowFrameIsDrawnByServer(_styleMask))
++    if(![self _sfFrameIsDrawnByServer])
+         [_backgroundView setNeedsDisplay:YES];
+     // a tab shows its window's title in the bar of the group
+     if([self respondsToSelector:@selector(_sfTabTitleChanged)])
+@@ -1316,7 +1316,7 @@
+ // the compositor's title and the title bar we draw, after the title or the edited state changed
+ -(void)_updatePlatformWindowTitle {
+     [self _updateWSState];
+-    if(!NSWindowFrameIsDrawnByServer(_styleMask))
++    if(![self _sfFrameIsDrawnByServer])
+         [_backgroundView setNeedsDisplay:YES];
+ }
+ 
+@@ -1596,14 +1596,47 @@
+    _isMovableByWindowBackground=value;
+ }
+ 
++/* (TERM12, FX-002) A window whose content runs under a transparent title bar with its title hidden draws its own title
++ * bar, as macOS does it: Firefox with its tabs in the title bar (it makes its view the whole frame and leaves the
++ * place of the window buttons free in its tab strip, -_closeButtonOrigin). The compositor then draws only the
++ * window's edges (client-side decorations), AppKit the three buttons over the content, and the in-window menu strip
++ * is not shown (Control-click on the buttons' row shows the application's menus). SF_NO_CLIENT_TITLEBAR=1: as before. */
++-(BOOL)_sfDrawsOwnTitlebar {
++   static int off=-1;
++   if(off<0)off=getenv("SF_NO_CLIENT_TITLEBAR")!=NULL;
++   return !off && (_styleMask & NSFullSizeContentViewWindowMask) && (_styleMask & NSTitledWindowMask) &&
++          !(_styleMask & NSFullScreenWindowMask) && _titlebarAppearsTransparent && _titleVisibility==NSWindowTitleHidden &&
++          NSWindowFrameIsDrawnByServer(_styleMask);
++}
++
++-(BOOL)_sfFrameIsDrawnByServer {
++   return NSWindowFrameIsDrawnByServer(_styleMask) && ![self _sfDrawsOwnTitlebar];
++}
++
++// who draws the title bar may have changed: the window server is told (the compositor's frame comes or goes), the
++// menu strip comes or goes, the frame lays itself out again
++-(void)_sfTitlebarModeChanged:(BOOL)was {
++   if([self _sfDrawsOwnTitlebar]==was)
++    return;
++   [self _updateWSState];
++   if([self respondsToSelector:@selector(_sfUpdateMenuStrip)])
++    [self performSelector:@selector(_sfUpdateMenuStrip)];
++   [_backgroundView resizeSubviewsWithOldSize:[_backgroundView frame].size];
++   [_backgroundView setNeedsDisplay:YES];
++}
++
+ -(void)setTitleVisibility:(NSWindowTitleVisibility)value {
++   BOOL was=[self _sfDrawsOwnTitlebar];
+    _titleVisibility=value;
+    [_backgroundView setNeedsDisplay:YES];
++   [self _sfTitlebarModeChanged:was];
+ }
+ 
+ -(void)setTitlebarAppearsTransparent:(BOOL)value {
++   BOOL was=[self _sfDrawsOwnTitlebar];
+    _titlebarAppearsTransparent=value;
+    [_backgroundView setNeedsDisplay:YES];
++   [self _sfTitlebarModeChanged:was];
+ }
+ 
+ // the unified styles make the title bar as tall as a toolbar, with the lights centred in it
+@@ -2302,7 +2335,7 @@
+    /* Where the compositor draws the frame, the title bar and its lights are its own: of ours only the
+     * tab bar looks different in a window that is not key. Redrawing the whole window here made every
+     * tab switch and every click into another window draw it twice. */
+-   if(NSWindowFrameIsDrawnByServer(_styleMask)){
++   if([self _sfFrameIsDrawnByServer]){
+     if([self respondsToSelector:@selector(_sfTabBarView)])
+      [[self performSelector:@selector(_sfTabBarView)] setNeedsDisplay:YES];
+     return;
+@@ -4154,7 +4187,8 @@
+ 
+     if(!(_styleMask & NSResizableWindowMask) || (_styleMask & NSFullScreenWindowMask) || _isZoomed || _sheetContext != nil)
+         return 0;
+-    // the compositor's frame has the resize edges of a window it decorates
++    // the compositor's frame has the resize edges of a window it decorates (its edge frame too, when the window
++    // draws its own title bar)
+     if(NSWindowFrameIsDrawnByServer(_styleMask))
+         return 0;
+     if(point.x < 0 || point.y < 0 || point.x > width || point.y > height)
+@@ -4291,6 +4325,12 @@
+         _number, _frame.origin.x, _frame.origin.y,
+         _frame.size.width, _frame.size.height, (_styleMask&~NSFullScreenWindowMask), 0, {'\0'}, _level
+     };
++#ifndef WS_STYLE_CLIENT_FRAME
++#define WS_STYLE_CLIENT_FRAME (1u << 29)
++#endif
++    // (TERM12, FX-002) the compositor draws only the edges of a window that draws its own title bar
++    if([self _sfDrawsOwnTitlebar])
++        data.style |= WS_STYLE_CLIENT_FRAME;
+     // a window may have no title (nil), and a title may have no UTF-8 form
+     const char *titleUTF8 = [_title UTF8String];
+     strncpy(data.title, titleUTF8 != NULL ? titleUTF8 : "", sizeof(data.title) - 1);
+--- a/src/Frameworks/AppKit/NSWindowMenuStrip.m
++++ b/src/Frameworks/AppKit/NSWindowMenuStrip.m
+@@ -193,7 +193,8 @@
+     // not be reached at all
+     if (!(_styleMask & NSTitledWindowMask))
+         return NO;
+-    return NSWindowFrameIsDrawnByServer(_styleMask);
++    // (TERM12, FX-002) none in a window that draws its own title bar (its content is the whole frame)
++    return NSWindowFrameIsDrawnByServer(_styleMask) && ![self _sfDrawsOwnTitlebar];
+ }
+ 
+ - (NSView *)_sfMenuStripView
+--- a/src/Frameworks/AppKit/NSWindowTabbing.m
++++ b/src/Frameworks/AppKit/NSWindowTabbing.m
+@@ -741,7 +741,7 @@
+ - (void)_sfUpdateTabBar
+ {
+     NSWindowTabGroup *group = objc_getAssociatedObject(self, &SFTabGroupKey);
+-    BOOL want = group != nil && [group isTabBarVisible] && NSWindowFrameIsDrawnByServer([self styleMask]) &&
++    BOOL want = group != nil && [group isTabBarVisible] && [self _sfFrameIsDrawnByServer] &&
+                 ([self styleMask] & NSTitledWindowMask) && ![self isKindOfClass:[NSPanel class]];
+     NSView *bar = objc_getAssociatedObject(self, &SFTabBarKey);
+     NSView *frameView = [[self contentView] superview];
+--- a/src/Frameworks/AppKit/NSThemeFrame.m
++++ b/src/Frameworks/AppKit/NSThemeFrame.m
+@@ -24,6 +24,8 @@
+ #import <AppKit/NSThemeFrame.h>
+ #import <AppKit/NSWindow.h>
+ #import <AppKit/NSWindow-Private.h>
++#import <AppKit/NSApplication.h>
++#import <AppKit/NSMenu.h>
+ #import <AppKit/NSGraphics.h>
+ #import <AppKit/NSColor.h>
+ #import <AppKit/NSAppearance.h>
+@@ -37,6 +39,7 @@
+ -(void)_titlebarDoubleClicked;
+ @end
+ #include <stdint.h>
++#include <dlfcn.h>
+ 
+ // libSystem exports notify(3), the sdk ships no header for it
+ extern uint32_t notify_register_check(const char *name, int *out_token);
+@@ -63,6 +66,9 @@
+    O2Context *context = [[[self window] graphicsContext] graphicsPort];
+    NSRect frame = [self frame];
+ 
++   // (TERM12, FX-002) over another application's title bar (GPU layers) only the buttons are opaque
++   if([[self window] _sfDrawsOwnTitlebar])
++      O2ContextClearRect(context, [self bounds]);
+    O2ContextSaveGState(context);
+    O2ContextTranslateCTM(context, -frame.origin.x, -frame.origin.y);
+    [(NSThemeFrame *)[self superview] _drawControlsInContext:context];
+@@ -71,9 +77,22 @@
+ 
+ // presses go to the frame, which knows the buttons and moves the window from the rest
+ -(void)mouseDown:(NSEvent *)event {
++   // (TERM12, FX-002) no menu strip in a window that draws its own title bar: Control-click there shows the menus
++   if([[self window] _sfDrawsOwnTitlebar] && ([event modifierFlags] & NSControlKeyMask) && [[NSApp mainMenu] numberOfItems] > 0) {
++      [NSMenu popUpContextMenu:[NSApp mainMenu] withEvent:event forView:self];
++      return;
++   }
+    [[self superview] mouseDown:event];
+ }
+ 
++-(void)rightMouseDown:(NSEvent *)event {
++   if([[self window] _sfDrawsOwnTitlebar] && [[NSApp mainMenu] numberOfItems] > 0) {
++      [NSMenu popUpContextMenu:[NSApp mainMenu] withEvent:event forView:self];
++      return;
++   }
++   [super rightMouseDown:event];
++}
++
+ @end
+ 
+ // the title bar views apps reach for, empty since the frame draws the title bar itself
+@@ -252,7 +271,7 @@
+     NSWindow *window = [self window];
+ 
+     // no title bar of ours inside a frame the compositor draws, nor on a window without one (a sheet)
+-    if(NSWindowFrameIsDrawnByServer([window styleMask]) || !([window styleMask] & NSTitledWindowMask))
++    if([window _sfFrameIsDrawnByServer] || !([window styleMask] & NSTitledWindowMask))
+         return 0;
+ 
+     if(!([window styleMask] & NSFullSizeContentViewWindowMask))
+@@ -267,10 +286,15 @@
+     }
+ }
+ 
++// (TERM12, FX-002) where the close button goes, at the left of the title bar: an application that draws its own title
++// bar moves the three by overriding this private method of the frame view (Firefox puts them into its tab strip)
++-(NSPoint)_sfDefaultCloseButtonOrigin {
++    return NSMakePoint(NSWindowControlInset, _frame.size.height - [self _titleHeight] / 2 - NSWindowControlDiameter / 2);
++}
++
+ -(void)_layoutControls {
+-    CGRect button = NSMakeRect(NSWindowControlInset,
+-        _frame.size.height - [self _titleHeight] / 2 - NSWindowControlDiameter / 2,
+-        NSWindowControlDiameter, NSWindowControlDiameter);
++    NSPoint origin = [[self window] _sfDrawsOwnTitlebar] ? [self _closeButtonOrigin] : [self _sfDefaultCloseButtonOrigin];
++    CGRect button = NSMakeRect(origin.x, origin.y, NSWindowControlDiameter, NSWindowControlDiameter);
+ 
+     _closeButtonRect = button;
+     button.origin.x += NSWindowControlSpacing + NSWindowControlDiameter;
+@@ -316,6 +340,9 @@
+ }
+ 
+ -(NSRect)_controlsOverlayFrame {
++    // (TERM12, FX-002) where the application put the buttons: just around them
++    if([[self window] _sfDrawsOwnTitlebar] && _closeButtonRect.size.width > 0)
++        return NSInsetRect(NSUnionRect(_closeButtonRect, _zoomButtonRect), -4, -4);
+     return NSMakeRect(0, NSHeight([self bounds]) - [self _titleHeight],
+         2 * NSWindowControlInset + 3 * NSWindowControlDiameter + 2 * NSWindowControlSpacing, [self _titleHeight]);
+ }
+@@ -417,7 +444,7 @@
+         return;
+     }
+     // the compositor draws this window's title bar, controls and edges: ours is the background above
+-    if(NSWindowFrameIsDrawnByServer([[self window] styleMask])) {
++    if([[self window] _sfFrameIsDrawnByServer]) {
+         _closeButtonRect = _miniButtonRect = _zoomButtonRect = controls = NSZeroRect;
+         return;
+     }
+@@ -571,7 +598,9 @@
+    [contentView setFrame:contentFrame];
+    for(NSView *view in others)
+     [view resizeWithOldSuperviewSize:oldSize];
++   [self _layoutControls];
+    [_controlsView setFrame:[self _controlsOverlayFrame]];
++   [self _sfUpdateControlsOverlay];
+    [_titlebarContainerView setFrame:[self _titlebarContainerFrame]];
+ }
+ 
+@@ -581,7 +610,7 @@
+     NSPoint pos = [event locationInWindow];
+ 
+     // inside the compositor's frame there is no title bar or control of ours to press
+-    if(NSWindowFrameIsDrawnByServer([[self window] styleMask])) {
++    if([[self window] _sfFrameIsDrawnByServer]) {
+         if([[self window] isMovableByWindowBackground])
+             [[self window] requestMove:event];
+         return;
+@@ -618,16 +647,39 @@
+ }
+ 
+ -(NSPoint)_closeButtonOrigin {
+-    return _closeButtonRect.origin;
++    return [self _sfDefaultCloseButtonOrigin];
+ }
+ 
+ -(void)_tileTitlebarAndRedisplay:(BOOL)redisplay {
+     [self _layoutControls];
+     [_controlsView setFrame:[self _controlsOverlayFrame]];
++    [self _sfUpdateControlsOverlay];
++    [_controlsView setNeedsDisplay:YES];
+     if(redisplay)
+         [self setNeedsDisplay:YES];
+ }
+ 
++/* (TERM12, FX-002) In a window that draws its own title bar over GPU layers (Firefox's), the window server puts the
++ * part of the window's own picture where the buttons are over those layers (the buttons' view clears its rectangle
++ * first, so only the buttons cover the layers): AppKit draws the buttons into the window, the layers would hide them. */
++-(void)_sfUpdateControlsOverlay {
++    static int (*setOverlay)(int,int,int,int,int);
++    static int looked;
++    NSWindow *window = [self window];
++
++    if(!looked){setOverlay=(int (*)(int,int,int,int,int))dlsym(RTLD_DEFAULT,"_windowServerSFFXSetOverlay");looked=1;}
++    if(setOverlay==NULL || window==nil || [window windowNumber]<=0)
++        return;
++    if(![window _sfDrawsOwnTitlebar] || _controlsView==nil) {
++        setOverlay((int)[window windowNumber],0,0,0,0);
++        return;
++    }
++    NSRect r = [_controlsView frame];
++    CGFloat scale = [window backingScaleFactor];
++    int x = (int)floor(NSMinX(r) * scale), y = (int)floor((NSHeight([self bounds]) - NSMaxY(r)) * scale);
++    setOverlay((int)[window windowNumber], x, y, (int)ceil(NSWidth(r) * scale), (int)ceil(NSHeight(r) * scale));
++}
++
+ // AppleActionOnDoubleClick is Maximize (zoom, the default), Fill, Minimize or None
+ -(NSString *)_doubleClickAction {
+     NSString *action = [[NSUserDefaults standardUserDefaults] stringForKey:@"AppleActionOnDoubleClick"];

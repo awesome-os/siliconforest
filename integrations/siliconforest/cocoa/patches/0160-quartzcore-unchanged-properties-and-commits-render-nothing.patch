@@ -1,0 +1,229 @@
+--- a/src/Frameworks/QuartzCore/CALayer.m
++++ b/src/Frameworks/QuartzCore/CALayer.m
+@@ -326,6 +326,9 @@
+ }
+ 
+ -(void)setOpacity:(float)value {
++   // (TERM10) an unchanged value asks for no render (Firefox sets its tiles' geometry again at every commit)
++   if(_opacity==value && [self animationForKey:@"opacity"]==nil)
++    return;
+    CAAnimation *animation=[self animationForKey:@"opacity"];
+    
+    if(animation==nil && ![CATransaction disableActions]){
+@@ -364,6 +367,8 @@
+ }
+ 
+ -(void)setTransform:(CATransform3D)value {
++   if(CATransform3DEqualToTransform(_transform,value))
++    return;
+    _transform=value;
+    [self _setNeedsRender];
+ }
+@@ -373,6 +378,8 @@
+ }
+ 
+ -(void)setSublayerTransform:(CATransform3D)value {
++   if(CATransform3DEqualToTransform(_sublayerTransform,value))
++    return;
+    _sublayerTransform=value;
+    [self _setNeedsRender];
+ }
+@@ -447,6 +454,8 @@
+ }
+ 
+ -(void)setHidden:(BOOL)value {
++   if(_hidden==value)
++    return;
+    _hidden=value;
+    [self _setNeedsRender];
+ }
+@@ -456,6 +465,8 @@
+ }
+ 
+ -(void)setMasksToBounds:(BOOL)value {
++   if(_masksToBounds==value)
++    return;
+    _masksToBounds=value;
+    [self _setNeedsRender];
+ }
+@@ -465,6 +476,8 @@
+ }
+ 
+ -(void)setGeometryFlipped:(BOOL)value {
++   if(_geometryFlipped==value)
++    return;
+    _geometryFlipped=value;
+    [self _setNeedsRender];
+ }
+@@ -498,6 +511,8 @@
+ }
+ 
+ -(void)setCornerRadius:(CGFloat)value {
++   if(_cornerRadius==value)
++    return;
+    _cornerRadius=value;
+    [self _setNeedsRender];
+ }
+@@ -507,6 +522,8 @@
+ }
+ 
+ -(void)setMaskedCorners:(CACornerMask)value {
++   if(_maskedCorners==value)
++    return;
+    _maskedCorners=value;
+    [self _setNeedsRender];
+ }
+@@ -516,6 +533,8 @@
+ }
+ 
+ -(void)setZPosition:(CGFloat)value {
++   if(_zPosition==value)
++    return;
+    _zPosition=value;
+    [self _setNeedsRender];
+ }
+@@ -525,6 +544,8 @@
+ }
+ 
+ -(void)setBorderWidth:(CGFloat)value {
++   if(_borderWidth==value)
++    return;
+    _borderWidth=value;
+    [self _setNeedsRender];
+ }
+@@ -534,6 +555,8 @@
+ }
+ 
+ -(void)setContentsRect:(CGRect)value {
++   if(CGRectEqualToRect(_contentsRect,value))
++    return;
+    _contentsRect=value;
+    [self _setNeedsRender];
+ }
+--- a/src/Frameworks/QuartzCore/CALayerContext.m
++++ b/src/Frameworks/QuartzCore/CALayerContext.m
+@@ -12,6 +12,8 @@
+ #include <os/lock.h>
+ #include <dlfcn.h>
+ #include <pthread.h>
++#include <time.h>
++#include <stdio.h>
+ #include <objc/runtime.h>
+ 
+ @interface CALayer(private)
+@@ -60,6 +62,28 @@
+  return old;
+ }
+ 
++static int sfcaSkipUnchanged(void);
++
++// (TERM10) SF_CA_DIAG=1: renders done, frames reused, and renders of a tree whose layers and seeds were unchanged, every 5 s
++static int sfcaDiagOn(void){
++ static int on=-1;
++ if(on<0)on=getenv("SF_CA_DIAG")!=NULL;
++ return on;
++}
++static void sfcaCount(int what){
++ static unsigned long counts[3];
++ static double since;
++ struct timespec t;
++ clock_gettime(CLOCK_MONOTONIC,&t);
++ double now=t.tv_sec+t.tv_nsec/1e9;
++ counts[what]++;
++ if(since==0)since=now;
++ if(now-since>=5){
++  fprintf(stderr,"PD-CA-DIAG renders/5s rendered=%lu reused=%lu rendered-unchanged=%lu%s\n",counts[1],counts[0],counts[2],sfcaSkipUnchanged()?" (skip unchanged)":"");
++  counts[0]=counts[1]=counts[2]=0;since=now;
++ }
++}
++
+ // every live context, so a committed transaction reaches them all: an app can redraw an
+ // IOSurface it already set as contents and only commit, which changes no layer property
+ #define MAX_LIVE_CONTEXTS 64
+@@ -68,6 +92,15 @@
+ 
+ @implementation CALayerContext
+ 
++// (TERM10) SFFX_GPU_SKIP_UNCHANGED=1 (Firefox's launcher, for the A/B): a commit that changed no layer property
++// schedules a render without counting as a change, so a context whose layers and contents seeds are as at its last
++// render (SFFX_GPU_DIRTY_FRAMES) reuses that frame, and AppKit presents nothing new (-_sfcaTakeNewFrame)
++static int sfcaSkipUnchanged(void){
++ static int on=-1;
++ if(on<0)on=getenv("SFFX_GPU_SKIP_UNCHANGED")!=NULL&&getenv("SFFX_GPU_DIRTY_FRAMES")!=NULL;
++ return on;
++}
++
+ +(void)_transactionCommitted {
+    CALayerContext *contexts[MAX_LIVE_CONTEXTS];
+    int count=0;
+@@ -78,7 +111,10 @@
+      contexts[count++]=[liveContexts[i] retain];
+    os_unfair_lock_unlock(&liveContextsLock);
+    for(int i=0;i<count;i++){
+-    [contexts[i] _layerTreeChanged];
++    if(sfcaSkipUnchanged())
++     [contexts[i] _scheduleRender];
++    else
++     [contexts[i] _layerTreeChanged];
+     [contexts[i] release];
+    }
+ }
+@@ -268,10 +304,19 @@
+    if(enabled){
+     pthread_once(&sffxStampOnce,sffxLoadStampAPI);
+     sffxCollectStamps(_layer,stamps,&count,0,&uncertain);
+-    if(!uncertain&&_sffxLastSurface&&generation==_sffxRenderedGeneration&&count==_sffxStampCount&&sffxSameStamps(stamps,_sffxLastStamps,count))return;
++    if(!uncertain&&_sffxLastSurface&&generation==_sffxRenderedGeneration&&count==_sffxStampCount&&sffxSameStamps(stamps,_sffxLastStamps,count)){
++     if(sfcaDiagOn())
++      sfcaCount(0);
++     return;
++    }
++    // (TERM10) SF_CA_DIAG: a render whose layers and seeds are as last time, but a property commit came between
++    if(sfcaDiagOn()&&!uncertain&&count==_sffxStampCount&&sffxSameStamps(stamps,_sffxLastStamps,count))
++     sfcaCount(2);
+    }
+    [self renderLayer:_layer];
+    _sffxRenderedGeneration=generation;_sffxRenderSerial++;
++   if(sfcaDiagOn())
++    sfcaCount(1);
+    _sffxStampCount=0;
+    if(enabled&&!uncertain){
+     if(!_sffxLastStamps)_sffxLastStamps=malloc(sizeof(stamps));
+@@ -308,6 +353,17 @@
+ // the tree from before the change: that last change was never drawn (SF_CA_OLD=1 keeps the old way, for A/B)
+ -(void)_layerTreeChanged {
+    [self _sffxMarkMutation];
++   [self _scheduleRender];
++}
++
++-(BOOL)_sfcaTakeNewFrame {
++   BOOL fresh=_sffxRenderSerial!=_sfcaPresentedSerial;
++
++   _sfcaPresentedSerial=_sffxRenderSerial;
++   return fresh || !sfcaSkipUnchanged();
++}
++
++-(void)_scheduleRender {
+    if(_delegate==nil)
+     return;
+    if(sfcaOld()){
+--- a/src/Frameworks/QuartzCore/CALayerContext.h
++++ b/src/Frameworks/QuartzCore/CALayerContext.h
+@@ -24,6 +24,7 @@
+     CFTypeRef _sffxLastSurface;
+     void *_sffxLastStamps;
+     unsigned _sffxStampCount;
++    uint64_t _sfcaPresentedSerial;
+ }
+ 
+ -(void)_sffxMarkMutation;
+@@ -45,6 +46,9 @@
+ // the delegate hears -layerContextNeedsDisplay: after the layer tree changes
+ - (void)setDelegate:delegate;
+ - (void)_layerTreeChanged;
++// (TERM10) a render without the tree counting as changed; whether a render since the last call made a new frame
++- (void)_scheduleRender;
++- (BOOL)_sfcaTakeNewFrame;
+ // the last render as an image, rows top down, premultiplied BGRA
+ - (CGImageRef)createImage;
+ 

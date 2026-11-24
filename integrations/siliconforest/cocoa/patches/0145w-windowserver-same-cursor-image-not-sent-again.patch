@@ -1,0 +1,44 @@
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -1462,6 +1462,7 @@
+     struct wl_buffer *imageBuffer;
+     void *imagePixels;
+     size_t imageSize;
++    int imageW, imageH, imageHotX, imageHotY;   // (TERM8) what imageBuffer holds, so the same image is not sent again
+ } cursor = { .lock = PTHREAD_MUTEX_INITIALIZER };
+ 
+ // xcursor names for each NSCursor, in order of preference, the last ones are in libwayland-cursor's built-in set
+@@ -1687,6 +1688,22 @@
+     if (!ensureConnected() || argb == NULL || width <= 0 || height <= 0)
+         return;
+     pthread_mutex_lock(&cursor.lock);
++    /* (TERM8) AppKit sets an application's own cursor at every pointer motion (Terminal's I-beam, from its
++     * -cursorUpdate: and -mouseMoved:): the same image is shown again from the buffer it already has, not copied into a
++     * new shared-memory buffer each time */
++    if (cursor.imageBuffer != NULL && cursor.imageW == width && cursor.imageH == height && cursor.imageHotX == hotX &&
++        cursor.imageHotY == hotY && cursor.imageSize == size && memcmp(cursor.imagePixels, argb, size) == 0) {
++        if (cursor.buffer != cursor.imageBuffer || cursor.shape != 0) {
++            cursor.shape = 0;
++            cursor.buffer = cursor.imageBuffer;
++            cursor.hotX = hotX;
++            cursor.hotY = hotY;
++            cursorApplyLocked();
++            wl_display_flush(ws.display);
++        }
++        pthread_mutex_unlock(&cursor.lock);
++        return;
++    }
+     if (cursor.imageBuffer != NULL) {
+         if (cursor.buffer == cursor.imageBuffer)
+             cursor.buffer = NULL;
+@@ -1714,6 +1731,10 @@
+         close(fd);
+     }
+     if (cursor.imageBuffer != NULL) {
++        cursor.imageW = width;
++        cursor.imageH = height;
++        cursor.imageHotX = hotX;
++        cursor.imageHotY = hotY;
+         cursor.shape = 0;   // an application's own image: its bitmap, not a named shape
+         cursor.buffer = cursor.imageBuffer;
+         cursor.hotX = hotX;

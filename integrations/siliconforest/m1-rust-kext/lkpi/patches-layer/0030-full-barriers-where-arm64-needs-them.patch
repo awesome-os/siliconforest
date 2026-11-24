@@ -1,0 +1,64 @@
+linuxkpi: full barriers where linux has them on arm64
+
+Audit findings P4, P5.
+
+- smp_mb__before_atomic()/smp_mb__after_atomic() were compiler barriers, right for x86 only.
+- set_current_state() was a plain store. The sleeper stores its state and loads its
+  condition, the waker stores the condition and loads the state under the sleep queue
+  lock; without a full barrier on both sides each can miss the other and the sleeper
+  never wakes (linux: smp_store_mb, and try_to_wake_up's barrier after taking the lock).
+
+--- a/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/include/asm/barrier.h
++++ b/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/include/asm/barrier.h
+@@ -55,8 +55,18 @@
+ #define	smp_store_mb(x, v)	do { WRITE_ONCE(x, v); smp_mb(); } while (0)
+ #endif
+ 
++/*
++ * Only on x86 is an atomic read-modify-write also a full barrier. On arm64 linux
++ * makes both of these smp_mb(), and so must this layer now that more than one
++ * cpu runs.
++ */
++#if defined(__i386__) || defined(__x86_64__)
+ #define	smp_mb__before_atomic()	barrier()
+ #define	smp_mb__after_atomic()	barrier()
++#else
++#define	smp_mb__before_atomic()	smp_mb()
++#define	smp_mb__after_atomic()	smp_mb()
++#endif
+ 
+ #define smp_store_release(p, v)	do { smp_mb(); WRITE_ONCE(*p, v); } while (0)
+ #define smp_load_acquire(p) ({ typeof(*p) _v = READ_ONCE(*p); smp_mb(); _v; })
+
+--- a/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/include/linux/sched.h
++++ b/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/include/linux/sched.h
+@@ -108,7 +108,16 @@
+ #define	get_task_state(task)		atomic_read(&(task)->state)
+ #define	set_task_state(task, x)		atomic_set(&(task)->state, (x))
+ #define	__set_task_state(task, x)	((task)->state.counter = (x))
+-#define	set_current_state(x)		set_task_state(current, x)
++/*
++ * linux: smp_store_mb(). The sleeper stores its state and then loads its
++ * condition; the waker stores the condition and then loads the state
++ * (wake_up_task). Without a full barrier between store and load on both
++ * sides each cpu can miss the other's store, and the sleeper sleeps for ever.
++ */
++#define	set_current_state(x)		do {					\
++	set_task_state(current, x);						\
++	__atomic_thread_fence(__ATOMIC_SEQ_CST);				\
++} while (0)
+ #define	__set_current_state(x)		__set_task_state(current, x)
+ 
+ static inline void
+
+--- a/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/src/linux_schedule.c
++++ b/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/src/linux_schedule.c
+@@ -120,6 +120,8 @@
+ 
+ 	ret = 0;
+ 	sleepq_lock(task);
++	/* the caller's condition store before the state load, see set_current_state() */
++	__atomic_thread_fence(__ATOMIC_SEQ_CST);
+ 	if ((atomic_read(&task->state) & state) != 0) {
+ 		set_task_state(task, TASK_WAKING);
+ 		sleepq_signal(task, SLEEPQ_SLEEP, 0, 0);

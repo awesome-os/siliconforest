@@ -1,0 +1,431 @@
+diff --git a/src/Kernel/Extensions/PDArmPlatformExpert/CMakeLists.txt b/src/Kernel/Extensions/PDArmPlatformExpert/CMakeLists.txt
+index 94bbeca..24e8828 100644
+--- a/src/Kernel/Extensions/PDArmPlatformExpert/CMakeLists.txt
++++ b/src/Kernel/Extensions/PDArmPlatformExpert/CMakeLists.txt
+@@ -7,6 +7,7 @@ target_sources(PDArmPlatformExpert PRIVATE
+     PDArmGIC.cpp
+     PDArmGICController.cpp
+     PDAppleAIC.cpp
++    PDAppleBootCPUPMGR.cpp
+     PDBcm2835IC.cpp
+     PDSun50iUSB.cpp
+     PDSun50iWatchdog.cpp
+diff --git a/src/Kernel/Extensions/PDArmPlatformExpert/PDAppleAIC.cpp b/src/Kernel/Extensions/PDArmPlatformExpert/PDAppleAIC.cpp
+index 890ff07..793bf88 100644
+--- a/src/Kernel/Extensions/PDArmPlatformExpert/PDAppleAIC.cpp
++++ b/src/Kernel/Extensions/PDArmPlatformExpert/PDAppleAIC.cpp
+@@ -31,6 +31,7 @@ private:
+ 	volatile uint8_t *aic;
+ 	uint32_t          numIRQs;
+ 	uint32_t          numCPUs;
++	const OSSymbol   *dtControllerName;
+ 
+ 	uint32_t
+ 	read32(uint32_t off) const
+@@ -65,7 +66,8 @@ static PDAppleAIC *gAIC;
+  * is still starting.
+  */
+ static bool
+-aic_find_registers(IOPhysicalAddress *outPhys, IOByteCount *outSize)
++aic_find_registers(IOPhysicalAddress *outPhys, IOByteCount *outSize,
++    const OSSymbol **outName)
+ {
+ 	IORegistryEntry *armio = IORegistryEntry::fromPath("/arm-io", gIODTPlane);
+ 	if (armio == NULL) {
+@@ -113,6 +115,20 @@ aic_find_registers(IOPhysicalAddress *outPhys, IOByteCount *outSize)
+ 	}
+ 	const uint64_t *r = (const uint64_t *)reg->getBytesNoCopy();
+ 
++	/*
++	 * Device tree nubs whose interrupt-parent is this node look the controller
++	 * up as "IOInterruptController%08X", built from its phandle.
++	 */
++	OSData *phandle = OSDynamicCast(OSData, aicNode->getProperty("AAPL,phandle"));
++	if (phandle == NULL || phandle->getLength() < sizeof(uint32_t)) {
++		IOLog("PDAppleAIC: interrupt controller has no AAPL,phandle\n");
++		return false;
++	}
++	*outName = IODTInterruptControllerName(aicNode);
++	if (*outName == NULL) {
++		return false;
++	}
++
+ 	*outPhys = (IOPhysicalAddress)(socPhys + r[0]);
+ 	*outSize = (IOByteCount)r[1];
+ 	return true;
+@@ -124,7 +140,7 @@ PDAppleAIC::initAIC(void)
+ 	IOPhysicalAddress phys = 0;
+ 	IOByteCount       size = 0;
+ 
+-	if (!aic_find_registers(&phys, &size)) {
++	if (!aic_find_registers(&phys, &size, &dtControllerName)) {
+ 		return false;
+ 	}
+ 
+@@ -190,6 +206,8 @@ PDAppleAIC::initAIC(void)
+ 	 * and as the primary controller, which is the fallback for nubs with no
+ 	 * explicit interrupt parent.
+ 	 */
++	getPlatform()->registerInterruptController(
++		(OSSymbol *)dtControllerName, this);
+ 	getPlatform()->registerInterruptController(
+ 		(OSSymbol *)gIODTDefaultInterruptController, this);
+ 
+@@ -244,6 +262,16 @@ PDAppleAIC::handleInterrupt(void * /*refCon*/, IOService * /*nub*/, int /*source
+ 		if (!vector->interruptDisabledSoft && vector->interruptRegistered) {
+ 			vector->handler(vector->target, vector->refCon,
+ 			    vector->nub, vector->source);
++			/*
++			 * Reading the event masked this source in hardware. Unmask it
++			 * again, unless the handler disabled it: then mark it hard
++			 * disabled, so that enableInterrupt() unmasks it later.
++			 */
++			if (vector->interruptDisabledSoft) {
++				vector->interruptDisabledHard = 1;
++			} else {
++				enableVector(irq, vector);
++			}
+ 		} else {
+ 			vector->interruptDisabledHard = 1;
+ 			disableVectorHard(irq, vector);
+diff --git a/src/Kernel/Extensions/PDArmPlatformExpert/PDAppleBootCPUPMGR.cpp b/src/Kernel/Extensions/PDArmPlatformExpert/PDAppleBootCPUPMGR.cpp
+new file mode 100644
+index 0000000..96021df
+--- /dev/null
++++ b/src/Kernel/Extensions/PDArmPlatformExpert/PDAppleBootCPUPMGR.cpp
+@@ -0,0 +1,130 @@
++#include "PDAppleBootCPUPMGR.h"
++#include <IOKit/IOLib.h>
++#include <IOKit/IOPMGR.h>
++#include <arm/cpu_topology.h>
++
++/*
++ * Power manager for Apple SoCs running xnu's AppleARMSMP, where Apple's
++ * ApplePMGR is not available. It manages the boot processor only and touches
++ * no PMGR registers:
++ *
++ * - Idle: the platform offers no idle states. xnu's cpu_idle() executes the
++ *   WFI itself; each callback here disables xnu's idle timer (timeout 0).
++ * - Secondary cores and cluster power are not implemented. Every such request
++ *   panics with its reason instead of returning as if it had worked. Boot with
++ *   a topology holding only the boot CPU (cpus=1, or a tree that lists only
++ *   it) so that xnu never makes one.
++ */
++class PDAppleBootCPUPMGR : public IOPMGR
++{
++	OSDeclareDefaultStructors(PDAppleBootCPUPMGR);
++
++public:
++	void enableCPUCore(unsigned int cpu_id, uint64_t entry_pa) APPLE_KEXT_OVERRIDE;
++	void enableCPUCore(unsigned int cpu_id) APPLE_KEXT_OVERRIDE;
++	void disableCPUCore(unsigned int cpu_id) APPLE_KEXT_OVERRIDE;
++	void enableCPUCluster(unsigned int cluster_id) APPLE_KEXT_OVERRIDE;
++	void disableCPUCluster(unsigned int cluster_id) APPLE_KEXT_OVERRIDE;
++	void initCPUIdle(ml_processor_info_t *info) APPLE_KEXT_OVERRIDE;
++	void enterCPUIdle(UInt64 *newIdleTimeoutTicks) APPLE_KEXT_OVERRIDE;
++	void exitCPUIdle(UInt64 *newIdleTimeoutTicks) APPLE_KEXT_OVERRIDE;
++	void updateCPUIdle(UInt64 *newIdleTimeoutTicks) APPLE_KEXT_OVERRIDE;
++};
++
++#define super IOPMGR
++OSDefineMetaClassAndStructors(PDAppleBootCPUPMGR, IOPMGR);
++
++void
++PDAppleBootCPUPMGR::enableCPUCore(unsigned int cpu_id, uint64_t entry_pa)
++{
++	panic("PDAppleBootCPUPMGR: start of cpu %u requested (entry 0x%llx); "
++	    "secondary CPU bring-up is not implemented, boot with cpus=1",
++	    cpu_id, (unsigned long long)entry_pa);
++}
++
++void
++PDAppleBootCPUPMGR::enableCPUCore(unsigned int cpu_id)
++{
++	panic("PDAppleBootCPUPMGR: start of cpu %u requested; "
++	    "secondary CPU bring-up is not implemented, boot with cpus=1", cpu_id);
++}
++
++void
++PDAppleBootCPUPMGR::disableCPUCore(unsigned int cpu_id)
++{
++	panic("PDAppleBootCPUPMGR: power-down of cpu %u requested; not implemented", cpu_id);
++}
++
++void
++PDAppleBootCPUPMGR::enableCPUCluster(unsigned int cluster_id)
++{
++	panic("PDAppleBootCPUPMGR: power-up of cluster %u requested; not implemented", cluster_id);
++}
++
++void
++PDAppleBootCPUPMGR::disableCPUCluster(unsigned int cluster_id)
++{
++	panic("PDAppleBootCPUPMGR: power-down of cluster %u requested; not implemented", cluster_id);
++}
++
++void
++PDAppleBootCPUPMGR::initCPUIdle(ml_processor_info_t *info)
++{
++	/* No nap, no power gating and no platform idle tickle. */
++	info->supports_nap = FALSE;
++	info->idle_tickle = NULL;
++	info->idle_timer_refcon = NULL;
++	info->powergate_stub_addr = 0;
++	info->powergate_stub_length = 0;
++	info->powergate_latency = 0;
++}
++
++void
++PDAppleBootCPUPMGR::enterCPUIdle(UInt64 *newIdleTimeoutTicks)
++{
++	if (newIdleTimeoutTicks != NULL) {
++		*newIdleTimeoutTicks = 0;
++	}
++}
++
++void
++PDAppleBootCPUPMGR::exitCPUIdle(UInt64 *newIdleTimeoutTicks)
++{
++	if (newIdleTimeoutTicks != NULL) {
++		*newIdleTimeoutTicks = 0;
++	}
++}
++
++void
++PDAppleBootCPUPMGR::updateCPUIdle(UInt64 *newIdleTimeoutTicks)
++{
++	if (newIdleTimeoutTicks != NULL) {
++		*newIdleTimeoutTicks = 0;
++	}
++}
++
++bool
++PDAppleBootCPUPMGR_publish(IOService *provider)
++{
++	const ml_topology_info_t *topo = ml_get_topology_info();
++	PDAppleBootCPUPMGR *pmgr = new PDAppleBootCPUPMGR;
++	bool ok;
++
++	if (pmgr == NULL) {
++		return false;
++	}
++	ok = pmgr->init() && pmgr->attach(provider);
++	if (ok && !pmgr->start(provider)) {
++		pmgr->detach(provider);
++		ok = false;
++	}
++	if (ok) {
++		if (topo != NULL && topo->num_cpus > 1) {
++			IOLog("PDAppleBootCPUPMGR: topology has %u processors; starting any "
++			    "but the boot CPU will panic (boot with cpus=1)\n", topo->num_cpus);
++		}
++		pmgr->registerService();
++	}
++	pmgr->release();
++	return ok;
++}
+diff --git a/src/Kernel/Extensions/PDArmPlatformExpert/PDAppleBootCPUPMGR.h b/src/Kernel/Extensions/PDArmPlatformExpert/PDAppleBootCPUPMGR.h
+new file mode 100644
+index 0000000..e7dba84
+--- /dev/null
++++ b/src/Kernel/Extensions/PDArmPlatformExpert/PDAppleBootCPUPMGR.h
+@@ -0,0 +1,13 @@
++#ifndef _PUREDARWIN_PDAPPLEBOOTCPUPMGR_H
++#define _PUREDARWIN_PDAPPLEBOOTCPUPMGR_H
++
++#include <IOKit/IOService.h>
++
++/*
++ * Publish the IOPMGR that xnu's AppleARMSMP cpu_boot_thread waits for, attached
++ * to provider. It manages only the boot processor; see PDAppleBootCPUPMGR.cpp.
++ * Returns false if the service could not be created or started.
++ */
++bool PDAppleBootCPUPMGR_publish(IOService *provider);
++
++#endif /* _PUREDARWIN_PDAPPLEBOOTCPUPMGR_H */
+diff --git a/src/Kernel/Extensions/PDArmPlatformExpert/PDArmPlatformExpert.cpp b/src/Kernel/Extensions/PDArmPlatformExpert/PDArmPlatformExpert.cpp
+index 4c82352..3e7f50d 100644
+--- a/src/Kernel/Extensions/PDArmPlatformExpert/PDArmPlatformExpert.cpp
++++ b/src/Kernel/Extensions/PDArmPlatformExpert/PDArmPlatformExpert.cpp
+@@ -8,6 +8,7 @@
+ #include "PDArmCPU.h"
+ #include "PDArmGIC.h"
+ #include "PDAppleAIC.h"
++#include "PDAppleBootCPUPMGR.h"
+ #include "PDBcm2835IC.h"
+ #include "PDArmGICController.h"
+ #include "PDSun50iUSB.h"
+@@ -44,8 +45,10 @@ public:
+ 
+ protected:
+ 	virtual bool initPlatformInterrupts(void);
++	virtual bool startProcessors(void);
+ 	virtual void initPlatformInterruptsLate(void);
+ 	virtual const char *platformModelName(void);
++	virtual bool usesPSCIHaltRestart(void);
+ 	void publishBcm2835EMMC(void);
+ 	void publishBcm283xFramebuffer(void);
+ 	void startQemuRTC(void);
+@@ -90,29 +93,7 @@ PDArmPlatformExpert::start(IOService *provider)
+ 	registerService();
+ 
+ 	if (!initPlatformInterrupts()) return false;
+-
+-	// One IOCPU per processor in xnu's topology.
+-	// The boot CPU finishes its setup here, the others wait for PE_cpu_start() to power them on
+-	{
+-		const ml_topology_info_t *topo = ml_get_topology_info();
+-		unsigned int ncpu = (topo != NULL) ? topo->num_cpus : 1;
+-
+-		PDArmCPU::setCPUCount(ncpu);
+-
+-		for (unsigned int i = 0; i < ncpu; i++) {
+-			PDArmCPU *cpu = new PDArmCPU;
+-			uint32_t phys_id = (topo != NULL) ? topo->cpus[i].phys_id : 0;
+-
+-			if (cpu == NULL) return false;
+-			cpu->init();
+-			// attach(0) would make a cpu the IOService root and unbalance the root busy count
+-			cpu->attach(this);
+-			if (!cpu->startForCPU(i, phys_id, i == 0)) return false;
+-			if (i == 0) bootCPU = cpu;
+-		}
+-		IOLog("PDArmPlatformExpert: %u processor(s)\n", ncpu);
+-	}
+-	if (bootCPU == NULL) return false;
++	if (!startProcessors()) return false;
+ 
+ 	initPlatformInterruptsLate();
+ 
+@@ -126,7 +107,9 @@ PDArmPlatformExpert::start(IOService *provider)
+ #if defined(__arm64__)
+ 	pd_perfcontrol_start();
+ 	PDSun60iDVFS_start();
+-	PE_halt_restart = pdArmHaltRestart;
++	if (usesPSCIHaltRestart()) {
++		PE_halt_restart = pdArmHaltRestart;
++	}
+ 	if (PDSun50i_isPlatform()) {
+ 		PDSun50iWatchdog_start();
+ 		PDSun50iMMC_publish(this);
+@@ -144,6 +127,31 @@ PDArmPlatformExpert::start(IOService *provider)
+ 	return true;
+ }
+ 
++// One IOCPU per processor in xnu's topology.
++// The boot CPU finishes its setup here, the others wait for PE_cpu_start() to power them on
++bool
++PDArmPlatformExpert::startProcessors(void)
++{
++	const ml_topology_info_t *topo = ml_get_topology_info();
++	unsigned int ncpu = (topo != NULL) ? topo->num_cpus : 1;
++
++	PDArmCPU::setCPUCount(ncpu);
++
++	for (unsigned int i = 0; i < ncpu; i++) {
++		PDArmCPU *cpu = new PDArmCPU;
++		uint32_t phys_id = (topo != NULL) ? topo->cpus[i].phys_id : 0;
++
++		if (cpu == NULL) return false;
++		cpu->init();
++		// attach(0) would make a cpu the IOService root and unbalance the root busy count
++		cpu->attach(this);
++		if (!cpu->startForCPU(i, phys_id, i == 0)) return false;
++		if (i == 0) bootCPU = cpu;
++	}
++	IOLog("PDArmPlatformExpert: %u processor(s)\n", ncpu);
++	return bootCPU != NULL;
++}
++
+ #if defined(__arm64__)
+ // true when a nul-separated compatible list names want
+ static bool
+@@ -576,6 +584,13 @@ PDArmPlatformExpert::platformModelName(void)
+ 	return sPDVirtualMac ? "VirtualMac2,1" : "QEMU Virtual ARM64";
+ }
+ 
++// Halt and restart go to PSCI firmware (pdArmHaltRestart)
++bool
++PDArmPlatformExpert::usesPSCIHaltRestart(void)
++{
++	return true;
++}
++
+ /*
+  * Apple SoCs. The device tree root of every one of them carries "AppleARM" in
+  * its compatible property, alongside the board and product names, so a single
+@@ -587,8 +602,10 @@ class PDAppleARMPlatformExpert : public PDArmPlatformExpert
+ 
+ protected:
+ 	bool initPlatformInterrupts(void) APPLE_KEXT_OVERRIDE;
++	bool startProcessors(void) APPLE_KEXT_OVERRIDE;
+ 	void initPlatformInterruptsLate(void) APPLE_KEXT_OVERRIDE;
+ 	const char *platformModelName(void) APPLE_KEXT_OVERRIDE;
++	bool usesPSCIHaltRestart(void) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ #undef super
+@@ -602,6 +619,46 @@ PDAppleARMPlatformExpert::initPlatformInterrupts(void)
+ 	return true;
+ }
+ 
++/*
++ * xnu's Apple SoC board configurations build with USE_APPLEARMSMP. Then xnu's
++ * own cpu_boot_thread (iokit/Kernel/arm/AppleARMSMP.cpp) registers every
++ * processor with ml_processor_register() and starts it through an IOPMGR.
++ * A PDArmCPU would register the processors a second time, and it needs a GIC
++ * that Apple SoCs do not have. So leave the processors to xnu, after checking
++ * that this kernel really owns them: its PassthruInterruptController, created
++ * once this platform expert has matched, is the platform interrupt controller.
++ * Without it, stop: there is no other processor driver for this hardware.
++ */
++#define PD_APPLE_SMP_WAIT_NS	(30ULL * 1000ULL * 1000ULL * 1000ULL)
++
++bool
++PDAppleARMPlatformExpert::startProcessors(void)
++{
++	OSDictionary *matching;
++	IOService *passthru;
++
++	matching = propertyMatching(gPlatformInterruptControllerName, kOSBooleanTrue,
++	    serviceMatching("PassthruInterruptController"));
++	if (matching == NULL) {
++		return false;
++	}
++	passthru = waitForMatchingService(matching, PD_APPLE_SMP_WAIT_NS);
++	matching->release();
++	if (passthru == NULL) {
++		IOLog("PDAppleARMPlatformExpert: no AppleARMSMP interrupt controller; "
++		    "this kernel does not register Apple processors itself\n");
++		return false;
++	}
++	passthru->release();
++
++	if (!PDAppleBootCPUPMGR_publish(this)) {
++		IOLog("PDAppleARMPlatformExpert: could not publish the boot-CPU power manager\n");
++		return false;
++	}
++	IOLog("PDAppleARMPlatformExpert: processors are registered by xnu (AppleARMSMP)\n");
++	return true;
++}
++
+ void
+ PDAppleARMPlatformExpert::initPlatformInterruptsLate(void)
+ {
+@@ -616,3 +673,16 @@ PDAppleARMPlatformExpert::platformModelName(void)
+ {
+ 	return "Apple ARM";
+ }
++
++/*
++ * Apple SoCs have no PSCI firmware, and pdArmHaltRestart's PSCI probe walks
++ * the IORegistry, whose locks may not be taken from the panic path. No Apple
++ * reset driver exists here yet, so install no handler: PE_halt_restart stays
++ * NULL, IOPlatformExpert::haltRestart() returns -1, and halt_all_cpus() spins
++ * once pd_psci_halt() finds no /psci node. Recovery is external.
++ */
++bool
++PDAppleARMPlatformExpert::usesPSCIHaltRestart(void)
++{
++	return false;
++}

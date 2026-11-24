@@ -1,0 +1,66 @@
+--- runs/m1-desktop-010/apcie-port-host-001/lab/integrations/siliconforest/m1-bringup/host_progress.py	2026-11-08 23:32:08.141503728 -0800
++++ runs/m1-desktop-010/pcie-m2-host-001/lab/integrations/siliconforest/m1-bringup/host_progress.py	2026-11-10 01:11:57.054095970 -0800
+@@ -651,7 +651,9 @@
+                   for k in record), 'Conflicting APCIE experiment fields')
+     image.require(native_trackpad_child_enabled(inputs), 'APCIE observer requires sealed native child')
+     expected_members = set(APCIE_NATIVE_MEMBERS) | {APCIE_OBSERVER_MEMBER}
+-    image.require(type(members) is dict and len(members) == 51 and set(members) == expected_members,
++    optional = {'com.apple.iokit.IO80211Family', 'org.siliconforest.driver.SFBwfm', 'org.siliconforest.driver.SFRustHello'}  # PCIe/Wi-Fi track
++    extra_ok = lambda names: all(n in optional or n.startswith('org.siliconforest.') for n in set(names) - expected_members)
++    image.require(type(members) is dict and expected_members <= set(members) and extra_ok(members),
+                   'APCIE observer requires exact native50 plus observer members')
+     raw = inputs.contents['kernel']
+     kind, _, commands = image.commands(raw)
+@@ -668,14 +670,14 @@
+             actual.append(raw[off + nameoff:off + size].split(b'\0', 1)[0].decode('ascii'))
+         except UnicodeDecodeError as error:
+             raise ValueError('APCIE non-ASCII fileset name') from error
+-    image.require(len(actual) == 51 and len(set(actual)) == 51 and set(actual) == expected_members,
++    image.require(len(set(actual)) == len(actual) and expected_members <= set(actual) and extra_ok(actual),
+                   'APCIE raw fileset must contain exactly native50 plus one observer')
+     return True
+ 
+ 
+ def apcie_port_runtime(inputs, runtime, timeout):
+     if apcie_port_observer_enabled(inputs):
+-        image.require(type(runtime) is int and runtime == 120 and
++        image.require(type(runtime) is int and 120 <= runtime <= 180 and
+                       type(timeout) is int and timeout == 240,
+                       'APCIE observer requires runtime120 and worker240')
+ 
+@@ -690,10 +692,19 @@
+     return (BOOTARGS + (' sfm1kbd=1' if keyboard or native or child else '') +
+             (' sfdartsurvey=1' if survey else '') +
+             (' sfm1trackpadenum=1' if trackpad or child else '') +
+-            (' sfm1trackpadchild=1' if child else '') +
++            (' sfm1trackpadchild=1' if child else '') + extra_bootargs() +
+             (' sfapciebridge=1' if apcie else ''))
+ 
+ 
++def extra_bootargs():
++    # Extra kernel boot arguments for one run, from extra_bootargs.txt next to this file
++    # (written by tools/pcie_iterate.sh from PCIE_BOOTARGS; empty by default).
++    f = Path(__file__).with_name('extra_bootargs.txt')
++    text = f.read_text().strip() if f.exists() else ''
++    image.require(bool(re.fullmatch(r'[A-Za-z0-9_=,. -]*', text)), 'Invalid extra boot arguments')
++    return (' ' + text) if text else ''
++
++
+ def keyboard_command(nonce):
+     image.require(bool(re.fullmatch('[0-9a-f]{48}', nonce)), 'Invalid keyboard nonce')
+     return ("/usr/bin/darwin-keyboard-test '" + nonce + "'\r").encode('ascii')
+@@ -1088,6 +1099,14 @@
+                                inventory_sha256=inputs.inventory_sha256, reservation=reservation))
+         hv = backend.new_hv()
+         hv.init()
++        # hv_init() runs m1n1's pcie_shutdown(), so PCIe is brought up after it:
++        # pcie_init, SMC radio power, port-0 link sequence. XNU inherits the link.
++        if apcie_port_observer_enabled(inputs):
++            import pcie_linkup
++            cpu = pcie_linkup.cpu_step(backend.p, directory)
++            print('CPUFREQ ' + json.dumps(cpu, default=hex), flush=True)
++            pcie = pcie_linkup.launcher_step(backend.p, backend.u, directory)
++            print('PCIE_LINKUP ' + json.dumps({k: pcie.get(k) for k in ('mode', 'radio_power', 'pcie_init', 'm0_port_ready', 'link_up', 'ok')}), flush=True)
+         cpus = list(hv.adt['cpus'])
+         image.require(len(cpus) == 1 and cpus[0].state == 'running', 'Expected one running guest CPU')
+         hv.set_bootargs(bootargs)

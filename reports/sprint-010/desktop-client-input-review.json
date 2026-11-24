@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SOURCE_AND_BINARY_REVIEW_NO_HARDWARE_NO_BUILDS",
+  "reviewed": {
+    "source_set": "integrations/puredarwin/chonkstep-darwin/client-input, 7b589414d815162f821205bf1725675b2308c84f35bbc37e99ce4f8a47da2a56. All 9 bound files match, there are no unbound files outside target/, and the digest recomputes when lines are sorted by path (same N1 wording note as the SSD set).",
+    "native_binary": "client-input/target/aarch64-apple-darwin/release/darwin-wayland-client-input, e92059c52886f7d219a70980ba793cee7b3ab91a5a2c12915d7e94f64849d489, 998784 bytes",
+    "freeze_record": "reports/sprint-010/desktop-client-input-preparation.json"
+  },
+  "verdict": "APPROVE. A strict, observation-only verifier fed only by real wl_seat/wl_keyboard/wl_pointer callbacks. It cannot inject, open devices or forge a click, and every deviation is a sticky failure that also makes the process exit nonzero. Compositor-side paths it depends on (keymap fd, focus, button replay) were checked against the pinned sources. W1-W3 are runtime expectations to record, not defects.",
+  "diff_vs_frozen_ssd_client": "Same package lock apart from the package name; Cargo.toml differs only in the package name. main.rs adds: a wl_seat bind (version >= 5, at most 9, exactly one seat, else rejected); InputProof feeding from SSD readiness and frame callbacks; the own-surface reference; app id and shm path renamed; a per-loop tick and sticky-error exit; DL10_INPUT_READY once on arm; DL10_INPUT_OBSERVED once on completion; and a final 'proof incomplete' error. negotiation.rs (fdb4d378) and the pixel workload are byte-identical to the qualified SSD client.",
+  "verified": [
+    "Readiness needs all of: the exact keyboard+pointer seat capability; an XKB v1 keymap read and validated; keyboard enter on its own surface with no held keys; zero depressed/latched/locked/group modifiers; acknowledged SSD; and a real frame callback. arm() fires once and starts the 15 s deadline.",
+    "Sequence: A press then release (evdev 30), only after arm and with focus and neutral modifiers. Then pointer enter on its own surface within +/-1 px of (200,100), only after both keys. Then BTN_LEFT 0x110 press then release at an in-tolerance position. Then a pointer frame after the release. Extra keys, wrong state, repeats, a second click, scroll (Axis), early or out-of-place motion, keyboard leave, and a pointer leave before the click completes are all rejected. Unknown enum states are rejected too.",
+    "Printed markers carry literals (key=30, button=272, zero modifiers, own_surface=1) only after the verifier accepted exactly those values, and nothing prints once any error is set. Coordinates are printed from the real callback values.",
+    "Keymap path on Darwin: Smithay 0.7 SealedFile uses shm_open plus write() off Linux. XNU's pshmops has fo_write = fo_no_write, which returns ENXIO (posix_shm.c:198-201, kern_descrip.c:6311), so the sealed file fails. KeymapFile::with_fd then falls back to a regular tempfile in XDG_RUNTIME_DIR holding the keymap and a NUL, with size len+1. The client's fstat (is_file, len >= size), seek(0) on the shared description and read_exact handle that fd correctly.",
+    "Compositor contract: hid.rs maps USB 4 to evdev 30; input.rs maps button bit 0 to 0x110. sync_input_focus calls set_focus only when focus actually changes (input.rs:59), and Smithay also ignores a same-focus set (keyboard/mod.rs:1371). A titlebar press or drag on the already-focused window therefore cannot send the keyboard leave that would invalidate a completed proof.",
+    "Native binary: an arm64 PIE Mach-O linking the same four dylibs as the qualified SSD client (libiconv.2, libSystem.B, libc, libm). It contains all ten DL10_INPUT_* markers, origin=host_pdserialhid (10 occurrences), the app id org.darwinlab.desktop-test-input and the refusal strings. It was built at 00:17:31, after the last source edit (00:15:10), but the build log does not record the hash, so the binary-to-source binding rests on root's build record."
+  ],
+  "runtime_expectations": [
+    {"id": "W1", "text": "The content click reaches the client only if wm-core replays it: input.rs:103-108 forwards a press when replay is set after the wm dispatch. This is the first live test of that path on Darwin. If the click is consumed (for example by click-to-focus), the client correctly fails 'proof incomplete', and the console shows no DL10_INPUT_BUTTON."},
+    {"id": "W2", "text": "The compositor may log Smithay's 'Error when creating sealed keymap file' (ENXIO) before falling back. That is the expected Darwin path, not a failure, provided DL10_INPUT_KEYMAP follows."},
+    {"id": "W3", "text": "Readiness depends on the compositor giving keyboard focus to the newly mapped window and sending modifiers after enter. If either is missing, no DL10_INPUT_READY appears and the host must send no input lines. This is the plan's 'gate on actual readiness' rule, and DL10_SERVER_SOCKET alone must not trigger the schedule."}
+  ],
+  "qualification_rule": "Host-origin input is qualified only by DL10_INPUT_READY, then the fresh-nonce KEY pressed/released, POINTER_ENTER within tolerance, BUTTON pressed/released and OBSERVED, all after the host TX ledger shows the matching SOH lines in order, with client exit 0 and no 'darwin-wayland-client-input:' error. Label it HOST_ORIGIN_PDSerialHID. It never shows a physical keyboard or trackpad.",
+  "not_claimed": ["any input delivery", "physical keyboard or trackpad", "drag displacement", "runtime"],
+  "scope": "Read-only. No builds, hardware or fetches. No cargo or tests were run in this review."
+}

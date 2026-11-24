@@ -1,0 +1,77 @@
+kernel: workqueue: LinuxKPI's delayed_work and system queues
+
+struct delayed_work in LinuxKPI holds a FreeBSD callout, initialised as a whole by
+INIT_DELAYED_WORK(); there is no timer_list for timer_init_key(). LinuxKPI is at the 6.14
+level: the unbound queue is system_unbound_wq (system_dfl_wq from 6.18), and there are no
+BH or freezable system queues.
+
+--- a/kernel/workqueue.rs
++++ b/kernel/workqueue.rs
+@@ -783,7 +783,15 @@
+         pin_init!(Self {
+             dwork <- Opaque::ffi_init(|slot: *mut bindings::delayed_work| {
+                 // SAFETY: The `WorkItemPointer` implementation promises that `run` can be used as
++                // the work item function. `slot` is valid for writes.
++                #[cfg(sf_lkpi)]
++                unsafe {
++                    bindings::sf_init_delayed_work(slot, Some(T::Pointer::run))
++                }
++
++                // SAFETY: The `WorkItemPointer` implementation promises that `run` can be used as
+                 // the work item function.
++                #[cfg(not(sf_lkpi))]
+                 unsafe {
+                     bindings::init_work_with_key(
+                         core::ptr::addr_of_mut!((*slot).work),
+@@ -797,6 +805,7 @@
+                 // SAFETY: The `delayed_work_timer_fn` function pointer can be used here because
+                 // the timer is embedded in a `struct delayed_work`, and only ever scheduled via
+                 // the core workqueue code, and configured to run in irqsafe context.
++                #[cfg(not(sf_lkpi))]
+                 unsafe {
+                     bindings::timer_init_key(
+                         core::ptr::addr_of_mut!((*slot).timer),
+@@ -1135,7 +1144,11 @@
+ /// Use this queue for work items which do not require a specific CPU.
+ pub fn system_dfl() -> &'static Queue {
+     // SAFETY: `system_dfl_wq` is a C global, always available.
++    #[cfg(not(sf_lkpi))]
+     unsafe { Queue::from_raw(bindings::system_dfl_wq) }
++    // SAFETY: LinuxKPI (6.14 level) still calls this queue `system_unbound_wq`.
++    #[cfg(sf_lkpi)]
++    unsafe { Queue::from_raw(bindings::system_unbound_wq) }
+ }
+ 
+ /// Returns the system work queue (`system_wq`).
+@@ -1177,6 +1190,7 @@
+     unsafe { Queue::from_raw(bindings::system_unbound_wq) }
+ }
+ 
++#[cfg(not(sf_lkpi))]
+ /// Returns the system freezable work queue (`system_freezable_wq`).
+ ///
+ /// It is equivalent to the one returned by [`system`] except that it's freezable.
+@@ -1198,6 +1212,7 @@
+     unsafe { Queue::from_raw(bindings::system_power_efficient_wq) }
+ }
+ 
++#[cfg(not(sf_lkpi))]
+ /// Returns the system freezable power-efficient work queue (`system_freezable_power_efficient_wq`).
+ ///
+ /// It is similar to the one returned by [`system_power_efficient`] except that is freezable.
+@@ -1209,6 +1224,7 @@
+     unsafe { Queue::from_raw(bindings::system_freezable_power_efficient_wq) }
+ }
+ 
++#[cfg(not(sf_lkpi))]
+ /// Returns the system bottom halves work queue (`system_bh_wq`).
+ ///
+ /// It is similar to the one returned by [`system`] but for work items which
+@@ -1218,6 +1234,7 @@
+     unsafe { Queue::from_raw(bindings::system_bh_wq) }
+ }
+ 
++#[cfg(not(sf_lkpi))]
+ /// Returns the system bottom halves high-priority work queue (`system_bh_highpri_wq`).
+ ///
+ /// It is similar to the one returned by [`system_bh`] but for work items which

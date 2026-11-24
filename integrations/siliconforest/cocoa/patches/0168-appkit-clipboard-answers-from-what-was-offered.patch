@@ -1,0 +1,141 @@
+--- a/src/Frameworks/AppKit/NSPasteboard.m
++++ b/src/Frameworks/AppKit/NSPasteboard.m
+@@ -135,6 +135,16 @@
+ 
+ // MIME type to pasteboard type for what this process last offered, read on the main thread only
+ static NSDictionary *publishedMimeTypes=nil;
++/* (TERM11, clipboard) what was on the board when it was offered, and the board's change count then. Another client's
++ * request was answered from the board as it was when the request reached the main thread: by then the desk's clipboard
++ * keeper (which asks for every type the moment a selection is set, and keeps a copy of its own) could own the
++ * selection, the board took that offer as its contents, and the answer read the desk's offer - which waited for this
++ * answer: Firefox's copy reached every other client as 0 bytes, Activity Monitor's (an idle main thread answering
++ * first) did not. A request is now answered from the data offered, on a thread of its own; only data an owner provides
++ * lazily goes through the main thread, and then from the offered board without taking another client's selection. */
++static pthread_mutex_t publishedLock=PTHREAD_MUTEX_INITIALIZER;
++static NSDictionary *publishedItems=nil, *publishedMimeMap=nil;
++static int publishedChangeCount=-1;
+ 
+ static void SFWriteAll(int fd,NSData *data) {
+    const char *bytes=[data bytes];
+@@ -150,6 +160,31 @@
+    close(fd);
+ }
+ 
++@interface NSPasteboard (SFOffered)
++-(NSData *)_sfOfferedDataForType:(NSString *)type;
++@end
++
++struct SFSelectionWrite { NSData *data; int fd; };
++
++static void *SFSelectionWriter(void *arg) {
++   struct SFSelectionWrite *write=arg;
++
++   SFWriteAll(write->fd,write->data);
++   [write->data release];
++   free(write);
++   return NULL;
++}
++
++// a uri-list line for a URL, else the data as offered
++static NSData *SFSelectionBytes(NSString *mimeType,NSData *data) {
++   if(data!=nil && [mimeType isEqualToString:@"text/uri-list"]){
++    NSString *url=[[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] autorelease];
++    if(url!=nil && ![url hasSuffix:@"\n"])
++     data=[[url stringByAppendingString:@"\r\n"] dataUsingEncoding:NSUTF8StringEncoding];
++   }
++   return data;
++}
++
+ // one paste request from another client, answered on the main thread where lazy owners may run
+ @interface SFSelectionRequest : NSObject {
+ @public
+@@ -170,13 +205,9 @@
+     fprintf(stderr,"pasteboard: answer runs, main thread %d\n",(int)pthread_main_np());
+    NSPasteboard *general=[NSPasteboard generalPasteboard];
+    NSString *type=[publishedMimeTypes objectForKey:_mimeType];
+-   NSData *data=(type!=nil)?[general dataForType:type]:nil;
++   NSData *data=(type!=nil)?[general _sfOfferedDataForType:type]:nil;
+ 
+-   // a URL goes out as a uri-list line
+-   if(data!=nil && [_mimeType isEqualToString:@"text/uri-list"]){
+-    NSString *url=[general stringForType:type];
+-    data=[[url stringByAppendingString:@"\r\n"] dataUsingEncoding:NSUTF8StringEncoding];
+-   }
++   data=SFSelectionBytes(_mimeType,data);
+    if(getenv("SF_WS_TRACE")!=NULL)
+     NSLog(@"pasteboard: answering %@ as %@ with %lu bytes",_mimeType,type,(unsigned long)[data length]);
+    if(data!=nil)
+@@ -192,6 +223,31 @@
+    if(getenv("SF_WS_TRACE")!=NULL)
+     fprintf(stderr,"pasteboard: request for %s, main thread %d\n",mimeType,(int)pthread_main_np());
+    NSAutoreleasePool *pool=[[NSAutoreleasePool alloc] init];
++   NSString *mime=[NSString stringWithUTF8String:mimeType];
++   NSData *offered=nil;
++
++   // what was offered with data goes out at once, from a thread of its own (a slow reader cannot hold anything up)
++   pthread_mutex_lock(&publishedLock);
++   NSString *offeredType=[publishedMimeMap objectForKey:mime];
++   if(offeredType!=nil)
++    offered=[[publishedItems objectForKey:offeredType] retain];
++   pthread_mutex_unlock(&publishedLock);
++   if(offered!=nil){
++    struct SFSelectionWrite *write=malloc(sizeof(*write));
++    pthread_t thread;
++
++    write->data=[SFSelectionBytes(mime,offered) retain];
++    write->fd=fd;
++    [offered release];
++    if(getenv("SF_WS_TRACE")!=NULL)
++     fprintf(stderr,"pasteboard: answering %s with %lu offered bytes\n",mimeType,(unsigned long)[write->data length]);
++    if(pthread_create(&thread,NULL,SFSelectionWriter,write)==0)
++     pthread_detach(thread);
++    else
++     SFSelectionWriter(write);
++    [pool release];
++    return;
++   }
+    SFSelectionRequest *request=[[[SFSelectionRequest alloc] init] autorelease];
+ 
+    request->_mimeType=[[NSString alloc] initWithUTF8String:mimeType];
+@@ -366,6 +422,13 @@
+    }
+    [publishedMimeTypes release];
+    publishedMimeTypes=[map copy];
++   pthread_mutex_lock(&publishedLock);
++   [publishedMimeMap release];
++   publishedMimeMap=[map copy];
++   [publishedItems release];
++   publishedItems=[_items copy];
++   publishedChangeCount=_changeCount;
++   pthread_mutex_unlock(&publishedLock);
+ 
+    count=[mimeTypes count];
+    list=malloc(sizeof(char *)*(count+1));
+@@ -438,6 +501,27 @@
+ }
+ 
+ 
++// (TERM11) the data this process offered for a type: the board's own while it still holds that offer (a lazy owner is
++// asked here), else the copy taken when it was offered - never another client's selection
++-(NSData *)_sfOfferedDataForType:(NSString *)type {
++   NSData *data=nil;
++
++   type=SFCanonicalType(type);
++   if(!_systemBacked && _changeCount==publishedChangeCount){
++    data=[_items objectForKey:type];
++    if(data==nil && _owner!=nil && [_owner respondsToSelector:@selector(pasteboard:provideDataForType:)]){
++     [_owner pasteboard:self provideDataForType:SFLegacyType(type)!=nil && ![_types containsObject:type]?SFLegacyType(type):type];
++     data=[_items objectForKey:type];
++    }
++   }
++   if(data==nil){
++    pthread_mutex_lock(&publishedLock);
++    data=[[[publishedItems objectForKey:type] retain] autorelease];
++    pthread_mutex_unlock(&publishedLock);
++   }
++   return data;
++}
++
+ -(NSString *)stringForType:(NSString *)type {
+    NSData *data=[self dataForType:type];
+    const unsigned char *bytes=[data bytes];

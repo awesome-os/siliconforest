@@ -1,0 +1,470 @@
+{
+  "schema_version": 1,
+  "recorded_utc": "2026-11-09T10:09:13.497822+00:00",
+  "status": "ADMIT_DESIGN_DIRECTION_ONLY_NO_IMPLEMENTATION",
+  "subject": {
+    "path": "reports/sprint-010/dart-native-owned-adapter-design-001.json",
+    "sha256": "98b638c2f26856b64747d6b1a75861f7780a202cdd665ba50c9d2a761febfc04",
+    "bytes": 19348
+  },
+  "scope": "Independent read-only mapper-design review against pinned local source/receipts. This reviewer did not author this mapper design. The separately reviewed owner design was not re-reviewed or treated as implementation authority.",
+  "conclusion": "No concrete contradiction found in the checked mapper direction. The design keeps genuine map/unmap and invalid-lookup success blocked, retains exposed backing/IOVA independently of swallowed framework errors, and preserves the finite frozen lifecycle.",
+  "concrete_defects": [],
+  "checks": [
+    {
+      "point": "Real map/unmap remain unsuccessful pending reviewed same-owner bridge",
+      "result": "PASS_DIRECTION_ONLY",
+      "design_sections": [
+        "same_owner_boundary[1]",
+        "callback_contract[0]",
+        "callback_contract[2]",
+        "callback_contract[3]",
+        "present_blockers"
+      ],
+      "assessment": "The design explicitly refuses present start/publication and real map/unmap success. Native79 and control002 are not represented as exposure authority; no fake codec/model result can satisfy these callbacks.",
+      "evidence": [
+        {
+          "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/IOKit/IOMapper.h",
+          "line": 86,
+          "through_line": 131,
+          "source_fact": "Exact six pure virtual callbacks match the design, including IOReturn map/unmap and scalar translation."
+        },
+        {
+          "path": "integrations/puredarwin/m1-apcie-bridge/native_backing/native_iokit.h",
+          "line": 19,
+          "through_line": 26,
+          "source_fact": "Public API exposes private pin/configure/acquire/zero/copy/retire/inspect only; no effect or owned-view export."
+        },
+        {
+          "path": "integrations/puredarwin/m1-apcie-bridge/native_backing/backing.c",
+          "line": 13,
+          "through_line": 18,
+          "source_fact": "private_core requires no effects, pending ticket or ever_resources."
+        },
+        {
+          "path": "integrations/puredarwin/m1-apcie-bridge/native_backing/backing.c",
+          "line": 212,
+          "through_line": 218,
+          "source_fact": "Current private operations retain/refuse when that private-core condition no longer holds."
+        }
+      ]
+    },
+    {
+      "point": "Invalid translation cannot return zero or identity as a failure value",
+      "result": "PASS_DIRECTION_ONLY",
+      "design_sections": [
+        "callback_contract[5].present_engine",
+        "present_blockers[2]"
+      ],
+      "assessment": "The uint64_t return has no error channel. The design rejects success-shaped failure values and makes containment/fail-stop an explicit blocker before subclass admission. Merely remaining non-system would not protect direct IODMACommand callers; the existing design blocker must cover them too.",
+      "evidence": [
+        {
+          "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/IOKit/IOMapper.h",
+          "line": 131,
+          "through_line": 131,
+          "source_fact": "mapToPhysicalAddress returns uint64_t, without a separate status."
+        },
+        {
+          "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IOMapper.cpp",
+          "line": 292,
+          "through_line": 351,
+          "source_fact": "IOMappedRead/Write use the returned address directly in physical-access functions without a failure check."
+        },
+        {
+          "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IODMACommand.cpp",
+          "line": 1204,
+          "through_line": 1219,
+          "source_fact": "A non-global command mapper translation also goes directly to copypv; no zero/identity failure check."
+        }
+      ]
+    },
+    {
+      "point": "First mapping is one whole16KiB data page, never the32-byte ring prefix",
+      "result": "PASS_DIRECTION_ONLY",
+      "design_sections": [
+        "first_workload.resources",
+        "IOVA_reservation_contract[2]",
+        "IOVA_reservation_contract[3]",
+        "permissions_and_attribution[1]"
+      ],
+      "assessment": "Root, leaf and data are each16KiB, and data descriptor length/returned map extent are exactly0x4000. The ring prefix is explicitly a use within that extent. No32B mapping admission is suggested.",
+      "evidence": [
+        {
+          "path": "integrations/puredarwin/m1-dart/dart_codec.h",
+          "line": 12,
+          "through_line": 20,
+          "source_fact": "Frozen codec has16KiB granule and bounded graph/table limits."
+        },
+        {
+          "path": "integrations/puredarwin/m1-apcie-bridge/private_lifecycle/lifecycle.h",
+          "line": 9,
+          "through_line": 11,
+          "source_fact": "Core has3 spans and16KiB page size."
+        },
+        {
+          "path": "integrations/puredarwin/m1-apcie-bridge/private_lifecycle/lifecycle.c",
+          "line": 83,
+          "through_line": 93,
+          "source_fact": "Every bound span must have BPL_PAGE bytes; data also requires aligned bounded IOVA and rights."
+        },
+        {
+          "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IODMACommand.cpp",
+          "line": 928,
+          "through_line": 946,
+          "source_fact": "Nonzero returned allocation length unequal to requested length selects multisegment processing."
+        },
+        {
+          "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IODMACommand.cpp",
+          "line": 1000,
+          "through_line": 1009,
+          "source_fact": "That multisegment path invokes iovmInsert, outside the proposed first profile."
+        }
+      ]
+    },
+    {
+      "point": "Bounded aperture/zero/MSI exclusion and no reservation reuse after an effect",
+      "result": "PASS_DIRECTION_ONLY",
+      "design_sections": [
+        "IOVA_reservation_contract"
+      ],
+      "assessment": "0x00100000+0xbfe00000 equals0xbff00000; the stated half-open aperture matches frozen constants. It excludes zero and lies below the separately reserved MSI page. The design adds a future monotonic reservation/tombstone contract; it does not claim an allocator already exists. Cancellation is allowed only before exposure under known-private ownership.",
+      "evidence": [
+        {
+          "path": "integrations/puredarwin/m1-dart/dart_codec.h",
+          "line": 14,
+          "through_line": 18,
+          "source_fact": "Separate32-bit IOVA/36-bit PA limits, aperture base/size and MSI page match the design."
+        },
+        {
+          "path": "integrations/puredarwin/m1-dart/dart_codec.c",
+          "line": 186,
+          "through_line": 191,
+          "source_fact": "Software validation requires page containment in aperture and separately rejects MSI overlap."
+        },
+        {
+          "path": "integrations/puredarwin/m1-apcie-bridge/private_lifecycle/lifecycle.c",
+          "line": 4,
+          "through_line": 6,
+          "source_fact": "Core IOVA bounds use the same lower and upper values."
+        },
+        {
+          "path": "integrations/puredarwin/m1-apcie-bridge/private_lifecycle/lifecycle.c",
+          "line": 180,
+          "through_line": 187,
+          "source_fact": "Any effect/pending/ever_resources blocks private retirement, so successful/no-op histories cannot make an exposed reservation reclaimable."
+        }
+      ]
+    },
+    {
+      "point": "Swallowed unmap errors cannot release independently held owner references",
+      "result": "PASS_DIRECTION_ONLY",
+      "design_sections": [
+        "unmap_error_retention",
+        "callback_contract[3]"
+      ],
+      "assessment": "Source confirms the exact hazard. The design therefore requires actual boot-lifetime strong references, an independent explicit prepare pair and immutable table/IOVA/control records before publication. Timeout alone is not treated as retention. A future bridge must prove these references survive caller state clearing and service teardown; no such implementation is admitted here.",
+      "evidence": [
+        {
+          "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IOMemoryDescriptor.cpp",
+          "line": 3317,
+          "through_line": 3327,
+          "source_fact": "kIOMDDMAUnmap assigns dmaUnmap result but returns kIOReturnSuccess."
+        },
+        {
+          "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IOMemoryDescriptor.cpp",
+          "line": 4908,
+          "through_line": 4935,
+          "source_fact": "DMA reference accounting decrements before iovmUnmapMemory and allocation accounting updates afterward despite its return."
+        },
+        {
+          "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IODMACommand.cpp",
+          "line": 1087,
+          "through_line": 1117,
+          "source_fact": "complete clears local allocation validity/address/length and prepared state after the unmap call."
+        },
+        {
+          "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IODMACommand.cpp",
+          "line": 455,
+          "through_line": 471,
+          "source_fact": "clearMemoryDescriptor loops complete then resets the descriptor reference."
+        },
+        {
+          "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IOMemoryDescriptor.cpp",
+          "line": 2491,
+          "through_line": 2505,
+          "source_fact": "Descriptor free ignores dmaUnmap status and then drops its memory-entry state."
+        },
+        {
+          "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IOBufferMemoryDescriptor.cpp",
+          "line": 753,
+          "through_line": 791,
+          "source_fact": "Buffer free invokes super::free and then deallocates backing. A separate retained owner must prevent reaching this path while exposure remains possible."
+        }
+      ]
+    },
+    {
+      "point": "32-effect lifetime bound applies; continuous map/unmap is another design",
+      "result": "PASS_DIRECTION_ONLY",
+      "design_sections": [
+        "first_workload.limits",
+        "first_workload.not_continuous",
+        "present_blockers[4]"
+      ],
+      "assessment": "The design requires a complete finite worst-case budget strictly below32, not the host example count. It explicitly prohibits rolling history, reinitialization, another registry or exposed IOVA reuse. Quarantined core entries cannot start another ticket; future containment must obey that frozen rule rather than reopening the journal.",
+      "evidence": [
+        {
+          "path": "integrations/puredarwin/m1-apcie-bridge/private_lifecycle/lifecycle.h",
+          "line": 10,
+          "through_line": 10,
+          "source_fact": "BPL_EFFECTS is32."
+        },
+        {
+          "path": "integrations/puredarwin/m1-apcie-bridge/private_lifecycle/lifecycle.c",
+          "line": 142,
+          "through_line": 152,
+          "source_fact": "Quarantine or a pending ticket refuses begin; history is appended and the32-entry limit is checked before commit."
+        },
+        {
+          "path": "integrations/puredarwin/m1-apcie-bridge/private_lifecycle/lifecycle.c",
+          "line": 163,
+          "through_line": 170,
+          "source_fact": "Failed/unknown/stale results retain/quarantine rather than resetting history."
+        },
+        {
+          "path": "integrations/puredarwin/m1-apcie-bridge/private_lifecycle/lifecycle.c",
+          "line": 180,
+          "through_line": 187,
+          "source_fact": "Private retirement remains forbidden after any effect."
+        }
+      ]
+    },
+    {
+      "point": "No present MMIO/PTE/DART/firmware/publication/boot admission",
+      "result": "PASS_DIRECTION_ONLY",
+      "design_sections": [
+        "scope",
+        "callback_contract[0].present_engine",
+        "present_blockers",
+        "no_hardware_or_implementation_admission"
+      ],
+      "assessment": "The proposal describes future obligations only. Current start/publication and real-engine success remain blocked. A granule constant does not justify a service. No write order, new physical address, MSI layout or hardware action is supplied.",
+      "evidence": [
+        {
+          "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IOMapper.cpp",
+          "line": 103,
+          "through_line": 134,
+          "source_fact": "Base start calls initHardware before page-size/system-mapper/property setup; fIsSystem would alter gSystem, so avoiding that path remains important."
+        },
+        {
+          "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IOMapper.cpp",
+          "line": 181,
+          "through_line": 206,
+          "source_fact": "Device association uses iommu-parent/property matching and may wait indefinitely; numeric IOMapperID is not SID ownership."
+        },
+        {
+          "path": "integrations/puredarwin/m1-dart/dart_codec.h",
+          "line": 74,
+          "through_line": 79,
+          "source_fact": "Codec validation/translation explicitly perform no allocation, MMIO, publication, DMA or hardware barrier."
+        },
+        {
+          "path": "reports/sprint-010/apcie-port-hardware-decision-003.json",
+          "source_fact": "Pinned STOP preserves PHY_NOT_READY, no initialization/retry/P_PCIE_INIT, compiled-out shared writers, no next boot and GPU observer hold."
+        }
+      ]
+    },
+    {
+      "point": "Frozen leaves and1024-byte frame guard remain unchanged",
+      "result": "PASS_DIRECTION_ONLY",
+      "design_sections": [
+        "settled_API_basis.no_rederivation_claim",
+        "all_old_freezes_preserved",
+        "future_meaningful_tests[5]"
+      ],
+      "assessment": "All43 own files named by the five cited leaf freezes match their receipts. Design direction is not source/subclass/build admission. The existing1024-byte individual frame guard remains mandatory; no new frame measurement or compilation was performed.",
+      "evidence": [
+        {
+          "path": "integrations/puredarwin/m1-apcie-bridge/control_protection/source-validation-002.json",
+          "json_pointer": "/change/individual_frame_limit_bytes",
+          "source_fact": "Guard remains1024; original over-limit failure is retained, not regraded."
+        }
+      ]
+    }
+  ],
+  "all_cited_inputs_verified": true,
+  "cited_input_count": 16,
+  "cited_inputs": [
+    {
+      "path": "reports/sprint-010/dart-native-iomapper-contract-001.json",
+      "sha256": "066189301c8237c314efd906895410633144a9d4e4e04f19e4ae07f8658a60d7",
+      "bytes": 24780,
+      "matches_design_pin": true
+    },
+    {
+      "path": "reports/sprint-010/dart-codec-independent-review.json",
+      "sha256": "5e42cbd3c1bbe09474811c2b0b5225afc67b7b484b2c900e1bea326f934ffc9b",
+      "bytes": 10931,
+      "matches_design_pin": true
+    },
+    {
+      "path": "integrations/puredarwin/m1-dart/source-validation.json",
+      "sha256": "20d170ac2b1f7aac159c9732cedcc9f77a2475dde96c0e8b7801219b904e0d5b",
+      "bytes": 6609,
+      "matches_design_pin": true
+    },
+    {
+      "path": "integrations/puredarwin/m1-dart/dart_codec.c",
+      "sha256": "137091e5d8bdf354c2f27687701219283fc2810800a95ae7657cc3bdec7923a5",
+      "bytes": 10849,
+      "matches_design_pin": true
+    },
+    {
+      "path": "integrations/puredarwin/m1-dart/dart_codec.h",
+      "sha256": "78c4818292297852d4d4df410a7286651f6d4d2e2cfaa9c2dbc1ff6a2a1b31b0",
+      "bytes": 3902,
+      "matches_design_pin": true
+    },
+    {
+      "path": "integrations/puredarwin/m1-apcie-bridge/private_lifecycle/source-validation-001.json",
+      "sha256": "c585fd8b80479975a46ad19c83b7610a53f3a4a1a420241cbe0022a2d1fb82fb",
+      "bytes": 10272,
+      "matches_design_pin": true
+    },
+    {
+      "path": "integrations/puredarwin/m1-apcie-bridge/native_backing/source-validation-001.json",
+      "sha256": "79b153f2de3c0899a1a59f42b2b2d24dd468588723ca9f75109d53d90269656b",
+      "bytes": 13734,
+      "matches_design_pin": true
+    },
+    {
+      "path": "integrations/puredarwin/m1-apcie-bridge/control_protection/source-validation-002.json",
+      "sha256": "ef00f73d46c11167751f0f274d323fac96c994a3ff267152b800af81644415bb",
+      "bytes": 18232,
+      "matches_design_pin": true
+    },
+    {
+      "path": "reports/sprint-010/bcm4378-owned-composition-design-001.json",
+      "sha256": "afbdab89c9b2fb09ca9ff90182b00fd759414a7d4e9642e1a59f0120519e7a6c",
+      "bytes": 15233,
+      "matches_design_pin": true
+    },
+    {
+      "path": "integrations/puredarwin/m1-apcie-bridge/owned_composition/source-validation-002.json",
+      "sha256": "cba2f15e753cd80ab8e586a73802739bc8b1e075ad893f527e4664521a6726f9",
+      "bytes": 11872,
+      "matches_design_pin": true
+    },
+    {
+      "path": "reports/sprint-010/apcie-port-hardware-decision-003.json",
+      "sha256": "c9462e002fcfafa62498631e9b5662795c7043b889a19391922d56a3b47d20dd",
+      "bytes": 2118,
+      "matches_design_pin": true
+    },
+    {
+      "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/IOKit/IOMapper.h",
+      "sha256": "87e82d46c961fb3caadc076939f1eb8313e2de636682f6826f57e8db34ee95ad",
+      "bytes": 4927,
+      "matches_design_pin": true
+    },
+    {
+      "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IOMapper.cpp",
+      "sha256": "de81e9e4874a973888cedb64a3fde9abaa0b443c546d89df931e987b13179a3c",
+      "bytes": 9454,
+      "matches_design_pin": true
+    },
+    {
+      "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/IOKit/IOMemoryDescriptor.h",
+      "sha256": "f55ae31c85a90790731b943898a8ad8bf7123c96604b3b12a8f055d519f3189e",
+      "bytes": 63702,
+      "matches_design_pin": true
+    },
+    {
+      "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IOMemoryDescriptor.cpp",
+      "sha256": "a83a0a152e67068765fde6d26462924ae7a2be6b8adea91ca45d5f3c2934ec71",
+      "bytes": 179995,
+      "matches_design_pin": true
+    },
+    {
+      "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IODMACommand.cpp",
+      "sha256": "c832c0a0a84e1096464c18494b938252cba716a62dc8a8124af0b823abf67560",
+      "bytes": 49154,
+      "matches_design_pin": true
+    }
+  ],
+  "additional_primary_source": {
+    "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IOBufferMemoryDescriptor.cpp",
+    "sha256": "3167094ab5e0d9dbbc7fb4ad822f2fa4f71873870c9f601f5eb0bba0be301208",
+    "provenance": "Already locally pinned source identified by the cited prior IOMapper contract; no source fetched."
+  },
+  "frozen_leaf_checks": [
+    {
+      "receipt": "integrations/puredarwin/m1-dart/source-validation.json",
+      "receipt_sha256": "20d170ac2b1f7aac159c9732cedcc9f77a2475dde96c0e8b7801219b904e0d5b",
+      "own_files_checked": 7,
+      "all_match": true
+    },
+    {
+      "receipt": "integrations/puredarwin/m1-apcie-bridge/private_lifecycle/source-validation-001.json",
+      "receipt_sha256": "c585fd8b80479975a46ad19c83b7610a53f3a4a1a420241cbe0022a2d1fb82fb",
+      "own_files_checked": 5,
+      "all_match": true
+    },
+    {
+      "receipt": "integrations/puredarwin/m1-apcie-bridge/native_backing/source-validation-001.json",
+      "receipt_sha256": "79b153f2de3c0899a1a59f42b2b2d24dd468588723ca9f75109d53d90269656b",
+      "own_files_checked": 17,
+      "all_match": true
+    },
+    {
+      "receipt": "integrations/puredarwin/m1-apcie-bridge/control_protection/source-validation-002.json",
+      "receipt_sha256": "ef00f73d46c11167751f0f274d323fac96c994a3ff267152b800af81644415bb",
+      "own_files_checked": 11,
+      "all_match": true
+    },
+    {
+      "receipt": "integrations/puredarwin/m1-apcie-bridge/owned_composition/source-validation-002.json",
+      "receipt_sha256": "cba2f15e753cd80ab8e586a73802739bc8b1e075ad893f527e4664521a6726f9",
+      "own_files_checked": 3,
+      "all_match": true
+    }
+  ],
+  "frozen_own_files_checked": 43,
+  "remaining_gates_not_admitted": [
+    "Actual reviewed coordinator/public owned bridge and independently anchored native references/preparation, without inspecting manager internals or exporting unowned views.",
+    "Concrete non-success invalid mapToPhysicalAddress containment covering direct IODMACommand callers as well as global wrappers, before any subclass admission.",
+    "Exact allocator/reservation/output/UPL/rights/address-width implementation and a full finite effect/containment budget obeying post-quarantine begin refusal.",
+    "Exact-source real framework compilation/import/vtable/frame checks under unchanged1024-byte guard; direction approval is not that check.",
+    "Genuine DART reachability/ownership, ordered visibility, invalidate completion, fault/drain containment and separate hardware admission; existing PHY_NOT_READY STOP persists."
+  ],
+  "admission": {
+    "design_direction_only": true,
+    "source": false,
+    "mapper_or_coordinator_implementation": false,
+    "subclass": false,
+    "runtime": false,
+    "hardware": false
+  },
+  "actions": {
+    "design_or_source_edit": false,
+    "owner_design_re_review": false,
+    "mapper_coordinator_or_subclass_implementation": false,
+    "compile": false,
+    "tests_executed": false,
+    "kext_link": false,
+    "packet_build": false,
+    "boot": false,
+    "SSH": false,
+    "Signal": false,
+    "fetch": false,
+    "physical_address_invention": false,
+    "T8103_MSI_layout_invention": false,
+    "pmap_find_phys_or_kernel_pmap_call": false,
+    "frame_guard_raise": false,
+    "DART_programming": false,
+    "P_PCIE_INIT": false,
+    "shared_PHY_or_PMGR_write": false,
+    "GPU_observer_release": false
+  },
+  "only_written_file": "reports/sprint-010/dart-native-owned-adapter-design-independent-review-001.json",
+  "stop_boundary": "Review file only. No implementation, subclass, runtime, hardware or publication admitted."
+}

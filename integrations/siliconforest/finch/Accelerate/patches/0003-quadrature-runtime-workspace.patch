@@ -1,0 +1,33 @@
+Match native runtime workspace transitions and unknown-integrator status.
+--- a/userland/Accelerate/Quadrature/quadrature.c
++++ b/userland/Accelerate/Quadrature/quadrature.c
+@@ -639,10 +639,16 @@
+     bool infinite = isinf(a) || isinf(b);
+     Integrand g = {f, 0, 0};
+     int limit = options->max_intervals ? (int)options->max_intervals : 50;
+-    size_t per = options->integrator == QUADRATURE_INTEGRATE_QAGS ? QUADRATURE_INTEGRATE_QAGS_WORKSPACE_PER_INTERVAL
+-                                                                 : QUADRATURE_INTEGRATE_QAG_WORKSPACE_PER_INTERVAL;
+-    if (workspace)
+-        limit = (int)(workspace_size / per);
++    if (workspace) {
++        if (options->integrator == QUADRATURE_INTEGRATE_QAGS) {
++            /* Native runtime transitions: two slots for the first interval,
++             * then two new slots per split; each slot occupies 76 bytes. */
++            size_t slots = workspace_size / 76;
++            limit = slots >= 2 ? (int)((slots + 1) / 2) : 0;
++        } else {
++            limit = (int)(workspace_size / QUADRATURE_INTEGRATE_QAG_WORKSPACE_PER_INTERVAL);
++        }
++    }
+     switch (options->integrator) {
+     case QUADRATURE_INTEGRATE_QNG:
+         if (infinite) {
+@@ -697,7 +703,7 @@
+         return sign * result;
+     }
+     default:
+-        *ier = QUADRATURE_INVALID_ARG_ERROR;
++        *ier = QUADRATURE_ERROR;
+         return 0;
+     }
+ }

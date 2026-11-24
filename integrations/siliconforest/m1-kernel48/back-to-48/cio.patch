@@ -1,0 +1,998 @@
+--- head/src/Kernel/Extensions/SFAppleCIO/SFAppleCIO.cpp
++++ kernel48/src/Kernel/Extensions/SFAppleCIO/SFAppleCIO.cpp
+@@ -52,10 +52,6 @@
+ #ifdef SF_CIO_ENDPOINT_MAPPER
+  uint32_t mapperCount;
+  static IOReturn mapperAction(OSObject *,void *,void *,void *,void *);
+-#if SF_CIO_DOCK_USB
+- uint32_t usbMapperCount;
+- static IOReturn usbMapperAction(OSObject *,void *,void *,void *,void *);
+-#endif
+ #endif
+  static void diagnosticTick(OSObject *,IOTimerEventSource *);
+  static IOReturn snapshotAction(OSObject *,void *,void *,void *,void *);
+@@ -307,9 +303,6 @@
+  authorizationCount=retrainCount=0;setProperty("authorization-request-count",(uint32_t)0,32);
+ #ifdef SF_CIO_ENDPOINT_MAPPER
+  mapperCount=0;setProperty("i210-mapper-request-count",(uint32_t)0,32);
+-#if SF_CIO_DOCK_USB
+- usbMapperCount=0;setProperty("dock-usb-mapper-request-count",(uint32_t)0,32);
+-#endif
+ #endif
+  setProperty("retrain-request-count",(uint32_t)0,32);
+ #endif
+@@ -332,9 +325,6 @@
+  if(dict->getObject("sf-cio-authorize-ts3")==kOSBooleanTrue)return gate->runAction(authorizationAction);
+ #ifdef SF_CIO_ENDPOINT_MAPPER
+  if(dict->getObject("sf-cio-prepare-i210-mapper")==kOSBooleanTrue)return gate->runAction(mapperAction);
+-#if SF_CIO_DOCK_USB
+- if(dict->getObject("sf-cio-prepare-dock-usb")==kOSBooleanTrue)return gate->runAction(usbMapperAction);
+-#endif
+ #endif
+  if(dict->getObject("sf-cio-retrain-peerless")==kOSBooleanTrue)return gate->runAction(retrainAction);
+  return kIOReturnBadArgument;
+@@ -477,18 +467,6 @@
+  s->setProperty("i210-mapper-request-error",(uint32_t)ret,32);
+  return ret?kIOReturnIOError:kIOReturnSuccess;
+ }
+-#if SF_CIO_DOCK_USB
+-IOReturn SFAppleCIO::usbMapperAction(OSObject *owner,void *,void *,void *,void *)
+-{
+- auto s=OSDynamicCast(SFAppleCIO,owner);
+- if(!s || !__atomic_load_n(&s->accepting,__ATOMIC_ACQUIRE) || s->stopping || s->quarantined || !s->cm || !cmPowered(s))return kIOReturnNotReady;
+- if(s->usbMapperCount)return kIOReturnNotPermitted;
+- s->setProperty("dock-usb-mapper-request-count",++s->usbMapperCount,32);
+- int ret=sf_cio_cm_prepare_dock_usb(s->cm);
+- s->setProperty("dock-usb-mapper-request-error",(uint32_t)ret,32);
+- return ret?kIOReturnIOError:kIOReturnSuccess;
+-}
+-#endif
+ #endif
+ IOReturn SFAppleCIO::retrainAction(OSObject *owner,void *,void *,void *,void *)
+ {
+--- head/src/Kernel/Extensions/SFAppleCIO/SFCIOCM.cpp
++++ kernel48/src/Kernel/Extensions/SFAppleCIO/SFCIOCM.cpp
+@@ -284,13 +284,6 @@
+  if(!s || !s->pci || !s->nhi || !s->live())return ENODEV;
+  return s->pci->prepareI210Mapper();
+ }
+-#if SF_CIO_DOCK_USB
+-int sf_cio_cm_prepare_dock_usb(SFCIOCM *s)
+-{
+- if(!s || !s->pci || !s->nhi || !s->live())return ENODEV;
+- return s->pci->prepareDockUSBMapper();
+-}
+-#endif
+ #endif
+ int sf_cio_cm_snapshot(SFCIOCM *s)
+ {
+--- head/src/Kernel/Extensions/SFAppleCIO/SFCIOPCIAdmission.cpp
++++ kernel48/src/Kernel/Extensions/SFAppleCIO/SFCIOPCIAdmission.cpp
+@@ -1,123 +1,12 @@
+ // SPDX-License-Identifier: GPL-2.0
+ // Actual I210/ancestor admission, separate from the inventory-only profile.
+ #include "sf_cio_pcie_host.h"
+-#include "sf_pciec_bar.h"
+ #include <IOKit/IOMapper.h>
+ #include <IOKit/IORegistryEntry.h>
+ #include <machine/machine_routines.h>
+ #include <libkern/OSByteOrder.h>
+ #include <sys/errno.h>
+ 
+-int SFCIOPCIHost::bindI210Access(IOPCIDevice *device)
+-{
+-    if(!device || ml_at_interrupt_context() || !interruptPower(this) ||
+-       device->configRead32(0)!=0x15338086 || (device->configRead32(8)>>8)!=0x020000)return ENODEV;
+-    IORegistryEntry *p=device;unsigned depth=0;
+-    while(p && p!=this && depth++<64)p=p->getParentEntry(gIOServicePlane);
+-    if(p!=this || networkEndpoint)return EBUSY;
+-    device->retain();__atomic_store_n(&networkEndpoint,device,__ATOMIC_RELEASE);
+-    return 0;
+-}
+-
+-int SFCIOPCIHost::bindDockUSBAccess(IOPCIDevice *device)
+-{
+-    if(!device || ml_at_interrupt_context() || !interruptPower(this) ||
+-       device->configRead32(0)!=0x11001b73 || (device->configRead32(8)>>8)!=0x0c0330 ||
+-       (device->configRead16(4)&4))return ENODEV;
+-    IORegistryEntry *p=device;unsigned depth=0;
+-    while(p && p!=this && depth++<64)p=p->getParentEntry(gIOServicePlane);
+-    if(p!=this || usbEndpoint)return EBUSY;
+-    auto mapper=IOMapper::copyMapperForDevice(device);
+-    bool ready=mapper && mapper->metaCast("SFCIOPCIDartMapper") &&
+-        mapper->getProvider()==networkEndpoint &&
+-        mapper->callPlatformFunction("SFCIOPCIDMAReady",false,device,NULL,NULL,NULL)==kIOReturnSuccess;
+-    OSSafeReleaseNULL(mapper);if(!ready)return ENODEV;
+-    device->retain();__atomic_store_n(&usbEndpoint,device,__ATOMIC_RELEASE);
+-    return 0;
+-}
+-
+-IOReturn SFCIOPCIHost::admitDockUSB(IOPCIDevice *device)
+-{
+-    if(!device || device!=__atomic_load_n(&usbEndpoint,__ATOMIC_ACQUIRE) ||
+-       ml_at_interrupt_context() || !msi || !interruptPower(this) ||
+-       device->configRead32(0)!=0x11001b73 || (device->configRead32(8)>>8)!=0x0c0330 ||
+-       (device->configRead16(4)&4))return kIOReturnNotReady;
+-    auto mapper=IOMapper::copyMapperForDevice(device);
+-    bool ready=mapper && mapper->metaCast("SFCIOPCIDartMapper") &&
+-        mapper->getProvider()==networkEndpoint &&
+-        mapper->callPlatformFunction("SFCIOPCIDMAReady",false,device,NULL,NULL,NULL)==kIOReturnSuccess;
+-    OSSafeReleaseNULL(mapper);
+-    if(!ready || !msi->routeReady(device))return kIOReturnNotReady;
+-    Grant chain[8]={};UInt32 count=0;unsigned depth=0;
+-    IORegistryEntry *p=device;
+-    while(p && p!=this && depth++<64){
+-        auto pci=OSDynamicCast(IOPCIDevice,p);
+-        if(pci){
+-            if(count==8)return kIOReturnUnsupported;
+-            UInt32 id=pci->configRead32(0),code=pci->configRead32(8)>>8;
+-            if(id==UINT32_MAX || (!count ? pci!=device || code!=0x0c0330 : code!=0x060400))
+-                return kIOReturnUnsupported;
+-            chain[count++]={pci,id,code,pci->getBusNumber(),pci->getDeviceNumber(),pci->getFunctionNumber()};
+-        }
+-        p=p->getParentEntry(gIOServicePlane);
+-    }
+-    if(p!=this || count<2)return kIOReturnUnsupported;
+-    // Retained identities from I210 admission are the only existing grants.
+-    // Snapshot under the config lock, then use normal config calls outside it.
+-    Grant old[16]={};UInt32 oldCount=0;
+-    IOLockLock(accessLock);
+-    bool active=view.admitted && bmeActive && networkAttempted && !usbAttempted;
+-    if(active){oldCount=grantCount;memcpy(old,grants,oldCount*sizeof(*old));}
+-    IOLockUnlock(accessLock);if(!active || !oldCount || oldCount>8)return kIOReturnNotPermitted;
+-    auto it=IORegistryIterator::iterateOver(this,gIOServicePlane,kIORegistryIterateRecursively);
+-    if(!it)return kIOReturnNoMemory;
+-    unsigned seen=0,xhci=0,i210=0;bool valid=true;
+-    while(auto object=it->getNextObject()){
+-        if(++seen>256){valid=false;break;}
+-        auto pci=OSDynamicCast(IOPCIDevice,object);if(!pci)continue;
+-        UInt32 id=pci->configRead32(0),code=pci->configRead32(8)>>8;
+-        UInt16 command=pci->configRead16(4);bool granted=false;
+-        for(UInt32 n=0;n<oldCount;++n)if(old[n].device==pci){
+-            granted=old[n].id==id && old[n].code==code &&
+-                old[n].bus==pci->getBusNumber() && old[n].slot==pci->getDeviceNumber() &&
+-                old[n].function==pci->getFunctionNumber();
+-            if(!granted)valid=false;
+-        }
+-        if(id==UINT32_MAX || command==UINT16_MAX || bool(command&4)!=granted){valid=false;break;}
+-        if(code==0x0c0330 && (id==0x11001b73 || id==0x12421b21 || id==0x15d48086))++xhci;
+-        else if(pci==networkEndpoint && id==0x15338086 && code==0x020000)++i210;
+-        else if(code!=0x060400){valid=false;break;}
+-    }
+-    if(!it->isValid())valid=false;it->release();
+-    if(!valid || xhci!=4 || i210!=1 || !interruptPower(this) || !msi->routeReady(device))return kIOReturnNotReady;
+-    IOLockLock(accessLock);
+-    if(!view.admitted || !bmeActive || usbAttempted || grantCount!=oldCount){IOLockUnlock(accessLock);return kIOReturnNotPermitted;}
+-    usbAttempted=true;
+-    for(UInt32 n=0;n<count;++n){
+-        bool found=false;
+-        for(UInt32 i=0;i<grantCount;++i)if(grants[i].device==chain[n].device)found=true;
+-        if(!found){grants[grantCount]=chain[n];grants[grantCount++].device->retain();}
+-    }
+-    IOLockUnlock(accessLock); // <= old8 + new8; existing I210 grants unchanged.
+-    bool ok=true;
+-    for(UInt32 n=count;n>0;--n){
+-        if(!interruptPower(this)){ok=false;break;}
+-        auto pci=chain[n-1].device;pci->setBusMasterEnable(true);
+-        UInt16 command=pci->configRead16(4);
+-        if(command==UINT16_MAX || !(command&4)){ok=false;break;}
+-    }
+-    if(!ok){
+-        leaseOwner->setProperty("pcie-usb-BME-error",(UInt32)EIO,32);
+-        blockConfiguration();return kIOReturnIOError; // Pin all, no false drain.
+-    }
+-    setProperty("SFCIOI210Only",false);
+-    setProperty("SFCIOI210AndFL1100",true);
+-    device->setProperty("SFCIOUSBHostBusMasterAdmitted",true);
+-    leaseOwner->setProperty("pcie-usb-BME-error",(UInt32)0,32);
+-    leaseOwner->setProperty("pcie-usb-BME-ancestor-count",count-1,32);
+-    return kIOReturnSuccess;
+-}
+-
+ bool SFCIOPCIHost::busMasterAllowed(IOPCIAddressSpace space)
+ {
+     // accessLock is held. Never call a mapper/IRQ query here: they read config.
+@@ -203,90 +92,9 @@
+         blockConfiguration(); // Gate/pin only; never claim a DMA drain.
+         return kIOReturnIOError;
+     }
+-    setProperty("SFCIOPCIDMAAdmitted",true);
+-    setProperty("SFCIOI210Only",true);
+     device->setProperty("SFCIOI210BusMasterAdmitted",true);
+     leaseOwner->setProperty("pcie-i210-BME-error",(UInt32)0,32);
+     leaseOwner->setProperty("pcie-i210-BME-ancestor-count",count-1,32);
+     leaseOwner->setProperty("pcie-endpoint-DMA-admitted",true);
+     return kIOReturnSuccess;
+ }
+-
+-int SFCIOPCIHost::publishI210Resources(IOPCIDevice *device)
+-{return publishEndpointResources(device,false);}
+-int SFCIOPCIHost::publishDockUSBResources(IOPCIDevice *device)
+-{return publishEndpointResources(device,true);}
+-int SFCIOPCIHost::resolveDockUSBInterrupt(IOPCIDevice *device)
+-{
+- if(!device || ml_at_interrupt_context() || !msi || !interruptPower(this) ||
+-    (device->configRead16(4)&4))return ENODEV;
+- auto mapper=IOMapper::copyMapperForDevice(device);
+- bool ready=mapper && mapper->metaCast("SFCIOPCIDartMapper") &&
+-  mapper->callPlatformFunction("SFCIOPCIDMAReady",false,device,NULL,NULL,NULL)==kIOReturnSuccess;
+- OSSafeReleaseNULL(mapper);if(!ready)return ENODEV;
+- int type=0;
+- if(device->getInterruptType(0,&type)==kIOReturnSuccess)return EBUSY;
+- UInt8 capability=0;
+- if(!device->findPCICapability(kIOPCIMSICapability,&capability) || !capability)return ENODEV;
+- // Call the public allocator used by IOPCIBridge::resolveMSIInterrupts.
+- // This exact retained per-port controller independently checks the actual
+- // host, mapper and endpoint identity; no IRQ properties are invented here.
+- IOReturn result=msi->allocateDeviceInterrupts(device,0,capability);
+- if(result!=kIOReturnSuccess || device->getInterruptType(0,&type)!=kIOReturnSuccess ||
+-    !(type&kIOInterruptTypePCIMessaged))return EIO;
+- device->setProperty("SFCIOUSBMSIAllocated",true);return 0;
+-}
+-int SFCIOPCIHost::publishEndpointResources(IOPCIDevice *device,bool usb)
+-{
+- if(!device || ml_at_interrupt_context())return EINVAL;
+- static const char *i210Keys[]={"pcie-i210-resource-error","pcie-i210-resource-BARs","pcie-i210-resource-stage","pcie-i210-resource-memory-count"};
+- static const char *usbKeys[]={"SFCIOUSBResourceError","SFCIOUSBResourceBARs","SFCIOUSBResourceStage","SFCIOUSBResourceMemoryCount"};
+- const char **keys=usb?usbKeys:i210Keys;IORegistryEntry *record=usb?device:leaseOwner;
+- auto fail=[record,keys](int error){record->setProperty(keys[0],(UInt32)error,32);return error;};
+- if(!interruptPower(this))return fail(ENODEV);
+- UInt32 id=device->configRead32(0),code=device->configRead32(8)>>8;
+- if(usb ? code!=0x0c0330 || (id!=0x11001b73 && id!=0x12421b21 && id!=0x15d48086) :
+-          id!=0x15338086 || code!=0x020000)return fail(ENODEV);
+- if(device->configRead16(4)&4)return fail(EBUSY);
+- IORegistryEntry *parent=device;unsigned depth=0;
+- while(parent && parent!=this && depth++<64)parent=parent->getParentEntry(gIOServicePlane);
+- if(parent!=this)return fail(ENODEV);
+- UInt32 bars[6];for(unsigned n=0;n<6;++n)bars[n]=device->configRead32(0x10+4*n);
+- record->setProperty(keys[1],bars,sizeof(bars));
+- auto existing=device->getDeviceMemoryWithRegister(0x10);
+- if(existing){
+-  IOByteCount span=0;UInt64 physical=existing->getPhysicalSegment(0,&span,kIOMemoryMapperNone),wanted=0;
+-  UInt64 bytes=existing->getLength(),bus=0;
+-  if(sf_pciec_bar_bus(bars,0,&bus) || sf_pciec_bar_cpu(bus,bytes,&wanted) || physical!=wanted || span<bytes)return fail(EIO);
+-  record->setProperty(keys[2],"existing-BAR0-verified");return fail(0);
+- }
+- auto property=device->copyProperty("reg");
+- struct Release {OSObject *value;~Release(){if(value)value->release();}} releaseProperty={property};
+- auto reg=OSDynamicCast(OSData,property);
+- if(!reg || !reg->getLength() || reg->getLength()%20 || reg->getLength()>8*20)return fail(EPROTO);
+- auto array=OSArray::withCapacity(6);Release releaseArray={array};if(!array)return fail(ENOMEM);
+- bool bar0=false;UInt32 seen=0;
+- for(unsigned offset=0;offset<reg->getLength();offset+=20){
+-  UInt32 row[5];memcpy(row,(const UInt8 *)reg->getBytesNoCopy()+offset,20);
+-  unsigned space=(row[0]>>24)&3,registerNumber=row[0]&0xff;
+-  if(space!=2 && space!=3)continue; // Config and unsupported I/O-port space are not memory.
+-  if(registerNumber<0x10 || registerNumber>0x24 || (registerNumber&3))return fail(EPROTO);
+-  unsigned index=(registerNumber-0x10)/4;
+-  if(seen&(1u<<index))return fail(EPROTO);seen|=1u<<index;
+-  UInt64 bytes=((UInt64)row[3]<<32)|row[4],bus=0,cpu=0;
+-  if(!bytes)return fail(ENXIO);
+-  int error=sf_pciec_bar_bus(bars,index,&bus);if(error)return fail(error);
+-  error=sf_pciec_bar_cpu(bus,bytes,&cpu);if(error)return fail(error);
+-  auto memory=IOMemoryDescriptor::withAddressRange(cpu,bytes,kIODirectionNone|kIOMemoryMapperNone,NULL);
+-  if(!memory)return fail(ENOMEM);memory->setTag(row[0]);
+-  bool added=array->setObject(memory);memory->release();if(!added)return fail(ENOMEM);
+-  if(!index)bar0=true;
+- }
+- if(!bar0 || !interruptPower(this))return fail(ENODEV);
+- // All addresses come from actual live BARs and native enumeration sizes.
+- // No BAR, bridge window, BME, or PCI configuration write is performed here.
+- device->setDeviceMemory(array);
+- if(!device->getDeviceMemoryWithRegister(0x10))return fail(EIO);
+- record->setProperty(keys[2],"live-BAR-descriptors-published");
+- record->setProperty(keys[3],array->getCount(),32);return fail(0);
+-}
+--- head/src/Kernel/Extensions/SFAppleCIO/SFCIOPCIDartMapper.cpp
++++ kernel48/src/Kernel/Extensions/SFAppleCIO/SFCIOPCIDartMapper.cpp
+@@ -2,8 +2,6 @@
+ // Fixed PCIe-C domain, separate from the NHI's SID1/0x200-root DART.
+ #include "sf_cio_pci_mapper.h"
+ #include "sf_usb_iova.h"
+-#include "sf_pciec_dma_inspect.h"
+-#include "sf_cpu_par.h"
+ #include <IOKit/IORegistryEntry.h>
+ #include <machine/machine_routines.h>
+ #include <mach/vm_param.h>
+@@ -14,7 +12,6 @@
+ bool SFCIOPCIDartMapper::initWithController(SFCIOPCIController *ctl,IOPCIDevice *dev)
+ {
+  controller=NULL;endpoint=NULL;lock=NULL;busy=NULL;mappings=NULL;
+- bzero(usbEndpoints,sizeof(usbEndpoints));usbEndpointCount=0;
+  tableCount=mappingCount=0;setupAttempted=ready=touched=poisoned=revoked=false;
+  bzero(tables,sizeof(tables));pt={};io={};fIsSystem=false;
+  if(!ctl || !dev || !IOMapper::init())return false;
+@@ -62,7 +59,7 @@
+ {
+  auto s=(SFCIOPCIDartMapper *)p;
+  bool word=!(off&3) && ((off>=0x100 && off<0x200) || (off>=0x400 && off<0x800));
+- if(!value || !(word || off==0x20 || off==0x40 || off==0x50 || off==0x54 || off==0x60 || off==0xfc))return EINVAL;
++ if(!value || !(word || off==0x20 || off==0x40 || off==0x60 || off==0xfc))return EINVAL;
+  if(!s->live())return ENODEV;
+  __asm__ volatile("dsb sy; isb" ::: "memory");
+  *value=s->controller->endpointDart.r32(off);
+@@ -135,59 +132,15 @@
+  if(unpin)release();return !error;
+ }
+ uint64_t SFCIOPCIDartMapper::getPageSize() const{return pciPage;}
+-bool SFCIOPCIDartMapper::knownEndpoint(IOService *device) const
+-{
+- if(device==endpoint)return true;
+- for(unsigned n=0;n<usbEndpointCount;++n)if(device==usbEndpoints[n])return true;
+- return false;
+-}
+-IOReturn SFCIOPCIDartMapper::registerDockUSB(IOPCIDevice *device)
+-{
+- if(!device || !endpoint || ml_at_interrupt_context() || !lock ||
+-    device->getDeviceNumber() || device->getFunctionNumber() ||
+-    (device->configRead32(8)>>8)!=0x0c0330 || (device->configRead16(4)&4))return kIOReturnBadArgument;
+- UInt32 id=device->configRead32(0);
+- if(id!=0x11001b73 && id!=0x12421b21 && id!=0x15d48086)return kIOReturnUnsupported;
+- auto hostFor=[](IORegistryEntry *node)->IORegistryEntry *{
+-  unsigned depth=0;
+-  while(node && !node->metaCast("SFCIOPCIHost") && depth++<64)node=node->getParentEntry(gIOServicePlane);
+-  return node && node->metaCast("SFCIOPCIHost")?node:NULL;
+- };
+- auto host=hostFor(endpoint);
+- if(!host || hostFor(device)!=host || device->getProperty("iommu-parent"))return kIOReturnNotPermitted;
+- // Query fresh TTBR/TCR/gate ownership before adding another requester to
+- // this root. Never call reserveRequester while holding controller->lock.
+- auto query=OSSymbol::withCString("SFCIOPCIDMAReady");
+- if(!query)return kIOReturnNoMemory;
+- IOReturn owned=callPlatformFunction(query,false,endpoint,NULL,NULL,NULL);
+- query->release();if(owned!=kIOReturnSuccess)return kIOReturnNotReady;
+- IOLockLock(lock);bool prior=knownEndpoint(device),full=usbEndpointCount==4;IOLockUnlock(lock);
+- if(prior || full)return kIOReturnNoResources;
+- uint32_t sid=UINT32_MAX;
+- if(controller->reserveRequester(device->getBusNumber(),device->getDeviceNumber(),device->getFunctionNumber(),&sid) || sid)
+-  return kIOReturnIOError;
+- IOLockLock(lock);IOLockLock(controller->lock);
+- bool ok=ready && live() && usbEndpointCount<4 && !knownEndpoint(device);
+- if(ok && sf_pciec_dart_sid0_check(&io)){poison();ok=false;}
+- if(ok){device->retain();usbEndpoints[usbEndpointCount++]=device;}
+- IOLockUnlock(controller->lock);IOLockUnlock(lock);
+- // The factory must bind this actual mapper object and verify native lookup
+- // before matching a driver. Registration alone publishes no such binding.
+- return ok?kIOReturnSuccess:kIOReturnNotReady;
+-}
+ IOReturn SFCIOPCIDartMapper::callPlatformFunction(const OSSymbol *name,bool wait,
+  void *p1,void *p2,void *p3,void *p4)
+ {
+- if(name && name->isEqualTo(SF_PCIEC_DMA_INSPECT_FUNCTION)){
+-  if(!p1 || !p2 || p3 || p4 || wait)return kIOReturnBadArgument;
+-  return inspectDMA((IOService *)p1,p2);
+- }
+  if(!name || !name->isEqualTo("SFCIOPCIDMAReady"))
+   return IOMapper::callPlatformFunction(name,wait,p1,p2,p3,p4);
+- if(!p1 || p2 || p3 || p4 || ml_at_interrupt_context() || !lock || !controller)
++ if(p1!=endpoint || p2 || p3 || p4 || ml_at_interrupt_context() || !lock || !controller)
+   return kIOReturnBadArgument;
+  IOLockLock(lock);IOLockLock(controller->lock);
+- bool ok=knownEndpoint((IOService *)p1) && ready && live();
++ bool ok=ready && live();
+  if(ok){
+   uint32_t tcr=0,root=0,gate=0;
+   int error=sf_pciec_dart_sid0_check(&io);
+@@ -202,58 +155,6 @@
+  // Translation ownership/readback only. Not an endpoint DMA/drain ACK.
+  return ok?kIOReturnSuccess:kIOReturnNotReady;
+ }
+-IOReturn SFCIOPCIDartMapper::inspectDMA(IOService *device,void *output)
+-{
+- auto snapshot=(sf_pciec_dma_inspect *)output;
+- if(!device || !snapshot || ml_at_interrupt_context() || !lock || !controller ||
+-    snapshot->version!=SF_PCIEC_DMA_INSPECT_VERSION || snapshot->size!=sizeof(*snapshot))
+-  return kIOReturnBadArgument;
+- IOLockLock(lock);IOLockLock(controller->lock);
+- // Identity and current ownership first. Do not use the normal health check:
+- // it poisons on a valid fault before the fault itself could be captured.
+- bool ok=device==endpoint && ready && live() && tableCount && mappings;
+- if(ok){
+-  bzero(snapshot,sizeof(*snapshot));
+-  snapshot->version=SF_PCIEC_DMA_INSPECT_VERSION;snapshot->size=sizeof(*snapshot);
+-  snapshot->mapping_count=mappingCount;snapshot->table_count=tableCount;
+-  static const uint32_t offsets[SF_PCIEC_DMA_INSPECT_REGS]={
+-   0x20,0x40,0x50,0x54,0x60,0xfc,0x100,0x400,0x404,0x408,0x40c,0x104};
+-  for(unsigned n=0;n<SF_PCIEC_DMA_INSPECT_REGS;++n)
+-   if(read(this,offsets[n],&snapshot->regs[n])){ok=false;break;}
+-  for(unsigned n=0;ok && n<64;++n){
+-   if(SFCIOPCIController::read(controller,SF_PCIEC_PORT,0x828+4*n,&snapshot->rid2sid[n]) ||
+-      read(this,0x100+4*n,&snapshot->tcr[n]))ok=false;
+-  }
+-  if(ok){
+-   snapshot->root_physical=tables[0].physical;
+-   snapshot->root_cpu_par=sf_cpu_par(tables[0].memory->getBytesNoCopy());
+-   // First two live allocations are normally the rings; last two include
+-   // current packet bounces. Select retained objects, never an input IOVA.
+-   unsigned first[2]={pciMappings,pciMappings},last[2]={pciMappings,pciMappings};
+-   for(unsigned n=0;n<pciMappings;++n)if(mappings[n].memory){
+-    if(first[0]==pciMappings)first[0]=n;
+-    else if(first[1]==pciMappings)first[1]=n;
+-    last[0]=last[1];last[1]=n;
+-   }
+-   unsigned slots[4]={first[0],first[1],last[0],last[1]};
+-   for(unsigned n=0;n<SF_PCIEC_DMA_INSPECT_SAMPLES;++n){
+-    auto &s=snapshot->sample[n];s.slot=slots[n];
+-    if(s.slot==pciMappings)continue;
+-    auto &m=mappings[s.slot];s.iova=m.address;s.bytes=m.bytes;
+-    IOByteCount span=0;s.physical=m.memory->getPhysicalSegment(0,&span,kIOMemoryMapperNone);s.span=span;
+-    sf_dart_walk walked={};s.walk_error=sf_dart_table_walk(&pt,m.address,&walked);
+-    s.walked=walked.phys;s.l1e=walked.l1e;s.pte=walked.pte;
+-    auto bytes=(volatile uint64_t *)m.memory->getBytesNoCopy();
+-    s.cpu_par=sf_cpu_par((const void *)bytes);
+-    if(m.bytes>=sizeof(s.words))for(unsigned q=0;q<4;++q)s.words[q]=bytes[q];
+-   }
+-  }
+- }
+- IOLockUnlock(controller->lock);IOLockUnlock(lock);
+- // Read-only CPU view of retained tables/backing plus current DART words.
+- // Neither a device translation walk nor a DMA completion acknowledgement.
+- return ok?kIOReturnSuccess:kIOReturnNotReady;
+-}
+ IOReturn SFCIOPCIDartMapper::iovmMapMemory(IOMemoryDescriptor *memory,uint64_t offset,
+  uint64_t length,uint32_t options,const IODMAMapSpecification *spec,IODMACommand *command,
+  const IODMAMapPageList *,uint64_t *address,uint64_t *mappedLength)
+@@ -266,16 +167,13 @@
+  uint64_t alignment=spec && spec->alignment?spec->alignment:pciPage;
+  if(alignment&(alignment-1))return kIOReturnUnsupported;
+  if(alignment<pciPage)alignment=pciPage;
+- if(alignment>pciBytes || (spec && spec->options))return kIOReturnUnsupported;
++ if(alignment>pciBytes || (spec && (spec->options || (spec->device && spec->device!=endpoint))))return kIOReturnUnsupported;
+  unsigned bits=spec && spec->numAddressBits?spec->numAddressBits:32;
+  if(bits>64)return kIOReturnBadArgument;
+  if(bits<27)return kIOReturnNoResources;
+  IOByteCount span=0;uint64_t pa=md->getPhysicalSegment(0,&span,kIOMemoryMapperNone);
+  if(!pa || (pa&~pciMask) || span<length || length-1>((1ULL<<36)-1)-pa)return kIOReturnBadArgument;
+  IOLockLock(lock);IOLockLock(controller->lock);
+- if(spec && spec->device && !knownEndpoint(spec->device)){
+-  IOLockUnlock(controller->lock);IOLockUnlock(lock);return kIOReturnNotPermitted;
+- }
+  if(!ready || !live()){IOLockUnlock(controller->lock);IOLockUnlock(lock);return kIOReturnNotReady;}
+  if(sf_pciec_dart_sid0_check(&io)){
+   poison();IOLockUnlock(controller->lock);IOLockUnlock(lock);return kIOReturnIOError;
+@@ -347,6 +245,5 @@
+  if(touched || mappingCount){IOLog("SFCIOPCIDartMapper: retaining SID0 tables/backing until reboot\n");return;}
+  for(unsigned n=0;n<tableCount;++n)tables[n].memory->release();
+  if(busy)IOFree(busy,pciPages);if(mappings)IOFree(mappings,sizeof(Mapping)*pciMappings);
+- for(unsigned n=0;n<usbEndpointCount;++n)usbEndpoints[n]->release();
+  if(lock)IOLockFree(lock);OSSafeReleaseNULL(endpoint);OSSafeReleaseNULL(controller);IOMapper::free();
+ }
+--- head/src/Kernel/Extensions/SFAppleCIO/SFCIOPCIEnumeration.cpp
++++ kernel48/src/Kernel/Extensions/SFAppleCIO/SFCIOPCIEnumeration.cpp
+@@ -13,9 +13,6 @@
+  posted=committed=attempted=revoked=0;preparing=false;
+ #ifdef SF_CIO_ENDPOINT_MAPPER
+  i210Mapper=NULL;mapperAttempted=false;
+-#if SF_CIO_I210_NETWORK
+- usbMapperEndpoint=NULL;usbMapperAttempted=false;
+-#endif
+ #endif
+  if(!service || !ctx || !proof || !OSObject::init())return false;
+  lock=IOLockAlloc();if(!lock)return false;
+@@ -46,12 +43,6 @@
+ #endif
+  if(!drivers || !drivers->getCount() || drivers->getCount()>64)return E2BIG;
+  unsigned bridges=0,wifi=0;int ret=0;
+-#if SF_CIO_I210_NETWORK
+- unsigned ethernet=0;
+-#endif
+-#if SF_CIO_DOCK_USB
+- unsigned usb=0;
+-#endif
+  for(unsigned i=0;i<drivers->getCount();++i){
+   auto dict=OSDynamicCast(OSDictionary,drivers->getObject(i));
+   auto cls=dict?OSDynamicCast(OSString,dict->getObject("IOClass")):NULL;
+@@ -60,23 +51,9 @@
+   auto id=dict?OSDynamicCast(OSString,dict->getObject("IOPCIPrimaryMatch")):NULL;
+   if(cls && cls->isEqualTo("SFBwfm") && bundle && bundle->isEqualTo("org.siliconforest.driver.SFBwfm") && id && id->isEqualTo("0x442514e4") &&
+      !dict->getObject("IOPCIMatch") && !dict->getObject("IOPCIClassMatch")){++wifi;continue;}
+-#if SF_CIO_I210_NETWORK
+-  if(cls && cls->isEqualTo("SFFBSDem") && bundle && bundle->isEqualTo("org.siliconforest.driver.SFFBSDem") && id && id->isEqualTo("0x15338086") &&
+-     !dict->getObject("IOPCIMatch") && !dict->getObject("IOPCIClassMatch") && dict->getObject("IOPCITunnelCompatible")==kOSBooleanTrue){++ethernet;continue;}
+-#endif
+-#if SF_CIO_DOCK_USB
+-  if(cls && cls->isEqualTo("RavynXHCIPort") && bundle && bundle->isEqualTo("com.ravynos.driver.RavynXHCIPort") && id && id->isEqualTo("0x11001b73") &&
+-     !dict->getObject("IOPCIMatch") && !dict->getObject("IOPCIClassMatch") && dict->getObject("IOPCITunnelCompatible")==kOSBooleanTrue){++usb;continue;}
+-#endif
+   ret=EOPNOTSUPP;break; // No generic endpoint personality, including PCI xHCI.
+  }
+  if(!ret && (!bridges || !wifi))ret=ENODEV;
+-#if SF_CIO_I210_NETWORK
+- if(!ret && ethernet!=1)ret=ENODEV;
+-#endif
+-#if SF_CIO_DOCK_USB
+- if(!ret && usb!=1)ret=ENODEV;
+-#endif
+  owner->setProperty("pcie-catalogue-error",(uint32_t)ret,32);
+  owner->setProperty("pcie-catalogue-count",drivers->getCount(),32);
+  owner->setProperty("pcie-catalogue-generation",(uint32_t)generation,32);
+@@ -229,74 +206,8 @@
+  mapper->registerService();
+  owner->setProperty("pcie-i210-mapper-stage","actual-object-bound-no-BME");
+  owner->setProperty("pcie-i210-mapper-created",true); // Historical binding, not a live/DMA proof.
+-#if SF_CIO_I210_NETWORK
+- // Initial matching refused before the mapper existed. Retry the exact
+- // endpoint only after binding and fresh native readiness checks above.
+- int resources=host->publishI210Resources(endpoint);
+- if(resources){endpoint->release();return fail(resources);}
+- if(host->bindI210Access(endpoint)){endpoint->release();return fail(ENODEV);}
+- endpoint->registerService(kIOServiceSynchronous);
+- owner->setProperty("pcie-i210-mapper-stage","mapper-bound-network-match-requested");
+-#endif
+  endpoint->release();return 0;
+ }
+-#if SF_CIO_I210_NETWORK
+-int SFCIOPCIEnumeration::prepareDockUSBMapper()
+-{
+- // Explicit owner command gate only, after the real I210 is active.
+- // Only the dedicated dock profile retries matching after all bindings.
+- if(!i210Mapper || !host || !controller || !tunnel(this) || host->isInactive())return ENODEV;
+- auto ethernet=OSDynamicCast(IOPCIDevice,i210Mapper->getProvider());
+- if(!ethernet || ethernet->configRead32(0)!=0x15338086 ||
+-    !(ethernet->configRead16(4)&4))return ENODEV;
+- IOMapper *bound=IOMapper::copyMapperForDevice(ethernet);bool same=bound==i210Mapper;OSSafeReleaseNULL(bound);
+- if(!same)return ENODEV;
+- int ret=catalogueSafe();if(ret)return ret;
+- IOLockLock(lock);bool prior=usbMapperAttempted;usbMapperAttempted=true;IOLockUnlock(lock);
+- if(prior)return EBUSY;
+- auto it=IORegistryIterator::iterateOver(host,gIOServicePlane,kIORegistryIterateRecursively);
+- if(!it)return ENOMEM;
+- IOPCIDevice *endpoint=NULL;unsigned seen=0;bool valid=true;
+- while(auto object=it->getNextObject()){
+-  if(++seen>256){valid=false;break;}
+-  auto dev=OSDynamicCast(IOPCIDevice,object);
+-  if(!dev || dev->configRead32(0)!=0x11001b73 || (dev->configRead32(8)>>8)!=0x0c0330)continue;
+-  // Linux's attached Keychron is on the FL1100 behind switch port0. Darwin
+-  // bus numbering differs: derive the nearest actual Alpine Ridge bridge.
+-  IORegistryEntry *parent=dev->getParentEntry(gIOServicePlane);IOPCIDevice *bridge=NULL;unsigned depth=0;
+-  while(parent && parent!=host && depth++<64){
+-   bridge=OSDynamicCast(IOPCIDevice,parent);if(bridge)break;
+-   parent=parent->getParentEntry(gIOServicePlane);
+-  }
+-  if(!bridge || bridge->configRead32(0)!=0x15d38086 ||
+-     (bridge->configRead32(8)>>8)!=0x060400 || bridge->getDeviceNumber() || bridge->getFunctionNumber())continue;
+-  if(endpoint){valid=false;break;}endpoint=dev;endpoint->retain();
+- }
+- if(!it->isValid())valid=false;it->release();
+- if(!valid || !endpoint){OSSafeReleaseNULL(endpoint);return ENODEV;}
+- // Keep even partial requester/binding state with its real owner until
+- // reboot. Registration validates live root ownership and never resets it.
+- usbMapperEndpoint=endpoint;
+- IOReturn registered=i210Mapper->registerDockUSB(endpoint);
+- if(registered!=kIOReturnSuccess)return fail(EIO);
+- if(!tunnel(this) || endpoint->getProperty("iommu-parent") ||
+-    !endpoint->setProperty("iommu-parent",i210Mapper))return fail(EIO);
+- bound=IOMapper::copyMapperForDevice(endpoint);same=bound==i210Mapper;OSSafeReleaseNULL(bound);
+- auto query=OSSymbol::withCString("SFCIOPCIDMAReady");
+- bool ready=same && query && i210Mapper->callPlatformFunction(query,false,endpoint,NULL,NULL,NULL)==kIOReturnSuccess;
+- OSSafeReleaseNULL(query);if(!ready)return fail(EIO);
+- ret=host->publishDockUSBResources(endpoint);if(ret)return fail(ret);
+- ret=host->resolveDockUSBInterrupt(endpoint);if(ret)return fail(ret);
+- ret=host->bindDockUSBAccess(endpoint);if(ret)return fail(ret);
+- owner->setProperty("pcie-usb-mapper-stage","actual-shared-root-resources-MSI-no-driver-no-BME");
+- owner->setProperty("pcie-usb-mapper-created",true);
+-#if SF_CIO_DOCK_USB
+- endpoint->registerService(kIOServiceSynchronous);
+- owner->setProperty("pcie-usb-mapper-stage","mapper-bound-FL1100-match-requested");
+-#endif
+- return 0;
+-}
+-#endif
+ #endif
+ int SFCIOPCIEnumeration::deactivate()
+ {
+--- head/src/Kernel/Extensions/SFAppleCIO/SFCIOPCIHost.cpp
++++ kernel48/src/Kernel/Extensions/SFAppleCIO/SFCIOPCIHost.cpp
+@@ -16,10 +16,6 @@
+ #if SF_CIO_PCI_MSI
+     msi=NULL;interruptAdmitted=0;
+ #endif
+-#if SF_CIO_I210_NETWORK
+-    bzero(grants,sizeof(grants));grantCount=bmeActive=0;networkAttempted=false;networkEndpoint=NULL;
+-    usbAttempted=false;usbEndpoint=NULL;
+-#endif
+     view={0x10000000,0,127,false};startAttempted=false;stopped=true;
+     if(!owner || !ctx || !proof || !IOPCIBridge::init())return false;
+     accessLock=IOLockAlloc();if(!accessLock)return false;
+@@ -90,15 +86,7 @@
+     if(!accessLock)return kIOReturnNotReady;
+     // Joins actual in-flight config accesses. Later calls cannot reach either
+     // the borrowed power context or the controller mappings after revocation.
+-    IOLockLock(accessLock);view.admitted=false;
+-#if SF_CIO_I210_NETWORK
+-    bmeActive=0;
+-#endif
+-    IOLockUnlock(accessLock);
+-#if SF_CIO_I210_NETWORK
+-    setProperty("SFCIOPCIDMAAdmitted",false); // Admission revoked, not DMA drained.
+-#endif
+-    return kIOReturnSuccess;
++    IOLockLock(accessLock);view.admitted=false;IOLockUnlock(accessLock);return kIOReturnSuccess;
+ }
+ #if SF_CIO_PCI_MSI
+ bool SFCIOPCIHost::msiPhysicalAccess()
+@@ -138,21 +126,6 @@
+ IOReturn SFCIOPCIHost::callPlatformFunction(const OSSymbol *name,bool wait,
+  void *p1,void *p2,void *p3,void *p4)
+ {
+-#if SF_CIO_I210_NETWORK
+-    if(name && name->isEqualTo("SFCIOPCIEndpointAccess")){
+-        if(!p1 || (p1!=__atomic_load_n(&networkEndpoint,__ATOMIC_ACQUIRE) &&
+-           p1!=__atomic_load_n(&usbEndpoint,__ATOMIC_ACQUIRE)) || p2 || p3 || p4)return kIOReturnBadArgument;
+-        return interruptPower(this)?kIOReturnSuccess:kIOReturnNotReady;
+-    }
+-    if(name && name->isEqualTo("SFCIOPCIEnableI210DMA")){
+-        if(p2 || p3 || p4 || ml_at_interrupt_context())return kIOReturnBadArgument;
+-        return admitI210(OSDynamicCast(IOPCIDevice,(IOService *)p1));
+-    }
+-    if(name && name->isEqualTo("SFCIOPCIEnableDockUSBDMA")){
+-        if(p2 || p3 || p4 || ml_at_interrupt_context())return kIOReturnBadArgument;
+-        return admitDockUSB(OSDynamicCast(IOPCIDevice,(IOService *)p1));
+-    }
+-#endif
+     if(name==gIOPlatformGetMessagedInterruptControllerKey){
+         if(p2)*(IOPCIMessagedInterruptController **)p2=NULL;
+         if(!p2 || !msi || !msi->ready())return kIOReturnNotReady;
+@@ -206,11 +179,7 @@
+     if(!accessLock || ml_at_interrupt_context())return;
+     IOLockLock(accessLock);auto p=address(space,offset,width);UInt32 filtered;
+     unsigned reg=((unsigned)space.es.registerNumExtended<<8)|offset;
+-    bool bme=false;
+-#if SF_CIO_I210_NETWORK
+-    if(p)bme=busMasterAllowed(space);
+-#endif
+-    if(p && !sf_pciec_config_write_filter(reg,width,value,bme,&filtered)){
++    if(p && !sf_pciec_config_write_filter(reg,width,value,false,&filtered)){
+         if(width==4)OSWriteLittleInt32((volatile void *)p,0,filtered);
+         else if(width==2)OSWriteLittleInt16((volatile void *)p,0,(UInt16)filtered);
+         else *p=(UInt8)filtered;
+@@ -220,11 +189,9 @@
+ }
+ bool SFCIOPCIHost::configure(IOService *provider)
+ {
+-    // Preserve Linux apciec1 range types. With only a MEM list, native TB
+-    // prefetch maximization falls back to it and starves ordinary BARs.
+     if(!addBridgeMemoryRange(0x00100000ULL,0x3ff00000ULL,true) ||
+-       !addBridgePrefetchableMemoryRange(0x40000000ULL,0x40000000ULL) ||
+-       !addBridgePrefetchableMemoryRange(0x580000000ULL,0x80000000ULL))return false;
++       !addBridgeMemoryRange(0x40000000ULL,0x40000000ULL,true) ||
++       !addBridgeMemoryRange(0x580000000ULL,0x80000000ULL,true))return false;
+     return IOPCIBridge::configure(provider);
+ }
+ IODeviceMemory *SFCIOPCIHost::ioDeviceMemory(){return NULL;}
+--- head/src/Kernel/Extensions/SFAppleCIO/SFCIOPCIMSIController.cpp
++++ kernel48/src/Kernel/Extensions/SFAppleCIO/SFCIOPCIMSIController.cpp
+@@ -62,13 +62,8 @@
+  if(!device || ml_at_interrupt_context() || !ready())return false;
+  IORegistryEntry *p=device;unsigned depth=0;
+  while(p && p!=powerOwner && depth++<64)p=p->getParentEntry(gIOServicePlane);
+- if(p!=powerOwner)return false;
+- UInt32 id=device->configRead32(0),code=device->configRead32(8)>>8;
+- bool i210=id==0x15338086 && code==0x020000;
+- bool usb=code==0x0c0330 && (id==0x11001b73 || id==0x12421b21 || id==0x15d48086);
+- // USB gets no MSI until the explicit factory bound this actual endpoint
+- // to the live shared domain. Bridge hotplug and generic PCI stay refused.
+- if(!i210 && !(usb && mapperReady(device)))return false;
++ if(p!=powerOwner || device->configRead32(0)!=0x15338086 ||
++    (device->configRead32(8)>>8)!=0x020000)return false;
+  UInt8 cap=0;return device->findPCICapability(kIOPCIMSICapability,&cap)!=0 && cap!=0;
+ }
+ bool SFCIOPCIMSIController::mapperReady(IOPCIDevice *device)
+@@ -84,7 +79,8 @@
+ }
+ uint32_t SFCIOPCIMSIController::getDeviceMSILimit(IOPCIDevice *device,uint32_t requested)
+ {
+- // One native MSI for I210 or an explicitly bound real dock xHCI endpoint.
++ // First functional scope is I210, one real MSI. USB controllers and bridge
++ // hotplug interrupts are deliberately not admitted by this variant yet.
+  return requested && deviceAllowed(device)?1:0;
+ }
+ IOReturn SFCIOPCIMSIController::messageForDevice(IOService *entry,UInt32 vector,UInt32 *message)
+--- head/src/Kernel/Extensions/SFAppleCIO/sf_cio_cm.h
++++ kernel48/src/Kernel/Extensions/SFAppleCIO/sf_cio_cm.h
+@@ -14,9 +14,6 @@
+ int sf_cio_cm_authorize_ts3(SFCIOCM *); // explicit private enum profile only
+ #ifdef SF_CIO_ENDPOINT_MAPPER
+ int sf_cio_cm_prepare_i210_dma(SFCIOCM *); // Actual mapper; BME remains stripped.
+-#if SF_CIO_DOCK_USB
+-int sf_cio_cm_prepare_dock_usb(SFCIOCM *); // Explicit FL1100 binding/matching.
+-#endif
+ #endif
+ int sf_cio_cm_can_retrain(SFCIOCM *); // Actual two unplugged lanes, pristine PCI owner.
+ #endif
+--- head/src/Kernel/Extensions/SFAppleCIO/sf_cio_dart.cpp
++++ kernel48/src/Kernel/Extensions/SFAppleCIO/sf_cio_dart.cpp
+@@ -94,7 +94,7 @@
+             IODelay(1);
+         }
+         if (poll == 10000) {
+-            __atomic_store_n(&poisoned,true,__ATOMIC_RELEASE);
++            poisoned = true;
+             LOG("bank %u streams %04x invalidate timed out; mappings quarantined", i, streams);
+             return ETIMEDOUT;
+         }
+@@ -152,7 +152,7 @@
+         [](void *ctx,uint32_t streams)->int {return ((SFCIODart *)ctx)->invalidate(streams);}
+     };
+     ret = sf_cio_dart_reset(&io);
+-    if (ret) __atomic_store_n(&poisoned,true,__ATOMIC_RELEASE); // retain bank/table ownership on uncertain reset
++    if (ret) poisoned = true; // retain bank/table ownership on uncertain reset
+     if (!ret) {
+         for (unsigned i = 0; i < 1; ++i) {
+             regs[i].w32(TTBR(1, 0), TTBR_VALID | (uint32_t)(tables[0].pa >> 12));
+@@ -160,7 +160,7 @@
+         }
+         ret = invalidate();
+     }
+-    __atomic_store_n(&ready,!ret,__ATOMIC_RELEASE);
++    ready = !ret;
+     snapshot("after-prepare");
+     LOG("ACIO1 SID1 prepare=%d root=0x%llx (no NHI DMA tested)", ret, tables[0].pa);
+     IOLockUnlock(lock);
+@@ -201,7 +201,7 @@
+     if (!ready || poisoned) { IOLockUnlock(lock); return EIO; }
+     int ret = 0;
+     if (sf_dart_table_unmap(&pt, dva, bytes) != bytes) {
+-        __atomic_store_n(&poisoned,true,__ATOMIC_RELEASE);
++        poisoned = true;
+         ret = EIO;
+     } else {
+         ret = invalidate();
+@@ -277,11 +277,11 @@
+ 
+ bool SFCIODart::healthy()
+ {
+-    // Also reached by the real PCI MSI primary handler through CM power.
+-    // Every publication is atomic; never take a sleeping mutex here. This
+-    // remains a cached ownership predicate, not a new hardware fault read.
+-    return __atomic_load_n(&ready,__ATOMIC_ACQUIRE) &&
+-           !__atomic_load_n(&poisoned,__ATOMIC_ACQUIRE);
++    if (!lock) return false;
++    IOLockLock(lock);
++    bool ok=ready && !poisoned;
++    IOLockUnlock(lock);
++    return ok;
+ }
+ 
+ int SFCIODart::suspend()
+@@ -295,8 +295,8 @@
+     }
+     // Caller has already drained NHI. Retire translations before power-off;
+     // retain all tables/backing if the invalidation cannot be established.
+-    __atomic_store_n(&ready,false,__ATOMIC_RELEASE);
+     regs[0].w32(TCR(1),0);
+     int ret=invalidate();
++    if (!ret) ready=false;
+     IOLockUnlock(lock);return ret;
+ }
+--- head/src/Kernel/Extensions/SFAppleCIO/sf_cio_dart.h
++++ kernel48/src/Kernel/Extensions/SFAppleCIO/sf_cio_dart.h
+@@ -36,7 +36,7 @@
+     int map(uint64_t pa, size_t bytes, uint64_t *dva, size_t alignment = SF_DART_PAGE);
+     int unmap(uint64_t dva, size_t bytes);
+     uint32_t faults();
+-    bool healthy(); // IRQ-safe atomic ownership/poison snapshot; no mutex/MMIO
++    bool healthy(); // after producer drain: reject a poisoned prior domain
+ };
+ 
+ /* Page-owned bounce/ring memory: physical pages are distinct from the DMA
+--- head/src/Kernel/Extensions/SFAppleCIO/sf_cio_pci_enumeration.h
++++ kernel48/src/Kernel/Extensions/SFAppleCIO/sf_cio_pci_enumeration.h
+@@ -28,10 +28,6 @@
+ #ifdef SF_CIO_ENDPOINT_MAPPER
+  SFCIOPCIDartMapper *i210Mapper;
+  bool mapperAttempted;
+-#if SF_CIO_I210_NETWORK
+- IOPCIDevice *usbMapperEndpoint;
+- bool usbMapperAttempted;
+-#endif
+ #endif
+  static bool power(void *);
+  static bool tunnel(void *);
+@@ -45,10 +41,7 @@
+  int deactivate();
+  int publishAfterApproval();
+ #ifdef SF_CIO_ENDPOINT_MAPPER
+- int prepareI210Mapper(); // IOMapper; explicit NETWORK variant then retries I210 matching.
+-#if SF_CIO_I210_NETWORK
+- int prepareDockUSBMapper(); // Source-only first-FL1100 factory; no driver/BME grant.
+-#endif
++ int prepareI210Mapper(); // Actual IOMapper only; no BME or endpoint admission.
+ #endif
+  bool blocksStop() const;
+  bool pristineForRetrain(); // No reserved controller or attempted host.
+--- head/src/Kernel/Extensions/SFAppleCIO/sf_cio_pci_mapper.h
++++ kernel48/src/Kernel/Extensions/SFAppleCIO/sf_cio_pci_mapper.h
+@@ -1,7 +1,6 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+-/* Native, explicitly created I210-owned SID0 mapper. Explicitly registered
+- * dock USB requesters may reuse its root. No USB factory/personality or BME
+- * admission exists yet. Fixed DART layout from pinned apple-dart.c; table implementation
++/* Native, explicitly created I210-only SID0 mapper. No personality or BME
++ * admission. Fixed DART layout from pinned apple-dart.c; table implementation
+  * by Asahi Linux Contributors (GPL-2.0-only OR MIT). Not in the boot profile.
+  * All mappings are distinct, whole-page IOBufferMemoryDescriptor bounces.
+  * Stop/revoke quarantines until reboot; endpoint/IRQ/work drain is not yet
+@@ -19,8 +18,6 @@
+  OSDeclareDefaultStructors(SFCIOPCIDartMapper)
+  SFCIOPCIController *controller;
+  IOPCIDevice *endpoint;
+- IOPCIDevice *usbEndpoints[4];
+- unsigned usbEndpointCount;
+  IOLock *lock;
+  struct Table { IOBufferMemoryDescriptor *memory;uint64_t physical; } tables[16];
+  // The live command owns its descriptor. We retain the page backing
+@@ -32,9 +29,7 @@
+  sf_pciec_dart_sid0_io io;
+  bool setupAttempted,ready,touched,poisoned,revoked;
+  bool inventoryBlocked();
+- bool knownEndpoint(IOService *) const; // Mapper lock held; pointer identity only.
+  bool live(); // Called with mapper and controller locks held.
+- IOReturn inspectDMA(IOService *,void *);
+  void poison();
+  static uint64_t *table(void *,uint64_t);
+  static uint64_t allocateTable(void *);
+@@ -47,9 +42,6 @@
+  // Factory caller attaches/starts this service, then may put this actual
+  // object in the endpoint's iommu-parent. No caller in the CM uses it yet.
+  bool initWithController(SFCIOPCIController *,IOPCIDevice *);
+- // Explicit source-only registration; no caller/USB personality/BME grant
+- // exists yet. Reuses the live SID0 domain, never resets its root or IOVAs.
+- IOReturn registerDockUSB(IOPCIDevice *);
+  uint64_t getPageSize() const override;
+  IOReturn iovmMapMemory(IOMemoryDescriptor *,uint64_t,uint64_t,uint32_t,
+   const IODMAMapSpecification *,IODMACommand *,const IODMAMapPageList *,
+--- head/src/Kernel/Extensions/SFAppleCIO/sf_cio_pcie_host.h
++++ kernel48/src/Kernel/Extensions/SFAppleCIO/sf_cio_pcie_host.h
+@@ -41,18 +41,6 @@
+     static int msiWrite(void *,uint32_t,uint32_t);
+     bool msiPhysicalAccess();
+ #endif
+-#if SF_CIO_I210_NETWORK
+-    struct Grant { IOPCIDevice *device; UInt32 id,code; UInt8 bus,slot,function; } grants[16];
+-    UInt32 grantCount,bmeActive;
+-    IOPCIDevice *networkEndpoint;
+-    bool networkAttempted;
+-    IOPCIDevice *usbEndpoint;
+-    bool usbAttempted;
+-    IOReturn admitI210(IOPCIDevice *);
+-    IOReturn admitDockUSB(IOPCIDevice *);
+-    bool busMasterAllowed(IOPCIAddressSpace);
+-    int publishEndpointResources(IOPCIDevice *,bool usb);
+-#endif
+     bool physicalPower(); // Always-on PMGR proof before any PCIe-C access.
+     volatile uint8_t *address(IOPCIAddressSpace,UInt8,unsigned);
+     UInt32 readConfig(IOPCIAddressSpace,UInt8,unsigned);
+@@ -65,13 +53,6 @@
+ #if SF_CIO_PCI_MSI
+     IOReturn callPlatformFunction(const OSSymbol *,bool,void *,void *,void *,void *) override;
+ #endif
+-#if SF_CIO_I210_NETWORK
+-    int bindI210Access(IOPCIDevice *);
+-    int bindDockUSBAccess(IOPCIDevice *);
+-    int publishI210Resources(IOPCIDevice *);
+-    int publishDockUSBResources(IOPCIDevice *);
+-    int resolveDockUSBInterrupt(IOPCIDevice *);
+-#endif
+     IOReturn blockConfiguration();
+     bool configure(IOService *) override;
+     IODeviceMemory *ioDeviceMemory() override;
+--- head/src/Kernel/Extensions/SFAppleCIO/sf_tb_nhi.h
++++ kernel48/src/Kernel/Extensions/SFAppleCIO/sf_tb_nhi.h
+@@ -24,15 +24,6 @@
+  int (*pci_prepare)(void *);
+  int (*pci_activated)(void *);
+  int (*pci_deactivate)(void *);
+- /* Optional all-or-none T8103 APPLE_DPIN_CHANGED handoff, not the M2
+-  * pre/post flow. Called with the real CM domain lock held. changed must
+-  * publish/revoke the actual generation and retire powered DP-IN access
+-  * synchronously on false, then queue provider/DCP work OUTSIDE that lock.
+-  * No DCP provider may be called synchronously from these callbacks.
+-  * waiting reports actual pipeline-capacity state, never a success stub.
+-  * Owner/context/resources remain retained through teardown and failures. */
+- int (*dp_changed)(void *,unsigned dpin,uint32_t port,uint64_t generation,bool active);
+- bool (*dp_waiting)(void *,unsigned dpin);
+ };
+ #ifdef __cplusplus
+ extern "C" {
+--- head/src/Kernel/Extensions/SFThunderboltCM/sf_tb_nhi.c
++++ kernel48/src/Kernel/Extensions/SFThunderboltCM/sf_tb_nhi.c
+@@ -118,40 +118,6 @@
+ }
+ static int no_dp(struct tb_nhi *nhi,struct tb_port *in,struct tb_port *out)
+ {(void)nhi;(void)in;(void)out;return -EOPNOTSUPP;}
+-/* T8103 mapping and notification flow from pinned apple.c:
+- * apple_dpin_index_for_port/apple_nhi_dp_tunnel_changed. Root DP-IN order
+- * is the physical crossbar index; a guessed port number is not that index. */
+-static int dp_index(struct sf_tb_nhi *s,struct tb_port *in)
+-{
+- if(!s->domain || !s->domain->root_switch || !in ||
+-    in->sw!=s->domain->root_switch || !tb_port_is_dpin(in))return -ENODEV;
+- struct tb_port *port;unsigned index=0;
+- tb_switch_for_each_port(s->domain->root_switch,port){
+-  if(!tb_port_is_dpin(port))continue;
+-  if(port==in)return index<2?(int)index:-ERANGE;
+-  ++index;
+- }
+- return -ENODEV;
+-}
+-static void dp_changed(struct tb_nhi *nhi,u8 in_port,u64 generation,bool yes)
+-{
+- struct sf_tb_nhi *s=owner(nhi);struct tb_port *port,*in=NULL;
+- if(s->domain && s->domain->root_switch)
+-  tb_switch_for_each_port(s->domain->root_switch,port)
+-   if(port->port==in_port){in=port;break;}
+- int index=dp_index(s,in);
+- if(index<0 || !s->config.dp_changed || (yes && !present(nhi))){fail(s);return;}
+- // Preserve the CM's full token. An old notification is an expected
+- // refusal; other owner failures quarantine rather than assert a drain.
+- int ret=s->config.dp_changed(s->config.ctx,index,in_port,generation,yes);
+- if(ret && ret!=-ESTALE)fail(s);
+-}
+-static bool dp_waiting(struct tb_nhi *nhi,struct tb_port *in)
+-{
+- struct sf_tb_nhi *s=owner(nhi);int index=dp_index(s,in);
+- return index>=0 && present(nhi) && s->config.dp_waiting &&
+-        s->config.dp_waiting(s->config.ctx,index);
+-}
+ static const struct tb_nhi_ops operations={
+  .request_ring_irq=request_ring_irq,.release_ring_irq=release_irq,
+  .ring_interrupt_active=active,.ring_interrupt_mask=mask,.ring_configure=configure,
+@@ -159,18 +125,11 @@
+  .pci_tunnel_post_activate=pci_activated,.pci_tunnel_deactivate=pci_deactivate,
+  .dp_tunnel_pre_activate=no_dp,
+ };
+-static const struct tb_nhi_ops display_operations={
+- .request_ring_irq=request_ring_irq,.release_ring_irq=release_irq,
+- .ring_interrupt_active=active,.ring_interrupt_mask=mask,.ring_configure=configure,
+- .is_present=present,.pci_tunnel_pre_activate=pci_prepare,
+- .pci_tunnel_post_activate=pci_activated,.pci_tunnel_deactivate=pci_deactivate,
+- .dp_tunnel_changed=dp_changed,.dp_tunnel_awaits_display=dp_waiting,
+-};
+ static const struct tb_nhi_ring_layout layout={TX_BASE,RX_BASE,STRIDE,TX_BASE+0x10,RX_BASE+0x10,STRIDE};
+ int sf_tb_nhi_check_stopped(void *opaque)
+ {
+  struct tb_ring *r=opaque;
+- if(!r || (r->nhi->ops!=&operations && r->nhi->ops!=&display_operations))return -EOPNOTSUPP;
++ if(!r || r->nhi->ops!=&operations)return -EOPNOTSUPP;
+  struct sf_tb_nhi *s=owner(r->nhi);
+  if(!s->config.powered(s->config.ctx) ||
+     (readl(s->config.nhi_base+(r->is_tx?TX_BASE:RX_BASE)+r->hop*STRIDE+0x10)&RING_FLAG_ENABLE) ||
+@@ -186,8 +145,6 @@
+  if(!sf_tb_native_ready() || !c->powered(c->ctx))return -ENODEV;
+  unsigned pci_callbacks=!!c->pci_prepare+!!c->pci_activated+!!c->pci_deactivate;
+  if(pci_callbacks && pci_callbacks!=3)return -EINVAL;
+- unsigned dp_callbacks=!!c->dp_changed+!!c->dp_waiting;
+- if(dp_callbacks && dp_callbacks!=2)return -EINVAL;
+  if((readl(c->nhi_base)&0x3ff)!=12 || readl(c->nhi_base+IRQ_ENABLE))return -EBUSY;
+  for(unsigned i=0;i<12;++i){
+   if(c->rx_irq[i]<=0 || c->tx_irq[i]<=0)return -EINVAL;
+@@ -199,9 +156,8 @@
+  int ret=sf_tb_dma_drain_status();if(ret)return ret;
+  struct sf_tb_nhi *s=kzalloc(sizeof(*s),GFP_KERNEL);if(!s)return -ENOMEM;
+  s->config=*c;s->nhi.dev=c->device;s->nhi.iobase=c->nhi_base;s->nhi.hop_count=12;
+- s->nhi.ops=dp_callbacks?&display_operations:&operations;s->nhi.ring_layout=&layout;s->nhi.tx_rings=s->tx;s->nhi.rx_rings=s->rx;
++ s->nhi.ops=&operations;s->nhi.ring_layout=&layout;s->nhi.tx_rings=s->tx;s->nhi.rx_rings=s->rx;
+  s->nhi.quirks=QUIRK_NO_DMA_PORT|QUIRK_NO_USB3_BW_ALLOC;
+- if(dp_callbacks){s->nhi.host_dp_policy=TB_HOST_DP_NOTIFY;s->nhi.quirks|=QUIRK_HOST_DP_NFC_CREDITS;}
+  spin_lock_init(&s->nhi.lock);init_completion(&s->nhi.domain_released);
+  *out=s;return 0;
+ }
+--- head/src/Kernel/Extensions/SFThunderboltCM/sf_tb_nhi.h
++++ kernel48/src/Kernel/Extensions/SFThunderboltCM/sf_tb_nhi.h
+@@ -24,15 +24,6 @@
+  int (*pci_prepare)(void *);
+  int (*pci_activated)(void *);
+  int (*pci_deactivate)(void *);
+- /* Optional all-or-none T8103 APPLE_DPIN_CHANGED handoff, not the M2
+-  * pre/post flow. Called with the real CM domain lock held. changed must
+-  * publish/revoke the actual generation and retire powered DP-IN access
+-  * synchronously on false, then queue provider/DCP work OUTSIDE that lock.
+-  * No DCP provider may be called synchronously from these callbacks.
+-  * waiting reports actual pipeline-capacity state, never a success stub.
+-  * Owner/context/resources remain retained through teardown and failures. */
+- int (*dp_changed)(void *,unsigned dpin,uint32_t port,uint64_t generation,bool active);
+- bool (*dp_waiting)(void *,unsigned dpin);
+ };
+ #ifdef __cplusplus
+ extern "C" {

@@ -1,0 +1,59 @@
+--- a/rpc_wayland.c
++++ b/rpc_wayland.c
+@@ -938,14 +938,20 @@
+      * compositor has passed the unmap are dropped unanswered. */
+     pthread_mutex_lock(&ws.queueLock);
+     stale = window->staleConfigures > 0;
++    // Serialize the serial check AND its marshalled ACK against unmap marking.
++    // Otherwise a null commit can invalidate the serial after the check.
++    if (!stale)
++        xdg_surface_ack_configure(surface, serial);
+     pthread_mutex_unlock(&ws.queueLock);
++    if (getenv("SFFX_WS_CONFIGURE_TRACE") != NULL)
++        fprintf(stderr, "FXWSCONFIG window=%d object=%u serial=%u dropped=%d\n",
++                window->windowID, wl_proxy_get_id((struct wl_proxy *)surface), serial, stale);
+     if (stale) {
+         if (getenv("SF_WS_TRACE") != NULL)
+             fprintf(stderr, "WindowServer: toplevel %d configure %u predates an unmap, dropped\n", window->windowID, serial);
+         return;
+     }
+ 
+-    xdg_surface_ack_configure(surface, serial);
+     // a rebuilt role starts unmapped: put the last finished frame back, or wait for the first flush
+     if (window->state != MINIMIZED && window->state != HIDDEN)
+         windowShowFront(window);
+@@ -3257,19 +3263,25 @@
+  * xdg toplevel is then as new - it needs the empty commit and a configure
+  * again before the next buffer (windowRemap). */
+ static void windowUnmap(struct wsWindow *window) {
++    int mappedToplevel;
+     if (getenv("SF_WS_TRACE") != NULL)
+         fprintf(stderr, "WindowServer: surface %d unmapped\n", window->windowID);
++    // A configure callback may already be queued. Mark BEFORE the null commit,
++    // sharing the lock held through ACK marshalling in xdgSurfaceConfigure.
++    pthread_mutex_lock(&ws.queueLock);
++    mappedToplevel = window->toplevel != NULL && window->attached;
++    if (mappedToplevel) {
++        window->staleConfigures++;
++        window->configured = 0;
++    }
++    pthread_mutex_unlock(&ws.queueLock);
++    if (getenv("SFFX_WS_CONFIGURE_TRACE") != NULL)
++        fprintf(stderr, "FXWSCONFIG unmap=%d mapped_toplevel=%d\n", window->windowID, mappedToplevel);
+     wl_surface_attach(window->surface, NULL, 0, 0);
+     wl_surface_commit(window->surface);
+-    // one that never had a buffer was not mapped, and stays configured
+-    if (window->toplevel != NULL && window->attached) {
+-        struct wl_callback *passed;
+-
+-        pthread_mutex_lock(&ws.queueLock);
+-        window->staleConfigures++;
+-        window->configured = 0;
+-        pthread_mutex_unlock(&ws.queueLock);
+-        passed = wl_display_sync(ws.display);
++    // One that never had a buffer was not mapped and stays configured.
++    if (mappedToplevel) {
++        struct wl_callback *passed = wl_display_sync(ws.display);
+         wl_callback_add_listener(passed, &unmapListener, (void *)(intptr_t)window->windowID);
+     }
+     window->attached = 0;

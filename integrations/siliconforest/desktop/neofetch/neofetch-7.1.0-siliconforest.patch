@@ -1,0 +1,131 @@
+--- nf.orig	2026-11-16 22:51:47.398640760 -0800
++++ neofetch	2026-11-16 22:52:44.196338268 -0800
+@@ -1,4 +1,4 @@
+-#!/usr/bin/env bash
++#!/opt/homebrew/bin/bash
+ # vim: noai:ts=4:sw=4:expandtab
+ # shellcheck source=/dev/null
+ # shellcheck disable=2009
+@@ -922,7 +922,9 @@
+     # $kernel_name is set in a function called cache_uname and is
+     # just the output of "uname -s".
+     case $kernel_name in
+-        Darwin)   os=$darwin_name ;;
++        Darwin)   os=$darwin_name
++                  # SiliconForest (a fork of PureDarwin): take the macOS code paths.
++                  [[ $os == SiliconForest ]] && { os=macOS; siliconforest=1; } ;;
+         SunOS)    os=Solaris ;;
+         Haiku)    os=Haiku ;;
+         MINIX)    os=MINIX ;;
+@@ -1134,6 +1136,7 @@
+             esac
+ 
+             distro="$codename $osx_version $osx_build"
++            [[ $siliconforest ]] && distro="SiliconForest $osx_version $osx_build"
+ 
+             case $distro_shorthand in
+                 on) distro=${distro/ ${osx_build}} ;;
+@@ -1208,6 +1211,16 @@
+ }
+ 
+ get_model() {
++    [[ $siliconforest ]] && {
++        case $(sysctl -n hw.targettype 2>/dev/null) in
++            J293) model="MacBook Pro (13-inch, M1, 2020)" ;;
++            J274) model="Mac mini (M1, 2020)" ;;
++            J313) model="MacBook Air (M1, 2020)" ;;
++            "")   model=$(sysctl -n hw.model) ;;
++            *)    model="Apple $(sysctl -n hw.targettype)" ;;
++        esac
++        return
++    }
+     case $os in
+         Linux)
+             if [[ -d /system/app/ && -d /system/priv-app ]]; then
+@@ -1679,6 +1692,7 @@
+ }
+ 
+ get_de() {
++    [[ $siliconforest ]] && { de=Chonkstep; de_run=1; return; }
+     # If function was run, stop here.
+     ((de_run == 1)) && return
+ 
+@@ -1785,6 +1799,7 @@
+ }
+ 
+ get_wm() {
++    [[ $siliconforest ]] && { wm="Chonkstep (Wayland)"; wm_run=1; return; }
+     # If function was run, stop here.
+     ((wm_run == 1)) && return
+ 
+@@ -1902,6 +1917,11 @@
+ }
+ 
+ get_wm_theme() {
++    [[ $siliconforest ]] && {
++        [[ -r /private/var/db/desktop-state/chonkstep/theme ]] &&
++            read -r wm_theme < /private/var/db/desktop-state/chonkstep/theme
++        return
++    }
+     ((wm_run != 1)) && get_wm
+     ((de_run != 1)) && get_de
+ 
+@@ -2378,6 +2398,12 @@
+ }
+ 
+ get_gpu() {
++    [[ $siliconforest ]] && {
++        gpu="$(sysctl -n machdep.cpu.brand_string 2>/dev/null) GPU"
++        [[ $gpu_brand == off ]] && gpu=${gpu/Apple }
++        prin "${subtitle:+${subtitle}}" "$gpu"
++        return
++    }
+     case $os in
+         "Linux")
+             # Read GPUs into array.
+@@ -2872,6 +2898,13 @@
+ }
+ 
+ get_resolution() {
++    [[ $siliconforest ]] && {
++        # The built-in panel of the 13-inch M1 MacBook Pro; the desk's scale is in its state file.
++        [[ $(sysctl -n hw.targettype 2>/dev/null) == J293 ]] && resolution="2560x1600"
++        [[ $resolution && -r /private/var/db/desktop-state/chonkstep/scale ]] &&
++            resolution+=" (scale $(tr -d '\n' < /private/var/db/desktop-state/chonkstep/scale) %)"
++        return
++    }
+     case $os in
+         "Mac OS X"|"macOS")
+             if type -p screenresolution >/dev/null; then
+@@ -7803,6 +7836,31 @@
+ EOF
+         ;;
+ 
++        "SiliconForest"*)
++            set_colors 2 10 7 2 10 7
++            read -rd '' ascii_data <<'EOF'
++${c1}                    /\\
++                   /||\\
++                  / || \\
++                 /  ||  \\
++              ${c2}(o)${c1}   ||   ${c2}(o)${c1}
++                   /||\\
++                 /  ||  \\
++               /    ||    \\
++             /      ||      \\
++          ${c2}(o)${c1}       ||       ${c2}(o)${c1}
++                   /||\\
++                /   ||   \\
++             /      ||      \\
++          /         ||         \\
++       /            ||            \\
++    ${c2}(o)${c1}             ||             ${c2}(o)${c1}
++                    ||
++            ========++========
++              ${c2}[#]   [#]   [#]${c1}
++EOF
++        ;;
++
+         "mac"* | "Darwin")
+             set_colors 2 3 1 1 5 4
+             read -rd '' ascii_data <<'EOF'

@@ -1,0 +1,341 @@
+--- a/src/Frameworks/AppKit/nib.subproj/NSNibArchiveUnarchiver.m
++++ b/src/Frameworks/AppKit/nib.subproj/NSNibArchiveUnarchiver.m
+@@ -6,7 +6,10 @@
+ #include <string.h>
+ 
+ // the file: "NIBArchive", two format words, then count and offset of the objects, keys, values and class names
+-enum { NIB_INT8, NIB_INT16, NIB_INT32, NIB_INT64, NIB_TRUE, NIB_FALSE, NIB_FLOAT, NIB_DOUBLE, NIB_DATA, NIB_NIL, NIB_OBJECT };
++// value types: 4 is false and 5 true (a separator menu item carries NSIsSeparator as type 5; read
++// the other way round every BOOL of a NIBArchive nib was inverted: Activity Monitor's views with
++// constraints came out as translating their autoresizing masks, docs/roadmap/issues/SF-AA-activity-monitor.md)
++enum { NIB_INT8, NIB_INT16, NIB_INT32, NIB_INT64, NIB_FALSE, NIB_TRUE, NIB_FLOAT, NIB_DOUBLE, NIB_DATA, NIB_NIL, NIB_OBJECT };
+ 
+ typedef struct {
+     uint32_t key;
+@@ -222,7 +225,7 @@
+         return 0;
+     if (v->type == NIB_FLOAT || v->type == NIB_DOUBLE)
+         return (int64_t)v->d;
+-    return v->type <= NIB_FALSE ? v->i : 0;
++    return v->type <= NIB_TRUE ? v->i : 0;
+ }
+ 
+ static double doubleOf(NibValue *v) {
+@@ -230,7 +233,7 @@
+         return 0;
+     if (v->type == NIB_FLOAT || v->type == NIB_DOUBLE)
+         return v->d;
+-    return v->type <= NIB_FALSE ? (double)v->i : 0;
++    return v->type <= NIB_TRUE ? (double)v->i : 0;
+ }
+ 
+ - (BOOL)decodeBoolForKey:(NSString *)key {
+--- a/src/Frameworks/AppKit/nib.subproj/NSCustomView.m
++++ b/src/Frameworks/AppKit/nib.subproj/NSCustomView.m
+@@ -8,6 +8,8 @@
+ #import "NSCustomView.h"
+ #import <Foundation/NSString.h>
+ #import <Foundation/NSKeyedArchiver.h>
++#import <AppKit/NSLayoutConstraint.h>
++#include <objc/runtime.h>
+ 
+ @implementation NSCustomView
+ 
+@@ -54,6 +56,25 @@
+ 
+          [newView setWantsLayer:[coder decodeBoolForKey:@"NSViewIsLayerTreeHost"]];
+          [newView setLayerContentsRedrawPolicy:[coder decodeIntegerForKey:@"NSViewLayerContentsRedrawPolicy"]];
++         // auto layout, as NSView's own -initWithCoder: reads it: the constraints IB archived on the
++         // view and whether its frame comes from them (Activity Monitor's summary box, a custom view,
++         // lost its 33 constraints and its figures kept the widths of the nib)
++         // (the constraints were decoded while this placeholder was the object being decoded: those
++         // that name it are given the view that replaces it, without retaining, as a constraint holds them)
++         NSArray *constraints=[coder decodeObjectForKey:@"NSViewConstraints"];
++         Ivar first=class_getInstanceVariable([NSLayoutConstraint class],"_firstItem");
++         Ivar second=class_getInstanceVariable([NSLayoutConstraint class],"_secondItem");
++         for(NSLayoutConstraint *c in constraints){
++          if(first!=NULL && object_getIvar(c,first)==self)
++           object_setIvar(c,first,newView);
++          if(second!=NULL && object_getIvar(c,second)==self)
++           object_setIvar(c,second,newView);
++         }
++         [newView addConstraints:constraints];
++         if([coder containsValueForKey:@"NSDoNotTranslateAutoresizingMask"])
++          [newView setTranslatesAutoresizingMaskIntoConstraints:![coder decodeBoolForKey:@"NSDoNotTranslateAutoresizingMask"]];
++         if([coder containsValueForKey:@"NSReuseIdentifierKey"] && [newView respondsToSelector:@selector(setIdentifier:)])
++          [(id)newView setIdentifier:[coder decodeObjectForKey:@"NSReuseIdentifierKey"]];
+          [self release];
+          return newView;
+       }
+--- a/src/Frameworks/AppKit/NSCell.m
++++ b/src/Frameworks/AppKit/NSCell.m
+@@ -124,7 +124,9 @@
+        _sendsActionOnEndEditing = (flags2 &0x00400000) ? YES : NO;
+ 
+        // Odd this isn't in flags - it's near other items in flags in the Cocoa struct from which these are derived.
+-       _lineBreakMode   = (flags2 & 0x00000600) >> 9 & 0x7;
++       // three bits (0x0E00): with two, truncating tail (4) read as word wrapping, and a label too narrow
++       // for its text drew its first line only, or nothing (Activity Monitor's process names)
++       _lineBreakMode   = (flags2 & 0x00000E00) >> 9;
+        _controlSize     = (flags2 & 0x000E0000) >> 17;
+ 
+ 
+--- a/src/Frameworks/AppKit/NSControl.m
++++ b/src/Frameworks/AppKit/NSControl.m
+@@ -18,6 +18,8 @@
+ #import <AppKit/NSTextView.h>
+ #import <AppKit/NSTextStorage.h>
+ #import <Foundation/NSKeyedArchiver.h>
++#import <Foundation/NSThread.h>
++#include <dispatch/dispatch.h>
+ #import <AppKit/NSRaise.h>
+ #import <AppKit/NSObject+BindingSupport.h>
+ 
+@@ -275,46 +277,99 @@
+    [self setNeedsDisplay:YES];
+ }
+ 
++// a view laid out by constraints is as wide as its value: a new value has its intrinsic size invalidated
++// so the layout runs again (Activity Monitor's summary figures were as wide as the first value they
++// were given, a digit). Not for the cells of a table's rows, whose frames the row gives them.
++static BOOL sfSizesToValue(NSControl *self) {
++    static Class rowView;
++
++    if ([self translatesAutoresizingMaskIntoConstraints] || [self superview] == nil)
++        return NO;
++    if (rowView == Nil)
++        rowView = NSClassFromString(@"NSTableRowView");
++    for (NSView *v = [self superview]; v != nil; v = [v superview])
++        if (rowView != Nil && [v isKindOfClass:rowView])
++            return NO;
++    return YES;
++}
++
++// the length of what the control shows, or NSNotFound when its size does not follow its value
++static NSUInteger sfValueLength(NSControl *self) {
++    return sfSizesToValue(self) ? [[[self selectedCell] stringValue] length] : NSNotFound;
++}
++
++// a new layout only when the shown string's length changed: a pass solves the window's constraints
++// (Activity Monitor's summary figures change every refresh, in digits of one width, and a pass for
++// each cost a sixth of a core)
++// Activity Monitor sets some values off the main thread (bindings fed from its sampling queue): the
++// layout pass is asked for on the main thread, else it ran on a dispatch worker and measured text
++// with the shared string drawer while the main thread drew (CoreFoundation halted in CFArrayCreateCopy
++// under -[NSTextStorage processEditing])
++static void sfValueMayResize(NSControl *self, NSUInteger before) {
++    if (before == NSNotFound || sfValueLength(self) == before)
++        return;
++    if ([NSThread isMainThread])
++        [self invalidateIntrinsicContentSize];
++    else {
++        [self retain];
++        dispatch_async(dispatch_get_main_queue(), ^{ [self invalidateIntrinsicContentSize]; [self release]; });
++    }
++}
++
+ -(void)setObjectValue:(id <NSCopying>)object {
++    NSUInteger sfBefore=sfValueLength(self);
+     [self abortEditing];
+     [(NSCell *)[self selectedCell] setObjectValue:object];
+     [self setNeedsDisplay:YES];
++    sfValueMayResize(self,sfBefore);
+ }
+ 
+ -(void)setStringValue:(NSString *)value {
++    NSUInteger sfBefore=sfValueLength(self);
+     [self abortEditing];
+     [[self selectedCell] setStringValue:value];
+     [self setNeedsDisplay:YES];
++    sfValueMayResize(self,sfBefore);
+ }
+ 
+ -(void)setIntValue:(int)value {
++    NSUInteger sfBefore=sfValueLength(self);
+     [self abortEditing];
+     [[self selectedCell] setIntValue:value];
+     [self setNeedsDisplay:YES];
++    sfValueMayResize(self,sfBefore);
+ }
+ 
+ -(void)setFloatValue:(CGFloat)value {
++    NSUInteger sfBefore=sfValueLength(self);
+     [self abortEditing];
+     [[self selectedCell] setFloatValue:value];
+     [self setNeedsDisplay:YES];
++    sfValueMayResize(self,sfBefore);
+ }
+ 
+ -(void)setDoubleValue:(double)value {
++    NSUInteger sfBefore=sfValueLength(self);
+     [self abortEditing];
+     [[self selectedCell] setDoubleValue:value];
+     [self setNeedsDisplay:YES];
++    sfValueMayResize(self,sfBefore);
+ }
+ 
+ -(void)setIntegerValue:(NSInteger)value {
++    NSUInteger sfBefore=sfValueLength(self);
+     [self abortEditing];
+     [[self selectedCell] setIntegerValue:value];
+     [self setNeedsDisplay:YES];
++    sfValueMayResize(self,sfBefore);
+ }
+ 
+ -(void)setAttributedStringValue:(NSAttributedString *)value {
++    NSUInteger sfBefore=sfValueLength(self);
+     [self abortEditing];
+     [[self selectedCell] setAttributedStringValue:value];
+     [self setNeedsDisplay:YES];
++    sfValueMayResize(self,sfBefore);
+ }
+ 
+ -(void)takeObjectValueFrom:sender {
+--- a/src/Frameworks/AppKit/NSKeyValueBinding/NSBinder.m
++++ b/src/Frameworks/AppKit/NSKeyValueBinding/NSBinder.m
+@@ -5,6 +5,8 @@
+ The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+ 
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
++#include <dispatch/dispatch.h>
++#import <Foundation/NSThread.h>
+ #import "NSBinder.h"
+ #import "NSObject+BindingSupport.h"
+ #import <Foundation/NSString.h>
+@@ -230,6 +232,16 @@
+ }
+ 
+ - (void)observeValueForKeyPath:(NSString *)kp ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
++   // applied on the main thread when the change was made elsewhere (see NSKVOBinder.m)
++   if(![NSThread isMainThread]){
++    [self retain]; [kp retain]; [object retain]; [change retain];
++    dispatch_async(dispatch_get_main_queue(), ^{
++     [self observeValueForKeyPath:kp ofObject:object change:change context:context];
++     [self release]; [kp release]; [object release]; [change release];
++    });
++    return;
++   }
++
+ 
+ 	NSBindingDebugLog(kNSBindingDebugLogLevel1, @"keyPath: %@\n   object: %@\n   change: %@\n    context: %p", kp, object, change, context);
+    if([self allowsReverseTransformation]){
+--- a/src/Frameworks/AppKit/NSKeyValueBinding/NSKVOBinder.m
++++ b/src/Frameworks/AppKit/NSKeyValueBinding/NSKVOBinder.m
+@@ -5,6 +5,8 @@
+ The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+ 
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
++#include <dispatch/dispatch.h>
++#import <Foundation/NSThread.h>
+ #import "NSKVOBinder.h"
+ #import <Foundation/NSKeyValueObserving.h>
+ #import <Foundation/NSKeyValueCoding.h>
+@@ -294,6 +296,19 @@
+ {
+ 	NSBindingDebugLog(kNSBindingDebugLogLevel1, @"keyPath: %@\n   object: %@\n   change: %@\n    context: %p", kp, object, change, context);
+ 	
++   // A change made off the main thread (Activity Monitor feeds its bound figures from its sampling
++   // queue) is applied on the main thread: applying it sets the view's value and takes the binder's
++   // notification observers off and on again, and the notification centre's observer lists are not
++   // safe against the main thread posting meanwhile (CoreFoundation halted copying one).
++   if(![NSThread isMainThread]){
++    [self retain]; [kp retain]; [object retain]; [change retain];
++    dispatch_async(dispatch_get_main_queue(), ^{
++     [self observeValueForKeyPath:kp ofObject:object change:change context:context];
++     [self release]; [kp release]; [object release]; [change release];
++    });
++    return;
++   }
++
+ // We want changes to propogate one way so we stop observing for both our handling and super's,
+ // otherwise our change will generate a change for the super's observation and it will write a value
+ // back the value we just got here which causes a problem for read only values
+--- a/src/Frameworks/AppKit/NSKeyValueBinding/NSCachingBinder.m
++++ b/src/Frameworks/AppKit/NSKeyValueBinding/NSCachingBinder.m
+@@ -7,6 +7,8 @@
+  
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+ 
++#include <dispatch/dispatch.h>
++#import <Foundation/NSThread.h>
+ #import "NSCachingBinder.h"
+ 
+ #import <Foundation/Foundation.h>
+@@ -166,6 +168,16 @@
+                         change:(NSDictionary *)change 
+                        context:(void *)context
+ {
++   // applied on the main thread when the change was made elsewhere (see NSKVOBinder.m)
++   if(![NSThread isMainThread]){
++    [self retain]; [kp retain]; [object retain]; [change retain];
++    dispatch_async(dispatch_get_main_queue(), ^{
++     [self observeValueForKeyPath:kp ofObject:object change:change context:context];
++     [self release]; [kp release]; [object release]; [change release];
++    });
++    return;
++   }
++
+    [self stopObservingChanges];
+    
+   if (context == NSCachingBinderChangeContext)
+--- a/src/Frameworks/AppKit/NSKeyValueBinding/NSMultipleValueBinder.m
++++ b/src/Frameworks/AppKit/NSKeyValueBinding/NSMultipleValueBinder.m
+@@ -5,6 +5,8 @@
+ The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+ 
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
++#include <dispatch/dispatch.h>
++#import <Foundation/NSThread.h>
+ #import "NSMultipleValueBinder.h"
+ #import <Foundation/NSDictionary.h>
+ #import <Foundation/NSException.h>
+@@ -183,6 +185,16 @@
+ 
+ - (void)observeValueForKeyPath:(NSString *)kp ofObject:(id)object change:(NSDictionary *)change context:(void *)context
+ {
++   // applied on the main thread when the change was made elsewhere (see NSKVOBinder.m)
++   if(![NSThread isMainThread]){
++    [self retain]; [kp retain]; [object retain]; [change retain];
++    dispatch_async(dispatch_get_main_queue(), ^{
++     [self observeValueForKeyPath:kp ofObject:object change:change context:context];
++     [self release]; [kp release]; [object release]; [change release];
++    });
++    return;
++   }
++
+ 	if(context==&NSMultipleValueBinderWholeArrayChangeContext)
+ 	{
+       [self stopObservingChanges];
+@@ -289,6 +301,16 @@
+ }
+ 
+ - (void)observeValueForKeyPath:(NSString *)kp ofObject:(id)object change:(NSDictionary *)change context:(void *)context {
++   // applied on the main thread when the change was made elsewhere (see NSKVOBinder.m)
++   if(![NSThread isMainThread]){
++    [self retain]; [kp retain]; [object retain]; [change retain];
++    dispatch_async(dispatch_get_main_queue(), ^{
++     [self observeValueForKeyPath:kp ofObject:object change:change context:context];
++     [self release]; [kp release]; [object release]; [change release];
++    });
++    return;
++   }
++
+ 	[self stopObservingChanges];
+ 
+ 	if(context==&NSTableViewContentBinderChangeContext)
+--- a/src/Frameworks/AppKit/NSWindowMenuStrip.m
++++ b/src/Frameworks/AppKit/NSWindowMenuStrip.m
+@@ -153,8 +153,11 @@
+         return NO;
+     if ([self isKindOfClass:[NSPanel class]] || [self isSheet])
+         return NO;
+-    // in full screen too: there is no menu bar to show at the top of the screen
+-    if (!(_styleMask & NSTitledWindowMask) || (_styleMask & NSFullSizeContentViewWindowMask))
++    // in full screen too: there is no menu bar to show at the top of the screen. A full-size-content
++    // window (a unified toolbar: Activity Monitor's) gets one too: the compositor draws the title bar,
++    // so the content starts below it either way, and without the strip the application's menus could
++    // not be reached at all
++    if (!(_styleMask & NSTitledWindowMask))
+         return NO;
+     return NSWindowFrameIsDrawnByServer(_styleMask);
+ }

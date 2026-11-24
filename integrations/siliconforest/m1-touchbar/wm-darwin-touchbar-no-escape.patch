@@ -1,0 +1,92 @@
+wm-darwin autopilot: the Touch Bar phase without Escape
+
+The strip no longer has an Escape key (the machine has a real one), so the phase touches
+the six volume keys only: twelve key events, F10's release last. The keys are looked up in
+kern.sf_touchbar.keys as before, on whichever layer the strip shows.
+
+Applies on top of wm-darwin 3944e53 (a Touch Bar phase) in sources/chonkstep-darwin, branch
+wm-darwin; working tree only, not committed there. It replaces
+wm-darwin-touchbar-phase.patch's last step; that file is what 3944e53 committed.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+diff --git i/crates/wm-darwin/src/autopilot.rs w/crates/wm-darwin/src/autopilot.rs
+index 2a691af..fc623ee 100644
+--- i/crates/wm-darwin/src/autopilot.rs
++++ w/crates/wm-darwin/src/autopilot.rs
+@@ -16,7 +16,7 @@
+ //!   other terminal, Control+Shift+V: the word must arrive there
+ //! * `brightness` press F1 and F2 (the brightness keys) and read the backlight back
+ //! * `volume`   press F11, F12 and F10 (the volume keys) and read the audio server's level back
+-//! * `touchbar` touch F11, F12, F10 and Escape on the Touch Bar: finger records written to the
++//! * `touchbar` touch F11, F12 and F10 (the strip's quieter, louder and mute keys): finger records written to the
+ //!   kernel driver's test entry (`kern.sf_touchbar.inject`), which parses them as it parses the
+ //!   digitizer's reports; the keys then arrive as any key does, through the SFHID device node.
+ //!   Skipped where there is no such driver or no native input
+@@ -139,7 +139,7 @@ impl Phase {
+             Phase::Clipboard => 9_000,
+             Phase::Brightness => 5_000,
+             Phase::Volume => 2_000,
+-            Phase::TouchBar => 4_000,
++            Phase::TouchBar => 3_500,
+             Phase::Idle => 10_000,
+             Phase::Resize => 4_000,
+             Phase::Redrag => 3_000,
+@@ -1052,7 +1052,7 @@ impl Autopilot {
+                 self.script = if self.mixer.is_some() { script } else { Vec::new() };
+             }
+             Phase::TouchBar => {
+-                // The volume phase's keys and Escape, as touches on the strip's function layer.
++                // The volume phase's keys as touches on the strip, whichever layer it shows (both have them).
+                 self.touch_looks.clear();
+                 self.touch_errors.clear();
+                 self.script_at = 0;
+@@ -1060,7 +1060,7 @@ impl Autopilot {
+                 self.touch_before = server.hid_keys();
+                 self.touch_keys = touchbar::keys().ok();
+                 let mut script = Vec::new();
+-                for (i, usage) in VOLUME_KEYS.into_iter().chain([USAGE_ESCAPE]).enumerate() {
++                for (i, usage) in VOLUME_KEYS.into_iter().enumerate() {
+                     let at = 200 + 450 * i as u64;
+                     script.extend([(at, Act::Touch(usage, true)), (at + 80, Act::Touch(usage, false)), (at + 380, Act::Probe(i as u8 + 1))]);
+                 }
+@@ -1251,11 +1251,11 @@ impl Autopilot {
+                     return;
+                 };
+                 use crate::volume::{percent, stepped, Level};
+-                // Every touch is a press and a release that reached this process as key events: 14 of them, Escape's release last.
++                // Every touch is a press and a release that reached this process as key events: 12 of them, F10's release last.
+                 let seen: Vec<u64> = self.touch_looks.iter().map(|l| l.1 .0 - self.touch_before.0).collect();
+-                let counted = seen.len() == 7 && seen.iter().enumerate().all(|(i, n)| *n == 2 * (i as u64 + 1));
++                let counted = seen.len() == 6 && seen.iter().enumerate().all(|(i, n)| *n == 2 * (i as u64 + 1));
+                 let last = self.touch_looks.last().and_then(|l| l.1 .1);
+-                let escape = last == Some((1, false));
++                let released = last == Some((crate::volume::KEY_MUTE, false));
+                 // With an audio server the first six are the volume keys and move its level as the volume phase's do.
+                 let (levels, volume_ok) = match self.mixer {
+                     Some(before) => {
+@@ -1273,9 +1273,9 @@ impl Autopilot {
+                     }
+                     None => ("volume=not-checked (no audio server: the keys are ordinary function keys)".to_string(), true),
+                 };
+-                let ok = counted && escape && volume_ok && self.touch_errors.is_empty();
++                let ok = counted && released && volume_ok && self.touch_errors.is_empty();
+                 let line = format!(
+-                    "WMAUTO touchbar touches=F11,F11,F12,F12,F10,F10,Escape through=kern.sf_touchbar.inject keys=\"{keys}\" key_events_after_each={seen:?} last_key={last:?} {levels} notices={:?} errors={:?} result={}",
++                    "WMAUTO touchbar touches=F11,F11,F12,F12,F10,F10 through=kern.sf_touchbar.inject keys=\"{keys}\" key_events_after_each={seen:?} last_key={last:?} {levels} notices={:?} errors={:?} result={}",
+                     self.touch_looks.iter().map(|l| l.2.as_str()).collect::<Vec<_>>(),
+                     self.touch_errors,
+                     if ok { "PASS" } else { "FAILED" }
+@@ -1591,9 +1591,9 @@ mod tests {
+ 
+     #[test]
+     fn touch_bar_keys_are_found_by_usage() {
+-        let keys = "29:780 3a:2433 43:17307 44:18959 45:20612 00:22265";
+-        assert_eq!(touchbar::position(keys, 0x44), Some(18959));
+-        assert_eq!(touchbar::position(keys, 0x29), Some(780));
++        let keys = "3a:2249 3b:6886 43:11523 44:16159 45:20796";
++        assert_eq!(touchbar::position(keys, 0x44), Some(16159));
++        assert_eq!(touchbar::position(keys, 0x3a), Some(2249));
+         assert_eq!(touchbar::position(keys, 0x46), None);
+         assert_eq!(touchbar::position("", 0x44), None);
+     }

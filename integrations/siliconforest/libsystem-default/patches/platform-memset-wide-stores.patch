@@ -1,0 +1,164 @@
+diff -ru a/src/Libraries/libSystem/libplatform/src/string/generic/bzero.c b/src/Libraries/libSystem/libplatform/src/string/generic/bzero.c
+--- a/src/Libraries/libSystem/libplatform/src/string/generic/bzero.c	2026-11-14 16:29:31.406898987 -0800
++++ b/src/Libraries/libSystem/libplatform/src/string/generic/bzero.c	2026-11-14 16:29:59.998141917 -0800
+@@ -22,6 +22,7 @@
+  */
+ 
+ #include <platform/string.h>
++#include <stdint.h>
+ 
+ #if !VARIANT_STATIC
+ // to satisfy compiler-generated memset inside libplatform (e.g. makecontext)
+@@ -35,16 +36,49 @@
+ 
+ #if !_PLATFORM_OPTIMIZED_MEMSET
+ 
++/*
++ * SiliconForest: fill with 8-byte stores, 64 bytes per round in the bulk, the first and last 16 bytes
++ * written unaligned. It went through _platform_memset_pattern4(), which called _platform_memmove()
++ * once for every 4 bytes (about 7 us for 4 KB on the M1, -O2). This file is compiled with
++ * -fno-builtin (../../integrations/siliconforest/libsystem-default/patches/string-functions-no-builtin.patch),
++ * so the loops stay loops and do not become calls of memset.
++ */
++typedef uint64_t __attribute__((may_alias, aligned(1))) sf_u64u;
++typedef uint32_t __attribute__((may_alias, aligned(1))) sf_u32u;
++typedef uint64_t __attribute__((may_alias, aligned(8))) sf_u64a;
++
+ void *
+ _platform_memset(void *b, int c, size_t len) {
+-	unsigned char pattern[4];
+-
+-	pattern[0] = (unsigned char)c;
+-	pattern[1] = (unsigned char)c;
+-	pattern[2] = (unsigned char)c;
+-	pattern[3] = (unsigned char)c;
++	unsigned char *p = (unsigned char *)b;
++	uint64_t v = 0x0101010101010101ULL * (unsigned char)c;
+ 
+-	_platform_memset_pattern4(b, pattern, len);
++	if (len < 16) {
++		if (len >= 8) {
++			*(sf_u64u *)p = v;
++			*(sf_u64u *)(p + len - 8) = v;
++		} else if (len >= 4) {
++			*(sf_u32u *)p = (uint32_t)v;
++			*(sf_u32u *)(p + len - 4) = (uint32_t)v;
++		} else {
++			for (size_t i = 0; i < len; i++)
++				p[i] = (unsigned char)c;
++		}
++		return b;
++	}
++	unsigned char *end = p + len;
++	*(sf_u64u *)p = v;
++	*(sf_u64u *)(p + 8) = v;
++	unsigned char *q = (unsigned char *)(((uintptr_t)p + 16) & ~(uintptr_t)15);
++	for (; end - q >= 64; q += 64) {
++		sf_u64a *w = (sf_u64a *)q;
++		w[0] = v; w[1] = v; w[2] = v; w[3] = v; w[4] = v; w[5] = v; w[6] = v; w[7] = v;
++	}
++	for (; end - q >= 16; q += 16) {
++		sf_u64a *w = (sf_u64a *)q;
++		w[0] = v; w[1] = v;
++	}
++	*(sf_u64u *)(end - 16) = v;
++	*(sf_u64u *)(end - 8) = v;
+ 	return b;
+ }
+ 
+diff -ru a/src/Libraries/libSystem/libplatform/src/string/generic/memset_pattern.c b/src/Libraries/libSystem/libplatform/src/string/generic/memset_pattern.c
+--- a/src/Libraries/libSystem/libplatform/src/string/generic/memset_pattern.c	2026-11-14 16:29:31.406898987 -0800
++++ b/src/Libraries/libSystem/libplatform/src/string/generic/memset_pattern.c	2026-11-14 16:29:31.419018843 -0800
+@@ -22,21 +22,43 @@
+  */
+ 
+ #include <platform/string.h>
++#include <stdint.h>
++
++/*
++ * SiliconForest: the pattern is laid 16 bytes at a time (two 8-byte stores) from the start of the
++ * buffer, the partial pattern at the end byte by byte. The generic code called _platform_memmove()
++ * for every 4, 8 or 16 bytes. Compiled with -fno-builtin (see bzero.c).
++ */
++typedef uint64_t __attribute__((may_alias, aligned(1))) sf_u64u;
++
++static void
++sf_memset_pattern16(unsigned char *p, const unsigned char pat[16], size_t len)
++{
++	uint64_t lo = *(const sf_u64u *)pat, hi = *(const sf_u64u *)(pat + 8);
++	size_t i = 0;
++	for (; len - i >= 64; i += 64) {
++		*(sf_u64u *)(p + i) = lo; *(sf_u64u *)(p + i + 8) = hi;
++		*(sf_u64u *)(p + i + 16) = lo; *(sf_u64u *)(p + i + 24) = hi;
++		*(sf_u64u *)(p + i + 32) = lo; *(sf_u64u *)(p + i + 40) = hi;
++		*(sf_u64u *)(p + i + 48) = lo; *(sf_u64u *)(p + i + 56) = hi;
++	}
++	for (; len - i >= 16; i += 16) {
++		*(sf_u64u *)(p + i) = lo;
++		*(sf_u64u *)(p + i + 8) = hi;
++	}
++	for (size_t k = 0; i < len; i++, k++)
++		p[i] = pat[k];
++}
+ 
+ #if !_PLATFORM_OPTIMIZED_MEMSET_PATTERN4
+ 
+ void
+ _platform_memset_pattern4(void *b, const void *pattern4, size_t len)
+ {
+-	char * start = (char *)b;
+-	char * p = (char *)b;
+-	while ((start + len) - p >= 4) {
+-		_platform_memmove(p, pattern4, 4);
+-		p += 4;
+-	}
+-	if ((start + len) - p != 0) {
+-		_platform_memmove(p, pattern4, (start + len) - p);
+-	}
++	unsigned char pat[16];
++	for (int i = 0; i < 16; i++)
++		pat[i] = ((const unsigned char *)pattern4)[i % 4];
++	sf_memset_pattern16((unsigned char *)b, pat, len);
+ }
+ 
+ #if VARIANT_STATIC
+@@ -55,15 +77,10 @@
+ void
+ _platform_memset_pattern8(void *b, const void *pattern8, size_t len)
+ {
+-	char * start = (char *)b;
+-	char * p = (char *)b;
+-	while ((start + len) - p >= 8) {
+-		_platform_memmove(p, pattern8, 8);
+-		p += 8;
+-	}
+-	if ((start + len) - p != 0) {
+-		_platform_memmove(p, pattern8, (start + len) - p);
+-	}
++	unsigned char pat[16];
++	for (int i = 0; i < 16; i++)
++		pat[i] = ((const unsigned char *)pattern8)[i % 8];
++	sf_memset_pattern16((unsigned char *)b, pat, len);
+ }
+ 
+ #if VARIANT_STATIC
+@@ -82,15 +99,10 @@
+ void
+ _platform_memset_pattern16(void *b, const void *pattern16, size_t len)
+ {
+-	char * start = (char *)b;
+-	char * p = (char *)b;
+-	while ((start + len) - p >= 16) {
+-		_platform_memmove(p, pattern16, 16);
+-		p += 16;
+-	}
+-	if ((start + len) - p != 0) {
+-		_platform_memmove(p, pattern16, (start + len) - p);
+-	}
++	unsigned char pat[16];
++	for (int i = 0; i < 16; i++)
++		pat[i] = ((const unsigned char *)pattern16)[i % 16];
++	sf_memset_pattern16((unsigned char *)b, pat, len);
+ }
+ 
+ #if VARIANT_STATIC

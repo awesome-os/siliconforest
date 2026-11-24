@@ -1,0 +1,97 @@
+SFArmPlatformExpert: SFAppleBootCPUPMGR releases cores the boot loader holds (sfcpuheld=1)
+
+Without m1n1's hypervisor a core released from reset through the PMGR CPU-start block
+starts at its RVBAR at EL2 with none of the core's chicken bits set, and this kernel has no
+EL2 entry code. Under the hypervisor neither was visible: m1n1 had started and initialised
+every core itself and entered the guest at EL1 when the guest wrote the CPU-start block.
+
+Natively the launcher does the first half the same way (m1n1 smp_start_secondaries, as for
+Linux) and then holds each core in the resident EL2 page
+(integrations/siliconforest/m1-native-boot/stub/el2_drop.S, hold_entry), which watches the
+core's reset vector register. With the boot argument sfcpuheld=1, enableCPUCore() writes
+xnu's reset vector to that register, as it already does where the register holds something
+else, sends an event, and does not write the CPU-start block: the core is not in reset. The
+holder sets EL2 up and enters xnu's reset vector at EL1. Without the argument nothing changes.
+
+--- a/src/Kernel/Extensions/SFArmPlatformExpert/SFAppleBootCPUPMGR.cpp
++++ b/src/Kernel/Extensions/SFArmPlatformExpert/SFAppleBootCPUPMGR.cpp
+@@ -65,6 +65,7 @@
+ 
+ static volatile uint8_t *sCpuStart;     /* the mapped CPU-start block of die 0 */
+ static bool              sPark = true;  /* xnu parks offline cores (sfcpupark) */
++static bool              sHeld;         /* the boot loader holds the secondary cores (sfcpuheld) */
+ static volatile uint32_t sReleased;     /* cpu ids released from reset by enableCPUCore */
+ static volatile uint32_t sOffline;      /* cpu ids xnu has asked to disable */
+ static volatile uint32_t sClustersOff;  /* cluster ids xnu has asked to power down */
+@@ -182,15 +183,39 @@
+ 		return;
+ 	}
+ 
+-	sf_apple_cpu_prepare_rvbar(cpu, entry_pa);
++	if (sHeld) {
++		/*
++		 * sfcpuheld=1: the boot loader has already released every core from reset,
++		 * initialised it (m1n1 applies the core's chicken bits when it starts it, as it
++		 * does for Linux) and holds it at EL2 until its reset vector register changes.
++		 * Writing xnu's vector there is the release; the holder then enters it at EL1.
++		 * The CPU-start block is not written: the core is not in reset.
++		 */
++		volatile uint64_t *reg = (volatile uint64_t *)cpu->cpu_IMPL_regs;
++
++		if (entry_pa == 0 || reg == NULL) {
++			panic("SFAppleBootCPUPMGR: cpu %u is held by the boot loader (sfcpuheld) and "
++			    "this kernel names no reset vector to release it with", cpu_id);
++		}
++		if ((*reg & RVBAR_ADDR) == entry_pa) {
++			panic("SFAppleBootCPUPMGR: cpu %u is held by the boot loader (sfcpuheld) but "
++			    "its reset vector register already names xnu's vector 0x%llx: nothing "
++			    "would release it", cpu_id, entry_pa);
++		}
++		sf_apple_cpu_prepare_rvbar(cpu, entry_pa);
++		__asm__ volatile ("dsb sy");
++		__asm__ volatile ("sev");
++	} else {
++		sf_apple_cpu_prepare_rvbar(cpu, entry_pa);
+ 
+-	__asm__ volatile ("dsb sy");
++		__asm__ volatile ("dsb sy");
+ 
+-	/* Some kind of system level startup/status bit. Without this, IRQs don't work */
+-	*(volatile uint32_t *)(sCpuStart + 0x4) = 1u << (4 * cluster + core);
++		/* Some kind of system level startup/status bit. Without this, IRQs don't work */
++		*(volatile uint32_t *)(sCpuStart + 0x4) = 1u << (4 * cluster + core);
+ 
+-	/* Actually start the core */
+-	*(volatile uint32_t *)(sCpuStart + 0x8 + 4 * cluster) = 1u << core;
++		/* Actually start the core */
++		*(volatile uint32_t *)(sCpuStart + 0x8 + 4 * cluster) = 1u << core;
++	}
+ 	if (cpu_id < 32) {
+ 		__sync_fetch_and_or(&sReleased, 1u << cpu_id);
+ 	}
+@@ -357,9 +382,14 @@
+ 	{
+ 		int park = 1;
+ 
++		int held = 0;
++
+ 		if (PE_parse_boot_argn("sfcpupark", &park, sizeof(park))) {
+ 			sPark = park != 0;
+ 		}
++		if (PE_parse_boot_argn("sfcpuheld", &held, sizeof(held))) {
++			sHeld = held != 0;
++		}
+ 	}
+ 	ok = pmgr->init() && pmgr->attach(provider);
+ 	if (ok && !pmgr->start(provider)) {
+@@ -373,6 +403,10 @@
+ 			    sCpuStartPhys, topo ? topo->num_cpus : 0, topo ? topo->num_clusters : 0,
+ 			    sPark ? "parked in WFI by xnu (sfcpupark)" :
+ 			    "expected to lose power (sfcpupark=0): not implemented, will panic");
++			if (sHeld) {
++				IOLog("SFAppleBootCPUPMGR: secondary cores are held by the boot loader "
++				    "(sfcpuheld); released through their reset vector registers\n");
++			}
+ 		} else if (topo != NULL && topo->num_cpus > 1) {
+ 			IOLog("SFAppleBootCPUPMGR: topology has %u processors and chip 0x%x has no "
+ 			    "known CPU-start block; starting any but the boot CPU will panic "

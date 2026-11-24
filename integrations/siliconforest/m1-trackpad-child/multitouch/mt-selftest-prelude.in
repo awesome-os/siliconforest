@@ -1,0 +1,55 @@
+#!/bin/sh
+# Guest prelude for the trackpad multitouch self-test (boot-arg sfm1tpselftest=2); the session
+# script follows in the same file (mt_session_boot.sh concatenates them).
+# Opening /dev/usb_hid_kbd is the signal: SFM1SPIHID then sends the pointer reports of its
+# synthetic multitouch scenario through the trackpad's HID device, once per boot. This reads
+# the resulting 12-byte records from /dev/usb_hid_mouse (byte 5 buttons, byte 8 wheel) and
+# prints one line: MTSELFTEST_RECORDS PASS|FAIL ...
+# The records are synthetic: they prove the path from a decoded report to the queue, not a finger.
+(
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin; export PATH
+printf '\nMTSELFTEST_BEGIN\n'
+mt_n=0
+while [ ! -c /dev/usb_hid_kbd ] || [ ! -c /dev/usb_hid_mouse ]; do
+    mt_n=$((mt_n + 1))
+    [ "$mt_n" -le 100 ] || break
+    sleep 0.1
+done
+if [ ! -c /dev/usb_hid_kbd ] || [ ! -c /dev/usb_hid_mouse ]; then
+    printf 'MTSELFTEST_RECORDS FAIL reason=no-input-nodes\n'
+    exit 0
+fi
+mt_t=/private/tmp/mtselftest.$$
+printf '\001' > "$mt_t.1"; printf '\002' > "$mt_t.2"; printf '\377' > "$mt_t.m"; printf '\000' > "$mt_t.0"
+mt_total=0 mt_left=0 mt_right=0 mt_up=0 mt_down=0 mt_motion=0
+mt_read() {
+    mt_i=0
+    while [ "$mt_i" -lt 80 ]; do
+        : > "$mt_t"
+        dd if=/dev/usb_hid_mouse of="$mt_t" bs=12 count=1 2>/dev/null
+        [ -s "$mt_t" ] || break
+        mt_i=$((mt_i + 1)); mt_total=$((mt_total + 1))
+        dd if="$mt_t" of="$mt_t.b" bs=1 skip=5 count=1 2>/dev/null
+        cmp -s "$mt_t.b" "$mt_t.1" && mt_left=$((mt_left + 1))
+        cmp -s "$mt_t.b" "$mt_t.2" && mt_right=$((mt_right + 1))
+        dd if="$mt_t" of="$mt_t.b" bs=1 skip=8 count=1 2>/dev/null
+        cmp -s "$mt_t.b" "$mt_t.1" && mt_up=$((mt_up + 1))
+        cmp -s "$mt_t.b" "$mt_t.m" && mt_down=$((mt_down + 1))
+        dd if="$mt_t" of="$mt_t.b" bs=1 skip=6 count=1 2>/dev/null
+        cmp -s "$mt_t.b" "$mt_t.0" || mt_motion=$((mt_motion + 1))
+    done
+}
+# Whatever is queued before the signal is counted too (the driver sends the scenario at the
+# first open of the keyboard node, whoever opens it) and reported as early=.
+mt_read
+mt_early=$mt_total
+sleep 3 < /dev/usb_hid_kbd &
+sleep 1
+mt_read
+wait
+rm -f "$mt_t" "$mt_t.b" "$mt_t.1" "$mt_t.2" "$mt_t.m" "$mt_t.0"
+if [ "$mt_right" -ge 1 ] && [ "$mt_left" -ge 1 ] && [ "$mt_up" -ge 1 ] && [ "$mt_down" -ge 1 ] && [ "$mt_motion" -ge 1 ]; then mt_r=PASS; else mt_r=FAIL; fi
+printf 'MTSELFTEST_RECORDS %s records=%s motion=%s left_button=%s right_button=%s wheel_up=%s wheel_down=%s early=%s input=synthetic-kernel-selftest\n' \
+    "$mt_r" "$mt_total" "$mt_motion" "$mt_left" "$mt_right" "$mt_up" "$mt_down" "$mt_early"
+)
+# ---- the session script follows ----

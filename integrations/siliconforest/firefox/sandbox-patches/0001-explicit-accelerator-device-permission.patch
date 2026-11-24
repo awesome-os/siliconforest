@@ -1,0 +1,40 @@
+--- a/src/Libraries/libsandbox/sbpl.c
++++ b/src/Libraries/libsandbox/sbpl.c
+@@ -982,7 +982,7 @@
+ compile_rule(struct compiler *c, const struct node *form, uint8_t action)
+ {
+ 	uint32_t ops = 0;
+-	bool had_operation = false, had_filter = false, mach_lookup = false;
++	bool had_operation = false, had_filter = false, mach_lookup = false, iokit_open = false;
+ 	size_t i = 1;
+ 
+ 	for (; i < form->count && form->items[i]->type == NODE_SYMBOL; i++) {
+@@ -1003,6 +1003,7 @@
+ 			fail(c, form->items[i]->line, "unknown operation '%s'", operation);
+ 			return;
+ 		}
++		if (strcmp(operation, "iokit-open") == 0) iokit_open = true;
+ 		ops |= bits;
+ 		had_operation = true;
+ 		if (strcmp(operation, "mach-lookup") == 0) {
+@@ -1028,6 +1029,20 @@
+ 		}
+ 		had_filter = true;
+ 		compile_filter(c, f, ops, action, 0);
++		/* SiliconForest's accelerator service is an exact character device.
++		 * Only an unconditional, explicit IOAccelerator connection grants it;
++		 * compound/unchecked filters must never widen an allow rule. */
++		if (iokit_open && action == SB_ACTION_ALLOW && !c->failed &&
++		    f->type == NODE_LIST && f->count == 2 &&
++		    f->items[0]->type == NODE_SYMBOL &&
++		    strcmp(f->items[0]->text, "iokit-connection") == 0) {
++			struct value v = eval(c, f->items[1]);
++			if (!c->failed && v.kind == VALUE_STRING &&
++			    strcmp(v.string, "IOAccelerator") == 0)
++				emit_rule(c, f->line, SB_OP_FILE_READ_DATA | SB_OP_FILE_WRITE_DATA,
++				          SB_ACTION_ALLOW, SB_FILTER_LITERAL, "/dev/sfavd");
++		}
++
+ 		if (mach_lookup && action == SB_ACTION_ALLOW && !c->failed && f->type == NODE_LIST &&
+ 		    f->count >= 2 && f->items[0]->type == NODE_SYMBOL &&
+ 		    strcmp(f->items[0]->text, "global-name") == 0) {

@@ -1,0 +1,137 @@
+#!/bin/sh
+# Guest side of the Wi-Fi lifecycle boot: sf-netd joins a remembered network by itself, keeps a
+# DHCP lease and the resolver, renews, recovers from a dropped association and cleans up on
+# SIGTERM. @SSID@ and @PSK@ are filled in from private/wifi.env at packet assembly; the filled
+# script is never committed. Waits are bounded so the whole run stays under 150 seconds.
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+log=/var/log/sf-netd.log
+status=/var/run/sf-netd.en0.status
+# how the second drop is forced: "offon" (wifiutil off, then on) or "drop" (disassociate)
+drop2=offon
+
+# wait_online SECONDS: 0 once sf-netd reports state=online
+wait_online() {
+    n=0
+    while [ $n -lt "$1" ]; do
+        if grep -q '^state=online' "$status" 2>/dev/null; then
+            printf 'DL35_WAITED=%s\n' "$n"
+            return 0
+        fi
+        sleep 1
+        n=$((n+1))
+    done
+    printf 'DL35_WAITED=%s\n' "$n"
+    return 1
+}
+
+# wait_offline SECONDS: 0 once sf-netd no longer reports state=online
+wait_offline() {
+    n=0
+    while [ $n -lt "$1" ]; do
+        grep -q '^state=online' "$status" 2>/dev/null || return 0
+        sleep 1
+        n=$((n+1))
+    done
+    return 1
+}
+
+# gone PID: 0 when no such process is left
+gone() {
+    kill -0 "$1" 2>/dev/null && return 1
+    return 0
+}
+
+printf '\nDL35_NETD_BEGIN_%s\n' "$nonce"
+mkdir -p /var/run /var/log /Library/Preferences/SystemConfiguration
+sleep 4
+sf-dhcp --up en0 2>&1
+sleep 2
+wifiutil on 2>&1
+printf 'DL35_ON_RC=%s\n' "$?"
+sleep 6
+
+# (a) join once so the network is remembered, then drop the association with no "left" marker
+printf 'DL35_JOIN\n'
+wifiutil join '@SSID@' '@PSK@' 2>&1
+printf 'DL35_JOIN_RC=%s\n' "$?"
+printf 'DL35_KNOWN_COUNT=%s\n' "$(wifiutil known 2>/dev/null | grep -c .)"
+sf-netd --drop-link en0 2>&1
+printf 'DL35_DROP1_RC=%s\n' "$?"
+sleep 2
+if [ -e /var/run/org.siliconforest.wifi.left ]; then printf 'DL35_LEFT_MARKER=present\n'; else printf 'DL35_LEFT_MARKER=absent\n'; fi
+printf 'DL35_STATE_AFTER_DROP1\n'
+wifiutil info 2>&1 | grep 'state:'
+
+# (b) the supervisor, renewing ten seconds after each lease
+sf-netd --poll 2 --renew-after 10 en0 > "$log" 2>&1 &
+netd=$!
+printf 'DL35_NETD_PID=%s\n' "$netd"
+
+# (c) it joins, gets a lease and starts the resolver by itself
+wait_online 40
+online=$?
+printf 'DL35_ONLINE1_RC=%s\n' "$online"
+cat "$status" 2>&1
+printf 'DL35_DNS_PING1\n'
+# without a resolver the lookup alone could outlast the boot
+if [ $online -eq 0 ]; then ping -c 2 example.com 2>&1; printf 'DL35_DNS_PING1_RC=%s\n' "$?"; else printf 'DL35_DNS_PING1_RC=skipped\n'; fi
+printf 'DL35_SECOND_INSTANCE\n'
+sf-netd en0 2>&1
+printf 'DL35_SECOND_INSTANCE_RC=%s\n' "$?"
+
+# (d) at least one renewal
+n=0
+while [ $n -lt 15 ] && ! grep -q 'RENEWED' "$log" 2>/dev/null; do sleep 1; n=$((n+1)); done
+grep 'sf-dhcp: .*RENEW' "$log" 2>/dev/null | head -4
+printf 'DL35_RENEW_COUNT=%s\n' "$(grep -c 'RENEWED' "$log" 2>/dev/null)"
+grep -q 'RENEWED' "$log" 2>/dev/null
+printf 'DL35_RENEW_RC=%s\n' "$?"
+
+# (e) a second drop, and recovery
+printf 'DL35_DROP2_%s\n' "$drop2"
+if [ "$drop2" = offon ]; then
+    wifiutil off 2>&1
+    printf 'DL35_OFF_RC=%s\n' "$?"
+    sleep 3
+    wifiutil on 2>&1
+    printf 'DL35_ON2_RC=%s\n' "$?"
+else
+    sf-netd --drop-link en0 2>&1
+    printf 'DL35_DROP2_RC=%s\n' "$?"
+fi
+wait_offline 8
+printf 'DL35_DROP2_SEEN_RC=%s\n' "$?"
+wait_online 40
+online=$?
+printf 'DL35_ONLINE2_RC=%s\n' "$online"
+cat "$status" 2>&1
+printf 'DL35_LOST_COUNT=%s\n' "$(grep -c -e 'association lost' -e 'state=radio-off' "$log" 2>/dev/null)"
+printf 'DL35_DHCP_NOLINK_COUNT=%s\n' "$(grep -c 'sf-dhcp: .*-> NOLINK' "$log" 2>/dev/null)"
+printf 'DL35_DNS_PING2\n'
+if [ $online -eq 0 ]; then ping -c 2 example.com 2>&1; printf 'DL35_DNS_PING2_RC=%s\n' "$?"; else printf 'DL35_DNS_PING2_RC=skipped\n'; fi
+
+# (f) SIGTERM, and the children are gone
+dhcp_pids=$(sed -n 's/.*started sf-dhcp --daemon (pid \([0-9]*\)).*/\1/p' "$log" 2>/dev/null)
+mdns_pids=$(sed -n 's/.*started resolver .* (pid \([0-9]*\)).*/\1/p' "$log" 2>/dev/null)
+printf 'DL35_CHILD_PIDS dhcp=%s resolver=%s\n' "$(echo $dhcp_pids)" "$(echo $mdns_pids)"
+kill -TERM "$netd" 2>&1
+printf 'DL35_TERM_RC=%s\n' "$?"
+n=0
+while [ $n -lt 6 ] && ! gone "$netd"; do sleep 1; n=$((n+1)); done
+left=0
+gone "$netd" || left=$((left+1))
+printf 'DL35_NETD_GONE_RC=%s\n' "$left"
+left=0
+for p in $dhcp_pids $mdns_pids; do
+    gone "$p" || { left=$((left+1)); printf 'DL35_CHILD_STILL_RUNNING=%s\n' "$p"; }
+done
+printf 'DL35_CHILDREN_LEFT=%s\n' "$left"
+printf 'DL35_PS\n'
+ps -A 2>&1 | grep -e sf-netd -e sf-dhcp -e mdnsd -e wifiutil | grep -v grep
+ls /var/run 2>&1
+
+printf 'DL35_NETD_LOG\n'
+cat "$log" 2>&1
+wifiutil info 2>&1
+printf 'DL35_NETD_END_%s\n' "$nonce"

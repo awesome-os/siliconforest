@@ -1,0 +1,38 @@
+xnu: AppleARMSMP passes the reset vector to IOPMGR::enableCPUCore
+
+PE_cpu_start_internal() gave the power manager a reset-vector address only on
+APPLEVIRTUALPLATFORM and 0 everywhere else, because on Apple's boot chain iBoot locks every
+core's RVBAR before xnu runs. Under m1n1 (chainloaded, or its hypervisor) RVBAR is left
+writable and may hold something else, so the IOPMGR that releases the core must be able to
+check and set it; it cannot name the address itself, LowResetVectorBase is not exported.
+
+Pass ml_static_vtop(&LowResetVectorBase), the address osfmk/arm64/cpu.c already hands to
+the monitor (MONITOR_SET_ENTRY). An IOPMGR that ignores the argument behaves as before.
+UPSTREAM: yes.
+
+--- a/src/Kernel/xnu/iokit/Kernel/arm/AppleARMSMP.cpp
++++ b/src/Kernel/xnu/iokit/Kernel/arm/AppleARMSMP.cpp
+@@ -56,6 +56,8 @@
+ // FIXME: These are in <kern/misc_protos.h> but that file has other deps that aren't being resolved
+ extern "C" void console_suspend();
+ extern "C" void console_resume();
++// osfmk/arm/cpu_data_internal.h; start.s places the reset vector at this page
++extern "C" unsigned int LowResetVectorBase;
+ 
+ static PassthruInterruptController *gCPUIC;
+ static IOPMGR *gPMGR;
+@@ -279,7 +281,13 @@
+ 	extern vm_offset_t reset_vector_vaddr;
+ 	gPMGR->enableCPUCore(cpu_id, ml_vtophys(reset_vector_vaddr));
+ #else /* APPLEVIRTUALPLATFORM */
+-	gPMGR->enableCPUCore(cpu_id, 0);
++	/*
++	 * SiliconForest: name the reset vector here as well. Where iBoot did not lock the
++	 * core's RVBAR to it (m1n1 leaves it writable, as its own src/smp.c relies on),
++	 * the IOPMGR has to check the register against this address, and write it, before
++	 * it releases the core.
++	 */
++	gPMGR->enableCPUCore(cpu_id, ml_static_vtop((vm_offset_t)&LowResetVectorBase));
+ #endif /* APPLEVIRTUALPLATFORM */
+ }
+ 

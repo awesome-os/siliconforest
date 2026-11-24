@@ -1,0 +1,104 @@
+drm/asahi: SiliconForest's Linux layer
+
+- gem.rs: no address_space behind a shmem GEM object here (m1-drm72 README assigns this
+  branch to the driver port); the held/charged accounting is kept.
+- mmu.rs: the firmware's `pagetables` region has no struct page on this kernel (memory the
+  boot loader reserved is outside xnu's managed memory), so every GPU reaches it through
+  ReservedTables, the mapping the driver already has for no-map regions.
+- stats_raw.rs: core::ffi::c_char is i8 on Apple targets and kernel::ffi::c_char is u8;
+  one pointer cast that is a no-op on Linux.
+UPSTREAM: the cast could go to the driver; the rest is SiliconForest only (cfg sf_lkpi).
+
+--- a/gem.rs
++++ b/gem.rs
+@@ -86,29 +86,34 @@
+ /// The same transitions charge and uncharge the held pages (see [`memacct`]): a held user object
+ /// counts towards the resident set of the process that created it.
+ pub(crate) fn set_mapping_held(gem: &Object, held: bool) {
+-    let raw = gem.as_raw();
+-    // SAFETY: `gem` keeps the GEM object alive. A shmem-backed object's `filp` and its
+-    // `f_mapping` are set at initialization and never change; imported objects have none.
+-    let mapping = unsafe {
+-        let filp = (*raw).filp;
+-        if filp.is_null() {
++    // SiliconForest: the layer has no `address_space` (`linux_file` has no `f_mapping`), so
++    // there is no mapping flag to set; the object is charged whether or not it has a `filp`.
++    #[cfg(not(sf_lkpi))]
++    {
++        let raw = gem.as_raw();
++        // SAFETY: `gem` keeps the GEM object alive. A shmem-backed object's `filp` and its
++        // `f_mapping` are set at initialization and never change; imported objects have none.
++        let mapping = unsafe {
++            let filp = (*raw).filp;
++            if filp.is_null() {
++                return;
++            }
++            (*filp).f_mapping
++        };
++        if mapping.is_null() {
+             return;
+         }
+-        (*filp).f_mapping
+-    };
+-    if mapping.is_null() {
+-        return;
+-    }
+-    // SAFETY: `flags` is the aligned flag word of the live mapping. The kernel updates it only
+-    // with atomic bit operations on the same word.
+-    let flags =
+-        unsafe { AtomicUsize::from_ptr(core::ptr::addr_of_mut!((*mapping).flags).cast::<usize>()) };
+-    let inaccessible = 1usize << kernel::bindings::mapping_flags_AS_INACCESSIBLE;
+-    let unevictable = 1usize << kernel::bindings::mapping_flags_AS_UNEVICTABLE;
+-    if held {
+-        flags.fetch_or(inaccessible | unevictable, Ordering::Relaxed);
+-    } else {
+-        flags.fetch_and(!inaccessible, Ordering::Relaxed);
++        // SAFETY: `flags` is the aligned flag word of the live mapping. The kernel updates it only
++        // with atomic bit operations on the same word.
++        let flags =
++            unsafe { AtomicUsize::from_ptr(core::ptr::addr_of_mut!((*mapping).flags).cast::<usize>()) };
++        let inaccessible = 1usize << kernel::bindings::mapping_flags_AS_INACCESSIBLE;
++        let unevictable = 1usize << kernel::bindings::mapping_flags_AS_UNEVICTABLE;
++        if held {
++            flags.fetch_or(inaccessible | unevictable, Ordering::Relaxed);
++        } else {
++            flags.fetch_and(!inaccessible, Ordering::Relaxed);
++        }
+     }
+     gem.charge.set_held(held);
+ }
+--- a/mmu.rs
++++ b/mmu.rs
+@@ -3665,6 +3665,21 @@
+         } else {
+             None
+         };
++        // SiliconForest: memory the boot loader reserved for the firmware is outside the kernel's
++        // managed memory on every SoC, so the `pagetables` region (the kernel root) has no
++        // `struct page`. It is reached through the same mapping `reserved_tables` uses.
++        #[cfg(sf_lkpi)]
++        let reserved = match reserved {
++            Some(tables) => Some(tables),
++            None => {
++                let mut tables = pgtable::ReservedTables::new();
++                let res = of_node.reserved_mem_region_to_resource_byname(c"pagetables")?;
++                // SAFETY: The boot loader reserved this region for the firmware's page tables;
++                // it stays reserved until reboot.
++                unsafe { tables.add(res)? };
++                Some(Arc::new(tables, GFP_KERNEL)?)
++            }
++        };
+ 
+         let inner = Self::make_inner(dev.clone(), firmware, quirks, reserved)?;
+ 
+--- a/stats_raw.rs
++++ b/stats_raw.rs
+@@ -484,7 +484,7 @@
+     }
+     // SAFETY: `unique` is a NUL terminated string owned by the DRM device,
+     // which outlives this read.
+-    let name = unsafe { core::ffi::CStr::from_ptr(unique) };
++    let name = unsafe { core::ffi::CStr::from_ptr(unique.cast()) };
+     name.to_str().unwrap_or("unknown")
+ }
+ 

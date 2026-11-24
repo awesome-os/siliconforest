@@ -1,0 +1,112 @@
+diff --git a/src/Libraries/libSystem/stub/CMakeLists.txt b/src/Libraries/libSystem/stub/CMakeLists.txt
+index 0c5dc6c3..e4b39341 100644
+--- a/src/Libraries/libSystem/stub/CMakeLists.txt
++++ b/src/Libraries/libSystem/stub/CMakeLists.txt
+@@ -27,1 +27,2 @@ target_sources(libSystem_B_stub PRIVATE
+     sf_libSystem_init.c
++    sf_dirhelper.c
+diff --git a/src/Libraries/libSystem/stub/sf_dirhelper.c b/src/Libraries/libSystem/stub/sf_dirhelper.c
+new file mode 100644
+index 00000000..49b6f296
+--- /dev/null
++++ b/src/Libraries/libSystem/stub/sf_dirhelper.c
+@@ -0,0 +1,78 @@
++// sf_dirhelper.c - per-user local, temporary and cache directories, which confstr hands out
++// Copyright (c) 2026 The PureDarwin Project, SPDX-License-Identifier: MPL-2.0 OR BSD-2-Clause
++
++// per-user temporary folders, /private/var/folders/pd/<uid>/{0,T,C}/, named by uid
++// the shared parent is sticky and world-writable like /tmp, so each user creates their own
++#include <errno.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#define SF_FOLDERS "/private/var/folders/sf"
++
++enum {
++    DIRHELPER_USER_LOCAL = 0,
++    DIRHELPER_USER_LOCAL_TEMP,
++    DIRHELPER_USER_LOCAL_CACHE,
++};
++
++static char userDirSuffix[256];
++
++// a process names its own subdirectory of the temporary and cache directories, once, before using them
++bool _set_user_dir_suffix(const char *suffix)
++{
++    if (suffix == NULL) {
++        userDirSuffix[0] = 0;
++        return true;
++    }
++    if (*suffix == 0 || strchr(suffix, '/') || strcmp(suffix, ".") == 0 || strcmp(suffix, "..") == 0 ||
++        strlen(suffix) >= sizeof(userDirSuffix)) {
++        errno = EINVAL;
++        return false;
++    }
++    strlcpy(userDirSuffix, suffix, sizeof(userDirSuffix));
++    return true;
++}
++
++static bool makeDirectory(const char *path, mode_t mode)
++{
++    struct stat st;
++
++    if (mkdir(path, mode) == 0)
++        return chmod(path, mode) == 0 || errno == EPERM;
++    return errno == EEXIST && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
++}
++
++char *_dirhelper(int which, char *path, size_t pathlen)
++{
++    static const char *const leaves[] = { "0", "T", "C" };
++    char user[64];
++    int length;
++
++    if (which < DIRHELPER_USER_LOCAL || which > DIRHELPER_USER_LOCAL_CACHE || path == NULL) {
++        errno = EINVAL;
++        return NULL;
++    }
++    snprintf(user, sizeof(user), SF_FOLDERS "/%u", (unsigned)geteuid());
++    if (!makeDirectory("/private/var/folders", 0755) || !makeDirectory(SF_FOLDERS, 01777) || !makeDirectory(user, 0700))
++        return NULL;
++    length = snprintf(path, pathlen, "%s/%s/", user, leaves[which]);
++    if (length < 0 || (size_t)length >= pathlen) {
++        errno = ENAMETOOLONG;
++        return NULL;
++    }
++    if (!makeDirectory(path, 0700))
++        return NULL;
++    if (which != DIRHELPER_USER_LOCAL && userDirSuffix[0]) {
++        length = snprintf(path, pathlen, "%s/%s/%s/", user, leaves[which], userDirSuffix);
++        if (length < 0 || (size_t)length >= pathlen) {
++            errno = ENAMETOOLONG;
++            return NULL;
++        }
++        if (!makeDirectory(path, 0700))
++            return NULL;
++    }
++    return path;
++}
+--- a/src/Libraries/libSystem/stub/sf_libSystem_init.c
++++ b/src/Libraries/libSystem/stub/sf_libSystem_init.c
+@@ -127,6 +127,9 @@
+ extern void sf_libdyld_tlv_initializer(void);
+ 
+ #include "../libc/darwin/libc_private.h"
++
++// sf_dirhelper.c, the per-user directories confstr hands out
++extern char *_dirhelper(int which, char *path, size_t pathlen);
+ extern void _malloc_fork_prepare(void);
+ extern void _malloc_fork_parent(void);
+ extern void _malloc_fork_child(void);
+@@ -295,7 +298,7 @@
+ 			.atfork_prepare = sf_atfork_prepare,
+ 			.atfork_parent = sf_atfork_parent,
+ 			.atfork_child = sf_atfork_child,
+-			.dirhelper = NULL,
++			.dirhelper = _dirhelper,
+ 		};
+ 		_libc_initializer(&libc_funcs, envp, apple, vars);
+ 	}

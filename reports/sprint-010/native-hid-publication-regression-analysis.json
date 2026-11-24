@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_FAILURE_ANALYSIS_NO_HARDWARE",
+  "subject": "Attempt 010 (candidate-010): 'PDHIDEventQueue: publication refused kind=1/2 attempts=60 error=3' (kPublishDevfs), no endpoint and no terminal. Root's record native-hid-hardware-attempt-010.json (FAILED_HID_PUBLICATION_REGRESSION_LINUX_VERIFIED) stands.",
+  "inputs": {
+    "console": "runs/m1-desktop-010/attempt-010/guest/console.bin, sha256 6412e15b8e09c2ea (matches console-result.json and root's record). Comparison: attempt-009 console b471ccab8ac63c28.",
+    "patched_source": "integrations/puredarwin/m1-native-input/after/.../PDHIDEventQueue.cpp dd2eb4e1 (the reviewed da499dd0 patch); baseline before/ c7a2f35b.",
+    "kernel_sources": "sources/puredarwin-m1-desktop: bsd_init.c d9467cd55e2290cb, IOStartIOKit.cpp ed140f2ca21d0ac9 (the same hashes as root's baseline snapshot), vfs_init.c, devfs_tree.c, devfs_vfsops.c, IOKitBSDInit.cpp, PDArmPlatformExpert.cpp 660e9a506649ff93, config/BSDKernel.exports."
+  },
+  "verdict": "Hypothesis (a) is confirmed by console order plus source: the whole 60-attempt budget ran inside bsd_init's IOKitInitializeTime, before vfsinit could set devfs_ready. Hypothesis (b) (devfs_is_ready ABI/semantics) is excluded. Hypothesis (c) (a shortened retry delay) is excluded by source and is consistent with the unchanged 78 s host boot time, but it is not directly measured, because the logs carry no monotonic time. The fix belongs in the publication lifecycle. The kernel waits must not change.",
+  "evidence": {
+    "console_order": [
+      "L464 'MAC Framework successfully initialized' (mac_policy_initbsd, bsd_init.c:581).",
+      "L466 'using 16384 buffer headers ...' (bsd_bufferinit, bsd_init.c:692). The only call between this and vfsinit is IOKitInitializeTime (bsd_init.c:697-702).",
+      "L471 'PDSerialHID: listening ...', then L475/L479 'publication deferred kind=1/2 attempt=1 error=3'. The request came from IOHIDEventService::start after bufinit, so at or after the start of IOKitInitializeTime.",
+      "L481/L483 'publication refused kind=1/2 attempts=60 error=3'.",
+      "L485 'MAC Framework enabling singlelabel support:  ->  ()'. This is the first console line printed inside vfsinit: the dead_mountp label (vfs_init.c:411-413, printed by mac_vfs.c:2280 under DEBUG). It runs right after the vfs_init loop (vfs_init.c:374) that calls devfs_init -> devfs_sinit -> devfs_ready = 1 (devfs_vfsops.c:110-112, devfs_tree.c:224).",
+      "So every attempt 1..60 ran before devfs_ready could be set. This is stronger than 'before BSD root': the refusals precede vfsinit itself.",
+      "Attempt 009 (old code) shows the same kernel sequence, with the same L477 dead-mount line before mbinit, and published only after DL11_TERMINAL_PRIME through the IOBSD notifier."
+    ],
+    "why_the_pre_devfs_window_is_long_on_m1": [
+      "IOKitInitializeTime (IOStartIOKit.cpp:73-95) waits up to 30 s for resource IORTC, then up to 30 s for the registry root to go quiet (waitQuiet), then initialises the calendar.",
+      "No IORTC exists on this target. PDArmPlatformExpert::startQemuRTC publishes IORTC only on qemuvirt-io, or when a 'pdtime' boot argument is present. The 010 boot arguments ('-v -s debug=0x14e ... pdtextboot=1') contain no pdtime, so the first wait always runs its full 30 s.",
+      "For 60 attempts at no less than 1 s spacing to end before vfsinit, the wait after the request must be at least ~56-59 s (see clock_delay below). So waitQuiet also ran close to or at its 30 s limit. This is an inference; the console has no IOKit busy/quiet message to confirm it."
+    ],
+    "host_timing": [
+      "File mtimes (1 s resolution, preserved by copy): before-start.json -> challenge-input.bin = 78 s in both attempt 009 (01:54:46 -> 01:56:04) and attempt 010 (02:35:55 -> 02:37:13). This matches root's birth-time table for 003-007 (challenge 77.82-77.89 s after console birth). The publication patch did not change boot length.",
+      "Kernel-to-host mapping from 009: kernel 123.302 s (IOGraphics '[IOFB?]::waitQuietController', right after DL10/publication) against desktop-input at before-start + 79 s gives kernel ~= host + 44 s, consistent with the earlier 42-44 s offset. In 010 the IOFB start line is kernel 55.306 s (~host +11 s), and the shell challenge is at host +78 s (~kernel 122 s). That leaves ~67 s from the publication request to the shell. A 60 s IOKitInitializeTime fits this; a short one would have made boot ~29 s shorter in every run since 003.",
+      "No per-attempt elapsed time exists. This receipt does not claim a measured 60 s budget or a measured 60 s wait."
+    ],
+    "devfs_abi_excluded": [
+      "devfs_is_ready() returns the static devfs_ready (devfs_tree.c:163-166), set only at devfs_tree.c:224 in devfs_sinit. It is exported in BSDKernel.exports:139.",
+      "The baseline used the identical 'extern \"C\" int devfs_is_ready(void)' (before/PDHIDEventQueue.cpp:17,224,282) and published successfully in qualified attempts 007-009. An unresolved symbol would have failed the KC link.",
+      "Error 3 is returned only by the '!devfs_is_ready()' check, after cdevsw_add succeeded (error 2 did not occur). That is exactly the expected value before vfsinit."
+    ],
+    "clock_delay_excluded_by_source": [
+      "The worker re-arms with clock_interval_to_deadline(1, kSecondScale, &deadline) (dd2eb4e1:327-331): now + 1e9 ns in absolute-time units. AbsoluteTime is UInt64 on LP64 KERNEL. The baseline 1 s retry and PDArmPlatformExpert's 10 s IORTC timer use the same call.",
+      "Thread-call deadlines can fire late (leeway, coalescing), never early.",
+      "Only a newly added request bit triggers an immediate re-run (pd_hid_request_publication returns early when no new bit is added), and there are at most 4 bits (keyboard, mouse, PS/2 aliases). So 60 attempts need at least ~56 delayed 1 s intervals.",
+      "If the kernel clock ran fast, IOKitInitializeTime's own 30 s timeouts would shrink too and boot would get shorter. It did not (78 s, as above)."
+    ],
+    "downstream": [
+      "The guest close supervisor 589e2485 printed DL11_TERMINAL_PRIME, waited 50 x 0.1 s for both nodes, then exited 1 silently (this script prints no failure marker). The prompt returned at L666-669.",
+      "The host sent 5 priming actions of 17 bytes. The schedule then hit 'Input schedule deadline expired', the controller saw NO_COMMAND_LINE_OBSERVED, and Linux recovery was verified. The failures stayed failures: no endpoint, no fake ACK, no input claim."
+    ]
+  },
+  "side_findings": [
+    {"id": "N1", "severity": "note", "text": "The current worker sets up storage and sets gQueueReady before the devfs check. In 010 the keyboard and mouse rings were therefore 'ready' from boot, with no node, and after the refusal gQueueReady stayed set. Pushes were enqueued into a queue nobody could open instead of being counted as early_drops. The console kick is safe before kminit: cons_cinput returns when km_tty[0] is NULL (bsd/dev/arm/km.c:397-404). It is harmless, but it hides how much input arrived before the endpoint existed."},
+    {"id": "N2", "severity": "note", "text": "cdevsw_add runs on attempt 1, before BSD init, and the major stays allocated with no node after a refusal. This is a harmless leak, and it disappears if rev002 does nothing until devfs is ready."},
+    {"id": "N3", "severity": "wording", "text": "Root's record says 'devfs_tree_init sets devfs_ready'. The function is devfs_sinit (devfs_tree.c:186, assignment at :224), called by devfs_init (devfs_vfsops.c:110) from vfsinit's vfs_init loop (vfs_init.c:374). The conclusion is unchanged."}
+  ],
+  "rev002_requirements": [
+    "R1 (core): the publication budget must not start before the readiness it measures. Split the worker into two phases. Phase W (devfs wait): the worker only checks devfs_is_ready(). It allocates nothing, adds no cdevsw entry, does not set gQueueReady, creates no node and consumes no attempts. Phase P (publish): starts when the worker first sees devfs_is_ready() true. Then storage, gQueueReady, cdevsw_add and devfs_make_node run in that order, with the existing 60 x 1 s budget for storage/major/node failures counted only from here.",
+    "R2 (bounded): Phase W gets its own time-based bound from the first request, measured with mach_absolute_time and not by counting attempts, so extra wake-ups neither extend nor shorten it. It must exceed the legitimate pre-vfsinit window: up to 60 s of IOKitInitializeTime plus any time a producer starts before bsd_init (about 11 s of early kernel under the HV here). A limit of at least 180 s is suggested. On expiry, log one 'publication refused kind=%u phase=devfs waited_ms=%llu error=3' and stop for this boot, as now.",
+    "R3 (single owner, no fake endpoint): keep the one ONCE thread call as the only publisher and readiness poller (1 s re-arm in both phases is fine). An IOBSD resource notifier is optional and not recommended: IOBSD is published only after devfs is ready (vfsinit at bsd_init.c:702 precedes bsd_autoconf at :808 -> IOKitBSDInit -> publishResource('IOBSD')), so it gains at most 1 s and brings back the re-entry surface rev001 removed. If one is used, its handler may only set a bit and thread_call_enter the owner. No node, success line or queue readiness may exist before devfs_is_ready().",
+    "R4 (measurement): add uptime to the logs. On the deferral line: 't_ms='. On the ready line: 'devfs_wait_ms= attempts= early_drops='. On both refusal kinds: 'phase= waited_ms='. The next capture then measures the pre-devfs window directly (closes F3 of native-input-publication-patch-review.json).",
+    "R5 (preserve): no change to IOKitInitializeTime, the IORTC wait, waitQuiet, pdtime or the platform expert. No fake RTC. I agree with root.",
+    "R6 (tests): extend test_publication.py with a fake clock. (i) devfs not ready for 75 s, then ready: published on the first poll after readiness with attempts=1 and devfs_wait_ms of at least 75000. (ii) devfs never ready: exactly one phase=devfs refusal at the bound, no node, gQueueReady clear. (iii) repeated or new requests during Phase W do not move the bound. (iv) after devfs is ready, a node failure is still refused at 60 attempts. (v) early pushes during Phase W increment early_drops and are not enqueued."
+  ],
+  "regression_rerun_expectations": "On a rev002 host-regression KC: the deferral(s) with phase W appear near the PDSerialHID start. 'published /dev/usb_hid_kbd', '/dev/usb_hid_mouse' and 'ready kind=1/2 attempts=1 devfs_wait_ms=~50000-70000' appear after the vfsinit dead-mount line and before BSD root. There is no refusal. Then the 009 terminal close workload qualifies as before. A devfs_wait_ms far below ~30000 would contradict the IORTC analysis and should be investigated, not accepted.",
+  "not_claimed": ["measured per-attempt timing", "measured IOKitInitializeTime duration", "rev002 source", "native keyboard input", "physical typing"],
+  "scope": "Read-only. Saved private capture, frozen patch and source snapshots only. No hardware, SSH, builds or edits outside this receipt."
+}

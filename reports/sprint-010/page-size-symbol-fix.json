@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "reviewer": "Grok",
+  "status": "LINK_FORWARDING_CONFIRMED_NO_RUNTIME_CLAIM",
+  "hardware_accessed": false,
+  "sources_edited": false,
+  "compiled_here": false,
+  "confirmed_commpage_bug": false,
+  "observation": {
+    "source": "root boot3 page-probe, numbers as reported this turn; full capture not bound here",
+    "sizeof_vm_address_t": 8,
+    "sizeof_vm_size_t": 8,
+    "sizeof_void_star": 8,
+    "getpagesize": 16384,
+    "sysconf_sc_pagesize": 16384,
+    "host_page_size": 16384,
+    "vm_page_size": 4096,
+    "vm_page_mask": 16383,
+    "vm_page_shift": 14,
+    "vm_kernel_page_size": 16384,
+    "vm_kernel_page_mask": 16383,
+    "vm_kernel_page_shift": 14,
+    "mprotect_16k_offset_0": "success",
+    "mprotect_16k_offset_4096": "EINVAL 22",
+    "mprotect_16k_offset_8192": "EINVAL 22",
+    "vm_protect_offsets_0_4096_8192": "success",
+    "restores_and_munmap": "success"
+  },
+  "symbol_ownership": [
+    "pd_libSystem_compat.c:711 is a strong definition, vm_size_t vm_page_size = 4096. It does not define vm_page_mask, vm_page_shift, or any vm_kernel_page_* symbol. The same line is in puredarwin-baseline and puredarwin-m1-desktop. libSystem.exports lists _vm_page_size.",
+    "libsystem_kernel mach_init.c:82-84 is the other strong definition: vm_page_size, vm_page_mask, and vm_page_shift, all initialized to 0. Lines 144-155 set the kernel trio from the commpage kernel shift. Lines 158-171, only when vm_page_shift is still 0, set vm_page_shift from USER_PAGE_SHIFT_64 on arm64, then vm_page_size = 1 << vm_page_shift, then vm_page_mask = vm_page_size - 1. The mask store can use the register just computed; it does not have to reload whatever _vm_page_size the rest of the process exports.",
+    "__libkernel_init calls mach_init before pd_libSystem_initializer reaches __malloc_init. The assignment runs. It is not skipped.",
+    "dyld glue.c vm_page_size = 0x1000 is inside TARGET_OS_SIMULATOR. It is not a device definition.",
+    "getpagesize is sysctl HW_PAGESIZE, not a read of vm_page_size. sysconf(_SC_PAGESIZE) calls getpagesize. host_page_size in this mach_init.c returns vm_kernel_page_size and does not trap. Those three agreeing on 16384 does not update the exported vm_page_size."
+  ],
+  "what_the_numbers_require": "Shift 14 with mask 16383 and kernel size 16384 is the mach_init result of a commpage shift of 14. The exported vm_page_size stayed 4096, which is the compat initializer. One object cannot be both. The process read the compat _vm_page_size and the mach_init mask and shift. The commpage byte that produced shift 14 is consistent with the kernel trio, getpagesize, and the 16K mprotect alignment. It is not the stale size.",
+  "why_mprotect_matches": "round_page and libmalloc's user quanta use vm_page_size. mach_vm_round_page and the large quanta use the mask and vm_kernel_page_size. With the exported size left at 4096 and the kernel size at 16384, user rounding is 4K and the guard quantum is 16K. BSD mprotect rejects a start that is not aligned to the task map page. The live calls did that: a 16K-aligned start succeeded, and the +4096 and +8192 starts returned EINVAL. vm_protect realigns, so those three calls succeeded. That is the guard-warning shape. It is a consequence of the split symbol, not a separate commpage defect.",
+  "proposed_patch": {
+    "isolated_to": "src/Libraries/libSystem/stub/pd_libSystem_compat.c",
+    "change": "Delete the definition vm_size_t vm_page_size = 4096. Leave mach_init.c, libSystem.exports, and the libdyld reexport unchanged.",
+    "do_not": [
+      "Do not hardcode 16384.",
+      "Do not change mach_init's assignment.",
+      "Do not change libmalloc, round_page, or the guard-page calls.",
+      "Do not edit getpagesize or host_page_size.",
+      "Do not silence the mvm_protect warning."
+    ],
+    "why_this_is_enough": "The compat definition was the local _vm_page_size. The rebuilt libSystem.B.dylib no longer defines it. nm shows _vm_page_size undefined from libdyld and indirect external, and the export trie re-exports it from libdyld. _mach_init stays undefined from libdyld. That is link forwarding to the existing libdyld object. It is not a new local copy.",
+    "link_note": "The earlier claim that -u,_vm_page_size would pull mach_init.o into libSystem is withdrawn. The rebuilt binary does not define _mach_init or _vm_page_size."
+  },
+  "link_result": {
+    "output": "/nix/store/5w1bfvwqap58q6nnr12bfv3r2isryaw2-puredarwin-libsystem-pagesize-0.1",
+    "libSystem_B_sha256": "8ff49e0c2a5f1c6532101c7ed662632444cc97ae9669479090e7968deddd12ff",
+    "nm_vm_page_size": "undefined from libdyld; indirect external",
+    "exports_trie": "re-export _vm_page_size from libdyld",
+    "nm_mach_init": "undefined from libdyld",
+    "local_vm_page_size_definition": false,
+    "runtime_fix_claimed": false
+  },
+  "not_part_of_this_fix": "The checked-in libSystem.exports names _vm_page_size, _vm_kernel_page_size, and _vm_kernel_page_mask. It does not name _vm_page_mask, _vm_page_shift, or _vm_kernel_page_shift. The live probe read those anyway, so the image it bound provided them. This agent did not nm the booted dylib. Adding export lines is not the fix for the value 4096.",
+  "limits": "Link forwarding is confirmed on root's SDK output above. No guest run of the patched libSystem is claimed, and the malloc warning is not claimed gone. This agent did not build or touch hardware. CMake and the export list were not changed."
+}

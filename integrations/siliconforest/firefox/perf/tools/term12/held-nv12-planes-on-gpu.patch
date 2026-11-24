@@ -1,0 +1,53 @@
+--- a/src/Frameworks/QuartzCore/CARenderer.m
++++ b/src/Frameworks/QuartzCore/CARenderer.m
+@@ -518,6 +518,41 @@
+    surfaceAPI.unlock(surface,1,NULL);
+ }
+ 
++/* (TERM12, CODEX's request) A video surface's planes bound on the GPU instead of copied by the CPU: the CGL entry
++ * CGLPDBindNV12PlaneTexture(surface, plane) (CODEX-FX's) binds plane 0 (as R8) or plane 1 (as RG8) of a GPU-published
++ * 420v/420f surface to the GL_TEXTURE_2D bound now, on the GPU only, and answers 0 when it cannot (then nothing is
++ * bound and both planes go the CPU way). Until the CGL has the entry this is never taken. */
++static BOOL bindVideoPlanes(CFTypeRef surface,GLuint texture) {
++   static int (*bindPlane)(CFTypeRef,unsigned);
++   static int looked;
++   int kind=surfaceKind(surface);
++
++   if(!looked){
++    bindPlane=(int (*)(CFTypeRef,unsigned))dlsym(RTLD_DEFAULT,"CGLPDBindNV12PlaneTexture");
++    looked=1;
++   }
++   if(bindPlane==NULL || sfcaPlanesAsRG==0 || (kind!=CASurfaceYUV8Video && kind!=CASurfaceYUV8Full) ||
++      surfaceAPI.planeCount==NULL || surfaceAPI.planeCount(surface)!=2)
++    return NO;
++   glBindTexture(GL_TEXTURE_2D,texture);
++   if(!bindPlane(surface,0))
++    return NO;
++   glActiveTexture(GL_TEXTURE1);
++   glBindTexture(GL_TEXTURE_2D,chromaTextureFor(texture));
++   BOOL chroma=bindPlane(surface,1)!=0;
++   if(chroma){
++    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
++    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
++    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
++    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
++   }
++   glActiveTexture(GL_TEXTURE0);
++   glBindTexture(GL_TEXTURE_2D,texture);
++   if(chroma)
++    sfcaPlanesAsRG=1;
++   return chroma;
++}
++
+ // luma from unit 0, CbCr from unit 1 (L and A of a luminance-alpha texture), out through the layer's opacity
+ static const char *yuvFragmentSource=
+    "uniform sampler2D luma, chroma;\n"
+@@ -1570,7 +1605,7 @@
+     if(loadPixelData){
+         if(!surface)
+             CATexImage2DCGImage((CGImageRef)contents);
+-        else if(!bindDrawableSurface((CFTypeRef)contents))
++        else if(!bindDrawableSurface((CFTypeRef)contents) && !bindVideoPlanes((CFTypeRef)contents,texture))
+             CATexImage2DSurface((CFTypeRef)contents,texture);
+         noteTexture(texture,contents,seed);
+         if(sfcaDiag.on>0)

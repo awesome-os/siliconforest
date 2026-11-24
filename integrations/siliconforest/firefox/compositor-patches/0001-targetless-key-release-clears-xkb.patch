@@ -1,0 +1,37 @@
+--- a/crates/wm-darwin/src/input.rs
++++ b/crates/wm-darwin/src/input.rs
+@@ -889,6 +889,20 @@
+         }
+         if errors.is_empty(){Ok(())}else{Err(errors.join("; "))}
+     }
++    /// Cancel a key this virtual request held after its target disappeared.
++    /// Update xkb/pressed-key state without forwarding into another client.
++    fn release_targetless_virtual_key(&mut self,evdev:u32)->Result<(),String>{
++        let input=self.input.as_mut().ok_or("no SFHID seat")?;
++        if !input.virt_keys.remove(&evdev){return Err(format!("synthetic key {evdev} released while not held: dropped"));}
++        input.suppressed_keys.remove(&evdev);
++        let keyboard=input.keyboard.clone();
++        keyboard.input_intercept(self,(evdev+8).into(),KeyState::Released,|s,m,_|{
++            s.input.as_mut().unwrap().modifiers=modifiers(m);
++        });
++        let input=self.input.as_mut().unwrap();
++        if input.virt_keys.is_empty() && input.kb_lent.take().is_some(){self.sync_input_focus();}
++        Ok(())
++    }
+     /// Deliver one event on the instrument's pointer (its own place and buttons; never drawn) or as one
+     /// of its keys (to its target window).
+     pub fn deliver_virtual(&mut self,event:Event,time:u32)->Result<(),String>{
+@@ -906,11 +920,12 @@
+                     // the window went in the middle of the request: the rest of its keys go nowhere
+                     let input=self.input.as_mut().unwrap();
+                     input.key_target=None;
+-                    if input.kb_lent.take().is_some() {eprintln!("WMINJECT the synthetic keys' window went (destroyed, unmapped or its client gone): the rest of the request's keys are dropped");}
++                    if input.kb_lent.is_some() {eprintln!("WMINJECT the synthetic keys' window went: presses dropped, held keys canceled locally before restoring focus");}
+                 }
+                 // DESK8: never to whatever window has the focus (TERM8, 23:56Z: its target window had gone and its
+                 // keys went into the desk's terminal): without a live target the instrument's keys are dropped
+                 if target.is_none() {
++                    if !down{return self.release_targetless_virtual_key(evdev);}
+                     return Err(format!("the synthetic keys have no target window (press in it first, or `target <id>`; the last one is gone or none was pressed in this request{}): key not delivered", if active { "; the owner is active" } else { "" }));
+                 }
+                 if let Some(target)=target {

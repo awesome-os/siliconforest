@@ -1,0 +1,105 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Unattended speaker check for SFAppleSound.
+#   bringup   the four amplifiers identified; state, limit and registers
+#   tone      @SECONDS@ s of the kernel test tone at @SPKDB@ dB below full scale, monitored: stream
+#             and sense capture counters, registers read back, sense statistics, the model
+#   writer    two seconds of silence through /dev/sfspeaker
+#   both      headphones and speakers playing at once
+#   idle      the model cooling for ten seconds without playback
+#   shutdown  the fault path, forced three times: amplifiers off, then speakers disabled
+# What can be heard depends on the kernel: with the model watching only, every volume is
+# held at -100 dB and nothing is audible. With the model in charge, this script first sets
+# kern.sf_speaker.hold_probe=1, which keeps the volume 20 dB down for good, so the tone
+# leaves the amplifiers at @SPKDB@ + 20 dB below full scale: with the default 22 that is
+# -42 dB, about 65 mV, a faint tone for @SECONDS@ seconds. It is just loud enough for the sense
+# channels to show it, which is the point: "sense data follows the signal" in the log.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nSD_BEGIN_%s\n' "$nonce"
+t0=$(date +%s)
+now() { echo $(( $(date +%s) - t0 )); }
+phase() { printf 'SD_PHASE %s t=%s\n' "$1" "$(now)"; }
+get() { sysctl -n "$1" 2>/dev/null; }
+mon() {
+    printf 'SD_SPK %s t=%s playing=%s unlocked=%s limit_steps=%s volume_steps=%s sense_trusted=%s periods=%s sense_periods=%s rate_mhz=%s trips=%s\n' \
+        "$1" "$(now)" "$(get kern.sf_speaker.playing)" "$(get kern.sf_speaker.unlocked)" "$(get kern.sf_speaker.limit_steps)" \
+        "$(get kern.sf_speaker.volume_steps)" "$(get kern.sf_speaker.sense_trusted)" "$(get kern.sf_speaker.periods)" \
+        "$(get kern.sf_speaker.sense_periods)" "$(get kern.sf_speaker.rate_mhz)" "$(get kern.sf_speaker.trips)"
+    printf 'SD_SPK_STATE %s %s\n' "$1" "$(get kern.sf_speaker.state)"
+    printf 'SD_SPK_VOLUME %s %s\n' "$1" "$(get kern.sf_speaker.volume)"
+    printf 'SD_SPK_SENSE %s %s\n' "$1" "$(get kern.sf_speaker.sense)"
+    printf 'SD_SPK_MODEL %s %s\n' "$1" "$(get kern.sf_speaker.model)"
+}
+idle() {
+    n=0
+    while [ "$(get "$1")" = 1 ] && [ "$n" -lt "$2" ]; do sleep 1; n=$((n+1)); done
+    [ "$(get "$1")" = 1 ] && printf 'SD_FAIL %s still 1 after %s s\n' "$1" "$2"
+}
+
+phase bringup
+n=0
+while [ "$n" -lt 40 ]; do
+    case "$(get kern.sf_speaker.state)" in idle*|failed*|disabled*) break;; esac
+    sleep 1; n=$((n+1))
+done
+mon bringup
+ls -l /dev/sfspeaker /dev/sfspeaker-safety 2>&1
+case "$(get kern.sf_speaker.state)" in
+idle*) ;;
+*)  printf 'SD_FAIL the speakers are not available\n'
+    sysctl kern.sf_speaker kern.sf_sound.state 2>&1
+    printf 'SD_END_%s\n' "$nonce"; printf '\nPD_BENCH_DONE\n'; exit 0;;
+esac
+
+# every tone of this script stays 20 dB under the model's limit, whatever the sense data says
+sysctl -w kern.sf_speaker.hold_probe=1 2>&1
+[ "$(get kern.sf_speaker.hold_probe)" = 1 ] || {
+    printf 'SD_FAIL the probe volume cannot be held: nothing is played\n'
+    printf 'SD_END_%s\n' "$nonce"; printf '\nPD_BENCH_DONE\n'; exit 0
+}
+
+phase tone
+sysctl -w kern.sf_speaker.tone_db=@SPKDB@ kern.sf_speaker.tone=@SECONDS@ 2>&1
+n=0; while [ "$n" -lt @SECONDS@ ]; do sleep 1; n=$((n+1)); mon tone; done
+idle kern.sf_speaker.playing 10
+mon tone-end
+
+phase writer
+dd if=/dev/zero bs=4096 count=94 2>/dev/null > /dev/sfspeaker
+idle kern.sf_speaker.playing 10
+mon writer-end
+
+phase both
+sysctl -w kern.sf_sound.volume_db=@VOLUME@ kern.sf_sound.tone_db=@TONEDB@ kern.sf_sound.tone=4 kern.sf_speaker.tone=3 2>&1
+sleep 3
+mon both
+printf 'SD_BOTH headphones playing=%s periods=%s rate_mhz=%s late=%s\n' "$(get kern.sf_sound.playing)" \
+    "$(get kern.sf_sound.periods)" "$(get kern.sf_sound.rate_mhz)" "$(get kern.sf_sound.late)"
+idle kern.sf_speaker.playing 10; idle kern.sf_sound.playing 10
+mon both-end
+
+phase idle
+sleep 10
+mon idle
+
+phase shutdown
+# the fault path, three times: each stops the stream and puts the amplifiers into hardware
+# shutdown; after the third the speakers stay off until the next boot
+c=0
+while [ "$c" -lt 3 ]; do
+    sysctl -w kern.sf_speaker.tone=3 > /dev/null 2>&1
+    sleep 2
+    sysctl -w kern.sf_speaker.test_shutdown=1 2>&1
+    sleep 1
+    c=$((c+1)); mon shutdown-$c
+done
+sysctl -w kern.sf_speaker.tone=2 2>&1
+sleep 1; mon after-disable
+
+phase end
+sysctl kern.sf_speaker 2>&1
+sysctl kern.sf_sound.state kern.sf_sound.i2c_errors kern.sf_sound.dart_faults kern.sf_sound.jack_irqs 2>&1
+printf 'SD_END_%s\n' "$nonce"
+printf '\nPD_BENCH_DONE\n'

@@ -1,0 +1,2171 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 6a7cf98..595aaa2 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -3503,6 +3503,7 @@ version = "0.7.2"
+ dependencies = [
+  "chonk-shell",
+  "libc",
++ "png 0.18.1",
+  "smithay",
+  "tempfile",
+  "tiny-skia",
+diff --git a/crates/chonk-shell/src/shell.rs b/crates/chonk-shell/src/shell.rs
+index 692308f..3e055bb 100644
+--- a/crates/chonk-shell/src/shell.rs
++++ b/crates/chonk-shell/src/shell.rs
+@@ -2171,9 +2171,15 @@ impl<B: Backend + PopupHost<PopupId = B::ShellId>> Shell<B> {
+                     let at = self.pointer_root;
+                     self.desktop.open_root_menu(wm.backend_mut(), &self.theme, at);
+                 }
+-                _ => b.refuse("action unsupported in standalone"),
++                // The window manager's own verbs (Spaces, maximize, full screen,
++                // focus, Overview, capture, ...) are carried out as on every other
++                // session, below; nothing that starts a program or reloads.
++                other if crate::startup::standalone_darwin_supports(other) => {}
++                _ => { b.refuse("action unsupported in standalone"); return ShellOutcome::Continue; }
++            }
++            if matches!(action, Action::SpawnTerminal | Action::Close | Action::RootMenu) {
++                return ShellOutcome::Continue;
+             }
+-            return ShellOutcome::Continue;
+         }
+         match action {
+             Action::Help => {
+diff --git a/crates/chonk-shell/src/startup.rs b/crates/chonk-shell/src/startup.rs
+index 12b57e4..6d10099 100644
+--- a/crates/chonk-shell/src/startup.rs
++++ b/crates/chonk-shell/src/startup.rs
+@@ -270,12 +270,7 @@ impl SessionState {
+         // windows come back through their desktop miniwindows.
+         let base_theme = wm_theme::default_theme::nextstep_classic();
+         let style = base_theme.resolve_style(wm_theme_api::DecorationStyle::WindowMaker);
+-        let keybindings = vec![
+-            (KeyCombo { keysym: 0xff0d, modifiers: Modifiers::SUPER }, Action::SpawnTerminal),
+-            (KeyCombo { keysym: u32::from(b'q'), modifiers: Modifiers::SUPER }, Action::Close),
+-            // Command-Space: the desktop menu (and its settings) from the keyboard.
+-            (KeyCombo { keysym: 0x20, modifiers: Modifiers::SUPER }, Action::RootMenu),
+-        ];
++        let keybindings = standalone_darwin_keybindings();
+         let bindings = keybindings.iter().map(|(combo, action)| wm_config::Binding {
+             combo:*combo, action:action.clone(), description:None, locked:false, repeating:false, release:false,
+         }).collect();
+@@ -298,7 +293,13 @@ impl SessionState {
+             omarchy_bar:None, decorations:config.decorations, drag_modifier:None, float_policy:None,
+             reads_hyprland_config:false, session_env:vec![], commands:Default::default(), terminal:None,
+             autostart:vec![], bindings, layer_bindings:Default::default(), switch_bindings:vec![],
+-            input, interaction:config.interaction, monitor_rules:vec![],
++            // Spaces with ordinary (Omarchy) keys: the owner's Linux session
++            // (`interaction_mode = "spaces"`, `keyboard_mode = "desktop"`).
++            input, interaction:wm_core::InteractionConfig {
++                mode: wm_core::InteractionMode::Spaces,
++                keyboard_mode: Some(wm_core::KeyboardMode::Desktop),
++                ..config.interaction
++            }, monitor_rules:vec![],
+             default_layout:Some(wm_core::LayoutMode::Freeform), workspace_layouts:Default::default(),
+             keybindings, config_diagnostics:vec![], motion:config.motion,
+         }
+@@ -1439,3 +1440,82 @@ mod continuation_tests {
+         assert!(super::session_continues(), "the answer is settled once and stays settled");
+     }
+ }
++
++/// What the standalone (Darwin) desk carries out from the keyboard: the
++/// window manager's own verbs. Programs are started only through the managed
++/// launcher (`SpawnTerminal`), so `run <command>`, reload and restart have no
++/// place here; nor have the second-monitor verbs on a single panel.
++pub fn standalone_darwin_supports(action: &Action) -> bool {
++    use wm_config::CaptureMode as C;
++    match action {
++        Action::Capture(mode) => matches!(mode, C::Screen | C::ScreenClipboard | C::Window | C::WindowClipboard | C::Area | C::AreaClipboard),
++        Action::Run(_) | Action::Reload | Action::Restart | Action::GlobalShortcut(_)
++        | Action::FocusMonitor(_) | Action::MoveWorkspaceToMonitor(_) | Action::ToggleOpaque
++        | Action::ForceQuitApplications => false,
++        _ => true,
++    }
++}
++
++/// The standalone desk's keys: the owner's Linux table, i.e. the Omarchy
++/// keymap (`wm_config::preset::omarchy_keybindings`, what `desktop =
++/// "omarchy"` selects) with Super being the Mac keyboard's Command key,
++/// limited to what the standalone desk carries out; the owner's own override
++/// (Super-O: Overview); Command-Space for the desktop menu (the launcher on
++/// this desk); and the Mac profile's global commands
++/// (`wm_config::preset::MAC_BINDINGS`) on chords the Omarchy table leaves
++/// free: Command-Q quits the application, Command-M miniaturizes, Command-H
++/// hides, Command-grave cycles an application's windows. The Mac profile's
++/// Control-arrows, F3 and F11 are left out: the owner's Linux table does not
++/// take them from applications.
++pub fn standalone_darwin_keybindings() -> Vec<(KeyCombo, Action)> {
++    let mut out: Vec<(KeyCombo, Action)> = Vec::new();
++    let put = |out: &mut Vec<(KeyCombo, Action)>, combo: KeyCombo, action: Action, replace: bool| {
++        if let Some(slot) = out.iter_mut().find(|(c, _)| *c == combo) {
++            if replace { slot.1 = action; }
++        } else {
++            out.push((combo, action));
++        }
++    };
++    for (combo, action) in wm_config::preset::omarchy_keybindings() {
++        if standalone_darwin_supports(&action) {
++            put(&mut out, combo, action, false);
++        }
++    }
++    let key = |spec: &str| wm_config::parse_key(spec).unwrap_or_else(|| panic!("standalone key spec {spec:?} must parse"));
++    put(&mut out, key("super+o"), Action::Overview, true);
++    put(&mut out, key("super+space"), Action::RootMenu, true);
++    put(&mut out, key("super+return"), Action::SpawnTerminal, true);
++    // The Linux capture toolbar (Command-Control-Shift-5) is not built here: the chord takes
++    // the focused window instead, one of the toolbar's modes.
++    put(&mut out, key("super+ctrl+shift+5"), Action::Capture(wm_config::CaptureMode::Window), true);
++    let skip = ["ctrl+up", "ctrl+down", "ctrl+left", "ctrl+right", "f3", "f11", "cmd+f3"].map(key);
++    for (combo, action) in wm_config::preset::mac_keybindings(wm_config::preset::Desktop::Chonkstep) {
++        if standalone_darwin_supports(&action) && !skip.contains(&combo) {
++            put(&mut out, combo, action, false);
++        }
++    }
++    out
++}
++
++#[cfg(test)]
++mod standalone_darwin_key_tests {
++    #[test]
++    fn the_standalone_key_table_builds() {
++        let table = super::standalone_darwin_keybindings();
++        assert!(table.len() > 40, "{}", table.len());
++        let state = super::SessionState::standalone_darwin();
++        assert!(state.interaction.spaces_mode());
++    }
++}
++
++#[cfg(test)]
++mod standalone_darwin_key_dump {
++    /// `cargo test -p chonk-shell standalone_key_table_dump -- --ignored --nocapture`: the table.
++    #[test]
++    #[ignore]
++    fn standalone_key_table_dump() {
++        for (combo, action) in super::standalone_darwin_keybindings() {
++            println!("KEY {:?} {:#x} {:?}", combo.modifiers, combo.keysym, action);
++        }
++    }
++}
+diff --git a/crates/wm-darwin/Cargo.toml b/crates/wm-darwin/Cargo.toml
+index 417a3cd..511286d 100644
+--- a/crates/wm-darwin/Cargo.toml
++++ b/crates/wm-darwin/Cargo.toml
+@@ -7,7 +7,7 @@ description = "Experimental Chonkstep CPU Wayland compositor for SiliconForest PDGO
+ 
+ [features]
+ default = []
+-darwin-backend = ["dep:smithay", "dep:wm-core", "dep:wm-theme", "dep:wm-theme-api", "dep:tiny-skia", "dep:libc"]
++darwin-backend = ["dep:smithay", "dep:wm-core", "dep:wm-theme", "dep:wm-theme-api", "dep:tiny-skia", "dep:libc", "dep:png"]
+ desktop-shell = ["darwin-backend", "dep:chonk-shell", "dep:wm-config"]
+ # Root links the frozen, reviewed-source C object explicitly. This does not
+ # establish Darwin FD-whitelist runtime admission. The separate desktop binary
+@@ -25,6 +25,7 @@ wm-theme = { path = "../wm-theme", optional = true }
+ wm-theme-api = { path = "../wm-theme-api", optional = true }
+ tiny-skia = { version = "0.11", optional = true }
+ libc = { version = "0.2", optional = true }
++png = { version = "0.18", optional = true }
+ chonk-shell = { path = "../chonk-shell", optional = true }
+ wm-config = { path = "../wm-config", optional = true }
+ 
+diff --git a/crates/wm-darwin/src/activation.rs b/crates/wm-darwin/src/activation.rs
+new file mode 100644
+index 0000000..47862aa
+--- /dev/null
++++ b/crates/wm-darwin/src/activation.rs
+@@ -0,0 +1,47 @@
++//! `xdg_activation_v1`: an application asks for one of its windows to come forward (AppKit's
++//! -makeKeyAndOrderFront: through libWindowServer: Command-`, the Window menu, a new window of
++//! the active application, un-minimising). The rule against stealing focus: the token must have
++//! been asked for by the client that has the keyboard now (its focused window's client), or carry
++//! the serial of an input event no older than ten seconds; anything else is refused and logged.
++//! The window then comes forward as an activation from a pager does (wm-core's
++//! ActivateRequested: deminiaturize, focus, raise), on its own Space (which is shown).
++use smithay::reexports::wayland_server::{protocol::wl_surface::WlSurface, Resource};
++use smithay::wayland::xdg_activation::{XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData};
++use wm_core::BackendEvent;
++
++use crate::server::Server;
++
++impl XdgActivationHandler for Server {
++    fn activation_state(&mut self) -> &mut XdgActivationState {
++        &mut self.activation
++    }
++    fn request_activation(&mut self, token: XdgActivationToken, data: XdgActivationTokenData, surface: WlSurface) {
++        let Some(window) = self.wm.backend().window_for_surface(&surface) else {
++            self.activation.remove_token(&token);
++            return;
++        };
++        let focused_client = self
++            .wm
++            .focused_client()
++            .and_then(|id| self.wm.client(id))
++            .and_then(|c| self.wm.backend().windows.get(&c.window))
++            .and_then(|w| w.surface.wl_surface().client())
++            .map(|c| c.id());
++        let from_focused = data.client_id.is_some() && data.client_id == focused_client;
++        let recent = data.serial.is_some() && data.timestamp.elapsed() < std::time::Duration::from_secs(10);
++        let allowed = from_focused || recent;
++        eprintln!("WMACTIVATE window={window} from_focused_client={from_focused} recent_serial={recent} allowed={allowed}");
++        if allowed {
++            if let Some(client) = self.wm.client_for_window(window) {
++                if let Some(space) = self.wm.client(client).map(|c| c.workspace) {
++                    if space != self.wm.current_workspace() {
++                        self.wm.switch_workspace(space);
++                    }
++                }
++            }
++            self.wm.dispatch(BackendEvent::ActivateRequested(window));
++        }
++        self.activation.remove_token(&token);
++    }
++}
++smithay::delegate_xdg_activation!(Server);
+diff --git a/crates/wm-darwin/src/capture.rs b/crates/wm-darwin/src/capture.rs
+new file mode 100644
+index 0000000..6a373e0
+--- /dev/null
++++ b/crates/wm-darwin/src/capture.rs
+@@ -0,0 +1,486 @@
++//! Screenshots: a feature of the desktop, separate from the test-only inject module.
++//!
++//! What starts a capture, and nothing else:
++//! - the desktop's own keys (`Action::Capture`, bound as on the owner's Linux session:
++//!   Command-Control-Shift-3 the screen, -4 an area, Command-Shift-... see the hand-over doc), and
++//! - a request on the socket `capture` in the session's runtime directory (`screencapture`,
++//!   the compositor binary run with `--screencapture`). The directory is the session's own
++//!   (mode 0700, root's); the socket is mode 0600, and a connection is served only when the
++//!   peer's effective uid (`getpeereid`) is the compositor's own. No file anywhere can start
++//!   a capture: a request is a live connection from a process of the desktop's own user.
++//!
++//! The picture is the scene as the compositor composes it, without the pointer. Keyed captures
++//! are saved as PNG to `$HOME/Pictures/Screenshots` (mode 0600, never replacing a file) and put
++//! on the clipboard as `image/png` (the `...Clipboard` variants: the clipboard only), as the
++//! Linux session does in desktop mode; a notice says where it went. A socket request gets the
++//! PNG back on the connection; the client writes the file.
++use crate::server::Server;
++use std::collections::VecDeque;
++use std::io::{Read, Write};
++use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
++use std::os::unix::io::AsRawFd;
++use std::os::unix::net::{UnixListener, UnixStream};
++use std::path::{Path, PathBuf};
++use std::sync::Arc;
++use std::time::{Duration, Instant};
++use wm_core::{Backend, Point, Rect, Size};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Target {
++    Screen,
++    Window,
++    Area(Rect),
++}
++
++pub(crate) struct Request {
++    target: Target,
++    file: bool,
++    clipboard: bool,
++    reply: Option<UnixStream>,
++}
++
++struct AreaSelect {
++    file: bool,
++    clipboard: bool,
++    start: Option<Point>,
++    outline: Vec<u64>,
++}
++
++struct Client {
++    stream: UnixStream,
++    line: Vec<u8>,
++    since: Instant,
++}
++
++#[derive(Default)]
++pub struct Captures {
++    pending: VecDeque<Request>,
++    area: Option<AreaSelect>,
++    listener: Option<UnixListener>,
++    clients: Vec<Client>,
++    pub taken: u64,
++}
++
++impl Captures {
++    /// The request socket, in the session's runtime directory.
++    pub fn listen(&mut self, path: &Path) -> Result<(), String> {
++        let _ = std::fs::remove_file(path);
++        let listener = UnixListener::bind(path).map_err(|e| format!("capture socket {}: {e}", path.display()))?;
++        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
++        listener.set_nonblocking(true).map_err(|e| e.to_string())?;
++        eprintln!("WMCAPTURE socket={} (peer uid must be {})", path.display(), unsafe { libc::geteuid() });
++        self.listener = Some(listener);
++        Ok(())
++    }
++    pub fn selecting(&self) -> bool {
++        self.area.is_some()
++    }
++}
++
++#[cfg(not(target_os = "linux"))]
++fn peer_uid(stream: &UnixStream) -> Option<u32> {
++    let (mut uid, mut gid) = (0 as libc::uid_t, 0 as libc::gid_t);
++    (unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) } == 0).then_some(uid)
++}
++/// (Host tests on Linux: the same question through SO_PEERCRED.)
++#[cfg(target_os = "linux")]
++fn peer_uid(stream: &UnixStream) -> Option<u32> {
++    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
++    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
++    (unsafe { libc::getsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len) } == 0).then_some(cred.uid)
++}
++
++/// One request line: `screen`, `window`, or `rect <x> <y> <w> <h>` (panel pixels).
++fn parse_request(line: &str) -> Option<Target> {
++    let words: Vec<&str> = line.split_whitespace().collect();
++    match words.as_slice() {
++        ["screen"] => Some(Target::Screen),
++        ["window"] => Some(Target::Window),
++        ["rect", x, y, w, h] => {
++            let (x, y, w, h) = (x.parse().ok()?, y.parse().ok()?, w.parse::<u32>().ok()?, h.parse::<u32>().ok()?);
++            (w > 0 && h > 0).then(|| Target::Area(Rect::new(Point::new(x, y), Size::new(w, h))))
++        }
++        _ => None,
++    }
++}
++
++fn local_stamp() -> String {
++    let now = unsafe { libc::time(std::ptr::null_mut()) };
++    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
++    unsafe { libc::localtime_r(&now, &mut tm) };
++    format!("{:04}-{:02}-{:02} at {:02}.{:02}.{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
++}
++
++fn screenshot_dir() -> PathBuf {
++    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/var/root"));
++    home.join("Pictures").join("Screenshots")
++}
++
++/// Writes the PNG as a new file (never replacing one), owner-only.
++fn save(png: &[u8]) -> Result<PathBuf, String> {
++    let dir = screenshot_dir();
++    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
++    let stamp = local_stamp();
++    for n in 0..100 {
++        let name = if n == 0 { format!("Screenshot {stamp}.png") } else { format!("Screenshot {stamp} ({n}).png") };
++        let path = dir.join(name);
++        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path) {
++            Ok(mut file) => {
++                file.write_all(png).map_err(|e| format!("{}: {e}", path.display()))?;
++                return Ok(path);
++            }
++            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
++            Err(e) => return Err(format!("{}: {e}", path.display())),
++        }
++    }
++    Err("no free file name".into())
++}
++
++/// RGBA (premultiplied, opaque scene) -> PNG RGB8, cropped to `rect`.
++pub fn encode_png(pixmap: &tiny_skia::Pixmap, rect: Rect) -> Result<Vec<u8>, String> {
++    let (w, h) = (rect.size.w, rect.size.h);
++    let stride = pixmap.width() as usize * 4;
++    let data = pixmap.data();
++    let mut rgb = Vec::with_capacity(w as usize * h as usize * 3);
++    for y in 0..h as usize {
++        let row = (rect.pos.y as usize + y) * stride + rect.pos.x as usize * 4;
++        for px in data[row..row + w as usize * 4].chunks_exact(4) {
++            rgb.extend_from_slice(&px[..3]);
++        }
++    }
++    let mut out = Vec::new();
++    {
++        let mut encoder = png::Encoder::new(&mut out, w, h);
++        encoder.set_color(png::ColorType::Rgb);
++        encoder.set_depth(png::BitDepth::Eight);
++        encoder.set_compression(png::Compression::Fast);
++        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
++        writer.write_image_data(&rgb).map_err(|e| e.to_string())?;
++    }
++    Ok(out)
++}
++
++fn clip(rect: Rect, screen: Size) -> Option<Rect> {
++    let x0 = rect.pos.x.clamp(0, screen.w as i32);
++    let y0 = rect.pos.y.clamp(0, screen.h as i32);
++    let x1 = (rect.pos.x + rect.size.w as i32).clamp(0, screen.w as i32);
++    let y1 = (rect.pos.y + rect.size.h as i32).clamp(0, screen.h as i32);
++    (x1 > x0 && y1 > y0).then(|| Rect::new(Point::new(x0, y0), Size::new((x1 - x0) as u32, (y1 - y0) as u32)))
++}
++
++impl Server {
++    /// A capture key (`Action::Capture`). Area: the next drag of the pointer selects it.
++    pub(crate) fn capture_key(&mut self, mode: wm_config::CaptureMode) {
++        use wm_config::CaptureMode as C;
++        let (file, clipboard) = match mode {
++            C::ScreenClipboard | C::AreaClipboard | C::WindowClipboard => (false, true),
++            _ => (true, true),
++        };
++        match mode {
++            C::Screen | C::ScreenClipboard => self.captures.pending.push_back(Request { target: Target::Screen, file, clipboard, reply: None }),
++            C::Window | C::WindowClipboard => self.captures.pending.push_back(Request { target: Target::Window, file, clipboard, reply: None }),
++            C::Area | C::AreaClipboard => {
++                if self.captures.area.is_none() {
++                    self.captures.area = Some(AreaSelect { file, clipboard, start: None, outline: Vec::new() });
++                    self.capture_notice("Drag to select an area; Escape cancels");
++                }
++            }
++            C::Toolbar | C::Stop => {}
++        }
++        eprintln!("WMCAPTURE key mode={mode:?}");
++    }
++    fn capture_notice(&mut self, text: &str) {
++        #[cfg(feature = "desktop-shell")]
++        if let Some(desktop) = self.desktop.as_mut() {
++            desktop.shell.notify(&mut self.wm, text);
++        }
++        #[cfg(not(feature = "desktop-shell"))]
++        let _ = text;
++    }
++    fn area_outline(&mut self, rect: Option<Rect>) {
++        let Some(area) = self.captures.area.as_mut() else { return };
++        let old = std::mem::take(&mut area.outline);
++        let backend = self.wm.backend_mut();
++        for id in old {
++            backend.destroy_shell_surface(id);
++        }
++        let Some(r) = rect else { return };
++        let t = 2u32;
++        let (x, y, w, h) = (r.pos.x, r.pos.y, r.size.w.max(1), r.size.h.max(1));
++        let edges = [
++            Rect::new(Point::new(x, y), Size::new(w, t)),
++            Rect::new(Point::new(x, y + h as i32 - t as i32), Size::new(w, t)),
++            Rect::new(Point::new(x, y), Size::new(t, h)),
++            Rect::new(Point::new(x + w as i32 - t as i32, y), Size::new(t, h)),
++        ];
++        let mut ids = Vec::new();
++        for edge in edges {
++            if let Some(id) = backend.create_shell_surface(edge, (90, 170, 255), true) {
++                backend.map_shell_surface(id);
++                ids.push(id);
++            }
++        }
++        if let Some(area) = self.captures.area.as_mut() {
++            area.outline = ids;
++        }
++    }
++    /// While an area is being selected the pointer and Escape belong to the selection.
++    /// Returns true when the event was taken.
++    pub(crate) fn capture_pointer(&mut self, root: Point, buttons: u8, previous: u8) -> bool {
++        let Some(area) = self.captures.area.as_mut() else { return false };
++        if buttons & !previous & 2 != 0 {
++            self.capture_cancel();
++            return true;
++        }
++        let rect = |a: Point, b: Point| Rect::new(Point::new(a.x.min(b.x), a.y.min(b.y)), Size::new((a.x - b.x).unsigned_abs() + 1, (a.y - b.y).unsigned_abs() + 1));
++        match area.start {
++            None if buttons & !previous & 1 != 0 => {
++                area.start = Some(root);
++                self.area_outline(Some(rect(root, root)));
++            }
++            Some(start) if buttons & 1 != 0 => self.area_outline(Some(rect(start, root))),
++            Some(start) => {
++                let (file, clipboard) = (area.file, area.clipboard);
++                self.area_outline(None);
++                self.captures.area = None;
++                let r = rect(start, root);
++                if r.size.w >= 4 && r.size.h >= 4 {
++                    self.captures.pending.push_back(Request { target: Target::Area(r), file, clipboard, reply: None });
++                } else {
++                    self.capture_notice("Screenshot cancelled");
++                }
++            }
++            None => {}
++        }
++        true
++    }
++    pub(crate) fn capture_cancel(&mut self) {
++        if self.captures.area.is_some() {
++            self.area_outline(None);
++            self.captures.area = None;
++            self.capture_notice("Screenshot cancelled");
++        }
++    }
++    /// Before the repaint: requests from the socket.
++    pub fn capture_step(&mut self) {
++        if let Some(listener) = &self.captures.listener {
++            for _ in 0..4 {
++                match listener.accept() {
++                    Ok((stream, _)) => {
++                        let uid = peer_uid(&stream);
++                        if uid != Some(unsafe { libc::geteuid() }) {
++                            eprintln!("WMCAPTURE refused peer uid={uid:?}");
++                            continue;
++                        }
++                        if stream.set_nonblocking(true).is_ok() && self.captures.clients.len() < 4 {
++                            self.captures.clients.push(Client { stream, line: Vec::new(), since: Instant::now() });
++                        }
++                    }
++                    Err(_) => break,
++                }
++            }
++        }
++        let mut keep = Vec::new();
++        for mut client in std::mem::take(&mut self.captures.clients) {
++            let mut buf = [0u8; 128];
++            match client.stream.read(&mut buf) {
++                Ok(0) => continue,
++                Ok(n) => client.line.extend_from_slice(&buf[..n]),
++                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
++                Err(_) => continue,
++            }
++            if let Some(end) = client.line.iter().position(|b| *b == b'\n') {
++                let text = String::from_utf8_lossy(&client.line[..end]).to_string();
++                // A new terminal window (the dock's Terminal tile): the desktop's own launcher.
++                if text.trim() == "terminal" {
++                    let _ = client.stream.set_nonblocking(false);
++                    let answer = self.request_terminal();
++                    let _ = client.stream.write_all(answer.as_bytes());
++                    continue;
++                }
++                let mut words = text.split_whitespace().collect::<Vec<_>>();
++                let clipboard = words.last() == Some(&"clipboard");
++                if clipboard {
++                    words.pop();
++                }
++                match parse_request(&words.join(" ")) {
++                    Some(target) => {
++                        let _ = client.stream.set_nonblocking(false);
++                        self.captures.pending.push_back(Request { target, file: false, clipboard, reply: Some(client.stream) });
++                    }
++                    None => {
++                        let _ = client.stream.set_nonblocking(false);
++                        let _ = client.stream.write_all(b"error request not understood\n");
++                    }
++                }
++            } else if client.line.len() < 256 && client.since.elapsed() < Duration::from_secs(2) {
++                keep.push(client);
++            }
++        }
++        self.captures.clients = keep;
++    }
++    fn request_terminal(&mut self) -> String {
++        #[cfg(feature = "desktop-shell")]
++        if let Some(desktop) = self.desktop.as_mut() {
++            let outcome = desktop.shell.run_action(&mut self.wm, &wm_config::Action::SpawnTerminal);
++            return match desktop.outcome(outcome) {
++                Ok(()) => { eprintln!("WMCONTROL terminal requested"); "ok\n".into() }
++                Err(e) => format!("error {e}\n"),
++            };
++        }
++        "error no desktop\n".into()
++    }
++    /// After the repaint: carry out what is pending.
++    pub fn capture_after_repaint(&mut self) {
++        while let Some(request) = self.captures.pending.pop_front() {
++            let started = Instant::now();
++            let result = self.capture_one(&request);
++            match (result, request.reply) {
++                (Ok((png, rect)), Some(mut stream)) => {
++                    if request.clipboard {
++                        self.offer_png(Arc::new(png.clone()));
++                    }
++                    let header = format!("ok {} {}x{}\n", png.len(), rect.size.w, rect.size.h);
++                    std::thread::spawn(move || {
++                        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
++                        let _ = stream.write_all(header.as_bytes()).and_then(|_| stream.write_all(&png));
++                    });
++                    eprintln!("WMCAPTURE request target={:?} size={}x{} ms={}", request.target, rect.size.w, rect.size.h, started.elapsed().as_millis());
++                }
++                (Ok((png, rect)), None) => {
++                    let saved = if request.file { Some(save(&png)) } else { None };
++                    let png = Arc::new(png);
++                    if request.clipboard {
++                        self.offer_png(png.clone());
++                    }
++                    let text = match &saved {
++                        Some(Ok(path)) => format!("Screenshot saved: {}", path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()),
++                        Some(Err(e)) => format!("Screenshot not saved: {e}"),
++                        None => "Screenshot copied to the clipboard".to_string(),
++                    };
++                    self.capture_notice(&text);
++                    self.captures.taken += 1;
++                    eprintln!("WMCAPTURE key target={:?} size={}x{} file={} clipboard={} ms={}", request.target, rect.size.w, rect.size.h,
++                        match &saved { Some(Ok(p)) => p.display().to_string(), Some(Err(e)) => format!("error:{e}"), None => "no".into() }, request.clipboard, started.elapsed().as_millis());
++                }
++                (Err(e), Some(mut stream)) => {
++                    let _ = stream.write_all(format!("error {e}\n").as_bytes());
++                }
++                (Err(e), None) => {
++                    eprintln!("WMCAPTURE failed: {e}");
++                    self.capture_notice(&format!("Screenshot failed: {e}"));
++                }
++            }
++        }
++    }
++    fn capture_one(&mut self, request: &Request) -> Result<(Vec<u8>, Rect), String> {
++        let screen = self.wm.backend().screen_size();
++        let rect = match request.target {
++            Target::Screen => Rect::new(Point::new(0, 0), screen),
++            Target::Area(r) => r,
++            Target::Window => {
++                let id = self.wm.focused_client().ok_or("no window is focused")?;
++                let window = self.wm.client(id).ok_or("no window is focused")?.window;
++                self.wm.backend().window_frame_rect(window).ok_or("the focused window is not on the screen")?
++            }
++        };
++        let rect = clip(rect, screen).ok_or("the area is off the screen")?;
++        let pixmap = self.wm.backend_mut().render_for_capture()?;
++        let png = encode_png(&pixmap, rect)?;
++        Ok((png, rect))
++    }
++    /// The PNG on the clipboard (`image/png`), served by the compositor.
++    fn offer_png(&mut self, png: Arc<Vec<u8>>) {
++        let Some(seat) = self.input.as_ref().map(|i| i.seat.clone()) else { return };
++        smithay::wayland::selection::data_device::set_data_device_selection(&self.display_handle.clone(), &seat, vec!["image/png".into()], Some(png));
++    }
++}
++
++/// `chonkstep-darwin-desktop --screencapture [-c] [-w | -R x,y,w,h] [file]`: a capture from
++/// the running desktop, through its socket (`$XDG_RUNTIME_DIR/capture`). Without a file name
++/// the PNG goes to `$HOME/Pictures/Screenshots`; `-c` puts it on the clipboard instead.
++/// `chonkstep-darwin-desktop --desktop-request terminal`: a new terminal window from the running
++/// desktop (what the dock's Terminal tile runs).
++pub fn request_cli(args: &[String]) -> i32 {
++    if args != ["terminal"] {
++        eprintln!("usage: chonkstep-darwin-desktop --desktop-request terminal");
++        return 2;
++    }
++    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/private/var/run/gpu-desktop"));
++    let mut stream = match UnixStream::connect(runtime.join("capture")) {
++        Ok(s) => s,
++        Err(e) => { eprintln!("no desktop answers at {}: {e}", runtime.join("capture").display()); return 1; }
++    };
++    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
++    let mut answer = String::new();
++    if stream.write_all(b"terminal\n").is_err() || stream.read_to_string(&mut answer).is_err() {
++        eprintln!("the desktop did not answer");
++        return 1;
++    }
++    if answer.starts_with("ok") { 0 } else { eprintln!("{}", answer.trim()); 1 }
++}
++
++pub fn cli(args: &[String]) -> i32 {
++    let mut target = "screen".to_string();
++    let mut clipboard = false;
++    let mut file: Option<PathBuf> = None;
++    let mut i = 0;
++    while i < args.len() {
++        match args[i].as_str() {
++            "-c" => clipboard = true,
++            "-w" => target = "window".into(),
++            "-R" => {
++                i += 1;
++                let Some(spec) = args.get(i) else { eprintln!("screencapture: -R needs x,y,w,h"); return 2 };
++                target = format!("rect {}", spec.replace(',', " "));
++            }
++            "-h" | "--help" => {
++                eprintln!("usage: screencapture [-c] [-w | -R x,y,w,h] [file.png]\n  the screen of the running desktop (panel pixels, without the pointer);\n  -c: to the clipboard; -w: the focused window; no file: ~/Pictures/Screenshots");
++                return 0;
++            }
++            other if other.starts_with('-') => { eprintln!("screencapture: unknown option {other}"); return 2; }
++            other => file = Some(PathBuf::from(other)),
++        }
++        i += 1;
++    }
++    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/private/var/run/gpu-desktop"));
++    let mut stream = match UnixStream::connect(runtime.join("capture")) {
++        Ok(s) => s,
++        Err(e) => { eprintln!("screencapture: no desktop answers at {}: {e}", runtime.join("capture").display()); return 1; }
++    };
++    let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
++    if stream.write_all(format!("{target}{}\n", if clipboard { " clipboard" } else { "" }).as_bytes()).is_err() {
++        eprintln!("screencapture: the desktop closed the connection");
++        return 1;
++    }
++    let mut reply = Vec::new();
++    if let Err(e) = stream.read_to_end(&mut reply) {
++        eprintln!("screencapture: {e}");
++        return 1;
++    }
++    let Some(end) = reply.iter().position(|b| *b == b'\n') else { eprintln!("screencapture: no answer"); return 1 };
++    let head = String::from_utf8_lossy(&reply[..end]).to_string();
++    let words: Vec<&str> = head.split_whitespace().collect();
++    match words.as_slice() {
++        ["ok", len, size] => {
++            let png = &reply[end + 1..];
++            if len.parse::<usize>().ok() != Some(png.len()) {
++                eprintln!("screencapture: short answer ({} of {len} bytes)", png.len());
++                return 1;
++            }
++            if clipboard && file.is_none() {
++                println!("{size} on the clipboard");
++                return 0;
++            }
++            let written = match &file {
++                Some(path) => std::fs::write(path, png).map(|_| path.clone()).map_err(|e| e.to_string()),
++                None => save(png),
++            };
++            match written {
++                Ok(path) => { println!("{} {size}", path.display()); 0 }
++                Err(e) => { eprintln!("screencapture: {e}"); 1 }
++            }
++        }
++        _ => { eprintln!("screencapture: {head}"); 1 }
++    }
++}
+diff --git a/crates/wm-darwin/src/desktop.rs b/crates/wm-darwin/src/desktop.rs
+index 9298ee5..558b6e5 100644
+--- a/crates/wm-darwin/src/desktop.rs
++++ b/crates/wm-darwin/src/desktop.rs
+@@ -40,6 +40,8 @@ pub struct DesktopSession {
+     /// What the menu's settings did, newest last (bounded): for the notice
+     /// and for unattended checks.
+     pub settings_log: Vec<String>,
++    /// The Space last announced (see `service_desktop`).
++    space_seen: Option<usize>,
+ }
+ 
+ /// Pending wins: no owned application is abandoned while another is still
+@@ -355,6 +357,15 @@ impl crate::server::Server {
+             return Ok(());
+         };
+         desktop.service(&mut self.wm)?;
++        // A change of Space is announced in a notice ("Space 2"): the desk has no bar
++        // with a workspace indicator, and Overview (Command-O) shows them all.
++        let (space, count) = (self.wm.current_workspace(), self.wm.workspace_count());
++        let desktop = self.desktop.as_mut().unwrap();
++        if desktop.space_seen.is_some_and(|seen| seen != space) {
++            desktop.shell.notify(&mut self.wm, &format!("Space {}", space + 1));
++            eprintln!("WMSPACE current={} count={}", space + 1, count);
++        }
++        desktop.space_seen = Some(space);
+         self.service_host_requests()
+     }
+     pub(crate) fn desktop_key(&mut self, combo: KeyCombo, down: bool) -> Result<bool, String> {
+@@ -383,6 +394,13 @@ impl crate::server::Server {
+             }
+             other => other,
+         };
++        // Screenshots are the compositor's own (capture.rs).
++        if let Some(KeyResolution::Action(wm_config::Action::Capture(mode))) = resolution {
++            if down {
++                self.capture_key(mode);
++            }
++            return Ok(true);
++        }
+         let desktop = self.desktop.as_mut().unwrap();
+         let outcome = match resolution {
+             Some(KeyResolution::Action(action)) => desktop.shell.run_action(&mut self.wm, &action),
+@@ -524,6 +542,7 @@ impl DesktopSession {
+             launcher: None,
+             startup_requested: false,
+             press_target: [None; 3],
++            space_seen: None,
+             wifi: Box::new(crate::settings::NativeWifi),
+             persist: false,
+             settings_log: Vec::new(),
+@@ -917,7 +936,7 @@ mod tests {
+             server.desktop_pointer(at, 2, 0).unwrap();
+             server.desktop_pointer(at, 0, 2).unwrap();
+             let rows = server.desktop_menu_level(0, 0).unwrap().0;
+-            assert_eq!(rows, ["Terminal", "Theme", "Wallpaper", "Display", "Applications", "Wi-Fi", "Sound", "End Session"]);
++            assert_eq!(rows, ["Terminal", "Theme", "Wallpaper", "Display", "Applications", "Wi-Fi", "Sound", "Session", "End Session"]);
+             // Every row is hit at its centre, and rows are the theme's row height at the scale.
+             let centres: Vec<Point> = (0..rows.len()).map(|i| server.desktop_menu_level(0, i).unwrap().1).collect();
+             let pitch = centres[1].y - centres[0].y;
+diff --git a/crates/wm-darwin/src/desktop_entry.rs b/crates/wm-darwin/src/desktop_entry.rs
+index 3fce24e..1db2d33 100644
+--- a/crates/wm-darwin/src/desktop_entry.rs
++++ b/crates/wm-darwin/src/desktop_entry.rs
+@@ -201,7 +201,11 @@ impl SessionIo for NativeIo<'_> {
+         if let Some(inject) = &mut self.inject {
+             inject.step(self.server, ms)?;
+         }
++        self.server.capture_step();
++        self.server.gesture_tick();
++        self.server.foreign_sync();
+         self.server.repaint(self.presenter, ms)?;
++        self.server.capture_after_repaint();
+         if let Some(inject) = &mut self.inject {
+             inject.after_repaint(self.server)?;
+         }
+@@ -328,6 +332,9 @@ fn run_session(options: Options) -> Result<(), String> {
+     )
+     .map_err(|e| e.to_string())?;
+     // All path/font/private-log input refusals above precede HID/SFGOP open.
++    // The screenshot socket beside the Wayland socket (capture.rs): the directory is the
++    // session's own; a failure to make it costs only the command-line captures.
++    let capture_socket = options.socket.parent().map(|dir| dir.join("capture"));
+     let listener = ListeningSocket::bind_absolute(options.socket).map_err(|e| e.to_string())?;
+     let mut display = Display::<Server>::new().map_err(|e| e.to_string())?;
+     let mut input = NativeHid::open()?;
+@@ -339,6 +346,11 @@ fn run_session(options: Options) -> Result<(), String> {
+     let mut presenter = selected.output;
+     let mut server = Server::new_with_fonts(&display.handle(), selected.size, fonts.clone())?;
+     server.set_renderer_boxed(selected.renderer);
++    if let Some(path) = &capture_socket {
++        if let Err(error) = server.captures.listen(path) {
++            eprintln!("WMCAPTURE no socket: {error}");
++        }
++    }
+     let dmabuf = server.enable_dmabuf(&display.handle())?;
+     eprintln!("WMSTAT selected renderer={} output={} width={} height={} linux_dmabuf={}", server.renderer_kind().name(), server.output_name(), selected.size.w, selected.size.h, if dmabuf { "v3" } else { "off" });
+     // The look, before anything is drawn: the display scale (the
+diff --git a/crates/wm-darwin/src/desktop_main.rs b/crates/wm-darwin/src/desktop_main.rs
+index 90bc8b7..bf809f3 100644
+--- a/crates/wm-darwin/src/desktop_main.rs
++++ b/crates/wm-darwin/src/desktop_main.rs
+@@ -4,6 +4,13 @@ fn main() {
+         println!("{}", wm_darwin::desktop_entry::USAGE);
+         return;
+     }
++    // A screenshot from the running desktop (capture.rs), as `screencapture` does on macOS.
++    if args[0] == "--screencapture" {
++        std::process::exit(wm_darwin::capture::cli(&args[1..]));
++    }
++    if args[0] == "--desktop-request" {
++        std::process::exit(wm_darwin::capture::request_cli(&args[1..]));
++    }
+     // Rendering benchmark: no session, no clients, no input devices.
+     let result = if args[0] == "--bench" {
+         wm_darwin::desktop_entry::bench(&args[1..])
+diff --git a/crates/wm-darwin/src/foreign.rs b/crates/wm-darwin/src/foreign.rs
+new file mode 100644
+index 0000000..7f3ba67
+--- /dev/null
++++ b/crates/wm-darwin/src/foreign.rs
+@@ -0,0 +1,178 @@
++//! `zwlr_foreign_toplevel_management_v1`: the windows of the desk, told to a program that shows
++//! them (the Chonkstep dock: running indicators, a click that brings an application's window
++//! forward), with activate, close and minimize from it. The Linux session serves the same
++//! protocol (`wm-wayland/src/protocols.rs`); this is a small server of its own for this
++//! compositor: the list is brought up to date once a frame from wm-core's managed windows
++//! (title, app id, activated, minimized, maximized, full screen), and requests go to wm-core
++//! as the frame's buttons and the keys send them.
++use std::collections::HashMap;
++
++use smithay::reexports::wayland_protocols_wlr::foreign_toplevel::v1::server::{
++    zwlr_foreign_toplevel_handle_v1::{self as handle, ZwlrForeignToplevelHandleV1},
++    zwlr_foreign_toplevel_manager_v1::{self as manager, ZwlrForeignToplevelManagerV1},
++};
++use smithay::reexports::wayland_server::{
++    Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource, backend::GlobalId,
++};
++use wm_core::{BackendEvent, ClientFlags, Lifecycle, NetState, NetStateAction};
++
++use crate::server::Server;
++
++#[derive(Clone, PartialEq, Eq, Default)]
++struct Shown {
++    title: String,
++    app_id: String,
++    states: Vec<u8>,
++}
++
++struct Listener {
++    manager: ZwlrForeignToplevelManagerV1,
++    handles: HashMap<u64, (ZwlrForeignToplevelHandleV1, Shown)>,
++}
++
++#[derive(Default)]
++pub struct ForeignToplevels {
++    listeners: Vec<Listener>,
++    global: Option<GlobalId>,
++}
++
++impl ForeignToplevels {
++    pub fn create_global(&mut self, dh: &DisplayHandle) {
++        self.global = Some(dh.create_global::<Server, ZwlrForeignToplevelManagerV1, ()>(3, ()));
++    }
++}
++
++fn states_bytes(states: &[handle::State]) -> Vec<u8> {
++    states.iter().flat_map(|s| (*s as u32).to_ne_bytes()).collect()
++}
++
++impl Server {
++    pub fn foreign_listener_count(&self) -> usize {
++        self.foreign.listeners.len()
++    }
++    /// What every listener should know now, per managed window.
++    fn foreign_now(&self) -> Vec<(u64, Shown)> {
++        let focused = self.wm.focused_client();
++        self.wm
++            .iter_clients()
++            .filter(|(_, c)| matches!(c.lifecycle, Lifecycle::Normal | Lifecycle::Miniaturized))
++            .filter_map(|(id, c)| {
++                let w = self.wm.backend().windows.get(&c.window)?;
++                let mut states = Vec::new();
++                if focused == Some(id) {
++                    states.push(handle::State::Activated);
++                }
++                if c.lifecycle == Lifecycle::Miniaturized {
++                    states.push(handle::State::Minimized);
++                }
++                if c.flags.contains(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V) {
++                    states.push(handle::State::Maximized);
++                }
++                if c.flags.contains(ClientFlags::FULLSCREEN) {
++                    states.push(handle::State::Fullscreen);
++                }
++                Some((c.window, Shown { title: w.title.clone().unwrap_or_default(), app_id: w.app_id.clone().unwrap_or_default(), states: states_bytes(&states) }))
++            })
++            .collect()
++    }
++    /// Once a frame: new windows, changes, windows gone.
++    pub fn foreign_sync(&mut self) {
++        if self.foreign.listeners.is_empty() {
++            return;
++        }
++        let now = self.foreign_now();
++        let dh = self.display_handle.clone();
++        for listener in &mut self.foreign.listeners {
++            if !listener.manager.is_alive() {
++                continue;
++            }
++            listener.handles.retain(|window, (h, _)| {
++                let keep = now.iter().any(|(w, _)| w == window);
++                if !keep && h.is_alive() {
++                    h.closed();
++                }
++                keep
++            });
++            for (window, shown) in &now {
++                match listener.handles.get_mut(window) {
++                    Some((h, sent)) => {
++                        if sent == shown {
++                            continue;
++                        }
++                        if sent.title != shown.title {
++                            h.title(shown.title.clone());
++                        }
++                        if sent.app_id != shown.app_id {
++                            h.app_id(shown.app_id.clone());
++                        }
++                        if sent.states != shown.states {
++                            h.state(shown.states.clone());
++                        }
++                        h.done();
++                        *sent = shown.clone();
++                    }
++                    None => {
++                        let Some(client) = listener.manager.client() else { continue };
++                        let Ok(h) = client.create_resource::<ZwlrForeignToplevelHandleV1, u64, Server>(&dh, listener.manager.version(), *window) else { continue };
++                        listener.manager.toplevel(&h);
++                        h.title(shown.title.clone());
++                        h.app_id(shown.app_id.clone());
++                        h.state(shown.states.clone());
++                        h.done();
++                        listener.handles.insert(*window, (h, shown.clone()));
++                    }
++                }
++            }
++        }
++        self.foreign.listeners.retain(|l| l.manager.is_alive());
++    }
++}
++
++impl GlobalDispatch<ZwlrForeignToplevelManagerV1, ()> for Server {
++    fn bind(state: &mut Self, _: &DisplayHandle, _: &Client, resource: New<ZwlrForeignToplevelManagerV1>, _: &(), data: &mut DataInit<'_, Self>) {
++        let manager = data.init(resource, ());
++        eprintln!("WMFOREIGN listener bound");
++        // the next frame's sync tells it every window
++        state.foreign.listeners.push(Listener { manager, handles: HashMap::new() });
++    }
++}
++
++impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for Server {
++    fn request(state: &mut Self, _: &Client, resource: &ZwlrForeignToplevelManagerV1, request: manager::Request, _: &(), _: &DisplayHandle, _: &mut DataInit<'_, Self>) {
++        if let manager::Request::Stop = request {
++            resource.finished();
++            state.foreign.listeners.retain(|l| l.manager != *resource);
++        }
++    }
++}
++
++impl Dispatch<ZwlrForeignToplevelHandleV1, u64> for Server {
++    fn request(state: &mut Self, _: &Client, _: &ZwlrForeignToplevelHandleV1, request: handle::Request, window: &u64, _: &DisplayHandle, _: &mut DataInit<'_, Self>) {
++        let window = *window;
++        if !state.wm.backend().windows.contains_key(&window) {
++            return;
++        }
++        let net = |state: &mut Self, action, first| state.wm.dispatch(BackendEvent::NetStateRequested { window, action, first, second: None });
++        match request {
++            handle::Request::Activate { .. } => {
++                // Another Space: go there first (an activation brings the window to the person).
++                if let Some(client) = state.wm.client_for_window(window) {
++                    if let Some(space) = state.wm.client(client).map(|c| c.workspace) {
++                        if space != state.wm.current_workspace() {
++                            state.wm.switch_workspace(space);
++                        }
++                    }
++                }
++                state.wm.dispatch(BackendEvent::ActivateRequested(window));
++            }
++            handle::Request::Close => state.wm.dispatch(BackendEvent::CloseRequested(window)),
++            handle::Request::SetMinimized => state.wm.dispatch(BackendEvent::MinimizeRequest(window)),
++            handle::Request::UnsetMinimized => state.wm.dispatch(BackendEvent::ActivateRequested(window)),
++            handle::Request::SetMaximized => state.wm.dispatch(BackendEvent::NetStateRequested { window, action: NetStateAction::Add, first: NetState::MaximizedHorz, second: Some(NetState::MaximizedVert) }),
++            handle::Request::UnsetMaximized => state.wm.dispatch(BackendEvent::NetStateRequested { window, action: NetStateAction::Remove, first: NetState::MaximizedHorz, second: Some(NetState::MaximizedVert) }),
++            handle::Request::SetFullscreen { .. } => net(state, NetStateAction::Add, NetState::Fullscreen),
++            handle::Request::UnsetFullscreen => net(state, NetStateAction::Remove, NetState::Fullscreen),
++            _ => {}
++        }
++    }
++}
+diff --git a/crates/wm-darwin/src/gesture.rs b/crates/wm-darwin/src/gesture.rs
+index 350d916..de4a980 100644
+--- a/crates/wm-darwin/src/gesture.rs
++++ b/crates/wm-darwin/src/gesture.rs
+@@ -1,9 +1,218 @@
+-//! Multi-finger swipes on the desktop (see `crate::hid::Event::Swipe`).
++//! Multi-finger swipes on the desktop (`crate::hid::Event::Swipe`), ported from the Linux
++//! session (`wm-wayland/src/input/gestures.rs`, `gesture_scene.rs`, docs/gestures.md):
++//! three- and four-finger horizontal swipes move between Spaces, the desk following the
++//! fingers (the current Space slides out, its neighbour in) and settling with the same
++//! velocity projection and critically damped spring (`wm_core::gesture_physics`); lift
++//! before halfway to stay, beyond it (or with a flick) to go; a missing neighbour resists
++//! elastically. Up opens Overview, down closes it (here without the Linux morph: it opens
++//! or closes when the swipe ends). Swipes are physical directions: natural scrolling does
++//! not turn them. The recognizer (axis lock, jitter, velocity) is wm-core's `SwipeTracker`,
++//! the Linux one. Two-finger swipes are not the desktop's: they are scrolling.
+ use crate::hid::SwipePhase;
+ use crate::server::Server;
++use std::time::Instant;
++use wm_core::{Backend, gesture_physics as physics, GestureConfig, SwipeAxis, SwipeMotion, SwipeTracker};
+ 
++/// The windows drawn displaced while a horizontal swipe is held or settling.
++#[derive(Clone, Debug, Default)]
++pub struct Slide {
++    /// Panel pixels the current Space is moved by (negative: to the left).
++    pub offset: i32,
++    pub current: Vec<u64>,
++    /// The neighbour coming in, and where it is drawn relative to its own place.
++    pub neighbour: Vec<u64>,
++    pub neighbour_offset: i32,
++}
++
++pub struct Gesture {
++    tracker: SwipeTracker,
++    /// Set when the horizontal axis locks: the Space it started on and its neighbours.
++    origin: Option<(usize, Option<usize>, Option<usize>)>,
++    position: f64,
++    velocity: f64,
++    spring: Option<physics::Spring>,
++    last: Instant,
++    vertical: Option<SwipeMotion>,
++    pub swipes: u64,
++    pub switches: u64,
++    /// The stand-in for the swipe while the trackpad driver reports no multi-finger swipes:
++    /// Control-Command with a two-finger scroll (`wheel_swipe`). When the scroll stops, the swipe ends.
++    wheel_until: Option<Instant>,
++}
++
++impl Default for Gesture {
++    fn default() -> Self {
++        Self { tracker: SwipeTracker::default(), origin: None, position: 0.0, velocity: 0.0, spring: None, last: Instant::now(), vertical: None, swipes: 0, switches: 0, wheel_until: None }
++    }
++}
++
+ impl Server {
+-    pub(crate) fn swipe(&mut self, phase: SwipePhase, fingers: u8, dx: i16, dy: i16, _time: u32) {
+-        eprintln!("WMGESTURE swipe phase={phase:?} fingers={fingers} dx={dx} dy={dy} handled=no");
++    fn gesture_available(&self) -> bool {
++        #[cfg(feature = "desktop-shell")]
++        let shell_free = self.desktop.as_ref().is_some_and(|d| d.shell.desktop_gesture_available(&self.wm));
++        #[cfg(not(feature = "desktop-shell"))]
++        let shell_free = true;
++        shell_free && !self.wm.interactive_drag_active() && !self.wm.backend().popup_active() && !self.captures.selecting()
++    }
++    fn bounds(&self) -> (f64, f64) {
++        match self.gesture.origin {
++            Some((_, previous, next)) => (if previous.is_some() { -1.0 } else { 0.0 }, if next.is_some() { 1.0 } else { 0.0 }),
++            None => (0.0, 0.0),
++        }
++    }
++    pub(crate) fn swipe(&mut self, phase: SwipePhase, fingers: u8, dx: i16, dy: i16, time: u32) {
++        let available = self.gesture_available();
++        match phase {
++            SwipePhase::Begin => {
++                // A new swipe catches a settling one where it is.
++                if self.gesture.spring.take().is_some() {
++                    self.finish_slide(None);
++                }
++                let claimed = self.gesture.tracker.begin(u32::from(fingers), GestureConfig::default(), available, time);
++                self.gesture.origin = None;
++                self.gesture.vertical = None;
++                self.gesture.swipes += 1;
++                eprintln!("WMGESTURE begin fingers={fingers} desktop={claimed} available={available}");
++            }
++            SwipePhase::Update => {
++                self.gesture.tracker.update(f64::from(dx), f64::from(dy), available, time);
++                let Some(motion) = self.gesture.tracker.motion(time) else {
++                    if matches!(self.gesture.tracker, SwipeTracker::Suppressed) {
++                        self.clear_slide();
++                    }
++                    return;
++                };
++                match motion.axis {
++                    SwipeAxis::Horizontal => {
++                        if self.gesture.origin.is_none() {
++                            let origin = self.wm.current_workspace();
++                            let previous = self.wm.neighboring_workspace(origin, -1);
++                            let next = self.wm.neighboring_workspace(origin, 1);
++                            self.gesture.origin = Some((origin, previous, next));
++                        }
++                        let (min, max) = self.bounds();
++                        self.gesture.position = physics::resisted(motion.progress, min, max).0;
++                        self.gesture.velocity = motion.velocity;
++                        self.show_slide();
++                    }
++                    SwipeAxis::Vertical => self.gesture.vertical = Some(motion),
++                }
++            }
++            SwipePhase::End | SwipePhase::Cancel => {
++                let cancelled = phase == SwipePhase::Cancel;
++                let (_, motion) = self.gesture.tracker.end(cancelled, available, time);
++                if self.gesture.origin.is_some() {
++                    if let Some(motion) = motion {
++                        let (min, max) = self.bounds();
++                        self.gesture.position = physics::resisted(motion.progress, min, max).0;
++                        self.gesture.velocity = motion.velocity;
++                    }
++                    let target = if cancelled || motion.is_none() {
++                        0.0
++                    } else {
++                        let (min, max) = self.bounds();
++                        physics::settle_target(self.gesture.position, self.gesture.velocity, min, max)
++                    };
++                    eprintln!("WMGESTURE release position={:.3} velocity={:.3} target={target}", self.gesture.position, self.gesture.velocity);
++                    self.gesture.spring = Some(physics::Spring::new(self.gesture.position, self.gesture.velocity, target));
++                    self.gesture.last = Instant::now();
++                } else if let Some(vertical) = self.gesture.vertical.take().filter(|_| !cancelled) {
++                    let projected = physics::projected(vertical.progress, vertical.velocity);
++                    #[cfg(feature = "desktop-shell")]
++                    if let Some(desktop) = self.desktop.as_mut() {
++                        // Positive progress is up: up opens Overview, down closes it.
++                        let gesture = if projected > physics::COMMIT_MIDPOINT {
++                            Some(wm_core::DesktopGesture::OverviewOpen)
++                        } else if projected < -physics::COMMIT_MIDPOINT {
++                            Some(wm_core::DesktopGesture::OverviewClose)
++                        } else {
++                            None
++                        };
++                        eprintln!("WMGESTURE vertical progress={:.3} projected={projected:.3} action={gesture:?}", vertical.progress);
++                        if let Some(gesture) = gesture {
++                            desktop.shell.on_desktop_gesture(&mut self.wm, gesture);
++                        }
++                    }
++                    #[cfg(not(feature = "desktop-shell"))]
++                    let _ = projected;
++                }
++            }
++        }
++    }
++    /// Control-Command and a two-finger scroll (wheel steps, the only thing the trackpad driver
++    /// reports of two fingers today) drive the same swipe between Spaces: each step is 24 units
++    /// of horizontal finger travel (scrolling down: to the next Space, up: to the one before),
++    /// followed on the screen, and released 250 ms after the last step. A stand-in, labelled so:
++    /// the swipe proper needs three or four fingers reported by the trackpad driver.
++    pub(crate) fn wheel_swipe(&mut self, wheel: i8, time: u32) {
++        if self.gesture.wheel_until.is_none() {
++            self.swipe(SwipePhase::Begin, 3, 0, 0, time);
++        }
++        self.swipe(SwipePhase::Update, 3, i16::from(wheel) * 24, 0, time);
++        self.gesture.wheel_until = Some(Instant::now() + std::time::Duration::from_millis(250));
++    }
++    /// Every frame: the spring after a release.
++    pub fn gesture_tick(&mut self) {
++        if self.gesture.wheel_until.is_some_and(|until| Instant::now() >= until) {
++            self.gesture.wheel_until = None;
++            self.swipe(SwipePhase::End, 3, 0, 0, 0);
++        }
++        let Some(mut spring) = self.gesture.spring else { return };
++        let now = Instant::now();
++        let dt = now.duration_since(self.gesture.last).as_secs_f64().min(0.1);
++        self.gesture.last = now;
++        let settled = spring.advance(dt);
++        self.gesture.position = spring.position;
++        if settled {
++            self.gesture.spring = None;
++            self.finish_slide(Some(spring.target));
++        } else {
++            self.gesture.spring = Some(spring);
++            self.show_slide();
++        }
++    }
++    fn show_slide(&mut self) {
++        let Some((origin, previous, next)) = self.gesture.origin else { return };
++        let width = self.wm.backend().screen_size().w as f64;
++        let offset = (-self.gesture.position * width).round() as i32;
++        let windows_on = |server: &Server, space: usize| -> Vec<u64> {
++            server.wm.iter_clients().filter(|(_, c)| c.workspace == space && !c.flags.contains(wm_core::ClientFlags::STICKY)).map(|(_, c)| c.window).collect()
++        };
++        let current = windows_on(self, origin);
++        let (neighbour, neighbour_offset) = if self.gesture.position > 0.0 {
++            next.map(|space| (windows_on(self, space), offset + width as i32)).unwrap_or_default()
++        } else if self.gesture.position < 0.0 {
++            previous.map(|space| (windows_on(self, space), offset - width as i32)).unwrap_or_default()
++        } else {
++            (Vec::new(), 0)
++        };
++        let backend = self.wm.backend_mut();
++        backend.slide = Some(Slide { offset, current, neighbour, neighbour_offset });
++        backend.dirty = true;
++    }
++    fn clear_slide(&mut self) {
++        let backend = self.wm.backend_mut();
++        if backend.slide.take().is_some() {
++            backend.dirty = true;
++        }
++        self.gesture.origin = None;
++        self.gesture.position = 0.0;
++    }
++    /// The swipe is over: go to the Space it settled on (one step at most) and draw
++    /// everything in its place again.
++    fn finish_slide(&mut self, target: Option<f64>) {
++        let origin = self.gesture.origin;
++        self.clear_slide();
++        let (Some((from, previous, next)), Some(target)) = (origin, target) else { return };
++        let to = if target > 0.5 { next } else if target < -0.5 { previous } else { None };
++        if let Some(to) = to {
++            if self.wm.current_workspace() == from {
++                self.wm.switch_workspace(to);
++                self.gesture.switches += 1;
++                #[cfg(feature = "desktop-shell")]
++                let _ = self.service_desktop();
++            }
++        }
++        eprintln!("WMGESTURE settled target={target} space={}", self.wm.current_workspace() + 1);
+     }
+ }
+diff --git a/crates/wm-darwin/src/input.rs b/crates/wm-darwin/src/input.rs
+index 47aa06a..91485e9 100644
+--- a/crates/wm-darwin/src/input.rs
++++ b/crates/wm-darwin/src/input.rs
+@@ -188,9 +188,18 @@ impl Server {
+                         // asks about running processes and ends every window), as on macOS: the key
+                         // goes to it, not to the desktop's "quit application" (which asked each
+                         // window to close).
+-                        if mods==Modifiers::SUPER && (combo.keysym==0x71 || combo.keysym==0x51) && s.focused_is_mac_application(){
++                        // The same for the other application commands of a Mac application: Command-W
++                        // (its Close, with its questions), Command-M (Miniaturize) and Command-H (Hide)
++                        // are AppKit's; on native windows they stay the desktop's.
++                        if (mods==Modifiers::SUPER || mods==Modifiers::SUPER|Modifiers::ALT)
++                            && matches!(combo.keysym,0x71|0x51|0x77|0x57|0x6d|0x4d|0x68|0x48) && s.focused_is_mac_application(){
+                             return FilterResult::Forward;
+                         }
++                        // While an area is selected for a screenshot, Escape cancels it.
++                        if s.captures.selecting() && combo.keysym==0xff1b {
++                            if down {s.capture_cancel();s.input.as_mut().unwrap().suppressed_keys.insert(evdev);}
++                            return FilterResult::Intercept(());
++                        }
+                         #[cfg(feature = "desktop-shell")]
+                         if s.desktop.is_some(){
+                             match s.desktop_key(combo,down){
+@@ -226,6 +235,17 @@ impl Server {
+                 let buttons=secondary_click(buttons,input.physical_buttons,mods==Modifiers::CONTROL,&mut input.control_click);
+                 input.physical_buttons=(input.physical_buttons&!7)|(buttons_physical(&event)&7);
+                 let b=self.wm.backend_mut();b.pointer=root;b.dirty=true;
++                // Control-Command with a two-finger scroll: between Spaces (gesture.rs, the stand-in).
++                if wheel!=0 && mods==Modifiers::CONTROL|Modifiers::SUPER && !self.wm.interactive_drag_active() {
++                    self.wheel_swipe(wheel,time);
++                    return Ok(());
++                }
++                // An area being selected for a screenshot takes the pointer until it is done.
++                if self.captures.selecting() && !self.wm.interactive_drag_active() {
++                    let taken=self.capture_pointer(root,buttons,previous);
++                    self.input.as_mut().unwrap().buttons=buttons;
++                    if taken {return Ok(());}
++                }
+                 // A client's popup (a menu, a list, a tool tip) is above everything: the pointer over
+                 // one goes to it, and a press elsewhere dismisses those that hold a grab (popups.rs).
+                 if !self.client_popups.is_empty() && !self.wm.interactive_drag_active() {
+@@ -250,6 +270,32 @@ impl Server {
+                         self.popup_press_outside(under.as_ref());
+                     }
+                 }
++                // Layer surfaces above the windows (the dock): the pointer goes to the topmost one
++                // under it, and a press on one keeps it there until the release.
++                let density=self.scale().factor();
++                let layer_target=match self.layer_grab.clone() {
++                    Some(surface)=>self.layer_place_of(&surface).map(|pos|(surface,(f64::from(pos.x)/density,f64::from(pos.y)/density))),
++                    None if self.input.as_ref().unwrap().forwarded==0 && !self.wm.interactive_drag_active()=>self.layer_at(root),
++                    None=>None,
++                };
++                if let Some((surface,origin))=layer_target {
++                    let location=(input_position_logical(x,size.w,density),input_position_logical(y,size.h,density));
++                    pointer.motion(self,Some((surface.clone(),origin.into())),&MotionEvent{location:location.into(),serial:SERIAL_COUNTER.next_serial(),time});
++                    if buttons&!previous!=0 {
++                        if !self.client_popups.is_empty(){self.popup_press_outside(Some(&surface));}
++                        self.layer_grab=Some(surface.clone());
++                    }
++                    for bit in 0..3 {
++                        let mask=1<<bit;if (previous^buttons)&mask==0{continue;}
++                        let pressed=buttons&mask!=0;
++                        pointer.button(self,&ButtonEvent{serial:SERIAL_COUNTER.next_serial(),time,button:0x110+bit,state:if pressed{ButtonState::Pressed}else{ButtonState::Released}});
++                    }
++                    if buttons&7==0 {self.layer_grab=None;}
++                    if wheel!=0 {pointer.axis(self,AxisFrame::new(time).source(AxisSource::Wheel).value(Axis::Vertical,-f64::from(wheel)*10.).v120(Axis::Vertical,-i32::from(wheel)*120));}
++                    self.input.as_mut().unwrap().buttons=buttons;
++                    pointer.frame(self);
++                    return Ok(());
++                }
+                 #[cfg(feature = "desktop-shell")]
+                 if self.input.as_ref().unwrap().forwarded==0 && !self.wm.interactive_drag_active()
+                     && self.desktop_pointer(root,buttons,previous)? {
+diff --git a/crates/wm-darwin/src/layers.rs b/crates/wm-darwin/src/layers.rs
+new file mode 100644
+index 0000000..ce0a37b
+--- /dev/null
++++ b/crates/wm-darwin/src/layers.rs
+@@ -0,0 +1,307 @@
++//! `zwlr_layer_shell_v1`: surfaces of desktop programs that are not windows (the Chonkstep
++//! dock's column, its Clip and launcher strip), anchored to the panel's edges, above or below
++//! the windows, never managed by the window manager. What this desk does with them:
++//! - size and place them by anchors, size and margins (logical units, as the protocol has them);
++//! - draw them through the scene's shell surfaces (above the windows for the top and overlay
++//!   layers, below them for background and bottom), from the client's SHM buffer;
++//! - keep windows out of an exclusive zone (the work area wm-core places and maximizes in);
++//! - give them the pointer (motion, buttons, wheel) when it is over them; keyboard focus is
++//!   not given (the dock asks for none in its ordinary state);
++//! - popups whose parent is a layer surface (`get_popup`), placed against it.
++//! Not done: per-output placement (there is one panel), the keyboard, exclusive focus.
++use smithay::reexports::wayland_server::protocol::{wl_output::WlOutput, wl_surface::WlSurface};
++use smithay::wayland::compositor::{with_states, BufferAssignment, SurfaceAttributes};
++use smithay::wayland::shell::wlr_layer::{
++    Anchor, ExclusiveZone, Layer, LayerSurface, LayerSurfaceCachedState, WlrLayerShellHandler, WlrLayerShellState,
++};
++use smithay::wayland::shell::xdg::PopupSurface;
++use wm_core::{Backend, Point, Rect, Size};
++
++use crate::server::Server;
++
++pub struct LayerEntry {
++    pub surface: LayerSurface,
++    pub namespace: String,
++    /// On the panel, panel pixels.
++    pub rect: Rect,
++    pub shell: Option<u64>,
++    pub above: bool,
++    /// The edge and panel pixels it keeps windows away from.
++    pub exclusive: Option<(Anchor, u32)>,
++}
++
++impl Server {
++    fn layer_index(&self, surface: &WlSurface) -> Option<usize> {
++        self.layers.iter().position(|l| l.surface.wl_surface() == surface)
++    }
++    /// Size and place from the cached state; returns (logical size to configure, panel rect).
++    fn layer_place(&self, state: &LayerSurfaceCachedState) -> (Size, Rect) {
++        let density = self.scale().factor();
++        let screen = self.wm.backend().screen_size();
++        let (sw, sh) = ((f64::from(screen.w) / density).round() as i32, (f64::from(screen.h) / density).round() as i32);
++        let a = state.anchor;
++        let m = state.margin;
++        let mut w = state.size.w;
++        let mut h = state.size.h;
++        if w == 0 && a.contains(Anchor::LEFT) && a.contains(Anchor::RIGHT) {
++            w = sw - m.left - m.right;
++        }
++        if h == 0 && a.contains(Anchor::TOP) && a.contains(Anchor::BOTTOM) {
++            h = sh - m.top - m.bottom;
++        }
++        let w = w.clamp(1, sw.max(1));
++        let h = h.clamp(1, sh.max(1));
++        let x = if a.contains(Anchor::LEFT) && !a.contains(Anchor::RIGHT) {
++            m.left
++        } else if a.contains(Anchor::RIGHT) && !a.contains(Anchor::LEFT) {
++            sw - w - m.right
++        } else if a.contains(Anchor::LEFT) {
++            m.left
++        } else {
++            (sw - w) / 2
++        };
++        let y = if a.contains(Anchor::TOP) && !a.contains(Anchor::BOTTOM) {
++            m.top
++        } else if a.contains(Anchor::BOTTOM) && !a.contains(Anchor::TOP) {
++            sh - h - m.bottom
++        } else if a.contains(Anchor::TOP) {
++            m.top
++        } else {
++            (sh - h) / 2
++        };
++        let px = |v: i32| (f64::from(v) * density).round() as i32;
++        (
++            Size::new(w as u32, h as u32),
++            Rect::new(Point::new(px(x), px(y)), Size::new(px(w).max(1) as u32, px(h).max(1) as u32)),
++        )
++    }
++    fn layer_exclusive(&self, state: &LayerSurfaceCachedState) -> Option<(Anchor, u32)> {
++        let ExclusiveZone::Exclusive(zone) = state.exclusive_zone else { return None };
++        if zone == 0 {
++            return None;
++        }
++        let a = state.anchor;
++        let edge = if !state.exclusive_edge.is_empty() {
++            state.exclusive_edge
++        } else if a == Anchor::TOP || a == Anchor::TOP | Anchor::LEFT | Anchor::RIGHT {
++            Anchor::TOP
++        } else if a == Anchor::BOTTOM || a == Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT {
++            Anchor::BOTTOM
++        } else if a == Anchor::LEFT || a == Anchor::LEFT | Anchor::TOP | Anchor::BOTTOM {
++            Anchor::LEFT
++        } else if a == Anchor::RIGHT || a == Anchor::RIGHT | Anchor::TOP | Anchor::BOTTOM {
++            Anchor::RIGHT
++        } else {
++            return None;
++        };
++        Some((edge, (f64::from(zone) * self.scale().factor()).round() as u32))
++    }
++    /// The work area: the panel less every exclusive zone (and the margin beside it).
++    fn layers_workarea(&mut self) {
++        let screen = self.wm.backend().screen_size();
++        let (mut left, mut right, mut top, mut bottom) = (0u32, 0u32, 0u32, 0u32);
++        for layer in &self.layers {
++            if layer.shell.is_none() {
++                continue;
++            }
++            match layer.exclusive {
++                Some((edge, px)) if edge == Anchor::LEFT => left = left.max(px),
++                Some((edge, px)) if edge == Anchor::RIGHT => right = right.max(px),
++                Some((edge, px)) if edge == Anchor::TOP => top = top.max(px),
++                Some((edge, px)) if edge == Anchor::BOTTOM => bottom = bottom.max(px),
++                _ => {}
++            }
++        }
++        let area = Rect::new(
++            Point::new(left as i32, top as i32),
++            Size::new(screen.w.saturating_sub(left + right).max(1), screen.h.saturating_sub(top + bottom).max(1)),
++        );
++        if self.layer_workarea != Some(area) {
++            self.layer_workarea = Some(area);
++            self.wm.set_workarea(area);
++            eprintln!("WMLAYER workarea={},{} {}x{}", area.pos.x, area.pos.y, area.size.w, area.size.h);
++        }
++    }
++    /// A commit on a layer surface. False when the surface is not one.
++    pub(crate) fn layer_commit(&mut self, surface: &WlSurface) -> bool {
++        let Some(index) = self.layer_index(surface) else { return false };
++        let state = with_states(surface, |s| *s.cached_state.get::<LayerSurfaceCachedState>().current());
++        let (size, rect) = self.layer_place(&state);
++        let exclusive = self.layer_exclusive(&state);
++        let above = matches!(state.layer, Layer::Top | Layer::Overlay);
++        let layer = &self.layers[index];
++        let configured = with_states(surface, |s| {
++            s.data_map.get::<smithay::wayland::shell::wlr_layer::LayerSurfaceData>().is_some_and(|d| d.lock().unwrap().initial_configure_sent)
++        });
++        if !configured || layer.rect.size != rect.size {
++            layer.surface.with_pending_state(|p| p.size = Some((size.w as i32, size.h as i32).into()));
++            if !configured {
++                self.announce_scale(surface);
++                layer.surface.send_configure();
++                self.layers[index].rect = rect;
++                self.layers[index].exclusive = exclusive;
++                self.layers[index].above = above;
++                return true;
++            }
++            layer.surface.send_pending_configure();
++        }
++        let (buffer, callbacks) = with_states(surface, |s| {
++            let mut attributes = s.cached_state.get::<SurfaceAttributes>();
++            let a = attributes.current();
++            a.damage.clear();
++            (a.buffer.take(), std::mem::take(&mut a.frame_callbacks))
++        });
++        self.cursor_callbacks.extend(callbacks);
++        // A surface already shown keeps the size it drew until its next buffer.
++        let rect = match self.layers[index].shell.and_then(|shell| self.wm.backend().shell_size(shell)) {
++            Some(drawn) => Rect::new(self.layer_drawn_pos(&state, rect.pos, drawn), drawn),
++            None => rect,
++        };
++        let moved = self.layers[index].rect.pos != rect.pos;
++        self.layers[index].rect = rect;
++        self.layers[index].exclusive = exclusive.map(|(edge, zone)| {
++            let shown = self.layers[index].shell.is_some();
++            let drawn = if edge == Anchor::LEFT || edge == Anchor::RIGHT { rect.size.w } else { rect.size.h };
++            (edge, if shown { zone.max(drawn) } else { zone })
++        });
++        self.layers[index].above = above;
++        match buffer {
++            Some(BufferAssignment::NewBuffer(buffer)) => {
++                let copied = self.import_shm(&buffer);
++                buffer.release();
++                let image = match copied {
++                    Ok(image) => image,
++                    Err(error) => {
++                        eprintln!("WMLAYER refused buffer: {error}");
++                        return true;
++                    }
++                };
++                let image_size = Size::new(image.width, image.height);
++                // Placed by what it drew: a surface anchored to the right or the bottom edge keeps
++                // its far side on that edge even when its buffer is larger than the size it asked
++                // for (the dock's column at 200%), and its exclusive zone covers what it drew.
++                let mut rect = rect;
++                rect.pos = self.layer_drawn_pos(&state, rect.pos, image_size);
++                let moved = moved || self.layers[index].rect.pos != rect.pos;
++                self.layers[index].rect.pos = rect.pos;
++                if let Some((edge, zone)) = exclusive {
++                    let drawn = if edge == Anchor::LEFT || edge == Anchor::RIGHT { image_size.w } else { image_size.h };
++                    self.layers[index].exclusive = Some((edge, zone.max(drawn)));
++                }
++                let old = self.layers[index].shell;
++                let backend = self.wm.backend_mut();
++                let shell = match old {
++                    Some(shell) if !moved && backend.shell_size(shell) == Some(image_size) => Some(shell),
++                    _ => {
++                        if let Some(old) = old {
++                            backend.destroy_shell_surface(old);
++                        }
++                        backend.create_shell_surface(Rect::new(rect.pos, image_size), (0, 0, 0), above)
++                    }
++                };
++                if let Some(shell) = shell {
++                    backend.paint_shell_surface(shell, &image);
++                    backend.map_shell_surface(shell);
++                    if old != Some(shell) {
++                        eprintln!("WMLAYER mapped namespace={} at={},{} size={}x{}", self.layers[index].namespace, rect.pos.x, rect.pos.y, image_size.w, image_size.h);
++                    }
++                }
++                self.layers[index].shell = shell;
++                self.layers[index].rect.size = image_size;
++                self.layers_workarea();
++                if old != shell {
++                    self.refresh_pointer();
++                }
++            }
++            Some(BufferAssignment::Removed) => {
++                if let Some(shell) = self.layers[index].shell.take() {
++                    self.wm.backend_mut().destroy_shell_surface(shell);
++                }
++                self.layers_workarea();
++            }
++            None => {}
++        }
++        true
++    }
++    /// The topmost shown layer surface under a point: its surface and its origin in logical units.
++    pub(crate) fn layer_at(&self, root: Point) -> Option<(WlSurface, (f64, f64))> {
++        let density = self.scale().factor();
++        let hit = |l: &&LayerEntry| {
++            l.shell.is_some()
++                && root.x >= l.rect.pos.x
++                && root.y >= l.rect.pos.y
++                && i64::from(root.x) < i64::from(l.rect.pos.x) + i64::from(l.rect.size.w)
++                && i64::from(root.y) < i64::from(l.rect.pos.y) + i64::from(l.rect.size.h)
++        };
++        self.layers.iter().rev().filter(|l| l.above).find(hit).map(|l| {
++            (l.surface.wl_surface().clone(), (f64::from(l.rect.pos.x) / density, f64::from(l.rect.pos.y) / density))
++        })
++    }
++    /// Where a surface of `drawn` panel pixels goes: its far side on the right or bottom edge it
++    /// is anchored to (a buffer larger than the size it asked for grows inwards, not off the panel).
++    fn layer_drawn_pos(&self, state: &LayerSurfaceCachedState, pos: Point, drawn: Size) -> Point {
++        let screen = self.wm.backend().screen_size();
++        let density = self.scale().factor();
++        let px = |v: i32| (f64::from(v) * density).round() as i32;
++        let (a, m) = (state.anchor, state.margin);
++        let mut pos = pos;
++        if a.contains(Anchor::RIGHT) && !a.contains(Anchor::LEFT) {
++            pos.x = screen.w as i32 - drawn.w as i32 - px(m.right);
++        }
++        if a.contains(Anchor::BOTTOM) && !a.contains(Anchor::TOP) {
++            pos.y = screen.h as i32 - drawn.h as i32 - px(m.bottom);
++        }
++        pos
++    }
++    /// One line per layer surface and the work area (tests, logs).
++    pub fn layer_report(&self) -> String {
++        let mut out = String::new();
++        for l in &self.layers {
++            out.push_str(&format!("layer namespace={} at={},{} size={}x{} shown={} exclusive={:?}\n", l.namespace, l.rect.pos.x, l.rect.pos.y, l.rect.size.w, l.rect.size.h, l.shell.is_some(), l.exclusive.map(|(_, px)| px)));
++        }
++        if let Some(a) = self.layer_workarea {
++            out.push_str(&format!("workarea={},{} {}x{}\n", a.pos.x, a.pos.y, a.size.w, a.size.h));
++        }
++        out.push_str(&format!("foreign_listeners={}\n", self.foreign_listener_count()));
++        out
++    }
++    /// Where a layer surface is, for a popup placed against it.
++    pub(crate) fn layer_place_of(&self, surface: &WlSurface) -> Option<Point> {
++        self.layers.iter().find(|l| l.surface.wl_surface() == surface).map(|l| l.rect.pos)
++    }
++    fn layer_gone(&mut self, surface: &WlSurface) {
++        if let Some(index) = self.layer_index(surface) {
++            let entry = self.layers.remove(index);
++            if let Some(shell) = entry.shell {
++                self.wm.backend_mut().destroy_shell_surface(shell);
++            }
++            eprintln!("WMLAYER gone namespace={}", entry.namespace);
++            self.layers_workarea();
++            self.refresh_pointer();
++        }
++    }
++}
++
++impl WlrLayerShellHandler for Server {
++    fn shell_state(&mut self) -> &mut WlrLayerShellState {
++        &mut self.layer_shell
++    }
++    fn new_layer_surface(&mut self, surface: LayerSurface, _output: Option<WlOutput>, layer: Layer, namespace: String) {
++        eprintln!("WMLAYER new namespace={namespace} layer={layer:?}");
++        self.layers.push(LayerEntry {
++            surface,
++            namespace,
++            rect: Rect::new(Point::new(0, 0), Size::new(1, 1)),
++            shell: None,
++            above: matches!(layer, Layer::Top | Layer::Overlay),
++            exclusive: None,
++        });
++    }
++    fn new_popup(&mut self, _parent: LayerSurface, popup: PopupSurface) {
++        self.popup_adopted(popup);
++    }
++    fn layer_destroyed(&mut self, surface: LayerSurface) {
++        self.layer_gone(surface.wl_surface());
++    }
++}
++smithay::delegate_layer_shell!(Server);
+diff --git a/crates/wm-darwin/src/lib.rs b/crates/wm-darwin/src/lib.rs
+index 2de0398..c85ca8e 100644
+--- a/crates/wm-darwin/src/lib.rs
++++ b/crates/wm-darwin/src/lib.rs
+@@ -2,8 +2,10 @@
+ #![cfg(feature = "darwin-backend")]
+ 
+ pub use smithay;
++mod activation;
+ pub mod applications;
+ pub mod autopilot;
++pub mod capture;
+ pub mod bench;
+ pub mod damage;
+ #[cfg(feature = "desktop-shell")]
+@@ -11,6 +13,7 @@ pub mod desktop;
+ #[cfg(feature = "desktop-shell")]
+ pub mod desktop_entry;
+ pub mod glrender;
++mod foreign;
+ mod gesture;
+ pub mod gpu;
+ pub mod hid;
+@@ -35,6 +38,7 @@ pub mod inject {
+ }
+ mod input;
+ pub mod kms;
++mod layers;
+ pub mod launch_audit;
+ pub mod output;
+ pub mod pixels;
+diff --git a/crates/wm-darwin/src/popups.rs b/crates/wm-darwin/src/popups.rs
+index 5c48bde..dc1d8b4 100644
+--- a/crates/wm-darwin/src/popups.rs
++++ b/crates/wm-darwin/src/popups.rs
+@@ -34,12 +34,23 @@ impl Server {
+             let w = self.wm.backend().windows.get(&id)?;
+             return Some((w.content.pos, self.wm.backend().density(id)));
+         }
++        if let Some(pos) = self.layer_place_of(parent) {
++            return Some((pos, self.scale().factor()));
++        }
+         self.client_popups
+             .iter()
+             .find(|p| p.surface.wl_surface() == parent)
+             .map(|p| (p.rect.pos, self.scale().factor()))
+     }
+ 
++    /// A layer surface took a popup made without a parent (`zwlr_layer_surface_v1.get_popup`).
++    pub(crate) fn popup_adopted(&mut self, surface: PopupSurface) {
++        if let Some(index) = self.parentless_popups.iter().position(|(p, _)| *p == surface) {
++            let (surface, positioner) = self.parentless_popups.remove(index);
++            self.popup_created(surface, positioner);
++        }
++    }
++
+     fn popup_rect(&self, parent: &WlSurface, positioner: &PositionerState) -> Option<(Rectangle<i32, Logical>, Rect)> {
+         let (origin, density) = self.popup_parent_place(parent)?;
+         let screen = self.wm.backend().screen_size();
+@@ -59,6 +70,14 @@ impl Server {
+     }
+ 
+     pub(crate) fn popup_created(&mut self, surface: PopupSurface, positioner: PositionerState) {
++        if surface.get_parent_surface().is_none() {
++            // A layer surface may adopt it (get_popup): it waits for that, unconfigured.
++            self.parentless_popups.retain(|(p, _)| p.alive());
++            if self.parentless_popups.len() < 8 {
++                self.parentless_popups.push((surface, positioner));
++                return;
++            }
++        }
+         let placed = surface.get_parent_surface().and_then(|parent| self.popup_rect(&parent, &positioner));
+         let Some((geometry, rect)) = placed else {
+             // No parent this compositor knows: there is nowhere to put it.
+diff --git a/crates/wm-darwin/src/scene.rs b/crates/wm-darwin/src/scene.rs
+index d7e3794..bfc3713 100644
+--- a/crates/wm-darwin/src/scene.rs
++++ b/crates/wm-darwin/src/scene.rs
+@@ -136,6 +136,8 @@ pub struct CpuBackend {
+     /// policy gives are only made pending, and the server sends each touched
+     /// window one configure afterwards (the request's owed reply included).
+     pub(crate) hold_configures: bool,
++    /// A swipe between Spaces in progress: windows drawn displaced (`gesture.rs`).
++    pub slide: Option<crate::gesture::Slide>,
+ }
+ impl CpuBackend {
+     pub fn new(size: Size) -> Result<Self, String> {
+@@ -160,6 +162,7 @@ impl CpuBackend {
+             interactive: false,
+             rescaling: false,
+             hold_configures: false,
++            slide: None,
+             monitors: vec![MonitorInfo {
+                 geometry: Rect::new(Point::new(0, 0), size),
+                 name: "SFGOP-0".into(),
+@@ -321,25 +324,33 @@ impl CpuBackend {
+         shells(&mut list, false);
+         for id in &self.stack {
+             let frame = self.frames.values().find(|f| f.window == *id);
+-            if !self.visible(*id) && !frame.is_some_and(|f| f.mapped) {
++            // A swipe between Spaces: the current Space's windows move with the fingers and the
++            // neighbour's (not mapped: another Space) come in beside them.
++            let (shift, neighbour) = match &self.slide {
++                Some(slide) if slide.neighbour.contains(id) => (slide.neighbour_offset, true),
++                Some(slide) if slide.current.contains(id) => (slide.offset, false),
++                _ => (0, false),
++            };
++            if !neighbour && !self.visible(*id) && !frame.is_some_and(|f| f.mapped) {
+                 continue;
+             }
+             let w = &self.windows[id];
+-            if let Some(image) = w.image.as_ref().filter(|_| w.mapped) {
++            if let Some(image) = w.image.as_ref().filter(|_| w.mapped || neighbour) {
++                let pos = Point::new(w.content.pos.x + shift, w.content.pos.y);
+                 list.push((
+                     ItemSig {
+                         key: ItemKey::Window(*id),
+-                        rect: image_rect(w.content.pos, image),
++                        rect: image_rect(pos, image),
+                         generation: w.generation,
+                     },
+                     match w.external {
+-                        Some(buffer) => DrawOp::External { pos: w.content.pos, buffer },
+-                        None => DrawOp::Image { pos: w.content.pos, image },
++                        Some(buffer) => DrawOp::External { pos, buffer },
++                        None => DrawOp::Image { pos, image },
+                     },
+                 ));
+             }
+             if let Some((frame, surface)) = frame.and_then(|f| Some((f, f.paint.as_ref()?))) {
+-                let pos = frame.geometry.pos;
++                let pos = Point::new(frame.geometry.pos.x + shift, frame.geometry.pos.y);
+                 let mut rect = DRect::EMPTY;
+                 for solid in &surface.solids {
+                     rect = rect.union(DRect::from_rect(solid.rect).translate(pos.x, pos.y));
+@@ -486,6 +497,26 @@ impl CpuBackend {
+         self.stack.retain(|v| *v != id);
+         self.dirty = true;
+     }
++    /// A window's rectangle on the panel with its frame (title bar and borders), or its
++    /// content alone when it has no frame; None when it is not shown.
++    /// A scene shell surface's picture size.
++    pub fn shell_size(&self, id: u64) -> Option<Size> {
++        self.shells.get(&id).map(|s| Size::new(s.image.width, s.image.height))
++    }
++    pub fn window_frame_rect(&self, id: u64) -> Option<Rect> {
++        let w = self.windows.get(&id).filter(|w| w.mapped)?;
++        Some(match self.frames.values().find(|f| f.window == id && f.mapped) {
++            Some(f) => f.geometry,
++            None => w.content,
++        })
++    }
++    /// The scene as composed, without the pointer (a screenshot).
++    pub fn render_for_capture(&mut self) -> Result<tiny_skia::Pixmap, String> {
++        let cursor = self.cursor.take();
++        let rendered = self.render();
++        self.cursor = cursor;
++        rendered
++    }
+     pub fn window_for_surface(
+         &self,
+         surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+@@ -619,6 +650,14 @@ impl CpuBackend {
+ impl Backend for CpuBackend {
+     type WindowId = u64;
+     type FrameId = u64;
++    /// The policy's Spaces profile (the owner's `interaction_mode = "spaces"`) is allowed
++    /// here: the standalone desk selects it with the ordinary (Desktop) keyboard, never the
++    /// Mac keyboard translation, which this backend does not provide. A Mac application gets
++    /// its Command keys as they are (`input.rs`), which is what that translation is for on
++    /// Linux.
++    fn supports_mac_interaction(&self) -> bool {
++        true
++    }
+     type ShellId = u64;
+     fn scan_existing_windows(&mut self) -> Vec<u64> {
+         self.windows.keys().copied().collect()
+diff --git a/crates/wm-darwin/src/server.rs b/crates/wm-darwin/src/server.rs
+index f7e05cd..342f49a 100644
+--- a/crates/wm-darwin/src/server.rs
++++ b/crates/wm-darwin/src/server.rs
+@@ -84,7 +84,7 @@ pub struct Server {
+     pub(crate) power: crate::power::Power,
+     /// The clipboard: `wl_data_device_manager` for the seat's clients.
+     data_device: DataDeviceState,
+-    display_handle: DisplayHandle,
++    pub(crate) display_handle: DisplayHandle,
+     /// Selections set by clients since start (clipboard only).
+     pub(crate) selections_set: u32,
+     dmabuf_stats: DmabufStats,
+@@ -98,6 +98,23 @@ pub struct Server {
+     _fractional_scale: FractionalScaleManagerState,
+     _viewporter: ViewporterState,
+     pub(crate) scale_stats: ScaleStats,
++    /// Screenshots (keys and the capture socket), see `capture.rs`.
++    pub captures: crate::capture::Captures,
++    /// Multi-finger swipes between Spaces, see `gesture.rs`.
++    pub gesture: crate::gesture::Gesture,
++    /// Layer-shell surfaces (the dock), see `layers.rs`.
++    pub(crate) layers: Vec<crate::layers::LayerEntry>,
++    pub(crate) layer_shell: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
++    pub(crate) layer_workarea: Option<wm_core::Rect>,
++    /// The layer surface a held button went down on: it gets the pointer until the release.
++    pub(crate) layer_grab: Option<WlSurface>,
++    /// Popups made without a parent, waiting for a layer surface to adopt them (`get_popup`).
++    pub(crate) parentless_popups: Vec<(PopupSurface, PositionerState)>,
++    _xdg_output: smithay::wayland::output::OutputManagerState,
++    /// The windows told to a dock (`foreign.rs`).
++    pub(crate) foreign: crate::foreign::ForeignToplevels,
++    /// xdg_activation_v1 (`activation.rs`).
++    pub(crate) activation: smithay::wayland::xdg_activation::XdgActivationState,
+ }
+ 
+ /// A window's sizes: what its client committed and what is on the panel.
+@@ -233,6 +250,16 @@ impl Server {
+             _fractional_scale: FractionalScaleManagerState::new::<Self>(dh),
+             _viewporter: ViewporterState::new::<Self>(dh),
+             scale_stats: ScaleStats::default(),
++            captures: Default::default(),
++            gesture: Default::default(),
++            layers: Vec::new(),
++            layer_shell: smithay::wayland::shell::wlr_layer::WlrLayerShellState::new::<Self>(dh),
++            layer_workarea: None,
++            layer_grab: None,
++            parentless_popups: Vec::new(),
++            _xdg_output: smithay::wayland::output::OutputManagerState::new_with_xdg_output::<Self>(dh),
++            activation: smithay::wayland::xdg_activation::XdgActivationState::new::<Self>(dh),
++            foreign: { let mut f = crate::foreign::ForeignToplevels::default(); f.create_global(dh); f },
+         })
+     }
+     /// The display scale in force.
+@@ -1072,6 +1099,7 @@ impl CompositorHandler for Server {
+     fn commit(&mut self, surface: &WlSurface) {
+         if self.input.as_ref().and_then(|i|i.cursor_surface.as_ref())==Some(surface){self.import_cursor(surface);return;}
+         if self.popup_commit(surface) { return; }
++        if self.layer_commit(surface) { return; }
+         let Some(id) = self.wm.backend().window_for_surface(surface) else {
+             return;
+         };
+@@ -1521,12 +1549,22 @@ delegate_seat!(Server);
+ // Linux, less what belongs to XWayland and persistence: the compositor never
+ // owns a selection, so `send_selection` has nothing to send.
+ impl SelectionHandler for Server {
+-    type SelectionUserData = ();
++    /// A selection the compositor serves itself: a screenshot's PNG (`capture.rs`).
++    type SelectionUserData = Option<Arc<Vec<u8>>>;
+     fn new_selection(&mut self, target: SelectionTarget, source: Option<SelectionSource>, _: Seat<Self>) {
+         if target == SelectionTarget::Clipboard && source.is_some() {
+             self.selections_set += 1;
+         }
+     }
++    fn send_selection(&mut self, _: SelectionTarget, mime_type: String, fd: std::os::fd::OwnedFd, _: Seat<Self>, data: &Self::SelectionUserData) {
++        if let (Some(data), "image/png") = (data.clone(), mime_type.as_str()) {
++            // A reader that is slow must not hold the compositor: the bytes go from a thread.
++            std::thread::spawn(move || {
++                let mut file = std::fs::File::from(fd);
++                let _ = std::io::Write::write_all(&mut file, &data);
++            });
++        }
++    }
+ }
+ impl DataDeviceHandler for Server {
+     fn data_device_state(&self) -> &DataDeviceState {
+diff --git a/crates/wm-darwin/src/settings.rs b/crates/wm-darwin/src/settings.rs
+index ff56f9e..9f89abf 100644
+--- a/crates/wm-darwin/src/settings.rs
++++ b/crates/wm-darwin/src/settings.rs
+@@ -160,8 +160,9 @@ pub fn request_session_end(poweroff: bool) -> Result<(), i32> {
+     Ok(())
+ }
+ 
+-/// The directories whose application bundles the Applications submenu lists.
+-pub const APPLICATION_DIRS: [&str; 2] = ["/Applications", "/Applications/Utilities"];
++/// The directories whose application bundles the Applications submenu lists, in the order
++/// `open -a` searches them (terminal-app/system/open.c): a name found twice is the first one's.
++pub const APPLICATION_DIRS: [&str; 4] = ["/Applications", "/Applications/Utilities", "/System/Applications", "/System/Applications/Utilities"];
+ 
+ /// The pipe in the session's runtime directory on which the session's listener
+ /// (`open --listen`) takes the path of a bundle to open.
+@@ -175,7 +176,8 @@ pub fn applications_in(dirs: &[&str]) -> Vec<std::path::PathBuf> {
+         let Ok(entries) = std::fs::read_dir(dir) else { continue };
+         for entry in entries.flatten() {
+             let path = entry.path();
+-            if path.extension().is_some_and(|e| e == "app") && path.is_dir() {
++            // A bundle of the same name in an earlier directory (or a link to this one) wins.
++            if path.extension().is_some_and(|e| e == "app") && path.is_dir() && !found.iter().any(|f| f.file_name() == path.file_name()) {
+                 found.push(path);
+             }
+         }
+diff --git a/crates/wm-darwin/tests/dock_host.rs b/crates/wm-darwin/tests/dock_host.rs
+new file mode 100644
+index 0000000..2019750
+--- /dev/null
++++ b/crates/wm-darwin/tests/dock_host.rs
+@@ -0,0 +1,106 @@
++//! The real Chonkstep dock (`chonk-dock`, built for this host) against this compositor's server
++//! on a socket: it must come up through zwlr_layer_shell_v1 (its column, Clip and launcher strip
++//! drawn above the windows, the column's exclusive zone keeping windows out), bind the
++//! foreign-toplevel list, and see a window (its running indicator). Needs the dock binary:
++//! `CHONK_DOCK_BIN=<path> cargo test -p wm-darwin --features desktop-shell --test dock_host -- --ignored`.
++//! `CHONK_DOCK_PICTURE=<file.png>` keeps the frame.
++#![cfg(all(feature = "darwin-backend", feature = "desktop-shell"))]
++use std::{
++    os::unix::net::UnixStream,
++    process::{Command, Stdio},
++    sync::mpsc,
++    thread,
++    time::{Duration, Instant},
++};
++use wm_core::Size;
++use wm_darwin::scale::Scale;
++use wm_darwin::server::Server;
++use wm_darwin::smithay::reexports::wayland_server::{Display, ListeningSocket};
++
++const PANEL: Size = Size { w: 1280, h: 800 };
++
++struct Memory(Option<tiny_skia::Pixmap>);
++impl wm_darwin::presenter::Presenter for Memory {
++    fn present(&mut self, frame: &tiny_skia::Pixmap) -> Result<(), String> {
++        self.0 = Some(frame.clone());
++        Ok(())
++    }
++}
++fn fonts() -> wm_theme::FontState {
++    let read = |name: &str| std::fs::read(format!("/usr/share/fonts/TTF/{name}")).expect("DejaVu Sans is installed on the test host");
++    wm_theme::FontState::from_packaged_fonts(read("DejaVuSans.ttf"), read("DejaVuSans-Bold.ttf")).unwrap()
++}
++
++#[test]
++#[ignore]
++fn the_dock_comes_up_on_layer_shell_and_sees_the_windows() {
++    let dock = std::env::var("CHONK_DOCK_BIN").expect("CHONK_DOCK_BIN");
++    let runtime = tempfile::tempdir().unwrap();
++    let socket = runtime.path().join("wayland-test");
++    let (result_tx, result_rx) = mpsc::channel();
++    let socket_for_server = socket.clone();
++    let server = thread::spawn(move || {
++        let mut display = Display::<Server>::new().unwrap();
++        let mut state = Server::new(&display.handle(), PANEL).unwrap();
++        state.set_scale(Scale::from_120(120).unwrap()).unwrap();
++        state.enable_sfhid_seat(&display.handle()).unwrap();
++        state.enable_desktop_shell_with(fonts(), None).unwrap();
++        let listener = ListeningSocket::bind_absolute(socket_for_server).unwrap();
++        let mut out = Memory(None);
++        let started = Instant::now();
++        let mut report = String::new();
++        while started.elapsed() < Duration::from_secs(25) {
++            while let Ok(Some(stream)) = listener.accept() {
++                Server::add_client(&mut display, stream).unwrap();
++            }
++            display.dispatch_clients(&mut state).unwrap();
++            state.capture_step();
++            state.foreign_sync();
++            state.repaint(&mut out, started.elapsed().as_millis() as u32).unwrap();
++            display.flush_clients().unwrap();
++            thread::sleep(Duration::from_millis(8));
++            if started.elapsed() > Duration::from_secs(20) && report.is_empty() {
++                report = state.layer_report();
++                let pixmap = state.wm.backend_mut().render_for_capture().unwrap();
++                if let Ok(path) = std::env::var("CHONK_DOCK_PICTURE") {
++                    pixmap.save_png(path).unwrap();
++                }
++                break;
++            }
++        }
++        result_tx.send(report).unwrap();
++    });
++    thread::sleep(Duration::from_millis(500));
++    let xdg_state = tempfile::tempdir().unwrap();
++    // The desk's dock items (CHONK_DOCK_ITEMS=<dir with applications/ and dock-pins>).
++    let data = tempfile::tempdir().unwrap();
++    if let Ok(items) = std::env::var("CHONK_DOCK_ITEMS") {
++        let apps = data.path().join("applications");
++        std::fs::create_dir_all(&apps).unwrap();
++        for entry in std::fs::read_dir(format!("{items}/applications")).unwrap() {
++            let entry = entry.unwrap();
++            std::fs::copy(entry.path(), apps.join(entry.file_name())).unwrap();
++        }
++        std::fs::create_dir_all(xdg_state.path().join("chonkstep")).unwrap();
++        std::fs::copy(format!("{items}/dock-pins"), xdg_state.path().join("chonkstep/dock")).unwrap();
++    }
++    let mut child = Command::new(dock)
++        .arg("--wayland")
++        .env("WAYLAND_DISPLAY", &socket)
++        .env("XDG_RUNTIME_DIR", runtime.path())
++        .env("XDG_STATE_HOME", xdg_state.path())
++        .env("XDG_DATA_DIRS", data.path())
++        .env("XDG_DATA_HOME", data.path())
++        .stdout(Stdio::null())
++        .stderr(Stdio::inherit())
++        .spawn()
++        .unwrap();
++    let _ = UnixStream::connect(&socket);
++    let report = result_rx.recv_timeout(Duration::from_secs(60)).unwrap();
++    let _ = child.kill();
++    let _ = child.wait();
++    server.join().unwrap();
++    eprintln!("{report}");
++    assert!(report.contains("namespace=chonk-dock "), "{report}");
++    assert!(report.contains("workarea="), "{report}");
++}
+diff --git a/crates/wm-darwin/tests/wayland_shm.rs b/crates/wm-darwin/tests/wayland_shm.rs
+index 693fb44..23cc2a1 100644
+--- a/crates/wm-darwin/tests/wayland_shm.rs
++++ b/crates/wm-darwin/tests/wayland_shm.rs
+@@ -453,10 +453,12 @@ fn actual_shm_client_uses_chonkstep_policy_decorations_and_owned_lifetime() {
+     let mut client = Client::default();
+     connection.display().get_registry(&qh, ());
+     queue.roundtrip(&mut client).unwrap();
++    // zwlr_layer_shell_v1 is served since the dock (layers.rs); the others still are not here.
+     assert!(!client.globals.iter().any(|g| matches!(
+         g.as_str(),
+-        "wl_seat" | "wl_subcompositor" | "zwp_linux_dmabuf_v1" | "zwlr_layer_shell_v1"
++        "wl_seat" | "wl_subcompositor" | "zwp_linux_dmabuf_v1"
+     )));
++    assert!(client.globals.iter().any(|g| g == "zwlr_layer_shell_v1"));
+     let surface = client.compositor.as_ref().unwrap().create_surface(&qh, ());
+     let xdg = client
+         .shell
+diff --git a/dock/crates/chonk-dock-proto/src/transport.rs b/dock/crates/chonk-dock-proto/src/transport.rs
+index 483624a..9ae654f 100644
+--- a/dock/crates/chonk-dock-proto/src/transport.rs
++++ b/dock/crates/chonk-dock-proto/src/transport.rs
+@@ -261,10 +261,20 @@ pub fn mint_token() -> io::Result<[u8; TOKEN_BYTES]> {
+     let mut token = [0u8; TOKEN_BYTES];
+     // SAFETY: `token` is writable for exactly `token.len()` bytes and remains
+     // exclusively borrowed until the syscall returns.
+-    let filled = unsafe { libc::getrandom(token.as_mut_ptr().cast(), token.len(), 0) };
+-    if filled == token.len() as libc::ssize_t {
++    #[cfg(target_os = "linux")]
++    {
++        let filled = unsafe { libc::getrandom(token.as_mut_ptr().cast(), token.len(), 0) };
++        if filled == token.len() as libc::ssize_t {
++            return Ok(token);
++        }
++    }
++    // Darwin: the kernel's generator through arc4random_buf(3), which cannot fail.
++    #[cfg(not(target_os = "linux"))]
++    {
++        unsafe { libc::arc4random_buf(token.as_mut_ptr().cast(), token.len()) };
+         return Ok(token);
+     }
++    #[allow(unreachable_code)]
+     read_urandom(&mut token)?;
+     Ok(token)
+ }
+@@ -653,11 +663,7 @@ fn connect_nonblocking(path: &Path, kind: libc::c_int) -> io::Result<OwnedFd> {
+     // SAFETY: `socket` takes only integer arguments and returns a new raw fd,
+     // whose error sentinel is checked by `cvt`.
+     let raw = cvt(unsafe {
+-        libc::socket(
+-            libc::AF_UNIX,
+-            kind | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+-            0,
+-        )
++        socket_cloexec_nonblock(kind)
+     })?;
+     // SAFETY: `raw` is newly created and nonnegative, with no other Rust
+     // owner; ownership transfers to this `OwnedFd` exactly once.
+@@ -703,11 +709,7 @@ fn bind_listener(path: &Path, kind: libc::c_int) -> io::Result<OwnedFd> {
+     // SAFETY: `socket` takes only integer arguments and returns a new raw fd,
+     // whose error sentinel is checked by `cvt`.
+     let raw = cvt(unsafe {
+-        libc::socket(
+-            libc::AF_UNIX,
+-            kind | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+-            0,
+-        )
++        socket_cloexec_nonblock(kind)
+     })?;
+     // SAFETY: `raw` is newly created and nonnegative, with no other Rust
+     // owner; ownership transfers to this `OwnedFd` exactly once.
+@@ -803,14 +805,7 @@ fn clear_stale_socket(path: &Path, kind: libc::c_int) -> io::Result<()> {
+ fn accept_nonblocking(listener: RawFd) -> io::Result<Option<OwnedFd>> {
+     // SAFETY: `listener` is used only as a kernel handle; both optional
+     // address outputs are null, and `accept4` returns a new fd or -1.
+-    let raw = unsafe {
+-        libc::accept4(
+-            listener,
+-            std::ptr::null_mut(),
+-            std::ptr::null_mut(),
+-            libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+-        )
+-    };
++    let raw = unsafe { accept_cloexec_nonblock(listener) };
+     if raw < 0 {
+         let err = io::Error::last_os_error();
+         return match err.kind() {
+@@ -825,6 +820,52 @@ fn accept_nonblocking(listener: RawFd) -> io::Result<Option<OwnedFd>> {
+ 
+ /// `SO_PEERCRED` on a borrowed descriptor — see
+ /// [`Seqpacket::peer_credentials`].
++#[cfg(not(target_os = "linux"))]
++pub fn peer_credentials_of(fd: RawFd) -> io::Result<PeerCredentials> {
++    // Darwin: getpeereid(3) for the ids, LOCAL_PEERPID for the process.
++    let (mut uid, mut gid) = (0 as libc::uid_t, 0 as libc::gid_t);
++    cvt(unsafe { libc::getpeereid(fd, &mut uid, &mut gid) })?;
++    let mut pid: libc::pid_t = 0;
++    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
++    cvt(unsafe { libc::getsockopt(fd, libc::SOL_LOCAL, libc::LOCAL_PEERPID, (&mut pid as *mut libc::pid_t).cast(), &mut len) })?;
++    Ok(PeerCredentials { pid, uid, gid })
++}
++
++/// `socket(AF_UNIX, kind)` close-on-exec and non-blocking. Darwin has no
++/// SOCK_CLOEXEC/SOCK_NONBLOCK: the flags are set right after (the dock
++/// spawns nothing between the two calls on its own thread).
++unsafe fn socket_cloexec_nonblock(kind: libc::c_int) -> libc::c_int {
++    #[cfg(target_os = "linux")]
++    {
++        libc::socket(libc::AF_UNIX, kind | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0)
++    }
++    #[cfg(not(target_os = "linux"))]
++    {
++        let fd = libc::socket(libc::AF_UNIX, kind, 0);
++        if fd >= 0 && (libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 || libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) < 0) {
++            libc::close(fd);
++            return -1;
++        }
++        fd
++    }
++}
++unsafe fn accept_cloexec_nonblock(listener: RawFd) -> libc::c_int {
++    #[cfg(target_os = "linux")]
++    {
++        libc::accept4(listener, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
++    }
++    #[cfg(not(target_os = "linux"))]
++    {
++        let fd = libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut());
++        if fd >= 0 && (libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0 || libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) < 0) {
++            libc::close(fd);
++            return -1;
++        }
++        fd
++    }
++}
++
++#[cfg(target_os = "linux")]
+ pub fn peer_credentials_of(fd: RawFd) -> io::Result<PeerCredentials> {
+     // SAFETY: all-zero is a valid initial representation for this C output
+     // structure, and the kernel fills it before fields are read.

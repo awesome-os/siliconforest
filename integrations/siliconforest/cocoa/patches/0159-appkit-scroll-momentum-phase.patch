@@ -1,0 +1,48 @@
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -556,7 +556,7 @@
+                                 case NSScrollWheel: {
+                                     NSEvent *e = [NSEvent mouseEventWithType:NSScrollWheel
+                                                     location:NSMakePoint(me.x, me.y)
+-                                               modifierFlags:(me.mods&1u)?(me.mods&~7u):me.mods
++                                               modifierFlags:(me.mods&1u)?(me.mods&~15u):me.mods
+                                                       window:window
+                                                   clickCount:0
+                                                       deltaX:me.dx
+@@ -564,7 +564,10 @@
+                                     if(me.mods&1u){
+                                         NSEventPhase phase=((me.mods&6u)==6u)?NSEventPhaseCancelled:((me.mods&4u)?NSEventPhaseEnded:((me.mods&2u)?NSEventPhaseBegan:NSEventPhaseChanged));
+                                         [e _sfSetPreciseScrolling:YES phase:phase];
+-                                        if(getenv("SFFX_SCROLL_TRACE"))fprintf(stderr,"FXSCROLL precise=1 phase=%lu dx=%.6f dy=%.6f modifiers=%lu\n",(unsigned long)phase,(double)[e scrollingDeltaX],(double)[e scrollingDeltaY],(unsigned long)[e modifierFlags]);
++                                        // (TERM10) bit 8: momentum after the gesture (2 began, 4 ended, else changed)
++                                        if(me.mods&8u)
++                                         [e _sfSetMomentumPhase:(me.mods&2u)?NSEventPhaseBegan:((me.mods&4u)?NSEventPhaseEnded:NSEventPhaseChanged)];
++                                        if(getenv("SFFX_SCROLL_TRACE"))fprintf(stderr,"FXSCROLL precise=1 phase=%lu momentum=%lu dx=%.6f dy=%.6f modifiers=%lu\n",(unsigned long)[e phase],(unsigned long)[e momentumPhase],(double)[e scrollingDeltaX],(double)[e scrollingDeltaY],(unsigned long)[e modifierFlags]);
+                                     }
+                                     [_display postEvent:e atStart:NO];
+                                     break;
+--- a/src/Frameworks/AppKit/NSEvent.subproj/NSEvent_mouse.h
++++ b/src/Frameworks/AppKit/NSEvent.subproj/NSEvent_mouse.h
+@@ -15,6 +15,7 @@
+     float _deltaY;
+     BOOL _sfPreciseScroll;
+     NSEventPhase _sfScrollPhase;
++    NSEventPhase _sfMomentumPhase;   // (TERM10) a scroll that goes on after the fingers lifted
+     CGFloat _sfMagnification;   // (TERM8) a magnify event's change of scale
+     NSInteger _trackingNumber;
+     NSInteger _serial;
+--- a/src/Frameworks/AppKit/NSEvent.subproj/NSEvent_mouse.m
++++ b/src/Frameworks/AppKit/NSEvent.subproj/NSEvent_mouse.m
+@@ -26,6 +26,12 @@
+     _sfScrollPhase=_sfPreciseScroll?phase:NSEventPhaseNone;
+ }
+ -(BOOL)hasPreciseScrollingDeltas {return _sfPreciseScroll;}
++// (TERM10) momentum: the window server's scroll after a gesture ended; its phase is none, as on macOS
++-(void)_sfSetMomentumPhase:(NSEventPhase)phase {
++    _sfMomentumPhase=(_type==NSScrollWheel)?phase:NSEventPhaseNone;
++    if(_sfMomentumPhase!=NSEventPhaseNone)_sfScrollPhase=NSEventPhaseNone;
++}
++-(NSEventPhase)momentumPhase {return _sfMomentumPhase;}
+ // (TERM8) a pinch: what the scale changed by since the event before, and the gesture's phase
+ -(void)_sfSetMagnification:(CGFloat)magnification phase:(NSEventPhase)phase {
+     _sfMagnification=magnification;

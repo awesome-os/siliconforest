@@ -1,0 +1,147 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Unattended proof of the read-only NVMe driver (sfnvme=2 or 3), one boot:
+#   identify   the controller's and namespace's Identify fields (no serial number)
+#   hash       SHA-256 of the ranges in /etc/sfnvme-ranges through /dev/sfnvme0
+#   speed      a sequential read and random 4 KiB reads
+#   write      opening for writing must fail; the driver's refusal counters
+#   media      sfnvme=3 only: the block device, its partitions, the same hashes through
+#              /dev/rdisk*, a write attempt through the block layer, and that nothing
+#              from the disk is mounted
+#   stop       SMART again, clean controller shutdown, final counters
+# tools/nv_summary.sh reads the result. (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nNV_BEGIN_%s\n' "$nonce"
+get() { sysctl -n "$1" 2>/dev/null; }
+t0=$(date +%s)
+phase() { printf 'NV_PHASE %s t=%s\n' "$1" "$(( $(date +%s) - t0 ))"; }
+finish() {
+    printf 'NV_STATE %s\n' "$(get kern.sf_nvme.state)"
+    printf 'NV_STATS %s\n' "$(get kern.sf_nvme.stats)"
+    printf 'NV_GATE_REJECTED %s\n' "$(get kern.sf_nvme.gate_rejected)"
+    printf 'NV_WRITE_REFUSED %s\n' "$(get kern.sf_nvme.write_refused)"
+    printf 'NV_STOP %s\n' "$(get kern.sf_nvme.stop)"
+    printf 'NV_END_%s\n' "$nonce"
+    printf '\nPD_BENCH_DONE\n'
+    exit 0
+}
+phase bringup
+n=0
+while [ "$n" -lt 60 ]; do
+    case "$(get kern.sf_nvme.state)" in ready*|failed*|stopped*) break;; esac
+    sleep 1; n=$((n+1))
+done
+printf 'NV_STATE %s\n' "$(get kern.sf_nvme.state)"
+printf 'NV_NCPU %s\n' "$(get hw.ncpu)"
+printf 'NV_GATE_SELFTEST %s\n' "$(get kern.sf_nvme.gate_selftest)"
+case "$(get kern.sf_nvme.state)" in ready*) ;; *) printf 'NV_FAIL the driver is not ready\n'; finish;; esac
+
+phase identify
+printf 'NV_IDCTRL %s\n' "$(get kern.sf_nvme.idctrl)"
+printf 'NV_IDNS %s\n' "$(get kern.sf_nvme.idns)"
+printf 'NV_SMART start %s\n' "$(get kern.sf_nvme.smart)"
+blocks=$(get kern.sf_nvme.idns | sed 's/^nsze=\([0-9]*\).*/\1/')
+ls -l /dev/sfnvme0 2>&1 | sed 's/^/NV_DEV /'
+
+phase hash
+sfnvme-test head /dev/sfnvme0 1 2>&1 | cut -c1-40
+sfnvme-test hash /dev/sfnvme0 /etc/sfnvme-ranges 2>&1
+
+phase speed
+sfnvme-test seq /dev/sfnvme0 @SEQ_LBA@ @SEQ_MIB@ 8192 2>&1
+sfnvme-test seq /dev/sfnvme0 @SEQ_LBA@ 256 1024 2>&1 | grep NVT_SEQ' '
+sfnvme-test seq /dev/sfnvme0 @SEQ_LBA@ 64 128 2>&1 | grep NVT_SEQ' '
+sfnvme-test rand /dev/sfnvme0 4000 "$blocks" 2>&1
+printf 'NV_STATS speed %s\n' "$(get kern.sf_nvme.stats)"
+
+phase write
+sfnvme-test wtest /dev/sfnvme0 2>&1
+printf 'NV_GATE_REJECTED %s\n' "$(get kern.sf_nvme.gate_rejected)"
+printf 'NV_WRITE_REFUSED %s\n' "$(get kern.sf_nvme.write_refused)"
+
+case "$(get kern.sf_nvme.state)" in *level=3*)
+    phase media
+    sleep 3
+    # FIRST: the guard. Nothing is read through the block layer unless every partition is
+    # held by the guard and nothing else is attached below the disk; otherwise the
+    # controller is stopped at once.
+    census=$(get kern.sf_nvme.media)
+    printf 'NV_MEDIA %s\n' "$census"
+    nodes=$(ls /dev/disk*s* 2>/dev/null | wc -l | tr -d ' ')
+    printf 'NV_PARTNODES %s\n' "$nodes"
+    mount 2>&1 | sed 's/^/NV_MOUNT /'
+    case "$census" in
+    "published=1 partitions=@PARTS@ guarded=@PARTS@ foreign=0") ;;
+    *)  printf 'NV_FAIL the partition guard did not take effect; stopping the controller\n'
+        sysctl -w kern.sf_nvme.stop=1 2>&1 | sed 's/^/NV_STOPCALL /'
+        finish;;
+    esac
+    if mount 2>/dev/null | grep -q '/dev/disk'; then
+        printf 'NV_FAIL something from a disk is mounted; stopping the controller\n'
+        sysctl -w kern.sf_nvme.stop=1 2>&1 | sed 's/^/NV_STOPCALL /'
+        finish
+    fi
+    ls /dev/disk* /dev/rdisk* 2>&1 | tr '\n' ' ' | sed 's/^/NV_NODES /'; echo
+    whole=$(ls /dev/rdisk* 2>/dev/null | grep -v 's[0-9]' | head -1)
+    if [ -n "$whole" ]; then
+        printf 'NV_WHOLE %s\n' "$whole"
+        gpt -r show "$whole" 2>&1 | awk '{print "NV_GPT", $1, $2, $3, $4, $5, $6, $7, $8}'
+        sfnvme-test hash "$whole" /etc/sfnvme-ranges 2>&1 | sed 's/^NVT_HASH/NVT_MEDIA_HASH/'
+        sfnvme-test seq "$whole" @SEQ_LBA@ 256 8192 2>&1 | grep NVT_SEQ' ' | sed 's/^NVT_SEQ/NVT_MEDIA_SEQ/'
+        sfnvme-test wtest "$whole" 2>&1
+        sfnvme-test wtest "$(echo "$whole" | sed 's/rdisk/disk/')" 2>&1
+        first=$(ls /dev/rdisk*s1 2>/dev/null | head -1)
+        [ -n "$first" ] && sfnvme-test wtest "$first" 2>&1
+        [ -n "$first" ] && sfnvme-test head "$first" 0 2>&1 | cut -c1-40
+    else
+        printf 'NV_FAIL no whole-disk node\n'
+    fi
+    mount 2>&1 | sed 's/^/NV_MOUNT /'
+    printf 'NV_MEDIA %s\n' "$(get kern.sf_nvme.media)"
+    printf 'NV_GATE_REJECTED %s\n' "$(get kern.sf_nvme.gate_rejected)"
+    printf 'NV_WRITE_REFUSED %s\n' "$(get kern.sf_nvme.write_refused)"
+    ;;
+esac
+
+phase stop
+printf 'NV_SMARTRAW start %s\n' "$(get kern.sf_nvme.smart_raw)"
+stop_and_wait() {
+    sysctl -w kern.sf_nvme.smart=1 > /dev/null 2>&1
+    printf 'NV_SMART %s %s\n' "$1" "$(get kern.sf_nvme.smart)"
+    printf 'NV_SMARTRAW %s %s\n' "$1" "$(get kern.sf_nvme.smart_raw)"
+    sysctl -w kern.sf_nvme.stop=1 2>&1 | sed 's/^/NV_STOPCALL /'
+    n=0
+    while [ "$n" -lt 40 ]; do
+        case "$(get kern.sf_nvme.state)" in stopped*|failed*) break;; esac
+        sleep 1; n=$((n+1))
+    done
+    printf 'NV_STATE %s\n' "$(get kern.sf_nvme.state)"
+}
+stop_and_wait end
+
+# A second start in the same boot (what Linux does when its driver is bound again), only
+# after a clean stop: does the firmware log the same things as on the first start?
+if [ "@SECOND@" = 1 ]; then
+    case "$(get kern.sf_nvme.state)" in stopped-clean*)
+        phase second-start
+        sysctl -w kern.sf_nvme.start=1 2>&1 | sed 's/^/NV_STARTCALL /'
+        n=0
+        while [ "$n" -lt 30 ]; do
+            case "$(get kern.sf_nvme.state)" in ready*|failed*|stopped*) break;; esac
+            sleep 1; n=$((n+1))
+        done
+        printf 'NV_STATE %s\n' "$(get kern.sf_nvme.state)"
+        case "$(get kern.sf_nvme.state)" in ready*)
+            printf 'NV_SMART start2 %s\n' "$(get kern.sf_nvme.smart)"
+            printf 'NV_SMARTRAW start2 %s\n' "$(get kern.sf_nvme.smart_raw)"
+            sfnvme-test hash /dev/sfnvme0 /etc/sfnvme-ranges 2>&1 | sed 's/^NVT_HASH/NVT_SECOND_HASH/' | grep ALL
+            sleep 2
+            stop_and_wait end2
+            ;;
+        esac
+        ;;
+    esac
+fi
+sfnvme-test head /dev/sfnvme0 0 2>&1 | cut -c1-60 | sed 's/^/NV_AFTERSTOP /'
+finish

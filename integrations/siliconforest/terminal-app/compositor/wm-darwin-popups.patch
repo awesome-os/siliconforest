@@ -1,0 +1,578 @@
+diff --git a/crates/wm-core/src/backend.rs b/crates/wm-core/src/backend.rs
+index 50d8e03..97dfcd5 100644
+--- a/crates/wm-core/src/backend.rs
++++ b/crates/wm-core/src/backend.rs
+@@ -235,6 +235,12 @@ pub trait Backend {
+     }
+     /// The backend has the native screenshot and recording selector.
+     fn supports_native_capture(&self) -> bool { false }
++    /// New windows that ask for more room than the work area has are
++    /// opened at the size that fits, frame included. For backends whose
++    /// clients cannot know the work area and size themselves from the
++    /// screen (wm-darwin: AppKit sees the display, not the dock or the
++    /// frame the compositor will add).
++    fn fits_new_windows_to_workarea(&self) -> bool { false }
+     fn show_live_overview(
+         &mut self,
+         surface: Self::ShellId,
+diff --git a/crates/wm-core/src/manager.rs b/crates/wm-core/src/manager.rs
+index e031ce1..391ef98 100644
+--- a/crates/wm-core/src/manager.rs
++++ b/crates/wm-core/src/manager.rs
+@@ -2241,6 +2241,7 @@ impl<B: Backend> WindowManager<B> {
+                 self.ui_scale,
+             ),
+         };
++        let mut fitted_to_workarea = false;
+         if let Some(size) = floated {
+             tracing::info!(?window, app = %client.class, title = %client.title, ?size, "a window rule places this window at a fixed size");
+             client.geometry.size = size;
+@@ -2250,6 +2251,20 @@ impl<B: Backend> WindowManager<B> {
+             // one it got is a frame with a seam in it.
+             request = Self::decoration_request(&client, None);
+             layout = self.chrome_layout(chrome, &request, decoration_scale);
++        } else if self.backend.fits_new_windows_to_workarea() {
++            // A window that opens larger than the work area holds would
++            // have its frame's far edges, resize grips included, off the
++            // screen. A backend whose clients size themselves from the
++            // whole screen (a Mac application opening "as large as the
++            // display") asks for the frame to be made to fit instead.
++            let fitted = placement::fit_in(content.size, workarea, chrome_size, 1.0);
++            if fitted != content.size {
++                tracing::info!(?window, app = %client.class, asked = ?content.size, ?fitted, "a new window is made to fit the work area");
++                client.geometry.size = fitted;
++                fitted_to_workarea = true;
++                request = Self::decoration_request(&client, None);
++                layout = self.chrome_layout(chrome, &request, decoration_scale);
++            }
+         }
+         // Place the FRAME at the client's own requested position rather
+         // than deriving it by subtracting the chrome offset from it.
+@@ -2344,9 +2359,9 @@ impl<B: Backend> WindowManager<B> {
+             ClientChrome::Full | ClientChrome::Edges => {
+                 let frame = self.backend.create_decoration(window, &layout);
+                 self.backend.set_frame_geometry(frame, frame_geom);
+-                if floated.is_some() {
+-                    // The only map path that overrides the client's own
+-                    // size, and so the only one that has to tell it:
++                if floated.is_some() || fitted_to_workarea {
++                    // The map paths that override the client's own
++                    // size, and so the ones that have to tell it:
+                     // framing a window neither resizes it nor implies a
+                     // configure (`set_frame_geometry` moves the content
+                     // rect and deliberately leaves its size alone —
+@@ -2815,6 +2830,22 @@ impl<B: Backend> WindowManager<B> {
+         if self.is_layout_managed(id) {
+             return;
+         }
++        // Where the frame is and what the work area under it holds, for the
++        // backends whose clients size themselves from the whole screen (see
++        // `Backend::fits_new_windows_to_workarea`): a window that grows itself
++        // past the work area after it is mapped is held to it as a new one is.
++        let fit = (committed && self.backend.fits_new_windows_to_workarea())
++            .then(|| self.clients.get(id))
++            .flatten()
++            .map(|client| {
++                let frame = client_frame_rect(client);
++                let center = Point::new(frame.pos.x + frame.size.w as i32 / 2, frame.pos.y + frame.size.h as i32 / 2);
++                let chrome = Size::new(
++                    frame.size.w.saturating_sub(client.geometry.size.w),
++                    frame.size.h.saturating_sub(client.geometry.size.h),
++                );
++                (self.usable_area_at(center), chrome, frame.pos)
++            });
+         let Some(client) = self.clients.get_mut(id) else {
+             return;
+         };
+@@ -2866,6 +2897,22 @@ impl<B: Backend> WindowManager<B> {
+             maximized_v,
+             "configure request from a managed client — applying"
+         );
++        let fit = fit.filter(|_| !client.flags.intersects(ClientFlags::MAXIMIZED_H | ClientFlags::MAXIMIZED_V));
++        if let Some((workarea, chrome, frame_pos)) = fit {
++            let fitted = placement::fit_in(size, workarea, chrome, 1.0);
++            let pos = placement::clamp_to(workarea, Size::new(fitted.w + chrome.w, fitted.h + chrome.h), frame_pos);
++            if fitted != size || pos != frame_pos {
++                tracing::info!(?id, asked = ?size, ?fitted, ?pos, "a window that grew past the work area is held to it");
++                client.geometry.pos.x += pos.x - frame_pos.x;
++                client.geometry.pos.y += pos.y - frame_pos.y;
++                // The client drew the size it asked for; it has to be told the one it gets.
++                let refit = fitted != size;
++                client.geometry.size = fitted;
++                self.bump_protocol_state_revision();
++                self.reflow_frame_internal(id, if refit { ReflowReason::Geometry } else { ReflowReason::ClientCommit });
++                return;
++            }
++        }
+         if client.geometry.size == size {
+             return;
+         }
+diff --git a/crates/wm-darwin/src/autopilot.rs b/crates/wm-darwin/src/autopilot.rs
+index 6a6e5b8..f0670bf 100644
+--- a/crates/wm-darwin/src/autopilot.rs
++++ b/crates/wm-darwin/src/autopilot.rs
+@@ -159,7 +159,7 @@ impl Phase {
+             Phase::Menu => 4_000,
+             // Upper bounds: both end as soon as their last step is done
+             // (a slow frame delays a step, it does not skip it).
+-            Phase::Scale => SCALE_STEP_MS * 8 + 30_000,
++            Phase::Scale => scale_step_ms() * 8 + 30_000,
+             Phase::Settings => PICK_MS * 13 + 40_000,
+             Phase::Chords => 8_000,
+             Phase::MenuTerm => 6_000,
+@@ -214,6 +214,18 @@ fn term_metrics(scale: crate::scale::Scale) -> (i32, i32, i32) {
+ }
+ /// One step of the scale phase: change, let clients redraw, move the pointer, look.
+ const SCALE_STEP_MS: u64 = 1_800;
++/// How long the scale phase stays at each scale. `CHONKSTEP_DARWIN_AUTOPILOT_SCALE_STEP_MS`
++/// lengthens it (1.8 s to 120 s) for a check that watches a slow client follow the scale,
++/// such as an emulated guest's Mac application redrawing at every step.
++fn scale_step_ms() -> u64 {
++    static STEP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *STEP.get_or_init(|| {
++        std::env::var("CHONKSTEP_DARWIN_AUTOPILOT_SCALE_STEP_MS")
++            .ok()
++            .and_then(|text| text.trim().parse::<u64>().ok())
++            .map_or(SCALE_STEP_MS, |ms| ms.clamp(SCALE_STEP_MS, 120_000))
++    })
++}
+ /// One pick from the desktop menu in the settings phase.
+ const PICK_MS: u64 = 2_400;
+ /// Environment: `0` keeps the settings phase from turning the radio off and on.
+@@ -733,7 +745,7 @@ impl Autopilot {
+             }
+         } else if at >= 1_500 && self.step == base + 2 {
+             // The look is of a frame that shows the scene as it is.
+-            if server.wm.backend().dirty && at < SCALE_STEP_MS + 2_000 {
++            if server.wm.backend().dirty && at < scale_step_ms() + 2_000 {
+                 return Ok(());
+             }
+             self.step += 1;
+@@ -772,7 +784,7 @@ impl Autopilot {
+                 }
+             }
+             self.scale_looks.push(look);
+-        } else if at >= SCALE_STEP_MS && self.step == base + 3 {
++        } else if at >= scale_step_ms() && self.step == base + 3 {
+             self.step = 0;
+             self.slot = None;
+         }
+diff --git a/crates/wm-darwin/src/input.rs b/crates/wm-darwin/src/input.rs
+index dddc043..4322755 100644
+--- a/crates/wm-darwin/src/input.rs
++++ b/crates/wm-darwin/src/input.rs
+@@ -209,6 +209,30 @@ impl Server {
+                 let buttons=secondary_click(buttons,input.physical_buttons,mods==Modifiers::CONTROL,&mut input.control_click);
+                 input.physical_buttons=(input.physical_buttons&!7)|(buttons_physical(&event)&7);
+                 let b=self.wm.backend_mut();b.pointer=root;b.dirty=true;
++                // A client's popup (a menu, a list, a tool tip) is above everything: the pointer over
++                // one goes to it, and a press elsewhere dismisses those that hold a grab (popups.rs).
++                if !self.client_popups.is_empty() && !self.wm.interactive_drag_active() {
++                    if let Some((surface,origin))=self.popup_at(root) {
++                        let density=self.scale().factor();
++                        let location=(input_position_logical(x,size.w,density),input_position_logical(y,size.h,density));
++                        pointer.motion(self,Some((surface,origin.into())),&MotionEvent{location:location.into(),serial:SERIAL_COUNTER.next_serial(),time});
++                        for bit in 0..3 {
++                            let mask=1<<bit;if (previous^buttons)&mask==0{continue;}
++                            let pressed=buttons&mask!=0;
++                            pointer.button(self,&ButtonEvent{serial:SERIAL_COUNTER.next_serial(),time,button:0x110+bit,state:if pressed{ButtonState::Pressed}else{ButtonState::Released}});
++                            let forwarded=&mut self.input.as_mut().unwrap().forwarded;
++                            if pressed{*forwarded|=mask;}else{*forwarded&=!mask;}
++                        }
++                        if wheel!=0 {pointer.axis(self,AxisFrame::new(time).source(AxisSource::Wheel).value(Axis::Vertical,-f64::from(wheel)*10.).v120(Axis::Vertical,-i32::from(wheel)*120));}
++                        self.input.as_mut().unwrap().buttons=buttons;
++                        pointer.frame(self);
++                        return Ok(());
++                    }
++                    if buttons&!previous!=0 {
++                        let under=self.wm.backend().hit_at(root).and_then(|(hit,_)|match hit{SurfaceRef::Client(id)=>self.wm.backend().windows.get(&id).map(|w|w.surface.wl_surface().clone()),_=>None});
++                        self.popup_press_outside(under.as_ref());
++                    }
++                }
+                 #[cfg(feature = "desktop-shell")]
+                 if self.input.as_ref().unwrap().forwarded==0 && !self.wm.interactive_drag_active()
+                     && self.desktop_pointer(root,buttons,previous)? {
+@@ -258,6 +282,17 @@ impl Server {
+         self.service_desktop()?;
+         self.sync_input_focus();Ok(())
+     }
++    /// What is under the pointer changed without the pointer moving (a popup appeared, moved or
++    /// went): the pointer is delivered again where it is, so that the surface now under it gets
++    /// `enter` and the one it left `leave`, as after a motion. Buttons are as they were.
++    pub(crate) fn refresh_pointer(&mut self){
++        let Some(input)=self.input.as_ref() else{return;};
++        if input.pointer.is_none(){return;}
++        let (buttons,time)=(input.physical_buttons&7,input.last_time);
++        if let Err(error)=self.deliver_hid(Event::Pointer{motion:Motion::Relative(0,0),buttons,wheel:0},time){
++            eprintln!("WMPOPUP pointer refresh: {error}");
++        }
++    }
+     pub(crate) fn cursor_image_changed(&mut self,image:CursorImageStatus){
+         let Some(input)=&mut self.input else{return;};
+         input.cursor_surface=match &image {CursorImageStatus::Surface(surface)=>Some(surface.clone()),_=>None};
+@@ -319,3 +354,6 @@ mod tests {
+         assert_eq!(secondary_click(3, 2, true, &mut active), 2 | 2);
+     }
+ }
++
++/// A panel coordinate in a surface's logical units, kept on the panel.
++fn input_position_logical(v:f64,extent:u32,density:f64)->f64{v.clamp(0.,f64::from(extent-1))/density}
+diff --git a/crates/wm-darwin/src/lib.rs b/crates/wm-darwin/src/lib.rs
+index 889fdc7..0ebdb1e 100644
+--- a/crates/wm-darwin/src/lib.rs
++++ b/crates/wm-darwin/src/lib.rs
+@@ -18,6 +18,7 @@ pub mod kms;
+ pub mod launch_audit;
+ pub mod output;
+ pub mod pixels;
++mod popups;
+ pub mod power;
+ pub mod presenter;
+ pub mod render;
+diff --git a/crates/wm-darwin/src/popups.rs b/crates/wm-darwin/src/popups.rs
+new file mode 100644
+index 0000000..5c48bde
+--- /dev/null
++++ b/crates/wm-darwin/src/popups.rs
+@@ -0,0 +1,224 @@
++//! Client popups (`xdg_popup`): menus, pop-up button lists, combo boxes and
++//! tool tips of a client, placed against one of its windows.
++//!
++//! A popup is not a window of the desk: the window manager never sees it, it
++//! has no frame and no place in the stacking of windows. It is drawn through
++//! the scene's shell surfaces, above every window, at the place the client's
++//! positioner gives it relative to its parent (a toplevel or another popup),
++//! kept on the panel by the positioner's own constraint rules. The pointer
++//! goes to the topmost popup under it. A popup that asked for a grab is
++//! dismissed (`popup_done`) by a press anywhere that is not a surface of the
++//! same client; a press on the client's own window reaches that window, and
++//! the client closes its menu itself, as the protocol has it.
++use smithay::reexports::wayland_server::{protocol::wl_surface::WlSurface, Resource};
++use smithay::utils::{Logical, Rectangle};
++use smithay::wayland::compositor::{with_states, BufferAssignment, SurfaceAttributes};
++use smithay::wayland::shell::xdg::{PopupSurface, PositionerState};
++use wm_core::{Backend, Point, Rect, Size};
++
++use crate::server::Server;
++
++pub(crate) struct ClientPopup {
++    pub surface: PopupSurface,
++    /// Where it is on the panel, in panel pixels.
++    pub rect: Rect,
++    /// The scene surface that shows it, once it has a buffer.
++    pub shell: Option<u64>,
++    pub grab: bool,
++}
++
++impl Server {
++    /// A surface's origin on the panel and how many panel pixels its logical unit is.
++    fn popup_parent_place(&self, parent: &WlSurface) -> Option<(Point, f64)> {
++        if let Some(id) = self.wm.backend().window_for_surface(parent) {
++            let w = self.wm.backend().windows.get(&id)?;
++            return Some((w.content.pos, self.wm.backend().density(id)));
++        }
++        self.client_popups
++            .iter()
++            .find(|p| p.surface.wl_surface() == parent)
++            .map(|p| (p.rect.pos, self.scale().factor()))
++    }
++
++    fn popup_rect(&self, parent: &WlSurface, positioner: &PositionerState) -> Option<(Rectangle<i32, Logical>, Rect)> {
++        let (origin, density) = self.popup_parent_place(parent)?;
++        let screen = self.wm.backend().screen_size();
++        let logical = |v: i32| (f64::from(v) / density).floor() as i32;
++        // The panel, as the parent sees it: what the positioner may slide or flip within.
++        let target = Rectangle::new(
++            (-logical(origin.x), -logical(origin.y)).into(),
++            (logical(screen.w as i32), logical(screen.h as i32)).into(),
++        );
++        let geometry = positioner.get_unconstrained_geometry(target);
++        let px = |v: i32| (f64::from(v) * density).round() as i32;
++        let rect = Rect::new(
++            Point::new(origin.x + px(geometry.loc.x), origin.y + px(geometry.loc.y)),
++            Size::new(px(geometry.size.w).max(1) as u32, px(geometry.size.h).max(1) as u32),
++        );
++        Some((geometry, rect))
++    }
++
++    pub(crate) fn popup_created(&mut self, surface: PopupSurface, positioner: PositionerState) {
++        let placed = surface.get_parent_surface().and_then(|parent| self.popup_rect(&parent, &positioner));
++        let Some((geometry, rect)) = placed else {
++            // No parent this compositor knows: there is nowhere to put it.
++            eprintln!("WMPOPUP refused: no known parent");
++            surface.send_popup_done();
++            return;
++        };
++        surface.with_pending_state(|state| {
++            state.geometry = geometry;
++            state.positioner = positioner;
++        });
++        self.announce_scale(surface.wl_surface());
++        eprintln!("WMPOPUP new at={},{} size={}x{}", rect.pos.x, rect.pos.y, rect.size.w, rect.size.h);
++        self.client_popups.push(ClientPopup { surface, rect, shell: None, grab: false });
++    }
++
++    pub(crate) fn popup_repositioned(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
++        let placed = surface.get_parent_surface().and_then(|parent| self.popup_rect(&parent, &positioner));
++        let Some((geometry, rect)) = placed else { return };
++        surface.with_pending_state(|state| {
++            state.geometry = geometry;
++            state.positioner = positioner;
++        });
++        surface.send_repositioned(token);
++        let _ = surface.send_configure();
++        if let Some(index) = self.client_popups.iter().position(|p| p.surface == surface) {
++            let moved = self.client_popups[index].rect.pos != rect.pos;
++            self.client_popups[index].rect.pos = rect.pos;
++            if let Some(shell) = self.client_popups[index].shell {
++                // The picture it has moves with it: a client need not draw again because it was moved
++                // (a new size arrives with the client's next buffer, which makes a new scene surface).
++                let size = self.client_popups[index].rect.size;
++                self.wm.backend_mut().configure_shell_surface(shell, Rect::new(rect.pos, size));
++                if moved {
++                    self.refresh_pointer();
++                }
++            }
++        }
++    }
++
++    pub(crate) fn popup_grabbed(&mut self, surface: &PopupSurface) {
++        if let Some(popup) = self.client_popups.iter_mut().find(|p| &p.surface == surface) {
++            popup.grab = true;
++        }
++    }
++
++    pub(crate) fn popup_removed(&mut self, surface: &WlSurface) {
++        // children first: a popup whose parent goes has nothing to stand on
++        while let Some(index) = self.client_popups.iter().position(|p| {
++            p.surface.wl_surface() == surface || p.surface.get_parent_surface().as_ref() == Some(surface)
++        }) {
++            let popup = self.client_popups.remove(index);
++            if let Some(shell) = popup.shell {
++                self.wm.backend_mut().destroy_shell_surface(shell);
++            }
++            if popup.surface.wl_surface() != surface {
++                popup.surface.send_popup_done();
++            }
++            eprintln!("WMPOPUP gone remaining={}", self.client_popups.len());
++        }
++        self.refresh_pointer();
++    }
++
++    /// A commit on a popup's surface. False when the surface is not a popup.
++    pub(crate) fn popup_commit(&mut self, surface: &WlSurface) -> bool {
++        let Some(index) = self.client_popups.iter().position(|p| p.surface.wl_surface() == surface) else {
++            return false;
++        };
++        if !self.client_popups[index].surface.is_initial_configure_sent() {
++            let _ = self.client_popups[index].surface.send_configure();
++            return true;
++        }
++        let (buffer, callbacks) = with_states(surface, |s| {
++            let mut attributes = s.cached_state.get::<SurfaceAttributes>();
++            let a = attributes.current();
++            a.damage.clear();
++            (a.buffer.take(), std::mem::take(&mut a.frame_callbacks))
++        });
++        // released with the next frame that reaches the screen, like a cursor's
++        self.cursor_callbacks.extend(callbacks);
++        match buffer {
++            Some(BufferAssignment::NewBuffer(buffer)) => {
++                let copied = self.import_shm(&buffer);
++                buffer.release();
++                let image = match copied {
++                    Ok(image) => image,
++                    Err(error) => {
++                        eprintln!("WMPOPUP refused buffer: {error}");
++                        return true;
++                    }
++                };
++                let pos = self.client_popups[index].rect.pos;
++                let size = Size::new(image.width, image.height);
++                let old = self.client_popups[index].shell;
++                let backend = self.wm.backend_mut();
++                // a scene surface has the size it was made with: another size is another surface
++                let shell = match old.filter(|_| self.client_popups[index].rect.size == size) {
++                    Some(shell) => Some(shell),
++                    None => {
++                        if let Some(old) = old {
++                            backend.destroy_shell_surface(old);
++                        }
++                        backend.create_shell_surface(Rect::new(pos, size), (0, 0, 0), true)
++                    }
++                };
++                if let Some(shell) = shell {
++                    backend.paint_shell_surface(shell, &image);
++                    backend.map_shell_surface(shell);
++                    if old != Some(shell) {
++                        eprintln!("WMPOPUP mapped at={},{} size={}x{}", pos.x, pos.y, size.w, size.h);
++                    }
++                }
++                self.client_popups[index].shell = shell;
++                self.client_popups[index].rect.size = size;
++                if old != shell {
++                    // it may have come up under the pointer
++                    self.refresh_pointer();
++                }
++            }
++            Some(BufferAssignment::Removed) => {
++                if let Some(shell) = self.client_popups[index].shell.take() {
++                    self.wm.backend_mut().destroy_shell_surface(shell);
++                }
++            }
++            None => {}
++        }
++        true
++    }
++
++    /// The topmost shown popup under a point of the panel: its surface and
++    /// its origin in the logical units the pointer is reported in.
++    pub(crate) fn popup_at(&self, root: Point) -> Option<(WlSurface, (f64, f64))> {
++        let density = self.scale().factor();
++        self.client_popups.iter().rev().find_map(|p| {
++            let inside = p.shell.is_some()
++                && root.x >= p.rect.pos.x
++                && root.y >= p.rect.pos.y
++                && i64::from(root.x) < i64::from(p.rect.pos.x) + i64::from(p.rect.size.w)
++                && i64::from(root.y) < i64::from(p.rect.pos.y) + i64::from(p.rect.size.h);
++            inside.then(|| {
++                (p.surface.wl_surface().clone(), (f64::from(p.rect.pos.x) / density, f64::from(p.rect.pos.y) / density))
++            })
++        })
++    }
++
++    /// A button went down outside every popup, on `under` (a client window) or
++    /// on nothing of a client's. Popups that hold a grab are dismissed unless
++    /// the press is on a surface of their own client.
++    pub(crate) fn popup_press_outside(&mut self, under: Option<&WlSurface>) {
++        let grabbing: Vec<PopupSurface> =
++            self.client_popups.iter().filter(|p| p.grab).map(|p| p.surface.clone()).collect();
++        for surface in grabbing.into_iter().rev() {
++            let own = under.is_some_and(|u| u.client().map(|c| c.id()) == surface.wl_surface().client().map(|c| c.id()));
++            if !own {
++                eprintln!("WMPOPUP dismissed by a press outside");
++                surface.send_popup_done();
++                if let Some(popup) = self.client_popups.iter_mut().find(|p| p.surface == surface) {
++                    popup.grab = false;
++                }
++            }
++        }
++    }
++}
+diff --git a/crates/wm-darwin/src/scene.rs b/crates/wm-darwin/src/scene.rs
+index 76c895a..e2281d3 100644
+--- a/crates/wm-darwin/src/scene.rs
++++ b/crates/wm-darwin/src/scene.rs
+@@ -622,6 +622,10 @@ impl Backend for CpuBackend {
+     fn screen_size(&self) -> Size {
+         self.monitors[0].geometry.size
+     }
++    // AppKit sizes windows from the display; it cannot know the dock or the frame added here
++    fn fits_new_windows_to_workarea(&self) -> bool {
++        true
++    }
+     fn poll_event(&mut self) -> Option<BackendEvent<u64, u64>> {
+         None
+     } // frontend dispatches synchronously
+@@ -823,6 +827,32 @@ impl Backend for CpuBackend {
+         }
+         self.dirty = true;
+     }
++    /// What the policy did with a window, said to its client through the
++    /// toplevel's states: maximised, full screen, put away (suspended).
++    /// A client keeps its own account of its window (a Mac application's
++    /// zoomed and miniaturised flags and the notifications that go with
++    /// them); the frame's buttons are ours, so this is how it follows them.
++    /// Nothing is sent before the first configure, and a client too old
++    /// for the suspended state is not told it (Smithay drops it).
++    fn publish_net_state(&mut self, id: u64, state: NetStateSnapshot) {
++        let Some(w) = self.windows.get(&id) else { return };
++        w.surface.with_pending_state(|s| {
++            for (flag, on) in [
++                (xdg_toplevel::State::Maximized, state.maximized_horizontally && state.maximized_vertically),
++                (xdg_toplevel::State::Fullscreen, state.fullscreen || state.client_fullscreen),
++                (xdg_toplevel::State::Suspended, state.hidden),
++            ] {
++                if on {
++                    s.states.set(flag);
++                } else {
++                    s.states.unset(flag);
++                }
++            }
++        });
++        if w.surface.is_initial_configure_sent() {
++            w.surface.send_pending_configure();
++        }
++    }
+     fn send_close(&mut self, id: u64) {
+         if let Some(w) = self.windows.get(&id) {
+             w.surface.send_close();
+diff --git a/crates/wm-darwin/src/server.rs b/crates/wm-darwin/src/server.rs
+index 25f7019..b93cd6e 100644
+--- a/crates/wm-darwin/src/server.rs
++++ b/crates/wm-darwin/src/server.rs
+@@ -51,6 +51,8 @@ pub struct Server {
+     pub(crate) seats: SeatState<Self>,
+     pub(crate) input: Option<crate::input::InputState>,
+     pub(crate) cursor_callbacks: Vec<wl_callback::WlCallback>,
++    /// Client popups (menus, lists, tool tips), bottom to top; see `popups.rs`.
++    pub(crate) client_popups: Vec<crate::popups::ClientPopup>,
+     pub wm: WindowManager<CpuBackend>,
+     callbacks: HashMap<u64, Vec<wl_callback::WlCallback>>,
+     renderer: Box<dyn Renderer>,
+@@ -203,7 +205,7 @@ impl Server {
+                 )),
+             ),
+             seats: SeatState::new(),
+-            input: None, cursor_callbacks: Vec::new(),
++            input: None, cursor_callbacks: Vec::new(), client_popups: Vec::new(),
+             callbacks: HashMap::new(),
+             renderer,
+             frames: FrameTotals::default(),
+@@ -1068,6 +1070,7 @@ impl CompositorHandler for Server {
+     }
+     fn commit(&mut self, surface: &WlSurface) {
+         if self.input.as_ref().and_then(|i|i.cursor_surface.as_ref())==Some(surface){self.import_cursor(surface);return;}
++        if self.popup_commit(surface) { return; }
+         let Some(id) = self.wm.backend().window_for_surface(surface) else {
+             return;
+         };
+@@ -1291,6 +1294,14 @@ impl CompositorHandler for Server {
+                     w.sizes_by_scale.push((at, logical));
+                 }
+                 if first {
++                    // A window that comes back as it left (hidden and shown
++                    // again) returns to its place. One that comes back at
++                    // another size is placed afresh: an application that
++                    // first shows a window empty and tiny, then at its real
++                    // size, would otherwise keep the tiny one's corner.
++                    if w.content.size != size {
++                        w.content.pos = wm_core::Point::new(0, 0);
++                    }
+                     w.content.size = size;
+                     self.wm.dispatch(BackendEvent::MapRequest(id));
+                     self.output.enter(surface);
+@@ -1397,15 +1408,17 @@ impl XdgShellHandler for Server {
+             E::TopLeft=>R::NorthWest,E::TopRight=>R::NorthEast,E::BottomLeft=>R::SouthWest,E::BottomRight=>R::SouthEast,_=>return};
+         if let Some(window)=self.authorize_client_drag(&surface,&seat,serial){self.wm.dispatch(BackendEvent::ResizeRequest{window,edge});}
+     }
+-    fn new_popup(&mut self, surface: PopupSurface, _: PositionerState) {
+-        eprintln!("unsupported: Darwin popup");
+-        surface.send_popup_done();
++    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
++        self.popup_created(surface, positioner);
+     }
+     fn grab(&mut self, surface: PopupSurface, _: wl_seat::WlSeat, _: Serial) {
+-        surface.send_popup_done();
++        self.popup_grabbed(&surface);
+     }
+-    fn reposition_request(&mut self, surface: PopupSurface, _: PositionerState, _: u32) {
+-        surface.send_popup_done();
++    fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
++        self.popup_repositioned(surface, positioner, token);
++    }
++    fn popup_destroyed(&mut self, surface: PopupSurface) {
++        self.popup_removed(surface.wl_surface());
+     }
+     // No maximize/fullscreen capability is advertised. Refuse requests by responding
+     // with the unchanged configure, never claiming that a mode was entered.

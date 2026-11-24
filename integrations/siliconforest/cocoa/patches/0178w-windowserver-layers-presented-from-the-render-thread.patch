@@ -1,0 +1,149 @@
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -140,6 +140,7 @@
+      * and an ordinary window) gets a new wl_surface; giving the old one another role ended the connection
+      * ("Surface already has a role", xdg_wm_base error 0: Firefox left running with no window) */
+     int surfaceRole;
++    uint64_t geometrySerial;   // (TERM12) changes with the backing store's size, the role and the state
+     struct wsWindow *next;
+ };
+ enum { WS_ROLE_NONE, WS_ROLE_TOPLEVEL, WS_ROLE_POPUP, WS_ROLE_LAYER };
+@@ -526,6 +527,7 @@
+ static const struct wl_seat_listener seatListener;
+ static void *dispatchThreadMain(void *unused);
+ static int windowCreateBuffer(struct wsWindow *window);
++static void windowGeometryChanged(struct wsWindow *window);
+ static int windowShowFront(struct wsWindow *window);
+ static int windowPresent(struct wsWindow *window);
+ static void windowReleaseBuffer(struct wsWindow *window);
+@@ -948,6 +950,13 @@
+     struct wsWindow *window = data;
+     int stale;
+ 
++    /* (TERM12) a configure (a new size or state: maximised, restored, full screen, activated) is answered by AppKit's
++     * next drawing, at the size it gives: until AppKit has presented again, the render thread's frames (of the size
++     * before) go to the main thread, so a frame of the old size is not committed after the acknowledgement */
++    pthread_mutex_lock(&ws.pixelsLock);
++    windowGeometryChanged(window);
++    pthread_mutex_unlock(&ws.pixelsLock);
++
+     /* Unmapping returns a toplevel to its initial state, and with it every
+      * configure sent before goes void: answering one is a protocol error
+      * ("wrong configure serial"). Such a configure can still be on its way
+@@ -1177,7 +1186,21 @@
+ 
+ /* Backing store sized to the frame, ARGB8888 - which is what AppKit's
+  * O2Surface writes (premultiplied-first, host byte order). */
++// (TERM12) presents by where they came from (trace): AppKit's flushes, the render thread, a frame's release
++static uint64_t wsPresentCounts[4];
++void _windowServerSFFXPresentCounts(uint64_t out[4]){
++    for(int i=0;i<4;i++)out[i]=__atomic_exchange_n(&wsPresentCounts[i],0,__ATOMIC_RELAXED);
++}
++
++// (TERM12) a new value whenever a window's backing store, role or state may change what AppKit's geometry of its
++// layers means: AppKit's render-thread presents name the value they were worked out under
++static uint64_t wsGeometryCounter;
++static void windowGeometryChanged(struct wsWindow *window) {
++    window->geometrySerial = __atomic_add_fetch(&wsGeometryCounter, 1, __ATOMIC_SEQ_CST);
++}
++
+ static int windowCreateBuffer(struct wsWindow *window) {
++    windowGeometryChanged(window);
+     // the size in points times the scale: AppKit draws through a context scaled the same way
+     int width = wsPixelsForPoints(window->w, ws.scale120);
+     int height = wsPixelsForPoints(window->h, ws.scale120);
+@@ -1351,6 +1374,7 @@
+         window->presentMaySkip = 1;
+         if (window->state != MINIMIZED && window->state != HIDDEN && window->surface != NULL &&
+             !(window->frameOut && wsNowMs() - window->frameOutAt < 100) && windowPresent(window)) {
++            __atomic_add_fetch(&wsPresentCounts[2],1,__ATOMIC_RELAXED);
+             windowPacedCommit(window);
+             if (wsTiming())
+                 fprintf(stderr, "WSTIME %.1f commit-on-release surface=%d frame=%p\n", wsNowMs(), window->windowID, (void *)window->front);
+@@ -3441,6 +3465,7 @@
+ }
+ 
+ static void windowCreateRole(struct wsWindow *window, const char *title) {
++    windowGeometryChanged(window);
+     uint32_t layer;
+ 
+     /* SF_WS_TRACE names every window the compositor is asked to show, which is
+@@ -3585,6 +3610,7 @@
+ }
+ 
+ static void windowDestroyRole(struct wsWindow *window) {
++    windowGeometryChanged(window);
+     /* A replacement layer surface starts with no anchor or margins, so the
+      * record of what was sent must not outlive the surface it described - or
+      * the new one would be skipped as "unchanged" and never anchored. */
+@@ -3763,6 +3789,11 @@
+ 
+ static kern_return_t windowModifyState(struct wsRPCWindow *msg) {
+     struct wsWindow *window = windowForID(msg->windowID);
++    /* (TERM12) a change of state, level or style may change the role or what the window shows: the render thread's
++     * presents wait for AppKit's next frame (a new size makes a new backing store, which says so itself). A new
++     * title alone (Firefox's at every page title change) changes nothing of that. */
++    if (window != NULL && (msg->state != window->state || msg->level != window->level || msg->style != window->style))
++        windowGeometryChanged(window);
+ 
+     /* AppKit sends the modify before the create for a window it has just
+      * built, so treat an unknown id as a create. */
+@@ -4074,6 +4105,7 @@
+             }
+             window->presentMaySkip = 1;
+             if (window->state != MINIMIZED && window->state != HIDDEN && windowPresent(window)) {
++                __atomic_add_fetch(&wsPresentCounts[0],1,__ATOMIC_RELAXED);
+                 windowPacedCommit(window);
+                 if (wsTiming())
+                     fprintf(stderr, "WSTIME %.1f commit surface=%d frame=%p took=%.1f size=%dx%d\n", wsNowMs(), window->windowID,
+@@ -5092,6 +5124,50 @@
+     if(window)window->baseClean=1;
+     pthread_mutex_unlock(&ws.pixelsLock);
+ }
++// (TERM12) the window's geometry serial (0: no such window): AppKit keeps it with the geometry of a view's GPU layer
++uint64_t _windowServerSFFXGeometrySerial(int windowID){
++    pthread_mutex_lock(&ws.pixelsLock);
++    struct wsWindow *window=windowForID(windowID);
++    uint64_t serial=window?window->geometrySerial:0;
++    pthread_mutex_unlock(&ws.pixelsLock);
++    return serial;
++}
++/* (TERM12) A frame of GPU layers from QuartzCore's render thread (SFFX_GPU_RENDER_THREAD=1): the window is presented as
++ * a flush after a layer-only change presents it (AppKit drew nothing into the backing store), from that thread. Only
++ * a window shown already, flushed at its current size, as a toplevel, with the geometry serial AppKit worked its
++ * layers' geometry out under; else 0 and the main thread does this frame (its flush prepares what the window needs). */
++int _windowServerSFFXPresentLayers(int windowID,uint64_t geometry){
++    const char *enabled=getenv("SFFX_GPU_PRESENT");
++    if(!enabled||strcmp(enabled,"1")||!ws.connected||!ws.dmabuf)return 0;
++    double began = wsTiming() ? wsNowMs() : 0;
++    pthread_mutex_lock(&ws.pixelsLock);
++    struct wsWindow *window=windowForID(windowID);
++    int good=window!=NULL&&window->geometrySerial==geometry&&window->flushed&&window->attached&&window->pixels!=NULL&&
++        window->surface!=NULL&&window->toplevel!=NULL&&window->configured&&!window->rolePrepared&&window->staleConfigures==0&&
++        window->gpuPresenter!=NULL&&!window->gpuPresenter->failed&&window->state!=MINIMIZED&&window->state!=HIDDEN&&
++        sfGPURoleTakesDmabuf(window);
++    if(!good&&getenv("SF_WS_TRACE")!=NULL)
++        fprintf(stderr,"WindowServer: render-thread present of %d declined: window %d serial %llu/%llu flushed %d attached %d configured %d state %d\n",
++                windowID,window!=NULL,window?(unsigned long long)window->geometrySerial:0ULL,(unsigned long long)geometry,
++                window?window->flushed:-1,window?window->attached:-1,window?window->configured:-1,window?window->state:-1);
++    if(good){
++        window->presentPending=0;
++        if(wsPacePresents()&&window->frameOut&&wsNowMs()-window->frameOutAt<100)
++            window->presentPending=1;
++        else{
++            window->presentMaySkip=1;
++            if(windowPresent(window)){
++                __atomic_add_fetch(&wsPresentCounts[1],1,__ATOMIC_RELAXED);
++                windowPacedCommit(window);
++                if(wsTiming())
++                    fprintf(stderr,"WSTIME %.1f commit-render-thread surface=%d frame=%p took=%.1f\n",wsNowMs(),window->windowID,
++                            (void *)window->front,wsNowMs()-began);
++            }
++        }
++    }
++    pthread_mutex_unlock(&ws.pixelsLock);
++    return good;
++}
+ int _windowServerSFFXGPUStats(int windowID,uint64_t values[4]){
+     pthread_mutex_lock(&ws.pixelsLock);
+     struct wsWindow *window=windowForID(windowID);int good=window&&window->gpuPresenter;

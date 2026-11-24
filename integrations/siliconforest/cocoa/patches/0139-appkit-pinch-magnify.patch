@@ -1,0 +1,58 @@
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -34,6 +34,7 @@
+ #import <AppKit/NSEvent.h>
+ @interface NSEvent(SFPreciseScrolling)
+ -(void)_sfSetPreciseScrolling:(BOOL)precise phase:(NSEventPhase)phase;
++-(void)_sfSetMagnification:(CGFloat)magnification phase:(NSEventPhase)phase;
+ @end
+ 
+ #import <AppKit/NSModalSessionX.h>
+@@ -568,6 +569,22 @@
+                                     [_display postEvent:e atStart:NO];
+                                     break;
+                                 }
++                                case NSEventTypeMagnify: {
++                                    // (TERM8) a pinch (the window server's zwp_pointer_gestures_v1): the scale's change
++                                    // and the gesture's phase, as macOS's magnify events carry them
++                                    NSEvent *e = [NSEvent mouseEventWithType:NSEventTypeMagnify
++                                                    location:NSMakePoint(me.x, me.y)
++                                               modifierFlags:me.mods
++                                                      window:window
++                                                  clickCount:0
++                                                      deltaX:0
++                                                      deltaY:0];
++                                    NSEventPhase phase=me.repeat==1?NSEventPhaseBegan:me.repeat==3?NSEventPhaseEnded:me.repeat==4?NSEventPhaseCancelled:NSEventPhaseChanged;
++
++                                    [e _sfSetMagnification:me.dx phase:phase];
++                                    [_display postEvent:e atStart:NO];
++                                    break;
++                                }
+                                 default:
+                                     NSLog(@"Unhandled input event type %d", me.code);
+                                     break;
+--- a/src/Frameworks/AppKit/NSEvent.subproj/NSEvent_mouse.h
++++ b/src/Frameworks/AppKit/NSEvent.subproj/NSEvent_mouse.h
+@@ -15,6 +15,7 @@
+     float _deltaY;
+     BOOL _sfPreciseScroll;
+     NSEventPhase _sfScrollPhase;
++    CGFloat _sfMagnification;   // (TERM8) a magnify event's change of scale
+     NSInteger _trackingNumber;
+     NSInteger _serial;
+     void *_userData;
+--- a/src/Frameworks/AppKit/NSEvent.subproj/NSEvent_mouse.m
++++ b/src/Frameworks/AppKit/NSEvent.subproj/NSEvent_mouse.m
+@@ -26,6 +26,12 @@
+     _sfScrollPhase=_sfPreciseScroll?phase:NSEventPhaseNone;
+ }
+ -(BOOL)hasPreciseScrollingDeltas {return _sfPreciseScroll;}
++// (TERM8) a pinch: what the scale changed by since the event before, and the gesture's phase
++-(void)_sfSetMagnification:(CGFloat)magnification phase:(NSEventPhase)phase {
++    _sfMagnification=magnification;
++    _sfScrollPhase=phase;
++}
++-(CGFloat)magnification {return _type==NSEventTypeMagnify?_sfMagnification:0;}
+ -(NSEventPhase)phase {return _sfScrollPhase;}
+ 
+ - (NSInteger)clickCount {

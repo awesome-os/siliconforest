@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SOURCE_REVIEW_NO_HARDWARE",
+  "reviewed": {
+    "source_set": "integrations/puredarwin/m1-display/console-return, 12d7a822 (Astra source-validation.json)",
+    "console-return.patch": "d32456c58698fc59",
+    "console-return-cumulative.patch": "b2a010922a58ed55",
+    "close_harness.cpp": "3a6d51e1490f50a2",
+    "test_console_return.py": "a3abfa3475c3c4fe",
+    "not_reviewed": "Root-owned build-framebuffer.nix (e4004236) and build-kc.nix (57af87e1). Review the SDK and KC outputs when root reports them."
+  },
+  "verdict": "APPROVE the IOGOPFramebuffer::close override for an SDK build and a later bounded return run. It targets exactly the source-proven attempt-003 cause (IOGOP has no PM table, so the generic close's getPowerState() gate skips kPEAcquireScreen). Generic IOGraphics is unchanged. The override acquires only in the narrow firmware-framebuffer text case and logs both outcomes. Tests re-run here: 6/6 OK (host fake harness, temp directory, nothing written to the source directory).",
+  "verified": [
+    "Dispatch and access: IOFramebuffer.h declares 'virtual void close(void)' (line 494, public), so closeWork's close() call reaches the override. fServerConnect, fSharedConnect, captured, dead and suspended are protected bitfields or members (lines 339-352), so the override compiles against the real header.",
+    "Context: closeWork holds both the system and framebuffer gates (SYSASSERTGATED, FBGATEGUARD). super::close() runs first, so the generic behaviour, including its own PM-gated acquire, is unchanged and fServerConnect is NULL afterwards.",
+    "Gates: NoServer (no server at entry); OwnerRemains (server, shared connect or captured still present; PDGOP opens only type 0, the server connect, so fSharedConnect is NULL); Unavailable (inactive, dead or suspended); ManagedPower (getPowerState() != 0, so a PM-managed framebuffer, which the generic path already handles, never gets a second acquire); NoConsole; DifferentFramebuffer (console base & ~3 must equal fbBase, and width, height, rowBytes and depth 30/32 must match; fbBase is taken from the same getConsoleInfo at start); NotText (v_display must be 2; the host sets guest display=2 and PE copies Video.v_display); OptedOut (pdtextboot non-zero and serial_video_mirror or gopconsole set; BOOTARGS has pdtextboot=1 serial_video_mirror=1). The provider must be a non-PCI IOPlatformDevice passing kernel003's existing gop_apple_soc_firmware_fb.",
+    "Effect: platform->setConsoleInfo(NULL, kPEAcquireScreen) runs PE_initialize_console. kernel003 restores last_console (1, video) and runs initialize_screen(kPEAcquireScreen); gc_acquired is FALSE after the open-path release, so vc_progress_set(FALSE) and gc_enable(TRUE) run. gc_enable(TRUE) resets the text grid, clears the whole screen, shows the cursor and re-enables console output (video_console.c:395-450). A second open still works: release, then disable with last_console re-captured because acquire reset it to -1.",
+    "Patch composition: the cumulative patch's added lines equal kernel003's IOGOP hunks plus the incremental override, exactly (multiset comparison). The incremental patch touches only IOGOPFramebuffer.cpp and .h.",
+    "Observability: every return attempt logs 'IOGOP: console-return skip=0x..' (bitmask of the blocking gates) or 'IOGOP: console-return acquire-request result=0x........'. The next run can therefore decide the cause from the log."
+  ],
+  "corroboration_of_cause": "Because gc_enable(TRUE) clears the whole screen, attempt-003's post-close framebuffer (the last compositor frame untouched, zero changed pixels outside it) also shows from pixels that gc_enable(TRUE) never ran. That fits the skipped acquire in desktop-attempt003-return-failure-analysis.json.",
+  "notes": [
+    {"id": "N1", "kind": "fail-safe edge", "text": "If findConsole ever runs (it did not in attempt-003: no 'console set'/'now console' lines), PE_state.video is overwritten with v_display=1 and the kernel-virtual fFrameBuffer. The override then skips with NotText|DifferentFramebuffer logged rather than acquiring the wrong console."},
+    {"id": "N2", "kind": "expected evidence", "text": "A successful return should show the console line 'IOGOP: console-return acquire-request result=0x00000000' right after '[FB??-A]::close', then a cleared post-close framebuffer with no Chonkstep frame anywhere and the kernel text grid from the top rows: the footer, DL10_RETURN_<fresh nonce>, uname lines, DL10_END and the prompt. Qualify only from pixels: no Chonkstep chrome, plus a glyph match of the RETURN nonce using the kernel's ISO 8x16 font (iso_font.c)."},
+    {"id": "N3", "kind": "scope", "text": "The acquire result is the PE_initialize_console return value. It does not prove that pixels changed; only the post-close capture does."}
+  ],
+  "not_claimed": ["console return", "SDK or KC build", "runtime", "physical panel"],
+  "scope": "Read-only source review plus Astra's host harness tests (temporary build directory only). No hardware or SDK builds."
+}

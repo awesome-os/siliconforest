@@ -1,0 +1,198 @@
+kernel: module parameters from xnu boot-args; module! without ELF sections
+
+A kext has no `__param` section walker, no initcall sections, no modprobe and no sysfs, and
+LinuxKPI's struct kernel_param/kernel_param_ops have another layout (no flags, no arg union).
+The two section names are also not valid Mach-O section specifiers, so `module!` does not
+even compile for this target as it is.
+
+With cfg(sf_lkpi):
+  - module_param: `ModuleParamAccess<T>` and `ModuleParam` are unchanged (same `.value()`),
+    the kernel_param plumbing is compiled out, and `sf_set_from_boot_arg()` reads the
+    boot-arg `<module>.<param>=value` through the same parser Linux uses.
+  - module!: no `__param` and initcall statics; `__<name>_init()` reads every parameter's
+    boot-arg before the module's own init. `__<name>_init()`/`__<name>_exit()` stay
+    `#[no_mangle] extern "C"`: the kext's start/stop routines call them.
+Without cfg(sf_lkpi) nothing changes.
+
+--- a/kernel/module_param.rs
++++ b/kernel/module_param.rs
+@@ -9,11 +9,13 @@
+ use bindings;
+ use kernel::sync::SetOnce;
+ 
++#[cfg(not(sf_lkpi))]
+ /// Newtype to make `bindings::kernel_param` [`Sync`].
+ #[repr(transparent)]
+ #[doc(hidden)]
+ pub struct KernelParam(bindings::kernel_param);
+ 
++#[cfg(not(sf_lkpi))]
+ impl KernelParam {
+     #[doc(hidden)]
+     pub const fn new(val: bindings::kernel_param) -> Self {
+@@ -21,6 +23,7 @@
+     }
+ }
+ 
++#[cfg(not(sf_lkpi))]
+ // SAFETY: C kernel handles serializing access to this type. We never access it
+ // from Rust module.
+ unsafe impl Sync for KernelParam {}
+@@ -32,6 +35,7 @@
+     fn try_from_param_arg(arg: &BStr) -> Result<Self>;
+ }
+ 
++#[cfg(not(sf_lkpi))]
+ /// Set the module parameter from a string.
+ ///
+ /// Used to set the parameter value at kernel initialization, when loading
+@@ -145,6 +149,44 @@
+     }
+ }
+ 
++/// SiliconForest: where a parameter's value comes from.
++///
++/// There is no `__param` section walker, `modprobe` or sysfs under a kext. A parameter `p` of
++/// module `m` is read once, when the module initialises, from the xnu boot-arg `m.p=value`
++/// (the spelling Linux uses for a built-in module's parameter on the kernel command line),
++/// and parsed by the same [`ModuleParam::try_from_param_arg`] as on Linux. As there, a value
++/// that does not parse is reported and the default stays. Parameters cannot be changed
++/// afterwards (on Linux these are read-only too: `perm` is 0 and there is no `get`).
++#[cfg(sf_lkpi)]
++impl<T: ModuleParam> ModuleParamAccess<T> {
++    /// Sets the value from the boot-arg `name` if it is present. Called by `module!`.
++    #[doc(hidden)]
++    pub fn sf_set_from_boot_arg(&self, name: &CStr) {
++        let mut buf = [0u8; 64];
++        // SAFETY: `name` is NUL terminated and `buf` is valid for writes of `buf.len()` bytes;
++        // the helper NUL terminates what it writes.
++        let found = unsafe {
++            bindings::sf_boot_arg_str(name.as_char_ptr(), buf.as_mut_ptr().cast(), buf.len() as c_int)
++        };
++        if !found {
++            return;
++        }
++        let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
++        let shown = name.to_str().unwrap_or("?");
++        match T::try_from_param_arg(BStr::from_bytes(&buf[..len])) {
++            Ok(value) => {
++                if !self.value.populate(value) {
++                    crate::pr_warn!("module parameter {}: already set\n", shown);
++                }
++            }
++            Err(_) => crate::pr_warn!(
++                "module parameter {}: invalid value, keeping the default\n",
++                shown
++            ),
++        }
++    }
++}
++
+ #[doc(hidden)]
+ /// Generate a static [`kernel_param_ops`](srctree/include/linux/moduleparam.h) struct.
+ ///
+@@ -169,13 +211,23 @@
+     };
+ }
+ 
++#[cfg(not(sf_lkpi))]
+ make_param_ops!(PARAM_OPS_I8, i8);
++#[cfg(not(sf_lkpi))]
+ make_param_ops!(PARAM_OPS_U8, u8);
++#[cfg(not(sf_lkpi))]
+ make_param_ops!(PARAM_OPS_I16, i16);
++#[cfg(not(sf_lkpi))]
+ make_param_ops!(PARAM_OPS_U16, u16);
++#[cfg(not(sf_lkpi))]
+ make_param_ops!(PARAM_OPS_I32, i32);
++#[cfg(not(sf_lkpi))]
+ make_param_ops!(PARAM_OPS_U32, u32);
++#[cfg(not(sf_lkpi))]
+ make_param_ops!(PARAM_OPS_I64, i64);
++#[cfg(not(sf_lkpi))]
+ make_param_ops!(PARAM_OPS_U64, u64);
++#[cfg(not(sf_lkpi))]
+ make_param_ops!(PARAM_OPS_ISIZE, isize);
++#[cfg(not(sf_lkpi))]
+ make_param_ops!(PARAM_OPS_USIZE, usize);
+--- a/macros/module.rs
++++ b/macros/module.rs
+@@ -37,6 +37,8 @@
+     counter: usize,
+     ts: TokenStream,
+     param_ts: TokenStream,
++    // SiliconForest: one statement per parameter that reads its boot-arg.
++    sf_param_ts: TokenStream,
+ }
+ 
+ impl<'a> ModInfoBuilder<'a> {
+@@ -46,6 +48,7 @@
+             counter: 0,
+             ts: TokenStream::new(),
+             param_ts: TokenStream::new(),
++            sf_param_ts: TokenStream::new(),
+         }
+     }
+ 
+@@ -135,12 +138,20 @@
+             let param_type = &param.ptype;
+             let param_default = &param.default;
+ 
++            self.sf_param_ts.extend(quote! {
++                #param_name.sf_set_from_boot_arg(#param_name_cstr_with_module);
++            });
++
+             self.param_ts.extend(quote! {
+                 #[allow(non_upper_case_globals)]
+                 pub(crate) static #param_name:
+                     ::kernel::module_param::ModuleParamAccess<#param_type> =
+                         ::kernel::module_param::ModuleParamAccess::new(#param_default);
+ 
++                // SiliconForest: no `__param` section under a kext (and the name is not a
++                // Mach-O section specifier); the value comes from a boot-arg instead, see
++                // `sf_param_ts` and kernel::module_param.
++                #[cfg(not(sf_lkpi))]
+                 const _: () = {
+                     #[allow(non_upper_case_globals)]
+                     #[link_section = "__param"]
+@@ -475,6 +486,7 @@
+ 
+     let modinfo_ts = modinfo.ts;
+     let params_ts = modinfo.param_ts;
++    let sf_params_ts = modinfo.sf_param_ts;
+ 
+     let ident_init = format_ident!("__{ident}_init");
+     let ident_exit = format_ident!("__{ident}_exit");
+@@ -579,6 +591,10 @@
+ 
+                 // Built-in modules are initialized through an initcall pointer
+                 // and the identifiers need to be unique.
++                // SiliconForest: no initcall sections under a kext (nor is the name a Mach-O
++                // section specifier). The kext's start routine calls the `#[no_mangle]`
++                // `__<name>_init()` below once LinuxKPI is up, and `__<name>_exit()` on stop.
++                #[cfg(not(sf_lkpi))]
+                 #[cfg(not(MODULE))]
+                 #[cfg(not(CONFIG_HAVE_ARCH_PREL32_RELOCATIONS))]
+                 #[link_section = #initcall_section]
+@@ -615,6 +631,8 @@
+                 ///
+                 /// This function must only be called once.
+                 unsafe fn __init() -> ::kernel::ffi::c_int {
++                    #[cfg(sf_lkpi)]
++                    super::super::module_parameters::__sf_init_from_boot_args();
+                     let initer = <super::super::LocalModule as ::kernel::InPlaceModule>::init(
+                         &super::super::THIS_MODULE
+                     );
+@@ -648,6 +666,12 @@
+ 
+         mod module_parameters {
+             #params_ts
++
++            /// SiliconForest: reads every parameter's boot-arg (`<module>.<parameter>=value`).
++            #[cfg(sf_lkpi)]
++            pub(crate) fn __sf_init_from_boot_args() {
++                #sf_params_ts
++            }
+         }
+     })
+ }

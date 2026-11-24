@@ -1,0 +1,72 @@
+diff --git i/Makefile w/Makefile
+index c10548b..3728d12 100644
+--- i/Makefile
++++ w/Makefile
+@@ -90,6 +90,16 @@ endif
+ ifeq ($(SF_INSTALLED),1)
+ CFG += SF_INSTALLED
+ endif
++# SiliconForest stage 2 as installed: its configuration and kernel collection are the file
++# sf/kernel.bin of the boot partition stage 1 names (pdsf_file.c). It never chainloads and
++# never takes boot=.
++ifeq ($(SF_KERNEL_FILE),1)
++ifneq ($(CHAINLOADING),1)
++$(error SF_KERNEL_FILE requires CHAINLOADING=1 for the FAT reader)
++endif
++CFG += SF_KERNEL_FILE
++SF_KERNEL_FILE_OBJECTS := pdsf_file.o
++endif
+ 
+ # Required for no_std + alloc for now
+ export RUSTC_BOOTSTRAP=1
+@@ -201,6 +211,7 @@ OBJECTS := \
+ 	nvme.o \
+ 	payload.o \
+ 	pdsf.o pdsf_boot.o pdsf_el2.o \
++	$(SF_KERNEL_FILE_OBJECTS) \
+ 	pcie.o \
+ 	pmgr.o \
+ 	proxy.o \
+diff --git i/src/payload.c w/src/payload.c
+index 51ff2ac..95a6dd2 100644
+--- i/src/payload.c
++++ w/src/payload.c
+@@ -414,6 +414,38 @@ int payload_run(void)
+         payload_scanned = true;
+     }
+ 
++#ifdef SF_KERNEL_FILE
++    /*
++     * SiliconForest stage 2 as installed: no records behind this image (pdsf_boot above found
++     * none). Stage 1 passed on the boot partition it read this image from; the records are the
++     * file sf/kernel.bin there. This stage starts that kernel or stops: it never chainloads
++     * another image and never boots anything else.
++     */
++    {
++        extern int pdsf_boot_file(const char *partuuid);
++        static const char esp_var[] = "chosen.asahi,efi-system-partition=";
++        const char *esp = NULL;
++
++        next_stage.entry = NULL;
++        if (chainload_spec || boot_spec || kernel || fdt) {
++            printf("SiliconForest stage 2: chainload=, boot= and other payloads are not accepted\n");
++            return -1;
++        }
++        for (size_t i = 0; i < chosen_cnt; i++)
++            if (!strncmp(chosen[i], esp_var, sizeof(esp_var) - 1))
++                esp = chosen[i] + sizeof(esp_var) - 1;
++        if (!esp) {
++            printf("SiliconForest stage 2: no boot partition was passed on by stage 1\n");
++            return -1;
++        }
++        if (pdsf_boot_file(esp)) {
++            next_stage.entry = NULL;
++            return -1;
++        }
++        return 0;
++    }
++#endif
++
+ #ifndef ESP_STAGE2
+     if (!stage1_config_applied) {
+         const char *target = stage1_config_target();

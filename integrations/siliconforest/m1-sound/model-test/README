@@ -1,0 +1,55 @@
+model-test: the kernel speaker model against the reference, on the host
+=======================================================================
+
+Question: is ../kernel/sf_speaker_model.c ever less conservative than the reference?
+Host only (x86_64 Linux, offline); nothing here runs on the machine.
+
+  ./run-model-tests.sh     rebuilds and runs everything; exit status 0 only if no
+                           scenario shows a violation, the sanitizer runs are clean,
+                           the compiler is silent and the arm64 object needs no helper
+  results/summary.txt      the result (sha256 of the model files on top)
+  results/summary-san.txt  the same scenarios with the model under UBSan + ASan
+
+The two sides
+-------------
+Reference: upstream speakersafetyd 2.0.1's model code, unmodified: types.rs and
+helpers.rs of ../safetyd/tests/upstream-ref/upstream (checked by sha256), with that
+directory's stand-in alsa crate, whose dB conversions call the real alsa-lib. j293.conf,
+cold start, amp gain 18.5 dBV. Driven as the daemon's loop does (src/main.rs RDriver):
+4096-frame periods; skip_model(dt - period) when the wall time between two period ends
+is more than 4 periods; run_model per speaker, the group's minimum gain,
+Speaker::update() -> volume control value. A reference panic is its fault; a
+temperature fault is counted from the frame at which the model first exceeds the limit
+(earlier than the daemon, which only sees the period once it is read).
+
+Kernel: sf_speaker_model.c as a C library (KDriver): run() in 1024-frame calls while
+a stream plays (one shorter call for what is left when a stream stops), idle() in
+100 ms slices while none plays, volume value = 201 - limit_steps after each run().
+
+Both get identical frames and identical pauses. They are compared at every period
+end of the reference (the kernel's state there is taken from a copy of its struct
+with the frames it has not been called for yet).
+
+Criteria
+--------
+(1)  kernel coil and magnet temperature >= reference, every speaker, every period end
+(2)  kernel volume value <= reference value at every period end
+(2n) kernel volume value <= the value the reference's gain formula and rounding give
+     for the reference's temperatures WITHOUT its hysteresis (not asked for; it
+     separates "limits less than the temperatures demand" from "releases the
+     hysteresis earlier")
+(3)  every reference fault: the kernel faults at the same frame or earlier
+(4)  gcc -Wall -Wextra -Wconversion silent; all scenarios with the model under
+     -fsanitize=undefined,address; san-edges.c (C only, exact heap buffers, extreme
+     samples, long idle); no undefined symbol in the freestanding arm64 object
+(5)  4500 random scenarios in three classes: clean (whole 4096-frame streams, pauses
+     over 4 periods, power factor >= 0), aligned (the same, any samples), any (any
+     stream length, any pause, any samples)
+
+Not covered
+-----------
+- sf_speakers.cpp: how the kext calls the model (period size, what happens to the
+  last frames of a stream, the one-step-per-period release of the volume, the sense
+  plausibility checks) is taken from the description, not tested.
+- Real sense data at music level: none exists for this machine (the captures are idle
+  noise of 30-60 counts). All inputs are synthetic.

@@ -1,0 +1,29 @@
+Do not print stale buffer contents when PD descriptions exceed the original512-byte ring slots.
+--- a/userland/tests/coremedia-test.c
++++ b/userland/tests/coremedia-test.c
+@@ -26,15 +26,18 @@
+ static const char *
+ desc(CFTypeRef d)
+ {
+-    static char buf[8][512];
++    static char *buf[8];
+     static int at;
+-    char *b = buf[at++ % 8];
+-    if (!d) {
+-        strcpy(b, "(null)");
+-        return b;
+-    }
++    if (!d) return "(null)";
+     CFStringRef s = CFGetTypeID(d) == CFStringGetTypeID() ? CFRetain(d) : CFCopyDescription(d);
+-    CFStringGetCString(s, b, 512, kCFStringEncodingUTF8);
++    CFIndex size = CFStringGetMaximumSizeForEncoding(CFStringGetLength(s), kCFStringEncodingUTF8) + 1;
++    int slot = at++ % 8;
++    free(buf[slot]);
++    char *b = buf[slot] = malloc((size_t)size);
++    if (!b || !CFStringGetCString(s, b, size, kCFStringEncodingUTF8)) {
++        fputs("description conversion failed\n", stderr);
++        exit(1);
++    }
+     CFRelease(s);
+     return b;
+ }

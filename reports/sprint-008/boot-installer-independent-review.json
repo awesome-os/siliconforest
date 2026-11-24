@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "record": "boot-installer-independent-review",
+  "recorded_at": "2026-11-08T02:20:00Z",
+  "revision": 3,
+  "reviewer": "Claude (independent, read-only source review)",
+  "subject": "tools/m1_boot_install.py J293 stage2 boot.bin install/restore (delta bound to window candidate attempt 4)",
+  "scope": {
+    "files_written": [
+      "reports/sprint-008/boot-installer-independent-review.json"
+    ],
+    "source_edits": false,
+    "tests_run_by_reviewer": false,
+    "ssh": false,
+    "hardware_accessed": false,
+    "maclab_server_contacted": false
+  },
+  "reviewed_sha256": {
+    "tools/m1_boot_install.py": "039419b8ae78f61243d2b57319e75f0bee7f975fbcd20ef694c4c763971c472b",
+    "tests/test_m1_boot_install.py": "915295669fe308d84d2160f43d0661c9405f69aabce4634e4e962ec4ada75c46"
+  },
+  "interim_reviewed_installer_sha256": "b91d5cb2ac1788400a13ed97260e3d14306491df67aa64a0c81f2c745c7fa081",
+  "superseded_review": {
+    "tools/m1_boot_install.py": "16c227abf1a7ec7518a4c3a3928df69d30c554a71f8fb346eff3ad73535a7c6e",
+    "tests/test_m1_boot_install.py": "4885fe217453a4fb9703b88cdc99078eddec4ce9d61ba3902eb0746003e9c15f"
+  },
+  "candidate_binding": {
+    "CANDIDATE_SHA": "e4ead838bb87a04dd00909edf8a598f813056ee2f9611777a4a77c4bf7351e27",
+    "PREFIX_SHA": "ba5bf4b396168ac540df852e3507c4342dd289eef7bf2c1fc29c50f11f0822bf",
+    "PREFIX_BYTES": "0x420000, shared by the footprint check and slice; matches receipt candidate_payload_offset 4325376 and m1n1-window.bin size",
+    "ORIGINAL_SHA": "54fa07e4f5cbeecd90e67e335657c40b33c25aede7015a84afb1427333b4f923",
+    "receipt": "reports/sprint-008/window-candidate-build.json attempt 4; the reviewer recomputed the proposed-boot.bin and m1n1-window.bin hashes, which match.",
+    "original_tag_check_by_reviewer": "The bound original image contains exactly one ##m1n1_ver##f5a82fdb-dirty tag in its first 0x400000 bytes, matching the stage2 version the tool accepts and root's live /chosen readback."
+  },
+  "verdict": "NO_WRITE_PATH_SAFETY_DEFECT; STATUS_FIX_RESOLVED_WITH_MINOR_RESIDUAL; FIRST_BOOT_OPERATOR_GATE_REMAINS",
+  "confirmed": [
+    "Everything confirmed in revision 1 still holds: plan by default, exact-byte gating with the byte-identical Linux suffix (consistent with m1n1 _payload_start = _end), CAS before plan, backup and rename, dedicated O_EXCL backup, boot.bin.old untouched, one-shot private intent, staged O_EXCL temp, os.replace, directory fsync, and no reboot, NVRAM, stage1, partition or boot-policy writes.",
+    "G2 is implemented: findmnt PARTUUID of the /boot/efi mount must equal /chosen asahi,efi-system-partition, and /chosen asahi,m1n1-stage2-version must be f5a82fdb-dirty (the original's embedded tag) or the reviewed candidate tag. A missing property fails closed.",
+    "C2 is implemented: verify_after_sync runs fsync, then POSIX_FADV_DONTNEED, then re-hash for both the backup and the replaced target, so file data is re-read from storage. The comment correctly says this is not a power-loss durability test.",
+    "C3 is implemented: any leftover .boot.bin.darwin-lab-*.tmp or any operation intent without result.json blocks new plans, including restore, pending manual review.",
+    "C1 is mostly implemented: a post-write storage mismatch raises BOOT_FILE_UNVERIFIED_DO_NOT_REBOOT, writes no result.json, and keeps the incomplete intent and the verified backup for manual review."
+  ],
+  "recommended_before_install": [
+    {
+      "id": "S1",
+      "status": "RESOLVED_AT_039419b8_WITH_MINOR_RESIDUAL",
+      "resolution": "BootFileUnverified wraps the directory fsync, storage re-read and result.json sequence after os.replace, and main() emits BOOT_FILE_UNVERIFIED_DO_NOT_REBOOT for it. A failure after a verified replace (e.g. result.json) is also reported as do-not-reboot, which is conservative.",
+      "residual": "os.replace itself is just outside the typed block. An exception raised by the rename (possible mid-operation on vfat) reports the generic REFUSED status although boot.bin state is uncertain. Moving os.replace inside the try would close it; until then the controller should treat any execute-mode failure as do-not-reboot.",
+      "original_severity": "cheap_fix_recommended",
+      "issue": "main() prints the generic status REFUSED_OR_INCOMPLETE_NO_BOOT_VERDICT for every exception, including BOOT_FILE_UNVERIFIED_DO_NOT_REBOOT after os.replace and any failure after a successful replace (e.g. writing result.json). A caller keyed on status could read that as 'nothing changed' and reboot.",
+      "fix": "Track the execute phase. When any ESP write has happened, emit a distinct status (e.g. BOOT_STORAGE_CHANGED_UNVERIFIED_DO_NOT_REBOOT) plus boot_file_replaced true/false, and make the M5 controller refuse resets on anything except BOOT_FILE_REPLACED_NOT_BOOT_VALIDATED or a plan-only/no-change result."
+    }
+  ],
+  "remaining_gates": [
+    {
+      "id": "G3",
+      "status": "OPEN_BY_DESIGN",
+      "gate": "No non-persistent candidate launch exists in the original stage2, so the first persistent candidate boot needs one-time owner availability and a prepared manual Recovery rollback (copy the verified ESP backup over m1n1/boot.bin; boot picker as last resort). The tool's restore requires a running Linux and cannot help if the candidate stops before Linux."
+    },
+    {
+      "id": "G4",
+      "status": "OPERATIONAL",
+      "gate": "Hold the M5 per-target lock and pause unattended resets for the whole install. Linux vfat rename over an existing file is not crash-atomic; the tool does not itself coordinate with the controller."
+    }
+  ],
+  "minor_notes": [
+    "Mount parsing still requires exactly one /proc/mounts row at /boot/efi (fails closed on autofs stacking); validate_machine is still patched out in tests, while the pure identity check now has a test.",
+    "An intent left by an early refusal (e.g. CAS drift before backup) also blocks later operations until a human removes it, which is conservative and should be documented.",
+    "The original slice offset 0x400000 is a literal; naming it beside ORIGINAL_SHA would make the binding clearer."
+  ],
+  "limits": [
+    "Source review only; the reviewer did not run the 17 host tests.",
+    "Linux vfat fsync/rename and FADV_DONTNEED behavior are reasoned from general kernel behavior; FAT metadata buffers are not dropped by the re-read.",
+    "A replaced boot file is not a boot test."
+  ],
+  "hardware_boot_observed": false,
+  "boot_storage_written": false
+}

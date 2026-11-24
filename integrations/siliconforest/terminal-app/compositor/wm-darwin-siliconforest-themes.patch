@@ -1,0 +1,3062 @@
+diff --git a/crates/chonk-shell/src/shell.rs b/crates/chonk-shell/src/shell.rs
+index d6d99b8..6bf345d 100644
+--- a/crates/chonk-shell/src/shell.rs
++++ b/crates/chonk-shell/src/shell.rs
+@@ -1311,6 +1311,9 @@ impl<B: Backend + PopupHost<PopupId = B::ShellId>> Shell<B> {
+         }
+         let mut next = self.state.clone();
+         if let Some(id) = theme_id {
++            // THEME: the standalone desk has no appearance of its own: a SiliconForest theme is worn
++            // in the appearance it was drawn for, every other theme dark, as a start in it is.
++            next.appearance = wm_theme::default_theme::standalone_appearance(id);
+             next.base_theme = wm_theme::default_theme::theme_variant(id, next.appearance).ok_or_else(|| format!("no theme named {id}"))?;
+             // A theme implies its wallpaper, as on every other session
+             // (`adopt_wallpaper_of`); the Wallpaper menu can override it.
+@@ -1731,8 +1734,13 @@ impl<B: Backend + PopupHost<PopupId = B::ShellId>> Shell<B> {
+             // follows through GSettings/the portal — both are fire-and
+             // -forget from here; the desktop's own repaint is not
+             // gated on any other process noticing.
+-            self.retint_terminals();
+-            crate::appearance::propagate_to_applications(self.state.appearance);
++            // THEME: the standalone desk's appearance now changes with a SiliconForest theme. Its
++            // terminals and applications are not foot or GTK: no signal is sent and no program
++            // started for it there (an unhandled SIGUSR2 ends a process).
++            if self.managed.is_none() {
++                self.retint_terminals();
++                crate::appearance::propagate_to_applications(self.state.appearance);
++            }
+         }
+         tracing::info!(
+             theme = %self.theme.id,
+diff --git a/crates/chonk-shell/src/startup.rs b/crates/chonk-shell/src/startup.rs
+index 95f36cb..7c3a947 100644
+--- a/crates/chonk-shell/src/startup.rs
++++ b/crates/chonk-shell/src/startup.rs
+@@ -251,6 +251,10 @@ impl SessionState {
+     /// unknown id wears the classic one) at a UI scale.
+     pub fn standalone_darwin_with(theme_id: Option<&str>, scale: f32) -> Self {
+         let mut state = Self::standalone_darwin_classic();
++        // THEME: a SiliconForest theme in its own appearance (`standalone_appearance`)
++        if let Some(id) = theme_id.filter(|id| wm_theme::default_theme::theme_by_id(id).is_some()) {
++            state.appearance = wm_theme::default_theme::standalone_appearance(id);
++        }
+         if let Some(theme) = theme_id.and_then(|id| wm_theme::default_theme::theme_variant(id, state.appearance)) {
+             state.decoration_style = theme.resolve_style(state.decoration_style_policy);
+             state.base_theme = theme;
+diff --git a/crates/chonk-shell/src/wallpaper.rs b/crates/chonk-shell/src/wallpaper.rs
+index 1965cd1..4d34dbd 100644
+--- a/crates/chonk-shell/src/wallpaper.rs
++++ b/crates/chonk-shell/src/wallpaper.rs
+@@ -62,6 +62,30 @@ pub enum Wallpaper {
+     /// Fold stands in — the neutral artwork, in the current mood.
+     Omarchy,
+     HostArt(u8),
++    /// THEME: the wallpaper of one of the SiliconForest themes (its index in
++    /// `wm_theme::forest::CHOICES`), under the theme's own id. The picture is a file of that
++    /// name in the host's backgrounds (`sf-canopy.jpg`), drawn by
++    /// `integrations/siliconforest/desktop/themes/wallpapers/make_wallpapers.py` of the lab repository; a
++    /// machine without the file shows the theme's desk colour. Not in [`Self::ALL`] (a theme's
++    /// own; the files are also offered as host backgrounds).
++    Forest(u8),
++}
++
++/// The directory of the host's own backgrounds (see [`host_art`]).
++fn host_background_dir() -> Option<PathBuf> {
++    match std::env::var_os("CHONKSTEP_BACKGROUND_DIR") {
++        Some(dir) => Some(PathBuf::from(dir)),
++        None => {
++            let id = crate::desktop::os_release_field("ID")?;
++            (!id.is_empty() && !id.contains('/') && !id.contains("..")).then(|| PathBuf::from(format!("/usr/share/backgrounds/{id}")))
++        }
++    }
++}
++
++/// THEME: the picture file of a SiliconForest theme's wallpaper, when the host has it.
++fn forest_picture(id: &str) -> Option<PathBuf> {
++    let dir = host_background_dir()?;
++    ["jpg", "png", "webp"].iter().map(|ext| dir.join(format!("{id}.{ext}"))).find(|path| path.is_file())
+ }
+ 
+ /// How many host backgrounds the menu will offer. A cap rather than a
+@@ -168,6 +192,11 @@ fn pretty_label(stem: &str, id: &str) -> String {
+         if lower == id.to_ascii_lowercase() || lower == "desktop" || lower == "background" {
+             continue;
+         }
++        // THEME: SiliconForest's own pictures are named sf-<name>.
++        if lower == "sf" {
++            words.push("SiliconForest".to_string());
++            continue;
++        }
+         // "4k" reads as an acronym, not a word to title-case.
+         if lower.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+             words.push(lower.to_ascii_uppercase());
+@@ -259,6 +288,7 @@ impl Wallpaper {
+             Self::OakGround => "Oak",
+             Self::Omarchy => "Omarchy's Background",
+             Self::HostArt(slot) => host_art().get(slot as usize).map_or("Background", |(_, label, _)| *label),
++            Self::Forest(index) => wm_theme::forest::CHOICES.get(index as usize).map_or("SiliconForest", |(_, label)| *label),
+         }
+     }
+ 
+@@ -290,6 +320,7 @@ impl Wallpaper {
+             Self::OakGround => "oak-ground",
+             Self::Omarchy => wm_theme::omarchy::WALLPAPER,
+             Self::HostArt(slot) => host_art().get(slot as usize).map_or("host:none", |(_, _, id)| *id),
++            Self::Forest(index) => wm_theme::forest::CHOICES.get(index as usize).map_or("sf-none", |(id, _)| *id),
+         }
+     }
+ 
+@@ -298,6 +329,7 @@ impl Wallpaper {
+             .into_iter()
+             .chain([Self::Omarchy])
+             .chain((0..host_art().len() as u8).map(Self::HostArt))
++            .chain((0..wm_theme::forest::CHOICES.len() as u8).map(Self::Forest))
+             .find(|wallpaper| wallpaper.id() == id)
+     }
+ 
+@@ -353,11 +385,12 @@ impl Wallpaper {
+     pub const fn is_solid_colour(self) -> bool {
+         #[cfg(feature = "lcos")]
+         {
+-            matches!(self, Self::BeOSBlue | Self::ClassicLavender | Self::WalnutGround | Self::DeskGround | Self::OakGround)
++            matches!(self, Self::BeOSBlue | Self::ClassicLavender | Self::WalnutGround | Self::DeskGround | Self::OakGround | Self::Forest(_))
+         }
+         #[cfg(not(feature = "lcos"))]
+         {
+-            matches!(self, Self::BeOSBlue | Self::ClassicLavender)
++            // THEME: a SiliconForest theme's wallpaper is its ground wherever the picture file is not
++            matches!(self, Self::BeOSBlue | Self::ClassicLavender | Self::Forest(_))
+         }
+     }
+ 
+@@ -431,6 +464,12 @@ impl Wallpaper {
+             // the picture is the host's and its edge colour is unknown
+             // until it is decoded.
+             (Self::HostArt(_), appearance) => Self::GraphiteFold.background_color(appearance),
++            // THEME: the theme's own desk colour (`wm_theme::forest`: the palettes' `background`;
++            // a theme in its other appearance wears its sibling's)
++            (Self::Forest(0 | 1), Appearance::Light) => (0xdf, 0xe5, 0xdc),
++            (Self::Forest(0 | 1), Appearance::Dark) => (0x0b, 0x12, 0x10),
++            (Self::Forest(_), Appearance::Light) => (0xe9, 0xed, 0xf2),
++            (Self::Forest(_), Appearance::Dark) => (0x07, 0x09, 0x0c),
+         }
+     }
+ 
+@@ -465,6 +504,7 @@ impl Wallpaper {
+             (Self::OS2Warp, _) => Some(include_bytes!("../assets/wallpapers/os2-warp-4-1024.png")),
+             (Self::Omarchy, _) => None,
+             (Self::HostArt(_), _) => None,
++            (Self::Forest(_), _) => None,
+         }
+     }
+ 
+@@ -481,6 +521,11 @@ impl Wallpaper {
+         if matches!(self, Self::Obsidian | Self::Washi | Self::Relay) {
+             return modern_art(self.id(), screen, appearance);
+         }
++        if let Self::Forest(index) = self {
++            // the picture when the host has it; else the theme's desk colour (`None`)
++            let path = wm_theme::forest::CHOICES.get(index as usize).and_then(|(id, _)| forest_picture(id));
++            return path.as_deref().and_then(load_image).map(|source| cover(&source, screen));
++        }
+         if let Self::HostArt(slot) = self {
+             let path = host_art().get(slot as usize).map(|(path, _, _)| path.clone());
+             return match path.as_deref().and_then(load_image) {
+@@ -828,6 +873,17 @@ mod tests {
+             assert_eq!(Wallpaper::from_id(wallpaper.id()), Some(wallpaper));
+         }
+         assert_eq!(Wallpaper::from_id("not-a-wallpaper"), None);
++        // THEME: each SiliconForest theme names its own wallpaper, whose ground is its desk colour
++        for (index, (id, _)) in wm_theme::forest::CHOICES.iter().enumerate() {
++            let paper = Wallpaper::from_id(id).expect("a SiliconForest theme's wallpaper");
++            assert_eq!(paper, Wallpaper::Forest(index as u8));
++            for appearance in [Appearance::Light, Appearance::Dark] {
++                let theme = wm_theme::forest::theme(id, appearance).unwrap();
++                assert_eq!(theme.wallpaper, *id);
++                let ground = theme.chrome.unwrap().background;
++                assert_eq!(paper.background_color(appearance), (ground.r, ground.g, ground.b), "{id}");
++            }
++        }
+         // The follow theme names its wallpaper by this id, and it must
+         // land on the variant that reads Omarchy's link.
+         assert_eq!(Wallpaper::from_id(wm_theme::omarchy::WALLPAPER), Some(Wallpaper::Omarchy));
+diff --git a/crates/wm-darwin/src/capture.rs b/crates/wm-darwin/src/capture.rs
+index db313db..7257f01 100644
+--- a/crates/wm-darwin/src/capture.rs
++++ b/crates/wm-darwin/src/capture.rs
+@@ -568,6 +568,56 @@ impl Server {
+                     }
+                     continue;
+                 }
++                // THEME: `--desktop-request theme <id>`: the desk dressed in a built-in theme (and its
++                // wallpaper) and the choice kept, as a pick in the menu's Theme rows does.
++                if let Some(id) = text.trim().strip_prefix("theme ") {
++                    #[cfg(feature = "desktop-shell")]
++                    {
++                        let id = id.trim().to_string();
++                        let known = wm_theme::default_theme::CHOICES.iter().find(|(known, _)| *known == id).map(|(_, label)| *label);
++                        let answer = match known {
++                            None => format!("error no theme named {id}; the themes: {}\n", wm_theme::default_theme::CHOICES.iter().map(|(id, _)| *id).collect::<Vec<_>>().join(" ")),
++                            Some(label) => match self.set_desktop_theme(&id) {
++                                Ok(()) => {
++                                    let persisted = self.desktop.as_ref().is_some_and(|d| d.persist)
++                                        && chonk_shell::scale_select::state_dir_known()
++                                        && chonk_shell::theme_select::persist(&id).is_ok();
++                                    eprintln!("WMSET theme={id} wallpaper={} persisted={} (desktop request)", self.desktop_wallpaper().unwrap_or_default(), u8::from(persisted));
++                                    self.show_desktop_notice(&format!("Theme: {label}"));
++                                    "ok\n".to_string()
++                                }
++                                Err(error) => format!("error {error}\n"),
++                            },
++                        };
++                        let _ = client.stream.write_all(answer.as_bytes());
++                    }
++                    #[cfg(not(feature = "desktop-shell"))]
++                    {
++                        let _ = (id, client.stream.write_all(b"error no desktop\n"));
++                    }
++                    continue;
++                }
++                // THEME: `--desktop-request wallpaper <id>`: the desk's wallpaper by id (a built-in one,
++                // `host:<file name>` for one of the host's backgrounds, a SiliconForest theme's id), kept,
++                // as a pick in the menu's Wallpaper rows.
++                if let Some(id) = text.trim().strip_prefix("wallpaper ") {
++                    #[cfg(feature = "desktop-shell")]
++                    {
++                        let id = id.trim().to_string();
++                        let answer = if self.set_desktop_wallpaper(&id) {
++                            eprintln!("WMSET wallpaper={id} (desktop request)");
++                            "ok\n".to_string()
++                        } else {
++                            format!("error no wallpaper named {id}\n")
++                        };
++                        let _ = client.stream.write_all(answer.as_bytes());
++                    }
++                    #[cfg(not(feature = "desktop-shell"))]
++                    {
++                        let _ = (id, client.stream.write_all(b"error no desktop\n"));
++                    }
++                    continue;
++                }
+                 // The dock tile's Quit (DESK6): the application quits as its own menu's Quit does.
+                 if let Some(id) = text.trim().strip_prefix("quit ") {
+                     #[cfg(feature = "desktop-shell")]
+@@ -956,8 +1006,10 @@ pub fn request_cli(args: &[String]) -> i32 {
+         [t] if t == "terminal" => "terminal\n".to_string(),
+         [a, id] if a == "application" => format!("application {id}\n"),
+         [q, id] if q == "quit" => format!("quit {id}\n"),
++        [t, id] if t == "theme" && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') => format!("theme {id}\n"),
++        [w, id] if w == "wallpaper" && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b':' || b == b'_') => format!("wallpaper {id}\n"),
+         _ => {
+-            eprintln!("usage: chonkstep-darwin-desktop --desktop-request terminal | application <bundle identifier> | quit <application id>");
++            eprintln!("usage: chonkstep-darwin-desktop --desktop-request terminal | application <bundle identifier> | quit <application id> | theme <theme id> | wallpaper <wallpaper id>");
+             return 2;
+         }
+     };
+diff --git a/crates/wm-darwin/src/damage.rs b/crates/wm-darwin/src/damage.rs
+index 12d31e5..95c6b50 100644
+--- a/crates/wm-darwin/src/damage.rs
++++ b/crates/wm-darwin/src/damage.rs
+@@ -176,6 +176,10 @@ pub enum ItemKey {
+     Window(u64),
+     /// Decoration frame of a window (keyed by window, one frame per window).
+     Decoration(u64),
++    /// The shadow under a window (THEME; keyed by window).
++    Shadow(u64),
++    /// One of a window's two lower corner pictures (THEME; window, left or right).
++    Corner(u64, u8),
+     Cursor,
+ }
+ 
+diff --git a/crates/wm-darwin/src/desktop_entry.rs b/crates/wm-darwin/src/desktop_entry.rs
+index e129c87..a6cea3d 100644
+--- a/crates/wm-darwin/src/desktop_entry.rs
++++ b/crates/wm-darwin/src/desktop_entry.rs
+@@ -492,6 +492,8 @@ fn run_session(options: Options) -> Result<(), String> {
+         _ => "default",
+     };
+     server.persist_desktop_settings(true);
++    // THEME: this session is on a display: windows appear and themes change in time (motion.rs)
++    server.motion.live = true;
+     // sf-session's word after the compositor before this one ended by itself (DESK4).
+     if let Some(text) = std::env::var("CHONKSTEP_DARWIN_START_NOTICE").ok().filter(|t| !t.trim().is_empty()) {
+         let text: String = text.chars().filter(|c| !c.is_control()).take(120).collect();
+diff --git a/crates/wm-darwin/src/effects.rs b/crates/wm-darwin/src/effects.rs
+new file mode 100644
+index 0000000..2b4eac8
+--- /dev/null
++++ b/crates/wm-darwin/src/effects.rs
+@@ -0,0 +1,428 @@
++//! What the desk draws around a window for a theme that asks for it (THEME, 17 November 2026;
++//! `wm_theme::modern::WindowChrome::effects`): a soft shadow and rounded lower corners.
++//!
++//! The shadow is eight pieces of pictures made once for a theme's shadow (radius, blur, colour):
++//! four corner tiles and four edge strips one pixel long that the renderers stretch (their
++//! sampling clamps at an image's edge). No pass over the screen, no blur at run time: a frame
++//! draws the pieces that lie in what it repaints, blended like any other picture. Under the
++//! window itself nothing is drawn (a window covers its shadow there).
++//!
++//! The lower corners are cut where the window's pixels are drawn (the upper ones are part of
++//! the title band's picture): `CornerClip` says where the two corner squares are; a renderer
++//! multiplies what it draws there by the corner's coverage and draws the border's ring.
++use crate::damage::DRect;
++use std::rc::Rc;
++use wm_core::Point;
++use wm_theme_api::{DecorationBuffer, DecorationShadow, DecorationShape};
++
++/// The pictures of one shadow. `spread` is how far it reaches outside its rectangle.
++pub(crate) struct ShadowTiles {
++    /// Top left, top right, bottom left, bottom right: `tile` square.
++    corners: [DecorationBuffer; 4],
++    /// Top and bottom: 1 wide, `2 * spread` high; left and right: `2 * spread` wide, 1 high.
++    edges: [DecorationBuffer; 4],
++    tile: u32,
++    pub spread: u32,
++    /// What the tiles were made for, and a number that differs for every such key.
++    key: (u16, u16, [u8; 4]),
++    pub id: u64,
++}
++
++/// One piece: which of the eight it is, the output rectangle it covers, its picture, where the
++/// picture's texel 0,0 is.
++pub(crate) type Piece<'a> = (u8, DRect, &'a DecorationBuffer, Point);
++
++impl ShadowTiles {
++    /// Premultiplied pictures of `rgba` under a rounded rectangle blurred by `blur` (a CSS blur:
++    /// sigma is half of it), cut off where the shadow is under one 8-bit step.
++    fn new(radius: u16, blur: u16, rgba: [u8; 4], id: u64) -> Self {
++        let sigma = (f32::from(blur) / 2.0).max(0.5);
++        let spread = (sigma * 2.5).ceil() as usize + 1;
++        let radius = usize::from(radius);
++        // the corner's picture: `spread` outside, the corner's radius and `spread` inside
++        let tile = radius + 2 * spread;
++        // coverage of a rounded rectangle's top-left corner whose other edges are far away
++        let n = tile + spread;
++        let mut mask = vec![0f32; n * n];
++        for y in 0..n {
++            for x in 0..n {
++                let (px, py) = (x as f32 + 0.5 - spread as f32, y as f32 + 0.5 - spread as f32);
++                let r = radius as f32;
++                let inside = if px < 0.0 || py < 0.0 {
++                    0.0
++                } else if px < r && py < r {
++                    let d = ((r - px).powi(2) + (r - py).powi(2)).sqrt();
++                    (r + 0.5 - d).clamp(0.0, 1.0)
++                } else {
++                    1.0
++                };
++                mask[y * n + x] = inside;
++            }
++        }
++        let kernel: Vec<f32> = {
++            let k: Vec<f32> = (0..=2 * spread).map(|i| (-((i as f32 - spread as f32).powi(2)) / (2.0 * sigma * sigma)).exp()).collect();
++            let sum: f32 = k.iter().sum();
++            k.into_iter().map(|v| v / sum).collect()
++        };
++        let pass = |src: &[f32], horizontal: bool| -> Vec<f32> {
++            let mut out = vec![0f32; n * n];
++            for y in 0..n {
++                for x in 0..n {
++                    let mut acc = 0.0;
++                    for (i, k) in kernel.iter().enumerate() {
++                        let o = i as isize - spread as isize;
++                        // before the picture there is no shadow; after it the rectangle goes on
++                        let (sx, sy) = if horizontal { (x as isize + o, y as isize) } else { (x as isize, y as isize + o) };
++                        let v = if sx < 0 || sy < 0 { 0.0 } else { src[(sy as usize).min(n - 1) * n + (sx as usize).min(n - 1)] };
++                        acc += v * k;
++                    }
++                    out[y * n + x] = acc;
++                }
++            }
++            out
++        };
++        let blurred = pass(&pass(&mask, true), false);
++        let texel = |v: f32| -> [u8; 4] {
++            let a = (v.clamp(0.0, 1.0) * f32::from(rgba[3])).round();
++            let c = |channel: u8| (f32::from(channel) * a / 255.0).round() as u8;
++            [c(rgba[0]), c(rgba[1]), c(rgba[2]), a as u8]
++        };
++        let picture = |w: usize, h: usize, at: &dyn Fn(usize, usize) -> f32| -> DecorationBuffer {
++            let mut pixels = Vec::with_capacity(w * h * 4);
++            for y in 0..h {
++                for x in 0..w {
++                    pixels.extend_from_slice(&texel(at(x, y)));
++                }
++            }
++            DecorationBuffer { width: w as u32, height: h as u32, pixels }
++        };
++        let corner = |x: usize, y: usize| blurred[y * n + x];
++        let corners = [
++            picture(tile, tile, &|x, y| corner(x, y)),
++            picture(tile, tile, &|x, y| corner(tile - 1 - x, y)),
++            picture(tile, tile, &|x, y| corner(x, tile - 1 - y)),
++            picture(tile, tile, &|x, y| corner(tile - 1 - x, tile - 1 - y)),
++        ];
++        // an edge far from the corners: the picture's last column, going in from outside
++        let profile = |i: usize| blurred[i * n + (n - 1)];
++        let band = 2 * spread;
++        let edges = [
++            picture(1, band, &|_, y| profile(y)),
++            picture(1, band, &|_, y| profile(band - 1 - y)),
++            picture(band, 1, &|x, _| profile(x)),
++            picture(band, 1, &|x, _| profile(band - 1 - x)),
++        ];
++        Self { corners, edges, tile: tile as u32, spread: spread as u32, key: (radius as u16, blur, rgba), id }
++    }
++
++    /// Everything the shadow of the rectangle `r` (the shadow's own: the window's, moved by the
++    /// shadow's offset) can touch.
++    pub fn bounds(&self, r: DRect) -> DRect {
++        let s = self.spread as i32;
++        DRect::new(r.x0 - s, r.y0 - s, r.x1 + s, r.y1 + s)
++    }
++
++    /// The pieces for the shadow rectangle `r`. A rectangle smaller than two tiles gets each
++    /// corner's picture as far as its middle (the pictures are of a rectangle with far edges: a
++    /// small one's shadow comes out a little full, and whole).
++    pub fn pieces(&self, r: DRect) -> Vec<Piece<'_>> {
++        if r.is_empty() {
++            return Vec::new();
++        }
++        let (s, t) = (self.spread as i32, self.tile as i32);
++        let (mx, my) = (r.x0 + (r.x1 - r.x0) / 2, r.y0 + (r.y1 - r.y0) / 2);
++        let (ox0, oy0, ox1, oy1) = (r.x0 - s, r.y0 - s, r.x1 + s, r.y1 + s);
++        // where the corner pictures end along the edges
++        let (cx0, cx1) = ((ox0 + t).min(mx), (ox1 - t).max(mx));
++        let (cy0, cy1) = ((oy0 + t).min(my), (oy1 - t).max(my));
++        let (c, e) = (&self.corners, &self.edges);
++        let all: [(DRect, &DecorationBuffer, Point); 8] = [
++            (DRect::new(ox0, oy0, cx0, cy0), &c[0], Point::new(ox0, oy0)),
++            (DRect::new(cx1, oy0, ox1, cy0), &c[1], Point::new(ox1 - t, oy0)),
++            (DRect::new(ox0, cy1, cx0, oy1), &c[2], Point::new(ox0, oy1 - t)),
++            (DRect::new(cx1, cy1, ox1, oy1), &c[3], Point::new(ox1 - t, oy1 - t)),
++            (DRect::new(cx0, oy0, cx1, (oy0 + 2 * s).min(my)), &e[0], Point::new(cx0, oy0)),
++            (DRect::new(cx0, (oy1 - 2 * s).max(my), cx1, oy1), &e[1], Point::new(cx0, oy1 - 2 * s)),
++            (DRect::new(ox0, cy0, (ox0 + 2 * s).min(mx), cy1), &e[2], Point::new(ox0, cy0)),
++            (DRect::new((ox1 - 2 * s).max(mx), cy0, ox1, cy1), &e[3], Point::new(ox1 - 2 * s, cy0)),
++        ];
++        all.into_iter().enumerate().filter(|(_, (rect, _, _))| !rect.is_empty()).map(|(slot, (rect, image, origin))| (slot as u8, rect, image, origin)).collect()
++    }
++
++    /// Bytes of pictures held (for the record of what a theme costs).
++    pub fn bytes(&self) -> usize {
++        self.corners.iter().chain(self.edges.iter()).map(|b| b.pixels.len()).sum()
++    }
++}
++
++/// The shadows' pictures, one set per shadow in use (a theme has two: with and without focus).
++#[derive(Default)]
++pub(crate) struct ShadowCache {
++    sets: Vec<Rc<ShadowTiles>>,
++    next: u64,
++}
++
++impl ShadowCache {
++    pub fn get(&mut self, shadow: &DecorationShadow) -> Rc<ShadowTiles> {
++        let key = (shadow.radius, shadow.blur, shadow.rgba);
++        if let Some(found) = self.sets.iter().find(|t| t.key == key) {
++            return found.clone();
++        }
++        if self.sets.len() >= 4 {
++            self.sets.remove(0);
++        }
++        self.next += 1;
++        let tiles = Rc::new(ShadowTiles::new(shadow.radius, shadow.blur, shadow.rgba, self.next));
++        self.sets.push(tiles.clone());
++        tiles
++    }
++    pub fn clear(&mut self) {
++        self.sets.clear();
++    }
++    pub fn bytes(&self) -> usize {
++        self.sets.iter().map(|t| t.bytes()).sum()
++    }
++}
++
++/// A window's two lower corners: `rect` is the window's outline on the output.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct CornerClip {
++    pub rect: DRect,
++    pub radius: u16,
++    pub border: u16,
++    pub rgb: [u8; 3],
++}
++
++impl CornerClip {
++    pub fn of(shape: &DecorationShape, frame: Point) -> Option<Self> {
++        (shape.radius > 0).then(|| Self {
++            rect: DRect::from_rect(shape.rect).translate(frame.x, frame.y),
++            radius: shape.radius,
++            border: shape.border,
++            rgb: shape.border_rgb,
++        })
++    }
++    /// The two corner squares.
++    pub fn squares(&self) -> [DRect; 2] {
++        let r = i32::from(self.radius);
++        let c = self.rect;
++        [DRect::new(c.x0, c.y1 - r, c.x0 + r, c.y1), DRect::new(c.x1 - r, c.y1 - r, c.x1, c.y1)]
++    }
++    /// At the pixel `(x, y)` of a corner square: how much of the pixel the outline covers and how
++    /// much of it is the border's ring. Outside the squares: (1, 0).
++    pub fn at(&self, x: i32, y: i32) -> (f32, f32) {
++        let r = f32::from(self.radius);
++        let c = self.rect;
++        let py = y as f32 + 0.5 - (c.y1 as f32 - r);
++        if py <= 0.0 || y >= c.y1 {
++            return (1.0, 0.0);
++        }
++        let px = x as f32 + 0.5;
++        let dx = if px < c.x0 as f32 + r { c.x0 as f32 + r - px } else if px > c.x1 as f32 - r { px - (c.x1 as f32 - r) } else { 0.0 };
++        if dx <= 0.0 || x < c.x0 || x >= c.x1 {
++            return (1.0, 0.0);
++        }
++        let d = (dx * dx + py * py).sqrt();
++        ((r + 0.5 - d).clamp(0.0, 1.0), (d - (r - f32::from(self.border)) + 0.5).clamp(0.0, 1.0))
++    }
++}
++
++/// What a window's pieces are drawn with (THEME): `alpha` under 255 while it appears (the GPU
++/// renderer; the CPU ones draw it whole), its lower corners' cut. `patched`: the corner squares
++/// are left out of the piece altogether and two small pictures of them follow
++/// (`corner_patches`: a window whose pixels the desk holds); else the GPU renderer's shader cuts
++/// the piece as it draws it (a client's GPU buffer, which only it can read).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct Fx {
++    pub alpha: u8,
++    pub clip: Option<CornerClip>,
++    pub patched: bool,
++}
++
++impl Fx {
++    pub const NONE: Fx = Fx { alpha: 255, clip: None, patched: false };
++}
++
++/// The pictures of a window's two lower corner squares: the window's own pixels there (its
++/// content, its frame's border), the border's ring on the curve, cut to the corner's coverage,
++/// premultiplied. Drawn over what is behind the window like any picture: the same pixels from
++/// every renderer. `content`: the window's picture and where its pixel 0,0 is on the output.
++pub(crate) fn corner_patches(clip: &CornerClip, content: Option<(&DecorationBuffer, Point)>) -> [(Point, DecorationBuffer); 2] {
++    let border = i32::from(clip.border);
++    clip.squares().map(|square| {
++        let (w, h) = (square.width(), square.height());
++        let mut pixels = Vec::with_capacity(w as usize * h as usize * 4);
++        for y in square.y0..square.y1 {
++            for x in square.x0..square.x1 {
++                let inside = content.and_then(|(image, at)| {
++                    let (lx, ly) = (x - at.x, y - at.y);
++                    (lx >= 0 && ly >= 0 && lx < image.width as i32 && ly < image.height as i32).then(|| {
++                        let i = (ly as usize * image.width as usize + lx as usize) * 4;
++                        [image.pixels[i], image.pixels[i + 1], image.pixels[i + 2], image.pixels[i + 3]]
++                    })
++                });
++                let on_border = x < clip.rect.x0 + border || x >= clip.rect.x1 - border || y >= clip.rect.y1 - border;
++                let own = match inside {
++                    Some(pixel) => pixel,
++                    None if on_border => [clip.rgb[0], clip.rgb[1], clip.rgb[2], 255],
++                    None => [0, 0, 0, 0],
++                };
++                let (cover, ring) = clip.at(x, y);
++                let line = [clip.rgb[0], clip.rgb[1], clip.rgb[2], 255];
++                for c in 0..4 {
++                    let v = f32::from(own[c]) + (f32::from(line[c]) - f32::from(own[c])) * ring;
++                    pixels.push((v * cover).round().clamp(0.0, 255.0) as u8);
++                }
++            }
++        }
++        (Point::new(square.x0, square.y0), DecorationBuffer { width: w, height: h, pixels })
++    })
++}
++
++/// The CPU renderers' corner cut: the pixels of a window's two corner squares are kept before
++/// the window is drawn and put back afterwards (the corner pictures are drawn over them then).
++pub(crate) struct CornerKeep {
++    pub clip: CornerClip,
++    saved: Vec<(i32, i32, [u8; 4])>,
++}
++
++impl CornerKeep {
++    /// `data` is a picture `width` wide whose pixel 0,0 is the output's `origin`.
++    pub fn take(clip: CornerClip, data: &[u8], width: u32, origin: (i32, i32)) -> Self {
++        let height = (data.len() / 4 / width.max(1) as usize) as i32;
++        let mut saved = Vec::new();
++        for square in clip.squares() {
++            for y in square.y0..square.y1 {
++                for x in square.x0..square.x1 {
++                    let (lx, ly) = (x - origin.0, y - origin.1);
++                    if lx < 0 || ly < 0 || lx >= width as i32 || ly >= height {
++                        continue;
++                    }
++                    let i = (ly as usize * width as usize + lx as usize) * 4;
++                    saved.push((x, y, [data[i], data[i + 1], data[i + 2], data[i + 3]]));
++                }
++            }
++        }
++        Self { clip, saved }
++    }
++    /// After the window was drawn: its corner squares as they were before it.
++    pub fn put(&self, data: &mut [u8], width: u32, origin: (i32, i32)) {
++        for (x, y, before) in &self.saved {
++            let i = ((*y - origin.1) as usize * width as usize + (*x - origin.0) as usize) * 4;
++            data[i..i + 4].copy_from_slice(before);
++        }
++    }
++}
++
++/// Source-over of one piece onto 8-bit premultiplied pixels, in the arithmetic a GPU's blend has
++/// (`src + dst * (1 - a)`, rounded once): the CPU renderers' shadow is the GPU's to the bit.
++/// `data` is `width` wide with its pixel 0,0 at the output's `origin`; `only` bounds what is drawn.
++pub(crate) fn blend_piece(data: &mut [u8], width: u32, origin: (i32, i32), only: DRect, piece: &Piece<'_>) {
++    let (_, rect, image, at) = piece;
++    let height = (data.len() / 4 / width.max(1) as usize) as i32;
++    let r = rect.intersect(only).intersect(DRect::new(origin.0, origin.1, origin.0 + width as i32, origin.1 + height));
++    for y in r.y0..r.y1 {
++        let sy = (y - at.y).clamp(0, image.height as i32 - 1) as usize;
++        for x in r.x0..r.x1 {
++            let sx = (x - at.x).clamp(0, image.width as i32 - 1) as usize;
++            let s = &image.pixels[(sy * image.width as usize + sx) * 4..][..4];
++            if s[3] == 0 {
++                continue;
++            }
++            let i = ((y - origin.1) as usize * width as usize + (x - origin.0) as usize) * 4;
++            let keep = 255 - u32::from(s[3]);
++            for c in 0..4 {
++                let d = u32::from(data[i + c]);
++                data[i + c] = (u32::from(s[c]) + (d * keep + 127) / 255).min(255) as u8;
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use wm_core::{Rect, Size};
++
++    fn shadow(blur: u16, radius: u16) -> DecorationShadow {
++        DecorationShadow { rect: Rect::new(Point::new(0, 0), Size::new(10, 10)), radius, offset: Point::new(0, 0), blur, rgba: [10, 20, 30, 200] }
++    }
++
++    #[test]
++    fn the_shadows_pieces_meet_without_a_seam_and_fade_to_nothing() {
++        let mut cache = ShadowCache::default();
++        let tiles = cache.get(&shadow(24, 9));
++        assert!(Rc::ptr_eq(&tiles, &cache.get(&shadow(24, 9))), "one set of pictures per shadow");
++        for (w, h) in [(600, 400), (90, 70), (31, 200)] {
++            let r = DRect::new(200, 150, 200 + w, 150 + h);
++            let bounds = tiles.bounds(r);
++            let (bw, bh) = (bounds.width(), bounds.height() as usize);
++            let mut canvas = vec![0u8; bw as usize * bh * 4];
++            let mut covered = vec![0u8; bw as usize * bh];
++            for piece in tiles.pieces(r) {
++                assert!(piece.1.intersect(bounds) == piece.1, "a piece stays inside the bounds");
++                for y in piece.1.y0..piece.1.y1 {
++                    for x in piece.1.x0..piece.1.x1 {
++                        covered[(y - bounds.y0) as usize * bw as usize + (x - bounds.x0) as usize] += 1;
++                    }
++                }
++                blend_piece(&mut canvas, bw, (bounds.x0, bounds.y0), bounds, &piece);
++            }
++            assert!(covered.iter().all(|n| *n <= 1), "{w}x{h}: no pixel is drawn twice");
++            let alpha = |x: i32, y: i32| canvas[((y - bounds.y0) as usize * bw as usize + (x - bounds.x0) as usize) * 4 + 3];
++            // nothing at the outer edge, and along an edge the shadow never jumps
++            for x in bounds.x0..bounds.x1 {
++                assert!(alpha(x, bounds.y0) <= 2 && alpha(x, bounds.y1 - 1) <= 2, "{w}x{h}: the rim at x={x}");
++            }
++            let row = r.y0 - 3;
++            for x in bounds.x0 + 1..bounds.x1 {
++                let (a, b) = (alpha(x - 1, row), alpha(x, row));
++                assert!(a.abs_diff(b) <= 12, "{w}x{h}: a jump along the top at x={x}: {a} -> {b}");
++            }
++            if w >= 600 {
++                // just outside the middle of an edge: half of the shadow's alpha
++                let mid = alpha(r.x0 + w / 2, r.y0 - 1);
++                assert!((90..=110).contains(&mid), "half the alpha at the edge, got {mid}");
++            }
++        }
++    }
++
++    #[test]
++    fn a_corner_is_cut_to_its_radius_with_the_borders_ring() {
++        let clip = CornerClip { rect: DRect::new(100, 100, 300, 260), radius: 12, border: 1, rgb: [200, 100, 50] };
++        assert_eq!(clip.at(150, 255), (1.0, 0.0), "the straight bottom edge is not touched");
++        assert_eq!(clip.at(100, 200), (1.0, 0.0), "nor the side above the corner");
++        let (cover, _) = clip.at(100, 259);
++        assert_eq!(cover, 0.0, "the corner's tip is outside");
++        let (cover, ring) = clip.at(104, 256);
++        assert!(cover > 0.0 && ring > 0.0, "on the curve: {cover} {ring}");
++        let (w, h) = (400u32, 300usize);
++        let mut data = vec![0u8; w as usize * h * 4];
++        for p in data.chunks_exact_mut(4) {
++            p.copy_from_slice(&[9, 9, 9, 255]);
++        }
++        let keep = CornerKeep::take(clip, &data, w, (0, 0));
++        let mut window = DecorationBuffer { width: 198, height: 159, pixels: vec![255; 198 * 159 * 4] };
++        window.pixels.chunks_exact_mut(4).for_each(|p| p.copy_from_slice(&[255, 255, 255, 255]));
++        for y in 100..260usize {
++            for x in 100..300usize {
++                data[(y * w as usize + x) * 4..][..4].copy_from_slice(&[255, 255, 255, 255]);
++            }
++        }
++        keep.put(&mut data, w, (0, 0));
++        let whole = DRect::new(0, 0, w as i32, h as i32);
++        for (index, (at, picture)) in corner_patches(&clip, Some((&window, Point::new(101, 100)))).into_iter().enumerate() {
++            assert_eq!((picture.width, picture.height), (12, 12));
++            blend_piece(&mut data, w, (0, 0), whole, &(index as u8, DRect::from_xywh(at.x, at.y, 12, 12), &picture, at));
++        }
++        let px = |x: usize, y: usize| &data[(y * w as usize + x) * 4..][..4];
++        assert_eq!(px(100, 259), [9, 9, 9, 255], "what was behind the corner is back");
++        assert_eq!(px(299, 259), [9, 9, 9, 255]);
++        assert_eq!(px(120, 250), [255, 255, 255, 255], "inside the window nothing changed");
++        assert_eq!(px(111, 250), [255, 255, 255, 255], "the content at the square's inner end");
++        assert_eq!(px(150, 259), [255, 255, 255, 255], "(the straight border is the frame's, not drawn here)");
++        // on the curve: the border's colour, part of a pixel
++        let on = px(103, 256);
++        assert!(on[0] > on[2] && on[3] == 255, "the ring is the border's colour over what was behind: {on:?}");
++    }
++}
+diff --git a/crates/wm-darwin/src/glrender.rs b/crates/wm-darwin/src/glrender.rs
+index 55f528e..d993ad4 100644
+--- a/crates/wm-darwin/src/glrender.rs
++++ b/crates/wm-darwin/src/glrender.rs
+@@ -17,6 +17,7 @@ use crate::gpu::*;
+ use crate::kms::{Committed, Flip, FlipQueue, FlipWait, Kms, OverlayPlacement, Scanout, ScanoutBuffer, Steps};
+ use crate::presenter::Presenter;
+ use crate::render::{drawn_image_rect, DmabufDesc, FrameStats, Presented, RecordFrame, Renderer, RendererKind};
++use crate::effects::Fx;
+ use crate::scene::{CpuBackend, DrawOp, ExternalBuffer};
+ use std::collections::HashMap;
+ use std::ffi::{c_char, c_void};
+@@ -963,10 +964,12 @@ uniform vec2 u_screen;
+ uniform vec4 u_view;    // the scene rectangle this target shows: origin, then target px per scene px
+ uniform vec2 u_origin;  // output position of the image's texel 0,0
+ out vec2 v_local;
++out vec2 v_pos;
+ void main() {
+     vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));
+     vec2 p = mix(u_rect.xy, u_rect.zw, corner);
+     v_local = p - u_origin;
++    v_pos = p;
+     // No y flip: framebuffer row 0 is the top scanline of the output.
+     gl_Position = vec4((p - u_view.xy) * u_view.zw / u_screen * 2.0 - 1.0, 0.0, 1.0);
+ }
+@@ -978,7 +981,16 @@ uniform sampler2D u_texture;
+ uniform vec4 u_color;
+ uniform int u_textured;
+ uniform ivec2 u_last;   // width - 1, height - 1
++// THEME: a window's lower corners (effects.rs CornerClip): its outline x0, y0, x1, y1; the radius
++// and the border's width (radius 0: no cut); the border's colour, and in its alpha whether the
++// shader cuts the corner (1) or leaves the corner squares out (0: their pictures follow). u_dim: 1 - alpha of a window
++// that is appearing (0: drawn whole).
++uniform vec4 u_clip;
++uniform vec2 u_clip_r;
++uniform vec4 u_clip_rgb;
++uniform vec2 u_dim;
+ in vec2 v_local;
++in vec2 v_pos;
+ out vec4 color;
+ void main() {
+     if (u_textured != 0) {
+@@ -987,6 +999,24 @@ void main() {
+     } else {
+         color = u_color;
+     }
++    if (u_clip_r.x > 0.0) {
++        float r = u_clip_r.x;
++        vec2 p = floor(v_pos) + 0.5;
++        float py = p.y - (u_clip.w - r);
++        float dx = p.x < u_clip.x + r ? u_clip.x + r - p.x : (p.x > u_clip.z - r ? p.x - (u_clip.z - r) : 0.0);
++        if (py > 0.0 && dx > 0.0 && p.y < u_clip.w && p.x > u_clip.x && p.x < u_clip.z) {
++            if (u_clip_rgb.a < 0.5) {
++                // the corner squares are drawn as pictures of their own (effects.rs corner_patches)
++                color = vec4(0.0);
++            } else {
++                float d = sqrt(dx * dx + py * py);
++                float ring = clamp(d - (r - u_clip_r.y) + 0.5, 0.0, 1.0);
++                color = color + (vec4(u_clip_rgb.rgb, 1.0) - color) * ring;
++                color *= clamp(r + 0.5 - d, 0.0, 1.0);
++            }
++        }
++    }
++    color *= 1.0 - u_dim.x;
+ }
+ ";
+ 
+@@ -1153,6 +1183,14 @@ pub struct GlRenderer {
+     u_color: GLint,
+     u_textured: GLint,
+     u_last: GLint,
++    u_clip: GLint,
++    u_clip_r: GLint,
++    u_clip_rgb: GLint,
++    u_dim: GLint,
++    /// THEME: the screen as it was before a theme change, drawn over the new one while it
++    /// fades (texture, its size, the alpha it is drawn with now).
++    fade: Option<(GLuint, (u32, u32), u8)>,
++    fade_fbo: GLuint,
+     textures: HashMap<TextureKey, Texture>,
+     frame: u64,
+     /// Bytes uploaded to textures while preparing the current frame.
+@@ -1256,6 +1294,12 @@ impl GlRenderer {
+                 u_color: uniform(c"u_color"),
+                 u_textured: uniform(c"u_textured"),
+                 u_last: uniform(c"u_last"),
++                u_clip: uniform(c"u_clip"),
++                u_clip_r: uniform(c"u_clip_r"),
++                u_clip_rgb: uniform(c"u_clip_rgb"),
++                u_dim: uniform(c"u_dim"),
++                fade: None,
++                fade_fbo: 0,
+                 program,
+                 vertex_array,
+                 libs,
+@@ -1419,7 +1463,7 @@ impl GlRenderer {
+         let index = self.target.drawing_index();
+         let frame = self.frame;
+         let need = self.repaint.plan(sigs, (width, height), frame, index, |key| scene.partial_damage(key));
+-        let need = need.filter(|_| self.partial_repaint);
++        let need = need.filter(|_| self.partial_repaint && self.fade.is_none());
+         let repainted = match &need {
+             None => {
+                 self.draw_list(scene, &list, screen, scene.cursor_on_plane);
+@@ -1452,6 +1496,21 @@ impl GlRenderer {
+                 rects.iter().map(|r| r.intersect(screen).area()).sum()
+             }
+         };
++        // THEME: a theme change: the screen as it was, over the new one, leaving
++        if let Some((texture, (fw, fh), alpha)) = self.fade {
++            let gl = &self.libs.gl;
++            unsafe {
++                (gl.glBindTexture)(GL_TEXTURE_2D, texture);
++                (gl.glUniform2f)(self.u_clip_r, 0.0, 0.0);
++                (gl.glUniform2f)(self.u_dim, 1.0 - f32::from(alpha) / 255.0, 0.0);
++                (gl.glUniform1i)(self.u_textured, 1);
++                (gl.glUniform2f)(self.u_origin, 0.0, 0.0);
++                (gl.glUniform2i)(self.u_last, fw as GLint - 1, fh as GLint - 1);
++                (gl.glUniform4f)(self.u_rect, 0.0, 0.0, fw.min(width) as f32, fh.min(height) as f32);
++                (gl.glDrawArrays)(GL_TRIANGLE_STRIP, 0, 4);
++                (gl.glUniform2f)(self.u_dim, 0.0, 0.0);
++            }
++        }
+         // the other outputs (an external display's CRTC): its rectangle of the scene, scaled to
+         // its mode, the pointer drawn in (the overlay plane is the panel's)
+         for head in 0..self.target.head_count() {
+@@ -1534,12 +1593,75 @@ impl GlRenderer {
+                         self.draw_image(key, rect.pos, image, sig.generation, None, screen);
+                     }
+                 }
+-                DrawOp::External { pos, buffer } => self.draw_external(*pos, *buffer, screen),
+-                DrawOp::Image { pos, image } => {
+-                    let partial = scene.partial_image_damage(sig.key);
+-                    self.draw_image(key, *pos, image, sig.generation, partial, screen);
++                DrawOp::External { pos, buffer, fx } => {
++                    self.set_fx(*fx);
++                    self.draw_external(*pos, *buffer, screen);
++                    self.set_fx(Fx::NONE);
+                 }
+-                DrawOp::Decoration { pos, surface } => {
++                DrawOp::Image { pos, image, fx } => {
++                    let partial = scene.partial_image_damage(sig.key);
++                    self.set_fx(*fx);
++                    self.draw_image(key, *pos, image, sig.generation, partial, screen);
++                    self.set_fx(Fx::NONE);
++                }
++                DrawOp::Shadow { tiles, rect, alpha } => {
++                    // the pictures are one set for every window with this shadow
++                    self.set_fx(Fx { alpha: *alpha, clip: None, patched: false });
++                    for (part, area, image, origin) in tiles.pieces(*rect) {
++                        let key = TextureKey { item: ItemKey::Shadow(tiles.id), part: u32::from(part) };
++                        self.draw_piece(key, area, image, origin, tiles.id, screen);
++                    }
++                    self.set_fx(Fx::NONE);
++                }
++                DrawOp::Patch { pos, image, alpha } => {
++                    self.set_fx(Fx { alpha: *alpha, clip: None, patched: false });
++                    self.draw_piece(key, DRect::from_xywh(pos.x, pos.y, image.width, image.height), image, *pos, sig.generation, screen);
++                    self.set_fx(Fx::NONE);
++                }
++                DrawOp::Decoration { pos, surface, fx } => {
++                    self.set_fx(*fx);
++                    self.draw_decoration(sig, *pos, surface, screen);
++                    self.set_fx(Fx::NONE);
++                }
++            }
++        }
++    }
++    /// THEME: what the next draws are cut and dimmed by (`Fx::NONE` puts both back).
++    fn set_fx(&self, fx: Fx) {
++        let gl = &self.libs.gl;
++        unsafe {
++            match fx.clip {
++                Some(clip) => {
++                    (gl.glUniform4f)(self.u_clip, clip.rect.x0 as f32, clip.rect.y0 as f32, clip.rect.x1 as f32, clip.rect.y1 as f32);
++                    (gl.glUniform2f)(self.u_clip_r, f32::from(clip.radius), f32::from(clip.border));
++                    (gl.glUniform4f)(self.u_clip_rgb, f32::from(clip.rgb[0]) / 255.0, f32::from(clip.rgb[1]) / 255.0, f32::from(clip.rgb[2]) / 255.0, if fx.patched { 0.0 } else { 1.0 });
++                }
++                None => (gl.glUniform2f)(self.u_clip_r, 0.0, 0.0),
++            }
++            (gl.glUniform2f)(self.u_dim, 1.0 - f32::from(fx.alpha) / 255.0, 0.0);
++        }
++    }
++    /// One piece of a shadow: `image` with its texel 0,0 at `origin`, over `area` (an edge strip
++    /// is one pixel long and stretched: the sampling clamps).
++    fn draw_piece(&mut self, key: TextureKey, area: DRect, image: &DecorationBuffer, origin: Point, generation: u64, screen: DRect) {
++        let covered = area.intersect(screen);
++        if !self.texture(key, image, generation, None) || covered.is_empty() {
++            return;
++        }
++        let gl = &self.libs.gl;
++        unsafe {
++            (gl.glUniform1i)(self.u_textured, 1);
++            (gl.glUniform2f)(self.u_origin, origin.x as f32, origin.y as f32);
++            (gl.glUniform2i)(self.u_last, image.width as GLint - 1, image.height as GLint - 1);
++            (gl.glUniform4f)(self.u_rect, covered.x0 as f32, covered.y0 as f32, covered.x1 as f32, covered.y1 as f32);
++            (gl.glDrawArrays)(GL_TRIANGLE_STRIP, 0, 4);
++        }
++    }
++    fn draw_decoration(&mut self, sig: &crate::damage::ItemSig, pos: Point, surface: &wm_theme_api::DecorationSurface, screen: DRect) {
++        {
++            {
++                {
++                    let pos = &pos;
+                     for solid in &surface.solids {
+                         let rect = DRect::from_rect(solid.rect).translate(pos.x, pos.y).intersect(screen);
+                         self.draw_solid(rect, solid.rgb);
+@@ -1560,10 +1682,16 @@ impl GlRenderer {
+             let parts = match op {
+                 DrawOp::Background { outputs, .. } => outputs.len() + 1,
+                 DrawOp::Decoration { surface, .. } => surface.parts.len() + 1,
++                DrawOp::Shadow { .. } => 8,
+                 _ => 1,
+             };
++            // a shadow's pictures are kept under their set, not their window
++            let item = match op {
++                DrawOp::Shadow { tiles, .. } => ItemKey::Shadow(tiles.id),
++                _ => sig.key,
++            };
+             for part in 0..parts as u32 {
+-                if let Some(t) = self.textures.get_mut(&TextureKey { item: sig.key, part }) {
++                if let Some(t) = self.textures.get_mut(&TextureKey { item, part }) {
+                     t.seen = frame;
+                 }
+             }
+@@ -1687,6 +1815,50 @@ impl Renderer for GlRenderer {
+         // DESK9: the next frame of every buffer is a complete repaint; textures stay valid.
+         self.repaint.reset();
+     }
++    fn fade_begin(&mut self) -> bool {
++        let Some(source) = self.target.last() else { return false };
++        let (width, height) = self.target.size();
++        let gl = &self.libs.gl;
++        unsafe {
++            if let Some((old, ..)) = self.fade.take() {
++                (gl.glDeleteTextures)(1, &old);
++            }
++            let mut texture = 0;
++            (gl.glGenTextures)(1, &mut texture);
++            (gl.glBindTexture)(GL_TEXTURE_2D, texture);
++            (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++            (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++            (gl.glTexImage2D)(GL_TEXTURE_2D, 0, GL_RGBA8 as GLint, width as GLsizei, height as GLsizei, 0, GL_RGBA, GL_UNSIGNED_BYTE, std::ptr::null());
++            if self.fade_fbo == 0 {
++                (gl.glGenFramebuffers)(1, &mut self.fade_fbo);
++            }
++            (gl.glBindFramebuffer)(GL_DRAW_FRAMEBUFFER, self.fade_fbo);
++            (gl.glFramebufferTexture2D)(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
++            (gl.glBindFramebuffer)(GL_READ_FRAMEBUFFER, source);
++            (gl.glBlitFramebuffer)(0, 0, width as GLint, height as GLint, 0, 0, width as GLint, height as GLint, GL_COLOR_BUFFER_BIT, GL_NEAREST as GLenum);
++            (gl.glBindFramebuffer)(GL_FRAMEBUFFER, 0);
++            if (gl.glGetError)() != GL_NO_ERROR {
++                (gl.glDeleteTextures)(1, &texture);
++                return false;
++            }
++            self.fade = Some((texture, (width, height), 255));
++        }
++        self.repaint.reset();
++        true
++    }
++    fn fade_set(&mut self, alpha: Option<u8>) {
++        match (alpha, self.fade.as_mut()) {
++            (Some(alpha), Some(fade)) => fade.2 = alpha,
++            (None, Some(_)) => {
++                if let Some((texture, ..)) = self.fade.take() {
++                    unsafe { (self.libs.gl.glDeleteTextures)(1, &texture) };
++                }
++            }
++            _ => {}
++        }
++        // while a picture of the screen before lies over the frames, every frame is drawn whole
++        self.repaint.reset();
++    }
+     fn set_partial_repaint(&mut self, on: bool) {
+         if on != self.partial_repaint {
+             self.partial_repaint = on;
+diff --git a/crates/wm-darwin/src/lib.rs b/crates/wm-darwin/src/lib.rs
+index 122af12..36465bc 100644
+--- a/crates/wm-darwin/src/lib.rs
++++ b/crates/wm-darwin/src/lib.rs
+@@ -10,6 +10,8 @@ pub mod capture;
+ pub mod bench;
+ pub mod cursors;
+ pub mod damage;
++mod effects;
++pub mod motion;
+ #[cfg(feature = "desktop-shell")]
+ pub mod desktop;
+ #[cfg(feature = "desktop-shell")]
+diff --git a/crates/wm-darwin/src/motion.rs b/crates/wm-darwin/src/motion.rs
+new file mode 100644
+index 0000000..4c0dd3f
+--- /dev/null
++++ b/crates/wm-darwin/src/motion.rs
+@@ -0,0 +1,145 @@
++//! How the desk moves (THEME, 17 November 2026): a window fades in while rising a few points
++//! when it appears, and a change of theme cross-fades, each as the theme in use says
++//! (`wm_theme::modern::WindowChrome`: `open_ms`, `open_rise`, `open_curve`, `switch_ms`).
++//! Also here: the theme's `effects` (shadows, rounded lower corners) told to the scene.
++//!
++//! Nothing runs while nothing moves: a window that appears is in `Motion::appear` for its
++//! `open_ms` (at most 400 ms), a theme change keeps one picture of the screen for its
++//! `switch_ms`. Only the session on a display moves (`Motion::live`, set by the desktop's entry;
++//! policy `motion=off` stops it): the host tests' frames are the scene, at rest.
++use crate::server::Server;
++use std::collections::{HashMap, HashSet};
++use std::time::Instant;
++
++#[derive(Default)]
++pub struct Motion {
++    /// The session is on a display: windows appear and themes change in time.
++    pub live: bool,
++    /// Windows that had a picture at the last look.
++    known: HashSet<u64>,
++    seen_once: bool,
++    appear: HashMap<u64, Instant>,
++    /// The theme (id, appearance) the desk wore at the last look.
++    theme: Option<(String, wm_theme::Appearance)>,
++    /// A theme change being shown: since when (`None` until the first frame of the new look
++    /// is out: dressing the desk takes longer than a frame), for how many milliseconds.
++    fade: Option<(Option<Instant>, u16)>,
++    fade_armed: bool,
++    /// The cross-fade of the theme worn at the last look (leaving it fades as entering it did).
++    switch_ms: u16,
++    /// Counted for the record: windows that appeared in time, theme changes cross-faded.
++    pub appeared: u64,
++    pub faded: u64,
++}
++
++/// 0..1 -> 0..1, fast first: `curve` 3 cubic, 5 quint, 10 exponential.
++pub(crate) fn ease_out(t: f32, curve: u8) -> f32 {
++    let t = t.clamp(0.0, 1.0);
++    match curve {
++        10 => 1.0 - (2f32.powf(-10.0 * t) - 2f32.powf(-10.0)) / (1.0 - 2f32.powf(-10.0)),
++        5 => 1.0 - (1.0 - t).powi(5),
++        _ => 1.0 - (1.0 - t).powi(3),
++    }
++}
++
++impl Server {
++    /// Once a frame, after the desktop's own work (a menu's theme pick is applied by then) and
++    /// before the frame is drawn.
++    pub(crate) fn motion_sync(&mut self) {
++        #[cfg(feature = "desktop-shell")]
++        {
++            let Some((id, appearance, window)) = self.desktop.as_ref().map(|d| {
++                let theme = d.shell.theme();
++                (theme.id.clone(), theme.appearance, theme.chrome.map(|c| c.window).unwrap_or_default())
++            }) else {
++                return;
++            };
++            let now = Instant::now();
++            let moving = self.motion.live && self.policy.now.motion;
++            let backend = self.wm.backend_mut();
++            if backend.effects != window.effects {
++                backend.effects = window.effects;
++                backend.dirty = true;
++            }
++            let wears = Some((id, appearance));
++            if self.motion.theme != wears {
++                let first = self.motion.theme.is_none();
++                self.motion.theme = wears;
++                self.wm.backend_mut().shadows.borrow_mut().clear();
++                let ms = window.switch_ms.max(self.motion.switch_ms);
++                self.motion.switch_ms = window.switch_ms;
++                if moving && !first && ms > 0 && self.renderer.fade_begin() {
++                    self.motion.fade = Some((None, ms));
++                    self.motion.faded += 1;
++                    eprintln!("WMMOTION theme change cross-fades over {ms} ms (the {}th)", self.motion.faded);
++                }
++            }
++            // windows that have a picture now and had none at the last look appear
++            let backend = self.wm.backend_mut();
++            let shown: HashSet<u64> = backend.windows.iter().filter(|(_, w)| w.mapped && w.image.is_some()).map(|(id, _)| *id).collect();
++            if moving && self.motion.seen_once && window.open_ms > 0 {
++                for id in shown.difference(&self.motion.known) {
++                    self.motion.appear.insert(*id, now);
++                    self.motion.appeared += 1;
++                    if self.motion.appeared <= 3 || self.motion.appeared % 50 == 0 {
++                        eprintln!("WMMOTION window {id} appears over {} ms rising {} pt (the {}th)", window.open_ms, window.open_rise, self.motion.appeared);
++                    }
++                }
++            }
++            self.motion.known = shown;
++            self.motion.seen_once = true;
++            let rise = f32::from(window.open_rise) * backend.scale.factor() as f32;
++            let (open_ms, curve) = (f32::from(window.open_ms.max(1)), window.open_curve);
++            let known = &self.motion.known;
++            self.motion.appear.retain(|id, since| moving && known.contains(id) && now.duration_since(*since).as_secs_f32() * 1000.0 < open_ms);
++            if !backend.appearing.is_empty() || !self.motion.appear.is_empty() {
++                backend.appearing.clear();
++                for (id, since) in &self.motion.appear {
++                    let e = ease_out(now.duration_since(*since).as_secs_f32() * 1000.0 / open_ms, curve);
++                    backend.appearing.insert(*id, ((e * 255.0).round() as u8, ((1.0 - e) * rise).round() as i32));
++                }
++                backend.dirty = true;
++            }
++            if let Some((since, ms)) = self.motion.fade {
++                let Some(since) = since else {
++                    // the new look's first frame is drawn under the whole old picture; time runs from the next
++                    if self.motion.fade_armed {
++                        self.motion.fade = Some((Some(now), ms));
++                        self.motion.fade_armed = false;
++                    } else {
++                        self.motion.fade_armed = true;
++                    }
++                    self.wm.backend_mut().dirty = true;
++                    return;
++                };
++                let t = now.duration_since(since).as_secs_f32() * 1000.0 / f32::from(ms.max(1));
++                if t >= 1.0 || !moving {
++                    self.motion.fade = None;
++                    self.renderer.fade_set(None);
++                } else {
++                    // the old picture leaves evenly at first and gently at the end
++                    self.renderer.fade_set(Some(((1.0 - ease_out(t, 3)) * 255.0).round() as u8));
++                }
++                self.wm.backend_mut().dirty = true;
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::ease_out;
++    #[test]
++    fn the_curves_start_at_nothing_end_whole_and_never_go_back() {
++        for curve in [3u8, 5, 10] {
++            assert!(ease_out(0.0, curve).abs() < 1e-6 && (ease_out(1.0, curve) - 1.0).abs() < 1e-6, "curve {curve}");
++            let mut last = 0.0;
++            for step in 0..=60 {
++                let v = ease_out(step as f32 / 60.0, curve);
++                assert!(v >= last - 1e-6 && (0.0..=1.0).contains(&v), "curve {curve} at {step}");
++                last = v;
++            }
++            assert!(ease_out(0.5, curve) > 0.8, "fast first: curve {curve}");
++        }
++    }
++}
+diff --git a/crates/wm-darwin/src/policy.rs b/crates/wm-darwin/src/policy.rs
+index 257a7fe..ab61fd5 100644
+--- a/crates/wm-darwin/src/policy.rs
++++ b/crates/wm-darwin/src/policy.rs
+@@ -30,6 +30,7 @@
+ //! | `record_crf` | 20 | DESK11: x264's constant quality (0..51, lower = better and bigger) |
+ //! | `record_threads` | 0 | DESK11: x264's threads (0 = x264's own choice) |
+ //! | `record_nice` | 0 | DESK11: the encoder's nice value (0..19: a higher number leaves the CPU to everything else first) |
++//! | `motion` | on | THEME: a window fades in while rising when it appears and a theme change cross-fades, each as the theme in use says (`motion.rs`); off: at once |
+ //! | `record_writeback` | on | DESK11: the recorder's GPU buffers are CPU-mapped cached (fast to read); off: write-combined (for a comparison) |
+ use std::path::PathBuf;
+ use std::time::{Duration, Instant, SystemTime};
+@@ -51,6 +52,8 @@ pub struct Switches {
+     pub natural_scroll: bool,
+     pub scroll_trace: bool,
+     pub window_position: bool,
++    /// THEME: windows fade in and theme changes cross-fade as the theme says
++    pub motion: bool,
+     /// percent, 25..400 (not a switch: `scroll_speed=<n>`)
+     pub scroll_speed: u16,
+     /// DESK11: the screen recorder's settings (`record_*`)
+@@ -128,7 +131,7 @@ impl RecordPolicy {
+ }
+ 
+ impl Switches {
+-    const KEYS: [&'static str; 15] = ["fifo", "fifo_shm", "client_wake", "flip_time_callbacks", "flip_stamps", "restore", "skip_unchanged", "partial_repaint", "framehash", "late_latch", "restore_after_reboot", "trackpad_scroll", "natural_scroll", "scroll_trace", "window_position"];
++    const KEYS: [&'static str; 16] = ["fifo", "fifo_shm", "client_wake", "flip_time_callbacks", "flip_stamps", "restore", "skip_unchanged", "partial_repaint", "framehash", "late_latch", "restore_after_reboot", "trackpad_scroll", "natural_scroll", "scroll_trace", "window_position", "motion"];
+     fn defaults() -> Self {
+         let env = |key: &str| std::env::var(format!("CHONKSTEP_DARWIN_{}", key.to_ascii_uppercase())).ok().and_then(|v| parse_bool(&v));
+         Self {
+@@ -147,6 +150,7 @@ impl Switches {
+             natural_scroll: env("natural_scroll").unwrap_or(true),
+             scroll_trace: env("scroll_trace").unwrap_or(false),
+             window_position: env("window_position").unwrap_or(false),
++            motion: env("motion").unwrap_or(true),
+             scroll_speed: std::env::var("CHONKSTEP_DARWIN_SCROLL_SPEED").ok().and_then(|v| parse_speed(&v)).unwrap_or(100),
+             record: RecordPolicy::default(),
+         }
+@@ -168,6 +172,7 @@ impl Switches {
+             "natural_scroll" => &mut self.natural_scroll,
+             "scroll_trace" => &mut self.scroll_trace,
+             "window_position" => &mut self.window_position,
++            "motion" => &mut self.motion,
+             _ => return None,
+         })
+     }
+@@ -311,14 +316,14 @@ mod tests {
+     use super::*;
+     #[test]
+     fn the_policy_file_changes_switches_without_a_relaunch_and_a_test_pin_wins_until_released() {
+-        let base = Switches { fifo: true, fifo_shm: true, client_wake: true, flip_time_callbacks: true, flip_stamps: true, restore: true, skip_unchanged: true, partial_repaint: true, framehash: false, late_latch: true, restore_after_reboot: false, trackpad_scroll: true, natural_scroll: true, scroll_trace: false, window_position: false, scroll_speed: 100, record: RecordPolicy::default() };
++        let base = Switches { fifo: true, fifo_shm: true, client_wake: true, flip_time_callbacks: true, flip_stamps: true, restore: true, skip_unchanged: true, partial_repaint: true, framehash: false, late_latch: true, restore_after_reboot: false, trackpad_scroll: true, natural_scroll: true, scroll_trace: false, window_position: false, motion: true, scroll_speed: 100, record: RecordPolicy::default() };
+         // DESK10: the trackpad's scrolling speed is a number, the rest switches
+         let (sp, refused) = Switches::parse("scroll_speed=140\nscroll_trace=on\ntrackpad_scroll=off\n", base);
+         assert!(refused.is_empty() && sp.scroll_speed == 140 && sp.scroll_trace && !sp.trackpad_scroll && sp.natural_scroll);
+         let (sp, refused) = Switches::parse("scroll_speed=1000\nscroll_speed=fast\n", base);
+         assert_eq!(sp.scroll_speed, 100);
+         assert_eq!(refused.len(), 2);
+-        assert!(sp.text().contains("scroll_trace=off window_position=off scroll_speed=100 record_fps=60 record_scale=full"));
++        assert!(sp.text().contains("scroll_trace=off window_position=off motion=on scroll_speed=100 record_fps=60 record_scale=full"));
+         // DESK11: the recorder's keys
+         let (r, refused) = Switches::parse("record_fps=30\nrecord_scale=half\nrecord_preset=superfast\nrecord_crf=99\nrecord_encoder=hardware\nrecord_codec=mjpeg\n", base);
+         assert_eq!(refused, vec!["record_crf=99".to_string()]);
+diff --git a/crates/wm-darwin/src/render.rs b/crates/wm-darwin/src/render.rs
+index 4f2ca3b..38b2208 100644
+--- a/crates/wm-darwin/src/render.rs
++++ b/crates/wm-darwin/src/render.rs
+@@ -204,6 +204,13 @@ pub trait Renderer {
+     /// DESK9: repaint only what changed since the target buffer was drawn last (GPU renderer; policy
+     /// `partial_repaint`). Others ignore it.
+     fn set_partial_repaint(&mut self, _: bool) {}
++    /// THEME: keep the picture now on the screen to draw it over the coming frames
++    /// (`fade_set`): a theme change cross-fades. False: this renderer cannot.
++    fn fade_begin(&mut self) -> bool {
++        false
++    }
++    /// The alpha the kept picture is drawn with from the next frame on; `None`: let it go.
++    fn fade_set(&mut self, _: Option<u8>) {}
+     /// Bring the presenter's output up to date with `scene`. On error nothing
+     /// is considered shown: the caller keeps the scene dirty and the next call
+     /// must deliver everything that is still outstanding.
+@@ -589,10 +596,20 @@ fn draw_items(target: &mut tiny_skia::PixmapMut<'_>, list: &[(ItemSig, DrawOp<'_
+         };
+         target.fill_rect(area, &paint, tiny_skia::Transform::identity(), None);
+     };
++    // THEME: what is behind the lower corners of the window being drawn (content, then frame)
++    let mut corners: Option<crate::effects::CornerKeep> = None;
++    let width = target.width();
+     for (sig, op) in list {
+         if !sig.rect.intersects(rect) {
+             continue;
+         }
++        let clip = match op {
++            DrawOp::Image { fx, .. } | DrawOp::External { fx, .. } | DrawOp::Decoration { fx, .. } => fx.clip,
++            _ => None,
++        };
++        if let Some(clip) = clip.filter(|clip| corners.as_ref().is_none_or(|kept| kept.clip != *clip)) {
++            corners = Some(crate::effects::CornerKeep::take(clip, target.data_mut(), width, (rect.x0, rect.y0)));
++        }
+         match op {
+             DrawOp::Background { color, image, outputs } => {
+                 target.fill(tiny_skia::Color::from_rgba8(color[0], color[1], color[2], 255));
+@@ -603,11 +620,20 @@ fn draw_items(target: &mut tiny_skia::PixmapMut<'_>, list: &[(ItemSig, DrawOp<'_
+                     draw(target, rect.pos, image);
+                 }
+             }
+-            DrawOp::Image { pos, image } => draw(target, *pos, image),
++            DrawOp::Image { pos, image, .. } => draw(target, *pos, image),
++            DrawOp::Patch { pos, image, .. } => {
++                let piece = (0u8, DRect::from_xywh(pos.x, pos.y, image.width, image.height), &**image, *pos);
++                crate::effects::blend_piece(target.data_mut(), width, (rect.x0, rect.y0), rect, &piece);
++            }
++            DrawOp::Shadow { tiles, rect: shadow, .. } => {
++                for piece in tiles.pieces(*shadow) {
++                    crate::effects::blend_piece(target.data_mut(), width, (rect.x0, rect.y0), rect, &piece);
++                }
++            }
+             // GPU memory of a client: only a GPU renderer can show it, and
+             // only a GPU renderer ever accepts such a buffer.
+             DrawOp::External { .. } => {}
+-            DrawOp::Decoration { pos, surface } => {
++            DrawOp::Decoration { pos, surface, .. } => {
+                 for solid in &surface.solids {
+                     let at = DRect::from_rect(solid.rect).translate(pos.x, pos.y);
+                     if !at.intersects(rect) {
+@@ -627,6 +653,10 @@ fn draw_items(target: &mut tiny_skia::PixmapMut<'_>, list: &[(ItemSig, DrawOp<'_
+                 for part in &surface.parts {
+                     draw(target, Point::new(pos.x + part.offset.x, pos.y + part.offset.y), &part.buffer);
+                 }
++                // the frame is the last of a window's pieces: its corners are cut now
++                if let Some(keep) = corners.take() {
++                    keep.put(target.data_mut(), width, (rect.x0, rect.y0));
++                }
+             }
+         }
+     }
+@@ -878,7 +908,7 @@ mod tests {
+                 ),
+                 (
+                     ItemSig { key: crate::damage::ItemKey::Decoration(1), rect: DRect::from_xywh(-100, -100, 400, 400), generation: 0 },
+-                    DrawOp::Decoration { pos, surface: &surface },
++                    DrawOp::Decoration { pos, surface: &surface, fx: crate::effects::Fx::NONE },
+                 ),
+             ]
+         };
+diff --git a/crates/wm-darwin/src/scene.rs b/crates/wm-darwin/src/scene.rs
+index a9741e3..6b6ae1d 100644
+--- a/crates/wm-darwin/src/scene.rs
++++ b/crates/wm-darwin/src/scene.rs
+@@ -5,6 +5,7 @@ use std::collections::HashMap;
+ use wm_core::*;
+ use wm_theme_api::{DecorationBuffer, DecorationLayout, DecorationSurface, ResizeEdge};
+ use crate::damage::{DRect, ItemKey, ItemSig};
++use crate::effects::Fx;
+ 
+ pub struct Window {
+     pub surface: ToplevelSurface,
+@@ -116,12 +117,17 @@ pub struct ExternalBuffer {
+ /// One entry of the display list, borrowed from the scene.
+ pub(crate) enum DrawOp<'a> {
+     /// A client dma-buf, drawn like an image at `pos`.
+-    External { pos: Point, buffer: ExternalBuffer },
++    External { pos: Point, buffer: ExternalBuffer, fx: Fx },
+     /// The desk's colour, its wallpaper at the panel's origin, and the wallpaper fitted to each
+     /// other output's rectangle (DESK6: before, an external display showed the colour alone).
+     Background { color: [u8; 3], image: Option<&'a DecorationBuffer>, outputs: &'a [(Rect, DecorationBuffer)] },
+-    Image { pos: Point, image: &'a DecorationBuffer },
+-    Decoration { pos: Point, surface: &'a DecorationSurface },
++    Image { pos: Point, image: &'a DecorationBuffer, fx: Fx },
++    Decoration { pos: Point, surface: &'a DecorationSurface, fx: Fx },
++    /// THEME: the shadow of the rectangle `rect` (the window's outline moved by the shadow's
++    /// offset), in the pieces of `tiles`; `alpha` under 255 while the window appears.
++    Shadow { tiles: std::rc::Rc<crate::effects::ShadowTiles>, rect: DRect, alpha: u8 },
++    /// THEME: one of a window's lower corner pictures (`effects::corner_patches`).
++    Patch { pos: Point, image: std::rc::Rc<DecorationBuffer>, alpha: u8 },
+ }
+ /// Everything an image at `pos` can touch, including tiny-skia's placement
+ /// of images with a negative origin (see `render::drawn_image_rect`).
+@@ -185,6 +191,17 @@ pub struct CpuBackend {
+     pub(crate) hold_configures: bool,
+     /// A swipe between Spaces in progress: windows drawn displaced (`gesture.rs`).
+     pub slide: Option<crate::gesture::Slide>,
++    /// THEME: the theme asks for a shadow under each framed window and rounded lower corners
++    /// (`wm_theme::modern::WindowChrome::effects`; set with the theme).
++    pub(crate) effects: bool,
++    /// THEME: windows that are appearing: the alpha they are drawn with and how far below
++    /// their place (`motion.rs`; the GPU renderer only).
++    pub(crate) appearing: HashMap<u64, (u8, i32)>,
++    /// THEME: the windows' lower corner pictures: what they were made for (content and frame
++    /// version, the corner) and the two pictures with their places.
++    pub(crate) corners: std::cell::RefCell<HashMap<u64, (u64, crate::effects::CornerClip, Vec<(Point, std::rc::Rc<DecorationBuffer>)>)>>,
++    /// THEME: the pictures of the shadows in use.
++    pub(crate) shadows: std::cell::RefCell<crate::effects::ShadowCache>,
+     /// The pointer is on the display's overlay plane (DESK5): GL frames are rendered without
+     /// it, and moving it or changing its image marks `cursor_moved`, not `dirty`.
+     pub(crate) cursor_on_plane: bool,
+@@ -223,6 +240,10 @@ impl CpuBackend {
+             rescaling: false,
+             hold_configures: false,
+             slide: None,
++            effects: false,
++            appearing: HashMap::new(),
++            shadows: Default::default(),
++            corners: Default::default(),
+             cursor_on_plane: false,
+             cursor_moved: false,
+             frame_cursor: None,
+@@ -441,7 +462,8 @@ impl CpuBackend {
+     /// item for item; `render::tests` holds the two to identical pixels.
+     pub(crate) fn display_list<'a>(&'a self) -> Vec<(ItemSig, DrawOp<'a>)> {
+         let size = self.screen_size();
+-        let mut list = Vec::with_capacity(2 + self.shell_stack.len() + 2 * self.stack.len());
++        let mut list = Vec::with_capacity(2 + self.shell_stack.len() + 5 * self.stack.len());
++        self.corners.borrow_mut().retain(|id, _| self.effects && self.windows.contains_key(id));
+         list.push((
+             ItemSig {
+                 key: ItemKey::Background,
+@@ -456,7 +478,7 @@ impl CpuBackend {
+                     let pos = Point::new(s.geometry.pos.x + shift, s.geometry.pos.y);
+                     list.push((
+                         ItemSig { key: ItemKey::Shell(*id), rect: image_rect(pos, &s.image), generation: s.generation },
+-                        DrawOp::Image { pos, image: &s.image },
++                        DrawOp::Image { pos, image: &s.image, fx: Fx::NONE },
+                     ));
+                 }
+             }
+@@ -470,7 +492,7 @@ impl CpuBackend {
+                             rect: image_rect(s.geometry.pos, &s.image),
+                             generation: s.generation,
+                         },
+-                        DrawOp::Image { pos: s.geometry.pos, image: &s.image },
++                        DrawOp::Image { pos: s.geometry.pos, image: &s.image, fx: Fx::NONE },
+                     ));
+                 }
+             }
+@@ -490,22 +512,40 @@ impl CpuBackend {
+             }
+             let w = &self.windows[id];
+             let (content_pos, drawn_frame) = self.drawn_frame(*id);
++            // THEME: while a window appears it is drawn fainter and a little lower; a theme
++            // with effects has a shadow under it and its lower corners cut
++            let (alpha, rise) = self.appearing.get(id).copied().unwrap_or((255, 0));
++            let moving = |generation: u64| if alpha == 255 { generation } else { generation ^ ((u64::from(alpha) + 1) << 52) };
++            let mut fx = Fx { alpha, clip: None, patched: w.external.is_none() };
++            if let Some((frame_pos, surface, frame_generation)) = drawn_frame.filter(|_| self.effects) {
++                let pos = Point::new(frame_pos.x + shift, frame_pos.y + rise);
++                fx.clip = surface.shape.as_ref().and_then(|shape| crate::effects::CornerClip::of(shape, pos));
++                if let Some(shadow) = surface.shadow.as_ref() {
++                    let tiles = self.shadows.borrow_mut().get(shadow);
++                    let rect = DRect::from_rect(shadow.rect).translate(pos.x + shadow.offset.x, pos.y + shadow.offset.y);
++                    list.push((
++                        ItemSig { key: ItemKey::Shadow(*id), rect: tiles.bounds(rect), generation: moving(tiles.id ^ (frame_generation << 8)) },
++                        DrawOp::Shadow { tiles, rect, alpha },
++                    ));
++                }
++            }
+             if let Some(image) = w.image.as_ref().filter(|_| w.mapped || neighbour) {
+-                let pos = Point::new(content_pos.x + shift, content_pos.y);
++                let pos = Point::new(content_pos.x + shift, content_pos.y + rise);
+                 list.push((
+                     ItemSig {
+                         key: ItemKey::Window(*id),
+                         rect: image_rect(pos, image),
+-                        generation: w.generation,
++                        generation: moving(w.generation),
+                     },
+                     match w.external {
+-                        Some(buffer) => DrawOp::External { pos, buffer },
+-                        None => DrawOp::Image { pos, image },
++                        Some(buffer) => DrawOp::External { pos, buffer, fx },
++                        None => DrawOp::Image { pos, image, fx },
+                     },
+                 ));
+             }
+             if let Some((frame_pos, surface, frame_generation)) = drawn_frame {
+-                let pos = Point::new(frame_pos.x + shift, frame_pos.y);
++                let frame_generation = moving(frame_generation);
++                let pos = Point::new(frame_pos.x + shift, frame_pos.y + rise);
+                 let mut rect = DRect::EMPTY;
+                 for solid in &surface.solids {
+                     rect = rect.union(DRect::from_rect(solid.rect).translate(pos.x, pos.y));
+@@ -516,8 +556,24 @@ impl CpuBackend {
+                 }
+                 list.push((
+                     ItemSig { key: ItemKey::Decoration(*id), rect, generation: frame_generation },
+-                    DrawOp::Decoration { pos, surface },
++                    DrawOp::Decoration { pos, surface, fx },
+                 ));
++                // THEME: the lower corners of a window whose pixels the desk holds: two small pictures
++                if let Some(clip) = fx.clip.filter(|_| fx.patched) {
++                    let content = w.image.as_ref().filter(|_| w.mapped || neighbour).map(|image| (image, Point::new(content_pos.x + shift, content_pos.y + rise)));
++                    let version = w.generation ^ frame_generation.rotate_left(32);
++                    let mut cache = self.corners.borrow_mut();
++                    let entry = cache.entry(*id).or_insert_with(|| (u64::MAX, clip, Vec::new()));
++                    if entry.0 != version || entry.1 != clip || entry.2.is_empty() {
++                        *entry = (version, clip, crate::effects::corner_patches(&clip, content).into_iter().map(|(at, picture)| (at, std::rc::Rc::new(picture))).collect());
++                    }
++                    for (index, (at, picture)) in entry.2.iter().enumerate() {
++                        list.push((
++                            ItemSig { key: ItemKey::Corner(*id, index as u8), rect: DRect::from_xywh(at.x, at.y, picture.width, picture.height), generation: moving(version) },
++                            DrawOp::Patch { pos: *at, image: picture.clone(), alpha },
++                        ));
++                    }
++                }
+             }
+             if w.mapped && !neighbour {
+                 owned(&mut list, *id, shift);
+@@ -532,7 +588,7 @@ impl CpuBackend {
+                     rect: image_rect(pos, image),
+                     generation: self.cursor_generation,
+                 },
+-                DrawOp::Image { pos, image },
++                DrawOp::Image { pos, image, fx: Fx::NONE },
+             ));
+         }
+         list
+@@ -803,6 +859,20 @@ impl CpuBackend {
+             }
+             let w = &self.windows[id];
+             let (content_pos, drawn_frame) = self.drawn_frame(*id);
++            // THEME: the shadow under the window, and what is behind its lower corners
++            let mut corners = None;
++            if let Some((frame_pos, surface, _)) = drawn_frame.filter(|_| self.effects) {
++                let width = pix.width();
++                let whole = DRect::from_xywh(0, 0, width, pix.height());
++                if let Some(shadow) = surface.shadow.as_ref() {
++                    let tiles = self.shadows.borrow_mut().get(shadow);
++                    let rect = DRect::from_rect(shadow.rect).translate(frame_pos.x + shadow.offset.x, frame_pos.y + shadow.offset.y);
++                    for piece in tiles.pieces(rect) {
++                        crate::effects::blend_piece(pix.data_mut(), width, (0, 0), whole, &piece);
++                    }
++                }
++                corners = surface.shape.as_ref().and_then(|shape| crate::effects::CornerClip::of(shape, frame_pos)).map(|clip| crate::effects::CornerKeep::take(clip, pix.data(), width, (0, 0)));
++            }
+             if let Some(image) = w.image.as_ref().filter(|_|w.mapped) {
+                 draw(&mut pix, content_pos, image);
+             }
+@@ -827,6 +897,16 @@ impl CpuBackend {
+                     );
+                 }
+             }
++            if let Some(keep) = corners {
++                let width = pix.width();
++                let whole = DRect::from_xywh(0, 0, width, pix.height());
++                keep.put(pix.data_mut(), width, (0, 0));
++                let content = w.image.as_ref().filter(|_| w.mapped).map(|image| (image, content_pos));
++                for (index, (at, picture)) in crate::effects::corner_patches(&keep.clip, content).into_iter().enumerate() {
++                    let piece = (index as u8, DRect::from_xywh(at.x, at.y, picture.width, picture.height), &picture, at);
++                    crate::effects::blend_piece(pix.data_mut(), width, (0, 0), whole, &piece);
++                }
++            }
+             if w.mapped {
+                 owned(&mut pix, *id);
+             }
+diff --git a/crates/wm-darwin/src/server.rs b/crates/wm-darwin/src/server.rs
+index a485407..524caba 100644
+--- a/crates/wm-darwin/src/server.rs
++++ b/crates/wm-darwin/src/server.rs
+@@ -300,6 +300,8 @@ pub struct Server {
+     pub captures: crate::capture::Captures,
+     /// Multi-finger swipes between Spaces, see `gesture.rs`.
+     pub gesture: crate::gesture::Gesture,
++    /// THEME: windows appearing, a theme change cross-fading (`motion.rs`).
++    pub motion: crate::motion::Motion,
+     /// Layer-shell surfaces (the dock), see `layers.rs`.
+     pub(crate) layers: Vec<crate::layers::LayerEntry>,
+     /// The launcher strip has been mapped once in this run (layers.rs).
+@@ -518,6 +520,7 @@ impl Server {
+             scale_stats: ScaleStats::default(),
+             captures: Default::default(),
+             gesture: Default::default(),
++            motion: Default::default(),
+             layers: Vec::new(),
+             launcher_seen: false,
+             layer_shell: smithay::wayland::shell::wlr_layer::WlrLayerShellState::new::<Self>(dh),
+@@ -799,6 +802,7 @@ impl Server {
+         self.clipboard_tick();
+         #[cfg(feature = "desktop-shell")]
+         self.service_desktop()?;
++        self.motion_sync();
+         self.sync_input_focus();
+         // The frame clock of an asynchronous renderer: a completed flip
+         // releases the callbacks of the frame it showed.
+diff --git a/crates/wm-darwin/tests/theme_gallery.rs b/crates/wm-darwin/tests/theme_gallery.rs
+new file mode 100644
+index 0000000..7f699f3
+--- /dev/null
++++ b/crates/wm-darwin/tests/theme_gallery.rs
+@@ -0,0 +1,217 @@
++#![cfg(all(feature = "darwin-backend", feature = "desktop-shell"))]
++//! Host-only, for looking at (THEME): the desk in each SiliconForest theme at the M1 panel's size
++//! and the owner's scale, with windows whose contents are pictures given to it, drawn by the GL
++//! renderer off screen, written as PPM files.
++//!   THEME_GALLERY_OUT=<dir> THEME_GALLERY_SHOTS=<dir> CHONKSTEP_BACKGROUND_DIR=<dir with sf-*.jpg> \
++//!     cargo test -p wm-darwin --features desktop-shell --test theme_gallery -- --ignored
++//! THEME_GALLERY_SHOTS holds `<n>-<title>-<width>x<height>-<x>,<y>.bgra` files (raw B, G, R, x; the
++//! size in panel pixels, the place in panel pixels), drawn in the order of their names.
++use std::{
++    io::Write,
++    os::fd::AsFd,
++    os::unix::net::UnixStream,
++    sync::mpsc,
++    thread,
++    time::{Duration, Instant},
++};
++use wayland_client::{
++    delegate_noop,
++    protocol::{wl_buffer, wl_compositor, wl_registry, wl_shm, wl_shm_pool, wl_surface},
++    Connection, Dispatch, QueueHandle,
++};
++use wayland_protocols::xdg::{
++    decoration::zv1::client::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1},
++    shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base},
++};
++use wm_core::{Backend, Point, Rect, Size};
++use wm_darwin::scale::Scale;
++use wm_darwin::server::Server;
++use wm_darwin::smithay::reexports::wayland_server::Display;
++
++const PANEL: Size = Size { w: 2560, h: 1600 };
++
++#[derive(Default)]
++struct Client {
++    compositor: Option<wl_compositor::WlCompositor>,
++    shm: Option<wl_shm::WlShm>,
++    shell: Option<xdg_wm_base::XdgWmBase>,
++    decoration: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
++}
++impl Dispatch<wl_registry::WlRegistry, ()> for Client {
++    fn event(s: &mut Self, r: &wl_registry::WlRegistry, e: wl_registry::Event, _: &(), _: &Connection, q: &QueueHandle<Self>) {
++        if let wl_registry::Event::Global { name, interface, version } = e {
++            match interface.as_str() {
++                "wl_compositor" => s.compositor = Some(r.bind(name, version.min(5), q, ())),
++                "wl_shm" => s.shm = Some(r.bind(name, 1, q, ())),
++                "xdg_wm_base" => s.shell = Some(r.bind(name, version.min(6), q, ())),
++                "zxdg_decoration_manager_v1" => s.decoration = Some(r.bind(name, 1, q, ())),
++                _ => {}
++            }
++        }
++    }
++}
++impl Dispatch<xdg_wm_base::XdgWmBase, ()> for Client {
++    fn event(_: &mut Self, p: &xdg_wm_base::XdgWmBase, e: xdg_wm_base::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
++        if let xdg_wm_base::Event::Ping { serial } = e {
++            p.pong(serial);
++        }
++    }
++}
++impl Dispatch<xdg_surface::XdgSurface, ()> for Client {
++    fn event(_: &mut Self, p: &xdg_surface::XdgSurface, e: xdg_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
++        if let xdg_surface::Event::Configure { serial } = e {
++            p.ack_configure(serial);
++        }
++    }
++}
++delegate_noop!(Client: ignore wl_compositor::WlCompositor);
++delegate_noop!(Client: ignore wl_shm::WlShm);
++delegate_noop!(Client: ignore wl_shm_pool::WlShmPool);
++delegate_noop!(Client: ignore wl_buffer::WlBuffer);
++delegate_noop!(Client: ignore wl_surface::WlSurface);
++delegate_noop!(Client: ignore xdg_toplevel::XdgToplevel);
++delegate_noop!(Client: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
++delegate_noop!(Client: ignore zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1);
++
++
++struct Memory(Option<tiny_skia::Pixmap>);
++impl wm_darwin::presenter::Presenter for Memory {
++    fn present(&mut self, frame: &tiny_skia::Pixmap) -> Result<(), String> {
++        self.0 = Some(frame.clone());
++        Ok(())
++    }
++}
++
++struct Shot {
++    title: String,
++    size: (i32, i32),
++    at: (i32, i32),
++    pixels: Vec<u8>,
++}
++
++fn shots(dir: &std::path::Path) -> Vec<Shot> {
++    let mut names: Vec<_> = std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.extension().is_some_and(|e| e == "bgra")).collect();
++    names.sort();
++    names
++        .into_iter()
++        .map(|path| {
++            let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
++            let parts: Vec<&str> = stem.split('-').collect();
++            let (w, h) = parts[parts.len() - 2].split_once('x').unwrap();
++            let (x, y) = parts[parts.len() - 1].split_once(',').unwrap();
++            let title = parts[1..parts.len() - 2].join(" ").replace('_', " ");
++            Shot { title, size: (w.parse().unwrap(), h.parse().unwrap()), at: (x.parse().unwrap(), y.parse().unwrap()), pixels: std::fs::read(&path).unwrap() }
++        })
++        .collect()
++}
++
++#[test]
++#[ignore]
++fn theme_gallery() {
++    let out = std::path::PathBuf::from(std::env::var("THEME_GALLERY_OUT").expect("THEME_GALLERY_OUT"));
++    let shots_dir = std::path::PathBuf::from(std::env::var("THEME_GALLERY_SHOTS").expect("THEME_GALLERY_SHOTS"));
++    let themes: Vec<String> = std::env::var("THEME_GALLERY_THEMES").unwrap_or_else(|_| "sf-clearing,sf-canopy,sf-wafer,sf-dieshot".into()).split(',').map(str::to_string).collect();
++    std::fs::create_dir_all(&out).unwrap();
++    let shots = shots(&shots_dir);
++    let (job_tx, job_rx) = mpsc::channel::<Box<dyn FnOnce(&mut Server, &mut Memory) + Send>>();
++    let (ready_tx, ready_rx) = mpsc::channel();
++    let mut sockets = Vec::new();
++    let mut server_ends = Vec::new();
++    for _ in 0..shots.len() {
++        let (server, client) = UnixStream::pair().unwrap();
++        server_ends.push(server);
++        sockets.push(client);
++    }
++    let first = themes[0].clone();
++    let thread = thread::spawn(move || {
++        let mut display = Display::<Server>::new().unwrap();
++        let mut state = Server::new(&display.handle(), PANEL).unwrap();
++        state.set_renderer_boxed(Box::new(wm_darwin::glrender::GlRenderer::offscreen(PANEL.w, PANEL.h).expect("GLES 3 off screen")));
++        state.set_scale(Scale::from_120(180).unwrap()).unwrap();
++        state.enable_sfhid_seat(&display.handle()).unwrap();
++        state.enable_desktop_shell_with(wm_theme::FontState::new(), Some(&first)).unwrap();
++        for server in server_ends {
++            Server::add_client(&mut display, server).unwrap();
++        }
++        ready_tx.send(()).unwrap();
++        let mut memory = Memory(None);
++        let started = Instant::now();
++        loop {
++            display.dispatch_clients(&mut state).unwrap();
++            state.repaint(&mut memory, started.elapsed().as_millis() as u32).unwrap();
++            display.flush_clients().unwrap();
++            match job_rx.try_recv() {
++                Ok(job) => job(&mut state, &mut memory),
++                Err(mpsc::TryRecvError::Disconnected) => break,
++                Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_micros(300)),
++            }
++        }
++    });
++    ready_rx.recv_timeout(Duration::from_secs(30)).unwrap();
++    let mut clients = Vec::new();
++    for (shot, socket) in shots.iter().zip(sockets) {
++        let connection = Connection::from_socket(socket).unwrap();
++        let mut queue = connection.new_event_queue();
++        let q = queue.handle();
++        let mut client = Client::default();
++        connection.display().get_registry(&q, ());
++        for _ in 0..3 {
++            queue.roundtrip(&mut client).unwrap();
++        }
++        let surface = client.compositor.as_ref().unwrap().create_surface(&q, ());
++        let xdg = client.shell.as_ref().unwrap().get_xdg_surface(&surface, &q, ());
++        let top = xdg.get_toplevel(&q, ());
++        top.set_title(shot.title.clone());
++        let decor = client.decoration.as_ref().unwrap().get_toplevel_decoration(&top, &q, ());
++        decor.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
++        surface.commit();
++        for _ in 0..3 {
++            queue.roundtrip(&mut client).unwrap();
++        }
++        let (w, h) = shot.size;
++        let mut file = tempfile::tempfile().unwrap();
++        file.write_all(&shot.pixels).unwrap();
++        let pool = client.shm.as_ref().unwrap().create_pool(file.as_fd(), w * h * 4, &q, ());
++        let buffer = pool.create_buffer(0, w, h, w * 4, wl_shm::Format::Xrgb8888, &q, ());
++        surface.attach(Some(&buffer), 0, 0);
++        surface.damage_buffer(0, 0, w, h);
++        surface.commit();
++        for _ in 0..4 {
++            queue.roundtrip(&mut client).unwrap();
++        }
++        clients.push((connection, queue, client, file));
++    }
++    let places: Vec<(i32, i32)> = shots.iter().map(|s| s.at).collect();
++    let run = |job: Box<dyn FnOnce(&mut Server, &mut Memory) + Send>| {
++        let (tx, rx) = mpsc::channel();
++        job_tx.send(Box::new(move |server: &mut Server, memory: &mut Memory| {
++            job(server, memory);
++            tx.send(()).unwrap();
++        })).unwrap();
++        rx.recv_timeout(Duration::from_secs(120)).unwrap();
++    };
++    for theme in themes {
++        let (id, dir, places) = (theme.clone(), out.clone(), places.clone());
++        run(Box::new(move |server, memory| {
++            server.set_desktop_theme(&id).unwrap();
++            let ids: Vec<_> = {
++                let mut ids: Vec<_> = server.wm.clients().map(|(id, client)| (client.window, id)).collect();
++                ids.sort();
++                ids.into_iter().map(|(_, id)| id).collect()
++            };
++            for (id, at) in ids.into_iter().zip(places) {
++                let size = server.wm.client(id).unwrap().geometry.size;
++                server.wm.set_client_content_geometry(id, Rect::new(Point::new(at.0, at.1), size));
++            }
++            server.repaint(memory, 0).unwrap();
++            let shown = server.read_back().unwrap().expect("the GL renderer reads its frame back");
++            let mut file = std::fs::File::create(dir.join(format!("{id}.ppm"))).unwrap();
++            write!(file, "P6\n{} {}\n255\n", PANEL.w, PANEL.h).unwrap();
++            let rgb: Vec<u8> = shown.chunks_exact(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
++            file.write_all(&rgb).unwrap();
++        }));
++    }
++    drop(job_tx);
++    thread.join().unwrap();
++    drop(clients);
++}
+diff --git a/crates/wm-darwin/tests/wayland_theme.rs b/crates/wm-darwin/tests/wayland_theme.rs
+index 30fec80..e731078 100644
+--- a/crates/wm-darwin/tests/wayland_theme.rs
++++ b/crates/wm-darwin/tests/wayland_theme.rs
+@@ -418,3 +418,39 @@ fn every_window_control_of_every_theme_can_be_clicked() {
+     }
+     eprintln!("{}", report.join("\n"));
+ }
++
++/// THEME: on a display a change of theme cross-fades (the picture of before over the new one,
++/// leaving) and ends on exactly the new theme's picture; a window that appears fades in and
++/// ends whole. Off a display (every other test here) neither happens.
++#[test]
++fn a_theme_change_cross_fades_and_a_window_appears_then_both_end_on_the_scenes_picture() {
++    let fresh = Harness::start("sf-canopy", 180, true).frame("fresh sf-canopy".into());
++    let harness = Harness::start("washi", 180, true);
++    let before = harness.frame("washi".into());
++    assert!(before != fresh);
++    harness.run(|server, _| {
++        server.motion.live = true;
++        Vec::new()
++    });
++    let _ = harness.frame("washi, moving".into());
++    harness.theme("sf-canopy");
++    // the first frames of the new look carry the old picture
++    let during = harness.run(|server, out| {
++        server.repaint(out, 0).unwrap();
++        server.repaint(out, 0).unwrap();
++        thread::sleep(Duration::from_millis(60));
++        server.repaint(out, 0).unwrap();
++        server.read_back().unwrap().unwrap()
++    });
++    assert!(during != before && during != fresh, "a frame between the two looks is neither");
++    thread::sleep(Duration::from_millis(700));
++    let after = harness.frame("sf-canopy after the fade".into());
++    if let Some(diff) = difference(&after, &fresh) {
++        panic!("after the cross-fade the picture is not the new theme's: {diff}");
++    }
++    let (faded, appeared) = {
++        let counts = harness.run(|server, _| vec![server.motion.faded as u8, server.motion.appeared as u8]);
++        (counts[0], counts[1])
++    };
++    assert_eq!((faded, appeared), (1, 0), "one cross-fade; the windows were there before");
++}
+diff --git a/crates/wm-theme/examples/forest_preview.rs b/crates/wm-theme/examples/forest_preview.rs
+new file mode 100644
+index 0000000..1eb0f84
+--- /dev/null
++++ b/crates/wm-theme/examples/forest_preview.rs
+@@ -0,0 +1,70 @@
++//! The SiliconForest themes' window chrome as PNG files, for looking at (THEME):
++//!   forest_preview <out-dir> [scale]
++//! One file per theme: a column of windows (focused; focused with the pointer on the controls;
++//! close pressed; without focus; a long title; a fixed-size window), each over the theme's desk colour.
++use wm_theme::{FontState, RasterThemeEngine};
++use wm_theme_api::{ButtonKind, ButtonRuntimeState, DecorationRequest, DecorationSurface, Size, ThemeEngine};
++
++fn put(canvas: &mut tiny_skia::Pixmap, at: (i32, i32), surface: &DecorationSurface, content: [u8; 3], layout: &wm_theme_api::DecorationLayout, size: Size) {
++    let mut paint = tiny_skia::Paint::default();
++    paint.anti_alias = false;
++    paint.set_color_rgba8(content[0], content[1], content[2], 255);
++    if let Some(r) = tiny_skia::Rect::from_xywh((at.0 + layout.client_offset.x) as f32, (at.1 + layout.client_offset.y) as f32, size.w as f32, size.h as f32) {
++        canvas.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
++    }
++    for solid in &surface.solids {
++        paint.set_color_rgba8(solid.rgb[0], solid.rgb[1], solid.rgb[2], 255);
++        if let Some(r) = tiny_skia::Rect::from_xywh((at.0 + solid.rect.pos.x) as f32, (at.1 + solid.rect.pos.y) as f32, solid.rect.size.w as f32, solid.rect.size.h as f32) {
++            canvas.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
++        }
++    }
++    for part in &surface.parts {
++        let Some(image) = tiny_skia::PixmapRef::from_bytes(&part.buffer.pixels, part.buffer.width, part.buffer.height) else { continue };
++        canvas.draw_pixmap(at.0 + part.offset.x, at.1 + part.offset.y, image, &tiny_skia::PixmapPaint::default(), tiny_skia::Transform::identity(), None);
++    }
++}
++
++fn main() {
++    let mut args = std::env::args().skip(1);
++    let dir = std::path::PathBuf::from(args.next().expect("out dir"));
++    let scale: f32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(1.5);
++    std::fs::create_dir_all(&dir).unwrap();
++    let fonts = FontState::new();
++    for (id, _) in wm_theme::forest::CHOICES {
++        let theme = wm_theme::default_theme::theme_by_id(id).unwrap();
++        let chrome = theme.chrome.unwrap();
++        let engine = RasterThemeEngine::with_fonts_at_scale(theme.scaled(scale), fonts.clone(), scale).with_style(wm_theme::DecorationStyle::Modern).unwrap();
++        let button = |kind, hovered, pressed| ButtonRuntimeState { kind, hovered, pressed };
++        let rest = vec![button(ButtonKind::Close, false, false), button(ButtonKind::Miniaturize, false, false), button(ButtonKind::Maximize, false, false)];
++        let hover = vec![button(ButtonKind::Close, false, false), button(ButtonKind::Miniaturize, true, false), button(ButtonKind::Maximize, false, false)];
++        let press = vec![button(ButtonKind::Close, true, true), button(ButtonKind::Miniaturize, false, false), button(ButtonKind::Maximize, false, false)];
++        let cases: Vec<(&str, bool, Vec<ButtonRuntimeState>, bool)> = vec![
++            ("Terminal \u{2014} zsh \u{2014} 120\u{00d7}30", true, rest.clone(), true),
++            ("Activity Monitor", true, hover.clone(), true),
++            ("Firefox", true, press, true),
++            ("zsh", false, rest.clone(), true),
++            ("Activity Monitor", false, hover, true),
++            ("A very long title that does not fit into the bar of a window this narrow at all, however it is cut", true, rest.clone(), true),
++            ("About This Machine", true, rest, false),
++        ];
++        let content = Size::new((520.0 * scale) as u32, (70.0 * scale) as u32);
++        let step = (content.h as f32 + 62.0 * scale) as u32;
++        let (w, h) = (content.w + (60.0 * scale) as u32, step * cases.len() as u32 + (20.0 * scale) as u32);
++        let mut canvas = tiny_skia::Pixmap::new(w, h).unwrap();
++        canvas.fill(tiny_skia::Color::from_rgba8(chrome.background.r, chrome.background.g, chrome.background.b, 255));
++        for (n, (title, focused, buttons, resizable)) in cases.into_iter().enumerate() {
++            let request = DecorationRequest { content_size: content, title: title.into(), focused, resizable, buttons };
++            let layout = engine.layout(&request);
++            let surface = engine.render_surface(&request, &layout);
++            let body = if n % 2 == 0 { [chrome.panel.r, chrome.panel.g, chrome.panel.b] } else { [0x1e, 0x1e, 0x1e] };
++            put(&mut canvas, ((24.0 * scale) as i32, (16.0 * scale) as i32 + (n as u32 * step) as i32), &surface, body, &layout, content);
++        }
++        let file = std::fs::File::create(dir.join(format!("{id}-chrome.png"))).unwrap();
++        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), w, h);
++        encoder.set_color(png::ColorType::Rgba);
++        encoder.set_depth(png::BitDepth::Eight);
++        let mut writer = encoder.write_header().unwrap();
++        // the canvas is opaque: premultiplied equals straight
++        writer.write_image_data(canvas.data()).unwrap();
++    }
++}
+diff --git a/crates/wm-theme/src/default_theme.rs b/crates/wm-theme/src/default_theme.rs
+index e7aac6a..b263852 100644
+--- a/crates/wm-theme/src/default_theme.rs
++++ b/crates/wm-theme/src/default_theme.rs
+@@ -20,30 +20,6 @@ fn tile_gradient(from: Color, to: Color, bevel: Bevel) -> TileStyle {
+ /// struct just to list them. `registry_matches_choices` pins this to
+ /// `all_themes()`.
+ #[cfg(not(feature = "lcos"))]
+-pub const CHOICES: [(&str, &str); 16] = [
+-    ("nextstep-classic", "NeXTSTEP Classic"),
+-    ("amber-phosphor", "Amber Phosphor"),
+-    ("teal-blueprint", "Teal Blueprint"),
+-    ("graphite", "Graphite"),
+-    ("next-lavender", "NeXT Lavender"),
+-    ("jade-lacquer", "Jade Lacquer"),
+-    ("ivory-halftone", "Ivory Halftone"),
+-    ("indigo-filament", "Indigo Filament"),
+-    ("obsidian", "Obsidian"),
+-    ("washi", "Washi"),
+-    ("relay", "Relay"),
+-    ("beos", "BeOS R5"),
+-    ("os2-warp-4", "OS/2 Warp 4"),
+-    ("system-7-classic", "System 7 Classic"),
+-    ("system-7-light-gray", "System 7 Light Gray"),
+-    ("system-7-dark-gray", "System 7 Dark Gray"),
+-];
+-
+-/// The same list with the LCOS themes appended. Written out rather than
+-/// concatenated so the array length is checked at compile time; the two
+-/// must stay in step, and `every_choice_resolves` fails loudly if they
+-/// do not.
+-#[cfg(feature = "lcos")]
+ pub const CHOICES: [(&str, &str); 20] = [
+     ("nextstep-classic", "NeXTSTEP Classic"),
+     ("amber-phosphor", "Amber Phosphor"),
+@@ -61,6 +37,38 @@ pub const CHOICES: [(&str, &str); 20] = [
+     ("system-7-classic", "System 7 Classic"),
+     ("system-7-light-gray", "System 7 Light Gray"),
+     ("system-7-dark-gray", "System 7 Dark Gray"),
++    ("sf-clearing", "SiliconForest Clearing"),
++    ("sf-canopy", "SiliconForest Canopy"),
++    ("sf-wafer", "SiliconForest Wafer"),
++    ("sf-dieshot", "SiliconForest Die Shot"),
++];
++
++/// The same list with the LCOS themes appended. Written out rather than
++/// concatenated so the array length is checked at compile time; the two
++/// must stay in step, and `every_choice_resolves` fails loudly if they
++/// do not.
++#[cfg(feature = "lcos")]
++pub const CHOICES: [(&str, &str); 24] = [
++    ("nextstep-classic", "NeXTSTEP Classic"),
++    ("amber-phosphor", "Amber Phosphor"),
++    ("teal-blueprint", "Teal Blueprint"),
++    ("graphite", "Graphite"),
++    ("next-lavender", "NeXT Lavender"),
++    ("jade-lacquer", "Jade Lacquer"),
++    ("ivory-halftone", "Ivory Halftone"),
++    ("indigo-filament", "Indigo Filament"),
++    ("obsidian", "Obsidian"),
++    ("washi", "Washi"),
++    ("relay", "Relay"),
++    ("beos", "BeOS R5"),
++    ("os2-warp-4", "OS/2 Warp 4"),
++    ("system-7-classic", "System 7 Classic"),
++    ("system-7-light-gray", "System 7 Light Gray"),
++    ("system-7-dark-gray", "System 7 Dark Gray"),
++    ("sf-clearing", "SiliconForest Clearing"),
++    ("sf-canopy", "SiliconForest Canopy"),
++    ("sf-wafer", "SiliconForest Wafer"),
++    ("sf-dieshot", "SiliconForest Die Shot"),
+     ("lcos", "LCOS"),
+     ("lunduke-walnut", "Lunduke Walnut"),
+     ("lunduke-desk", "Lunduke Desk"),
+@@ -92,6 +100,10 @@ pub fn all_themes() -> Vec<Theme> {
+         crate::system7::theme("system-7-classic", Appearance::Light).unwrap(),
+         crate::system7::theme("system-7-light-gray", Appearance::Light).unwrap(),
+         crate::system7::theme("system-7-dark-gray", Appearance::Light).unwrap(),
++        crate::forest::theme("sf-clearing", Appearance::Light).unwrap(),
++        crate::forest::theme("sf-canopy", Appearance::Dark).unwrap(),
++        crate::forest::theme("sf-wafer", Appearance::Light).unwrap(),
++        crate::forest::theme("sf-dieshot", Appearance::Dark).unwrap(),
+         #[cfg(feature = "lcos")]
+         lcos(),
+         #[cfg(feature = "lcos")]
+@@ -131,6 +143,18 @@ pub fn native_appearance(id: &str) -> Option<Appearance> {
+     theme_by_id(id).map(|theme| theme.appearance)
+ }
+ 
++/// THEME: the appearance a desk without an appearance of its own (SiliconForest's standalone
++/// desk and its dock: always dark until now) wears a theme in. A SiliconForest theme is worn in
++/// the appearance it was drawn for (Clearing and Wafer are light); every other theme stays dark
++/// there, as before.
++pub fn standalone_appearance(id: &str) -> Appearance {
++    if crate::forest::CHOICES.iter().any(|(known, _)| *known == id) {
++        native_appearance(id).unwrap_or(Appearance::Dark)
++    } else {
++        Appearance::Dark
++    }
++}
++
+ /// Resolves one theme id in one appearance — the pair the session
+ /// actually dresses in. Both renditions of an id share that id, name,
+ /// and chrome geometry; what differs is the dress: fills, bevel tones,
+@@ -1915,7 +1939,7 @@ mod tests {
+     #[test]
+     fn native_renditions_are_what_each_theme_originally_shipped_as() {
+         for (id, _) in CHOICES {
+-            let expected = if matches!(id,"ivory-halftone" | "washi" | "beos" | "os2-warp-4") || id.starts_with("system-7-") { Appearance::Light } else { Appearance::Dark };
++            let expected = if matches!(id,"ivory-halftone" | "washi" | "beos" | "os2-warp-4" | "sf-clearing" | "sf-wafer") || id.starts_with("system-7-") { Appearance::Light } else { Appearance::Dark };
+             assert_eq!(native_appearance(id), Some(expected), "{id}");
+             let by_id = theme_by_id(id).unwrap();
+             assert_eq!(by_id.appearance, expected, "{id}");
+diff --git a/crates/wm-theme/src/forest.rs b/crates/wm-theme/src/forest.rs
+new file mode 100644
+index 0000000..70e0c35
+--- /dev/null
++++ b/crates/wm-theme/src/forest.rs
+@@ -0,0 +1,256 @@
++//! The four SiliconForest themes (THEME, 17 November 2026): Clearing, Canopy, Wafer and Die Shot.
++//! They wear the modern recipe (`styles::modern`) with the window tokens of
++//! [`crate::modern::WindowChrome`]: controls at the left in a Mac's order, each theme its own
++//! shape of control, shadow and motion. The brief, with every value's reason and contrast
++//! ratio, is `docs/design/siliconforest-themes.md` of the lab repository.
++use crate::model::{Appearance, Color, Fill, FontStyle, FontWeight, TextAlign, Theme};
++use crate::modern::{Chrome, Controls, InstrumentChrome, Shadow, TopLine, WindowChrome};
++use wm_theme_api::{ButtonKind, FrameMetrics, OverviewMetrics};
++
++pub const CHOICES: [(&str, &str); 4] = [
++    ("sf-clearing", "SiliconForest Clearing"),
++    ("sf-canopy", "SiliconForest Canopy"),
++    ("sf-wafer", "SiliconForest Wafer"),
++    ("sf-dieshot", "SiliconForest Die Shot"),
++];
++
++fn c(hex: u32) -> Color {
++    Color::rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
++}
++
++/// background, panel, surface (title), raised (title without focus), text, muted, line, accent,
++/// accent_text, selection, success, danger; then close, minimise, zoom, idle; then the shadow's
++/// colour and its alpha with and without focus.
++struct Palette {
++    tokens: [u32; 12],
++    controls: [u32; 4],
++    shadow: (u32, u8, u8),
++    light: bool,
++}
++
++const CLEARING: Palette = Palette {
++    tokens: [0xdfe5dc, 0xfbfcf9, 0xe9ede5, 0xf1f3ee, 0x1f2a24, 0x56625a, 0xb9c3b8, 0x2c7a54, 0xffffff, 0xcfe6d8, 0x2f8a52, 0xb3402e],
++    controls: [0xcf4a3a, 0xa87004, 0x2f8a52, 0x7c877d],
++    shadow: (0x16241b, 102, 61),
++    light: true,
++};
++const CANOPY: Palette = Palette {
++    tokens: [0x0b1210, 0x111a16, 0x17221d, 0x121a16, 0xe6ede4, 0x9aa89d, 0x2e3d35, 0xdd8f55, 0x1a120b, 0x2b3d33, 0x82c98f, 0xec7c60],
++    controls: [0xec7c60, 0xe2b65c, 0x82c98f, 0x5d6e64],
++    shadow: (0x010403, 178, 115),
++    light: false,
++};
++const WAFER: Palette = Palette {
++    tokens: [0xe9edf2, 0xffffff, 0xf1f3f7, 0xf6f7f9, 0x1c2330, 0x566074, 0xc3cad6, 0x4a5bd0, 0xffffff, 0xdde2fa, 0x1f8a5b, 0xc43c4e],
++    controls: [0xd2475a, 0xa87400, 0x1f8a5b, 0x737c8c],
++    shadow: (0x141d38, 87, 51),
++    light: true,
++};
++const DIESHOT: Palette = Palette {
++    tokens: [0x07090c, 0x0e1116, 0x12161c, 0x0e1116, 0xe9eef2, 0x93a0ad, 0x2c3540, 0xe7c15a, 0x14110a, 0x26303a, 0x58d6a0, 0xff7a6b],
++    controls: [0xff7a6b, 0xe7c15a, 0x58d6a0, 0x5b6876],
++    shadow: (0x000000, 204, 128),
++    light: false,
++};
++
++/// One of the four, in either appearance. Each is drawn for one (Clearing and Wafer light,
++/// Canopy and Die Shot dark; `default_theme::native_appearance`); in the other it keeps its
++/// shapes, type and motion and takes its sibling's palette (Clearing <-> Canopy, Wafer <-> Die
++/// Shot). The standalone desk wears a picked SiliconForest theme in its own appearance
++/// (`chonk_shell` `set_standalone_look`).
++pub fn theme(id: &str, appearance: Appearance) -> Option<Theme> {
++    let (name, _) = CHOICES.iter().find(|(known, _)| *known == id).map(|(_, name)| (*name, ()))?;
++    let light = appearance == Appearance::Light;
++    let palette = match (id, light) {
++        ("sf-clearing", true) | ("sf-canopy", true) => &CLEARING,
++        ("sf-clearing", false) | ("sf-canopy", false) => &CANOPY,
++        ("sf-wafer", true) | ("sf-dieshot", true) => &WAFER,
++        _ => &DIESHOT,
++    };
++    debug_assert_eq!(palette.light, light);
++    let [background, panel, surface, raised, text, muted, line, accent, accent_text, selection, success, danger] = palette.tokens.map(c);
++    let [close, minimise, zoom, idle] = palette.controls.map(c);
++    // (title height, radius, family, weight, size, controls, button box, gap, padding)
++    let (title, radius, family, weight, size, controls, button, gap, padding) = match id {
++        "sf-clearing" => (28, 10, "Inter", FontWeight::Medium, 13.0, Controls::Discs, 16, 4, 6),
++        "sf-canopy" => (30, 12, "Inter", FontWeight::SemiBold, 13.0, Controls::Vias, 16, 4, 7),
++        "sf-wafer" => (28, 7, "IBM Plex Sans", FontWeight::Medium, 13.0, Controls::Pads, 15, 4, 6),
++        _ => (30, 3, "Source Code Pro", FontWeight::Medium, 12.0, Controls::BondPads, 16, 4, 7),
++    };
++    // (offset y, blur, appear ms, rise, curve, cross-fade ms)
++    let (drop, blur, open_ms, open_rise, open_curve, switch_ms) = match id {
++        "sf-clearing" => (10, 40, 180, 8, 3, 220),
++        "sf-canopy" => (14, 48, 200, 10, 5, 260),
++        "sf-wafer" => (7, 28, 140, 4, 3, 200),
++        _ => (10, 32, 120, 0, 10, 180),
++    };
++    let (shadow_rgb, shadow_focused, shadow_unfocused) = palette.shadow;
++    let shadow_rgb = c(shadow_rgb);
++    let window = WindowChrome {
++        controls,
++        left: true,
++        centered: id != "sf-dieshot",
++        neutral_at_rest: id == "sf-wafer",
++        close,
++        minimise,
++        zoom,
++        idle,
++        top_line: match id {
++            "sf-clearing" => TopLine::Highlight,
++            "sf-canopy" => TopLine::Accent,
++            "sf-wafer" => TopLine::Interference,
++            _ => TopLine::None,
++        },
++        trace: id == "sf-dieshot",
++        hairline: id != "sf-canopy",
++        effects: true,
++        shadow_unfocused,
++        open_ms,
++        open_rise,
++        open_curve,
++        switch_ms,
++    };
++    let chrome = Chrome {
++        instrument: InstrumentChrome { background: Some(panel), border: Some(line), accent_edge: 0 },
++        window,
++        shadow: Shadow { x: 0, y: drop, blur, color: Color { r: shadow_rgb.r, g: shadow_rgb.g, b: shadow_rgb.b, a: shadow_focused } },
++        frame: FrameMetrics {
++            title_height: title,
++            border: 1,
++            radius,
++            input_margin: 6,
++            padding,
++            button_size: button,
++            button_gap: gap,
++            focus_edge: 0,
++            round_focus_mark: false,
++        },
++        overview: OverviewMetrics { radius, ..OverviewMetrics::default() },
++        background,
++        panel,
++        surface,
++        raised,
++        text,
++        muted,
++        line,
++        accent,
++        accent_text,
++        selection,
++        success,
++        danger,
++    };
++    let mut theme = crate::default_theme::nextstep_classic();
++    theme.id = id.into();
++    theme.name = name.into();
++    theme.appearance = appearance;
++    theme.chrome = Some(chrome);
++    // the picture of the same name in the host's backgrounds (chonk-shell `Wallpaper::Forest`); a
++    // desk without it shows `background`
++    theme.wallpaper = id.into();
++    theme.titlebar.height = title;
++    theme.titlebar.font.family = family.into();
++    theme.titlebar.font.size = size;
++    theme.titlebar.font.weight = weight;
++    theme.titlebar.font.style = FontStyle::Normal;
++    theme.titlebar.text_align = if window.centered { TextAlign::Center } else { TextAlign::Left };
++    theme.titlebar.active = Fill::Solid(surface);
++    theme.titlebar.inactive = Fill::Solid(raised);
++    theme.titlebar.text_color_active = text;
++    theme.titlebar.text_color_inactive = muted;
++    theme.titlebar.bevel.width = 0;
++    theme.titlebar.button_margin = padding;
++    let button_style = theme.titlebar.buttons[0].clone();
++    theme.titlebar.buttons = [ButtonKind::Close, ButtonKind::Miniaturize, ButtonKind::Maximize]
++        .map(|kind| crate::model::ButtonStyle { kind, size: button, ..button_style.clone() })
++        .to_vec();
++    theme.border.color_active = if id == "sf-dieshot" { accent } else { line };
++    theme.border.color_inactive = line;
++    theme.resize_bar.height = 0;
++    theme.resize_bar.bevel.width = 0;
++    theme.tile.fill = Fill::Solid(raised);
++    theme.tile.bevel.width = 0;
++    let mut menu_font = theme.titlebar.font.clone();
++    // the resident faces are the titles' weights (Inter 500 and 600, Source Code Pro 500)
++    menu_font.weight = FontWeight::Medium;
++    if id == "sf-dieshot" {
++        // the monospaced face is the title's alone; menus and the dock's names are in Inter
++        menu_font.family = "Inter".into();
++        menu_font.size = 13.0;
++    }
++    theme.menu.title_font = menu_font.clone();
++    theme.menu.item_font = menu_font;
++    theme.menu.title_bar = Fill::Solid(surface);
++    theme.menu.title_text_color = muted;
++    theme.menu.background = Fill::Solid(panel);
++    theme.menu.text_color = text;
++    theme.menu.highlight_background = Fill::Solid(if palette.light { accent } else { selection });
++    theme.menu.highlight_text_color = if palette.light { accent_text } else { text };
++    theme.menu.bevel.width = 0;
++    theme.menu.item_height = 28;
++    theme.terminal.bg = panel;
++    theme.terminal.fg = text;
++    theme.terminal.cursor = accent;
++    let (blue, violet, teal) = if palette.light { (c(0x3b5fc4), c(0x7a4fb8), c(0x1c7f86)) } else { (c(0x7aa2f7), c(0xb9a3d9), c(0x81b6ac)) };
++    theme.terminal.ansi = [
++        if palette.light { text } else { surface },
++        danger,
++        success,
++        minimise,
++        blue,
++        violet,
++        teal,
++        if palette.light { muted } else { text },
++        muted,
++        danger,
++        success,
++        accent,
++        blue,
++        violet,
++        teal,
++        text,
++    ];
++    theme.terminal.opacity = None;
++    Some(theme)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn the_four_resolve_in_both_appearances_and_keep_their_shapes() {
++        for (id, name) in CHOICES {
++            let native = crate::default_theme::theme_by_id(id).expect("registered");
++            assert_eq!(native.name, name);
++            for appearance in [Appearance::Light, Appearance::Dark] {
++                let t = theme(id, appearance).unwrap();
++                assert_eq!(t.appearance, appearance);
++                let (a, b) = (t.chrome.unwrap().window, native.chrome.unwrap().window);
++                assert_eq!((a.controls, a.left, a.centered, a.open_ms), (b.controls, b.left, b.centered, b.open_ms));
++                assert_eq!(t.titlebar.buttons.iter().map(|b| b.kind).collect::<Vec<_>>(), [ButtonKind::Close, ButtonKind::Miniaturize, ButtonKind::Maximize]);
++                let decoded: Theme = toml::from_str(&toml::to_string(&t).unwrap()).unwrap();
++                assert_eq!(decoded, t);
++            }
++        }
++        assert!(theme("obsidian", Appearance::Dark).is_none());
++    }
++
++    /// The brief's promises: text at 4.5:1 or better on its bar, controls at 3:1 or better.
++    #[test]
++    fn text_and_controls_keep_their_contrast() {
++        for (id, _) in CHOICES {
++            for appearance in [Appearance::Light, Appearance::Dark] {
++                let t = theme(id, appearance).unwrap();
++                let k = t.chrome.unwrap();
++                assert!(k.text.contrast_ratio(k.surface) >= 4.5, "{id} title");
++                assert!(k.muted.contrast_ratio(k.raised) >= 4.5, "{id} title without focus");
++                assert!(k.text.contrast_ratio(k.panel) >= 4.5 && k.muted.contrast_ratio(k.panel) >= 4.5, "{id} menus");
++                assert!(k.accent_text.contrast_ratio(k.accent) >= 4.5, "{id} accent text");
++                for hue in [k.window.close, k.window.minimise, k.window.zoom] {
++                    assert!(hue.contrast_ratio(k.surface) >= 3.0, "{id} control {hue:?}");
++                }
++                assert!(k.window.idle.contrast_ratio(k.raised) >= 3.0, "{id} idle controls");
++            }
++        }
++    }
++}
+diff --git a/crates/wm-theme/src/lib.rs b/crates/wm-theme/src/lib.rs
+index c525959..ac229d7 100644
+--- a/crates/wm-theme/src/lib.rs
++++ b/crates/wm-theme/src/lib.rs
+@@ -5,6 +5,7 @@ pub mod app_icon;
+ pub mod bluetooth;
+ pub mod cascade;
+ pub mod default_theme;
++pub mod forest;
+ pub mod system7;
+ pub mod beos;
+ pub mod os2warp;
+diff --git a/crates/wm-theme/src/model.rs b/crates/wm-theme/src/model.rs
+index 8618bb4..bf96a7b 100644
+--- a/crates/wm-theme/src/model.rs
++++ b/crates/wm-theme/src/model.rs
+@@ -136,6 +136,10 @@ pub enum GradientDirection {
+ pub enum FontWeight {
+     Normal,
+     Bold,
++    /// 500 and 600 (THEME): a title in a medium weight reads as a Mac's does; a face without
++    /// them gives its nearest weight.
++    Medium,
++    SemiBold,
+ }
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+diff --git a/crates/wm-theme/src/modern.rs b/crates/wm-theme/src/modern.rs
+index b2a8911..6811019 100644
+--- a/crates/wm-theme/src/modern.rs
++++ b/crates/wm-theme/src/modern.rs
+@@ -35,11 +35,104 @@ impl Shadow {
+     }
+ }
+ 
++/// The shape of a title bar's controls (THEME). `Glyphs` is the recipe's own line glyphs.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "lowercase")]
++pub enum Controls {
++    #[default]
++    Glyphs,
++    /// Filled discs with a darker rim.
++    Discs,
++    /// Rings: a plated through-hole. Hover fills them.
++    Vias,
++    /// Rounded squares.
++    Pads,
++    /// Outlined squares with a solid core. Hover fills them.
++    BondPads,
++}
++
++/// What runs along the top edge of a focused window's title bar (THEME).
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "lowercase")]
++pub enum TopLine {
++    #[default]
++    None,
++    /// One lighter pixel inside the border.
++    Highlight,
++    /// The border itself in the accent at the top, fading into the hairline down the corners.
++    Accent,
++    /// Two points of teal to indigo to violet, left to right.
++    Interference,
++}
++
++/// The window tokens of the SiliconForest themes (THEME): the controls' shape, place and
++/// colours, the title's place, the top edge, and what the Darwin desk does around a window
++/// (shadow by focus, rounded lower corners, how a window appears, how a theme change is shown).
++/// All default to the recipe as it was, and a theme without them serialises as before.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
++#[serde(default)]
++pub struct WindowChrome {
++    pub controls: Controls,
++    /// Close, minimise, zoom from the left edge, as on a Mac (else the recipe's right side).
++    pub left: bool,
++    /// The title centred over the window (else after the controls or the focus mark).
++    pub centered: bool,
++    /// The controls take their colours only while the pointer is over one of them.
++    pub neutral_at_rest: bool,
++    pub close: Color,
++    pub minimise: Color,
++    pub zoom: Color,
++    /// The controls of a window without focus, and of `neutral_at_rest` controls at rest.
++    pub idle: Color,
++    pub top_line: TopLine,
++    /// A one-pixel trace in the accent from the title to a via before the right edge.
++    pub trace: bool,
++    /// The frame's border stays one device pixel at every scale.
++    pub hairline: bool,
++    /// The Darwin desk draws this theme's shadow and rounds the window's lower corners.
++    pub effects: bool,
++    /// The shadow's alpha under a window without focus (0: as focused).
++    pub shadow_unfocused: u8,
++    /// A window's appearing: fade over `open_ms` while rising `open_rise` (0 ms: at once).
++    pub open_ms: u16,
++    pub open_rise: u16,
++    /// 3: ease-out cubic, 5: quint, 10: expo.
++    pub open_curve: u8,
++    /// A theme change cross-fades over this long (0: at once).
++    pub switch_ms: u16,
++}
++
++impl WindowChrome {
++    pub fn is_default(&self) -> bool {
++        *self == Self::default()
++    }
++    pub fn normalized(mut self) -> Self {
++        self.open_ms = self.open_ms.min(400);
++        self.open_rise = self.open_rise.min(64);
++        self.switch_ms = self.switch_ms.min(400);
++        self
++    }
++    pub fn scaled(mut self, factor: f32) -> Self {
++        self.open_rise = (f32::from(self.open_rise) * factor).round() as u16;
++        self.normalized()
++    }
++    /// The hue of one control.
++    pub fn hue(&self, kind: wm_theme_api::ButtonKind) -> Color {
++        match kind {
++            wm_theme_api::ButtonKind::Close => self.close,
++            wm_theme_api::ButtonKind::Miniaturize => self.minimise,
++            _ => self.zoom,
++        }
++    }
++}
++
+ #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+ pub struct Chrome {
+     /// Instrument-specific overrides use shared semantic colors by default.
+     #[serde(default)]
+     pub instrument: InstrumentChrome,
++    #[serde(default, skip_serializing_if = "WindowChrome::is_default")]
++    pub window: WindowChrome,
+     #[serde(default, deserialize_with = "deserialize_shadow")]
+     pub shadow: Shadow,
+     #[serde(default, deserialize_with = "deserialize_frame")]
+@@ -89,6 +182,7 @@ fn deserialize_overview<'de, D: serde::Deserializer<'de>>(
+ impl Chrome {
+     pub fn normalized(mut self) -> Self {
+         self.instrument.accent_edge = self.instrument.accent_edge.min(64);
++        self.window = self.window.normalized();
+         self.shadow = self.shadow.normalized();
+         self.frame = self.frame.normalized();
+         self.overview = self.overview.normalized();
+@@ -103,8 +197,12 @@ impl Chrome {
+         };
+         self.instrument.accent_edge =
+             ((f32::from(self.instrument.accent_edge) * factor).round() as u16).min(64);
++        self.window = self.window.scaled(factor);
+         self.shadow = self.shadow.scaled(factor);
+         self.frame = self.frame.scaled(factor);
++        if self.window.hairline {
++            self.frame.border = 1;
++        }
+         self.overview = self.overview.scaled(factor);
+         self
+     }
+@@ -124,6 +222,7 @@ impl Chrome {
+         }
+         Self {
+             instrument: InstrumentChrome::default(),
++            window: WindowChrome::default(),
+             shadow: Shadow::default(),
+             frame: FrameMetrics::default(),
+             overview: OverviewMetrics::default(),
+@@ -155,6 +254,9 @@ pub const CHOICES: [(&str, &str); 3] = [
+ ];
+ 
+ pub fn theme(id: &str, appearance: Appearance) -> Option<Theme> {
++    if let Some(theme) = crate::forest::theme(id, appearance) {
++        return Some(theme);
++    }
+     let (name, radius, title, edge, family, _native_light) = match id {
+         "obsidian" => ("Obsidian", 3, 34, 2, "IBM Plex Mono", false),
+         "washi" => ("Washi", 0, 32, 0, "IBM Plex Sans", true),
+@@ -234,6 +336,7 @@ pub fn theme(id: &str, appearance: Appearance) -> Option<Theme> {
+     };
+     let chrome = Chrome {
+         instrument,
++        window: WindowChrome::default(),
+         shadow,
+         frame: FrameMetrics {
+             title_height: title,
+@@ -456,7 +559,7 @@ pub(crate) fn round_corners(image: &mut Pixmap, rect: wm_theme_api::Rect, radius
+     finish_corners(image, rect, radius, None);
+ }
+ 
+-fn finish_corners(
++pub(crate) fn finish_corners(
+     image: &mut Pixmap,
+     rect: wm_theme_api::Rect,
+     radius: u32,
+diff --git a/crates/wm-theme/src/paint.rs b/crates/wm-theme/src/paint.rs
+index 38297cb..635d06a 100644
+--- a/crates/wm-theme/src/paint.rs
++++ b/crates/wm-theme/src/paint.rs
+@@ -268,6 +268,8 @@ pub fn text_width(font_system: &mut cosmic_text::FontSystem, font: &FontSpec, te
+     let weight = match font.weight {
+         FontWeight::Bold => Weight::BOLD,
+         FontWeight::Normal => Weight::NORMAL,
++        FontWeight::Medium => Weight::MEDIUM,
++        FontWeight::SemiBold => Weight::SEMIBOLD,
+     };
+     let style = match font.style {
+         FontStyle::Italic => Style::Italic,
+@@ -457,6 +459,8 @@ fn draw_text_impl<const TRANSPARENT: bool>(
+     let weight = match font.weight {
+         FontWeight::Bold => Weight::BOLD,
+         FontWeight::Normal => Weight::NORMAL,
++        FontWeight::Medium => Weight::MEDIUM,
++        FontWeight::SemiBold => Weight::SEMIBOLD,
+     };
+     let style = match font.style {
+         FontStyle::Italic => Style::Italic,
+@@ -535,6 +539,87 @@ fn draw_text_impl<const TRANSPARENT: bool>(
+     }
+ }
+ 
++/// A title on a fixed line (THEME): the capitals' height is centred in `h`, whatever the text
++/// (centring the ink of each text, as [`draw_text`] does, moves "zsh" and "Terminal" to
++/// different lines in the same title bar). `align` is within `[x, x + w)`; the text is
++/// expected to fit (see [`fit_measured_prefix`]). Returns the drawn text's left edge and width.
++#[allow(clippy::too_many_arguments)]
++pub fn draw_title_text(
++    pixmap: &mut Pixmap,
++    font_system: &mut cosmic_text::FontSystem,
++    swash_cache: &mut cosmic_text::SwashCache,
++    text: &str,
++    font: &FontSpec,
++    color: Color,
++    x: i32,
++    y: i32,
++    w: u32,
++    h: u32,
++    align: TextAlign,
++) -> (i32, u32) {
++    use cosmic_text::{Attrs, Buffer, Family, Metrics, Shaping, Style, Weight, Wrap};
++    if text.is_empty() || w == 0 || h == 0 {
++        return (x, 0);
++    }
++    let weight = match font.weight {
++        FontWeight::Bold => Weight::BOLD,
++        FontWeight::Normal => Weight::NORMAL,
++        FontWeight::Medium => Weight::MEDIUM,
++        FontWeight::SemiBold => Weight::SEMIBOLD,
++    };
++    let style = match font.style {
++        FontStyle::Italic => Style::Italic,
++        FontStyle::Normal => Style::Normal,
++    };
++    let attrs = Attrs::new().family(Family::Name(&font.family)).weight(weight).style(style);
++    let metrics = Metrics::new(font.size, font.size * 1.25);
++    // the capitals' top and the baseline, from an "H" in the same face
++    let mut reference = Buffer::new(font_system, metrics);
++    reference.set_size(None, None);
++    reference.set_text("H", &attrs, Shaping::Advanced, None);
++    reference.shape_until_scroll(font_system, false);
++    let mut cap: Option<(i32, i32)> = None;
++    for run in reference.layout_runs() {
++        for glyph in run.glyphs.iter() {
++            let physical = physical_snapped(glyph, (0.0, 0.0));
++            if let Some(image) = swash_cache.get_image(font_system, physical.cache_key) {
++                let top = physical.y - image.placement.top + run.line_y as i32;
++                cap = Some((top, top + image.placement.height as i32));
++            }
++        }
++    }
++    let offset_y = match cap {
++        Some((top, bottom)) => ((h as i32 - (bottom - top) + 1) / 2 - top).max(0),
++        None => ((h as f32 - font.size) / 2.0).max(0.0) as i32,
++    };
++    let mut buffer = Buffer::new(font_system, metrics);
++    buffer.set_size(None, None);
++    buffer.set_wrap(Wrap::None);
++    buffer.set_text(text, &attrs, Shaping::Advanced, None);
++    buffer.shape_until_scroll(font_system, false);
++    let mut text_width = 0f32;
++    for run in buffer.layout_runs() {
++        text_width = text_width.max(run.line_w);
++    }
++    let offset_x = match align {
++        TextAlign::Left => 0.0,
++        TextAlign::Center => ((w as f32 - text_width) / 2.0).max(0.0).round(),
++        TextAlign::Right => (w as f32 - text_width).max(0.0).round(),
++    };
++    let clip = TextClip { left: x as i64, top: y as i64, right: x as i64 + w as i64, bottom: y as i64 + h as i64 };
++    for run in buffer.layout_runs() {
++        for glyph in run.glyphs.iter() {
++            let physical = physical_snapped(glyph, (x as f32 + offset_x, y as f32 + offset_y as f32));
++            if let Some(image) = swash_cache.get_image(font_system, physical.cache_key) {
++                let img_x = physical.x + image.placement.left;
++                let img_y = physical.y - image.placement.top + run.line_y as i32;
++                blend_glyph_image::<false>(pixmap, img_x, img_y, image, color, clip);
++            }
++        }
++    }
++    (x + offset_x as i32, text_width.ceil() as u32)
++}
++
+ #[derive(Clone, Copy)]
+ struct TextClip {
+     left: i64,
+diff --git a/crates/wm-theme/src/raster.rs b/crates/wm-theme/src/raster.rs
+index 238b9b6..bf0543b 100644
+--- a/crates/wm-theme/src/raster.rs
++++ b/crates/wm-theme/src/raster.rs
+@@ -24,6 +24,10 @@ pub struct FontState {
+     system7_fallback: Rc<RefCell<system7::Fallback>>,
+     modern_font_system: Rc<RefCell<Option<cosmic_text::FontSystem>>>,
+     modern_swash_cache: Rc<RefCell<Option<GlyphCache>>>,
++    /// THEME: the system's Inter (500, 600) and Source Code Pro (500) faces' bytes (1.4 MB),
++    /// where it has them (SiliconForest does): the SiliconForest themes' titles. Read once
++    /// with the session's fonts so that a theme change reads no file.
++    system_title_faces: Rc<Vec<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>>>,
+ }
+ 
+ /// Read-only font/raster cache sizes for explicit diagnostics, not RSS.
+@@ -131,7 +135,38 @@ impl FontState {
+ 
+     fn from_system(mut font_system: cosmic_text::FontSystem) -> Self {
+         let system7_fallback = system7::Fallback::prepare(&mut font_system);
++        let mut system_title_faces: Vec<std::sync::Arc<dyn AsRef<[u8]> + Send + Sync>> = Vec::new();
++        // SiliconForest's session gives the desk two packaged faces and no system scan (the first
++        // run on the M1 drew these titles in DejaVu Sans): the files are read where SiliconForest has them
++        for path in [
++            "/System/Library/Fonts/Inter/Inter-Medium.otf",
++            "/System/Library/Fonts/Inter/Inter-SemiBold.otf",
++            "/System/Library/Fonts/SourceCodePro/SourceCodePro-Medium.otf",
++        ] {
++            if let Ok(bytes) = std::fs::read(path) {
++                system_title_faces.push(std::sync::Arc::new(bytes));
++            }
++        }
++        let found_by_path = !system_title_faces.is_empty();
++        for (family, weights) in [("Inter", &[500u16, 600][..]), ("Source Code Pro", &[500][..])] {
++            for &weight in weights {
++                let query = cosmic_text::fontdb::Query {
++                    families: &[cosmic_text::fontdb::Family::Name(family)],
++                    weight: cosmic_text::fontdb::Weight(weight),
++                    ..cosmic_text::fontdb::Query::default()
++                };
++                if found_by_path {
++                    continue;
++                }
++                let Some(id) = font_system.db().query(&query) else { continue };
++                let exact = font_system.db().face(id).is_some_and(|face| face.weight.0 == weight && face.style == cosmic_text::fontdb::Style::Normal);
++                if let Some(bytes) = exact.then(|| font_system.db().with_face_data(id, |data, _| data.to_vec())).flatten() {
++                    system_title_faces.push(std::sync::Arc::new(bytes));
++                }
++            }
++        }
+         Self {
++            system_title_faces: Rc::new(system_title_faces),
+             font_system: Rc::new(RefCell::new(font_system)),
+             swash_cache: Rc::new(RefCell::new(GlyphCache::new())),
+             system7_fallback: Rc::new(RefCell::new(system7_fallback)),
+@@ -179,6 +214,11 @@ impl FontState {
+                 general.db_mut().load_font_source(source.clone());
+                 resident.db_mut().load_font_source(source);
+             }
++            // THEME: the SiliconForest themes' title faces, read from the system's files when the
++            // session's fonts were set up (`from_system`): nothing is read here
++            for bytes in self.system_title_faces.iter() {
++                resident.db_mut().load_font_source(cosmic_text::fontdb::Source::Binary(bytes.clone()));
++            }
+             *fonts = Some(resident);
+         }
+     }
+@@ -569,6 +609,7 @@ mod tests {
+     #[test]
+     fn font_statistics_observe_payload_capacity_without_triggering_eviction() {
+         let fonts = FontState {
++            system_title_faces: Rc::new(Vec::new()),
+             modern_font_system: Rc::new(RefCell::new(None)),
+             modern_swash_cache: Rc::new(RefCell::new(None)),
+             system7_fallback: Rc::new(RefCell::new(system7::Fallback::from_db("en-US".into(), cosmic_text::fontdb::Database::new()))),
+diff --git a/crates/wm-theme/src/styles/forest.rs b/crates/wm-theme/src/styles/forest.rs
+new file mode 100644
+index 0000000..a4d44d6
+--- /dev/null
++++ b/crates/wm-theme/src/styles/forest.rs
+@@ -0,0 +1,282 @@
++//! The title band of the SiliconForest themes (THEME): the modern recipe's band with the
++//! window tokens of [`crate::modern::WindowChrome`]: controls drawn as shapes (discs, vias,
++//! pads, bond pads) at the left in a Mac's order, the title on a fixed line, centred or after
++//! the controls, a top edge, and a trace. Drawn once per title, focus and control state and
++//! kept by the recipe's cache (`styles::modern::render`); nothing here runs per frame.
++use crate::model::{Color, TextAlign, Theme};
++use crate::modern::{Chrome, Controls, TopLine};
++use crate::paint;
++use tiny_skia::{FillRule, GradientStop, LineCap, LinearGradient, Paint, PathBuilder, Pixmap, Point as SkPoint, SpreadMode, Stroke, Transform};
++use wm_theme_api::{ButtonKind, DecorationLayout, DecorationRequest};
++
++fn solid(color: Color) -> Paint<'static> {
++    let mut p = Paint::default();
++    p.set_color_rgba8(color.r, color.g, color.b, 255);
++    p.anti_alias = true;
++    p
++}
++
++/// A band `w` wide from `top` down past the image's bottom, its two upper corners rounded.
++fn band(left: f32, top: f32, right: f32, bottom: f32, r: f32) -> Option<tiny_skia::Path> {
++    let r = r.max(0.0).min((right - left) / 2.0);
++    let k = r * 0.552_284_8;
++    let mut b = PathBuilder::new();
++    b.move_to(left, bottom);
++    b.line_to(left, top + r);
++    if r > 0.0 {
++        b.cubic_to(left, top + r - k, left + r - k, top, left + r, top);
++    }
++    b.line_to(right - r, top);
++    if r > 0.0 {
++        b.cubic_to(right - r + k, top, right, top + r - k, right, top + r);
++    }
++    b.line_to(right, bottom);
++    b.close();
++    b.finish()
++}
++
++fn rounded(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
++    let r = r.max(0.0).min(w / 2.0).min(h / 2.0);
++    if r <= 0.0 {
++        return tiny_skia::Rect::from_xywh(x, y, w, h).map(PathBuilder::from_rect);
++    }
++    let k = r * 0.552_284_8;
++    let (x1, y1) = (x + w, y + h);
++    let mut b = PathBuilder::new();
++    b.move_to(x + r, y);
++    b.line_to(x1 - r, y);
++    b.cubic_to(x1 - r + k, y, x1, y + r - k, x1, y + r);
++    b.line_to(x1, y1 - r);
++    b.cubic_to(x1, y1 - r + k, x1 - r + k, y1, x1 - r, y1);
++    b.line_to(x + r, y1);
++    b.cubic_to(x + r - k, y1, x, y1 - r + k, x, y1 - r);
++    b.line_to(x, y + r);
++    b.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
++    b.close();
++    b.finish()
++}
++
++fn fill(image: &mut Pixmap, path: Option<tiny_skia::Path>, paint: &Paint) {
++    if let Some(path) = path {
++        image.fill_path(&path, paint, FillRule::Winding, Transform::identity(), None);
++    }
++}
++
++fn stroke(image: &mut Pixmap, path: Option<tiny_skia::Path>, paint: &Paint, width: f32) {
++    if let Some(path) = path {
++        let stroke = Stroke { width, line_cap: LineCap::Round, ..Stroke::default() };
++        image.stroke_path(&path, paint, &stroke, Transform::identity(), None);
++    }
++}
++
++fn line(x0: f32, y0: f32, x1: f32, y1: f32) -> Option<tiny_skia::Path> {
++    let mut b = PathBuilder::new();
++    b.move_to(x0, y0);
++    b.line_to(x1, y1);
++    b.finish()
++}
++
++/// One control in its box. `u` is device pixels per point; `(cx, cy)` its centre.
++#[allow(clippy::too_many_arguments)]
++fn control(image: &mut Pixmap, chrome: &Chrome, kind: ButtonKind, cx: f32, cy: f32, u: f32, bar: Color, focused: bool, group_hover: bool, pressed: bool) {
++    let window = &chrome.window;
++    let black = Color::rgb(0, 0, 0);
++    let white = Color::rgb(255, 255, 255);
++    let lit = group_hover || (focused && !window.neutral_at_rest);
++    let hue = if lit { window.hue(kind) } else { window.idle };
++    let hue = match (pressed, chrome.text.relative_luminance() > 0.5) {
++        (true, true) => hue.mix(white, 0.18),
++        (true, false) => hue.mix(black, 0.14),
++        _ => hue,
++    };
++    // whole pixels for the outer size keep the three alike at every scale
++    let (glyph_ink, filled) = match window.controls {
++        Controls::Discs => {
++            let r = (6.0 * u).round();
++            if lit {
++                fill(image, PathBuilder::from_circle(cx, cy, r), &solid(hue));
++                let rim = (0.5 * u).max(1.0);
++                stroke(image, PathBuilder::from_circle(cx, cy, r - rim / 2.0), &solid(hue.mix(black, 0.16)), rim);
++            } else {
++                let wall = (1.25 * u).max(1.0);
++                stroke(image, PathBuilder::from_circle(cx, cy, r - wall / 2.0), &solid(hue), wall);
++            }
++            (hue.mix(black, 0.58), lit)
++        }
++        Controls::Vias => {
++            let r = (6.0 * u).round();
++            let wall = (1.75 * u).max(1.0);
++            if group_hover {
++                fill(image, PathBuilder::from_circle(cx, cy, r), &solid(hue));
++            } else {
++                stroke(image, PathBuilder::from_circle(cx, cy, r - wall / 2.0), &solid(hue), wall);
++            }
++            (bar, group_hover)
++        }
++        Controls::Pads => {
++            let side = (11.0 * u).round();
++            let (x, y) = ((cx - side / 2.0).round(), (cy - side / 2.0).round());
++            if focused || group_hover {
++                fill(image, rounded(x, y, side, side, 3.0 * u), &solid(hue));
++            } else {
++                let wall = (1.25 * u).max(1.0);
++                stroke(image, rounded(x + wall / 2.0, y + wall / 2.0, side - wall, side - wall, 3.0 * u - wall / 2.0), &solid(hue), wall);
++            }
++            (white, group_hover)
++        }
++        _ => {
++            let side = (12.0 * u).round();
++            let (x, y) = ((cx - side / 2.0).round(), (cy - side / 2.0).round());
++            if group_hover {
++                fill(image, rounded(x, y, side, side, 1.5 * u), &solid(hue));
++            } else {
++                let wall = (1.5 * u).max(1.0);
++                stroke(image, rounded(x + wall / 2.0, y + wall / 2.0, side - wall, side - wall, 1.5 * u - wall / 2.0), &solid(hue), wall);
++                let core = (4.0 * u).round();
++                fill(image, rounded((cx - core / 2.0).round(), (cy - core / 2.0).round(), core, core, 0.0), &solid(hue));
++            }
++            (bar, group_hover)
++        }
++    };
++    if !(group_hover && filled) {
++        return;
++    }
++    // the glyphs appear for all three while the pointer is over any of them
++    let ink = solid(glyph_ink);
++    let width = (1.3 * u).max(1.0);
++    let a = 2.6 * u;
++    match kind {
++        ButtonKind::Close => {
++            stroke(image, line(cx - a, cy - a, cx + a, cy + a), &ink, width);
++            stroke(image, line(cx - a, cy + a, cx + a, cy - a), &ink, width);
++        }
++        ButtonKind::Miniaturize => stroke(image, line(cx - a * 1.2, cy, cx + a * 1.2, cy), &ink, width),
++        _ => {
++            stroke(image, line(cx - a * 1.2, cy, cx + a * 1.2, cy), &ink, width);
++            stroke(image, line(cx, cy - a * 1.2, cx, cy + a * 1.2), &ink, width);
++        }
++    }
++}
++
++/// The title band, `w` by `h` device pixels, premultiplied, its upper corners cut to the radius.
++pub(crate) fn title(
++    theme: &Theme,
++    fonts: &mut cosmic_text::FontSystem,
++    cache: &mut cosmic_text::SwashCache,
++    request: &DecorationRequest,
++    layout: &DecorationLayout,
++    w: u32,
++    h: u32,
++) -> Option<Pixmap> {
++    let mut image = Pixmap::new(w.max(1), h.max(1))?;
++    let chrome = Chrome::from_theme(theme);
++    let window = chrome.window;
++    let focused = request.focused;
++    let b = f32::from(chrome.frame.border.max(1));
++    let r = f32::from(chrome.frame.radius.min(chrome.frame.title_height));
++    // device pixels per point: the control box is 16 points in the 12-point shapes' themes
++    let u = (theme.titlebar.font.size / match window.controls {
++        Controls::BondPads => 12.0,
++        _ => 13.0,
++    })
++    .max(0.5);
++    let (wf, hf) = (w as f32, h as f32 + r + 2.0);
++    let bar = match if focused { &theme.titlebar.active } else { &theme.titlebar.inactive } {
++        crate::model::Fill::Solid(c) => *c,
++        crate::model::Fill::Gradient(g) => g.from,
++    };
++    let edge = if focused { theme.border.color_active } else { theme.border.color_inactive };
++    // the outline: the band in the border's colour (or its top edge's), the bar inside it
++    let mut top = b;
++    match (window.top_line, focused) {
++        (TopLine::Accent, true) => {
++            let stops = vec![
++                GradientStop::new(0.0, tiny_skia::Color::from_rgba8(chrome.accent.r, chrome.accent.g, chrome.accent.b, 255)),
++                GradientStop::new(1.0, tiny_skia::Color::from_rgba8(edge.r, edge.g, edge.b, 255)),
++            ];
++            let mut p = solid(edge);
++            if let Some(shader) = LinearGradient::new(SkPoint::from_xy(0.0, 0.0), SkPoint::from_xy(0.0, (r * 1.15).max(b * 6.0)), stops, SpreadMode::Pad, Transform::identity()) {
++                p.shader = shader;
++            }
++            fill(&mut image, band(0.0, 0.0, wf, hf, r), &p);
++        }
++        (TopLine::Interference, _) => {
++            // the film's colours along the top edge of every window: three points of them at full
++            // strength on the focused one, two points paled toward the hairline on the others (the
++            // first build drew it on the focused window only, two points: in a picture of the whole
++            // desk the theme read as "light with a blue accent")
++            let pale = |c: u32| {
++                let colour = Color::rgb((c >> 16) as u8, (c >> 8) as u8, c as u8);
++                let colour = if focused { colour } else { colour.mix(edge, 0.62) };
++                tiny_skia::Color::from_rgba8(colour.r, colour.g, colour.b, 255)
++            };
++            let stops = vec![GradientStop::new(0.0, pale(0x19a3a8)), GradientStop::new(0.55, pale(0x4a5bd0)), GradientStop::new(1.0, pale(0x9a5bd6))];
++            let mut p = solid(edge);
++            if let Some(shader) = LinearGradient::new(SkPoint::from_xy(0.0, 0.0), SkPoint::from_xy(wf, 0.0), stops, SpreadMode::Pad, Transform::identity()) {
++                p.shader = shader;
++            }
++            fill(&mut image, band(0.0, 0.0, wf, hf, r), &p);
++            top = ((if focused { 3.0 } else { 2.0 }) * u).round().max(2.0);
++            fill(&mut image, band(0.0, top, wf, hf + top, r), &solid(edge));
++            // the hairline under the colour would make three lines of two: the bar starts at the colour
++        }
++        _ => fill(&mut image, band(0.0, 0.0, wf, hf, r), &solid(edge)),
++    }
++    let inner = (r - b).max(0.0);
++    if window.top_line == TopLine::Highlight {
++        let white = Color::rgb(255, 255, 255);
++        fill(&mut image, band(b, top, wf - b, hf, inner), &solid(bar.mix(white, if focused { 0.75 } else { 0.5 })));
++        fill(&mut image, band(b, top + 1.0, wf - b, hf + 1.0, inner), &solid(bar));
++    } else {
++        fill(&mut image, band(b, top, wf - b, hf, inner), &solid(bar));
++    }
++    // the line between the bar and the window's content
++    let rule = bar.mix(theme.border.color_inactive, 0.55);
++    paint::fill_rect(&mut image, b as i32, h as i32 - 1, w.saturating_sub(2 * b as u32), 1, rule);
++
++    let margin = layout.input_margin as i32;
++    let cy = (h as f32 / 2.0).round();
++    let group_hover = request.buttons.iter().any(|s| s.hovered || s.pressed);
++    let mut controls_right = b as i32 + i32::from(chrome.frame.padding);
++    let mut controls_left = w as i32;
++    for (kind, hit) in &layout.button_hitboxes {
++        let (x, y) = (hit.pos.x - margin, hit.pos.y - margin);
++        let _ = y;
++        let state = request.buttons.iter().find(|s| s.kind == *kind);
++        let cx = x as f32 + hit.size.w as f32 / 2.0;
++        control(&mut image, &chrome, *kind, cx, cy, u, bar, focused, group_hover, state.is_some_and(|s| s.pressed));
++        controls_right = controls_right.max(x + hit.size.w as i32);
++        controls_left = controls_left.min(x);
++    }
++    // the title
++    let ink = if focused { theme.titlebar.text_color_active } else { theme.titlebar.text_color_inactive };
++    let gap = (10.0 * u).round() as i32;
++    let (text_x, text_w, align) = if window.centered {
++        // centred over the window: the same room is kept free on the right as the controls take on the left
++        let side = if window.left { controls_right + gap } else { (w as i32 - controls_left) + gap };
++        (side, (w as i32 - 2 * side).max(0) as u32, TextAlign::Center)
++    } else if window.left {
++        let x = controls_right + gap;
++        (x, (w as i32 - x - gap).max(0) as u32, TextAlign::Left)
++    } else {
++        let x = b as i32 + gap;
++        (x, (controls_left - gap - x).max(0) as u32, TextAlign::Left)
++    };
++    let font = &theme.titlebar.font;
++    let text = paint::fit_measured_prefix(&request.title, text_w, "\u{2026}", |t| paint::text_width(fonts, font, t));
++    let (drawn_x, drawn_w) = paint::draw_title_text(&mut image, fonts, cache, &text, font, ink, text_x, 0, text_w, h, align);
++    // the trace: from the title to a via before the right edge
++    if window.trace {
++        let via_r = (2.5 * u).round();
++        let end = w as f32 - b - (9.0 * u).round() - via_r * 2.0;
++        let start = (drawn_x + drawn_w as i32 + gap) as f32;
++        if end - start >= 24.0 * u {
++            let colour = if focused { chrome.accent.mix(bar, 0.35) } else { chrome.line };
++            let t = u.round().max(1.0);
++            paint::fill_rect(&mut image, start as i32, (cy - t / 2.0).round() as i32, (end - start) as u32, t as u32, colour);
++            let wall = (1.25 * u).max(1.0);
++            stroke(&mut image, PathBuilder::from_circle(end + via_r, cy, via_r - wall / 2.0 + 0.5), &solid(colour), wall);
++        }
++    }
++    Some(image)
++}
+diff --git a/crates/wm-theme/src/styles/mod.rs b/crates/wm-theme/src/styles/mod.rs
+index 3bdf512..4e80fb0 100644
+--- a/crates/wm-theme/src/styles/mod.rs
++++ b/crates/wm-theme/src/styles/mod.rs
+@@ -2,6 +2,7 @@
+ //! in the engine; each recipe owns only its geometry and sparse painting.
+ pub(crate) mod windowmaker;
+ pub(crate) mod system7;
++pub(crate) mod forest;
+ pub(crate) mod modern;
+ pub(crate) mod beos;
+ pub(crate) mod os2warp;
+diff --git a/crates/wm-theme/src/styles/modern.rs b/crates/wm-theme/src/styles/modern.rs
+index 0f760ad..a7dbb75 100644
+--- a/crates/wm-theme/src/styles/modern.rs
++++ b/crates/wm-theme/src/styles/modern.rs
+@@ -28,7 +28,22 @@ pub(crate) fn layout(theme: &Theme, request: &DecorationRequest) -> DecorationLa
+     let size = u32::from(m.button_size).min(title.saturating_sub(border * 2));
+     let mut right = w.saturating_sub(margin + border + u32::from(m.padding));
+     let left = margin + border + u32::from(m.padding);
+-    for button in theme.titlebar.buttons.iter().rev() {
++    let from_left = Chrome::from_theme(theme).window.left;
++    if from_left {
++        // THEME: close, minimise, zoom from the left edge in the theme's order (a Mac's)
++        let mut x = left;
++        for button in theme.titlebar.buttons.iter() {
++            if size == 0 || x.saturating_add(size) > right {
++                break;
++            }
++            if button.kind == ButtonKind::Maximize && !request.resizable {
++                continue;
++            }
++            buttons.push((button.kind, Rect::new(Point::new(x as i32, (margin + (title - size) / 2) as i32), Size::new(size, size))));
++            x += size + u32::from(m.button_gap);
++        }
++    }
++    for button in theme.titlebar.buttons.iter().rev().filter(|_| !from_left) {
+         if size == 0 || right < left.saturating_add(size) {
+             break;
+         }
+@@ -147,7 +162,7 @@ pub(crate) fn render_edges(theme: &Theme, request: &DecorationRequest, layout: &
+             });
+         }
+     }
+-    let (shadow, shape) = frame_effects(&chrome, visual, rgb);
++    let (shadow, shape) = frame_effects(&chrome, visual, rgb, request.focused);
+     DecorationSurface {
+         frame_size: layout.frame_size,
+         parts: Vec::new(),
+@@ -276,7 +291,7 @@ pub(crate) fn render(
+             });
+         }
+     }
+-    let (shadow, shape) = frame_effects(&chrome, visual, rgb);
++    let (shadow, shape) = frame_effects(&chrome, visual, rgb, request.focused);
+     DecorationSurface {
+         frame_size: layout.frame_size,
+         parts,
+@@ -292,8 +307,14 @@ fn frame_effects(
+     chrome: &Chrome,
+     visual: Rect,
+     rgb: [u8; 3],
++    focused: bool,
+ ) -> (Option<wm_theme_api::DecorationShadow>, Option<wm_theme_api::DecorationShape>) {
+-    let shadow = &chrome.shadow;
++    let mut shadow = chrome.shadow;
++    if !focused && chrome.window.shadow_unfocused > 0 {
++        // THEME: a window without focus lies lower
++        shadow.color.a = chrome.window.shadow_unfocused;
++    }
++    let shadow = &shadow;
+     let shadow = (shadow.color.a > 0).then_some(
+         wm_theme_api::DecorationShadow {
+             rect: visual,
+@@ -454,10 +475,17 @@ fn title(
+     w: u32,
+     h: u32,
+ ) -> DecorationBuffer {
++    let chrome = Chrome::from_theme(theme);
++    if chrome.window.controls != crate::modern::Controls::Glyphs {
++        // THEME: the SiliconForest themes' band
++        return match super::forest::title(theme, fonts, cache, request, layout, w, h) {
++            Some(image) => DecorationBuffer { width: image.width(), height: image.height(), pixels: image.take() },
++            None => solid(1, 1, theme.terminal.bg),
++        };
++    }
+     let Some(mut image) = Pixmap::new(w.max(1), h.max(1)) else {
+         return solid(1, 1, theme.terminal.bg);
+     };
+-    let chrome = Chrome::from_theme(theme);
+     let border = u32::from(chrome.frame.border.max(1));
+     let line = if request.focused {
+         theme.border.color_active
+diff --git a/dock/crates/chonk-dock-theme/src/launcher.rs b/dock/crates/chonk-dock-theme/src/launcher.rs
+index 65edb97..03308ce 100644
+--- a/dock/crates/chonk-dock-theme/src/launcher.rs
++++ b/dock/crates/chonk-dock-theme/src/launcher.rs
+@@ -168,9 +168,13 @@ pub fn render_launcher_tile_launching(
+     // a caption under the monogram, same role as the icon tile's
+     // title caption.
+     let label_h = (size as i32 - margin - label_y).max(0) as u32;
++    // THEME: a theme whose menus are set in another face than its titles (Die Shot: a monospaced
++    // title, as a net label) names its tiles in the menus' face: a monospaced name is cut
++    // ("Activity Moni...") where the others fit.
++    let label_face = if theme.menu.item_font.family != theme.titlebar.font.family { &theme.menu.item_font } else { &theme.titlebar.font };
+     let mut label_font = FontSpec {
+         size: (label_h as f32 * 0.60).max(6.0),
+-        ..theme.titlebar.font.clone()
++        ..label_face.clone()
+     };
+     // A name a little too long for the strip ("Activity Monitor") is set smaller, down to three
+     // quarters of the size, before anything is cut; only a longer one is elided.
+diff --git a/dock/crates/chonk-dock/src/runtime.rs b/dock/crates/chonk-dock/src/runtime.rs
+index 96fb6a4..1d71b21 100644
+--- a/dock/crates/chonk-dock/src/runtime.rs
++++ b/dock/crates/chonk-dock/src/runtime.rs
+@@ -71,7 +71,8 @@ fn theme(options: &Options, control: &Control, scale: f32) -> wm_theme::Theme {
+         .theme
+         .as_ref()
+         .map(|(_, mode)| *mode)
+-        .unwrap_or(wm_theme::Appearance::Dark);
++        // THEME: SiliconForest's desk tells no appearance: a SiliconForest theme in its own, the others dark
++        .unwrap_or_else(|| wm_theme::default_theme::standalone_appearance(id));
+     let theme = if id == "omarchy" {
+         wm_theme::omarchy::load_current().ok()
+     } else {
+diff --git a/dock/crates/chonk-dock/src/siliconforest.rs b/dock/crates/chonk-dock/src/siliconforest.rs
+index e6eff71..510fd7e 100644
+--- a/dock/crates/chonk-dock/src/siliconforest.rs
++++ b/dock/crates/chonk-dock/src/siliconforest.rs
+@@ -216,7 +216,8 @@ mod preview {
+         std::fs::create_dir_all(&dir).unwrap();
+         let mut fs = cosmic_text::FontSystem::new();
+         let mut sc = cosmic_text::SwashCache::new();
+-        for id in ["relay", "amber-phosphor", "nextstep-classic", "washi"] {
++        let wanted = std::env::var("DOCK_PREVIEW_THEMES").unwrap_or_else(|_| "relay,amber-phosphor,nextstep-classic,washi".into());
++        for id in wanted.split(',') {
+             let Some(theme) = wm_theme::default_theme::theme_by_id(id) else { panic!("theme {id}") };
+             for tile in [56u32, 84, 112] {
+                 let mut tiles: Vec<wm_theme_api::DecorationBuffer> = Vec::new();

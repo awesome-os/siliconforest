@@ -1,0 +1,171 @@
+{
+  "schema_version": 1,
+  "reviewer": "Astra",
+  "status": "SOURCE_QUESTION_UNRESOLVED_NO_GUARD_CHANGE_OR_INITIALIZATION_AUTHORIZED",
+  "question": "For normal J293/T8103 dart-apcie0, does DART-register MMIO require PCIe PHY/port RUN or only its PMGR/bus-clock domain?",
+  "answer": "The pinned normal Linux DART probe does not explicitly require PHY, PERST, port RUN or endpoint link-up. It enables declared clocks and reads parameters. This is not evidence that the four PMGR words alone make a cold/reset normal APCIE DART aperture safe: the exact DART Linux clock/power provider declarations are missing locally, normal pinned m1n1 kboot already initializes PCIe, and the saved ADT has no independent DART clock/reset contract. The current all-PCIe readiness guard is conservative; its necessity is not proven, but its removal is not justified by these sources.",
+  "separation_from_runtime": {
+    "qualified_observation": "reports/sprint-010/dart-survey-attempt001-independent-qualification.json",
+    "fact": "Four PMGR predicate checks passed, then the fifth read found PHY reset asserted and its request/ack predicate incomplete. The sampler stopped with zero DART reads.",
+    "limits": "Later RC/APPCLK/PERST/RUN fields were never read; their zero snapshot fields are not hardware state. The run cannot measure which of those signals the DART aperture actually needs. No current or earlier refusal is relabeled SAMPLED."
+  },
+  "primary_evidence": [
+    {
+      "file": "sources/linux-aurora-platform-reference/drivers/iommu/apple-dart.c",
+      "lines": "2954-3007,3030-3088",
+      "finding": "Normal vs tunneled is selected from the DT parent name. For the normal path: map >=0x4000 resource, get IRQ, devm_clk_bulk_get_all, clk_bulk_prepare_enable, runtime-PM bookkeeping, then read PARAMS1/PARAMS2. No pcie_init, PHY register, link-status or endpoint PERST test is performed by this probe."
+    },
+    {
+      "file": "sources/linux-aurora-platform-reference/drivers/iommu/apple-dart.c",
+      "lines": "3034-3049",
+      "finding": "The actual clock list comes from firmware metadata/providers. pm_runtime_get_noresume plus set_active does not by itself establish a particular physical power-up handshake; exact platform/PM-domain attachment and DT providers must be known. Number of clocks may be zero. Absence of a direct test is not a cold-read safety guarantee."
+    },
+    {
+      "file": "sources/linux-aurora-platform-reference/drivers/iommu/apple-dart.c",
+      "lines": "3190-3230,2127-2141",
+      "finding": "After parameter/profile reads the driver may reset/write the DART, then registers its IOMMU. Consumer device_link_add uses the DART as runtime-PM supplier. This dependency makes the DART available before a consumer uses it; it does not prove DART probes before all host/bootloader PCIe setup."
+    },
+    {
+      "file": "sources/linux-aurora-platform-reference/drivers/pci/controller/pcie-apple.c",
+      "lines": "255-264,1418-1450,1469-1570,1698-1714,1734-1778,2114-2136,2704-2733,2794-2826",
+      "finding": "Normal T8103 host probe resolves port GPIO dependencies, initializes MSI and calls generic PCI-host setup. setup_port may inherit a live link; otherwise setup_link enables APPCLK, asserts endpoint GPIO PERST, programs refclk, releases internal PORT_PERST and endpoint GPIO, and waits PORT_STATUS_READY. LTSSM/link training is distinct and later. There is no normal-DART-specific access guard here; generic PCI core/DT ordering is not fully present in this partial source acquisition."
+    },
+    {
+      "file": "sources/m1n1-baseline/src/kboot.c",
+      "lines": "6665-6705",
+      "finding": "The pinned normal kboot handoff calls tunables_apply_static, clk_init, USB init and pcie_init before handing off. Therefore a normal Linux probe can run with PCIe PHY/APPCLK/port already initialized; Linux driver source alone cannot reproduce the survey cold/reset starting state."
+    },
+    {
+      "file": "sources/m1n1-baseline/src/pcie.c",
+      "lines": "38-69,549-564,615-650,738-744,861-912",
+      "finding": "m1n1 first enables APCIE ADT clock-gate domains, applies shared tunables, requests/acks PHY clocks and releases PHY reset, starts PHYIF, then each port APPCLK, internal reset release and RUN poll. It does not independently read/verify normal DART reachability between these phases. The sequence shows how PCIe is initialized, not minimal DART prerequisites."
+    },
+    {
+      "file": "sources/m1n1-baseline/src/pmgr.c",
+      "lines": "326-356",
+      "finding": "pmgr_power_enable recurses through domain parents; pmgr_adt_find_devices consumes clock-gates. No DART-specific clock mapping is inferred when dart-apcie0 has no such property."
+    },
+    {
+      "file": "sources/m1n1-baseline/src/dart.c",
+      "lines": "302-389,399-433",
+      "finding": "dart_init and dart_init_adt assume the aperture is accessible. T8020 immediately reads CONFIG then may write stream/TTBR/TCR/invalidation state. No power or PCIe guard is present. This low-level mutating helper is not a safe survey or evidence of prerequisite sufficiency."
+    },
+    {
+      "file": "sources/m1n1-baseline/proxyclient/m1n1/hw/dart.py",
+      "lines": "29-37",
+      "finding": "from_adt resolves the register address and constructs a backend; it neither checks nor enables power."
+    },
+    {
+      "file": "sources/m1n1-baseline/proxyclient/m1n1/hw/dart8020.py",
+      "lines": "98-104,261-275",
+      "finding": "Constructor already reads ENABLED_STREAMS; initialize mutates translations. Even constructing this convenience object is not source-only or a harmless way to test the hypothesis. No imports/execution were used in this review."
+    },
+    {
+      "file": "sources/m1n1-baseline/src/hv/hv.c",
+      "lines": "165-175",
+      "finding": "HV entry calls pcie_shutdown. This differs from normal kboot and cannot inherit its initialized-state assumption without evidence."
+    },
+    {
+      "file": "sources/m1n1-baseline/src/pcie.c",
+      "lines": "1091-1128",
+      "finding": "Shutdown is gated by in-process initialized state; when entered, it clears per-port reset-disable/APPCLK and PHY clock requests. A call does not establish what prior firmware or another proxy image initialized. Survey001 actual guard reads remain the authority for the five observed fields."
+    },
+    {
+      "file": "sources/linux-aurora-platform-reference/drivers/iommu/apple-dart.c",
+      "lines": "2987-2994,3056-3084,3286-3339,3564-3582",
+      "finding": "PCIe-C/tunneled DART has explicit asynchronous-abort and APPCLK/resume-order constraints and skips unsafe parameter reads. Restore can precede downstream link training, but this is a different aperture/profile. Neither its hazards nor its sufficiency rules can be silently transferred to normal dart-apcie0."
+    },
+    {
+      "file": "sources/linux-aurora-platform-reference/drivers/pci/controller/pcie-apple.c",
+      "lines": "2473-2518,2794-2799",
+      "finding": "The explicit host-before-DART PM link is inside the PCIe-C tunnel path, not normal T8103 APCIE. It is not proof that normal DART requires RUN, nor that it is independent of APPCLK."
+    },
+    {
+      "file": "sources/linux-aurora-keyboard-reference/drivers/pmdomain/apple/pmgr-pwrstate.c",
+      "lines": "60-132",
+      "finding": "PMGR target/actual/reset/disable state is a meaningful domain guard. Externally-clocked domains explicitly permit clock-gated actual state while requesting active, demonstrating that a generic PMGR operation is not a universal local-clock contract. This survey instead requires actual active and rejects AUTO/reset/disable, but the normal DART clock relation still needs separate evidence."
+    }
+  ],
+  "saved_ADT_evidence": {
+    "path": "runs/m1-desktop-010/dart-survey-attempt-001/guest/guest-adt.bin",
+    "sha256": "8f8613d8787f912137b482991dc0d5eca403d93e01bceb212019a02be9b8d8c5",
+    "bytes": 340908,
+    "decoder": "Existing bounded parse_adt extracted as Python AST; no m1n1/transport import. Selected nodes only.",
+    "normal_DART": "/arm-io/dart-apcie0 is dart,t8020, normal aperture0x681008000/0x4000, sibling of apcie under arm-io, manual-availability=1. No clock-gates, power-gates, clocks, power-domains or dependencies properties.",
+    "APCIE_domains": {
+      "clock-gates": [
+        77,
+        97,
+        29
+      ],
+      "power-gates": [
+        77,
+        97,
+        29
+      ],
+      "PMGR_ancestry": "APCIE77 -> IMX32; APCIE_GP97 -> APCIE77; PCIE_REF29 has no parent in the validated table. These are APCIE node declarations, not a separately declared DART domain."
+    },
+    "bridge_functions": "pci-bridge0 function-dart_force_active/request_sid/release_sid/self each point to dart-apcie0 phandle with an operation selector. They describe software calls; no implementation in the local pinned sources defines F-act or manual-availability as an electrical clock/reset prerequisite. Do not treat these as a Linux dependency cell or success permission.",
+    "reference": "integrations/puredarwin/m1-dart-survey/board.c:50-114 validates identities/ranges/APCIE domains. Absence of DART clock properties independently checked in actual saved blob."
+  },
+  "prerequisite_matrix": [
+    {
+      "item": "Exact normal DART identity/range/profile",
+      "source_support": "Established from actual saved ADT and T8103 driver match.",
+      "sufficiency": "Necessary identity constraint; not bus access safety."
+    },
+    {
+      "item": "Four PMGR domains active, reset/disable/AUTO absent",
+      "source_support": "Established APCIE declarations and observed successful predicates.",
+      "sufficiency": "Good conservative prerequisite; no source proves it is sufficient for DART."
+    },
+    {
+      "item": "Shared PHY request/ACK and PHY reset released",
+      "source_support": "Explicit PCIe initialization steps; current survey guard.",
+      "sufficiency": "Not established as normal DART MMIO requirement. Fails in actual survey; no DART read attempted."
+    },
+    {
+      "item": "RC PHYIF RUN, port APPCLK and internal PORT_PERST release, PORT_STATUS_RUN",
+      "source_support": "Explicit host-controller startup steps. APPCLK is a proven DART dependency only for the separately scoped tunneled path.",
+      "sufficiency": "Unproven for normal aperture; all unobserved in survey001 after early refusal."
+    },
+    {
+      "item": "Endpoint GPIO PERST released, radio power or PCIe LINK_UP",
+      "source_support": "Consumer link startup requirements, distinct from local DART MMIO and from internal port-reset bit.",
+      "sufficiency": "No normal DART source requires link-up. That absence does not prove safe reads with local core/PHY reset asserted; external endpoint reset must not be conflated with internal port or PHY reset."
+    }
+  ],
+  "missing_primary_evidence": [
+    "Exact pinned arch/arm64/boot/dts/apple/t8103.dtsi and board includes, plus applicable DART/PCIe/clock/power bindings, are not in the acquired local reference set. No fetch was performed. Need to resolve normal dart0 clocks/power-domains to their provider and ancestry rather than reuse APCIE or keyboard phandles.",
+    "The partial Linux source set lacks generic platform/genpd/of-IOMMU probe-order implementations needed to prove actual normal-DART power and clock setup/order. No runtime probe-order trace is present in the saved survey.",
+    "No local specification or proven cold/reset experiment establishes the reset-tree/bus-clock relation for normal0x681008000. APPCLK vs shared PHY vs internal PORT_RESET may affect access independently of endpoint PERST.",
+    "No hardware bus-fault containment/timeout guarantee follows from a whitelisted offset or an IOMap read-only mapping; a synchronous load can still fault or hang on an unclocked aperture."
+  ],
+  "recommendation": [
+    "Keep frozen survey002 and its truthful refusal unchanged. Do not call pcie_init or weaken checks on the strength of Linux not checking PHY explicitly.",
+    "Resolve the missing exact DT/provider and local clock/reset contract before proposing a separate read-only guard revision. Existing retained snapshots may help, but any source acquisition or hardware observation is separate authorization.",
+    "If those facts support DART-only MMIO, propose an isolated candidate with no PMGR/PHY/link writes and endpoints kept in their proven reset state, explicit power/clock ownership for the whole read interval, bounded observation and failure evidence. A candidate would still require independent review and explicit hardware authorization."
+  ],
+  "not_done": [
+    "No guard or production/source changes, no init, no pcie_init, no register or device access, no source fetch, no builds, no SSH.",
+    "No DART-only read has been authorized or executed by this analysis. No register-value allowlist is used as bus-safety proof."
+  ],
+  "source_pins": {
+    "m1n1": "121fcbf35d4501814b58ca5347926a4173b6a512",
+    "m1n1_read_files_equal_pin_git_objects": true,
+    "linux": "6a08a08e57558083f552733a5276d71b1a4d8ff6",
+    "linux_acquisition_receipt": "reports/sprint-010/platform-source-acquisition.json",
+    "acquired_driver_SHA256_and_Git_blobs_reverified": true
+  },
+  "source_hashes": {
+    "sources/m1n1-baseline/src/pcie.c": "fc285646b6c1bdb950b792d55326caf838b58d57799e9ad1327e5ec4d38f86df",
+    "sources/m1n1-baseline/src/dart.c": "c650a8aa7823518e72988f905eef9f2dc6dd229dee584dcef89c65a766c3dba2",
+    "sources/m1n1-baseline/src/pmgr.c": "dad4bebb125aab3811f2674654c20641956f945f2cbd496ac6d99d6df73299e3",
+    "sources/m1n1-baseline/src/kboot.c": "3474be9e8ad071f004099ff11bf2820005a97987db12bef02fb282be80c1e31c",
+    "sources/m1n1-baseline/src/hv/hv.c": "6b92efaea66a4d50aac19f5bd4e98edebaeb262471c018dd57f7716cf942590f",
+    "sources/m1n1-baseline/proxyclient/m1n1/hw/dart.py": "a7fbb5771b77128a16ea7eced4bc4058c02d8f1c1838ed9359f2e2ba37fe5387",
+    "sources/m1n1-baseline/proxyclient/m1n1/hw/dart8020.py": "497b7a64ba8e99cb406a267f16f3b6ab431144a88bf420cf1ac47178ad1c346b",
+    "sources/linux-aurora-platform-reference/drivers/iommu/apple-dart.c": "ebbd025037478cf792d979fb79d55cfd337a1a4ed2948ed756b1a17be301d270",
+    "sources/linux-aurora-platform-reference/drivers/pci/controller/pcie-apple.c": "3ed383956928941e16ec75445c1a94bfbd2f957ccb29634ce88327472701fd37"
+  }
+}

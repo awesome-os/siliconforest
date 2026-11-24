@@ -1,0 +1,87 @@
+--- a/src/Frameworks/AppKit/NSScroller.m
++++ b/src/Frameworks/AppKit/NSScroller.m
+@@ -16,6 +16,14 @@
+ #import <AppKit/NSGraphicsStyle.h>
+ #import <Foundation/NSKeyedArchiver.h>
+ #import <AppKit/NSRaise.h>
++#import <AppKit/NSAppearance.h>
++#import <AppKit/NSBezierPath.h>
++
++extern BOOL SFControlLookIs26(void);
++
++@interface NSAppearance (SFScrollerDark)
++-(BOOL)_isDark;
++@end
+ 
+ @implementation NSScroller
+ 
+@@ -223,7 +231,21 @@
+    return (int)value;
+ }
+ 
++/* In the macOS 26 look a scroller has no arrow buttons: its slot is its whole length and the knob
++ * is a rounded bar in it (drawn in -drawRect:). The macOS 15 look (SFControlLook=15) keeps the
++ * buttons. Not measured against a Mac: a scroller is shown there only while scrolling. */
+ -(NSRect)rectForPart:(NSScrollerPart)part {
++   NSScrollArrowPosition position=_arrowsPosition;
++   NSRect result;
++
++   if(SFControlLookIs26())
++    _arrowsPosition=NSScrollerArrowsNone;
++   result=[self _sfRectForPart:part];
++   _arrowsPosition=position;
++   return result;
++}
++
++-(NSRect)_sfRectForPart:(NSScrollerPart)part {
+    NSRect bounds=[self bounds];
+    NSRect decLine=bounds;
+    NSRect incLine;
+@@ -370,6 +392,33 @@
+ 
+ 
+ -(void)drawRect:(NSRect)rect {
++   if(SFControlLookIs26()){
++    BOOL   dark=[[NSAppearance currentDrawingAppearance] _isDark];
++    NSRect bounds=[self bounds];
++    NSRect bar=[self rectForPart:NSScrollerKnob];
++
++    [[NSColor colorWithCalibratedWhite:dark ? 0.16 : 0.965 alpha:1] setFill];
++    NSRectFill(bounds);
++    // a hairline on the side of the content
++    [[NSColor colorWithCalibratedWhite:dark ? 1 : 0 alpha:dark ? 0.08 : 0.07] setFill];
++    if([self isVertical])
++     NSRectFillUsingOperation(NSMakeRect(NSMinX(bounds),NSMinY(bounds),1,NSHeight(bounds)),NSCompositeSourceOver);
++    else
++     NSRectFillUsingOperation(NSMakeRect(NSMinX(bounds),NSMinY(bounds),NSWidth(bounds),1),NSCompositeSourceOver);
++    if(!NSIsEmptyRect(bar) && [self isEnabled]){
++     CGFloat thickness=[self isVertical] ? NSWidth(bar) : NSHeight(bar);
++     CGFloat inset=MAX(2,floor(thickness*0.22));
++     NSRect  knob=[self isVertical] ? NSInsetRect(bar,inset,2) : NSInsetRect(bar,2,inset);
++     CGFloat radius=MIN(NSWidth(knob),NSHeight(knob))/2;
++     BOOL    held=_isHighlighted && _hitPart==NSScrollerKnob;
++
++     if(NSWidth(knob)>0 && NSHeight(knob)>0){
++      [[NSColor colorWithCalibratedWhite:dark ? 1 : 0 alpha:held ? 0.55 : 0.34] setFill];
++      [[NSBezierPath bezierPathWithRoundedRect:knob xRadius:radius yRadius:radius] fill];
++     }
++    }
++    return;
++   }
+    NSRect decPage=[self rectForPart:NSScrollerDecrementPage];
+    NSRect incPage=[self rectForPart:NSScrollerIncrementPage];
+    NSRect slot=[self rectForPart:NSScrollerKnobSlot];
+--- a/src/Frameworks/AppKit/NSInterfacePart/SFControlDrawing.m
++++ b/src/Frameworks/AppKit/NSInterfacePart/SFControlDrawing.m
+@@ -127,6 +127,11 @@
+    return look;
+ }
+ 
++// for the controls that draw themselves (NSScroller)
++BOOL SFControlLookIs26(void) {
++   return lookIs26();
++}
++
+ /* The macOS 26 look, light appearance, every number measured from the control sheet rendered on
+  * a Mac (runs/cocoa/ref-macos/render-controls*.png; alpha over the window, n/255 as measured):
+  *   push button, pop-up, segmented track   black 20/255; disabled 10/255; corner radius a quarter

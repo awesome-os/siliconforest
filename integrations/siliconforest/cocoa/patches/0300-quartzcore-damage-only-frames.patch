@@ -1,0 +1,898 @@
+--- a/src/Frameworks/QuartzCore/CALayer.m
++++ b/src/Frameworks/QuartzCore/CALayer.m
+@@ -920,6 +920,11 @@
+    return __atomic_load_n(&_contentsSeed,__ATOMIC_ACQUIRE);
+ }
+ 
++// (FXPERF2) the renderer reads a layer's geometry straight from its properties when nothing animates it
++-(BOOL)_sfcaHasAnimations {
++   return [_animations count]>0;
++}
++
+ -(void)_setTextureId:(NSNumber *)value {
+    [lockedSwap(&_textureId,[value copy]) release];
+ }
+--- a/src/Frameworks/QuartzCore/CALayerContext.h
++++ b/src/Frameworks/QuartzCore/CALayerContext.h
+@@ -25,6 +25,12 @@
+     void *_sffxLastStamps;
+     unsigned _sffxStampCount;
+     uint64_t _sfcaPresentedSerial;
++    // (FXPERF2) damage frames (SFFX_GPU_DAMAGE=1): the drawable's damage of render serial n is at [n%8] (x0,y0,x1,y1,
++    // GL rows), the serial each exported frame holds, and where the frame exported last differs from the one before
++    int _sfdHistory[8][4];
++    uint64_t _sfdSlotSerial[2];
++    int _sfdExportDamage[4];
++    BOOL _sfdExportPartial;
+ }
+ 
+ -(void)_sffxMarkMutation;
+--- a/src/Frameworks/QuartzCore/CALayerContext.m
++++ b/src/Frameworks/QuartzCore/CALayerContext.m
+@@ -16,6 +16,14 @@
+ #include <stdio.h>
+ #include <objc/runtime.h>
+ 
++int CARendererSFFXDamageEnabled(void);
++
++@interface CARenderer(sfd)
++-(BOOL)_sfdDamage:(int *)box full:(BOOL)full;
++-(void)_sfdRenderInBox:(const int *)box;
++-(void)_sfdInvalidate;
++@end
++
+ @interface CALayer(private)
+ -(void)_setContext:(CALayerContext *)context;
+ -(CALayerContext *)_context;
+@@ -243,10 +251,7 @@
+     [self assignTextureIdsToLayerTree:child];
+ }
+ 
+--(void)renderLayer:(CALayer *)layer {
+-   @autoreleasepool {
+-   CGLSetCurrentContext(_glContext);
+-
++-(void)_setUpFrameState {
+    glEnable(GL_DEPTH_TEST);
+    //glShadeModel(GL_SMOOTH);
+ 
+@@ -263,7 +268,9 @@
+    glEnable(GL_TEXTURE_2D);
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_TEXTURE_COORD_ARRAY);
+-   
++}
++
++-(void)_deletePendingTextures {
+    GLsizei i=0;
+    GLuint  deleteIds[[_deleteTextureIds count]];
+    
+@@ -274,13 +281,54 @@
+     glDeleteTextures(i,deleteIds);
+    
+    [_deleteTextureIds removeAllObjects];
+-   
++}
++
++-(void)renderLayer:(CALayer *)layer {
++   @autoreleasepool {
++   CGLSetCurrentContext(_glContext);
++   [self _setUpFrameState];
++   [self _deletePendingTextures];
+    [self assignTextureIdsToLayerTree:layer];
+-   
+    [_renderer render];
+    }
+ }
+ 
++// (FXPERF2) a damage frame: nothing is drawn when no layer's picture changed (the last frame stays, no new serial),
++// else only the damaged rectangle of the retained drawable
++-(void)_sfdRender {
++   @autoreleasepool {
++   int box[4];
++
++   CGLSetCurrentContext(_glContext);
++   [self _setUpFrameState];
++   if(![_renderer _sfdDamage:box full:(_sffxRenderSerial==0)]){
++    if(sfcaDiagOn())
++     sfcaCount(0);
++    return;
++   }
++   [self _deletePendingTextures];
++   [self assignTextureIdsToLayerTree:_layer];
++   [_renderer _sfdRenderInBox:box];
++   _sffxRenderSerial++;
++   memcpy(_sfdHistory[_sffxRenderSerial%8],box,sizeof(box));
++   if(sfcaDiagOn())
++    sfcaCount(1);
++   }
++}
++
++// the union of the drawable's damage over render serials (after, upto]; NO when it is not known (the whole frame)
++-(BOOL)_sfdDamageAfter:(uint64_t)after upTo:(uint64_t)upto into:(int *)box {
++   box[0]=box[1]=INT32_MAX; box[2]=box[3]=INT32_MIN;
++   if(after==0 || after>upto || upto-after>7)
++    return NO;
++   for(uint64_t n=after+1;n<=upto;n++){
++    const int *d=_sfdHistory[n%8];
++
++    box[0]=MIN(box[0],d[0]); box[1]=MIN(box[1],d[1]); box[2]=MAX(box[2],d[2]); box[3]=MAX(box[3],d[3]);
++   }
++   return YES;
++}
++
+ // (TERM7) what CoreAnimation does before it draws a tree: each layer marked with -setNeedsDisplay fills its contents
+ static void displayLayersIfNeeded(CALayer *layer,int depth) {
+    [layer displayIfNeeded];
+@@ -295,6 +343,10 @@
+ 
+ -(void)render {
+    displayLayersIfNeeded(_layer,0);
++   if(CARendererSFFXDamageEnabled()){
++    [self _sfdRender];
++    return;
++   }
+    uint64_t generation=__atomic_load_n(&_sffxGeneration,__ATOMIC_ACQUIRE);
+    // (TERM9) the environment is read once: Firefox's launcher sets it, no other application has it
+    static int dirtyFrames=-1;
+@@ -360,7 +412,16 @@
+    BOOL fresh=_sffxRenderSerial!=_sfcaPresentedSerial;
+ 
+    _sfcaPresentedSerial=_sffxRenderSerial;
+-   return fresh || !sfcaSkipUnchanged();
++   return fresh || !(sfcaSkipUnchanged() || CARendererSFFXDamageEnabled());
++}
++
++// (FXPERF2) where the frame -copySFFXRenderedSurface returned last differs from the one it returned before, in that
++// surface's pixels (x0,y0,x1,y1, rows top-down); NO: the whole frame
++-(BOOL)_sffxExportDamage:(int *)box {
++   if(!_sfdExportPartial)
++    return NO;
++   memcpy(box,_sfdExportDamage,sizeof(_sfdExportDamage));
++   return YES;
+ }
+ 
+ -(void)_scheduleRender {
+@@ -424,14 +485,21 @@
+    if(!create||!width||!height||!copy)return NULL;
+    int w=(int)ceil(_frame.size.width*_backingScale),h=(int)ceil(_frame.size.height*_backingScale);
+    if(w<=0||h<=0||w>16384||h>16384)return NULL;
+-   if(getenv("SFFX_GPU_DIRTY_FRAMES") && _sffxLastSurface &&
+-      _sffxCopiedSerial==_sffxRenderSerial && width(_sffxLastSurface)==(size_t)w && height(_sffxLastSurface)==(size_t)h)
++   BOOL damageFrames=CARendererSFFXDamageEnabled();
++
++   if((damageFrames || getenv("SFFX_GPU_DIRTY_FRAMES")) && _sffxLastSurface &&
++      _sffxCopiedSerial==_sffxRenderSerial && width(_sffxLastSurface)==(size_t)w && height(_sffxLastSurface)==(size_t)h){
++    _sfdExportPartial=damageFrames;
++    _sfdExportDamage[0]=_sfdExportDamage[1]=_sfdExportDamage[2]=_sfdExportDamage[3]=0;
+     return CFRetain(_sffxLastSurface);
++   }
+    unsigned index=_sffxNext++%2;
+    CFTypeRef surface=_sffxFrames[index];
+    if(surface&&(width(surface)!=(size_t)w||height(surface)!=(size_t)h)){
+     CFRelease(surface);surface=NULL;_sffxFrames[index]=NULL;
+    }
++   if(!surface)
++    _sfdSlotSerial[index]=0;
+    if(!surface){
+     CFMutableDictionaryRef props=CFDictionaryCreateMutable(NULL,0,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks);
+     if(!props)return NULL;
+@@ -441,7 +509,35 @@
+     _sffxFrames[index]=surface=create(props);CFRelease(props);
+    }
+    CGLSetCurrentContext(_glContext);
+-   if(!surface||!copy(surface,1))return NULL;
++   if(!surface)return NULL;
++   if(damageFrames){
++    // (FXPERF2) the frame being written holds serial _sfdSlotSerial[index]: only what changed since goes in
++    static dispatch_once_t rectOnce;
++    static int (*copyRect)(CFTypeRef,int,int,int,int,int);
++    int region[4],since[4];
++    BOOL partial=[self _sfdDamageAfter:_sfdSlotSerial[index] upTo:_sffxRenderSerial into:region];
++
++    dispatch_once(&rectOnce,^{ copyRect=dlsym(RTLD_DEFAULT,"CGLSFFXCopyFramebufferRect"); });
++    if(partial && region[2]<=region[0])
++     ; // nothing to copy: the frame is current
++    else if(partial && copyRect!=NULL){
++     region[0]=MAX(region[0],0); region[1]=MAX(region[1],0); region[2]=MIN(region[2],w); region[3]=MIN(region[3],h);
++     if(region[2]>region[0] && region[3]>region[1] && !copyRect(surface,1,region[0],region[1],region[2]-region[0],region[3]-region[1]))
++      return NULL;
++    }
++    else if(!copy(surface,1))
++     return NULL;
++    _sfdSlotSerial[index]=_sffxRenderSerial;
++    _sfdExportPartial=_sffxLastSurface!=NULL && [self _sfdDamageAfter:_sffxCopiedSerial upTo:_sffxRenderSerial into:since];
++    if(_sfdExportPartial){
++     // GL rows bottom-up -> the surface's rows top-down
++     _sfdExportDamage[0]=MAX(since[0],0); _sfdExportDamage[2]=MIN(since[2],w);
++     _sfdExportDamage[1]=MAX(h-since[3],0); _sfdExportDamage[3]=MIN(h-since[1],h);
++     if(_sfdExportDamage[2]<=_sfdExportDamage[0] || _sfdExportDamage[3]<=_sfdExportDamage[1])
++      _sfdExportDamage[0]=_sfdExportDamage[1]=_sfdExportDamage[2]=_sfdExportDamage[3]=0;
++    }
++   }
++   else if(!copy(surface,1))return NULL;
+    if(_sffxLastSurface)CFRelease(_sffxLastSurface);
+    _sffxLastSurface=CFRetain(surface);_sffxCopiedSerial=_sffxRenderSerial;
+    return CFRetain(surface);
+--- a/src/Frameworks/QuartzCore/CARenderer.h
++++ b/src/Frameworks/QuartzCore/CARenderer.h
+@@ -8,6 +8,13 @@
+     void *_cglContext;
+     CGRect _bounds;
+     CALayer *_rootLayer;
++    // (FXPERF2) damage tracking (SFFX_GPU_DAMAGE=1): what each layer drew last frame, and this frame's
++    void *_sfdPrevious,*_sfdCurrent;
++    int _sfdViewport[4];
++    double _sfdProjection[16];
++    BOOL _sfdHavePrevious;
++    int _sfdScissor[4];
++    BOOL _sfdScissoring;
+ }
+ 
+ @property(assign) CGRect bounds;
+@@ -21,4 +28,12 @@
+ 
+ - (void)endFrame;
+ 
++// (FXPERF2) with the context current and its viewport and projection set: the window pixels (GL's bottom-up rows,
++// x0,y0,x1,y1) whose picture differs from the last frame drawn. NO when nothing differs. full forces the viewport.
++- (BOOL)_sfdDamage:(int *)box full:(BOOL)full;
++// draws only inside box (as -render, without its final flush); layers wholly outside are not drawn
++- (void)_sfdRenderInBox:(const int *)box;
++// the next damage is the whole viewport (the drawable was replaced)
++- (void)_sfdInvalidate;
++
+ @end
+--- a/src/Frameworks/QuartzCore/CARenderer.m
++++ b/src/Frameworks/QuartzCore/CARenderer.m
+@@ -16,6 +16,8 @@
+ #include <pthread.h>
+ #include <stdio.h>
+ #include <unistd.h>
++#include <limits.h>
++#include <string.h>
+ 
+ @interface CALayer(private)
+ -(void)_setContext:(CALayerContext *)context;
+@@ -23,10 +25,20 @@
+ -(NSNumber *)_textureId;
+ -(uint32_t)_contentsSeed;
+ -(NSNumber *)_textureIdSettingIfNone:(NSNumber *)value;
++-(BOOL)_sfcaHasAnimations;
+ @end
+ 
+ @implementation CARenderer
+ 
++struct sfdFrame;
++static void sfdFrameFree(struct sfdFrame *f);
++
++-(void)dealloc {
++   sfdFrameFree(_sfdPrevious);
++   sfdFrameFree(_sfdCurrent);
++   [super dealloc];
++}
++
+ -(CGRect)bounds {
+    return _bounds;
+ }
+@@ -106,9 +118,16 @@
+    return applyMediaTimingFunction(function,zeroToOne);
+ }
+ 
++// (FXPERF2) the keys the renderer interpolates; a layer nothing animates is read through its properties (KVC boxed
++// each value, structs through an NSInvocation: a large part of the renderer's time in Firefox's parent)
++static NSString *const sfcaKeyAnchorPoint=@"anchorPoint",*const sfcaKeyPosition=@"position",*const sfcaKeyBounds=@"bounds",
++   *const sfcaKeyOpacity=@"opacity";
++
+ static float interpolateFloatInLayerKey(CALayer *layer,NSString *key,CFTimeInterval currentTime){
+-   CAAnimation *animation=[layer animationForKey:key];
++   CAAnimation *animation=[layer _sfcaHasAnimations] ? [layer animationForKey:key] : nil;
+    
++   if(animation==nil && key==sfcaKeyOpacity)
++    return layer.opacity;
+    if(animation==nil)
+     return [[layer valueForKey:key] floatValue];
+    
+@@ -136,8 +155,12 @@
+ }
+ 
+ static CGPoint interpolatePointInLayerKey(CALayer *layer,NSString *key,CFTimeInterval currentTime){
+-   CAAnimation *animation=[layer animationForKey:key];
++   CAAnimation *animation=[layer _sfcaHasAnimations] ? [layer animationForKey:key] : nil;
+    
++   if(animation==nil && key==sfcaKeyAnchorPoint)
++    return layer.anchorPoint;
++   if(animation==nil && key==sfcaKeyPosition)
++    return layer.position;
+    if(animation==nil)
+     return [[layer valueForKey:key] pointValue];
+    
+@@ -166,8 +189,10 @@
+ }
+ 
+ static CGRect interpolateRectInLayerKey(CALayer *layer,NSString *key,CFTimeInterval currentTime){
+-   CAAnimation *animation=[layer animationForKey:key];
++   CAAnimation *animation=[layer _sfcaHasAnimations] ? [layer animationForKey:key] : nil;
+ 
++   if(animation==nil && key==sfcaKeyBounds)
++    return layer.bounds;
+    if(animation==nil){
+     return [[layer valueForKey:key] rectValue];
+    }
+@@ -657,10 +682,46 @@
+    glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+ }
+ 
++// (FXPERF2) during a damage frame a rectangular, axis-aligned clip is a scissor box covering exactly the pixels whose
++// centres the stencil shape would cover, so no stencil pass (and no full-window stencil clear) is needed for it
++static BOOL sfdRectClips;
++
++static BOOL sfdAxisAligned(void){
++   GLfloat m[16],p[16];
++
++   glGetFloatv(GL_MODELVIEW_MATRIX,m);
++   glGetFloatv(GL_PROJECTION_MATRIX,p);
++   return fabsf(m[1])<1e-6f && fabsf(m[4])<1e-6f && fabsf(m[3])<1e-6f && fabsf(m[7])<1e-6f &&
++          fabsf(p[3])<1e-6f && fabsf(p[7])<1e-6f && fabsf(p[11])<1e-6f;
++}
++
++static void windowRectCentred(CGFloat w,CGFloat h,GLint box[4]){
++   GLfloat m[16],p[16];
++   GLint view[4];
++   double x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
++
++   glGetFloatv(GL_MODELVIEW_MATRIX,m);
++   glGetFloatv(GL_PROJECTION_MATRIX,p);
++   glGetIntegerv(GL_VIEWPORT,view);
++   for(int i=0;i<4;i++){
++    double x=(i&1)?w:0,y=(i&2)?h:0;
++    double ex=m[0]*x+m[4]*y+m[12],ey=m[1]*x+m[5]*y+m[13],ez=m[2]*x+m[6]*y+m[14],ew=m[3]*x+m[7]*y+m[15];
++    double cx=p[0]*ex+p[4]*ey+p[8]*ez+p[12]*ew,cy=p[1]*ex+p[5]*ey+p[9]*ez+p[13]*ew,cw=p[3]*ex+p[7]*ey+p[11]*ez+p[15]*ew;
++    double wx=view[0]+(cx/cw+1)*view[2]/2,wy=view[1]+(cy/cw+1)*view[3]/2;
++
++    x0=MIN(x0,wx); y0=MIN(y0,wy); x1=MAX(x1,wx); y1=MAX(y1,wy);
++   }
++   // a pixel is inside when its centre is: [ceil(x0-0.5), ceil(x1-0.5))
++   box[0]=(GLint)ceil(x0-0.5); box[1]=(GLint)ceil(y0-0.5);
++   box[2]=MAX(0,(GLint)ceil(x1-0.5)-box[0]); box[3]=MAX(0,(GLint)ceil(y1-0.5)-box[1]);
++}
++
+ static BOOL pushClip(CGFloat w,CGFloat h,CGFloat radius,CACornerMask corners,float z,GLint savedScissor[5]){
+    GLint bits=0;
++   BOOL rect=sfdRectClips && !(radius>0) && sfdAxisAligned();
+ 
+-   glGetIntegerv(GL_STENCIL_BITS,&bits);
++   if(!rect)
++    glGetIntegerv(GL_STENCIL_BITS,&bits);
+    if(bits>0){
+     if(clipDepth==0){
+      glClearStencil(0);
+@@ -677,7 +738,10 @@
+ 
+    savedScissor[4]=glIsEnabled(GL_SCISSOR_TEST);
+    glGetIntegerv(GL_SCISSOR_BOX,savedScissor);
+-   windowRect(w,h,box);
++   if(rect)
++    windowRectCentred(w,h,box);
++   else
++    windowRect(w,h,box);
+    if(savedScissor[4]){
+     GLint x0=MAX(box[0],savedScissor[0]),y0=MAX(box[1],savedScissor[1]);
+     GLint x1=MIN(box[0]+box[2],savedScissor[0]+savedScissor[2]),y1=MIN(box[1]+box[3],savedScissor[1]+savedScissor[3]);
+@@ -939,11 +1003,451 @@
+ 
+ static int sfcaDepth;
+ 
+--(void)_renderLayer:(CALayer *)layer z:(float)z currentTime:(CFTimeInterval)currentTime {
++// (FXPERF2) SFFX_GPU_DAMAGE=1 (Firefox's launcher only; needs SFFX_GPU_PRESENT=1): damage-only frames. Before a frame
++// is drawn, a walk of the tree (no GL) works out for every layer the window pixels it can touch and a signature of
++// everything that decides those pixels (matrix, size, clip, paint order, depth, contents and their seeds, opacity,
++// colours, border, shadow, mask, filters). Layers whose signature changed, appeared or went contribute their old and
++// new boxes; the frame is drawn with the scissor set to that rectangle into the retained drawable, and layers wholly
++// outside it are not drawn at all. Inside the rectangle every layer is drawn as before, in the same order and depth,
++// so its pixels are those a whole-window frame would have. A rectangular clip (no rounded corners, axis-aligned)
++// becomes a scissor box with the same pixel coverage instead of a stencil pass with a full-window stencil clear.
++int CARendererSFFXDamageEnabled(void){
++   static int on=-1;
++
++   if(on<0){
++    const char *v=getenv("SFFX_GPU_DAMAGE");
++    const char *p=getenv("SFFX_GPU_PRESENT");
++
++    on=v!=NULL && strcmp(v,"1")==0 && p!=NULL && strcmp(p,"1")==0;
++   }
++   return on;
++}
++
++static int sfdTrace(void){
++   static int on=-1;
++
++   if(on<0)
++    on=getenv("SFFX_GPU_DAMAGE_TRACE")!=NULL;
++   return on;
++}
++
++// part: the signature's pieces (order, depth, matrix, size and clip, contents, colours and opacity, border/shadow/mask),
++// kept to say what changed (SFFX_GPU_DAMAGE_TRACE)
++enum { SFD_ORDER, SFD_DEPTH, SFD_MATRIX, SFD_CLIP, SFD_CONTENTS, SFD_LOOK, SFD_EXTRA, SFD_PARTS };
++struct sfdRecord { void *layer; uint64_t sig; uint64_t part[SFD_PARTS]; int box[4]; int tree[4]; int matched; };
++struct sfdFrame { struct sfdRecord *r; unsigned count,cap; uint32_t *index; unsigned indexCap; };
++
++static void sfdBoxEmpty(int *b){ b[0]=b[1]=INT_MAX; b[2]=b[3]=INT_MIN; }
++static BOOL sfdBoxIsEmpty(const int *b){ return b[2]<=b[0] || b[3]<=b[1]; }
++static void sfdBoxUnion(int *a,const int *b){
++   if(sfdBoxIsEmpty(b))
++    return;
++   if(sfdBoxIsEmpty(a)){ memcpy(a,b,4*sizeof(int)); return; }
++   a[0]=MIN(a[0],b[0]); a[1]=MIN(a[1],b[1]); a[2]=MAX(a[2],b[2]); a[3]=MAX(a[3],b[3]);
++}
++static void sfdBoxIntersect(int *a,const int *b){
++   a[0]=MAX(a[0],b[0]); a[1]=MAX(a[1],b[1]); a[2]=MIN(a[2],b[2]); a[3]=MIN(a[3],b[3]);
++   if(sfdBoxIsEmpty(a))
++    sfdBoxEmpty(a);
++}
++static BOOL sfdBoxMeets(const int *a,const int *b){
++   return !sfdBoxIsEmpty(a) && !sfdBoxIsEmpty(b) && a[0]<b[2] && b[0]<a[2] && a[1]<b[3] && b[1]<a[3];
++}
++
++static void sfdFrameReset(struct sfdFrame *f){ f->count=0; }
++
++static struct sfdRecord *sfdFrameAdd(struct sfdFrame *f){
++   if(f->count==f->cap){
++    unsigned cap=f->cap ? f->cap*2 : 64;
++    struct sfdRecord *grown=realloc(f->r,cap*sizeof(*grown));
++
++    if(grown==NULL)
++     return NULL;
++    f->r=grown; f->cap=cap;
++   }
++   memset(&f->r[f->count],0,sizeof(f->r[0]));
++   return &f->r[f->count++];
++}
++
++static unsigned sfdHash(void *p){
++   uintptr_t v=(uintptr_t)p;
++
++   v^=v>>33; v*=0xff51afd7ed558ccdULL; v^=v>>33;
++   return (unsigned)v;
++}
++
++static void sfdFrameIndex(struct sfdFrame *f){
++   unsigned want=16;
++
++   while(want<f->count*2)
++    want*=2;
++   if(want!=f->indexCap){
++    free(f->index);
++    f->index=malloc(want*sizeof(uint32_t));
++    f->indexCap=f->index ? want : 0;
++   }
++   if(f->index==NULL)
++    return;
++   memset(f->index,0,f->indexCap*sizeof(uint32_t));
++   for(unsigned i=0;i<f->count;i++){
++    unsigned h=sfdHash(f->r[i].layer)&(f->indexCap-1);
++
++    while(f->index[h]!=0)
++     h=(h+1)&(f->indexCap-1);
++    f->index[h]=i+1;
++   }
++}
++
++static struct sfdRecord *sfdFrameFind(struct sfdFrame *f,void *layer){
++   if(f==NULL || f->index==NULL || f->count==0)
++    return NULL;
++   unsigned h=sfdHash(layer)&(f->indexCap-1);
++
++   for(unsigned n=0;n<f->indexCap && f->index[h]!=0;n++,h=(h+1)&(f->indexCap-1))
++    if(f->r[f->index[h]-1].layer==layer)
++     return &f->r[f->index[h]-1];
++   return NULL;
++}
++
++static void sfdFrameFree(struct sfdFrame *f){
++   if(f==NULL)
++    return;
++   free(f->r); free(f->index); free(f);
++}
++
++// column-major 4x4, as GL keeps its matrices: m = m * b
++static void sfdMul(double *m,const double *b){
++   double r[16];
++
++   for(int c=0;c<4;c++)
++    for(int row=0;row<4;row++)
++     r[c*4+row]=m[0*4+row]*b[c*4+0]+m[1*4+row]*b[c*4+1]+m[2*4+row]*b[c*4+2]+m[3*4+row]*b[c*4+3];
++   memcpy(m,r,sizeof(r));
++}
++static void sfdTranslate(double *m,double x,double y,double z){
++   double t[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, x,y,z,1};
++
++   sfdMul(m,t);
++}
++static void sfdScale(double *m,double x,double y,double z){
++   double t[16]={x,0,0,0, 0,y,0,0, 0,0,z,0, 0,0,0,1};
++
++   sfdMul(m,t);
++}
++
++struct sfdWalk {
++   struct sfdFrame *frame;
++   void *previous;          // the layer drawn before, in paint order
++   double projection[16];
++   int viewport[4];
++   CFTimeInterval time;
++};
++
++// the window pixels of a rectangle of layer space, as windowRect computes them from GL's matrices
++static void sfdWindowBox(const struct sfdWalk *w,const double *m,CGRect r,int *box){
++   double x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
++   const double *p=w->projection;
++
++   for(int i=0;i<4;i++){
++    double x=(i&1)?CGRectGetMaxX(r):r.origin.x,y=(i&2)?CGRectGetMaxY(r):r.origin.y;
++    double ex=m[0]*x+m[4]*y+m[12],ey=m[1]*x+m[5]*y+m[13],ez=m[2]*x+m[6]*y+m[14],ew=m[3]*x+m[7]*y+m[15];
++    double cx=p[0]*ex+p[4]*ey+p[8]*ez+p[12]*ew,cy=p[1]*ex+p[5]*ey+p[9]*ez+p[13]*ew,cw=p[3]*ex+p[7]*ey+p[11]*ez+p[15]*ew;
++
++    if(!(cw>1e-9)){ box[0]=w->viewport[0]; box[1]=w->viewport[1]; box[2]=w->viewport[0]+w->viewport[2]; box[3]=w->viewport[1]+w->viewport[3]; return; }
++    double wx=w->viewport[0]+(cx/cw+1)*w->viewport[2]/2,wy=w->viewport[1]+(cy/cw+1)*w->viewport[3]/2;
++
++    x0=MIN(x0,wx); y0=MIN(y0,wy); x1=MAX(x1,wx); y1=MAX(y1,wy);
++   }
++   // one pixel of margin for rounding: the box only has to contain what is drawn
++   box[0]=(int)floor(x0)-1; box[1]=(int)floor(y0)-1; box[2]=(int)ceil(x1)+1; box[3]=(int)ceil(y1)+1;
++}
++
++static uint64_t sfdMix(uint64_t h,uint64_t v){
++   h^=v; h*=0x100000001b3ULL; h^=h>>29;
++   return h;
++}
++static uint64_t sfdMixDouble(uint64_t h,double v){
++   uint64_t u;
++
++   memcpy(&u,&v,sizeof(u));
++   return sfdMix(h,u);
++}
++static uint64_t sfdMixColor(uint64_t h,CGColorRef color){
++   const CGFloat *c;
++   size_t count;
++
++   if(color==NULL || (c=CGColorGetComponents(color))==NULL)
++    return sfdMix(h,0x51);
++   count=CGColorGetNumberOfComponents(color);
++   h=sfdMix(h,count);
++   for(size_t i=0;i<count && i<5;i++)
++    h=sfdMixDouble(h,c[i]);
++   return h;
++}
++
++-(void)_sfdWalk:(CALayer *)layer walk:(struct sfdWalk *)w matrix:(const double *)parent z:(float)z clip:(const int *)clip flip:(int)flip tree:(int *)parentTree {
+    if(layer.isHidden)
+     return;
+ 
++   struct sfdRecord *record=sfdFrameAdd(w->frame);
++
++   if(record==NULL)
++    return;
++   unsigned index=w->frame->count-1;
+    id contents=layer.contents;
++   record->layer=(void *)layer;
++   CGPoint anchorPoint=interpolatePointInLayerKey(layer,sfcaKeyAnchorPoint,w->time);
++   CGPoint position=interpolatePointInLayerKey(layer,sfcaKeyPosition,w->time);
++   CGRect  bounds=interpolateRectInLayerKey(layer,sfcaKeyBounds,w->time);
++   float   opacity=interpolateFloatInLayerKey(layer,sfcaKeyOpacity,w->time);
++   CGFloat width=bounds.size.width,height=bounds.size.height;
++   CATransform3D transform=[layer transform];
++   double m[16];
++   uint64_t h=0xcbf29ce484222325ULL;
++
++   z+=layer.zPosition;
++   memcpy(m,parent,sizeof(m));
++   sfdTranslate(m,position.x,position.y,0);
++   if(!CATransform3DIsIdentity(transform))
++    sfdMul(m,(const double *)&transform);
++   sfdTranslate(m,-(width*anchorPoint.x),-(height*anchorPoint.y),0);
++
++   // what the layer itself can touch: its bounds and its shadow, inside the clips around it
++   CGRect local=CGRectMake(0,0,width,height);
++   BOOL shadow=layer.shadowOpacity>0 && (layer.backgroundColor!=NULL || contents!=nil || layer.shadowPath!=NULL);
++
++   if(shadow){
++    CGRect shape=layer.shadowPath!=NULL ? CGPathGetBoundingBox(layer.shadowPath) : local;
++    CGFloat blur=MAX(0,layer.shadowRadius);
++
++    shape=CGRectOffset(shape,layer.shadowOffset.width,layer.shadowOffset.height);
++    local=CGRectUnion(local,CGRectInset(shape,-blur/2-1,-blur/2-1));
++   }
++   sfdWindowBox(w,m,local,record->box);
++   sfdBoxIntersect(record->box,clip);
++
++   // paint order: the layer drawn just before this one (an inserted or removed layer changes only its neighbour's)
++   record->part[SFD_ORDER]=sfdMix(h,(uintptr_t)w->previous);
++   w->previous=(void *)layer;
++   record->part[SFD_DEPTH]=sfdMixDouble(h,z);
++   for(int i=0;i<16;i++)
++    h=sfdMixDouble(h,m[i]);
++   record->part[SFD_MATRIX]=h; h=0xcbf29ce484222325ULL;
++   h=sfdMixDouble(h,width); h=sfdMixDouble(h,height);
++   for(int i=0;i<4;i++)
++    h=sfdMix(h,(uint32_t)clip[i]);
++   h=sfdMix(h,flip&1);
++   record->part[SFD_CLIP]=h; h=0xcbf29ce484222325ULL;
++   h=sfdMix(h,(uintptr_t)contents);
++   if(contents!=nil){
++    BOOL surface=contentsIsSurface(contents);
++
++    h=sfdMix(h,[layer _contentsSeed]);
++    h=sfdMix(h,surface ? surfaceAPI.seed((CFTypeRef)contents) : 0);
++    CGRect cr=layer.contentsRect;
++
++    h=sfdMixDouble(h,cr.origin.x); h=sfdMixDouble(h,cr.origin.y); h=sfdMixDouble(h,cr.size.width); h=sfdMixDouble(h,cr.size.height);
++    h=sfdMix(h,(uintptr_t)layer.minificationFilter); h=sfdMix(h,(uintptr_t)layer.magnificationFilter);
++   }
++   record->part[SFD_CONTENTS]=h; h=0xcbf29ce484222325ULL;
++   h=sfdMixDouble(h,opacity);
++   h=sfdMixDouble(h,layer.cornerRadius);
++   h=sfdMix(h,layer.maskedCorners);
++   h=sfdMix(h,layer.masksToBounds);
++   h=sfdMixColor(h,layer.backgroundColor);
++   record->part[SFD_LOOK]=h; h=0xcbf29ce484222325ULL;
++   h=sfdMixDouble(h,layer.borderWidth);
++   if(layer.borderWidth>0)
++    h=sfdMixColor(h,layer.borderColor);
++   h=sfdMixDouble(h,layer.shadowOpacity);
++   if(shadow){
++    h=sfdMixColor(h,layer.shadowColor);
++    h=sfdMixDouble(h,layer.shadowOffset.width); h=sfdMixDouble(h,layer.shadowOffset.height);
++    h=sfdMixDouble(h,layer.shadowRadius); h=sfdMix(h,(uintptr_t)layer.shadowPath);
++   }
++   CALayer *mask=layer.mask;
++
++   h=sfdMix(h,(uintptr_t)mask);
++   if(mask!=nil){
++    CGRect mb=mask.bounds;
++
++    h=sfdMix(h,mask.isHidden);
++    h=sfdMixDouble(h,mask.position.x); h=sfdMixDouble(h,mask.position.y);
++    h=sfdMixDouble(h,mask.anchorPoint.x); h=sfdMixDouble(h,mask.anchorPoint.y);
++    h=sfdMixDouble(h,mb.origin.x); h=sfdMixDouble(h,mb.origin.y); h=sfdMixDouble(h,mb.size.width); h=sfdMixDouble(h,mb.size.height);
++    h=sfdMixDouble(h,mask.cornerRadius); h=sfdMix(h,mask.maskedCorners);
++    h=sfdMix(h,[mask isKindOfClass:[CAShapeLayer class]] ? (uintptr_t)[(CAShapeLayer *)mask path] : 0);
++   }
++   record->part[SFD_EXTRA]=h;
++   h=0xcbf29ce484222325ULL;
++   for(int k=0;k<SFD_PARTS;k++)
++    h=sfdMix(h,record->part[k]);
++   record->sig=h;
++   memcpy(record->tree,record->box,sizeof(record->tree));
++
++   // sublayers, inside this layer's clip when it masks to its bounds
++   int childClip[4];
++
++   memcpy(childClip,clip,sizeof(childClip));
++   if(layer.masksToBounds && width>0 && height>0){
++    int own[4];
++
++    sfdWindowBox(w,m,CGRectMake(0,0,width,height),own);
++    sfdBoxIntersect(childClip,own);
++   }
++   NSArray *sublayers=layer.sublayers;
++
++   if([sublayers count]>0){
++    CATransform3D sublayerTransform=layer.sublayerTransform;
++    double cm[16];
++    int tree[4];
++
++    memcpy(cm,m,sizeof(cm));
++    if(!CATransform3DIsIdentity(sublayerTransform)){
++     sfdTranslate(cm,width*anchorPoint.x,height*anchorPoint.y,0);
++     sfdMul(cm,(const double *)&sublayerTransform);
++     sfdTranslate(cm,-(width*anchorPoint.x),-(height*anchorPoint.y),0);
++    }
++    if(layer.isGeometryFlipped){
++     sfdTranslate(cm,0,height,0);
++     sfdScale(cm,1,-1,1);
++    }
++    sfdBoxEmpty(tree);
++    for(CALayer *child in sublayers)
++     [self _sfdWalk:child walk:w matrix:cm z:z+1 clip:childClip flip:flip+(layer.isGeometryFlipped?1:0) tree:tree];
++    // the frame's array may have moved while the sublayers were added
++    sfdBoxUnion(w->frame->r[index].tree,tree);
++   }
++   sfdBoxUnion(parentTree,w->frame->r[index].tree);
++}
++
++-(void)_sfdInvalidate {
++   _sfdHavePrevious=NO;
++}
++
++-(BOOL)_sfdDamage:(int *)damage full:(BOOL)full {
++   struct sfdWalk w;
++   float p[16];
++   double identity[16]={1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
++   int viewportBox[4],tree[4];
++
++   if(_sfdCurrent==NULL) _sfdCurrent=calloc(1,sizeof(struct sfdFrame));
++   if(_sfdPrevious==NULL) _sfdPrevious=calloc(1,sizeof(struct sfdFrame));
++   if(_sfdCurrent==NULL || _sfdPrevious==NULL){
++    glGetIntegerv(GL_VIEWPORT,damage);
++    damage[2]+=damage[0]; damage[3]+=damage[1];
++    return YES;
++   }
++   w.frame=_sfdCurrent;
++   w.previous=NULL;
++   w.time=CACurrentMediaTime();
++   glGetFloatv(GL_PROJECTION_MATRIX,p);
++   for(int i=0;i<16;i++)
++    w.projection[i]=p[i];
++   glGetIntegerv(GL_VIEWPORT,w.viewport);
++   viewportBox[0]=w.viewport[0]; viewportBox[1]=w.viewport[1];
++   viewportBox[2]=w.viewport[0]+w.viewport[2]; viewportBox[3]=w.viewport[1]+w.viewport[3];
++   sfdFrameReset(_sfdCurrent);
++   sfdBoxEmpty(tree);
++   if(_rootLayer!=nil)
++    [self _sfdWalk:_rootLayer walk:&w matrix:identity z:0 clip:viewportBox flip:0 tree:tree];
++   sfdFrameIndex(_sfdCurrent);
++
++   struct sfdFrame *now=_sfdCurrent,*before=_sfdPrevious;
++
++   BOOL projected=memcmp(_sfdProjection,w.projection,sizeof(_sfdProjection))==0;
++
++   memcpy(_sfdProjection,w.projection,sizeof(_sfdProjection));
++   if(!_sfdHavePrevious || full || !projected || memcmp(_sfdViewport,w.viewport,sizeof(_sfdViewport))!=0)
++    memcpy(damage,viewportBox,sizeof(viewportBox));
++   else {
++    sfdBoxEmpty(damage);
++    for(unsigned i=0;i<before->count;i++)
++     before->r[i].matched=0;
++    unsigned added=0,removed=0,changed=0,why[SFD_PARTS]={0};
++    long biggest=0;
++    int biggestBox[4]={0};
++
++    for(unsigned i=0;i<now->count;i++){
++     struct sfdRecord *r=&now->r[i],*old=sfdFrameFind(before,r->layer);
++
++     if(old==NULL){
++      sfdBoxUnion(damage,r->box);
++      added++;
++     }
++     else {
++      old->matched=1;
++      if(old->sig!=r->sig){
++       sfdBoxUnion(damage,r->box);
++       sfdBoxUnion(damage,old->box);
++       changed++;
++       for(int k=0;k<SFD_PARTS;k++)
++        if(old->part[k]!=r->part[k])
++         why[k]++;
++       long area=sfdBoxIsEmpty(r->box) ? 0 : (long)(r->box[2]-r->box[0])*(r->box[3]-r->box[1]);
++       if(area>biggest){ biggest=area; memcpy(biggestBox,r->box,sizeof(biggestBox)); }
++      }
++     }
++    }
++    for(unsigned i=0;i<before->count;i++)
++     if(!before->r[i].matched){
++      sfdBoxUnion(damage,before->r[i].box);
++      removed++;
++     }
++    if(sfdTrace()){
++     static unsigned long diffs;
++
++     if(diffs++%30==0)
++      fprintf(stderr,"SFFXDAMAGE-WHY layers=%u added=%u removed=%u changed=%u order=%u depth=%u matrix=%u clip=%u contents=%u look=%u extra=%u biggest=%d,%d,%d,%d\n",
++              now->count,added,removed,changed,why[SFD_ORDER],why[SFD_DEPTH],why[SFD_MATRIX],why[SFD_CLIP],why[SFD_CONTENTS],why[SFD_LOOK],why[SFD_EXTRA],
++              biggestBox[0],biggestBox[1],biggestBox[2],biggestBox[3]);
++    }
++    sfdBoxIntersect(damage,viewportBox);
++   }
++   memcpy(_sfdViewport,w.viewport,sizeof(_sfdViewport));
++   _sfdHavePrevious=YES;
++   _sfdPrevious=now; _sfdCurrent=before;
++   if(sfdTrace()){
++    static unsigned long frames;
++    long area=sfdBoxIsEmpty(damage) ? 0 : (long)(damage[2]-damage[0])*(damage[3]-damage[1]);
++
++    if(frames++%30==0)
++     fprintf(stderr,"SFFXDAMAGE frame=%lu layers=%u box=%d,%d,%d,%d area=%ld of %ld\n",frames,now->count,damage[0],damage[1],
++             damage[2],damage[3],area,(long)w.viewport[2]*w.viewport[3]);
++   }
++   return !sfdBoxIsEmpty(damage);
++}
++
++-(void)_sfdRenderInBox:(const int *)box {
++   memcpy(_sfdScissor,box,sizeof(_sfdScissor));
++   _sfdScissoring=YES;
++   glEnable(GL_SCISSOR_TEST);
++   glScissor(box[0],box[1],box[2]-box[0],box[3]-box[1]);
++   [self render];
++   glDisable(GL_SCISSOR_TEST);
++   _sfdScissoring=NO;
++}
++
++
++-(void)_renderLayer:(CALayer *)layer z:(float)z currentTime:(CFTimeInterval)currentTime {
++   if(layer.isHidden)
++    return;
++
++   // (FXPERF2) a damage frame skips a layer whose pixels and sublayers lie wholly outside the damage, and the drawing
++   // of one whose own pixels do (a layer the walk did not see, added since, is drawn)
++   BOOL drawOwn=YES;
++
++   if(_sfdScissoring){
++    struct sfdRecord *seen=sfdFrameFind(_sfdPrevious,layer);
++
++    if(seen!=NULL){
++     if(!sfdBoxMeets(seen->tree,_sfdScissor))
++      return;
++     drawOwn=sfdBoxMeets(seen->box,_sfdScissor);
++    }
++   }
++
++   id contents=drawOwn ? layer.contents : nil;
+    NSNumber *textureId=[layer _textureId];
+    GLuint    texture=[textureId unsignedIntValue];
+    GLboolean loadPixelData=GL_FALSE;
+@@ -998,10 +1502,10 @@
+         glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_REPEAT);
+    }
+    
+-   CGPoint anchorPoint=interpolatePointInLayerKey(layer,@"anchorPoint",currentTime);
+-   CGPoint position=interpolatePointInLayerKey(layer,@"position",currentTime);
+-   CGRect  bounds=interpolateRectInLayerKey(layer,@"bounds",currentTime);
+-   float   opacity=interpolateFloatInLayerKey(layer,@"opacity",currentTime);
++   CGPoint anchorPoint=interpolatePointInLayerKey(layer,sfcaKeyAnchorPoint,currentTime);
++   CGPoint position=interpolatePointInLayerKey(layer,sfcaKeyPosition,currentTime);
++   CGRect  bounds=interpolateRectInLayerKey(layer,sfcaKeyBounds,currentTime);
++   float   opacity=interpolateFloatInLayerKey(layer,sfcaKeyOpacity,currentTime);
+    CGFloat width=bounds.size.width,height=bounds.size.height;
+    CGFloat radius=MIN(layer.cornerRadius,MIN(width,height)/2);
+    CACornerMask corners=layer.maskedCorners;
+@@ -1058,7 +1562,7 @@
+     glMultMatrixd((const GLdouble *)&transform);
+    glTranslatef(-(width*anchorPoint.x),-(height*anchorPoint.y),0);
+ 
+-   if(layer.shadowOpacity>0 && (layer.backgroundColor!=NULL || contents!=nil || layer.shadowPath!=NULL))
++   if(drawOwn && layer.shadowOpacity>0 && (layer.backgroundColor!=NULL || contents!=nil || layer.shadowPath!=NULL))
+     drawShadow(layer,width,height,radius,corners,z,opacity);
+ 
+    // a mask clips the layer and its sublayers to the mask's shape, through the stencil when there is one
+@@ -1086,7 +1590,7 @@
+     }
+    }
+ 
+-   if(setColor(layer.backgroundColor,opacity))
++   if(drawOwn && setColor(layer.backgroundColor,opacity))
+     drawShape(width,height,radius,corners,z);
+ 
+    // rounded contents are clipped to the corners like the sublayers
+@@ -1168,7 +1672,7 @@
+     popClip(stencil,width,height,radius,corners,z,savedScissor);
+ 
+    // the border sits above the contents and sublayers
+-   if(layer.borderWidth>0 && setColor(layer.borderColor,opacity)){
++   if(drawOwn && layer.borderWidth>0 && setColor(layer.borderColor,opacity)){
+     GLboolean depth=glIsEnabled(GL_DEPTH_TEST);
+ 
+     glDisable(GL_DEPTH_TEST);
+@@ -1229,7 +1733,9 @@
+     }
+    }
+    sfcaDepth=0;
++   sfdRectClips=_sfdScissoring;
+    [self _renderLayer:_rootLayer z:0 currentTime:CACurrentMediaTime()];
++   sfdRectClips=NO;
+    if(sfcaDiag.on>0){
+     if(sfcaDiag.unnamed>0 || sfcaDiag.mismatched>0 || sfcaDiag.frame%300==1)
+      fprintf(stderr,"PD-CA-DIAG frame=%lu layers=%u with-contents=%u unnamed=%u mismatched=%u%s\n",sfcaDiag.frame,sfcaDiag.layers,
+@@ -1240,7 +1746,10 @@
+     }
+    }
+ 
+-   glFlush();
++   // (FXPERF2) a damage frame is flushed by the copy into the window's frame that follows (one submission: on this
++   // kernel each flush that touches a shared buffer waits for the GPU)
++   if(!_sfdScissoring)
++    glFlush();
+ }
+ 
+ -(void)endFrame {

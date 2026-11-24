@@ -1,0 +1,43 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Unattended check of the headset microphone path (/dev/sfmic) of SFAppleSound. Nothing
+# is plugged in, so what is captured is the codec converter's noise floor: the check is
+# that frames arrive at the sample rate, are not constant, and the path starts and stops
+# with its reader, alone and next to playback.
+#   alone     3 s read with nothing playing (the headphone stream runs silently)
+#   playing   3 s read while a tone plays on the headphone output
+#   again     a second reader after the first closed
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nSD_BEGIN_%s\n' "$nonce"
+get() { sysctl -n "$1" 2>/dev/null; }
+n=0
+while [ "$n" -lt 40 ]; do
+    case "$(get kern.sf_sound.state)" in idle*|failed*|codec-only*) break;; esac
+    sleep 1; n=$((n+1))
+done
+printf 'SD_STATE %s\n' "$(get kern.sf_sound.state)"
+ls -l /dev/sfmic 2>&1
+sysctl -w kern.sf_sound.volume_db=@VOLUME@ kern.sf_sound.tone_db=@TONEDB@ > /dev/null 2>&1
+take() {        # tag
+    t0=$(date +%s)
+    dd if=/dev/sfmic of=/tmp/mic-$1.raw bs=4096 count=140 2>&1 | tail -1
+    printf 'SD_MIC %s seconds=%s bytes=%s cksum=%s\n' "$1" "$(( $(date +%s) - t0 ))" \
+        "$(wc -c < /tmp/mic-$1.raw | tr -d ' ')" "$(cksum < /tmp/mic-$1.raw | cut -d' ' -f1)"
+    printf 'SD_MIC %s %s\n' "$1" "$(get kern.sf_sound.mic)"
+    printf 'SD_MIC %s codec %s\n' "$1" "$(get kern.sf_sound.codec)"
+}
+take alone
+sleep 2
+printf 'SD_MIC idle playing=%s %s\n' "$(get kern.sf_sound.playing)" "$(get kern.sf_sound.mic)"
+sysctl -w kern.sf_sound.tone=6 > /dev/null 2>&1
+sleep 2
+take playing
+n=0; while [ "$(get kern.sf_sound.playing)" = 1 ] && [ "$n" -lt 12 ]; do sleep 1; n=$((n+1)); done
+take again
+sleep 2
+sysctl kern.sf_sound.state kern.sf_sound.mic kern.sf_sound.playing kern.sf_sound.ring_errors kern.sf_sound.i2c_errors \
+    kern.sf_sound.dart_faults kern.sf_sound.late 2>&1
+printf 'SD_END_%s\n' "$nonce"
+printf '\nPD_BENCH_DONE\n'

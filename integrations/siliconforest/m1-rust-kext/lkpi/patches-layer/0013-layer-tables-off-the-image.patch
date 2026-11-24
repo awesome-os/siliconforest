@@ -1,0 +1,30 @@
+fbsdkpi: the thread and area tables are allocated at load instead of being .bss
+
+sThreads (8192 slots, 720 KiB) and sAreas (4096 slots, 128 KiB) were static arrays in every
+kext that carries the layer; the kernel collection has 16 MiB for all kexts together. They
+are now allocated by a static constructor when the kext loads. Same sizes, same behaviour.
+(The page hash of patch 0011 is allocated the same way, in lkpi_page_init.)
+UPSTREAM: yes (saves 850 KiB of collection space per LinuxKPI kext).
+
+--- a/src/Kernel/fbsdkpi/sf/sf_haiku_kernel.cpp
++++ b/src/Kernel/fbsdkpi/sf/sf_haiku_kernel.cpp
+@@ -910,7 +964,18 @@
+ 
+ enum { AREA_FREE = 0, AREA_CONTIG, AREA_PHYS };
+ 
+-static sf_area sAreas[SF_AREA_SLOTS];
++static sf_area *sAreas;
++
++// sf_tables: runs with the kext's other static constructors, before anything can call in
++static struct sf_tables_init {
++	sf_tables_init()
++	{
++		sThreads = (sf_thread *)sfos_malloc(sizeof(sf_thread) * SF_THREAD_SLOTS, 1, 1);
++		sAreas = (sf_area *)sfos_malloc(sizeof(sf_area) * SF_AREA_SLOTS, 1, 1);
++		if (sThreads == NULL || sAreas == NULL)
++			panic("pd: no memory for the thread and area tables");
++	}
++} sTablesInit;
+ static spinlock sAreaLock;
+ static int32 sNextArea = 1;
+ 

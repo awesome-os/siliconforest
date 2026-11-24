@@ -1,0 +1,921 @@
+--- a/sf_ans.h
++++ b/sf_ans.h
+@@ -1,7 +1,9 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ /*
+  * The M1's internal storage controller (ANS2: an RTKit coprocessor that speaks NVMe
+- * through a linear submission queue and the NVMMU), READ-ONLY.
++ * through a linear submission queue and the NVMMU), WRITE-FENCED BUILD (SFAppleNVMeRW):
++ * the read-only driver plus Write and Flush inside one LBA range (sf_nvme_wgate.h,
++ * sf_nvme_wring.h). With the fence closed it sends what the read-only build sends.
+  *
+  * Ported from the Omacom Linux tree (omacom/linux-aurora, integration/aurora):
+  *   drivers/nvme/host/apple.c   controller bring-up, queues, NVMMU, shutdown ("t8103" path)
+@@ -19,7 +21,7 @@
+ #ifndef _SF_ANS_H
+ #define _SF_ANS_H
+ 
+-#include "sf_nvme_gate.h"
++#include "sf_nvme_wring.h"
+ #include "sf_soc.h"
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ 
+@@ -90,6 +92,10 @@
+ 	uint32_t  blockSize;
+ 	SFAnsSlot slot[SF_ANS_SLOTS];
+ 	unsigned  inflight;
++	/* the one range that may be written; opened once by sf_wfence_open(), closed by sf_wfence_close() */
++	struct sf_nvme_fence fence;
++	uint32_t  fenceRejected;        /* refusals at the doorbell that were about the fence (must stay 0) */
++	uint64_t  writeCommands, writeBlocks, flushCommands;
+ 
+ 	/* Counters. gateRejected is the one the tests assert is 0. */
+ 	uint32_t  gateRejected, gateLastReason, gateLastOpcode, gateLastQueue;
+@@ -112,6 +118,12 @@
+ 	int freeSlot(void) const;
+ 	/* Starts a read of `blocks` blocks at `lba` into slot `s`. 0 or an errno value. */
+ 	int submitRead(unsigned s, uint64_t lba, uint32_t blocks, void *cookie);
++	/* Starts a write of `blocks` blocks at `lba` from slot `s` (its data buffer, filled by the caller). */
++	int submitWrite(unsigned s, uint64_t lba, uint32_t blocks, void *cookie);
++	/* Starts a Flush of namespace 1 on slot `s` (no data). */
++	int submitFlush(unsigned s, void *cookie);
++	/* A Flush, waited for; only with nothing in flight. 0 or an errno value. */
++	int flushWait(uint32_t timeoutMs);
+ 	/* Takes finished reads off the I/O completion queue; at most `max`. Also serves the mailbox. */
+ 	unsigned reap(SFAnsCompletion *out, unsigned max);
+ 	/* Reads that have been in flight for longer than `micros`; marks the controller dead when there are. */
+--- a/sf_ans.cpp
++++ b/sf_ans.cpp
+@@ -54,16 +54,8 @@
+ #define NVMMU_TCB_INVAL            0x28118
+ #define NVMMU_TCB_STAT             0x28120
+ #define ANS_BOOT_TIMEOUT_MS        1000
+-#define ANS_TCB_DMA_FROM_DEVICE    (1u << 0)
+-#define ANS_TCB_DMA_TO_DEVICE      (1u << 1)
+ /* struct apple_nvmmu_tcb by offset (128 bytes) */
+-#define TCB_SIZE       128
+-#define TCB_OPCODE     0
+-#define TCB_DMA_FLAGS  1
+-#define TCB_COMMAND_ID 2
+-#define TCB_LENGTH     4
+-#define TCB_PRP1       24
+-#define TCB_PRP2       32
++#define TCB_SIZE       SF_TCB_SIZE
+ 
+ /* ---- include/linux/nvme.h ---- */
+ #define NVME_REG_CAP   0x00
+@@ -631,67 +623,48 @@
+ /*
+  * apple_nvme_submit_cmd_t8103(): the command into its slot of the linear submission
+  * queue, its TCB into the NVMMU's table, the tag into the doorbell. THE ONLY DOORBELL
+- * WRITE OF THIS DRIVER, behind the gate.
++ * WRITE OF THIS DRIVER. sf_wring_prepare() (plain C, host-tested) runs the gate on the
++ * command as built and on the bytes in the slot, decides the data direction and takes the
++ * second look; the second look is taken once more here, on the slot, immediately before
++ * the doorbell. A refusal leaves the slot zeroed.
+  */
+ bool
+ SFAns::ring(unsigned queue, unsigned tag, const uint8_t sqeIn[64], bool hasData)
+ {
+-	uint8_t sqe[SQE_SIZE];
+-	uint8_t *sq = (queue == SF_NVME_Q_ADMIN ? asq.va : iosq.va) + tag * SQE_SIZE;
+-	uint8_t *tcb = (queue == SF_NVME_Q_ADMIN ? atcb.va : iotcb.va) + tag * TCB_SIZE;
++	uint8_t *sq, *tcb;
+ 	int reason;
+ 
+-	memcpy(sqe, sqeIn, SQE_SIZE);
+-	p16(sqe + SQE_CID, (uint16_t)tag);
+-	reason = (dead || !enabled || tag >= SF_ANS_IO_DEPTH) ? SF_NVME_GATE_QUEUE : sf_nvme_gate(queue, sqe, nsBlocks);
+-	if (reason == SF_NVME_GATE_OK) {
+-		memcpy(sq, sqe, SQE_SIZE);
+-		/* the bytes the controller will read */
+-		reason = sf_nvme_gate(queue, sq, nsBlocks);
+-		if (reason != SF_NVME_GATE_OK)
+-			bzero(sq, SQE_SIZE);
+-	}
+-	if (reason != SF_NVME_GATE_OK) {
++	if (queue > SF_NVME_Q_IO || tag >= SF_ANS_IO_DEPTH || (queue == SF_NVME_Q_ADMIN ? asq.va : iosq.va) == NULL) {
+ 		gateRejected++;
+-		gateLastReason = (uint32_t)reason;
+-		gateLastOpcode = sqe[0];
++		gateLastReason = SF_WRING_UNUSABLE;
++		gateLastOpcode = sqeIn[0];
+ 		gateLastQueue = queue;
+-		LOG("REFUSED: opcode 0x%02x on queue %u (reason %d); nothing was sent", sqe[0], queue, reason);
++		LOG("REFUSED: opcode 0x%02x on queue %u tag %u; nothing was sent", sqeIn[0], queue, tag);
+ 		return false;
+ 	}
+-
+-	uint64_t prp1 = g64(sqe + SQE_PRP1);
+-	tcb[TCB_OPCODE] = 0;
+-	p64(tcb + TCB_PRP1, prp1);
+-	p64(tcb + TCB_PRP2, g64(sqe + SQE_PRP2));
+-	p16(tcb + TCB_LENGTH, g16(sqe + SQE_CDW12));
+-	tcb[TCB_COMMAND_ID] = (uint8_t)tag;
+-	/*
+-	 * As Linux: no pointer, no DMA; an odd opcode reads host memory, an even one writes
+-	 * it. With the allowlist the odd ones are Create I/O CQ/SQ (the pointer is the queue
+-	 * itself); the I/O queue's only opcode is Read.
+-	 */
+-	if (prp1 == 0 || !hasData)
+-		tcb[TCB_DMA_FLAGS] = 0;
+-	else if (sqe[0] & 1)
+-		tcb[TCB_DMA_FLAGS] = ANS_TCB_DMA_TO_DEVICE;
+-	else
+-		tcb[TCB_DMA_FLAGS] = ANS_TCB_DMA_FROM_DEVICE;
+-	if (queue == SF_NVME_Q_IO && tcb[TCB_DMA_FLAGS] != ANS_TCB_DMA_FROM_DEVICE) {
+-		/* cannot happen: the gate admits Read only */
++	sq = (queue == SF_NVME_Q_ADMIN ? asq.va : iosq.va) + tag * SQE_SIZE;
++	tcb = (queue == SF_NVME_Q_ADMIN ? atcb.va : iotcb.va) + tag * SF_TCB_SIZE;
++	reason = sf_wring_prepare(queue, tag, SF_ANS_IO_DEPTH, !dead && enabled, sqeIn, hasData, nsBlocks, &fence, sq, tcb);
++	if (reason == SF_NVME_GATE_OK && !sf_nvmew_inside(queue, sq, &fence)) {
+ 		bzero(sq, SQE_SIZE);
++		bzero(tcb, SF_TCB_SIZE);
++		reason = SF_WRING_SECOND;
++	}
++	if (reason != SF_NVME_GATE_OK) {
+ 		gateRejected++;
+-		gateLastReason = SF_NVME_GATE_FIELDS;
+-		gateLastOpcode = sqe[0];
++		if (reason == SF_NVMEW_GATE_FENCE || reason == SF_WRING_SECOND || reason == SF_WRING_DIRECTION)
++			fenceRejected++;
++		gateLastReason = (uint32_t)reason;
++		gateLastOpcode = sqeIn[0];
+ 		gateLastQueue = queue;
+-		LOG("REFUSED: I/O command without device-to-host direction; nothing was sent");
++		LOG("REFUSED: opcode 0x%02x on queue %u (reason %d); nothing was sent", sqeIn[0], queue, reason);
+ 		return false;
+ 	}
+ 	mem_sync();
+ 	nvme.w32(queue == SF_NVME_Q_ADMIN ? ANS_LINEAR_ASQ_DB : ANS_LINEAR_IOSQ_DB, (uint32_t)tag);
+ 	doorbells[queue]++;
+-	if (sqe[0] < 8)
+-		opcodeCount[queue][sqe[0]]++;
++	if (sqeIn[0] < 8)
++		opcodeCount[queue][sqeIn[0]]++;
+ 	return true;
+ }
+ 
+@@ -1028,6 +1001,90 @@
+ 	return 0;
+ }
+ 
++/*
++ * A write of the slot's own buffer. The range is looked at here, before a command exists
++ * (and then by the gate, twice, and by the second look, twice, in ring()).
++ */
++int
++SFAns::submitWrite(unsigned s, uint64_t lba, uint32_t blocks, void *cookie)
++{
++	uint8_t sqe[SQE_SIZE] = { 0 };
++
++	if (s >= SF_ANS_SLOTS || slot[s].busy || blocks == 0 || blocks > SF_NVMEW_MAX_WRITE_BLOCKS)
++		return EINVAL;
++	if (!sf_wabs_ok(&fence, lba, blocks))
++		return EPERM;
++	sqe[0] = SF_NVMEW_IO_WRITE;
++	p32(sqe + SQE_NSID, SF_NVME_NSID);
++	p64(sqe + SQE_PRP1, slot[s].data.phys);
++	if (blocks == 2)
++		p64(sqe + SQE_PRP2, slot[s].data.phys + 4096);
++	else if (blocks > 2)
++		p64(sqe + SQE_PRP2, slot[s].prp.phys);
++	p32(sqe + SQE_CDW10, (uint32_t)lba);
++	p32(sqe + SQE_CDW11, (uint32_t)(lba >> 32));
++	p32(sqe + SQE_CDW12, blocks - 1);
++	slot[s].busy = true;
++	slot[s].cookie = cookie;
++	slot[s].blocks = blocks;
++	slot[s].submitted = sf_ans_now_us();
++	if (!ring(SF_NVME_Q_IO, SF_ANS_AQ_DEPTH + s, sqe, true)) {
++		slot[s].busy = false;
++		return EPERM;
++	}
++	inflight++;
++	writeCommands++;
++	writeBlocks += blocks;
++	return 0;
++}
++
++int
++SFAns::submitFlush(unsigned s, void *cookie)
++{
++	uint8_t sqe[SQE_SIZE] = { 0 };
++
++	if (s >= SF_ANS_SLOTS || slot[s].busy)
++		return EINVAL;
++	sqe[0] = SF_NVMEW_IO_FLUSH;
++	p32(sqe + SQE_NSID, SF_NVME_NSID);
++	slot[s].busy = true;
++	slot[s].cookie = cookie;
++	slot[s].blocks = 0;
++	slot[s].submitted = sf_ans_now_us();
++	if (!ring(SF_NVME_Q_IO, SF_ANS_AQ_DEPTH + s, sqe, false)) {
++		slot[s].busy = false;
++		return EPERM;
++	}
++	inflight++;
++	flushCommands++;
++	return 0;
++}
++
++int
++SFAns::flushWait(uint32_t timeoutMs)
++{
++	uint64_t deadline = sf_ans_now_us() + (uint64_t)timeoutMs * 1000;
++	SFAnsCompletion c;
++	int err;
++
++	if (dead || !ioQueues || inflight != 0)
++		return EBUSY;
++	err = submitFlush(0, NULL);
++	if (err != 0)
++		return err;
++	for (;;) {
++		if (reap(&c, 1) == 1)
++			return c.status == 0 ? 0 : EIO;
++		if (sf_ans_now_us() > deadline || crashed) {
++			cmdTimeouts++;
++			dead = true;
++			LOG("flush: no completion in %u ms; the controller is not used any more", timeoutMs);
++			return ETIMEDOUT;
++		}
++		IOSleep(1);
++	}
++}
++
+ /* apple_nvme_poll_cq() for the I/O queue */
+ unsigned
+ SFAns::reap(SFAnsCompletion *out, unsigned max)
+@@ -1089,7 +1146,7 @@
+ 	if (n != 0 && !dead) {
+ 		dead = true;
+ 		cmdTimeouts += n;
+-		LOG("%u read(s) without completion after %llu ms (CSTS=0x%x); the controller is not used any more", n,
++		LOG("%u command(s) without completion after %llu ms (CSTS=0x%x); the controller is not used any more", n,
+ 		    micros / 1000, nvme.r32(NVME_REG_CSTS));
+ 	}
+ 	return n;
+--- a/SFAppleNVMe.cpp
++++ b/SFAppleNVMe.cpp
+@@ -1,6 +1,26 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /*
+- * SFAppleNVMe: the M1's internal NVMe storage (ANS2), READ-ONLY.
++ * SFAppleNVMeRW: the M1's internal NVMe storage (ANS2), WRITE-FENCED BUILD. This file is the
++ * read-only driver (kernel/SFAppleNVMe.cpp) with kernel-rw/rw.patch applied; it is never part
++ * of a default collection. Without sfnvme_write=1 it behaves as the read-only build. With
++ *   sfnvme=3 sfnvme_part=... sfnvme_part_lba=... sfnvme_part_blocks=... sfnvme_write=1
++ * and only after the partition was verified in both GPT copies AND its range equals the one
++ * compiled in (sf_nvme_wring.h), the fence is opened over exactly that range and
++ *   - the whole-disk block device stays write-protected, guards ALL partitions (ours too) and,
++ *     with sfnvme_readfence=1, serves only the GPT's own blocks;
++ *   - a second block device (sfnvme0w) is published whose block 0 is the partition's first
++ *     block and whose size is the partition's: nothing above it can name a block outside.
++ *     It is writable; its synchronize is an NVMe Flush;
++ *   - kern.sf_nvme.wstats reports, kern.sf_nvme.wprobe asks whether a write of an absolute
++ *     range would be admitted (the check every write passes first; the probe has no data
++ *     path and writes nothing), kern.sf_nvme.seal=1 flushes and closes the fence for good,
++ *     kern.sf_nvme.stop refuses while the second device is open and the fence is not sealed.
++ * A write passes: the range check before a command is built (sf_wabs_ok), the gate on the
++ * command and on the queue slot (sf_nvmew_gate), the data direction (host-to-device only for
++ * opcode 0x01 on the I/O queue) and the second look (sf_nvmew_inside) next to the doorbell.
++ * The data goes out of this driver's own bounce buffers.
++ *
++ * What follows is the read-only build's description.
+  *
+  * OFF unless the boot arguments say otherwise:
+  *   sfnvme=0 or absent  nothing is touched: no power domain, no register, no memory
+@@ -64,6 +84,8 @@
+ #include <sys/systm.h>
+ #include <sys/uio.h>
+ 
++#include <uuid/uuid.h>
++
+ #include "sf_ans.h"
+ #include "sf_nvme_part.h"
+ 
+@@ -76,8 +98,12 @@
+ static const char *const kStateNames[] = { "off", "observed", "starting", "ready", "stopping", "stopped-clean",
+     "stopped-unclean", "failed" };
+ 
++enum { kOpRead, kOpWrite, kOpFlush };
+ struct SFReq {
+ 	SFReq   *next;
++	int      op;
++	IOMemoryDescriptor *md;         /* a write's data ... */
++	uint64_t mdOffset;              /* ... from this byte of it */
+ 	uint64_t lba;
+ 	uint32_t blocks;
+ 	int      slot;          /* valid when done with result 0: the caller copies out and releases it */
+@@ -113,6 +139,17 @@
+ static IOLock   *gPartLock;
+ static uint32_t  gExempted;
+ static uint32_t  gReadFence;
++/* the write-fenced build */
++class SFAppleNVMeFenced;
++static SFAppleNVMeFenced *gFenced;
++static uint32_t  gWriteArg;             /* sfnvme_write=1 */
++static bool      gWriteMode;            /* the fence was opened in this boot (it may be sealed since) */
++static bool      gSealed;
++static unsigned  gWritesOut, gFlushesOut;
++static uint64_t  gRangeRefused, gRangeRefusedBlocks, gSealedRefused, gProbeAdmitted, gProbeRefused, gWrittenBytes, gWriteCopyFailed;
++static uint64_t  gWriteMaxMicros, gFlushMaxMicros, gFlushSumMicros, gFlushesDone;
++static void publish_fenced(void);
++static void fenced_root_thread(void *arg, wait_result_t wr);
+ static uint64_t  gFenceRefused, gFenceRefusedBlocks, gOursRequests, gOursBlocks, gGptRequests, gOtherRequests, gOtherBlocks;
+ #define GPT_HEAD_BLOCKS 6u      /* protective MBR, header, 4 blocks of table */
+ #define GPT_TAIL_BLOCKS 5u      /* 4 blocks of table, header */
+@@ -137,7 +174,7 @@
+ typedef int (*sf_sink_t)(void *ctx, uint64_t offset, const uint8_t *data, uint32_t len);
+ 
+ static IOReturn
+-sf_read(uint64_t lba, uint64_t blocks, sf_sink_t sink, void *ctx)
++sf_io(int op, uint64_t lba, uint64_t blocks, sf_sink_t sink, void *ctx, IOMemoryDescriptor *md)
+ {
+ 	uint64_t done = 0;
+ 	IOReturn result = kIOReturnSuccess;
+@@ -156,6 +193,9 @@
+ 			SFReq *r = &reqs[n++];
+ 
+ 			r->next = NULL;
++			r->op = op;
++			r->md = md;
++			r->mdOffset = at * BLOCK;
+ 			r->lba = lba + at;
+ 			r->blocks = left > SF_NVME_MAX_READ_BLOCKS ? SF_NVME_MAX_READ_BLOCKS : (uint32_t)left;
+ 			r->slot = -1;
+@@ -179,6 +219,8 @@
+ 					result = r->result;
+ 				continue;
+ 			}
++			if (op != kOpRead)
++				continue;
+ 			/* the slot is this request's until it is released: copy without the lock */
+ 			IOLockUnlock(gLock);
+ 			if (result == kIOReturnSuccess &&
+@@ -194,6 +236,61 @@
+ 	return result;
+ }
+ 
++static IOReturn
++sf_read(uint64_t lba, uint64_t blocks, sf_sink_t sink, void *ctx)
++{
++	return sf_io(kOpRead, lba, blocks, sink, ctx, NULL);
++}
++
++/*
++ * THE check every write passes before anything is queued or built: the whole range inside
++ * the open fence. kern.sf_nvme.wprobe calls this and nothing else.
++ */
++static bool
++write_admissible(uint64_t lba, uint64_t blocks)
++{
++	return sf_wabs_ok(&gAns.fence, lba, blocks) != 0;
++}
++
++/* Writes `blocks` blocks at the absolute `lba` from `md` (prepared by the caller). */
++static IOReturn
++sf_write(uint64_t lba, uint64_t blocks, IOMemoryDescriptor *md)
++{
++	if (gSealed || !write_admissible(lba, blocks)) {
++		OSIncrementAtomic64((volatile SInt64 *)(gSealed ? &gSealedRefused : &gRangeRefused));
++		if (!gSealed)
++			OSAddAtomic64((SInt64)blocks, (volatile SInt64 *)&gRangeRefusedBlocks);
++		return kIOReturnNotPermitted;
++	}
++	return sf_io(kOpWrite, lba, blocks, NULL, NULL, md);
++}
++
++/* One Flush of the namespace, after every write queued before it has completed. */
++static IOReturn
++sf_flush(void)
++{
++	SFReq r;
++
++	IOLockLock(gLock);
++	if (gState != kStateReady || gStopRequested || !gAns.fence.open) {
++		IOLockUnlock(gLock);
++		return kIOReturnOffline;
++	}
++	bzero(&r, sizeof(r));
++	r.op = kOpFlush;
++	r.slot = -1;
++	if (gQueueTail != NULL)
++		gQueueTail->next = &r;
++	else
++		gQueueHead = &r;
++	gQueueTail = &r;
++	IOLockWakeup(gLock, &gEvent, true);
++	while (!r.done)
++		IOLockSleep(gLock, &r, THREAD_UNINT);
++	IOLockUnlock(gLock);
++	return r.result;
++}
++
+ /* ---- /dev/sfnvme0 ------------------------------------------------------------------------- */
+ 
+ static int
+@@ -362,7 +459,7 @@
+ 	/* where the request lies: the GPT's own blocks, our partition (only once identified), or anything else */
+ 	if (block + nblks <= GPT_HEAD_BLOCKS || block >= gAns.nsBlocks - GPT_TAIL_BLOCKS) {
+ 		OSIncrementAtomic64((volatile SInt64 *)&gGptRequests);
+-	} else if (gPartState == kPartVerified && block >= gWant.first && nblks <= gWant.blocks && block - gWant.first <= gWant.blocks - nblks) {
++	} else if (gPartState == kPartVerified && !gWriteMode && block >= gWant.first && nblks <= gWant.blocks && block - gWant.first <= gWant.blocks - nblks) {
+ 		OSIncrementAtomic64((volatile SInt64 *)&gOursRequests);
+ 		OSAddAtomic64((SInt64)nblks, (volatile SInt64 *)&gOursBlocks);
+ 	} else if (gReadFence) {
+@@ -422,6 +519,149 @@
+ }
+ 
+ /*
++ * The second block device of the write-fenced build: the SiliconForest partition and nothing
++ * else. Block 0 is the fence's first block; the size is the fence's. Every request is mapped
++ * by sf_wdev_map() (plain C, host-tested); a write then passes write_admissible() like any
++ * other. Published only after the fence was opened.
++ */
++class SFAppleNVMeFenced : public IOBlockStorageDevice
++{
++	OSDeclareDefaultStructors(SFAppleNVMeFenced);
++
++public:
++	bool setup(void);
++	IOReturn doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, UInt64 nblks, IOStorageAttributes *attributes,
++	    IOStorageCompletion *completion) APPLE_KEXT_OVERRIDE;
++	IOReturn doSynchronize(UInt64 block, UInt64 nblks, IOStorageSynchronizeOptions options = 0) APPLE_KEXT_OVERRIDE;
++	IOReturn doUnmap(IOBlockStorageDeviceExtent *, UInt32, IOStorageUnmapOptions = 0) APPLE_KEXT_OVERRIDE { return kIOReturnUnsupported; }
++	IOReturn doEjectMedia(void) APPLE_KEXT_OVERRIDE { return kIOReturnUnsupported; }
++	IOReturn doFormatMedia(UInt64) APPLE_KEXT_OVERRIDE { OSIncrementAtomic((volatile SInt32 *)&gWriteRefused); return kIOReturnNotWritable; }
++	UInt32 doGetFormatCapacities(UInt64 *capacities, UInt32 capacitiesMaxCount) const APPLE_KEXT_OVERRIDE
++	{
++		if (capacities != NULL && capacitiesMaxCount != 0)
++			capacities[0] = sf_wdev_blocks(&gAns.fence) * BLOCK;
++		return 1;
++	}
++	IOReturn setWriteCacheState(bool) APPLE_KEXT_OVERRIDE { return kIOReturnUnsupported; }
++	IOReturn getWriteCacheState(bool *enabled) APPLE_KEXT_OVERRIDE { if (enabled) *enabled = true; return kIOReturnSuccess; }
++	char *getVendorString(void) APPLE_KEXT_OVERRIDE { return (char *)"APPLE"; }
++	char *getProductString(void) APPLE_KEXT_OVERRIDE { return (char *)"SiliconForest partition"; }
++	char *getRevisionString(void) APPLE_KEXT_OVERRIDE { return (char *)"1"; }
++	char *getAdditionalDeviceInfoString(void) APPLE_KEXT_OVERRIDE { return (char *)"write-fenced"; }
++	IOReturn reportBlockSize(UInt64 *blockSize) APPLE_KEXT_OVERRIDE { *blockSize = BLOCK; return kIOReturnSuccess; }
++	IOReturn reportEjectability(bool *isEjectable) APPLE_KEXT_OVERRIDE { *isEjectable = false; return kIOReturnSuccess; }
++	IOReturn reportMaxValidBlock(UInt64 *maxBlock) APPLE_KEXT_OVERRIDE
++	{
++		uint64_t n = sf_wdev_blocks(&gAns.fence);
++		*maxBlock = n ? n - 1 : 0;
++		return kIOReturnSuccess;
++	}
++	IOReturn reportMediaState(bool *mediaPresent, bool *changedState = 0) APPLE_KEXT_OVERRIDE
++	{
++		*mediaPresent = gState == kStateReady && sf_wdev_blocks(&gAns.fence) != 0;
++		if (changedState != NULL)
++			*changedState = false;
++		return kIOReturnSuccess;
++	}
++	IOReturn reportRemovability(bool *isRemovable) APPLE_KEXT_OVERRIDE { *isRemovable = false; return kIOReturnSuccess; }
++	IOReturn reportWriteProtection(bool *isWriteProtected) APPLE_KEXT_OVERRIDE { *isWriteProtected = gAns.fence.open != 1; return kIOReturnSuccess; }
++};
++
++OSDefineMetaClassAndStructors(SFAppleNVMeFenced, IOBlockStorageDevice);
++
++bool
++SFAppleNVMeFenced::setup(void)
++{
++	if (!init(NULL))
++		return false;
++	OSDictionary *protocol = OSDictionary::withCapacity(2);
++	OSString *location = OSString::withCString(kIOPropertyInternalKey);
++	OSString *interconnect = OSString::withCString("NVMe");
++	bool ok = protocol != NULL && location != NULL && interconnect != NULL &&
++	    protocol->setObject(kIOPropertyPhysicalInterconnectLocationKey, location) &&
++	    protocol->setObject(kIOPropertyPhysicalInterconnectTypeKey, interconnect) &&
++	    setProperty(kIOPropertyProtocolCharacteristicsKey, protocol);
++	OSSafeReleaseNULL(location);
++	OSSafeReleaseNULL(interconnect);
++	OSSafeReleaseNULL(protocol);
++	setProperty(kIOBlockStorageDeviceTypeKey, kIOBlockStorageDeviceTypeGeneric);
++	setProperty(kIOMaximumBlockCountReadKey, (unsigned long long)(SF_ANS_SLOTS * SF_NVME_MAX_READ_BLOCKS), 64);
++	setProperty(kIOMaximumBlockCountWriteKey, (unsigned long long)(SF_ANS_SLOTS * SF_NVMEW_MAX_WRITE_BLOCKS), 64);
++	setProperty("SFWriteFenced", kOSBooleanTrue);
++	setName("sfnvme0w");
++	setLocation("1");
++	return ok;
++}
++
++IOReturn
++SFAppleNVMeFenced::doAsyncReadWrite(IOMemoryDescriptor *buffer, UInt64 block, UInt64 nblks, __unused IOStorageAttributes *attributes,
++    IOStorageCompletion *completion)
++{
++	uint64_t lba = 0;
++	IOReturn ret;
++
++	if (buffer == NULL)
++		return kIOReturnBadArgument;
++	IODirection dir = buffer->getDirection();
++	if (dir != kIODirectionIn && dir != kIODirectionOut)
++		return kIOReturnBadArgument;
++	/* relative to the fence; anything not wholly inside goes no further */
++	if (sf_wdev_map(&gAns.fence, block, nblks, &lba) != 0 || buffer->getLength() < nblks * BLOCK) {
++		OSIncrementAtomic64((volatile SInt64 *)&gRangeRefused);
++		OSAddAtomic64((SInt64)nblks, (volatile SInt64 *)&gRangeRefusedBlocks);
++		return kIOReturnBadArgument;
++	}
++	ret = buffer->prepare(dir);
++	if (ret != kIOReturnSuccess)
++		return ret;
++	if (dir == kIODirectionIn) {
++		OSIncrementAtomic64((volatile SInt64 *)&gOursRequests);
++		OSAddAtomic64((SInt64)nblks, (volatile SInt64 *)&gOursBlocks);
++		ret = sf_read(lba, nblks, md_sink, buffer);
++	} else {
++		ret = sf_write(lba, nblks, buffer);
++	}
++	buffer->complete(dir);
++	IOStorage::complete(completion, ret, ret == kIOReturnSuccess ? nblks * BLOCK : 0);
++	return kIOReturnSuccess;
++}
++
++/* The filesystem's barrier: an NVMe Flush after the writes queued before it. Sealed: nothing was written since the seal's own. */
++IOReturn
++SFAppleNVMeFenced::doSynchronize(__unused UInt64 block, __unused UInt64 nblks, __unused IOStorageSynchronizeOptions options)
++{
++	if (gSealed)
++		return kIOReturnSuccess;
++	IOReturn ret = sf_flush();
++	return ret == kIOReturnSuccess ? kIOReturnSuccess : kIOReturnIOError;
++}
++
++static void
++publish_fenced(void)
++{
++	SFAppleNVMeFenced *dev;
++
++	if (gFenced != NULL || !gWriteMode)
++		return;
++	dev = new SFAppleNVMeFenced;
++	if (dev == NULL || !dev->setup() || !dev->attach(gService)) {
++		LOG("the fenced block device could not be made");
++		OSSafeReleaseNULL(dev);
++		return;
++	}
++	gFenced = dev;
++	dev->registerService();
++	{
++		thread_t thread;
++
++		if (kernel_thread_start(fenced_root_thread, NULL, &thread) == KERN_SUCCESS)
++			thread_deallocate(thread);
++	}
++	LOG("the fenced device is published: %llu blocks of %u bytes, block 0 = LBA %llu, writable", sf_wdev_blocks(&gAns.fence), BLOCK,
++	    gAns.fence.first);
++}
++
++/*
+  * The guard of the partitions of this disk (sfnvme=3). Partition schemes, the APFS
+  * container scheme and every other content driver for IOMedia compete in the match
+  * category "IOStorage", one winner per media. This driver enters that category with the
+@@ -486,6 +726,15 @@
+ 		if (work != NULL)
+ 			IOFree(work, SF_PART_WORK);
+ 		gPartState = r == 0 ? kPartVerified : kPartRefused;
++		if (gWriteArg != 0) {
++			/* the fence: only now, only this machine's compiled-in range, only once */
++			IOLockLock(gLock);
++			int f = sf_wfence_open(&gAns.fence, gWant.first, gWant.blocks, gAns.nsBlocks, gPartState == kPartVerified, (int)gWriteArg);
++			gWriteMode = f == 0;
++			IOLockUnlock(gLock);
++			LOG("sfnvme_write=1: the write fence is %s (%d)%s", f == 0 ? "OPEN over the SiliconForest partition" : "NOT opened", f,
++			    f == 0 ? "" : "; this boot is read-only");
++		}
+ 		LOG("the SiliconForest partition (blocks %llu..%llu): %s (%d): %s", gWant.first, gWant.first + gWant.blocks - 1,
+ 		    r == 0 ? "identified, not guarded" : "NOT identified, guarded like the others", r, gPartWhy);
+ 	}
+@@ -506,7 +755,7 @@
+ 		ours = e == (IORegistryEntry *)gDisk;
+ 	if (!ours)
+ 		return NULL;
+-	if (is_our_partition(media)) {
++	if (is_our_partition(media) && !gWriteMode) {
+ 		OSIncrementAtomic((volatile SInt32 *)&gExempted);
+ 		return NULL;
+ 	}
+@@ -524,6 +773,8 @@
+ 	provider->setProperty(kIOMediaContentHintKey, "SFAppleNVMe-guarded");
+ 	OSIncrementAtomic((volatile SInt32 *)&gGuarded);
+ 	LOG("partition %s: guarded, no content driver attaches", provider->getName());
++	if (gWriteMode && is_our_partition(OSDynamicCast(IOMedia, provider)))
++		publish_fenced();
+ 	return true;
+ }
+ 
+@@ -601,10 +852,32 @@
+ 		}
+ 		while (gQueueHead != NULL && (s = pick_slot()) >= 0) {
+ 			SFReq *r = gQueueHead;
++			int err;
++
++			/* a flush is a barrier: it waits for the writes before it, and writes after it wait for it */
++			if ((r->op == kOpFlush && gWritesOut != 0) || (r->op == kOpWrite && gFlushesOut != 0))
++				break;
+ 			gQueueHead = r->next;
+ 			if (gQueueHead == NULL)
+ 				gQueueTail = NULL;
+-			int err = gAns.submitRead((unsigned)s, r->lba, r->blocks, r);
++			if (r->op == kOpWrite) {
++				/* out of the caller's memory into this driver's buffer; the device reads only that */
++				if (r->md == NULL || r->md->readBytes((IOByteCount)r->mdOffset, gAns.slot[s].data.va, (IOByteCount)r->blocks * BLOCK) !=
++				    (IOByteCount)r->blocks * BLOCK) {
++					gWriteCopyFailed++;
++					finish(r, kIOReturnVMError);
++					continue;
++				}
++				err = gAns.submitWrite((unsigned)s, r->lba, r->blocks, r);
++				if (err == 0)
++					gWritesOut++;
++			} else if (r->op == kOpFlush) {
++				err = gAns.submitFlush((unsigned)s, r);
++				if (err == 0)
++					gFlushesOut++;
++			} else {
++				err = gAns.submitRead((unsigned)s, r->lba, r->blocks, r);
++			}
+ 			if (err != 0)
+ 				finish(r, err == EPERM ? kIOReturnNotPermitted : kIOReturnBadArgument);
+ 			else
+@@ -616,6 +889,27 @@
+ 
+ 			if (r == NULL)
+ 				continue;       /* a read that was given up on long ago */
++			if (r->op != kOpRead) {
++				bool flush = r->op == kOpFlush;
++
++				if (flush) {
++					gFlushesOut--;
++					gFlushesDone++;
++					gFlushSumMicros += comps[i].micros;
++					if (comps[i].micros > gFlushMaxMicros)
++						gFlushMaxMicros = comps[i].micros;
++				} else {
++					gWritesOut--;
++					if (comps[i].micros > gWriteMaxMicros)
++						gWriteMaxMicros = comps[i].micros;
++					if (comps[i].status == 0)
++						gWrittenBytes += (uint64_t)r->blocks * BLOCK;
++				}
++				if (comps[i].status != 0)
++					LOG("%s of %u blocks at %llu failed: NVMe status 0x%x", flush ? "flush" : "write", r->blocks, r->lba, comps[i].status);
++				finish(r, comps[i].status != 0 ? kIOReturnIOError : kIOReturnSuccess);
++				continue;
++			}
+ 			r->micros = comps[i].micros;
+ 			gCompleted++;
+ 			gSumMicros += comps[i].micros;
+@@ -697,7 +991,7 @@
+ 	set_state(kStateStarting);
+ 	gStartMs = now_ms();
+ 	LOG("start %u of this boot", gStarts);
+-	LOG("starting the controller (level %u, time to live %u s); READ-ONLY build: allowlist admin 00 01 02 04 05 06, I/O 02", gLevel, gTtl);
++	LOG("starting the controller (level %u, time to live %u s); WRITE-FENCED build: allowlist admin 00 01 02 04 05 06, I/O 02; I/O 00 01 only inside the fence, sfnvme_write=%u", gLevel, gTtl, gWriteArg);
+ 	err = gAns.start(why, sizeof(why));
+ 	if (err != 0) {
+ 		bool clean = gAns.stop(gWhy, sizeof(gWhy));
+@@ -720,6 +1014,17 @@
+ 	engine();
+ 
+ 	LOG("stopping the controller (%s)", gStopReason);
++	if (gAns.fence.open == 1 && !gAns.dead) {
++		/* whatever was written is made durable before the shutdown notification, then the fence is closed */
++		int f = gAns.flushWait(30000);
++		LOG("flush before the stop: %d", f);
++	}
++	IOLockLock(gLock);
++	if (gWriteMode) {
++		sf_wfence_close(&gAns.fence);
++		gSealed = true;
++	}
++	IOLockUnlock(gLock);
+ 	if (!gAns.dead)
+ 		gAns.readSmart();
+ 	bool clean = gAns.stop(why, sizeof(why));
+@@ -728,6 +1033,8 @@
+ 	LOG("controller stopped %s (%s); gate_rejected=%u write_refused=%u reads=%llu blocks=%llu errors=%llu timeouts=%llu",
+ 	    clean ? "CLEANLY" : "NOT CLEANLY", gWhy, gAns.gateRejected, gWriteRefused, gAns.readCommands, gAns.readBlocks,
+ 	    gAns.cmdErrors, gAns.cmdTimeouts);
++	LOG("write side: writes=%llu write_blocks=%llu flushes=%llu fence_rejected=%u range_refused=%llu sealed_refused=%llu",
++	    gAns.writeCommands, gAns.writeBlocks, gAns.flushCommands, gAns.fenceRejected, gRangeRefused, gSealedRefused);
+ 	IOLockLock(gLock);
+ 	gState = clean ? kStateStoppedClean : kStateStoppedUnclean;
+ 	IOLockWakeup(gLock, &gState, false);
+@@ -768,7 +1075,7 @@
+ 	thread_t thread;
+ 
+ 	IOLockLock(gLock);
+-	if (gState != kStateStoppedClean || gLevel < 2) {
++	if (gState != kStateStoppedClean || gLevel < 2 || gWriteMode) {
+ 		IOLockUnlock(gLock);
+ 		return EBUSY;
+ 	}
+@@ -826,7 +1133,100 @@
+ 
+ /* ---- sysctl -------------------------------------------------------------------------------- */
+ 
+-enum { kCtlState, kCtlGate, kCtlWrite, kCtlStats, kCtlIdCtrl, kCtlIdNs, kCtlSmart, kCtlStop, kCtlGateTest, kCtlRegs, kCtlMedia, kCtlSmartRaw, kCtlStart, kCtlPart, kCtlFence };
++enum { kCtlState, kCtlGate, kCtlWrite, kCtlStats, kCtlIdCtrl, kCtlIdNs, kCtlSmart, kCtlStop, kCtlGateTest, kCtlRegs, kCtlMedia, kCtlSmartRaw, kCtlStart, kCtlPart, kCtlFence, kCtlWStats, kCtlWProbe, kCtlSeal, kCtlWGateTest };
++
++/* The fenced device's media (the storage driver between them keeps the device itself open all the time). */
++static IOMedia *
++fenced_media(void)
++{
++	IORegistryEntry *driver = gFenced ? ((IORegistryEntry *)gFenced)->getChildEntry(gIOServicePlane) : NULL;
++
++	return driver ? OSDynamicCast(IOMedia, driver->getChildEntry(gIOServicePlane)) : NULL;
++}
++
++/*
++ * The root on the fenced device (rd=uuid boot-uuid=<filesystem UUID>): the whole-disk view of
++ * our partition is guarded in write mode, so the tree's Ext4FileSystemDriver has no media to
++ * match. When the ext4 superblock in the fence's first block carries the boot-uuid, the fenced
++ * media is published as the boot-uuid-media resource the kernel's root search waits for.
++ */
++static void
++fenced_root_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	IOService *res = IOService::getResourceService();
++	OSString *want = res ? OSDynamicCast(OSString, res->getProperty("boot-uuid")) : NULL;
++	IOMedia *media = NULL;
++	uuid_t wanted;
++	uint8_t *blk;
++
++	if (want == NULL || uuid_parse(want->getCStringNoCopy(), wanted) != 0)
++		return;
++	for (unsigned i = 0; i < 300; i++) {
++		media = fenced_media();
++		if (media != NULL && media->getProperty("BSD Name") != NULL)
++			break;
++		media = NULL;
++		IOSleep(100);
++	}
++	blk = (uint8_t *)IOMalloc(BLOCK);
++	if (media == NULL || blk == NULL || part_read(NULL, gAns.fence.first, 1, blk) != 0) {
++		LOG("boot-uuid: the fenced media or its first block could not be had; not published as the root");
++	} else if (blk[1024 + 0x38] != 0x53 || blk[1024 + 0x39] != 0xef || memcmp(blk + 1024 + 0x68, wanted, 16) != 0) {
++		LOG("boot-uuid: the filesystem on the fenced device is not the one asked for; not published as the root");
++	} else {
++		LOG("boot-uuid: the ext4 filesystem on the fenced device matches; publishing %s as boot-uuid-media", media->getName());
++		IOService::publishResource("boot-uuid-media", media);
++		res->removeProperty("boot-uuid");
++	}
++	if (blk != NULL)
++		IOFree(blk, BLOCK);
++}
++
++/* Its BSD name ("diskN"), or "-". */
++static void
++fenced_bsd_name(char *out, size_t len)
++{
++	IOMedia *media = fenced_media();
++	OSString *name = media ? OSDynamicCast(OSString, media->getProperty("BSD Name")) : NULL;
++
++	snprintf(out, len, "-");
++	if (name != NULL)
++		snprintf(out, len, "%s", name->getCStringNoCopy());
++}
++
++/* The live fence through the whole command-to-doorbell sequence on scratch buffers. Touches no hardware and no counter. */
++static void
++wgate_selftest(char *text, size_t len)
++{
++	const struct sf_nvme_fence *f = &gAns.fence;
++	uint64_t first = f->first, last = f->last, ns = gAns.nsBlocks;
++	const struct { uint64_t lba; uint32_t n; int want; } kCases[] = {
++		{ first, 1, 1 }, { last, 1, 1 }, { first, 256, 1 }, { last - 255, 256, 1 },
++		{ first - 1, 1, 0 }, { last + 1, 1, 0 }, { first - 1, 2, 0 }, { last, 2, 0 }, { first - 255, 256, 0 }, { last - 254, 256, 0 },
++		{ 0, 1, 0 }, { 1, 1, 0 }, { 6, 1, 0 }, { ns - 1, 1, 0 }, { ns, 1, 0 }, { first | (1ULL << 32), 1, 0 }, { ~0ULL, 2, 0 },
++	};
++	unsigned admitted = 0, refused = 0, wrong = 0;
++	uint8_t slot[64], tcb[SF_TCB_SIZE];
++
++	for (unsigned i = 0; i < sizeof(kCases) / sizeof(kCases[0]); i++) {
++		uint8_t sqe[64] = { 0 };
++		sqe[0] = SF_NVMEW_IO_WRITE;
++		OSWriteLittleInt32(sqe, 4, 1);
++		OSWriteLittleInt64(sqe, 24, 0x4000);
++		OSWriteLittleInt64(sqe, 40, kCases[i].lba);
++		OSWriteLittleInt32(sqe, 48, kCases[i].n - 1);
++		int ok = sf_wring_prepare(SF_NVME_Q_IO, 2, SF_ANS_IO_DEPTH, 1, sqe, 1, ns, f, slot, tcb) == SF_NVME_GATE_OK;
++		int want = kCases[i].want && f->open == 1;
++		if (ok != want || ok != (sf_wabs_ok(f, kCases[i].lba, kCases[i].n) != 0) || (ok && tcb[SF_TCB_DMA_FLAGS] != SF_TCB_DMA_TO_DEVICE))
++			wrong++;
++		else if (ok)
++			admitted++;
++		else
++			refused++;
++	}
++	snprintf(text, len, "fence=%s admitted=%u refused=%u wrong=%u (17 writes at and around the fence; expected 4/13/0 open, 0/17/0 closed)",
++	    f->open == 1 ? "open" : "closed", admitted, refused, wrong);
++}
+ 
+ static uint64_t le64(const uint8_t *p) { return OSReadLittleInt64(p, 0); }
+ static uint32_t le32(const uint8_t *p) { return OSReadLittleInt32(p, 0); }
+@@ -944,9 +1344,74 @@
+ 		error = sysctl_handle_int(oidp, &value, 0, req);
+ 		if (error != 0 || req->newptr == USER_ADDR_NULL)
+ 			return error;
++		if (value == 1 && gWriteMode && !gSealed && fenced_media() != NULL && fenced_media()->isOpen()) {
++			/* a filesystem may still be writing: unmount it, or seal (kern.sf_nvme.seal=1), first */
++			LOG("stop refused: the fenced device is open and the fence is not sealed");
++			return EBUSY;
++		}
+ 		if (value == 1 && !request_stop("requested", 30000))
+ 			return EBUSY;
+ 		return 0;
++	case kCtlWStats: {
++		char bsd[24];
++
++		fenced_bsd_name(bsd, sizeof(bsd));
++		snprintf(text, sizeof(text), "write_arg=%u fence=%s first=%llu last=%llu device=%s open=%d writes=%llu write_blocks=%llu "
++		    "written_bytes=%llu flushes=%llu fence_rejected=%u range_refused=%llu range_refused_blocks=%llu sealed_refused=%llu "
++		    "probe_admitted=%llu probe_refused=%llu copy_failed=%llu io_ops[00,01]=%llu,%llu write_max_us=%llu flush_avg_us=%llu flush_max_us=%llu",
++		    gWriteArg, gAns.fence.open == 1 ? "open" : (gSealed ? "sealed" : "closed"), gAns.fence.first, gAns.fence.last, bsd,
++		    fenced_media() != NULL && fenced_media()->isOpen(), gAns.writeCommands, gAns.writeBlocks, gWrittenBytes, gAns.flushCommands,
++		    gAns.fenceRejected, gRangeRefused, gRangeRefusedBlocks, gSealedRefused, gProbeAdmitted, gProbeRefused, gWriteCopyFailed,
++		    gAns.opcodeCount[1][0], gAns.opcodeCount[1][1], gWriteMaxMicros, gFlushesDone ? gFlushSumMicros / gFlushesDone : 0,
++		    gFlushMaxMicros);
++		break;
++	}
++	case kCtlWProbe: {
++		/* "<absolute LBA> <blocks>": would a write of that range be admitted? Nothing is written, queued or built. */
++		char in[48] = "", *end = NULL;
++		uint64_t lba, blocks;
++
++		if (req->newptr == USER_ADDR_NULL) {
++			snprintf(text, sizeof(text), "admitted=%llu refused=%llu", gProbeAdmitted, gProbeRefused);
++			break;
++		}
++		if (req->newlen == 0 || req->newlen >= sizeof(in) || SYSCTL_IN(req, in, req->newlen) != 0)
++			return EINVAL;
++		lba = strtouq(in, &end, 0);
++		if (end == in || *end != ' ')
++			return EINVAL;
++		blocks = strtouq(end + 1, &end, 0);
++		if (write_admissible(lba, blocks)) {
++			OSIncrementAtomic64((volatile SInt64 *)&gProbeAdmitted);
++			return 0;
++		}
++		OSIncrementAtomic64((volatile SInt64 *)&gProbeRefused);
++		return EPERM;
++	}
++	case kCtlSeal:
++		value = gSealed ? 1 : 0;
++		error = sysctl_handle_int(oidp, &value, 0, req);
++		if (error != 0 || req->newptr == USER_ADDR_NULL)
++			return error;
++		if (value != 1 || !gWriteMode)
++			return EINVAL;
++		if (!gSealed) {
++			/* new writes are refused from here; then the barrier; then the fence is closed for good */
++			IOLockLock(gLock);
++			gSealed = true;
++			IOLockUnlock(gLock);
++			IOReturn fr = sf_flush();
++			IOLockLock(gLock);
++			sf_wfence_close(&gAns.fence);
++			IOLockUnlock(gLock);
++			LOG("sealed: flush 0x%x, the fence is closed for the rest of this boot", fr);
++			if (fr != kIOReturnSuccess)
++				return EIO;
++		}
++		return 0;
++	case kCtlWGateTest:
++		wgate_selftest(text, sizeof(text));
++		break;
+ 	case kCtlGateTest:
+ 		gate_selftest(text, sizeof(text));
+ 		break;
+@@ -1018,7 +1483,15 @@
+ SYSCTL_PROC(_kern_sf_nvme, OID_AUTO, start, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, kCtlStart, sf_sysctl, "I",
+     "write 1 after a clean stop: start the controller again; reads the number of starts");
+ 
++SF_STR(wstats, kCtlWStats, "the write side: fence, device, counters");
++SF_STR(wgate_selftest, kCtlWGateTest, "writes at and around the live fence through the command-to-doorbell checks (no hardware access)");
++SYSCTL_PROC(_kern_sf_nvme, OID_AUTO, wprobe, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, kCtlWProbe, sf_sysctl, "A",
++    "write \"<absolute LBA> <blocks>\": EPERM unless a write of that range would be admitted; nothing is written");
++SYSCTL_PROC(_kern_sf_nvme, OID_AUTO, seal, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED, 0, kCtlSeal, sf_sysctl, "I",
++    "write 1: flush, then close the write fence for the rest of this boot; reads 1 when sealed");
++
+ static struct sysctl_oid *const gOids[] = {
++	&sysctl__kern_sf_nvme_wstats, &sysctl__kern_sf_nvme_wgate_selftest, &sysctl__kern_sf_nvme_wprobe, &sysctl__kern_sf_nvme_seal,
+ 	&sysctl__kern_sf_nvme_media, &sysctl__kern_sf_nvme_part, &sysctl__kern_sf_nvme_fence, &sysctl__kern_sf_nvme_smart_raw, &sysctl__kern_sf_nvme_start,
+ 	&sysctl__kern_sf_nvme, &sysctl__kern_sf_nvme_state, &sysctl__kern_sf_nvme_stats, &sysctl__kern_sf_nvme_idctrl,
+ 	&sysctl__kern_sf_nvme_idns, &sysctl__kern_sf_nvme_gate_selftest, &sysctl__kern_sf_nvme_smart,
+@@ -1086,6 +1559,9 @@
+ 				gPartState = kPartUnchecked;
+ 				if (PE_parse_boot_argn("sfnvme_readfence", &value, sizeof(value)) && value == 1)
+ 					gReadFence = 1;
++				/* exactly 1; anything else, or its absence, and this boot is read-only */
++				if (PE_parse_boot_argn("sfnvme_write", &value, sizeof(value)) && value == 1)
++					gWriteArg = 1;
+ 				snprintf(gPartWhy, sizeof(gPartWhy), "not looked at yet");
+ 			} else {
+ 				gPartState = kPartRefused;

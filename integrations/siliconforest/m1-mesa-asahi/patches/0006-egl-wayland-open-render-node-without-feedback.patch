@@ -1,0 +1,37 @@
+--- a/src/egl/drivers/dri2/platform_wayland.c	2026-11-10 12:24:50.878797399 -0800
++++ b/src/egl/drivers/dri2/platform_wayland.c	2026-11-10 12:24:50.891533861 -0800
+@@ -2649,6 +2649,34 @@
+       dmabuf_feedback_format_table_fini(&dri2_dpy->format_table);
+    }
+ 
++#ifdef __APPLE__
++   /* SiliconForest: a linux-dmabuf v3 compositor names no device (that needs the
++    * v4 default feedback) and wl_drm is not built.  Client and compositor
++    * share the one GPU here, so take the first DRM device with a render node;
++    * libdrm enumerates them from the kern.sf_dri sysctls, without udev. */
++   if (dri2_dpy->fd_render_gpu == -1) {
++      drmDevicePtr devices[8];
++      int num = drmGetDevices2(0, devices, ARRAY_SIZE(devices));
++
++      for (int i = 0; i < num && dri2_dpy->fd_render_gpu == -1; i++) {
++         if (!(devices[i]->available_nodes & (1 << DRM_NODE_RENDER)))
++            continue;
++         int fd = loader_open_device(devices[i]->nodes[DRM_NODE_RENDER]);
++         if (fd == -1)
++            continue;
++         dri2_dpy->device_name = strdup(devices[i]->nodes[DRM_NODE_RENDER]);
++         dri2_dpy->fd_render_gpu = fd;
++#ifdef HAVE_BIND_WL_DISPLAY
++         dri2_dpy->authenticated = true;
++#endif
++      }
++      if (num > 0)
++         drmFreeDevices(devices, num);
++      if (dri2_dpy->fd_render_gpu == -1)
++         return false;
++   }
++#endif
++
+ #ifdef HAVE_BIND_WL_DISPLAY
+    /* We couldn't retrieve a render node from the dma-buf feedback (or the
+     * feedback was not advertised at all), so we must fallback to wl_drm. */

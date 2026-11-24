@@ -1,0 +1,230 @@
+fbsdkpi: drm: DMA_BUF_IOCTL_EXPORT_SYNC_FILE and IMPORT_SYNC_FILE
+
+Both returned ENOTTY. Mesa calls them for every shared buffer on every submission and
+falls back to waiting on the CPU when they fail. dma_buf_export_sync_file() and
+dma_buf_import_sync_file() of the pin's drivers/dma-buf/dma-buf.c (lines 450-551), compared
+line by line, on the layer's dma_resv, dma_fence_unwrap and sync_file. DMA_BUF_IOCTL_SYNC,
+which returned 0 for anything, is the pin's case of dma_buf_ioctl() as well (flags
+validated, dma_buf_begin/end_cpu_access).
+
+The functions are a port of GPL-2.0-only code, so they are in a file of their own,
+drm/src/pd_dma_buf_syncfile.c, with that licence and the original notice (pd_dma_buf.c is
+MIT and only forwards the two commands). drm.cmake lists the file apart from the MIT ones.
+UPSTREAM: yes; the tree then carries a GPL-2.0-only file in the DRM layer, and every DRM
+kext that links the layer links it.
+
+--- a/src/Kernel/fbsdkpi/drm/drm.cmake
++++ b/src/Kernel/fbsdkpi/drm/drm.cmake
+@@ -40,6 +40,9 @@
+     sf_drm_testclient.c sf_lfile_lkpi.c)
+ set(SF_DRM_AMDGPU_PD_SOURCES sf_amdgpu_absent.c sf_amdgpu_absent_blocks.c
+     sf_amdgpu_fb.c sf_amdgpu_mmap.c)
++# From linux drivers/dma-buf/dma-buf.c, GPL-2.0-only (it makes a kext that links it a
++# GPL-2.0 work): the sync_file ioctls of a dma-buf descriptor
++list(APPEND SF_DRM_PD_SOURCES sf_dma_buf_syncfile.c)
+ 
+ # DRM_AMDGPU_CIK puts gcn2 (kaveri, kabini, mullins, bonaire, hawaii) in amdgpu's device table
+ set(SF_DRM_KCONFIG APERTURE_HELPERS ARCH_HAVE_NMI_SAFE_CMPXCHG
+--- a/src/Kernel/fbsdkpi/drm/src/sf_dma_buf.c
++++ b/src/Kernel/fbsdkpi/drm/src/sf_dma_buf.c
+@@ -94,11 +96,16 @@
+ 	return 0;
+ }
+ 
++long sf_dma_buf_sync_file_ioctl(struct dma_buf *db, unsigned int cmd, unsigned long arg);
++
+ // DMA_BUF_IOCTL_SYNC brackets cpu access, a no-op for coherent buffers
+ static long
+ sf_dma_buf_file_ioctl(struct linux_file *filp, unsigned int cmd, unsigned long arg)
+ {
+-	return cmd == _IOW('b', 0, uint64_t) ? 0 : -ENOTTY;
++	struct dma_buf *db = filp->private_data;
++
++	// DMA_BUF_IOCTL_SYNC, EXPORT_SYNC_FILE and IMPORT_SYNC_FILE (sf_dma_buf_syncfile.c), else -ENOTTY
++	return sf_dma_buf_sync_file_ioctl(db, cmd, arg);
+ }
+ 
+ // libdrm sizes an imported buffer with lseek(SEEK_END)
+--- a/src/Kernel/fbsdkpi/drm/src/sf_dma_buf_syncfile.c
++++ b/src/Kernel/fbsdkpi/drm/src/sf_dma_buf_syncfile.c
+@@ -0,0 +1,180 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * DMA_BUF_IOCTL_EXPORT_SYNC_FILE and DMA_BUF_IOCTL_IMPORT_SYNC_FILE on a dma-buf descriptor.
++ *
++ * From drivers/dma-buf/dma-buf.c of linux-aurora (Omacom, integration/aurora) at 6a08a08e:
++ *
++ * Framework for buffer objects that can be shared across devices/subsystems.
++ *
++ * Copyright(C) 2011 Linaro Limited. All rights reserved.
++ * Author: Sumit Semwal <sumit.semwal@ti.com>
++ *
++ * Many thanks to linaro-mm-sig list, and specially
++ * Arnd Bergmann <arnd@arndb.de>, Rob Clark <rob@ti.com> and
++ * Daniel Vetter <daniel@ffwll.ch> for their support in creation and
++ * refining of this idea.
++ */
++// file.h renames struct file, so it comes before the dma-buf header uses it
++#include <linux/uaccess.h>
++#include <linux/sync_file.h>
++#include <linux/dma-fence-unwrap.h>
++#include <linux/dma-fence.h>
++#include <linux/fs.h>
++#include <linux/file.h>
++#include <linux/ioctl.h>
++#include <linux/dma-buf.h>
++#include <linux/dma-resv.h>
++#include <linux/err.h>
++#include <linux/kernel.h>
++#include <linux/slab.h>
++
++// dma_buf_export_sync_file() and dma_buf_import_sync_file() (lines 450-551 there), statement
++// for statement, with include/uapi/linux/dma-buf.h's layouts: the buffer's implicit-sync
++// fences as a sync_file, and a sync_file's fences added to the buffer. mesa calls both for
++// every shared buffer on every submission.
++struct sf_dma_buf_sync_file {
++	uint32_t flags;		// DMA_BUF_SYNC_READ 1, DMA_BUF_SYNC_WRITE 2
++	int32_t fd;
++};
++#define SF_DMA_BUF_SYNC_READ	(1 << 0)
++#define SF_DMA_BUF_SYNC_WRITE	(2 << 0)
++#define SF_DMA_BUF_SYNC_RW	(SF_DMA_BUF_SYNC_READ | SF_DMA_BUF_SYNC_WRITE)
++#define SF_DMA_BUF_IOCTL_EXPORT_SYNC_FILE	_IOWR('b', 2, struct sf_dma_buf_sync_file)
++#define SF_DMA_BUF_IOCTL_IMPORT_SYNC_FILE	_IOW('b', 3, struct sf_dma_buf_sync_file)
++
++static long
++sf_dma_buf_export_sync_file(struct dma_buf *db, unsigned long uarg)
++{
++	struct sf_dma_buf_sync_file arg;
++	struct dma_fence *fence = NULL;
++	struct sync_file *sf;
++	int fd, ret;
++
++	if (copy_from_user(&arg, (void *)uarg, sizeof(arg)) != 0)
++		return -EFAULT;
++	if ((arg.flags & ~SF_DMA_BUF_SYNC_RW) != 0 || (arg.flags & SF_DMA_BUF_SYNC_RW) == 0)
++		return -EINVAL;
++	fd = get_unused_fd_flags(O_CLOEXEC);
++	if (fd < 0)
++		return fd;
++	// a reader waits for writers, a writer for everybody
++	ret = dma_resv_get_singleton(db->resv,
++	    dma_resv_usage_rw((arg.flags & SF_DMA_BUF_SYNC_WRITE) != 0), &fence);
++	if (ret != 0)
++		goto err_fd;
++	if (fence == NULL)
++		fence = dma_fence_get_stub();
++	sf = sync_file_create(fence);
++	dma_fence_put(fence);
++	if (sf == NULL) {
++		ret = -ENOMEM;
++		goto err_fd;
++	}
++	arg.fd = fd;
++	if (copy_to_user((void *)uarg, &arg, sizeof(arg)) != 0) {
++		fput(sf->file);
++		ret = -EFAULT;
++		goto err_fd;
++	}
++	fd_install(fd, sf->file);
++	return 0;
++
++err_fd:
++	put_unused_fd(fd);
++	return ret;
++}
++
++static long
++sf_dma_buf_import_sync_file(struct dma_buf *db, unsigned long uarg)
++{
++	struct sf_dma_buf_sync_file arg;
++	struct dma_fence *fence, *f;
++	struct dma_fence_unwrap iter;
++	enum dma_resv_usage usage;
++	unsigned int n = 0;
++	int ret;
++
++	if (copy_from_user(&arg, (void *)uarg, sizeof(arg)) != 0)
++		return -EFAULT;
++	if ((arg.flags & ~SF_DMA_BUF_SYNC_RW) != 0 || (arg.flags & SF_DMA_BUF_SYNC_RW) == 0)
++		return -EINVAL;
++	fence = sync_file_get_fence(arg.fd);
++	if (fence == NULL)
++		return -EINVAL;
++	usage = (arg.flags & SF_DMA_BUF_SYNC_WRITE) != 0 ? DMA_RESV_USAGE_WRITE : DMA_RESV_USAGE_READ;
++	dma_fence_unwrap_for_each(f, &iter, fence)
++		n++;
++	// as the pin's dma_buf_import_sync_file(): a sync file whose fences have all signalled
++	// unwraps to nothing, and then the reservation object is not touched at all
++	ret = 0;
++	if (n > 0) {
++		dma_resv_lock(db->resv, NULL);
++		ret = dma_resv_reserve_fences(db->resv, n);
++		if (ret == 0) {
++			dma_fence_unwrap_for_each(f, &iter, fence)
++				dma_resv_add_fence(db->resv, f, usage);
++		}
++		dma_resv_unlock(db->resv);
++	}
++	dma_fence_put(fence);
++	return ret;
++}
++
++// DMA_BUF_IOCTL_SYNC, the case of dma_buf_ioctl() (lines 565-591 there): brackets a CPU
++// access through a mapping of the descriptor
++struct sf_dma_buf_sync {
++	uint64_t flags;
++};
++#define SF_DMA_BUF_SYNC_END	(1 << 2)
++#define SF_DMA_BUF_SYNC_VALID_FLAGS_MASK	(SF_DMA_BUF_SYNC_RW | SF_DMA_BUF_SYNC_END)
++#define SF_DMA_BUF_IOCTL_SYNC	_IOW('b', 0, struct sf_dma_buf_sync)
++
++static long
++sf_dma_buf_sync(struct dma_buf *dmabuf, unsigned long arg)
++{
++	struct sf_dma_buf_sync sync;
++	enum dma_data_direction direction;
++	int ret;
++
++	if (copy_from_user(&sync, (void *)arg, sizeof(sync)))
++		return -EFAULT;
++
++	if (sync.flags & ~SF_DMA_BUF_SYNC_VALID_FLAGS_MASK)
++		return -EINVAL;
++
++	switch (sync.flags & SF_DMA_BUF_SYNC_RW) {
++	case SF_DMA_BUF_SYNC_READ:
++		direction = DMA_FROM_DEVICE;
++		break;
++	case SF_DMA_BUF_SYNC_WRITE:
++		direction = DMA_TO_DEVICE;
++		break;
++	case SF_DMA_BUF_SYNC_RW:
++		direction = DMA_BIDIRECTIONAL;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	if (sync.flags & SF_DMA_BUF_SYNC_END)
++		ret = dma_buf_end_cpu_access(dmabuf, direction);
++	else
++		ret = dma_buf_begin_cpu_access(dmabuf, direction);
++
++	return ret;
++}
++
++long sf_dma_buf_sync_file_ioctl(struct dma_buf *db, unsigned int cmd, unsigned long arg);
++
++// -ENOTTY for any other command
++long
++sf_dma_buf_sync_file_ioctl(struct dma_buf *db, unsigned int cmd, unsigned long arg)
++{
++	if (cmd == SF_DMA_BUF_IOCTL_SYNC)
++		return sf_dma_buf_sync(db, arg);
++	if (cmd == SF_DMA_BUF_IOCTL_EXPORT_SYNC_FILE)
++		return sf_dma_buf_export_sync_file(db, arg);
++	if (cmd == SF_DMA_BUF_IOCTL_IMPORT_SYNC_FILE)
++		return sf_dma_buf_import_sync_file(db, arg);
++	return -ENOTTY;
++}

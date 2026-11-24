@@ -1,0 +1,606 @@
+--- a/src/Frameworks/AppKit/NSAlert.m
++++ b/src/Frameworks/AppKit/NSAlert.m
+@@ -22,6 +22,9 @@
+ #import <AppKit/NSTextField.h>
+ #import <AppKit/NSFont.h>
+ #import <AppKit/NSAttributedString.h>
++#import <AppKit/NSThemeFrame.h>
++
++static NSImage *sfDefaultAlertIcon(void);
+ 
+ @implementation NSAlert
+ 
+@@ -33,7 +36,7 @@
+ 
+ -init {
+    _style=NSWarningAlertStyle;
+-   _icon=[[NSImage imageNamed:@"NSAlertPanelExclamation"] retain];
++   _icon=[sfDefaultAlertIcon() retain];
+    _messageText=[NSLocalizedStringFromTableInBundle(@"Alert", nil, [NSBundle bundleForClass: [NSAlert class]], @"Default message text for NSAlert") copy];
+    _informativeText=@"";
+    _accessoryView=nil;
+@@ -41,7 +44,8 @@
+    _showsSuppressionButton=NO;
+    _helpAnchor=nil;
+    _buttons=[NSMutableArray new];
+-   _window=[[NSPanel alloc] initWithContentRect:NSMakeRect(0,0,10,10) styleMask:NSTitledWindowMask backing:NSBackingStoreBuffered defer:NO];
++   // no title bar, as on macOS (the compositor would otherwise frame the panel with an empty one)
++   _window=[[NSPanel alloc] initWithContentRect:NSMakeRect(0,0,10,10) styleMask:NSDocModalWindowMask backing:NSBackingStoreBuffered defer:NO];
+    _suppressionButton=[[NSButton alloc] init];
+  //  [_suppressionButton setButtonType:NSSwitchButton];
+    [_suppressionButton setTitle:NSLocalizedStringFromTableInBundle(@"Do not show this message again", nil, [NSBundle bundleForClass: [NSAlert class]], @"Default NSAlert supression button title")];
+@@ -217,206 +221,158 @@
+    [result setTarget:self];
+    [result setAction:@selector(_alertButton:)];
+    [result setTag:NSAlertFirstButtonReturn+[_buttons count]];
++   // as on macOS: the first button answers Return, one titled Cancel Escape, one titled Don't Save Command-D
++   if([_buttons count]==0)
++    [result setKeyEquivalent:@"\r"];
++   else if([title isEqualToString:@"Cancel"])
++    [result setKeyEquivalent:@"\033"];
++   else if([title isEqualToString:@"Don\u2019t Save"] || [title isEqualToString:@"Don't Save"]){
++    [result setKeyEquivalent:@"d"];
++    [result setKeyEquivalentModifierMask:NSCommandKeyMask];
++   }
+    [_buttons addObject:result];
+    _needsLayout=YES;
+    return result;
+ }
+ 
++/* The panel's layout: metrics and order of parts after Finch's NSAlert.m (Finch, an open Darwin for
++ * Apple Silicon, userland/AppKit/NSAlert.m at commit 2d9b1bb; SPDX-License-Identifier: MIT OR
++ * Apache-2.0; Copyright (c) 2026 The Finch Project contributors), "measured on macOS 26": 420 points
++ * wide at least, a 64-point icon at the top left, the bold message beside it and the informative
++ * text under it, both wrapped, then the accessory view and the suppression checkbox, the buttons
++ * along the bottom from the right (the first rightmost), each its title plus 32 and at least 82
++ * wide. Adapted to this AppKit's ivars and its string drawer. */
++#define ALERT_WIDTH 420.
++#define ALERT_MARGIN 20.
++#define ALERT_ICON 64.
++#define ALERT_BUTTON_HEIGHT 24.
++#define ALERT_BUTTON_GAP 12.
++#define ALERT_MIN_BUTTON 82.
++
++static NSImage *sfDefaultAlertIcon(void){
++   static NSImage *icon;
++
++   if(icon==nil)
++    icon=[[NSImage imageNamed:@"NSAlertPanelExclamation"] retain];
++   return icon;
++}
++
++static CGFloat sfAlertTextHeight(NSString *s,NSFont *font,CGFloat width){
++   if([s length]==0)
++    return 0;
++   // a label's cell draws its text 2 points in from each side
++   NSSize size=[[NSStringDrawer sharedStringDrawer] sizeOfString:s withAttributes:[NSDictionary dictionaryWithObject:font forKey:NSFontAttributeName] inSize:NSMakeSize(width-4,NSStringDrawerLargeDimension)];
++   return ceil(size.height)+2;
++}
++
++static CGFloat sfAlertButtonWidth(NSButton *button){
++   NSFont *font=[button font];
++
++   if(font==nil)
++    font=[NSFont systemFontOfSize:13];
++   CGFloat width=ceil([[button title] sizeWithAttributes:[NSDictionary dictionaryWithObject:font forKey:NSFontAttributeName]].width)+32;
++   return MAX(ALERT_MIN_BUTTON,width);
++}
++
++static NSTextField *sfAlertLabel(NSString *text,NSFont *font,NSRect frame){
++   NSTextField *field=[[[NSTextField alloc] initWithFrame:frame] autorelease];
++
++   [field setStringValue:text];
++   [field setFont:font];
++   [field setEditable:NO];
++   [field setSelectable:YES];
++   [field setBordered:NO];
++   [field setDrawsBackground:NO];
++   [[field cell] setWraps:YES];
++   [[field cell] setLineBreakMode:NSLineBreakByWordWrapping];
++   return field;
++}
++
+ -(void)layout {
+-#define BOTTOM_MARGIN 16
+-#define TOP_MARGIN 16
+-#define LEFT_MARGIN 16
+-#define RIGHT_MARGIN 16
+-
+-// A NSTextField adds a small margin around the text.
+-#define TEXTFIELD_MARGIN 2.
+-
+-#define INTERTEXT_GAP 8.
+-#define BUTTON_MARGIN 8
+-#define INTERBUTTON_GAP 6
+-#define OTHER_GAP 20
+-#define ICON_MAIN_GAP 20
+-#define MAIN_BUTTON_GAP 20
+-
+-   NSSize screenSize=[[NSScreen mainScreen] visibleFrame].size;
+-   NSSize textSize=NSZeroSize;
+-   NSStringDrawer *drawer=[NSStringDrawer sharedStringDrawer];
+-   NSSize iconSize=(_icon!=nil)?[_icon size]:NSZeroSize;
+-   NSDictionary *messageAttributes=[NSDictionary dictionaryWithObjectsAndKeys:[NSFont boldSystemFontOfSize:0],NSFontAttributeName,nil];
+-   NSSize messageSize=NSZeroSize;
+-   NSDictionary *informativeAttributes=[NSDictionary dictionaryWithObjectsAndKeys:[NSFont systemFontOfSize:0],NSFontAttributeName,nil];
+-   NSSize informativeSize=NSZeroSize;
+-   float messageInformativeGap=0.;
+-   NSDictionary *suppressionAttributes=[NSDictionary dictionaryWithObjectsAndKeys:[NSFont systemFontOfSize:0],NSFontAttributeName,nil];
+-   NSSize supressionSize=NSZeroSize;
+-   float informativeSuppressionGap=0.;
+-   NSSize accessorySize=(_accessoryView!=nil)?[_accessoryView frame].size:NSZeroSize;
+-   float suppressionAccessoryGap=0.;
+-   NSSize mainSize=NSZeroSize;
+-   NSSize panelSize=NSZeroSize;
+    int i,count=[_buttons count];
+-   NSSize okCancelButtonSize=NSMakeSize(40,24);
+-   NSSize otherButtonSize=okCancelButtonSize;
+-   NSSize allButtonsSize=NSZeroSize;
+-
+-   // Size the buttons.
+-   for(i=0;i<count && i<2;i++){
+-    NSButton *check=[_buttons objectAtIndex:i];
+-    NSAttributedString *title=[check attributedTitle];
+-    NSSize size=[drawer sizeOfAttributedString:title inSize:NSZeroSize];
+-
+-    okCancelButtonSize.width=MAX(size.width+BUTTON_MARGIN*2,okCancelButtonSize.width);
+-    okCancelButtonSize.height=MAX(size.height,okCancelButtonSize.height);
++   CGFloat buttonsWidth=0;
++   NSFont *messageFont=[NSFont boldSystemFontOfSize:13];
++   NSFont *informativeFont=[NSFont systemFontOfSize:11];
++   NSView *content=[_window contentView];
++   NSImage *icon=_icon;
++
++   // as on macOS: a warning or an informational alert shows the application's icon, a critical one the caution sign
++   if(icon==sfDefaultAlertIcon() && _style!=NSCriticalAlertStyle){
++    NSImage *app=[NSApp applicationIconImage];
++
++    if(app==nil)
++     app=[NSImage imageNamed:@"NSApplicationIcon"];
++    if(app!=nil)
++     icon=app;
+    }
+ 
+-   for(i=0;i<count && i<2;i++)
+-    [[_buttons objectAtIndex:i] setFrameSize:okCancelButtonSize];
+-
+-   for(i=2;i<count;i++){
+-    NSButton *check=[_buttons objectAtIndex:i];
+-    NSAttributedString *title=[check attributedTitle];
+-    NSSize size=[drawer sizeOfAttributedString:title inSize:NSZeroSize];
++   for(i=0;i<count;i++)
++    buttonsWidth+=sfAlertButtonWidth([_buttons objectAtIndex:i])+(i>0?ALERT_BUTTON_GAP:0);
+ 
+-    otherButtonSize.width=MAX(size.width+BUTTON_MARGIN*2,otherButtonSize.width);
+-    otherButtonSize.height=MAX(size.height,otherButtonSize.height);
+-   }
++   CGFloat helpWidth=_showsHelp?24+ALERT_BUTTON_GAP*2:0;
++   CGFloat width=MAX(ALERT_WIDTH,buttonsWidth+helpWidth+ALERT_MARGIN*2);
++   width=MAX(width,ALERT_MARGIN+ALERT_ICON+16+[_accessoryView frame].size.width+ALERT_MARGIN);
++   CGFloat textX=ALERT_MARGIN+ALERT_ICON+16,textW=width-textX-ALERT_MARGIN;
++   CGFloat mh=MAX(sfAlertTextHeight(_messageText,messageFont,textW),16);
++   CGFloat ih=sfAlertTextHeight(_informativeText,informativeFont,textW);
++   CGFloat block=mh+(ih>0?8+ih:0);
+ 
+-   for(i=2;i<count;i++)
+-    [[_buttons objectAtIndex:i] setFrameSize:otherButtonSize];
++   if(_accessoryView!=nil)
++    block+=12+[_accessoryView frame].size.height;
++   if(_showsSuppressionButton)
++    block+=12+18;
+ 
+-   for(i=0;i<count;i++){
+-    NSButton *button=[_buttons objectAtIndex:i];
++   CGFloat height=20+MAX(block,ALERT_ICON)+20+ALERT_BUTTON_HEIGHT+18;
++   CGFloat top=height-20,y;
+ 
+-    allButtonsSize.width+=[button frame].size.width;
+-    allButtonsSize.height=MAX(allButtonsSize.height,[button frame].size.height);
++   if(icon!=nil){
++    NSImageView *imageView=[[[NSImageView alloc] initWithFrame:NSMakeRect(ALERT_MARGIN,top-ALERT_ICON,ALERT_ICON,ALERT_ICON)] autorelease];
+ 
+-    allButtonsSize.width+=INTERBUTTON_GAP;
+-    if(i==1)
+-     allButtonsSize.width+=OTHER_GAP;
++    [imageView setImageScaling:NSImageScaleProportionallyUpOrDown];
++    [imageView setImage:icon];
++    [content addSubview:imageView];
+    }
+ 
+-   // Size the main reasonable and at least wide enough to make all buttons fit.
+-   mainSize.width=MAX(screenSize.width/3.,allButtonsSize.width-iconSize.width-ICON_MAIN_GAP);
+-   mainSize.width=MAX(mainSize.width,accessorySize.width);
+-
+-   // Size the texts.
+-   textSize=NSMakeSize(mainSize.width-TEXTFIELD_MARGIN*2,NSStringDrawerLargeDimension);
+-
+-   if(_messageText!=nil){
+-    messageSize=[drawer sizeOfString:_messageText withAttributes:messageAttributes inSize:textSize];
+-    messageSize.width+=TEXTFIELD_MARGIN*2;
+-    messageSize.height+=TEXTFIELD_MARGIN*2;
++   [content addSubview:sfAlertLabel(_messageText!=nil?_messageText:@"",messageFont,NSMakeRect(textX,top-mh,textW,mh))];
++   y=top-mh;
++   if(ih>0){
++    [content addSubview:sfAlertLabel(_informativeText,informativeFont,NSMakeRect(textX,y-8-ih,textW,ih))];
++    y-=8+ih;
+    }
++   if(_accessoryView!=nil){
++    NSRect frame=[_accessoryView frame];
+ 
+-   if(_informativeText!=nil){
+-    informativeSize=[drawer sizeOfString:_informativeText withAttributes:informativeAttributes inSize:textSize];
+-    informativeSize.width+=TEXTFIELD_MARGIN*2;
+-    informativeSize.height+=TEXTFIELD_MARGIN*2;
++    y-=12+frame.size.height;
++    [_accessoryView setFrameOrigin:NSMakePoint(textX,y)];
++    if([_accessoryView superview]!=content)
++     [content addSubview:_accessoryView];
++   }
++   if(_showsSuppressionButton){
++    y-=12+18;
++    [_suppressionButton setButtonType:NSSwitchButton];
++    [_suppressionButton setFrame:NSMakeRect(textX,y,textW,18)];
++    [content addSubview:_suppressionButton];
+    }
+ 
+-   if(_messageText!=nil && _informativeText!=nil)
+-    messageInformativeGap=INTERTEXT_GAP;
+-
+-   if(_showsSuppressionButton)
+-    supressionSize=[drawer sizeOfString:[_suppressionButton title] withAttributes:suppressionAttributes inSize:textSize];
+-
+-   if(_informativeText!=nil && _showsSuppressionButton)
+-    informativeSuppressionGap=INTERTEXT_GAP;
+-
+-   if(_showsSuppressionButton && _accessoryView!=nil)
+-    suppressionAccessoryGap=INTERTEXT_GAP;
++   CGFloat x=width-ALERT_MARGIN;
+ 
+-   // Now we can size the heights as well.
+-   mainSize.height=messageSize.height+informativeSize.height+messageInformativeGap+supressionSize.height+informativeSuppressionGap+accessorySize.height+suppressionAccessoryGap;
+-
+-   panelSize.width=LEFT_MARGIN+mainSize.width+iconSize.width+ICON_MAIN_GAP+RIGHT_MARGIN;
+-   panelSize.height=TOP_MARGIN+MAX(mainSize.height,iconSize.height)+MAIN_BUTTON_GAP+allButtonsSize.height+BOTTOM_MARGIN;
+-
+-  if(_icon!=nil){
+-   NSRect       frame;
+-   NSImageView *imageView;
+-
+-   frame.origin.x=LEFT_MARGIN;
+-   frame.origin.y=panelSize.height-TOP_MARGIN-iconSize.height;
+-   frame.size=iconSize;
+-   imageView=[[[NSImageView alloc] initWithFrame:frame] autorelease];
+-   [imageView setImage:_icon];
+-   [[_window contentView] addSubview:imageView];
+-  }
+-
+-  if(_messageText!=nil){
+-   NSRect       frame;
+-   NSTextField *textField;
+-
+-   frame.origin.x=LEFT_MARGIN+iconSize.width+ICON_MAIN_GAP;
+-   frame.origin.y=panelSize.height-TOP_MARGIN-messageSize.height;
+-   frame.size=messageSize;
+-   textField=[[[NSTextField alloc] initWithFrame:frame] autorelease];
+-   [textField setAttributedStringValue:[[[NSAttributedString alloc] initWithString:_messageText attributes:messageAttributes] autorelease]];
+-   [textField setEditable:NO];
+-   [textField setSelectable:YES];
+-   [textField setBordered:NO];
+-   [[_window contentView] addSubview:textField];
+-  }
+-
+-  if(_informativeText!=nil){
+-   NSRect       frame;
+-   NSTextField *textField;
+-
+-   frame.origin.x=LEFT_MARGIN+iconSize.width+ICON_MAIN_GAP;
+-   frame.origin.y=panelSize.height-TOP_MARGIN-messageSize.height-messageInformativeGap-informativeSize.height;
+-   frame.size=informativeSize;
+-   textField=[[[NSTextField alloc] initWithFrame:frame] autorelease];
+-   [textField setStringValue:[[[NSAttributedString alloc] initWithString:_informativeText attributes:informativeAttributes] autorelease]];
+-   [textField setEditable:NO];
+-   [textField setSelectable:YES];
+-   [textField setBordered:NO];
+-   [[_window contentView] addSubview:textField];
+-  }
+-
+-  if(_showsSuppressionButton){
+-   NSRect frame;
+-
+-   frame.origin.x=LEFT_MARGIN+iconSize.width+ICON_MAIN_GAP;
+-   frame.origin.y=panelSize.height-TOP_MARGIN-messageSize.height-messageInformativeGap-informativeSize.height-informativeSuppressionGap-frame.size.height;
+-   frame.size=supressionSize;
+-   [_suppressionButton setFrame:frame];
+-   [[_window contentView] addSubview:_suppressionButton];
+-  }
+-
+-  if(_accessoryView!=nil){
+-   NSRect frame=[_accessoryView frame];
+-
+-   frame.origin.x=LEFT_MARGIN+iconSize.width+ICON_MAIN_GAP;
+-   frame.origin.y=panelSize.height-TOP_MARGIN-messageSize.height-messageInformativeGap-informativeSize.height-informativeSuppressionGap-supressionSize.height-suppressionAccessoryGap-frame.size.height;
+-   [_accessoryView setFrame:frame];
+-  }
+-
+-  NSPoint origin={panelSize.width-RIGHT_MARGIN,BOTTOM_MARGIN};
+-
+-  for(i=0;i<count;i++){
+-   NSButton *button=[_buttons objectAtIndex:i];
+-   NSSize    bSize=[button frame].size;
+-
+-   origin.x-=bSize.width;
+-   [button setFrameOrigin:origin];
+-   origin.x-=INTERBUTTON_GAP;
+-   if(i==1)
+-    origin.x-=OTHER_GAP;
+-   [[_window contentView] addSubview:button];
+-  }
++   for(i=0;i<count;i++){
++    NSButton *button=[_buttons objectAtIndex:i];
++    CGFloat   w=sfAlertButtonWidth(button);
+ 
+-  NSRect contentRect={{0,0},panelSize};
++    x-=w;
++    [button setFrame:NSMakeRect(x,18,w,ALERT_BUTTON_HEIGHT)];
++    [content addSubview:button];
++    x-=ALERT_BUTTON_GAP;
++   }
+ 
+-  NSRect frame=[_window frameRectForContentRect:contentRect];
++   NSRect frame=[_window frameRectForContentRect:NSMakeRect(0,0,width,height)];
+ 
+    // This stops the platform window from trying to impose a different size on us
+-   // Which for some reason it wants to do.
+-   [_window setMinSize: frame.size];
+-   [_window setMaxSize: frame.size];
+-
+-  [_window setFrame:frame display:NO];
+-  _needsLayout=NO;
++   [_window setMinSize:frame.size];
++   [_window setMaxSize:frame.size];
++   [_window setFrame:frame display:NO];
++   _needsLayout=NO;
+ }
+ 
+ -(void)layoutIfNeeded {
+@@ -471,14 +427,17 @@
+ 
+ -(NSInteger)runModal {
+    [_window setLevel: NSModalPanelWindowLevel];
+-   [_window setStyleMask:NSTitledWindowMask];
++   // an alert has no title bar on macOS: the panel's own border, as a sheet's
++   [_window setStyleMask:NSDocModalWindowMask];
++   [(NSThemeFrame *)[_window _backgroundView] setWindowBorderType:NSWindowSheetBorderType];
++   [_window center];
+    [self layoutIfNeeded];
+    [_window setDefaultButtonCell:[[_buttons objectAtIndex:0] cell]];
+    return [NSApp runModalForWindow:_window];
+ }
+ 
+ -(void)_alertButton:sender {
+-   if([_window isSheet])
++   if([NSApp modalWindow]!=_window && [_window isSheet])
+     [NSApp endSheet:_window returnCode:[sender tag]];
+    else
+     [NSApp stopModalWithCode:[sender tag]];
+--- a/src/Frameworks/AppKit/NSPanel.m
++++ b/src/Frameworks/AppKit/NSPanel.m
+@@ -7,6 +7,7 @@
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+ #import <AppKit/NSPanel.h>
+ #import <AppKit/NSAlertPanel.h>
++#import <AppKit/NSAlert.h>
+ #import <AppKit/NSApplication.h>
+ #import <CoreGraphics/CGWindow.h>
+ 
+@@ -71,89 +72,107 @@
+ 
+ @end
+ 
+-int NSRunAlertPanel(NSString *title, NSString *format, NSString *defaultButton, NSString *alternateButton, NSString *otherButton, ...) {
+-   va_list          arguments;
+-   NSString        *message;
+-   NSPanel         *panel;
+-   int              result;
+-
+-   va_start(arguments,otherButton);
+-
+-   message=[[[NSString alloc] initWithFormat:format arguments:arguments] autorelease];
+-
+-   panel=[[NSAlertPanel alloc] initWithTitle:title message:message defaultButton:defaultButton alternateButton:alternateButton otherButton:otherButton sheet:NO];
++/* The legacy alert functions (Terminal's question before closing a window or quitting with running
++ * processes) are NSAlert on macOS: the title is the alert's bold message, the formatted text its
++ * informative text, and the buttons answer NSAlertDefaultReturn, NSAlertAlternateReturn and
++ * NSAlertOtherReturn. */
++static NSAlert *sfLegacyAlert(NSAlertStyle style,NSString *title,NSString *message,NSString *defaultButton,NSString *alternateButton,NSString *otherButton){
++   NSAlert *alert=[[[NSAlert alloc] init] autorelease];
++
++   [alert setAlertStyle:style];
++   if(title!=nil)
++    [alert setMessageText:title];
++   [alert setInformativeText:message!=nil?message:@""];
++   [alert addButtonWithTitle:defaultButton!=nil?defaultButton:NSLocalizedStringFromTableInBundle(@"OK", nil, [NSBundle bundleForClass:[NSAlert class]], @"Default button title for NSAlert")];
++   if(alternateButton!=nil)
++    [alert addButtonWithTitle:alternateButton];
++   if(otherButton!=nil)
++    [alert addButtonWithTitle:otherButton];
++   return alert;
++}
++
++static NSInteger sfLegacyReturn(NSInteger code){
++   switch(code){
++    case NSAlertFirstButtonReturn: return NSAlertDefaultReturn;
++    case NSAlertSecondButtonReturn: return NSAlertAlternateReturn;
++    case NSAlertThirdButtonReturn: return NSAlertOtherReturn;
++    default: return code;
++   }
++}
+ 
+-   result=[NSApp runModalForWindow:panel];
++static int sfRunLegacyAlert(NSAlertStyle style,NSString *title,NSString *message,NSString *defaultButton,NSString *alternateButton,NSString *otherButton){
++   return (int)sfLegacyReturn([sfLegacyAlert(style,title,message,defaultButton,alternateButton,otherButton) runModal]);
++}
+ 
+-   [panel release];
++int NSRunAlertPanel(NSString *title, NSString *format, NSString *defaultButton, NSString *alternateButton, NSString *otherButton, ...) {
++   va_list arguments;
+ 
+-   return result;
++   va_start(arguments,otherButton);
++   NSString *message=format!=nil?[[[NSString alloc] initWithFormat:format arguments:arguments] autorelease]:nil;
++   va_end(arguments);
++   return sfRunLegacyAlert(NSWarningAlertStyle,title,message,defaultButton,alternateButton,otherButton);
+ }
+ 
+ int NSRunInformationalAlertPanel(NSString *title, NSString *msgFormat, NSString *defaultButton, NSString *alternateButton, NSString *otherButton, ...) {
++   va_list arguments;
+ 
+-    // FIXME: should have a different icon
+-	va_list          arguments;
+-	NSString        *message;
+-    
+-	va_start(arguments,otherButton);
+-	
+-	message=[[[NSString alloc] initWithFormat:msgFormat arguments:arguments] autorelease];
+-    
+-    return NSRunAlertPanel(title, msgFormat, defaultButton, alternateButton, otherButton);
++   va_start(arguments,otherButton);
++   NSString *message=msgFormat!=nil?[[[NSString alloc] initWithFormat:msgFormat arguments:arguments] autorelease]:nil;
++   va_end(arguments);
++   return sfRunLegacyAlert(NSInformationalAlertStyle,title,message,defaultButton,alternateButton,otherButton);
+ }
+ 
+ int NSRunCriticalAlertPanel(NSString *title, NSString *msgFormat, NSString *defaultButton, NSString *alternateButton, NSString *otherButton, ...) {
+-    
+-    // FIXME: should have a different icon
+-    va_list          arguments;
+-    NSString        *message;
+-
+-    va_start(arguments,otherButton);
+-
+-    message=[[[NSString alloc] initWithFormat:msgFormat arguments:arguments] autorelease];
++   va_list arguments;
+ 
+-    return NSRunAlertPanel(title, msgFormat, defaultButton, alternateButton, otherButton);
++   va_start(arguments,otherButton);
++   NSString *message=msgFormat!=nil?[[[NSString alloc] initWithFormat:msgFormat arguments:arguments] autorelease]:nil;
++   va_end(arguments);
++   return sfRunLegacyAlert(NSCriticalAlertStyle,title,message,defaultButton,alternateButton,otherButton);
++}
++
++static void sfBeginLegacyAlertSheet(NSAlertStyle style,NSString *title,NSString *defaultButton,NSString *alternateButton,NSString *otherButton,NSWindow *window,id modalDelegate,SEL didEndSelector,SEL didDismissSelector,void *contextInfo,NSString *message){
++   NSAlert *alert=sfLegacyAlert(style,title,message,defaultButton,alternateButton,otherButton);
++   NSWindow *sheet=[alert window];
++
++   [modalDelegate retain];
++   [alert beginSheetModalForWindow:window completionHandler:^(NSInteger code){
++      typedef void (*didEnd)(id,SEL,NSWindow *,NSInteger,void *);
++      NSInteger legacy=sfLegacyReturn(code);
++
++      // the sheet is still on the screen when the delegate hears of it, as on macOS
++      if(modalDelegate!=nil && didEndSelector!=NULL)
++       ((didEnd)[modalDelegate methodForSelector:didEndSelector])(modalDelegate,didEndSelector,sheet,legacy,contextInfo);
++      [sheet orderOut:nil];
++      if(modalDelegate!=nil && didDismissSelector!=NULL)
++       ((didEnd)[modalDelegate methodForSelector:didDismissSelector])(modalDelegate,didDismissSelector,sheet,legacy,contextInfo);
++      [modalDelegate release];
++   }];
+ }
+ 
+ void NSBeginAlertSheet(NSString *title,NSString *defaultButton,NSString *alternateButton,NSString *otherButton,NSWindow *window, id modalDelegate,SEL didEndSelector,SEL didDismissSelector,void *contextInfo,NSString *format,...) {
+-   va_list          arguments;
+-   NSString        *message;
+-   NSPanel         *panel;
++   va_list arguments;
+ 
+    va_start(arguments,format);
++   NSString *message=format!=nil?[[[NSString alloc] initWithFormat:format arguments:arguments] autorelease]:nil;
++   va_end(arguments);
++   sfBeginLegacyAlertSheet(NSWarningAlertStyle,title,defaultButton,alternateButton,otherButton,window,modalDelegate,didEndSelector,didDismissSelector,contextInfo,message);
++}
+ 
+-   message=[[[NSString alloc] initWithFormat:format arguments:arguments] autorelease];
+-
+-   panel=[[[NSAlertPanel alloc] initWithTitle:title message:message defaultButton:defaultButton alternateButton:alternateButton otherButton:otherButton sheet:YES] autorelease];
++void NSBeginCriticalAlertSheet(NSString *title,NSString *defaultButton,NSString *alternateButton,NSString *otherButton,NSWindow *window, id modalDelegate,SEL didEndSelector,SEL didDismissSelector,void *contextInfo,NSString *format,...) {
++   va_list arguments;
+ 
+-   [NSApp beginSheet:panel modalForWindow:window modalDelegate:modalDelegate didEndSelector:didEndSelector contextInfo:contextInfo];
++   va_start(arguments,format);
++   NSString *message=format!=nil?[[[NSString alloc] initWithFormat:format arguments:arguments] autorelease]:nil;
++   va_end(arguments);
++   sfBeginLegacyAlertSheet(NSCriticalAlertStyle,title,defaultButton,alternateButton,otherButton,window,modalDelegate,didEndSelector,didDismissSelector,contextInfo,message);
+ }
+ 
+-void NSBeginCriticalAlertSheet(NSString *title,NSString *defaultButton,NSString *alternateButton,NSString *otherButton,NSWindow *window, id modalDelegate,SEL didEndSelector,SEL didDismissSelector,void *contextInfo,NSString *format,...)
+-{
+-	// FIXME: should probably have different icon or so
+-	
+-	va_list          arguments;
+-	NSString        *message;
+-
+-	va_start(arguments,format);
+-	
+-	message=[[[NSString alloc] initWithFormat:format arguments:arguments] autorelease];
+-	
+-	NSBeginAlertSheet(title, defaultButton, alternateButton,otherButton,window, modalDelegate, didEndSelector,didDismissSelector,contextInfo,message);
+-}
+-
+-void NSBeginInformationalAlertSheet(NSString *title,NSString *defaultButton,NSString *alternateButton,NSString *otherButton,NSWindow *window, id modalDelegate,SEL didEndSelector,SEL didDismissSelector,void *contextInfo,NSString *format,...)
+-{
+-	// FIXME: should probably have different icon or so
+-	
+-	va_list          arguments;
+-	NSString        *message;
+-	
+-	va_start(arguments,format);
+-	
+-	message=[[[NSString alloc] initWithFormat:format arguments:arguments] autorelease];
+-	
+-	NSBeginAlertSheet(title, defaultButton, alternateButton,otherButton,window, modalDelegate, didEndSelector,didDismissSelector,contextInfo,message);
++void NSBeginInformationalAlertSheet(NSString *title,NSString *defaultButton,NSString *alternateButton,NSString *otherButton,NSWindow *window, id modalDelegate,SEL didEndSelector,SEL didDismissSelector,void *contextInfo,NSString *format,...) {
++   va_list arguments;
++
++   va_start(arguments,format);
++   NSString *message=format!=nil?[[[NSString alloc] initWithFormat:format arguments:arguments] autorelease]:nil;
++   va_end(arguments);
++   sfBeginLegacyAlertSheet(NSInformationalAlertStyle,title,defaultButton,alternateButton,otherButton,window,modalDelegate,didEndSelector,didDismissSelector,contextInfo,message);
+ }
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -824,6 +824,18 @@
+ }
+ 
+ -(NSImage *)applicationIconImage {
++   // the bundle's icon (CFBundleIconFile) as soon as it is asked for, not only once launching finished
++   if(_applicationIconImage==nil){
++    NSString *name=[[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleIconFile"];
++
++    if([name isKindOfClass:[NSString class]] && [name length]>0){
++     NSString *type=[[name pathExtension] length]>0?[name pathExtension]:@"icns";
++     NSString *path=[[NSBundle mainBundle] pathForResource:[name stringByDeletingPathExtension] ofType:type];
++
++     if(path!=nil)
++      _applicationIconImage=[[NSImage alloc] initWithContentsOfFile:path];
++    }
++   }
+    return _applicationIconImage;
+ }
+ 
+--- a/src/Frameworks/AppKit/NSImage.m
++++ b/src/Frameworks/AppKit/NSImage.m
+@@ -120,6 +120,14 @@
+ 
+ +imageNamed:(NSString *)name {
+    NSImage *image=[[self allImages] objectForKey:name];
++
++   // as on macOS the application's own icon (its bundle's CFBundleIconFile), not AppKit's generic one
++   if([name isEqualToString:NSImageNameApplicationIcon] && NSApp!=nil){
++    NSImage *app=[NSApp applicationIconImage];
++
++    if(app!=nil)
++     return app;
++   }
+    if(image==nil){
+     NSArray *bundles=[self _checkBundles];
+     int      i,count=[bundles count];

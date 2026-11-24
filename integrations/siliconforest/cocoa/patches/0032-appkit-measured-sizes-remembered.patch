@@ -1,0 +1,118 @@
+--- a/src/Frameworks/AppKit/NSStringDrawer.h
++++ b/src/Frameworks/AppKit/NSStringDrawer.h
+@@ -17,6 +17,9 @@
+     NSTextStorage *_textStorage;
+     NSLayoutManager *_layoutManager;
+     NSTextContainer *_textContainer;
++    // sizes of unbounded one-style strings measured lately: {attributes: {string: size}}
++    NSMutableDictionary *_sfSizes;
++    NSUInteger _sfSizeCount;
+ }
+ 
+ + (NSStringDrawer *)sharedStringDrawer;
+--- a/src/Frameworks/AppKit/NSStringDrawer.m
++++ b/src/Frameworks/AppKit/NSStringDrawer.m
+@@ -36,9 +36,61 @@
+    return self;
+ }
+ 
++/* Measuring is a pass of the whole text system (about 5 ms for a word on the M1), and interfaces
++ * measure the same few strings over and over: a menu's titles for every rectangle it asks for, a
++ * terminal the cell of each font of each of its profiles. The size of a string in one set of
++ * attributes with no bound is remembered (a few hundred of them; forgotten together when full). */
++#define SF_SIZE_CACHE_LIMIT 600
++
++-(BOOL)_sfCachedSize:(NSSize *)size ofString:(NSString *)string attributes:(NSDictionary *)attributes {
++   NSValue *value;
++
++   if(string==nil || [string length]>256)
++    return NO;
++   value=[[_sfSizes objectForKey:(attributes!=nil)?(id)attributes:(id)[NSNull null]] objectForKey:string];
++   if(value==nil)
++    return NO;
++   *size=[value sizeValue];
++   return YES;
++}
++
++-(void)_sfRememberSize:(NSSize)size ofString:(NSString *)string attributes:(NSDictionary *)attributes {
++   id key=(attributes!=nil)?(id)attributes:(id)[NSNull null];
++   NSMutableDictionary *strings;
++
++   if(string==nil || [string length]>256)
++    return;
++   if(_sfSizes==nil)
++    _sfSizes=[[NSMutableDictionary alloc] init];
++   if(_sfSizeCount>=SF_SIZE_CACHE_LIMIT){
++    [_sfSizes removeAllObjects];
++    _sfSizeCount=0;
++   }
++   strings=[_sfSizes objectForKey:key];
++   if(strings==nil){
++    strings=[NSMutableDictionary dictionary];
++    [_sfSizes setObject:strings forKey:[[key copy] autorelease]];
++   }
++   [strings setObject:[NSValue valueWithSize:size] forKey:[[string copy] autorelease]];
++   _sfSizeCount++;
++}
++
+ -(NSSize)sizeOfString:(NSString *)string withAttributes:(NSDictionary *)attributes  inSize:(NSSize)maxSize {
+-   if(maxSize.width==NSZeroSize.width && maxSize.height==NSZeroSize.height)
+-    maxSize=NSMakeSize(NSStringDrawerLargeDimension,NSStringDrawerLargeDimension);
++   BOOL unbounded=(maxSize.width==NSZeroSize.width && maxSize.height==NSZeroSize.height);
++   NSSize known;
++
++   if(unbounded && [self _sfCachedSize:&known ofString:string attributes:attributes])
++    return known;
++   if(unbounded){
++    [_textContainer setContainerSize:NSMakeSize(NSStringDrawerLargeDimension,NSStringDrawerLargeDimension)];
++    [_textStorage beginEditing];
++    [_textStorage replaceCharactersInRange:NSMakeRange(0,[_textStorage length]) withString:string];
++    [_textStorage setAttributes:attributes range:NSMakeRange(0,[_textStorage length])];
++    [_textStorage endEditing];
++    known=[_layoutManager usedRectForTextContainer:_textContainer].size;
++    [self _sfRememberSize:known ofString:string attributes:attributes];
++    return known;
++   }
+    [_textContainer setContainerSize:maxSize];
+    [_textStorage beginEditing];
+    [_textStorage replaceCharactersInRange:NSMakeRange(0,[_textStorage length]) withString:string];
+@@ -79,6 +131,16 @@
+ }
+ 
+ -(NSSize)sizeOfAttributedString:(NSAttributedString *)astring inSize:(NSSize)maxSize {
++   NSUInteger length=[astring length];
++
++   // one style over the whole string and no bound: the size of that string in those attributes
++   if(maxSize.width==NSZeroSize.width && maxSize.height==NSZeroSize.height && length>0 && length<=256){
++    NSRange run=NSMakeRange(0,0);
++    NSDictionary *attributes=[astring attributesAtIndex:0 longestEffectiveRange:&run inRange:NSMakeRange(0,length)];
++
++    if(run.location==0 && run.length==length)
++     return [self sizeOfString:[astring string] withAttributes:attributes inSize:NSZeroSize];
++   }
+    if(maxSize.width==NSZeroSize.width && maxSize.height==NSZeroSize.height)
+     maxSize=NSMakeSize(NSStringDrawerLargeDimension,NSStringDrawerLargeDimension);
+    [_textContainer setContainerSize:maxSize];
+@@ -152,6 +214,22 @@
+ 	// by Cocotron
+ 	NSAttributedString *string = self; 
+ 	NSSize size = [string size];
++	/* A title that is a little too wide for its place is drawn a little narrower rather than cut
++	 * ("New window with profi..."): nibs made on macOS are laid out for the widths of its system
++	 * font, and the system font here (Inter) runs wider. Up to an eighth is taken out this way;
++	 * a title that needs more is cut with an ellipsis as before. */
++	if (truncateTail && size.width > rect.size.width && rect.size.width > 0 && size.width <= rect.size.width * 1.143 &&
++	    size.height <= rect.size.height * 1.6 && [string length]) {
++		CGFloat squeeze = rect.size.width / size.width;
++
++		CGContextTranslateCTM(graphicsPort, rect.origin.x, 0);
++		CGContextScaleCTM(graphicsPort, squeeze, 1);
++		CGContextTranslateCTM(graphicsPort, -rect.origin.x, 0);
++		[[NSStringDrawer sharedStringDrawer] drawAttributedString:string
++		        inRect:NSMakeRect(rect.origin.x, rect.origin.y, size.width + 1, rect.size.height)];
++		CGContextRestoreGState(graphicsPort);
++		return;
++	}
+ 	if (truncateTail && size.width > rect.size.width && [string length]) {
+ 		// Create a "..." attributed string with the attributes of the last char of this string
+ 		NSDictionary *attributes = [string attributesAtIndex:[string length]-1 effectiveRange:NULL];

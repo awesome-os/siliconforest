@@ -1,0 +1,330 @@
+wm-darwin autopilot: a Touch Bar phase
+
+Phase `touchbar`, after `volume`: finger records for F11, F11, F12, F12, F10, F10 and
+Escape are written to the Touch Bar driver's test entry (kern.sf_touchbar.inject, in the
+digitizer's units, at the positions kern.sf_touchbar.keys gives). The driver parses them
+as it parses the digitizer's reports; the keys come back through IOHIDFamily and the
+SFHID device node like any key. The phase counts the key events delivered (two per touch,
+Escape's release last) and, with an audio server, reads its level back after each of the
+six volume touches as the volume phase does. Without the driver it reports SKIPPED.
+Server::hid_keys() counts delivered key events for it.
+
+Applies on top of the uncommitted volume-key change (../m1-sound/sysaudio/
+wm-darwin-volume-keys.commit) in sources/chonkstep-darwin, branch wm-darwin, commit
+d92ac89; working tree only, not committed there.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+---
+--- a/crates/wm-darwin/src/autopilot.rs
++++ b/crates/wm-darwin/src/autopilot.rs
+@@ -16,6 +16,10 @@
+ //!   other terminal, Control+Shift+V: the word must arrive there
+ //! * `brightness` press F1 and F2 (the brightness keys) and read the backlight back
+ //! * `volume`   press F11, F12 and F10 (the volume keys) and read the audio server's level back
++//! * `touchbar` touch F11, F12, F10 and Escape on the Touch Bar: finger records written to the
++//!   kernel driver's test entry (`kern.sf_touchbar.inject`), which parses them as it parses the
++//!   digitizer's reports; the keys then arrive as any key does, through the SFHID device node.
++//!   Skipped where there is no such driver or no native input
+ //! * `idle`     shorten the idle time, wait for the display to be powered down, wake it
+ //!   with a key (which must not be delivered) and see frames resume
+ //! * `resize`   drag the window's bottom-right corner
+@@ -67,6 +71,7 @@
+     Clipboard,
+     Brightness,
+     Volume,
++    TouchBar,
+     Idle,
+     Resize,
+     Redrag,
+@@ -77,7 +82,7 @@
+     Limit,
+     Done,
+ }
+-const ORDER: [Phase; 17] = [
++const ORDER: [Phase; 18] = [
+     Phase::Settle,
+     Phase::Pointer,
+     Phase::Drag,
+@@ -87,6 +92,7 @@
+     Phase::Clipboard,
+     Phase::Brightness,
+     Phase::Volume,
++    Phase::TouchBar,
+     Phase::Idle,
+     Phase::Resize,
+     Phase::Redrag,
+@@ -109,6 +115,7 @@
+             Phase::Clipboard => "clipboard",
+             Phase::Brightness => "brightness",
+             Phase::Volume => "volume",
++            Phase::TouchBar => "touchbar",
+             Phase::Idle => "idle",
+             Phase::Resize => "resize",
+             Phase::Redrag => "redrag",
+@@ -132,6 +139,7 @@
+             Phase::Clipboard => 9_000,
+             Phase::Brightness => 5_000,
+             Phase::Volume => 2_000,
++            Phase::TouchBar => 4_000,
+             Phase::Idle => 10_000,
+             Phase::Resize => 4_000,
+             Phase::Redrag => 3_000,
+@@ -167,6 +175,8 @@
+ #[derive(Clone, Copy, Debug)]
+ enum Act {
+     Key(u8, bool),
++    /// A finger down on (or up from) the Touch Bar key that sends this usage, through the kernel driver.
++    Touch(u8, bool),
+     /// A wheel record of this many steps (positive: up, back into history).
+     Wheel(i8),
+     /// Look at the terminal's own state now; the number says which look.
+@@ -312,6 +322,11 @@
+     /// Volume phase: the level before, (level, notice) after each key.
+     mixer: Option<crate::volume::Level>,
+     volumes: Vec<(crate::volume::Level, String)>,
++    /// Touch Bar phase: the driver's keys, key events seen before, (level, (key events, last key), notice) after each touch.
++    touch_keys: Option<String>,
++    touch_before: (u64, Option<(u32, bool)>),
++    touch_looks: Vec<(Option<crate::volume::Level>, (u64, Option<(u32, bool)>), String)>,
++    touch_errors: Vec<String>,
+     /// Idle phase: the idle time to put back, and (display off, frames, flips, counts) at each look.
+     idle_restore: Option<Option<std::time::Duration>>,
+     idle_looks: Vec<(bool, u64, u64, crate::power::PowerCounts)>,
+@@ -368,6 +383,10 @@
+             levels: Vec::new(),
+             mixer: None,
+             volumes: Vec::new(),
++            touch_keys: None,
++            touch_before: (0, None),
++            touch_looks: Vec::new(),
++            touch_errors: Vec::new(),
+             idle_restore: None,
+             idle_looks: Vec::new(),
+             lines: Vec::new(),
+@@ -744,13 +763,18 @@
+                     let _ = chord(self, server, 5, start, USAGE_ENTER)?;
+                 }
+             }
+-            Phase::FullScreen | Phase::Scrollback | Phase::Clipboard | Phase::Brightness | Phase::Volume | Phase::Idle => {
++            Phase::FullScreen | Phase::Scrollback | Phase::Clipboard | Phase::Brightness | Phase::Volume | Phase::TouchBar | Phase::Idle => {
+                 // Run the phase's script: one step per tick once its time has come.
+                 if let Some((at, act)) = self.script.get(self.script_at).copied() {
+                     if t >= at {
+                         self.script_at += 1;
+                         match act {
+                             Act::Key(usage, down) => self.key(server, usage, down, time_ms)?,
++                            Act::Touch(usage, down) => {
++                                if let Err(error) = touchbar::touch(usage, down) {
++                                    self.touch_errors.push(error);
++                                }
++                            }
+                             Act::Wheel(steps) => self.wheel(server, steps, time_ms)?,
+                             Act::To(index) => {
+                                 let to = self.points[index as usize];
+@@ -815,6 +839,9 @@
+                                             Self::notice(server),
+                                         ));
+                                     }
++                                    (Phase::TouchBar, _) => {
++                                        self.touch_looks.push((server.mixer().level().ok(), server.hid_keys(), Self::notice(server)));
++                                    }
+                                     (Phase::Volume, _) => {
+                                         if let Ok(level) = server.mixer().level() {
+                                             self.volumes.push((level, Self::notice(server)));
+@@ -1024,6 +1051,21 @@
+                 }
+                 self.script = if self.mixer.is_some() { script } else { Vec::new() };
+             }
++            Phase::TouchBar => {
++                // The volume phase's keys and Escape, as touches on the strip's function layer.
++                self.touch_looks.clear();
++                self.touch_errors.clear();
++                self.script_at = 0;
++                self.mixer = server.mixer().level().ok();
++                self.touch_before = server.hid_keys();
++                self.touch_keys = touchbar::keys().ok();
++                let mut script = Vec::new();
++                for (i, usage) in VOLUME_KEYS.into_iter().chain([USAGE_ESCAPE]).enumerate() {
++                    let at = 200 + 450 * i as u64;
++                    script.extend([(at, Act::Touch(usage, true)), (at + 80, Act::Touch(usage, false)), (at + 380, Act::Probe(i as u8 + 1))]);
++                }
++                self.script = if self.touch_keys.is_some() { script } else { Vec::new() };
++            }
+             Phase::Idle => {
+                 // No input for longer than a shortened idle time; then one key.
+                 self.idle_looks.clear();
+@@ -1202,6 +1244,44 @@
+                 );
+                 if ok { self.say(line) } else { self.fail(line) }
+             }
++            Phase::TouchBar => {
++                let Some(keys) = self.touch_keys.clone() else {
++                    let reason = touchbar::keys().err().unwrap_or_default();
++                    self.say(format!("WMAUTO touchbar result=SKIPPED reason=\"{reason}\""));
++                    return;
++                };
++                use crate::volume::{percent, stepped, Level};
++                // Every touch is a press and a release that reached this process as key events: 14 of them, Escape's release last.
++                let seen: Vec<u64> = self.touch_looks.iter().map(|l| l.1 .0 - self.touch_before.0).collect();
++                let counted = seen.len() == 7 && seen.iter().enumerate().all(|(i, n)| *n == 2 * (i as u64 + 1));
++                let last = self.touch_looks.last().and_then(|l| l.1 .1);
++                let escape = last == Some((1, false));
++                // With an audio server the first six are the volume keys and move its level as the volume phase's do.
++                let (levels, volume_ok) = match self.mixer {
++                    Some(before) => {
++                        let mut expected = Vec::new();
++                        let mut level = before;
++                        for evdev in VOLUME_EVDEV {
++                            level = stepped(level, evdev);
++                            expected.push(level);
++                        }
++                        let read: Vec<Level> = self.touch_looks.iter().take(6).filter_map(|l| l.0).collect();
++                        let same = |a: &Level, b: &Level| a.muted == b.muted && (a.volume - b.volume).abs() < 0.002;
++                        let ok = read.len() == expected.len() && read.iter().zip(&expected).all(|(a, b)| same(a, b));
++                        let list = |v: &[Level]| v.iter().map(|l| format!("{}{}", percent(l.volume), if l.muted { "m" } else { "" })).collect::<Vec<_>>().join(",");
++                        (format!("before={} read_back={} expected={}", list(&[before]), list(&read), list(&expected)), ok)
++                    }
++                    None => ("volume=not-checked (no audio server: the keys are ordinary function keys)".to_string(), true),
++                };
++                let ok = counted && escape && volume_ok && self.touch_errors.is_empty();
++                let line = format!(
++                    "WMAUTO touchbar touches=F11,F11,F12,F12,F10,F10,Escape through=kern.sf_touchbar.inject keys=\"{keys}\" key_events_after_each={seen:?} last_key={last:?} {levels} notices={:?} errors={:?} result={}",
++                    self.touch_looks.iter().map(|l| l.2.as_str()).collect::<Vec<_>>(),
++                    self.touch_errors,
++                    if ok { "PASS" } else { "FAILED" }
++                );
++                if ok { self.say(line) } else { self.fail(line) }
++            }
+             Phase::Volume => {
+                 let Some(before) = self.mixer else {
+                     let errno = server.mixer().level().err().unwrap_or(0);
+@@ -1452,6 +1532,52 @@
+     }
+ }
+ 
++/// The Touch Bar driver's test entry (SFAppleTouchBar, `kern.sf_touchbar.*`); absent anywhere else.
++mod touchbar {
++    /// The current layer's keys: "usage:x ..." (usage in hex, x in the digitizer's units).
++    #[cfg(target_os = "macos")]
++    pub fn keys() -> Result<String, String> {
++        let mut text = [0u8; 1024];
++        let mut size = text.len() - 1;
++        // SAFETY: `text` and `size` describe the buffer; no new value is passed.
++        let result = unsafe { libc::sysctlbyname(c"kern.sf_touchbar.keys".as_ptr(), text.as_mut_ptr().cast(), &mut size, std::ptr::null_mut(), 0) };
++        if result != 0 {
++            return Err(format!("kern.sf_touchbar.keys: errno {}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0)));
++        }
++        Ok(String::from_utf8_lossy(&text[..size]).trim_end_matches('\0').to_string())
++    }
++    #[cfg(not(target_os = "macos"))]
++    pub fn keys() -> Result<String, String> {
++        Err("no Touch Bar driver on this system".into())
++    }
++    /// Where the key that sends `usage` is, from the driver's list.
++    pub fn position(keys: &str, usage: u8) -> Option<u32> {
++        keys.split_whitespace().find_map(|key| {
++            let (u, x) = key.split_once(':')?;
++            (u8::from_str_radix(u, 16).ok()? == usage).then(|| x.parse().ok())?
++        })
++    }
++    /// One finger record: down on (state 3) or up from (state 7) the key that sends `usage`.
++    pub fn touch(usage: u8, down: bool) -> Result<(), String> {
++        let keys = keys()?;
++        let x = position(&keys, usage).ok_or_else(|| format!("no key sends usage {usage:#04x} in \"{keys}\""))?;
++        inject(&format!("1 {} {x} 320", if down { 3 } else { 7 }))
++    }
++    #[cfg(target_os = "macos")]
++    fn inject(record: &str) -> Result<(), String> {
++        let text = std::ffi::CString::new(record).map_err(|_| "record".to_string())?;
++        // SAFETY: the new value is the record's bytes with their terminator; nothing is read back.
++        let result = unsafe {
++            libc::sysctlbyname(c"kern.sf_touchbar.inject".as_ptr(), std::ptr::null_mut(), std::ptr::null_mut(), text.as_ptr().cast_mut().cast(), record.len() + 1)
++        };
++        if result == 0 { Ok(()) } else { Err(format!("kern.sf_touchbar.inject \"{record}\": errno {}", std::io::Error::last_os_error().raw_os_error().unwrap_or(0))) }
++    }
++    #[cfg(not(target_os = "macos"))]
++    fn inject(_: &str) -> Result<(), String> {
++        Err("no Touch Bar driver on this system".into())
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -1464,6 +1590,14 @@
+     }
+ 
+     #[test]
++    fn touch_bar_keys_are_found_by_usage() {
++        let keys = "29:780 3a:2433 43:17307 44:18959 45:20612 00:22265";
++        assert_eq!(touchbar::position(keys, 0x44), Some(18959));
++        assert_eq!(touchbar::position(keys, 0x29), Some(780));
++        assert_eq!(touchbar::position(keys, 0x46), None);
++        assert_eq!(touchbar::position("", 0x44), None);
++    }
++    #[test]
+     fn phases_run_in_order_and_fit_a_three_minute_session() {
+         let mut phase = Phase::Arm.next();
+         let (mut total, mut names) = (0, Vec::new());
+@@ -1472,8 +1606,8 @@
+             names.push(phase.name());
+             phase = phase.next();
+         }
+-        assert_eq!(names, ["settle", "pointer", "drag", "type", "fullscreen", "scrollback", "clipboard", "brightness", "volume", "idle", "resize", "redrag", "minimize", "menu", "chords", "menuterm", "limit"]);
+-        assert!(total <= 101_000, "{total} ms of phases, leaving room for start-up and checks in a 180 s session");
++        assert_eq!(names, ["settle", "pointer", "drag", "type", "fullscreen", "scrollback", "clipboard", "brightness", "volume", "touchbar", "idle", "resize", "redrag", "minimize", "menu", "chords", "menuterm", "limit"]);
++        assert!(total <= 105_000, "{total} ms of phases, leaving room for start-up and checks in a 180 s session");
+     }
+ 
+     #[test]
+--- a/crates/wm-darwin/src/input.rs
++++ b/crates/wm-darwin/src/input.rs
+@@ -16,6 +16,8 @@
+     /// Physical button mask of the last record, and whether the left button
+     /// went down with Control held: that press is a secondary click.
+     physical_buttons:u8,control_click:bool,
++    /// Key events delivered so far and the last one (evdev code, down).
++    hid_keys:u64,last_hid_key:Option<(u32,bool)>,
+     #[cfg(feature = "desktop-shell")]
+     deferred_focus:bool,
+ }
+@@ -73,7 +75,7 @@
+         let pointer=if caps.pointer{Some(seat.add_pointer())}else{None};
+         self.input=Some(InputState{seat,keyboard,pointer,position:(0.,0.),buttons:0,forwarded:0,
+             modifiers:Modifiers::empty(),last_time:0,suppressed_keys:HashSet::new(),cursor_surface:None,
+-            physical_buttons:0,control_click:false,
++            physical_buttons:0,control_click:false,hid_keys:0,last_hid_key:None,
+             #[cfg(feature = "desktop-shell")]
+             deferred_focus:false});
+         let b=self.wm.backend_mut();b.input_enabled=true;
+@@ -95,11 +97,19 @@
+             .filter(|id|self.wm.backend().visible(*id)).map(|id|self.wm.backend().windows[&id].surface.wl_surface().clone())};
+         if keyboard.current_focus()!=focus{keyboard.set_focus(self,focus,SERIAL_COUNTER.next_serial());}
+     }
++    /// Key events delivered since start and the last one (evdev code, down), whatever became of them.
++    pub fn hid_keys(&self)->(u64,Option<(u32,bool)>){
++        self.input.as_ref().map_or((0,None),|input|(input.hid_keys,input.last_hid_key))
++    }
+     pub fn deliver_hid(&mut self,event:Event,time:u32)->Result<(),String>{
+         if self.input.is_none(){return Err("no SFHID seat; event not delivered".into());}
+         let caps=SeatCaps{keyboard:true,pointer:self.input.as_ref().unwrap().pointer.is_some()};
+         accept_for_seat(caps,&event)?;
+         self.input.as_mut().unwrap().last_time=time;
++        if let Event::Key{evdev,down}=event{
++            let input=self.input.as_mut().unwrap();
++            input.hid_keys+=1;input.last_hid_key=Some((evdev,down));
++        }
+         // Display sleep, the brightness keys and the volume keys come before everything else:
+         // the event that wakes the display is spent on that.
+         let plain=self.input.as_ref().unwrap().modifiers.is_empty();
+--- a/crates/wm-darwin/tests/wayland_shm.rs
++++ b/crates/wm-darwin/tests/wayland_shm.rs
+@@ -903,7 +903,7 @@
+     let text = lines.join("\n");
+     let line = |start: &str| lines.iter().find(|l| l.starts_with(start)).unwrap_or_else(|| panic!("no line {start:?} in:\n{text}")).clone();
+     assert!(line("WMAUTO armed").contains("input=synthetic-autopilot"), "{text}");
+-    for phase in ["settle", "pointer", "drag", "type", "fullscreen", "scrollback", "clipboard", "brightness", "volume", "idle", "resize", "redrag", "minimize", "menu", "chords", "menuterm", "limit"] {
++    for phase in ["settle", "pointer", "drag", "type", "fullscreen", "scrollback", "clipboard", "brightness", "volume", "touchbar", "idle", "resize", "redrag", "minimize", "menu", "chords", "menuterm", "limit"] {
+         line(&format!("WMSTAT phase={phase} input=synthetic-autopilot "));
+         let check = line(&format!("WMAUTO check phase={phase} "));
+         // On the CPU renderers there is no readback; on GL the frames must agree.

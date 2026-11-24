@@ -1,0 +1,314 @@
+diff --git a/Makefile b/Makefile
+index 9c4784e..a41db83 100644
+--- a/Makefile
++++ b/Makefile
+@@ -110,6 +110,12 @@ endif
+ CFG += ESP_STAGE2
+ endif
+ 
++ifeq ($(M1_BOOT_WINDOW),1)
++ifneq ($(ESP_STAGE2),1)
++$(error M1_BOOT_WINDOW requires ESP_STAGE2=1)
++endif
++CFG += M1_BOOT_WINDOW
++endif
+ 
+ LDFLAGS := -EL -maarch64elf --no-undefined -X -Bsymbolic \
+ 	-z notext --no-apply-dynamic-relocs --orphan-handling=warn \
+@@ -189,7 +195,7 @@ OBJECTS := \
+ 	kboot.o kboot_atc.o kboot_gpu_t8122.o kboot_gpu_t8122_power.o kboot_pmp_t8122.o \
+ 	kboot_t6020_compat.o \
+ 	kboot_display_handoff.o kboot_display_facts.o kboot_gpu26.o kboot_gpu_t6031.o kboot_t6031.o \
+-	main.o boot_options.o \
++	main.o boot_options.o m1_boot_window.o \
+ 	mitigations.o \
+ 	mcc.o \
+ 	memory.o memory_asm.o \
+diff --git a/src/main.c b/src/main.c
+index 3e0a9e1..ef23362 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -5,6 +5,12 @@
+ 
+ #include "../config.h"
+ 
++#if defined(M1_BOOT_WINDOW) && (defined(EARLY_PROXY_TIMEOUT) || defined(USE_DEBUG_USB) || defined(BRINGUP))
++#error M1_BOOT_WINDOW requires the normal stage2 profile without another early USB window
++#endif
++
++#include "m1_boot_window.h"
++
+ #include "adt.h"
+ #include "aic.h"
+ #include "boot_options.h"
+@@ -80,6 +86,28 @@ void run_actions(void)
+     enum stage1_proxy_result window_result = STAGE1_PROXY_TIMEOUT;
+     enum stage1_payload_action payload_action;
+ 
++#ifdef M1_BOOT_WINDOW
++    bool window_timed_out = false;
++    u32 target_len = 0;
++    const char *window_target = adt_getprop(adt, 0, "target-type", &target_len);
++    if (m1_boot_window_allowed(chip_id, window_target, target_len, m1n1_debug_enabled())) {
++        /* Record the attempt even if no port registers: never initialize iodevs twice. */
++        usb_up = true;
++        usb_init();
++        usb_iodev_init();
++        if (uartproxy_wait_m1_boot_window(M1_BOOT_WINDOW_MS)) {
++            fb_set_active(true);
++            uartproxy_run(NULL);
++            /* After acquisition, arbitrary proxy mutations forbid Linux fallthrough. */
++            while (!next_stage.entry)
++                uartproxy_run(NULL);
++            return;
++        }
++        window_timed_out = true;
++        printf("J293 CDC window expired; checking original payloads\n");
++    }
++#endif
++
+ #ifndef J613_ESP_STAGE1
+     /* J613 Stage 1 runs its own USB window after the board checks below. */
+     u32 window_ms = stage1_config_window_ms();
+@@ -194,6 +222,12 @@ void run_actions(void)
+     payload_action = stage1_proxy_payload_action(window_result, payload_valid, usb_cdc_ready(),
+                                                  !usb_cdc_owns_carrier());
+     if (payload_action == STAGE1_PAYLOAD_NATIVE) {
++#ifdef M1_BOOT_WINDOW
++        /* Match P_VECTOR: only restore masks saved by usb_init, after native payload
++         * preparation succeeded. A failed payload keeps the existing proxy IRQ state. */
++        if (window_timed_out)
++            usb_hpm_restore_irqs(true);
++#endif
+         printf("Valid payload found\n");
+         return;
+     }
+diff --git a/src/uartproxy.c b/src/uartproxy.c
+index 6fe183f..c921d95 100644
+--- a/src/uartproxy.c
++++ b/src/uartproxy.c
+@@ -1,5 +1,7 @@
+ /* SPDX-License-Identifier: MIT */
+ 
++#include "../build/build_cfg.h"
++#include "m1_boot_window.h"
+ #include "uartproxy.h"
+ #include "assert.h"
+ #include "exception.h"
+@@ -72,6 +74,52 @@ static_assert(sizeof(UartReply) == (REPLY_SIZE + 4), "Invalid UartReply size");
+ static u32 iodev_proxy_buffer[IODEV_MAX];
+ static iodev_id_t presynced_iodev = IODEV_MAX;
+ 
++#ifdef M1_BOOT_WINDOW
++static_assert(M1_BOOT_WINDOW_FRAME == REQ_SIZE, "Window wire frame size mismatch");
++static UartRequest window_request;
++static iodev_id_t window_iodev = IODEV_MAX;
++
++bool uartproxy_wait_m1_boot_window(unsigned int timeout_ms)
++{
++    struct m1_boot_window window;
++    m1_boot_window_init(&window, timeout_ms);
++    window_iodev = IODEV_MAX;
++    u64 start = get_ticks();
++    while (m1_boot_window_feed(&window, ticks_to_msecs(get_ticks() - start), -1, 0) ==
++           M1_WINDOW_WAIT) {
++        for (int port = 0; port < M1_BOOT_WINDOW_PORTS; port++) {
++            iodev_id_t id = IODEV_USB0 + port;
++            if (!(iodev_get_usage(id) & USAGE_UARTPROXY))
++                continue;
++            iodev_handle_events(id);
++            /* Single consumer; read only an available byte, never the unreceived frame tail. */
++            for (unsigned int budget = 0; budget < 256; budget++) {
++                if (m1_boot_window_feed(&window, ticks_to_msecs(get_ticks() - start), -1, 0) !=
++                    M1_WINDOW_WAIT)
++                    return false;
++                if (iodev_can_read(id) <= 0)
++                    break;
++                u8 byte;
++                if (iodev_read(id, &byte, 1) != 1)
++                    break;
++                enum m1_window_result result = m1_boot_window_feed(
++                    &window, ticks_to_msecs(get_ticks() - start), port, byte);
++                if (result == M1_WINDOW_TIMEOUT)
++                    return false;
++                if (result == M1_WINDOW_CLAIMED) {
++                    memset(&window_request, 0, sizeof(window_request));
++                    memcpy(&window_request.type, window.frame[port], REQ_SIZE);
++                    window_iodev = id;
++                    return true;
++                }
++            }
++        }
++        mdelay(1);
++    }
++    return false;
++}
++#endif
++
+ static bool uartproxy_sync_iodev(iodev_id_t iodev)
+ {
+     if (!(iodev_get_usage(iodev) & USAGE_UARTPROXY))
+@@ -236,6 +284,16 @@ int uartproxy_run(struct uartproxy_msg_start *start)
+     iodev_id_t iodev = use_presynced ? presynced_iodev : IODEV_MAX;
+     presynced_iodev = IODEV_MAX;
+ 
++#ifdef M1_BOOT_WINDOW
++    bool use_window_request = !start && window_iodev < IODEV_MAX;
++    if (use_window_request) {
++        iodev = window_iodev;
++        window_iodev = IODEV_MAX;
++    }
++#else
++    const bool use_window_request = false;
++#endif
++
+     UartRequest request;
+     UartReply reply = {REQ_BOOT};
+     if (!start) {
+@@ -254,7 +312,7 @@ int uartproxy_run(struct uartproxy_msg_start *start)
+ 
+     while (running) {
+         usb_cdc_poll();
+-        if (!start) {
++        if (!start && !use_window_request) {
+             // A bounded host window may already have consumed the sync word.
+             if (use_presynced) {
+                 use_presynced = false;
+@@ -280,7 +338,7 @@ int uartproxy_run(struct uartproxy_msg_start *start)
+                     if (iodev == IODEV_MAX)
+                         iodev = 0;
+                 }
+-        } else {
++        } else if (start) {
+             // Stick to the current iodev for exceptions
+             do {
+                 u8 b;
+@@ -294,11 +352,19 @@ int uartproxy_run(struct uartproxy_msg_start *start)
+             } while ((iodev_proxy_buffer[iodev] & 0xffffff) != 0xAA55FF);
+         }
+ 
+-        memset(&request, 0, sizeof(request));
+-        request.type = iodev_proxy_buffer[iodev];
+-        bytes = iodev_read(iodev, (&request.type) + 1, REQ_SIZE - 4);
+-        if (bytes != REQ_SIZE - 4)
+-            continue;
++#ifdef M1_BOOT_WINDOW
++        if (use_window_request) {
++            request = window_request;
++            use_window_request = false;
++        } else
++#endif
++        {
++            memset(&request, 0, sizeof(request));
++            request.type = iodev_proxy_buffer[iodev];
++            bytes = iodev_read(iodev, (&request.type) + 1, REQ_SIZE - 4);
++            if (bytes != REQ_SIZE - 4)
++                continue;
++        }
+ 
+         if (checksum(&(request.type), REQ_SIZE - 4) != request.checksum) {
+             memset(&reply, 0, sizeof(reply));
+diff --git a/src/uartproxy.h b/src/uartproxy.h
+index 88768ef..bfd0f31 100644
+--- a/src/uartproxy.h
++++ b/src/uartproxy.h
+@@ -44,6 +44,7 @@ int uartproxy_run(struct uartproxy_msg_start *start);
+ bool uartproxy_wait_dockchannel(unsigned int timeout_ms);
+ enum stage1_proxy_result uartproxy_wait_stage1(unsigned int timeout_ms);
+ int uartproxy_run_presynced(void);
++bool uartproxy_wait_m1_boot_window(unsigned int timeout_ms);
+ void uartproxy_send_event(u16 event_type, void *data, u16 length);
+ 
+ #endif
+diff --git a/src/m1_boot_window.c b/src/m1_boot_window.c
+new file mode 100644
+index 0000000..c4a6f40
+--- /dev/null
++++ b/src/m1_boot_window.c
+@@ -0,0 +1,51 @@
++#include "m1_boot_window.h"
++
++bool m1_boot_window_allowed(uint32_t chip, const char *target, size_t length, bool debug)
++{
++    return !debug && chip == 0x8103 && target && length == 5 &&
++           (target[0] == 'J' || target[0] == 'j') && target[1] == '2' && target[2] == '9' &&
++           target[3] == '3' && target[4] == '\0';
++}
++
++void m1_boot_window_init(struct m1_boot_window *window, uint32_t timeout_ms)
++{
++    *window = (struct m1_boot_window){.timeout_ms = timeout_ms};
++}
++
++static bool valid_nop(const uint8_t *frame)
++{
++    if (frame[0] != 0xff || frame[1] != 0x55 || frame[2] != 0xaa || frame[3] != 0)
++        return false;
++    /* Same wire checksum as uartproxy.c; dispatcher checks it again before execution. */
++    uint32_t sum = 0xdeadbeef;
++    for (unsigned int i = 0; i < M1_BOOT_WINDOW_FRAME - 4; i++)
++        sum = sum * 31337u + (frame[i] ^ 0x5au);
++    sum ^= 0xaddedbad;
++    uint32_t expected = (uint32_t)frame[60] | ((uint32_t)frame[61] << 8) |
++                        ((uint32_t)frame[62] << 16) | ((uint32_t)frame[63] << 24);
++    return sum == expected;
++}
++
++enum m1_window_result m1_boot_window_feed(struct m1_boot_window *window, uint64_t elapsed_ms,
++                                         int port, uint8_t byte)
++{
++    if (window->result != M1_WINDOW_WAIT)
++        return window->result;
++    /* Expiry wins even when the last byte of an otherwise valid NOP arrives now. */
++    if (elapsed_ms >= window->timeout_ms)
++        return window->result = M1_WINDOW_TIMEOUT;
++    if (port < 0 || port >= M1_BOOT_WINDOW_PORTS)
++        return M1_WINDOW_WAIT;
++    uint8_t *frame = window->frame[port];
++    if (window->used[port] == M1_BOOT_WINDOW_FRAME) {
++        for (unsigned int i = 1; i < M1_BOOT_WINDOW_FRAME; i++)
++            frame[i - 1] = frame[i];
++        window->used[port]--;
++    }
++    frame[window->used[port]++] = byte;
++    if (window->used[port] == M1_BOOT_WINDOW_FRAME && valid_nop(frame)) {
++        window->selected = port;
++        window->result = M1_WINDOW_CLAIMED;
++    }
++    return window->result;
++}
+diff --git a/src/m1_boot_window.h b/src/m1_boot_window.h
+new file mode 100644
+index 0000000..cffd5a7
+--- /dev/null
++++ b/src/m1_boot_window.h
+@@ -0,0 +1,29 @@
++/* Bounded J293 bootstrap acquisition policy. No hardware access. */
++#ifndef M1_BOOT_WINDOW_H
++#define M1_BOOT_WINDOW_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
++
++#define M1_BOOT_WINDOW_MS 10000u
++#define M1_BOOT_WINDOW_PORTS 2
++#define M1_BOOT_WINDOW_FRAME 64
++
++enum m1_window_result { M1_WINDOW_WAIT, M1_WINDOW_TIMEOUT, M1_WINDOW_CLAIMED };
++
++struct m1_boot_window {
++    uint32_t timeout_ms;
++    enum m1_window_result result;
++    unsigned int selected;
++    unsigned int used[M1_BOOT_WINDOW_PORTS];
++    uint8_t frame[M1_BOOT_WINDOW_PORTS][M1_BOOT_WINDOW_FRAME];
++};
++
++bool m1_boot_window_allowed(uint32_t chip, const char *target, size_t length, bool debug);
++void m1_boot_window_init(struct m1_boot_window *window, uint32_t timeout_ms);
++/* port=-1 polls expiry without feeding data. elapsed is monotonic since init. */
++enum m1_window_result m1_boot_window_feed(struct m1_boot_window *window, uint64_t elapsed_ms,
++                                         int port, uint8_t byte);
++
++#endif

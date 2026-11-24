@@ -1,0 +1,275 @@
+{
+  "schema_version": 1,
+  "reviewer": "Astra",
+  "status": "SOURCE_AND_LINK_FEASIBLE_PTY_RUNTIME_SMOKE_REQUIRED_NO_IMPLEMENTATION",
+  "scope": "Bounded offline source/API, existing binary-symbol and saved RAM-image inspection. No new code, build, acquisition, target access, hardware run or user-input wait. Only this report written.",
+  "conclusion": "A real Darwin PTY-backed /bin/sh Wayland terminal is feasible with existing source and exported APIs; no missing PTM implementation or kernel patch was identified. First qualify one finite real-shell PTY smoke. Then add a separate real terminal client using the proven SHM/SSD transport, actual XKB translation and an honest bounded terminal model. Current observer text/input code is not itself a terminal.",
+  "source_pin": "e7aa00a60f0b56ef35aa24252e81467787bf71ea",
+  "api_evidence": [
+    {
+      "file": "sources/puredarwin-baseline/src/Libraries/libSystem/libc/stdlib/grantpt.c",
+      "lines": [
+        39,
+        42,
+        55,
+        57,
+        99,
+        110,
+        121,
+        126,
+        143,
+        145
+      ],
+      "finding": "posix_openpt opens /dev/ptmx. grantpt and unlockpt use real TIOCPTYGRANT/TIOCPTYUNLK ioctls. ptsname_r uses TIOCPTYGNAME, stats the returned path, checks supplied buffer length, returns 0 or -1/errno. Use the caller-owned 128-byte-or-larger buffer, not thread-local allocating ptsname."
+    },
+    {
+      "file": "sources/puredarwin-baseline/src/Libraries/libSystem/libc/util/pty.c",
+      "lines": [
+        72,
+        81,
+        83,
+        85,
+        89,
+        94,
+        96,
+        101,
+        109,
+        112,
+        124,
+        125,
+        126
+      ],
+      "finding": "openpty is a real master/slave allocator but ignores termios/winsize-setting failures and takes an unbounded optional name destination. Safe convenience use is name/termp/winp=NULL followed by explicitly checked settings. forkpty exists in source but is not exported by current libSystem; its failure path also intentionally continues after login_tty failure. Do not add/export/use it as a shortcut for this candidate."
+    },
+    {
+      "file": "sources/puredarwin-baseline/src/Libraries/libSystem/libc/util/login_tty.c",
+      "lines": [
+        41,
+        44,
+        45,
+        47,
+        48,
+        49,
+        50
+      ],
+      "finding": "login_tty ignores setsid/dup2 failures; it reports only TIOCSCTTY failure. A returned zero is insufficient to prove the complete child setup. Prefer explicit checked setsid, TIOCSCTTY, dup2 and postconditions."
+    },
+    {
+      "file": "sources/puredarwin-baseline/src/Libraries/libSystem/libc/CMakeLists.txt",
+      "lines": [
+        323,
+        324,
+        331,
+        553
+      ],
+      "finding": "The real libc PTY/helper sources are selected. No separate libutil is required for APIs already exported by libSystem."
+    },
+    {
+      "artifact": "/nix/store/5w1bfvwqap58q6nnr12bfv3r2isryaw2-puredarwin-libsystem-pagesize-0.1/usr/lib/libSystem.B.dylib",
+      "sha256": "8ff49e0c2a5f1c6532101c7ed662632444cc97ae9669479090e7968deddd12ff",
+      "method": "Read-only nm -m of the existing built dylib",
+      "defined_exports_observed": [
+        "openpty",
+        "posix_openpt",
+        "grantpt",
+        "unlockpt",
+        "ptsname",
+        "ptsname_r",
+        "login_tty",
+        "setsid",
+        "ioctl",
+        "fork",
+        "execve",
+        "waitpid",
+        "kill",
+        "poll",
+        "select",
+        "kqueue",
+        "kevent",
+        "fcntl",
+        "tcgetattr",
+        "tcsetattr",
+        "tcgetpgrp",
+        "tcsetpgrp",
+        "tcflush",
+        "cfmakeraw",
+        "pipe",
+        "dup2",
+        "close",
+        "_exit",
+        "sigaction",
+        "sigprocmask",
+        "getpid",
+        "getpgrp",
+        "getsid",
+        "isatty",
+        "ttyname"
+      ],
+      "not_exported": "forkpty",
+      "limit": "Defined symbols establish link availability, not successful PTY/session behavior on the M1."
+    }
+  ],
+  "kernel_path": [
+    {
+      "file": "sources/puredarwin-m1-desktop/src/Kernel/xnu/config/MASTER",
+      "lines": [
+        493
+      ],
+      "finding": "ptmx pseudo-device selected with ptmx_init; bsd/conf/files:471 selects tty_ptmx.c; bsd_init.c:1133-1136 invokes pseudo-device init functions. bsd_init.c:1003-1004 mounts devfs."
+    },
+    {
+      "file": "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/kern/tty_ptmx.c",
+      "lines": [
+        159,
+        160,
+        197,
+        205,
+        210,
+        215,
+        221,
+        226,
+        237,
+        379,
+        426,
+        443
+      ],
+      "finding": "Real cloning /dev/ptmx, kqueue-enabled master/slave cdevs, dynamically allocated /dev/ttysNNN (not Linux /dev/pts/N), and last-close removal. No devpts mount or mknod should be added. An empty /dev/ptmx entry in the offline ext4 image is not required; it is a runtime devfs node."
+    },
+    {
+      "file": "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/kern/tty_dev.c",
+      "lines": [
+        263,
+        272,
+        280,
+        1091,
+        1098,
+        1115,
+        1125,
+        1130
+      ],
+      "finding": "Locked slave opens fail until unlock; first slave open initializes termios. grant changes real devfs ownership/mode; getname returns the kernel-selected name; unlock sets the PTY flag."
+    },
+    {
+      "file": "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/kern/tty.c",
+      "lines": [
+        1454,
+        1465,
+        1492,
+        1503,
+        1508,
+        1518,
+        1594,
+        1599
+      ],
+      "finding": "TIOCSCTTY requires a session leader and refuses another session/tty association; assigns controlling session and foreground pgrp. TIOCSWINSZ records geometry and signals SIGWINCH. Never apply these to the launching serial /dev/console."
+    },
+    {
+      "artifact": "/nix/store/1ys1x1hzkq3v0l8bc14v2bq1jm5i46zn-puredarwin-kernel-arm64-t8103-bringup-0.1/System/Library/Kernels/kernel.debug.t8103",
+      "method": "Read-only nm",
+      "symbols_observed": {
+        "_ptmx_init": "fffffe0007ee0334",
+        "_ptmx_get_name": "fffffe0007ee0db0",
+        "_ptyioctl": "fffffe0007edf580",
+        "_ptsd_kqfilter": "fffffe0007ee1200",
+        "_ptsopen": "fffffe0007eddcbc",
+        "_ttioctl": "fffffe0007ed7cb0"
+      },
+      "limit": "Linked native kernel003 includes these functions. No PTY open or data exchange was executed for this review."
+    }
+  ],
+  "guest_shell_binding": {
+    "image": "artifacts/m1-desktop-010/candidate-006/ramdisk.img",
+    "manifest_ramdisk_sha256": "038f14aed01c10ecd3a33f39272a9abd36610b70b38355e1949d234cb6190e8e",
+    "method": "Read-only debugfs stat/cat to memory; no mount or image writes. Same shell hashes independently checked in candidate003.",
+    "bin_sh": {
+      "type": "regular Mach-O ARM64 executable, mode0755",
+      "bytes": 50783,
+      "sha256": "f114ccce2f48b62b17c222872dd00c8dc9b70332f3bb075c64fc0ff63e7508e0",
+      "dependency": "/usr/lib/libSystem.B.dylib; /usr/lib/dyld loader",
+      "imports": "readlink, execv, strcmp, fprintf and supporting real libc calls; it is a launcher, not the shell interpreter."
+    },
+    "selection": "/private/var/select/sh is a symlink to /bin/zsh. /bin/bash is absent; /bin/zsh is present (2176800 bytes, sha256 ddaa5e6a6185a2cfc70581284bfffe1e9d5143eaaff186f651864d044b04153c).",
+    "source": "src/Userspace/sh/sh.c:1-31 rewrites argv[0] to sh, execs the selected shell, then tries /bin/bash and /bin/zsh; failure exits127. exec preserves the child PID. Do not claim bash runtime or host shell execution.",
+    "zsh_dependencies": [
+      "/usr/lib/libiconv.2.dylib",
+      "/usr/lib/libm.dylib",
+      "/usr/lib/libSystem.B.dylib",
+      "/usr/lib/libc.dylib"
+    ],
+    "uname": "Use /bin/uname (50962 bytes, SHA256 c46dd05dd16008e1f3a6624a7df31fec5fdb24e65899feeb74af725496dfcfd8); /usr/bin/uname is absent in the inspected image.",
+    "configuration": "Saved /etc/zshenv and /etc/profile set TERM to vt220 only if unset. /etc/zshrc configures history, line editing, completion and optional commands. Explicit bounded test environment must avoid inheriting unreviewed startup behavior/history writes.",
+    "terminal_database_limit": "No /usr/share/terminfo directory/database, /etc/termcap or /usr/share/misc/termcap in inspected image. This does not prove no compiled fallback, but a full xterm/VT220 capability claim is unsupported. Begin with explicitly TERM=dumb and a plain prompt; qualify any richer TERM separately."
+  },
+  "minimal_finite_pty_smoke": [
+    "Separate small guest C executable linked only to the reviewed libSystem, using exact pinned SDK termios/ioctl types. No Wayland, framebuffer or HID opens. All argv/env and diagnostic buffers prepared before fork; use a monotonic overall deadline (suggest20s), finite input and output budgets, and independent outer timeout.",
+    "Open one master with O_RDWR|O_NOCTTY, grantpt, unlockpt, ptsname_r into owned bounded storage, stat/fstat the real slave, then open slave O_RDWR|O_NOCTTY. Mark all internal descriptors CLOEXEC and verify they are above2. Handle every partial failure by closing only owned descriptors. No hardcoded PTY minor, device creation, storage or console change.",
+    "Use tcgetattr/tcsetattr(TCSANOW) with a deliberate canonical/ISIG mode, normal CR input and output translation and known erase/EOF chars; do not copy the launcher console state blindly or rely on unchecked openpty settings. Set and read back TIOCSWINSZ (e.g.80x24). Set master nonblocking only; slave stdio remains blocking. Check all return values.",
+    "Create a CLOEXEC child-status/error pipe. In a single-threaded pre-framework phase fork once. Child closes master/read pipe, checks setsid, acquires ONLY the slave with TIOCSCTTY, checks dup2 to0/1/2 and their inheritable flags, and validates isatty plus getsid(0)==getpid(), getpgrp()==getpid(), tcgetpgrp(0)==getpgrp(). Open /dev/tty only in this child if needed to verify its controlling tty; never open host or parent console for this test.",
+    "Child resets inherited signal dispositions/mask needed for normal shell use, closes every unrelated fd using precomputed ownership bounds, writes a fixed numeric setup record to the error pipe, and execve(\"/bin/sh\", argv, controlled_env). No Rust allocator, logging framework, locks or exit()-destructors after fork; failures write a bounded errno/stage record and _exit. Pipe EOF after setup proves successful exec boundary, not shell success by itself.",
+    "First smoke may use actual /bin/sh -c with a finite script waiting for one PTY-delivered nonce line, then printing a joined nonce response and /bin/uname results and exiting with a prescribed status. This is explicitly a PTY/process smoke, not an interactive-terminal milestone. Input written to the master must arrive at the shell and output must be read from the master, not synthesized by the parent.",
+    "Parent immediately closes its slave and error-write copies; multiplexes nonblocking master/status pipe with poll, handles partial reads/writes, EINTR and EAGAIN, enforces byte/deadline caps and records raw tx/rx privately. Output budget suggested64KiB, input1KiB. Use split nonce markers so the joined expected response does not appear in sent/echoed command bytes. Separately require successful checked setup, exec, real response and waitpid status.",
+    "Treat zero-length master read as EOF; preserve EIO/other errors and classify only against child/PTY state rather than pretending Linux-specific EOF semantics. On timeout or failure enter owned-child cleanup below, preserve the failure and bounded partial transcript. No failed check becomes success because cleanup completed."
+  ],
+  "child_fd_timeout_cleanup_contract": [
+    "One live unreaped child/session owner PID is authoritative. Before its successful setsid/setup record, signal only that positive owned child PID. Never kill(0), kill(-1), or a process group inferred from the launching shell. Do not setpgid(child,child) before child setsid: making it a group leader would make setsid fail.",
+    "For the initial finite smoke disable shell job control and forbid background/detached jobs in the fixed script. After verified session/pgrp ownership, TERM then (after a short monotonic grace, e.g.1s) KILL only the owned process group/child, poll waitpid(WNOHANG), and never signal a reaped PID again. Continue bounded output draining while normal exit is pending.",
+    "Master close is NOT a complete shutdown mechanism: tty_dev.c:581-588 explicitly describes its carrier-drop operation as not sending SIGHUP; :589-592 flushes and marks disconnected. Send owned signals explicitly. ptsclose:329-364 also has a drain-timeout workaround, so short application timeouts are not proof every kernel close completes immediately. Retain the independent outer supervisor.",
+    "Close master once as shutdown progresses to flush/wake the PTY when necessary; close status pipe, release all remaining owned fds exactly once and reap child. Do not blindly retry close on an fd number that may already have been consumed. Do not report CLEANED if the child remains live/unknown at the grace deadline.",
+    "An interactive shell may move jobs into different foreground/background process groups. Killing only -shell_pid does NOT guarantee all descendants died. For the first UI qualification use fixed no-background commands and verify/disable monitor mode explicitly. General job-control support needs tracked session descendants/owned groups or another reviewed supervisor; a checked foreground group can be targeted only when its session identity belongs to this child. Unknown detached descendants remain a limitation, not an automatic cleanup pass.",
+    "Keep a small external guest supervisor or equivalent known-owner cleanup path for crashes of the graphical client: the current launcher that kills only client/compositor PIDs does not automatically own newly spawned shell groups. A parent SIGKILL cannot run destructors. Extend the future test supervision explicitly before relying on it; no existing launcher change is made here.",
+    "GUI close/Wayland disconnect/timeout all enter the same idempotent cleanup state machine. Stop accepting new keyboard input first, settle shell ownership, release Wayland buffers/resources, then exit. The terminal must not own PDGOP/HID handles directly: compositor remains the framebuffer/input owner and retains existing console restoration responsibilities."
+  ],
+  "real_wayland_terminal_increment": {
+    "new_project": "Separate terminal project; preserve original client, client-ssd, client-input and compositor. Reuse proven Wayland connection/SHM/SSD protocol structure, not the observer success state machine.",
+    "pty": "Use the qualified checked helper to spawn actual /bin/sh -i on its own slave and controlling session, not a subprocess pipe and not system()/a host command. Prepare child before Wayland/XKB/framework threads or keep all post-fork work in the audited minimal C helper. A clean test HOME/ZDOTDIR/ENV/HISTFILE policy and TERM=dumb limit incidental startup side effects; verify actual shell startup behavior rather than assuming bash flags apply to zsh-as-sh.",
+    "event_loop": "One deadline-aware loop polls Wayland, PTY master and status/signal notification. Dispatch already queued Wayland events first; honor prepare_read/read-or-cancel on every path; poll POLLOUT only with queued bytes. No blocking registry roundtrip before the deadline, no write_all on nonblocking PTY, no render-only blocking waits that starve child I/O.",
+    "key_translation": "The current client-input checks XkbV1/keymap shape and only verifies key30; it does not translate a general keyboard. Parse the compositor-supplied bounded keymap with real xkbcommon, maintain masks/group from wl_keyboard.modifiers, map Wayland keycode+8, obtain UTF-8/keysym, and encode Return/Backspace/Tab/Escape/Ctrl combinations as terminal input. Ignore releases for byte emission, cancel repeat on focus loss, use repeat_info with a bounded timer if implemented. Do not implement US letters by treating raw evdev numbers as characters.",
+    "xkb_dependencies": "xkbcommon0.8.0 source is already cached locally and native libxkbcommon.a exists from root. Use its real APIs (context_new, keymap_new_from_string/buffer, state_new, state_update_mask, state_key_get_utf8/one_sym) with static no-X11 linkage. A small checked C wrapper is an option. Cross-linking/ABI verification is still required; no dependency fetched here.",
+    "terminal_model": "Replace the current uppercasing demo glyph function and canned paint routine with a bounded grid fed exclusively by real PTY output. Initial honest TERM=dumb scope: case-correct printable ASCII, visible replacement for unsupported text, incremental UTF-8 handling if accepted, CR/LF/backspace/tab/wrap/scroll and cursor. Cap dimensions/scrollback/escape lengths. Do not advertise xterm/VT220/full-screen app support until actual ANSI state handling and capability data are provided and tested.",
+    "font": "Current demo glyph(c.to_ascii_uppercase()) lacks lowercase and much punctuation; it cannot faithfully display shell output. Supply a proper bounded case-correct font/glyph set with provenance or an existing verified renderer, not a hand-picked expected-response drawing.",
+    "protocol": "Negotiate actual ServerSide decoration, acknowledge xdg_surface configure before buffers, render only from terminal state, preserve wl_buffer release lifetime and frame-callback pacing. On resize validate dimensions and memory arithmetic then update the grid and checked TIOCSWINSZ so real SIGWINCH reaches the shell. No terminal-controlled paint outside its surface.",
+    "unsupported": "Initially no clipboard/OSC52, escape-triggered host commands, arbitrary file/URL opening, detached/background jobs, advanced gestures, or full terminal-emulator claim. Unknown sequences must be bounded and accounted for, not interpreted as app-control commands."
+  },
+  "unattended_host_origin_input_proof": {
+    "chain": "Fixed bounded M5-origin PDSerialHID sequence -> real kernel queue -> Chonkstep Wayland keyboard -> terminal XKB encoding -> PTY master write -> actual guest /bin/sh -> master output -> text grid -> SHM framebuffer. This proves the virtual input path only, never native physical keyboard/trackpad typing.",
+    "prerequisites": "Require actual seat keyboard capability, valid parsed keymap, focus on the terminal surface, ready PTY/session/exec handshake and a rendered shell prompt/checkpoint before one sequence. Keep transcript binding to the candidate/terminal/client hashes and fresh nonce.",
+    "command": "Use a finite reviewed command such as shell printf joining two nonce halves followed by /bin/uname -s/-m/-r and a known exit, typed through real Wayland key events. The joined marker must be absent from input/echo. Do not write this challenge directly to the PTY from a hidden test side channel when claiming Wayland keyboard proof.",
+    "host_changes_needed_later": "The existing virtual_input_progress helper is a frozen A/click/drag verifier, not a general typing backend. A future independent fixed-command schedule needs explicit packet/time/character caps, same-owner ordering and no retries; do not broaden that frozen helper implicitly. No host code changed here.",
+    "evidence": "Private exact PTY tx/rx and Wayland numeric input trace, child setup/exec/wait results, nonce response from PTY (stderr preserved), rendered-grid/frame binding and paused framebuffer capture. Child output must be the renderer input; serial diagnostic success markers or embedded expected strings alone are insufficient.",
+    "negative_cases": "Missing focus/keymap, absent PTY-ready, echo-only marker, partial command, failed exec, wrong child status, timeout, unreaped child, Wayland disconnect and missing actual rendered shell output all remain failures. Human observation is a separate future panel/input qualification; do not wait for Chris overnight."
+  },
+  "recommended_offline_tests_before_any_runtime": [
+    "Pure/fake syscall state tests for each open/termios/winsize/setsid/TIOCSCTTY/dup2/exec failure, fd0..2/CLOEXEC hazards, partial status records, fork failure, no signal-before-ownership, no signal after reap, partial writes/EINTR/EAGAIN/EOF, output flood and deadline escalation.",
+    "Host PTY integration with the host shell can validate generic process/fd logic only; label it host-only and do not substitute it for Darwin PTM runtime evidence. No such test was run in this review.",
+    "Meaningful terminal stream tests across arbitrary read splits: case-sensitive text, CRLF/CRCRLF, wrap/scroll/backspace/tab, partial UTF-8, oversized/truncated CSI/OSC and unsupported codepoints. Verify actual grid-to-SHM output; no test that merely redraws expected nonce text.",
+    "XKB tests from a real supplied map for letter/case/shift/Ctrl/Return and key-release suppression, focus loss and keymap replacement; Wayland configure/release/resize/disconnect lifetime tests.",
+    "Root cross-link checks all required imports against exact new SystemB + retained old libdyld and inspects Darwin ABI; first target prerequisite is the finite PTY smoke. No new kernel feature bypass is justified by this review."
+  ],
+  "explicit_runtime_unknowns": [
+    "Actual /dev/ptmx open/grant/unlock/slave path in this guest has not been tested.",
+    "Controlling-session/foreground-pgrp semantics, PTY poll readiness and shell fork/exec/reap on this candidate remain unqualified.",
+    "The fixed SystemB page-size change is artifact-approved, not assumed runtime-passed in this report.",
+    "Interactive zsh-as-sh behavior under the clean TERM=dumb environment and available capabilities needs the smoke/UI runs.",
+    "No real terminal surface, PTY-derived framebuffer, native physical input or full job-control cleanup has been demonstrated by this source review."
+  ],
+  "reviewed_file_sha256": {
+    "sources/puredarwin-baseline/src/Libraries/libSystem/libc/util/pty.c": "eefaf12a34c6aecc8fe8e0bda03bd2fbcd13771978ea0f6e944e35323f519024",
+    "sources/puredarwin-baseline/src/Libraries/libSystem/libc/util/login_tty.c": "3644a7d7ed1ca08eac7ca46e21fac9821a3c61e57b188434366afe55687b2cdb",
+    "sources/puredarwin-baseline/src/Libraries/libSystem/libc/stdlib/grantpt.c": "b3df9ff1b9a7c3dbc7fb00a055788c738f058bc3455667a8e41df4130820d67b",
+    "sources/puredarwin-baseline/src/Libraries/libSystem/libc/CMakeLists.txt": "441cd643d3baef32e6fd9d057ec0f0b8faa8588d198a910cc0e600e154117108",
+    "sources/puredarwin-baseline/src/Libraries/libSystem/stub/libSystem.exports": "2d0e0d963b9db07b3c4a1148927bff088bc4d7f7813d6dc18e6dcb6c3bbd65fb",
+    "sources/puredarwin-baseline/src/Userspace/sh/sh.c": "5a33f06e910eae6abaf145d2b9931d5d878b247a03e16d01acce71de0cfd8e59",
+    "sources/puredarwin-baseline/src/Userspace/sh/CMakeLists.txt": "955507b957d05069a43ef3656bf56a047d0088f2676725ecfbc8da792efa683e",
+    "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/kern/tty_ptmx.c": "15e1f42f430754e7843e83c669ada1a69a793c32cc637a1cae6eff9516d63b14",
+    "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/kern/tty_dev.c": "a9bd50db11211d42f368654b26212d04d93ae2affceee0d7abc6e4eb7e06fd9e",
+    "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/kern/tty.c": "de57a5a52aa5dba2e484eb65a53fbc1ef70c567589490066e134b325a7145d35",
+    "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/kern/bsd_init.c": "d9467cd55e2290cbbea7e5f5084aa59cf82d9d9e5441ca0e2871cdb015a52776",
+    "sources/puredarwin-m1-desktop/src/Kernel/xnu/bsd/conf/files": "70ef55759b5fb7db901cb9dc9bc4cccc20498adecc2bb5d84b7e5120c625677d",
+    "sources/puredarwin-m1-desktop/src/Kernel/xnu/config/MASTER": "b2850318ad98d1cb6135f6d3e1ff42bb1ffffdfd56e2d8a0e5250d311d6e629b",
+    "integrations/puredarwin/chonkstep-darwin/client-input/src/main.rs": "40ee7400251a916233e5b6bf34dc397cf12c5186bef83cad8c45563ddf9ee0fe",
+    "integrations/puredarwin/chonkstep-darwin/client-input/src/input_events.rs": "4bf278149c09d736ff1636dc711b93445c9ba3cb1f29711dcaf7280cdc647971",
+    "integrations/puredarwin/chonkstep-darwin/client-input/Cargo.toml": "213bc828f514945d8af254ff3a28f7c191c2600e4287f02b035a5403f0d75402",
+    "artifacts/m1-desktop-010/candidate-006/manifest.json": "e66be24212ee8de79d2c97469417fd8721e49f24c8415b433f5dace40c18dbfd",
+    "reports/sprint-010/page-size-built-forwarding-review.json": "6b7fcb754a6fe249a260dbcfa1162d7ea2a1447f913f6e435c086bf4cafeecde"
+  }
+}

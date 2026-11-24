@@ -1,0 +1,50 @@
+fbsdkpi: of_find_compatible_node() continues after `from`
+
+It ignored `from` and returned the first match every time: for_each_compatible_node() and
+anything built on it looped forever once a node matched (boot dp01, the display driver's
+for_each_matching_node over "apple,dcp"). Now a pre-order walk from the tree root that
+returns the first match after `from`. Found and written by m1-dcp-dart (ANSWERS.md, item 3).
+UPSTREAM: yes.
+
+--- a/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_of.c
++++ b/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_of.c
+@@ -410,11 +438,37 @@
+ 	return (NULL);
+ }
+ 
+-// the first node in tree order with the compatible string, the search starts at the root
++// the next node in tree order after `from` (the first when from is NULL) with the compatible
++// string, as on linux. it used to ignore `from` and return the first match every time, so a
++// for_each_compatible_node() over a node that exists never ended (m1-dcp-dart found it)
++static struct device_node *
++sf_of_next(struct device_node *root, struct device_node *np)
++{
++	struct device_node *next = of_get_next_child(np, NULL);
++
++	if (next != NULL)
++		return (next);
++	while (np != NULL && np != root && np->parent != NULL) {
++		next = of_get_next_child(np->parent, np);
++		if (next != NULL)
++			return (next);
++		np = np->parent;
++	}
++	return (NULL);
++}
++
+ struct device_node *
+ of_find_compatible_node(struct device_node *from, const char *type, const char *compat)
+ {
+-	return (sf_of_node_for_entry(sfos_dt_find_compatible(compat)));
++	struct device_node *root = sf_of_node_for_entry(sfos_dt_root());
++	struct device_node *np;
++
++	if (root == NULL || compat == NULL)
++		return (NULL);
++	for (np = from != NULL ? sf_of_next(root, from) : root; np != NULL; np = sf_of_next(root, np))
++		if (of_device_is_compatible(np, compat))
++			return (np);
++	return (NULL);
+ }
+ 
+ struct device_node *

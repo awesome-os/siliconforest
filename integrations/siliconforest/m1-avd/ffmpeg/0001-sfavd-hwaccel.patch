@@ -1,0 +1,2576 @@
+diff -ruN a/configure b/configure
+--- a/configure	2026-11-12 00:10:07.493359959 -0800
++++ b/configure	2026-11-12 00:37:20.282054127 -0800
+@@ -355,6 +355,7 @@
+   --disable-cuvid          disable Nvidia CUVID support [autodetect]
+   --disable-d3d11va        disable Microsoft Direct3D 11 video acceleration code [autodetect]
+   --disable-d3d12va        disable Microsoft Direct3D 12 video acceleration code [autodetect]
++  --enable-sfavd           enable the Apple Video Decoder through SiliconForest's libsfavd [no]
+   --disable-dxva2          disable Microsoft DirectX 9 video acceleration code [autodetect]
+   --disable-ffnvcodec      disable dynamically linked Nvidia code [autodetect]
+   --disable-libdrm         disable DRM code (Linux) [autodetect]
+@@ -2162,6 +2163,7 @@
+     mmal
+     omx
+     opencl
++    sfavd
+ "
+ 
+ DOCUMENT_LIST="
+@@ -3378,6 +3380,12 @@
+ h264_d3d11va2_hwaccel_deps="d3d11va"
+ h264_d3d11va2_hwaccel_select="h264_decoder"
+ h264_d3d12va_hwaccel_deps="d3d12va"
++h264_sfavd_hwaccel_deps="sfavd"
++h264_sfavd_hwaccel_select="h264_decoder"
++hevc_sfavd_hwaccel_deps="sfavd"
++hevc_sfavd_hwaccel_select="hevc_decoder"
++vp9_sfavd_hwaccel_deps="sfavd"
++vp9_sfavd_hwaccel_select="vp9_decoder"
+ h264_d3d12va_hwaccel_select="h264_decoder"
+ h264_dxva2_hwaccel_deps="dxva2"
+ h264_dxva2_hwaccel_select="h264_decoder"
+@@ -4309,7 +4317,7 @@
+ 
+ avcodec_extralibs="pthreads_extralibs iconv_extralibs dxva2_extralibs liblcevc_dec_extralibs lcms2_extralibs"
+ avfilter_extralibs="pthreads_extralibs"
+-avutil_extralibs="d3d11va_extralibs d3d12va_extralibs mediacodec_extralibs nanosleep_extralibs pthreads_extralibs vaapi_drm_extralibs vaapi_x11_extralibs vaapi_win32_extralibs vdpau_x11_extralibs"
++avutil_extralibs="d3d11va_extralibs d3d12va_extralibs sfavd_extralibs mediacodec_extralibs nanosleep_extralibs pthreads_extralibs vaapi_drm_extralibs vaapi_x11_extralibs vaapi_win32_extralibs vdpau_x11_extralibs"
+ 
+ # programs
+ ffmpeg_deps="avcodec avfilter avformat threads"
+@@ -7486,6 +7494,7 @@
+                                  test_code cc OMX_Core.h OMX_IndexConfigBrcmVideoRequestIFrame; } ||
+                                die "ERROR: OpenMAX IL headers from raspberrypi/firmware not found"; } &&
+                              enable omx
++enabled sfavd             && require sfavd sfavd/sfavd.h sfavd_open -lsfavd
+ enabled omx               && require_headers OMX_Core.h && \
+     warn "The OpenMAX encoders are deprecated and will be removed in future versions"
+ 
+diff -ruN a/libavcodec/h264dec.c b/libavcodec/h264dec.c
+--- a/libavcodec/h264dec.c	2026-11-12 00:10:07.532802426 -0800
++++ b/libavcodec/h264dec.c	2026-11-12 00:14:36.220820803 -0800
+@@ -1133,6 +1133,9 @@
+ #if CONFIG_H264_NVDEC_HWACCEL
+                                HWACCEL_NVDEC(h264),
+ #endif
++#if CONFIG_H264_SFAVD_HWACCEL
++                               HWACCEL_SFAVD(h264),
++#endif
+ #if CONFIG_H264_VAAPI_HWACCEL
+                                HWACCEL_VAAPI(h264),
+ #endif
+diff -ruN a/libavcodec/h264_slice.c b/libavcodec/h264_slice.c
+--- a/libavcodec/h264_slice.c	2026-11-12 00:10:07.532802426 -0800
++++ b/libavcodec/h264_slice.c	2026-11-12 00:14:36.222626586 -0800
+@@ -790,6 +790,7 @@
+ #define HWACCEL_MAX (CONFIG_H264_DXVA2_HWACCEL + \
+                      (CONFIG_H264_D3D11VA_HWACCEL * 2) + \
+                      CONFIG_H264_D3D12VA_HWACCEL + \
++                     CONFIG_H264_SFAVD_HWACCEL + \
+                      CONFIG_H264_NVDEC_HWACCEL + \
+                      CONFIG_H264_VAAPI_HWACCEL + \
+                      CONFIG_H264_VIDEOTOOLBOX_HWACCEL + \
+@@ -902,6 +903,9 @@
+ #if CONFIG_H264_VAAPI_HWACCEL
+             *fmt++ = AV_PIX_FMT_VAAPI;
+ #endif
++#if CONFIG_H264_SFAVD_HWACCEL
++            *fmt++ = AV_PIX_FMT_SFAVD;
++#endif
+             if (h->avctx->color_range == AVCOL_RANGE_JPEG)
+                 *fmt++ = AV_PIX_FMT_YUVJ420P;
+             else
+diff -ruN a/libavcodec/hevc/hevcdec.c b/libavcodec/hevc/hevcdec.c
+--- a/libavcodec/hevc/hevcdec.c	2026-11-12 00:10:07.534679842 -0800
++++ b/libavcodec/hevc/hevcdec.c	2026-11-12 01:36:15.542553310 -0800
+@@ -579,6 +579,7 @@
+ #define HWACCEL_MAX (CONFIG_HEVC_DXVA2_HWACCEL + \
+                      CONFIG_HEVC_D3D11VA_HWACCEL * 2 + \
+                      CONFIG_HEVC_D3D12VA_HWACCEL + \
++                     CONFIG_HEVC_SFAVD_HWACCEL + \
+                      CONFIG_HEVC_NVDEC_HWACCEL + \
+                      CONFIG_HEVC_VAAPI_HWACCEL + \
+                      CONFIG_HEVC_VIDEOTOOLBOX_HWACCEL + \
+@@ -607,6 +608,9 @@
+ #if CONFIG_HEVC_VAAPI_HWACCEL
+         *fmt++ = AV_PIX_FMT_VAAPI;
+ #endif
++#if CONFIG_HEVC_SFAVD_HWACCEL
++        *fmt++ = AV_PIX_FMT_SFAVD;
++#endif
+ #if CONFIG_HEVC_VDPAU_HWACCEL
+         *fmt++ = AV_PIX_FMT_VDPAU;
+ #endif
+@@ -634,6 +638,9 @@
+ #if CONFIG_HEVC_VAAPI_HWACCEL
+         *fmt++ = AV_PIX_FMT_VAAPI;
+ #endif
++#if CONFIG_HEVC_SFAVD_HWACCEL
++        *fmt++ = AV_PIX_FMT_SFAVD;
++#endif
+ #if CONFIG_HEVC_VIDEOTOOLBOX_HWACCEL
+         *fmt++ = AV_PIX_FMT_VIDEOTOOLBOX;
+ #endif
+@@ -4269,6 +4276,9 @@
+ #if CONFIG_HEVC_NVDEC_HWACCEL
+                                HWACCEL_NVDEC(hevc),
+ #endif
++#if CONFIG_HEVC_SFAVD_HWACCEL
++                               HWACCEL_SFAVD(hevc),
++#endif
+ #if CONFIG_HEVC_VAAPI_HWACCEL
+                                HWACCEL_VAAPI(hevc),
+ #endif
+diff -ruN a/libavcodec/hwaccels.h b/libavcodec/hwaccels.h
+--- a/libavcodec/hwaccels.h	2026-11-12 00:10:07.535802390 -0800
++++ b/libavcodec/hwaccels.h	2026-11-12 00:37:20.212353020 -0800
+@@ -35,6 +35,7 @@
+ extern const struct FFHWAccel ff_h264_d3d11va_hwaccel;
+ extern const struct FFHWAccel ff_h264_d3d11va2_hwaccel;
+ extern const struct FFHWAccel ff_h264_d3d12va_hwaccel;
++extern const struct FFHWAccel ff_h264_sfavd_hwaccel;
+ extern const struct FFHWAccel ff_h264_dxva2_hwaccel;
+ extern const struct FFHWAccel ff_h264_nvdec_hwaccel;
+ extern const struct FFHWAccel ff_h264_vaapi_hwaccel;
+@@ -44,6 +45,7 @@
+ extern const struct FFHWAccel ff_hevc_d3d11va_hwaccel;
+ extern const struct FFHWAccel ff_hevc_d3d11va2_hwaccel;
+ extern const struct FFHWAccel ff_hevc_d3d12va_hwaccel;
++extern const struct FFHWAccel ff_hevc_sfavd_hwaccel;
+ extern const struct FFHWAccel ff_hevc_dxva2_hwaccel;
+ extern const struct FFHWAccel ff_hevc_nvdec_hwaccel;
+ extern const struct FFHWAccel ff_hevc_vaapi_hwaccel;
+@@ -82,6 +84,7 @@
+ extern const struct FFHWAccel ff_vp9_d3d11va_hwaccel;
+ extern const struct FFHWAccel ff_vp9_d3d11va2_hwaccel;
+ extern const struct FFHWAccel ff_vp9_d3d12va_hwaccel;
++extern const struct FFHWAccel ff_vp9_sfavd_hwaccel;
+ extern const struct FFHWAccel ff_vp9_dxva2_hwaccel;
+ extern const struct FFHWAccel ff_vp9_nvdec_hwaccel;
+ extern const struct FFHWAccel ff_vp9_vaapi_hwaccel;
+diff -ruN a/libavcodec/hwconfig.h b/libavcodec/hwconfig.h
+--- a/libavcodec/hwconfig.h	2026-11-12 00:10:07.535802390 -0800
++++ b/libavcodec/hwconfig.h	2026-11-12 00:14:36.218895847 -0800
+@@ -77,6 +77,8 @@
+     HW_CONFIG_HWACCEL(1, 1, 1, VULKAN,       VULKAN,       ff_ ## codec ## _vulkan_hwaccel)
+ #define HWACCEL_D3D11VA(codec) \
+     HW_CONFIG_HWACCEL(0, 0, 1, D3D11VA_VLD,  NONE,         ff_ ## codec ## _d3d11va_hwaccel)
++#define HWACCEL_SFAVD(codec) \
++    HW_CONFIG_HWACCEL(1, 1, 0, SFAVD,        SFAVD,        ff_ ## codec ## _sfavd_hwaccel)
+ #define HWACCEL_D3D12VA(codec) \
+     HW_CONFIG_HWACCEL(1, 1, 0, D3D12,        D3D12VA,      ff_ ## codec ## _d3d12va_hwaccel)
+ 
+diff -ruN a/libavcodec/Makefile b/libavcodec/Makefile
+--- a/libavcodec/Makefile	2026-11-12 00:10:07.500131072 -0800
++++ b/libavcodec/Makefile	2026-11-12 00:37:20.212893149 -0800
+@@ -1039,6 +1039,7 @@
+ # hardware accelerators
+ OBJS-$(CONFIG_D3D11VA)                    += dxva2.o
+ OBJS-$(CONFIG_D3D12VA)                    += dxva2.o d3d12va_decode.o
++OBJS-$(CONFIG_SFAVD)                      += sfavd.o
+ OBJS-$(CONFIG_DXVA2)                      += dxva2.o
+ OBJS-$(CONFIG_NVDEC)                      += nvdec.o
+ OBJS-$(CONFIG_VAAPI)                      += vaapi_decode.o
+@@ -1061,6 +1062,7 @@
+ OBJS-$(CONFIG_H264_D3D11VA_HWACCEL)       += dxva2_h264.o
+ OBJS-$(CONFIG_H264_DXVA2_HWACCEL)         += dxva2_h264.o
+ OBJS-$(CONFIG_H264_D3D12VA_HWACCEL)       += dxva2_h264.o d3d12va_h264.o
++OBJS-$(CONFIG_H264_SFAVD_HWACCEL)         += sfavd_h264.o
+ OBJS-$(CONFIG_H264_NVDEC_HWACCEL)         += nvdec_h264.o
+ OBJS-$(CONFIG_H264_QSV_HWACCEL)           += qsvdec.o
+ OBJS-$(CONFIG_H264_VAAPI_HWACCEL)         += vaapi_h264.o
+@@ -1070,6 +1072,7 @@
+ OBJS-$(CONFIG_HEVC_D3D11VA_HWACCEL)       += dxva2_hevc.o
+ OBJS-$(CONFIG_HEVC_DXVA2_HWACCEL)         += dxva2_hevc.o
+ OBJS-$(CONFIG_HEVC_D3D12VA_HWACCEL)       += dxva2_hevc.o d3d12va_hevc.o
++OBJS-$(CONFIG_HEVC_SFAVD_HWACCEL)         += sfavd_hevc.o
+ OBJS-$(CONFIG_HEVC_NVDEC_HWACCEL)         += nvdec_hevc.o
+ OBJS-$(CONFIG_HEVC_QSV_HWACCEL)           += qsvdec.o
+ OBJS-$(CONFIG_HEVC_VAAPI_HWACCEL)         += vaapi_hevc.o h265_profile_level.o
+@@ -1104,6 +1107,7 @@
+ OBJS-$(CONFIG_VP9_D3D11VA_HWACCEL)        += dxva2_vp9.o
+ OBJS-$(CONFIG_VP9_DXVA2_HWACCEL)          += dxva2_vp9.o
+ OBJS-$(CONFIG_VP9_D3D12VA_HWACCEL)        += dxva2_vp9.o d3d12va_vp9.o
++OBJS-$(CONFIG_VP9_SFAVD_HWACCEL)          += sfavd_vp9.o
+ OBJS-$(CONFIG_VP9_NVDEC_HWACCEL)          += nvdec_vp9.o
+ OBJS-$(CONFIG_VP9_VAAPI_HWACCEL)          += vaapi_vp9.o
+ OBJS-$(CONFIG_VP9_VDPAU_HWACCEL)          += vdpau_vp9.o
+diff -ruN a/libavcodec/sfavd.c b/libavcodec/sfavd.c
+--- a/libavcodec/sfavd.c	1969-12-31 16:00:00.000000000 -0800
++++ b/libavcodec/sfavd.c	2026-11-12 00:52:29.217958553 -0800
+@@ -0,0 +1,182 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "config.h"
++
++#include <errno.h>
++#include <string.h>
++
++#include "libavutil/hwcontext.h"
++#include "libavutil/mem.h"
++
++#include "decode.h"
++#include "hwaccel_internal.h"
++#include "internal.h"
++#include "sfavd.h"
++
++static SFAVDContext *sfavd_context(AVCodecContext *avctx)
++{
++    return avctx->internal->hwaccel_priv_data;
++}
++
++int ff_sfavd_frame_params(AVCodecContext *avctx, AVBufferRef *hw_frames_ctx,
++                          uint32_t codec, uint32_t ctrl_id, const void *ctrl,
++                          size_t ctrl_size, int refs)
++{
++    AVHWFramesContext *hwfc = (AVHWFramesContext *)hw_frames_ctx->data;
++    AVPDAVDFramesContext *fctx = hwfc->hwctx;
++
++    if (!ctrl || ctrl_size > AV_SFAVD_FORMAT_CTRL_MAX)
++        return AVERROR(EINVAL);
++
++    fctx->codec = codec;
++    fctx->format_ctrl_id = ctrl_id;
++    fctx->format_ctrl_size = ctrl_size;
++    memcpy(fctx->format_ctrl, ctrl, ctrl_size);
++
++    hwfc->format = AV_PIX_FMT_SFAVD;
++    hwfc->sw_format = AV_PIX_FMT_NV12;   /* replaced by the device's answer */
++    hwfc->width = avctx->coded_width;
++    hwfc->height = avctx->coded_height;
++    /*
++     * References, the picture being decoded, pictures waiting for output in the
++     * decoder, and a few in the hands of the caller (ff_decode_get_hw_frames_ctx()
++     * adds 3 more, the caller its extra_hw_frames).
++     */
++    hwfc->initial_pool_size = refs + 1 + avctx->has_b_frames + 2;
++    return 0;
++}
++
++int ff_sfavd_init(AVCodecContext *avctx)
++{
++    SFAVDContext *ctx = sfavd_context(avctx);
++    AVHWFramesContext *hwfc;
++    AVPDAVDDeviceContext *dev;
++    AVPDAVDFramesContext *fctx;
++    int ret;
++
++    ret = ff_decode_get_hw_frames_ctx(avctx, AV_HWDEVICE_TYPE_SFAVD);
++    if (ret < 0)
++        return ret;
++
++    hwfc = (AVHWFramesContext *)avctx->hw_frames_ctx->data;
++    dev = hwfc->device_ctx->hwctx;
++    fctx = hwfc->hwctx;
++    ctx->dev = dev->dev;
++    ctx->ctx = fctx->ctx;
++    return 0;
++}
++
++int ff_sfavd_uninit(AVCodecContext *avctx)
++{
++    SFAVDContext *ctx = sfavd_context(avctx);
++
++    if (ctx->pictures)
++        av_log(avctx, AV_LOG_VERBOSE, "AVD: %"PRIu64" pictures, decode time mean %.2f ms, max %.2f ms\n",
++               ctx->pictures, ctx->decode_us / 1000.0 / ctx->pictures, ctx->decode_us_max / 1000.0);
++    av_freep(&ctx->bitstream);
++    ctx->bitstream_alloc = ctx->bitstream_size = 0;
++    return 0;
++}
++
++uint64_t ff_sfavd_timestamp(const AVFrame *frame)
++{
++    const AVPDAVDFrame *f;
++
++    if (!frame || frame->format != AV_PIX_FMT_SFAVD || !frame->data[0])
++        return 0;
++    f = (const AVPDAVDFrame *)frame->data[0];
++    return f->timestamp;
++}
++
++uint64_t ff_sfavd_start_frame(AVCodecContext *avctx, AVFrame *frame)
++{
++    SFAVDContext *ctx = sfavd_context(avctx);
++    AVHWFramesContext *hwfc = (AVHWFramesContext *)avctx->hw_frames_ctx->data;
++    AVPDAVDFramesContext *fctx = hwfc->hwctx;
++    AVPDAVDFrame *f = (AVPDAVDFrame *)frame->data[0];
++
++    ctx->bitstream_size = 0;
++    f->timestamp = ++fctx->timestamp;
++    return f->timestamp;
++}
++
++void ff_sfavd_reset(AVCodecContext *avctx)
++{
++    sfavd_context(avctx)->bitstream_size = 0;
++}
++
++int ff_sfavd_append(AVCodecContext *avctx, const uint8_t *data, uint32_t size)
++{
++    SFAVDContext *ctx = sfavd_context(avctx);
++    uint8_t *p;
++
++    p = av_fast_realloc(ctx->bitstream, &ctx->bitstream_alloc, ctx->bitstream_size + size);
++    if (!p)
++        return AVERROR(ENOMEM);
++    ctx->bitstream = p;
++    memcpy(ctx->bitstream + ctx->bitstream_size, data, size);
++    ctx->bitstream_size += size;
++    return 0;
++}
++
++int ff_sfavd_decode(AVCodecContext *avctx, AVFrame *frame,
++                    const struct sfavd_ctrl *ctrls, int nb_ctrls, int hold)
++{
++    SFAVDContext *ctx = sfavd_context(avctx);
++    AVPDAVDFrame *f = (AVPDAVDFrame *)frame->data[0];
++    struct sfavd_decode decode = { 0 };
++    struct sfavd_meta meta = { 0 };
++
++    if (nb_ctrls > SFAVD_MAX_CTRLS || !ctx->bitstream_size)
++        return AVERROR(EINVAL);
++
++    decode.ctx = ctx->ctx;
++    decode.flags = hold ? SFAVD_DECODE_HOLD : 0;
++    decode.dst = f->index;
++    decode.timestamp = f->timestamp;
++    decode.data = (uintptr_t)ctx->bitstream;
++    decode.size = ctx->bitstream_size;
++    decode.nctrls = nb_ctrls;
++    memcpy(decode.ctrls, ctrls, nb_ctrls * sizeof(*ctrls));
++
++    meta.pts = frame->pts;
++    meta.width = avctx->width;
++    meta.height = avctx->height;
++    meta.crop_left = frame->crop_left;
++    meta.crop_top = frame->crop_top;
++    meta.flags = (frame->flags & AV_FRAME_FLAG_KEY) ? SFAVD_META_KEY : 0;
++
++    if (sfavd_decode(ctx->dev, &decode, hold ? NULL : &meta) < 0) {
++        int err = AVERROR(errno);
++        av_log(avctx, AV_LOG_ERROR, "AVD decode of picture %"PRIu64" failed: %s (decoder status 0x%x)\n",
++               f->timestamp, av_err2str(err), decode.status);
++        return err;
++    }
++    if (!hold) {
++        AVHWFramesContext *hwfc = (AVHWFramesContext *)avctx->hw_frames_ctx->data;
++        AVPDAVDDeviceContext *dev = hwfc->device_ctx->hwctx;
++
++        if (dev->picture_decoded)
++            dev->picture_decoded(dev->picture_decoded_opaque, frame);
++        ctx->pictures++;
++        ctx->decode_us += decode.decode_us;
++        ctx->decode_us_max = FFMAX(ctx->decode_us_max, decode.decode_us);
++    }
++    return 0;
++}
+diff -ruN a/libavcodec/sfavd.h b/libavcodec/sfavd.h
+--- a/libavcodec/sfavd.h	1969-12-31 16:00:00.000000000 -0800
++++ b/libavcodec/sfavd.h	2026-11-12 00:14:09.174478782 -0800
+@@ -0,0 +1,70 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVCODEC_SFAVD_H
++#define AVCODEC_SFAVD_H
++
++/**
++ * @file
++ * Common part of the `sfavd` hwaccels: the Apple Video Decoder through libsfavd. The
++ * decoder takes Linux's V4L2 stateless control structures; the per-codec files fill them
++ * the way the V4L2 request API hwaccels do.
++ */
++
++#include <stdint.h>
++
++#include <sfavd/sfavd.h>
++#include <sfavd/v4l2-controls.h>
++
++#include "libavutil/frame.h"
++#include "libavutil/hwcontext_sfavd.h"
++
++#include "avcodec.h"
++
++typedef struct SFAVDContext {
++    void    *dev;            /* sfavd_dev * of the device context */
++    uint32_t ctx;
++    /* coded data of the slice (H.264) or picture being collected */
++    uint8_t *bitstream;
++    unsigned bitstream_alloc;
++    unsigned bitstream_size;
++    /* statistics */
++    uint64_t pictures;
++    uint64_t decode_us, decode_us_max;
++} SFAVDContext;
++
++int ff_sfavd_init(AVCodecContext *avctx);
++int ff_sfavd_uninit(AVCodecContext *avctx);
++/**
++ * Fills the frames context for av_hwframe_ctx_init(): codec, format control, and a pool
++ * of `refs` reference pictures plus what the decoder and the caller hold besides.
++ */
++int ff_sfavd_frame_params(AVCodecContext *avctx, AVBufferRef *hw_frames_ctx,
++                          uint32_t codec, uint32_t ctrl_id, const void *ctrl,
++                          size_t ctrl_size, int refs);
++/** Starts a picture into `frame`: names it (the returned timestamp) and resets the coded data. */
++uint64_t ff_sfavd_start_frame(AVCodecContext *avctx, AVFrame *frame);
++/** The name of the picture in a decoded frame, for reference lists; 0 if none. */
++uint64_t ff_sfavd_timestamp(const AVFrame *frame);
++int ff_sfavd_append(AVCodecContext *avctx, const uint8_t *data, uint32_t size);
++void ff_sfavd_reset(AVCodecContext *avctx);
++/** Submits the collected coded data with these controls. `hold`: more slices follow. */
++int ff_sfavd_decode(AVCodecContext *avctx, AVFrame *frame,
++                    const struct sfavd_ctrl *ctrls, int nb_ctrls, int hold);
++
++#endif /* AVCODEC_SFAVD_H */
+diff -ruN a/libavcodec/sfavd_h264.c b/libavcodec/sfavd_h264.c
+--- a/libavcodec/sfavd_h264.c	1969-12-31 16:00:00.000000000 -0800
++++ b/libavcodec/sfavd_h264.c	2026-11-12 01:45:21.164306821 -0800
+@@ -0,0 +1,464 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * H.264 through the Apple Video Decoder. The control filling follows the V4L2 request
++ * API hwaccel for H.264 (v4l2_request_h264.c by Jonas Karlman and others), which is what
++ * the Linux driver of this decoder is used with.
++ */
++
++#include "config.h"
++
++#include "h264dec.h"
++#include "hwaccel_internal.h"
++#include "hwconfig.h"
++#include "internal.h"
++#include "sfavd.h"
++
++typedef struct SFAVDControlsH264 {
++    struct v4l2_ctrl_h264_sps sps;
++    struct v4l2_ctrl_h264_pps pps;
++    struct v4l2_ctrl_h264_scaling_matrix scaling_matrix;
++    struct v4l2_ctrl_h264_decode_params decode_params;
++    struct v4l2_ctrl_h264_slice_params slice_params;
++    struct v4l2_ctrl_h264_pred_weights pred_weights;
++    int pred_weights_required;
++    int num_slices;
++} SFAVDControlsH264;
++
++static void fill_weight_factors(struct v4l2_h264_weight_factors *weight_factors,
++                                int list, const H264SliceContext *sl)
++{
++    for (int i = 0; i < sl->ref_count[list]; i++) {
++        if (sl->pwt.luma_weight_flag[list]) {
++            weight_factors->luma_weight[i] = sl->pwt.luma_weight[i][list][0];
++            weight_factors->luma_offset[i] = sl->pwt.luma_weight[i][list][1];
++        } else {
++            weight_factors->luma_weight[i] = 1 << sl->pwt.luma_log2_weight_denom;
++            weight_factors->luma_offset[i] = 0;
++        }
++        for (int j = 0; j < 2; j++) {
++            if (sl->pwt.chroma_weight_flag[list]) {
++                weight_factors->chroma_weight[i][j] = sl->pwt.chroma_weight[i][list][j][0];
++                weight_factors->chroma_offset[i][j] = sl->pwt.chroma_weight[i][list][j][1];
++            } else {
++                weight_factors->chroma_weight[i][j] = 1 << sl->pwt.chroma_log2_weight_denom;
++                weight_factors->chroma_offset[i][j] = 0;
++            }
++        }
++    }
++}
++
++static void fill_dpb_entry(struct v4l2_h264_dpb_entry *entry,
++                           const H264Picture *pic, int long_idx)
++{
++    entry->reference_ts = ff_sfavd_timestamp(pic->f);
++    entry->pic_num = pic->pic_id;
++    entry->frame_num = pic->long_ref ? long_idx : pic->frame_num;
++    entry->fields = pic->reference & V4L2_H264_FRAME_REF;
++    entry->flags = V4L2_H264_DPB_ENTRY_FLAG_VALID;
++    if (entry->fields)
++        entry->flags |= V4L2_H264_DPB_ENTRY_FLAG_ACTIVE;
++    if (pic->long_ref)
++        entry->flags |= V4L2_H264_DPB_ENTRY_FLAG_LONG_TERM;
++    if (pic->field_picture)
++        entry->flags |= V4L2_H264_DPB_ENTRY_FLAG_FIELD;
++    if (pic->field_poc[0] != INT_MAX)
++        entry->top_field_order_cnt = pic->field_poc[0];
++    if (pic->field_poc[1] != INT_MAX)
++        entry->bottom_field_order_cnt = pic->field_poc[1];
++}
++
++static void fill_dpb(struct v4l2_ctrl_h264_decode_params *decode_params,
++                     const H264Context *h)
++{
++    int entries = 0;
++
++    for (int i = 0; i < h->short_ref_count && entries < V4L2_H264_NUM_DPB_ENTRIES; i++) {
++        const H264Picture *pic = h->short_ref[i];
++        if (pic && (pic->field_poc[0] != INT_MAX || pic->field_poc[1] != INT_MAX))
++            fill_dpb_entry(&decode_params->dpb[entries++], pic, pic->pic_id);
++    }
++
++    if (!h->long_ref_count)
++        return;
++
++    for (int i = 0; i < FF_ARRAY_ELEMS(h->long_ref) && entries < V4L2_H264_NUM_DPB_ENTRIES; i++) {
++        const H264Picture *pic = h->long_ref[i];
++        if (pic && (pic->field_poc[0] != INT_MAX || pic->field_poc[1] != INT_MAX))
++            fill_dpb_entry(&decode_params->dpb[entries++], pic, i);
++    }
++}
++
++static void fill_ref_list(struct v4l2_h264_reference *reference,
++                          struct v4l2_ctrl_h264_decode_params *decode_params,
++                          const H264Ref *ref)
++{
++    uint64_t timestamp;
++
++    /* an index that names no picture: the driver refuses the slice instead of decoding garbage */
++    reference->index = 0xff;
++    if (!ref->parent)
++        return;
++
++    timestamp = ff_sfavd_timestamp(ref->parent->f);
++
++    for (uint8_t i = 0; i < FF_ARRAY_ELEMS(decode_params->dpb); i++) {
++        struct v4l2_h264_dpb_entry *entry = &decode_params->dpb[i];
++        if ((entry->flags & V4L2_H264_DPB_ENTRY_FLAG_VALID) &&
++            entry->reference_ts == timestamp) {
++            reference->fields = ref->reference & V4L2_H264_FRAME_REF;
++            reference->index = i;
++            return;
++        }
++    }
++}
++
++static void fill_sps(struct v4l2_ctrl_h264_sps *ctrl, const H264Context *h)
++{
++    const SPS *sps = h->ps.sps;
++
++    *ctrl = (struct v4l2_ctrl_h264_sps) {
++        .profile_idc = sps->profile_idc,
++        .constraint_set_flags = sps->constraint_set_flags,
++        .level_idc = sps->level_idc,
++        .seq_parameter_set_id = sps->sps_id,
++        .chroma_format_idc = sps->chroma_format_idc,
++        .bit_depth_luma_minus8 = sps->bit_depth_luma - 8,
++        .bit_depth_chroma_minus8 = sps->bit_depth_chroma - 8,
++        .log2_max_frame_num_minus4 = sps->log2_max_frame_num - 4,
++        .pic_order_cnt_type = sps->poc_type,
++        .log2_max_pic_order_cnt_lsb_minus4 = sps->log2_max_poc_lsb - 4,
++        .max_num_ref_frames = sps->ref_frame_count,
++        .num_ref_frames_in_pic_order_cnt_cycle = sps->poc_cycle_length,
++        .offset_for_non_ref_pic = sps->offset_for_non_ref_pic,
++        .offset_for_top_to_bottom_field = sps->offset_for_top_to_bottom_field,
++        .pic_width_in_mbs_minus1 = h->mb_width - 1,
++        .pic_height_in_map_units_minus1 = sps->frame_mbs_only_flag ?
++                                          h->mb_height - 1 : h->mb_height / 2 - 1,
++    };
++
++    if (sps->poc_cycle_length > 0 && sps->poc_cycle_length <= 255)
++        memcpy(ctrl->offset_for_ref_frame, sps->offset_for_ref_frame,
++               sps->poc_cycle_length * sizeof(ctrl->offset_for_ref_frame[0]));
++
++    if (sps->residual_color_transform_flag)
++        ctrl->flags |= V4L2_H264_SPS_FLAG_SEPARATE_COLOUR_PLANE;
++
++    if (sps->transform_bypass)
++        ctrl->flags |= V4L2_H264_SPS_FLAG_QPPRIME_Y_ZERO_TRANSFORM_BYPASS;
++
++    if (sps->delta_pic_order_always_zero_flag)
++        ctrl->flags |= V4L2_H264_SPS_FLAG_DELTA_PIC_ORDER_ALWAYS_ZERO;
++
++    if (sps->gaps_in_frame_num_allowed_flag)
++        ctrl->flags |= V4L2_H264_SPS_FLAG_GAPS_IN_FRAME_NUM_VALUE_ALLOWED;
++
++    if (sps->frame_mbs_only_flag)
++        ctrl->flags |= V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY;
++
++    if (sps->mb_aff)
++        ctrl->flags |= V4L2_H264_SPS_FLAG_MB_ADAPTIVE_FRAME_FIELD;
++
++    if (sps->direct_8x8_inference_flag)
++        ctrl->flags |= V4L2_H264_SPS_FLAG_DIRECT_8X8_INFERENCE;
++}
++
++static void fill_pps(struct v4l2_ctrl_h264_pps *ctrl, const H264Context *h)
++{
++    const SPS *sps = h->ps.sps;
++    const PPS *pps = h->ps.pps;
++    const H264SliceContext *sl = &h->slice_ctx[0];
++    int qp_bd_offset = 6 * (sps->bit_depth_luma - 8);
++
++    *ctrl = (struct v4l2_ctrl_h264_pps) {
++        .pic_parameter_set_id = sl->pps_id,
++        .seq_parameter_set_id = pps->sps_id,
++        .num_slice_groups_minus1 = pps->slice_group_count - 1,
++        .num_ref_idx_l0_default_active_minus1 = pps->ref_count[0] - 1,
++        .num_ref_idx_l1_default_active_minus1 = pps->ref_count[1] - 1,
++        .weighted_bipred_idc = pps->weighted_bipred_idc,
++        .pic_init_qp_minus26 = pps->init_qp - 26 - qp_bd_offset,
++        .pic_init_qs_minus26 = pps->init_qs - 26 - qp_bd_offset,
++        .chroma_qp_index_offset = pps->chroma_qp_index_offset[0],
++        .second_chroma_qp_index_offset = pps->chroma_qp_index_offset[1],
++    };
++
++    if (pps->cabac)
++        ctrl->flags |= V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE;
++
++    if (pps->pic_order_present)
++        ctrl->flags |= V4L2_H264_PPS_FLAG_BOTTOM_FIELD_PIC_ORDER_IN_FRAME_PRESENT;
++
++    if (pps->weighted_pred)
++        ctrl->flags |= V4L2_H264_PPS_FLAG_WEIGHTED_PRED;
++
++    if (pps->deblocking_filter_parameters_present)
++        ctrl->flags |= V4L2_H264_PPS_FLAG_DEBLOCKING_FILTER_CONTROL_PRESENT;
++
++    if (pps->constrained_intra_pred)
++        ctrl->flags |= V4L2_H264_PPS_FLAG_CONSTRAINED_INTRA_PRED;
++
++    if (pps->redundant_pic_cnt_present)
++        ctrl->flags |= V4L2_H264_PPS_FLAG_REDUNDANT_PIC_CNT_PRESENT;
++
++    if (pps->transform_8x8_mode)
++        ctrl->flags |= V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE;
++
++    /* FFmpeg always provide a scaling matrix */
++    ctrl->flags |= V4L2_H264_PPS_FLAG_SCALING_MATRIX_PRESENT;
++}
++
++static int sfavd_h264_start_frame(AVCodecContext *avctx,
++                                  av_unused const AVBufferRef *buf_ref,
++                                  av_unused const uint8_t *buffer,
++                                  av_unused uint32_t size)
++{
++    const H264Context *h = avctx->priv_data;
++    const PPS *pps = h->ps.pps;
++    const SPS *sps = h->ps.sps;
++    const H264SliceContext *sl = &h->slice_ctx[0];
++    SFAVDControlsH264 *controls = h->cur_pic_ptr->hwaccel_picture_private;
++
++    ff_sfavd_start_frame(avctx, h->cur_pic_ptr->f);
++
++    fill_sps(&controls->sps, h);
++    fill_pps(&controls->pps, h);
++
++    memcpy(controls->scaling_matrix.scaling_list_4x4, pps->scaling_matrix4,
++           sizeof(controls->scaling_matrix.scaling_list_4x4));
++    memcpy(controls->scaling_matrix.scaling_list_8x8[0], pps->scaling_matrix8[0],
++           sizeof(controls->scaling_matrix.scaling_list_8x8[0]));
++    memcpy(controls->scaling_matrix.scaling_list_8x8[1], pps->scaling_matrix8[3],
++           sizeof(controls->scaling_matrix.scaling_list_8x8[1]));
++
++    if (sps->chroma_format_idc == 3) {
++        memcpy(controls->scaling_matrix.scaling_list_8x8[2], pps->scaling_matrix8[1],
++               sizeof(controls->scaling_matrix.scaling_list_8x8[2]));
++        memcpy(controls->scaling_matrix.scaling_list_8x8[3], pps->scaling_matrix8[4],
++               sizeof(controls->scaling_matrix.scaling_list_8x8[3]));
++        memcpy(controls->scaling_matrix.scaling_list_8x8[4], pps->scaling_matrix8[2],
++               sizeof(controls->scaling_matrix.scaling_list_8x8[4]));
++        memcpy(controls->scaling_matrix.scaling_list_8x8[5], pps->scaling_matrix8[5],
++               sizeof(controls->scaling_matrix.scaling_list_8x8[5]));
++    }
++
++    controls->decode_params = (struct v4l2_ctrl_h264_decode_params) {
++        .nal_ref_idc = h->nal_ref_idc,
++        .frame_num = h->poc.frame_num,
++        .top_field_order_cnt = h->cur_pic_ptr->field_poc[0] != INT_MAX ?
++                               h->cur_pic_ptr->field_poc[0] : 0,
++        .bottom_field_order_cnt = h->cur_pic_ptr->field_poc[1] != INT_MAX ?
++                                  h->cur_pic_ptr->field_poc[1] : 0,
++        .idr_pic_id = sl->idr_pic_id,
++        .pic_order_cnt_lsb = sl->poc_lsb,
++        .delta_pic_order_cnt_bottom = sl->delta_poc_bottom,
++        .delta_pic_order_cnt0 = sl->delta_poc[0],
++        .delta_pic_order_cnt1 = sl->delta_poc[1],
++        /*
++         * dec_ref_pic_marking_bit_size and pic_order_cnt_bit_size are not known to
++         * FFmpeg's parser; the AVD driver does not read them.
++         */
++        .slice_group_change_cycle = 0, /* slice group not supported by FFmpeg */
++    };
++
++    if (h->picture_idr)
++        controls->decode_params.flags |= V4L2_H264_DECODE_PARAM_FLAG_IDR_PIC;
++
++    if (FIELD_PICTURE(h))
++        controls->decode_params.flags |= V4L2_H264_DECODE_PARAM_FLAG_FIELD_PIC;
++
++    if (h->picture_structure == PICT_BOTTOM_FIELD)
++        controls->decode_params.flags |= V4L2_H264_DECODE_PARAM_FLAG_BOTTOM_FIELD;
++
++    if (sl->slice_type_nos == AV_PICTURE_TYPE_P)
++        controls->decode_params.flags |= V4L2_H264_DECODE_PARAM_FLAG_PFRAME;
++
++    if (sl->slice_type_nos == AV_PICTURE_TYPE_B)
++        controls->decode_params.flags |= V4L2_H264_DECODE_PARAM_FLAG_BFRAME;
++
++    fill_dpb(&controls->decode_params, h);
++
++    controls->num_slices = 0;
++
++    return 0;
++}
++
++static int sfavd_h264_queue_decode(AVCodecContext *avctx, int last_slice)
++{
++    const H264Context *h = avctx->priv_data;
++    SFAVDControlsH264 *controls = h->cur_pic_ptr->hwaccel_picture_private;
++
++    struct sfavd_ctrl control[] = {
++        {
++            .id = V4L2_CID_STATELESS_H264_SPS,
++            .ptr = (uintptr_t)&controls->sps,
++            .size = sizeof(controls->sps),
++        },
++        {
++            .id = V4L2_CID_STATELESS_H264_PPS,
++            .ptr = (uintptr_t)&controls->pps,
++            .size = sizeof(controls->pps),
++        },
++        {
++            .id = V4L2_CID_STATELESS_H264_SCALING_MATRIX,
++            .ptr = (uintptr_t)&controls->scaling_matrix,
++            .size = sizeof(controls->scaling_matrix),
++        },
++        {
++            .id = V4L2_CID_STATELESS_H264_DECODE_PARAMS,
++            .ptr = (uintptr_t)&controls->decode_params,
++            .size = sizeof(controls->decode_params),
++        },
++        {
++            .id = V4L2_CID_STATELESS_H264_SLICE_PARAMS,
++            .ptr = (uintptr_t)&controls->slice_params,
++            .size = sizeof(controls->slice_params),
++        },
++        {
++            .id = V4L2_CID_STATELESS_H264_PRED_WEIGHTS,
++            .ptr = (uintptr_t)&controls->pred_weights,
++            .size = sizeof(controls->pred_weights),
++        },
++    };
++
++    /* the weights are sent with every slice: the driver reads its denominators unconditionally */
++    return ff_sfavd_decode(avctx, h->cur_pic_ptr->f, control, FF_ARRAY_ELEMS(control), !last_slice);
++}
++
++static int sfavd_h264_decode_slice(AVCodecContext *avctx,
++                                   const uint8_t *buffer, uint32_t size)
++{
++    const H264Context *h = avctx->priv_data;
++    const PPS *pps = h->ps.pps;
++    const H264SliceContext *sl = &h->slice_ctx[0];
++    SFAVDControlsH264 *controls = h->cur_pic_ptr->hwaccel_picture_private;
++    int i, ret, count;
++
++    /* the decoder takes one slice per call; the previous one is known not to be the last now */
++    if (controls->num_slices) {
++        ret = sfavd_h264_queue_decode(avctx, 0);
++        if (ret)
++            return ret;
++        ff_sfavd_reset(avctx);
++    }
++
++    /*
++     * Without the zero bytes that may follow a NAL unit in a byte stream
++     * (trailing_zero_8bits, and the zero_byte of the next start code): the decoder
++     * takes the slice's length as the end of its data, and a slice that is not the
++     * last of its picture fails with them.
++     */
++    while (size > 1 && buffer[size - 1] == 0)
++        size--;
++
++    ret = ff_sfavd_append(avctx, buffer, size);
++    if (ret)
++        return ret;
++
++    controls->slice_params = (struct v4l2_ctrl_h264_slice_params) {
++        /* Offset in bits to slice_data() from the beginning of this slice. */
++        .header_bit_size = get_bits_count(&sl->gb),
++
++        .first_mb_in_slice = sl->first_mb_addr,
++
++        .slice_type = ff_h264_get_slice_type(sl),
++        .colour_plane_id = 0, /* separate colour plane not supported by FFmpeg */
++        .redundant_pic_cnt = sl->redundant_pic_count,
++        .cabac_init_idc = sl->cabac_init_idc,
++        .slice_qp_delta = sl->qscale - pps->init_qp,
++        .slice_qs_delta = 0, /* not implemented by FFmpeg */
++        .disable_deblocking_filter_idc = sl->deblocking_filter < 2 ?
++                                         !sl->deblocking_filter :
++                                         sl->deblocking_filter,
++        .slice_alpha_c0_offset_div2 = sl->slice_alpha_c0_offset / 2,
++        .slice_beta_offset_div2 = sl->slice_beta_offset / 2,
++        .num_ref_idx_l0_active_minus1 = sl->list_count > 0 ? sl->ref_count[0] - 1 : 0,
++        .num_ref_idx_l1_active_minus1 = sl->list_count > 1 ? sl->ref_count[1] - 1 : 0,
++    };
++
++    if (sl->slice_type == AV_PICTURE_TYPE_B && sl->direct_spatial_mv_pred)
++        controls->slice_params.flags |= V4L2_H264_SLICE_FLAG_DIRECT_SPATIAL_MV_PRED;
++
++    /* V4L2_H264_SLICE_FLAG_SP_FOR_SWITCH: not implemented by FFmpeg */
++
++    memset(&controls->pred_weights, 0, sizeof(controls->pred_weights));
++    controls->pred_weights_required =
++        V4L2_H264_CTRL_PRED_WEIGHTS_REQUIRED(&controls->pps, &controls->slice_params);
++    if (controls->pred_weights_required) {
++        controls->pred_weights.chroma_log2_weight_denom = sl->pwt.chroma_log2_weight_denom;
++        controls->pred_weights.luma_log2_weight_denom = sl->pwt.luma_log2_weight_denom;
++    }
++
++    count = sl->list_count > 0 ? sl->ref_count[0] : 0;
++    for (i = 0; i < count; i++)
++        fill_ref_list(&controls->slice_params.ref_pic_list0[i],
++                      &controls->decode_params, &sl->ref_list[0][i]);
++    if (count && controls->pred_weights_required)
++        fill_weight_factors(&controls->pred_weights.weight_factors[0], 0, sl);
++
++    count = sl->list_count > 1 ? sl->ref_count[1] : 0;
++    for (i = 0; i < count; i++)
++        fill_ref_list(&controls->slice_params.ref_pic_list1[i],
++                      &controls->decode_params, &sl->ref_list[1][i]);
++    if (count && controls->pred_weights_required)
++        fill_weight_factors(&controls->pred_weights.weight_factors[1], 1, sl);
++
++    controls->num_slices++;
++    return 0;
++}
++
++static int sfavd_h264_end_frame(AVCodecContext *avctx)
++{
++    const H264Context *h = avctx->priv_data;
++    SFAVDControlsH264 *controls = h->cur_pic_ptr->hwaccel_picture_private;
++
++    if (!controls->num_slices)
++        return AVERROR_INVALIDDATA;
++    return sfavd_h264_queue_decode(avctx, 1);
++}
++
++static int sfavd_h264_frame_params(AVCodecContext *avctx,
++                                   AVBufferRef *hw_frames_ctx)
++{
++    const H264Context *h = avctx->priv_data;
++    const SPS *sps = h ? h->ps.sps : NULL;
++    struct v4l2_ctrl_h264_sps ctrl;
++
++    if (!sps)
++        return AVERROR(EINVAL);
++    fill_sps(&ctrl, h);
++    return ff_sfavd_frame_params(avctx, hw_frames_ctx, SFAVD_CODEC_H264,
++                                 V4L2_CID_STATELESS_H264_SPS, &ctrl, sizeof(ctrl),
++                                 sps->ref_frame_count);
++}
++
++const FFHWAccel ff_h264_sfavd_hwaccel = {
++    .p.name             = "h264_sfavd",
++    .p.type             = AVMEDIA_TYPE_VIDEO,
++    .p.id               = AV_CODEC_ID_H264,
++    .p.pix_fmt          = AV_PIX_FMT_SFAVD,
++    .start_frame        = sfavd_h264_start_frame,
++    .decode_slice       = sfavd_h264_decode_slice,
++    .end_frame          = sfavd_h264_end_frame,
++    .frame_priv_data_size = sizeof(SFAVDControlsH264),
++    .init               = ff_sfavd_init,
++    .uninit             = ff_sfavd_uninit,
++    .priv_data_size     = sizeof(SFAVDContext),
++    .frame_params       = sfavd_h264_frame_params,
++};
+diff -ruN a/libavcodec/sfavd_hevc.c b/libavcodec/sfavd_hevc.c
+--- a/libavcodec/sfavd_hevc.c	1969-12-31 16:00:00.000000000 -0800
++++ b/libavcodec/sfavd_hevc.c	2026-11-12 01:45:21.165267017 -0800
+@@ -0,0 +1,622 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * HEVC through the Apple Video Decoder. The control filling follows the V4L2 request API
++ * hwaccel for HEVC (v4l2_request_hevc.c by Jonas Karlman, Benjamin Gaignard and others);
++ * the decoder is frame based: all slice segments of a picture go in one call, each with
++ * its size and the offset of its slice data, without start codes.
++ */
++
++#include "config.h"
++
++#include "libavutil/mem.h"
++#include "hevc/hevcdec.h"
++#include "hwaccel_internal.h"
++#include "hwconfig.h"
++#include "internal.h"
++#include "sfavd.h"
++
++/* limits of the decoder's driver (the array sizes of its V4L2 controls) */
++#define SFAVD_HEVC_MAX_SLICES       600
++#define SFAVD_HEVC_MAX_ENTRY_POINTS 256
++
++typedef struct SFAVDControlsHEVC {
++    struct v4l2_ctrl_hevc_sps sps;
++    struct v4l2_ctrl_hevc_pps pps;
++    struct v4l2_ctrl_hevc_decode_params decode_params;
++    struct v4l2_ctrl_hevc_scaling_matrix scaling_matrix;
++    struct v4l2_ctrl_hevc_slice_params *slice_params;
++    unsigned int allocated_slice_params;
++    unsigned int num_slice_params;
++    uint32_t *entry_point_offsets;
++    unsigned int allocated_entry_point_offsets;
++    unsigned int num_entry_point_offsets;
++} SFAVDControlsHEVC;
++
++static void fill_pred_weight_table(struct v4l2_hevc_pred_weight_table *table,
++                                   const HEVCContext *h)
++{
++    int32_t luma_weight_denom, chroma_weight_denom;
++    const SliceHeader *sh = &h->sh;
++
++    if (sh->slice_type == HEVC_SLICE_I ||
++        (sh->slice_type == HEVC_SLICE_P && !h->pps->weighted_pred_flag) ||
++        (sh->slice_type == HEVC_SLICE_B && !h->pps->weighted_bipred_flag))
++        return;
++
++    table->luma_log2_weight_denom = sh->luma_log2_weight_denom;
++
++    if (h->pps->sps->chroma_format_idc)
++        table->delta_chroma_log2_weight_denom = sh->chroma_log2_weight_denom -
++                                                sh->luma_log2_weight_denom;
++
++    luma_weight_denom = (1 << sh->luma_log2_weight_denom);
++    chroma_weight_denom = (1 << sh->chroma_log2_weight_denom);
++
++    for (int i = 0; i < 15 && i < sh->nb_refs[L0]; i++) {
++        table->delta_luma_weight_l0[i] = sh->luma_weight_l0[i] - luma_weight_denom;
++        table->luma_offset_l0[i] = sh->luma_offset_l0[i];
++        table->delta_chroma_weight_l0[i][0] = sh->chroma_weight_l0[i][0] - chroma_weight_denom;
++        table->delta_chroma_weight_l0[i][1] = sh->chroma_weight_l0[i][1] - chroma_weight_denom;
++        table->chroma_offset_l0[i][0] = sh->chroma_offset_l0[i][0];
++        table->chroma_offset_l0[i][1] = sh->chroma_offset_l0[i][1];
++    }
++
++    if (sh->slice_type != HEVC_SLICE_B)
++        return;
++
++    for (int i = 0; i < 15 && i < sh->nb_refs[L1]; i++) {
++        table->delta_luma_weight_l1[i] = sh->luma_weight_l1[i] - luma_weight_denom;
++        table->luma_offset_l1[i] = sh->luma_offset_l1[i];
++        table->delta_chroma_weight_l1[i][0] = sh->chroma_weight_l1[i][0] - chroma_weight_denom;
++        table->delta_chroma_weight_l1[i][1] = sh->chroma_weight_l1[i][1] - chroma_weight_denom;
++        table->chroma_offset_l1[i][0] = sh->chroma_offset_l1[i][0];
++        table->chroma_offset_l1[i][1] = sh->chroma_offset_l1[i][1];
++    }
++}
++
++static uint8_t get_ref_pic_index(const HEVCContext *h, const HEVCFrame *frame,
++                                 struct v4l2_ctrl_hevc_decode_params *decode_params)
++{
++    uint64_t timestamp;
++
++    if (!frame || !frame->f)
++        return 0;
++
++    timestamp = ff_sfavd_timestamp(frame->f);
++
++    for (uint8_t i = 0; i < decode_params->num_active_dpb_entries; i++) {
++        struct v4l2_hevc_dpb_entry *entry = &decode_params->dpb[i];
++        if (entry->timestamp == timestamp)
++            return i;
++    }
++
++    return 0;
++}
++
++static void fill_decode_params(struct v4l2_ctrl_hevc_decode_params *decode_params,
++                               const HEVCContext *h)
++{
++    const HEVCFrame *pic = h->cur_frame;
++    const HEVCLayerContext *l = &h->layers[h->cur_layer];
++    const SliceHeader *sh = &h->sh;
++    int i, entries = 0;
++
++    *decode_params = (struct v4l2_ctrl_hevc_decode_params) {
++        .pic_order_cnt_val = h->poc,
++        .short_term_ref_pic_set_size = sh->short_term_ref_pic_set_size,
++        .long_term_ref_pic_set_size = sh->long_term_ref_pic_set_size,
++        .num_poc_st_curr_before = h->rps[ST_CURR_BEF].nb_refs,
++        .num_poc_st_curr_after = h->rps[ST_CURR_AFT].nb_refs,
++        .num_poc_lt_curr = h->rps[LT_CURR].nb_refs,
++    };
++
++    if (h->sh.short_term_ref_pic_set_sps_flag == 0 && h->sh.short_term_rps)
++        decode_params->num_delta_pocs_of_ref_rps_idx =
++                                h->sh.short_term_rps->rps_idx_num_delta_pocs;
++
++    for (i = 0; i < FF_ARRAY_ELEMS(l->DPB) && entries < V4L2_HEVC_DPB_ENTRIES_NUM_MAX; i++) {
++        const HEVCFrame *frame = &l->DPB[i];
++        if (frame != pic &&
++            (frame->flags & (HEVC_FRAME_FLAG_LONG_REF | HEVC_FRAME_FLAG_SHORT_REF))) {
++            struct v4l2_hevc_dpb_entry *entry = &decode_params->dpb[entries++];
++
++            entry->timestamp = ff_sfavd_timestamp(frame->f);
++            entry->field_pic = !!(frame->f->flags & AV_FRAME_FLAG_INTERLACED);
++            entry->flags = 0;
++            if (frame->flags & HEVC_FRAME_FLAG_LONG_REF)
++                entry->flags |= V4L2_HEVC_DPB_ENTRY_LONG_TERM_REFERENCE;
++
++            entry->pic_order_cnt_val = frame->poc;
++        }
++    }
++
++    decode_params->num_active_dpb_entries = entries;
++
++    if (IS_IRAP(h))
++        decode_params->flags |= V4L2_HEVC_DECODE_PARAM_FLAG_IRAP_PIC;
++
++    if (IS_IDR(h))
++        decode_params->flags |= V4L2_HEVC_DECODE_PARAM_FLAG_IDR_PIC;
++
++    if (sh->no_output_of_prior_pics_flag)
++        decode_params->flags |= V4L2_HEVC_DECODE_PARAM_FLAG_NO_OUTPUT_OF_PRIOR;
++
++    for (i = 0; i < V4L2_HEVC_DPB_ENTRIES_NUM_MAX; i++) {
++        decode_params->poc_st_curr_before[i] =
++            get_ref_pic_index(h, h->rps[ST_CURR_BEF].ref[i], decode_params);
++        decode_params->poc_st_curr_after[i] =
++            get_ref_pic_index(h, h->rps[ST_CURR_AFT].ref[i], decode_params);
++        decode_params->poc_lt_curr[i] =
++            get_ref_pic_index(h, h->rps[LT_CURR].ref[i], decode_params);
++    }
++}
++
++/*
++ * The slice header's length in the NAL unit as it is in the stream: data_offset counts
++ * bytes after emulation prevention bytes were removed.
++ */
++static uint32_t raw_data_offset(const uint8_t *buffer, uint32_t size, uint32_t rbsp_offset)
++{
++    uint32_t pos = 0, rbsp = 0, zeros = 0;
++
++    while (pos < size && rbsp < rbsp_offset) {
++        if (zeros >= 2 && buffer[pos] == 3) {
++            zeros = 0;
++            pos++;
++            continue;
++        }
++        zeros = buffer[pos] == 0 ? zeros + 1 : 0;
++        pos++;
++        rbsp++;
++    }
++    return pos;
++}
++
++static int fill_slice_params(SFAVDControlsHEVC *controls, int slice,
++                             const uint8_t *buffer, uint32_t size,
++                             const HEVCContext *h)
++{
++    struct v4l2_ctrl_hevc_slice_params *slice_params = &controls->slice_params[slice];
++    struct v4l2_ctrl_hevc_decode_params *decode_params = &controls->decode_params;
++    const SliceHeader *sh = &h->sh;
++    const RefPicList *rpl;
++    int i;
++
++    *slice_params = (struct v4l2_ctrl_hevc_slice_params) {
++        /* the whole slice segment NAL unit, and where its data starts in it */
++        .bit_size = size * 8,
++        .data_byte_offset = raw_data_offset(buffer, size, sh->data_offset),
++        .num_entry_point_offsets = sh->num_entry_point_offsets,
++
++        /* ISO/IEC 23008-2, ITU-T Rec. H.265: NAL unit header */
++        .nal_unit_type = h->nal_unit_type,
++        .nuh_temporal_id_plus1 = h->temporal_id + 1,
++
++        /* ISO/IEC 23008-2, ITU-T Rec. H.265: General slice segment header */
++        .slice_type = sh->slice_type,
++        .colour_plane_id = sh->colour_plane_id,
++        .slice_pic_order_cnt = sh->poc,
++        .num_ref_idx_l0_active_minus1 = sh->nb_refs[L0] ? sh->nb_refs[L0] - 1 : 0,
++        .num_ref_idx_l1_active_minus1 = sh->nb_refs[L1] ? sh->nb_refs[L1] - 1 : 0,
++        .collocated_ref_idx = sh->slice_temporal_mvp_enabled_flag ?
++                              sh->collocated_ref_idx : 0,
++        .five_minus_max_num_merge_cand = sh->slice_type == HEVC_SLICE_I ?
++                                         0 : 5 - sh->max_num_merge_cand,
++        .slice_qp_delta = sh->slice_qp_delta,
++        .slice_cb_qp_offset = sh->slice_cb_qp_offset,
++        .slice_cr_qp_offset = sh->slice_cr_qp_offset,
++        .slice_act_y_qp_offset = 0,
++        .slice_act_cb_qp_offset = 0,
++        .slice_act_cr_qp_offset = 0,
++        .slice_beta_offset_div2 = sh->beta_offset / 2,
++        .slice_tc_offset_div2 = sh->tc_offset / 2,
++
++        /* ISO/IEC 23008-2, ITU-T Rec. H.265: Picture timing SEI message */
++        .pic_struct = h->sei.picture_timing.picture_struct,
++
++        /* ISO/IEC 23008-2, ITU-T Rec. H.265: General slice segment header */
++        .slice_segment_addr = sh->slice_segment_addr,
++        .short_term_ref_pic_set_size = sh->short_term_ref_pic_set_size,
++        .long_term_ref_pic_set_size = sh->long_term_ref_pic_set_size,
++    };
++
++    if (sh->slice_sample_adaptive_offset_flag[0])
++        slice_params->flags |= V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_SAO_LUMA;
++
++    if (sh->slice_sample_adaptive_offset_flag[1])
++        slice_params->flags |= V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_SAO_CHROMA;
++
++    if (sh->slice_temporal_mvp_enabled_flag)
++        slice_params->flags |= V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_TEMPORAL_MVP_ENABLED;
++
++    if (sh->mvd_l1_zero_flag)
++        slice_params->flags |= V4L2_HEVC_SLICE_PARAMS_FLAG_MVD_L1_ZERO;
++
++    if (sh->cabac_init_flag)
++        slice_params->flags |= V4L2_HEVC_SLICE_PARAMS_FLAG_CABAC_INIT;
++
++    if (sh->collocated_list == L0)
++        slice_params->flags |= V4L2_HEVC_SLICE_PARAMS_FLAG_COLLOCATED_FROM_L0;
++
++    if (sh->use_integer_mv_flag)
++        slice_params->flags |= V4L2_HEVC_SLICE_PARAMS_FLAG_USE_INTEGER_MV;
++
++    if (sh->disable_deblocking_filter_flag)
++        slice_params->flags |= V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_DEBLOCKING_FILTER_DISABLED;
++
++    if (sh->slice_loop_filter_across_slices_enabled_flag)
++        slice_params->flags |= V4L2_HEVC_SLICE_PARAMS_FLAG_SLICE_LOOP_FILTER_ACROSS_SLICES_ENABLED;
++
++    if (sh->dependent_slice_segment_flag)
++        slice_params->flags |= V4L2_HEVC_SLICE_PARAMS_FLAG_DEPENDENT_SLICE_SEGMENT;
++
++    if (sh->slice_type != HEVC_SLICE_I) {
++        rpl = &h->cur_frame->refPicList[0];
++        for (i = 0; i < rpl->nb_refs && i < V4L2_HEVC_DPB_ENTRIES_NUM_MAX; i++)
++            slice_params->ref_idx_l0[i] = get_ref_pic_index(h, rpl->ref[i], decode_params);
++    }
++
++    if (sh->slice_type == HEVC_SLICE_B) {
++        rpl = &h->cur_frame->refPicList[1];
++        for (i = 0; i < rpl->nb_refs && i < V4L2_HEVC_DPB_ENTRIES_NUM_MAX; i++)
++            slice_params->ref_idx_l1[i] = get_ref_pic_index(h, rpl->ref[i], decode_params);
++    }
++
++    fill_pred_weight_table(&slice_params->pred_weight_table, h);
++
++    if (controls->num_entry_point_offsets + sh->num_entry_point_offsets > SFAVD_HEVC_MAX_ENTRY_POINTS) {
++        /* the driver reads them for tiles only; without tiles they may be left out */
++        if (h->pps->tiles_enabled_flag)
++            return AVERROR(ENOSYS);
++        return 0;
++    }
++    if (controls->allocated_entry_point_offsets < controls->num_entry_point_offsets + sh->num_entry_point_offsets) {
++        void *p = av_realloc_array(controls->entry_point_offsets, SFAVD_HEVC_MAX_ENTRY_POINTS,
++                                   sizeof(*controls->entry_point_offsets));
++        if (!p)
++            return AVERROR(ENOMEM);
++        controls->entry_point_offsets = p;
++        controls->allocated_entry_point_offsets = SFAVD_HEVC_MAX_ENTRY_POINTS;
++    }
++    for (i = 0; i < sh->num_entry_point_offsets; i++)
++        controls->entry_point_offsets[controls->num_entry_point_offsets + i] = sh->entry_point_offset[i];
++    controls->num_entry_point_offsets += sh->num_entry_point_offsets;
++
++    return 0;
++}
++
++static void fill_sps(struct v4l2_ctrl_hevc_sps *ctrl, const HEVCPPS *pps)
++{
++    const HEVCSPS *sps = pps->sps;
++
++    /* ISO/IEC 23008-2, ITU-T Rec. H.265: Sequence parameter set */
++    *ctrl = (struct v4l2_ctrl_hevc_sps) {
++        .video_parameter_set_id = sps->vps_id,
++        .seq_parameter_set_id = pps->sps_id,
++        .pic_width_in_luma_samples = sps->width,
++        .pic_height_in_luma_samples = sps->height,
++        .bit_depth_luma_minus8 = sps->bit_depth - 8,
++        .bit_depth_chroma_minus8 = sps->bit_depth_chroma - 8,
++        .log2_max_pic_order_cnt_lsb_minus4 = sps->log2_max_poc_lsb - 4,
++        .sps_max_dec_pic_buffering_minus1 =
++            sps->temporal_layer[sps->max_sub_layers - 1].max_dec_pic_buffering - 1,
++        .sps_max_num_reorder_pics =
++            sps->temporal_layer[sps->max_sub_layers - 1].num_reorder_pics,
++        .sps_max_latency_increase_plus1 =
++            sps->temporal_layer[sps->max_sub_layers - 1].max_latency_increase + 1,
++        .log2_min_luma_coding_block_size_minus3 = sps->log2_min_cb_size - 3,
++        .log2_diff_max_min_luma_coding_block_size =
++            sps->log2_diff_max_min_coding_block_size,
++        .log2_min_luma_transform_block_size_minus2 = sps->log2_min_tb_size - 2,
++        .log2_diff_max_min_luma_transform_block_size =
++            sps->log2_max_trafo_size - sps->log2_min_tb_size,
++        .max_transform_hierarchy_depth_inter = sps->max_transform_hierarchy_depth_inter,
++        .max_transform_hierarchy_depth_intra = sps->max_transform_hierarchy_depth_intra,
++        .pcm_sample_bit_depth_luma_minus1 = sps->pcm.bit_depth - 1,
++        .pcm_sample_bit_depth_chroma_minus1 = sps->pcm.bit_depth_chroma - 1,
++        .log2_min_pcm_luma_coding_block_size_minus3 = sps->pcm.log2_min_pcm_cb_size - 3,
++        .log2_diff_max_min_pcm_luma_coding_block_size =
++            sps->pcm.log2_max_pcm_cb_size - sps->pcm.log2_min_pcm_cb_size,
++        .num_short_term_ref_pic_sets = sps->nb_st_rps,
++        .num_long_term_ref_pics_sps = sps->num_long_term_ref_pics_sps,
++        .chroma_format_idc = sps->chroma_format_idc,
++        .sps_max_sub_layers_minus1 = sps->max_sub_layers - 1,
++    };
++
++    if (sps->separate_colour_plane)
++        ctrl->flags |= V4L2_HEVC_SPS_FLAG_SEPARATE_COLOUR_PLANE;
++
++    if (sps->scaling_list_enabled)
++        ctrl->flags |= V4L2_HEVC_SPS_FLAG_SCALING_LIST_ENABLED;
++
++    if (sps->amp_enabled)
++        ctrl->flags |= V4L2_HEVC_SPS_FLAG_AMP_ENABLED;
++
++    if (sps->sao_enabled)
++        ctrl->flags |= V4L2_HEVC_SPS_FLAG_SAMPLE_ADAPTIVE_OFFSET;
++
++    if (sps->pcm_enabled)
++        ctrl->flags |= V4L2_HEVC_SPS_FLAG_PCM_ENABLED;
++
++    if (sps->pcm_loop_filter_disabled)
++        ctrl->flags |= V4L2_HEVC_SPS_FLAG_PCM_LOOP_FILTER_DISABLED;
++
++    if (sps->long_term_ref_pics_present)
++        ctrl->flags |= V4L2_HEVC_SPS_FLAG_LONG_TERM_REF_PICS_PRESENT;
++
++    if (sps->temporal_mvp_enabled)
++        ctrl->flags |= V4L2_HEVC_SPS_FLAG_SPS_TEMPORAL_MVP_ENABLED;
++
++    if (sps->strong_intra_smoothing_enabled)
++        ctrl->flags |= V4L2_HEVC_SPS_FLAG_STRONG_INTRA_SMOOTHING_ENABLED;
++}
++
++static int sfavd_hevc_start_frame(AVCodecContext *avctx,
++                                  av_unused const AVBufferRef *buf_ref,
++                                  av_unused const uint8_t *buffer,
++                                  av_unused uint32_t size)
++{
++    const HEVCContext *h = avctx->priv_data;
++    const HEVCPPS *pps = h->pps;
++    const HEVCSPS *sps = pps->sps;
++    SFAVDControlsHEVC *controls = h->cur_frame->hwaccel_picture_private;
++    const SliceHeader *sh = &h->sh;
++    const ScalingList *sl = pps->scaling_list_data_present_flag ?
++                            &pps->scaling_list :
++                            sps->scaling_list_enabled ?
++                            &sps->scaling_list : NULL;
++
++    ff_sfavd_start_frame(avctx, h->cur_frame->f);
++
++    fill_sps(&controls->sps, pps);
++    fill_decode_params(&controls->decode_params, h);
++
++    memset(&controls->scaling_matrix, 0, sizeof(controls->scaling_matrix));
++    if (sl) {
++        for (int i = 0; i < 6; i++) {
++            for (int j = 0; j < 16; j++)
++                controls->scaling_matrix.scaling_list_4x4[i][j] = sl->sl[0][i][j];
++            for (int j = 0; j < 64; j++) {
++                controls->scaling_matrix.scaling_list_8x8[i][j]   = sl->sl[1][i][j];
++                controls->scaling_matrix.scaling_list_16x16[i][j] = sl->sl[2][i][j];
++                if (i < 2)
++                    controls->scaling_matrix.scaling_list_32x32[i][j] = sl->sl[3][i * 3][j];
++            }
++            controls->scaling_matrix.scaling_list_dc_coef_16x16[i] = sl->sl_dc[0][i];
++            if (i < 2)
++                controls->scaling_matrix.scaling_list_dc_coef_32x32[i] = sl->sl_dc[1][i * 3];
++        }
++    }
++
++    /* ISO/IEC 23008-2, ITU-T Rec. H.265: Picture parameter set */
++    controls->pps = (struct v4l2_ctrl_hevc_pps) {
++        .pic_parameter_set_id = sh->pps_id,
++        .num_extra_slice_header_bits = pps->num_extra_slice_header_bits,
++        .num_ref_idx_l0_default_active_minus1 = pps->num_ref_idx_l0_default_active - 1,
++        .num_ref_idx_l1_default_active_minus1 = pps->num_ref_idx_l1_default_active - 1,
++        .init_qp_minus26 = pps->pic_init_qp_minus26,
++        .diff_cu_qp_delta_depth = pps->diff_cu_qp_delta_depth,
++        .pps_cb_qp_offset = pps->cb_qp_offset,
++        .pps_cr_qp_offset = pps->cr_qp_offset,
++        .pps_beta_offset_div2 = pps->beta_offset / 2,
++        .pps_tc_offset_div2 = pps->tc_offset / 2,
++        .log2_parallel_merge_level_minus2 = pps->log2_parallel_merge_level - 2,
++    };
++
++    if (pps->dependent_slice_segments_enabled_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_DEPENDENT_SLICE_SEGMENT_ENABLED;
++
++    if (pps->output_flag_present_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_OUTPUT_FLAG_PRESENT;
++
++    if (pps->sign_data_hiding_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_SIGN_DATA_HIDING_ENABLED;
++
++    if (pps->cabac_init_present_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_CABAC_INIT_PRESENT;
++
++    if (pps->constrained_intra_pred_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_CONSTRAINED_INTRA_PRED;
++
++    if (pps->transform_skip_enabled_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_TRANSFORM_SKIP_ENABLED;
++
++    if (pps->cu_qp_delta_enabled_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_CU_QP_DELTA_ENABLED;
++
++    if (pps->pic_slice_level_chroma_qp_offsets_present_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_PPS_SLICE_CHROMA_QP_OFFSETS_PRESENT;
++
++    if (pps->weighted_pred_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_WEIGHTED_PRED;
++
++    if (pps->weighted_bipred_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_WEIGHTED_BIPRED;
++
++    if (pps->transquant_bypass_enable_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_TRANSQUANT_BYPASS_ENABLED;
++
++    if (pps->tiles_enabled_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_TILES_ENABLED;
++
++    if (pps->entropy_coding_sync_enabled_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_ENTROPY_CODING_SYNC_ENABLED;
++
++    if (pps->loop_filter_across_tiles_enabled_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_LOOP_FILTER_ACROSS_TILES_ENABLED;
++
++    if (pps->seq_loop_filter_across_slices_enabled_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_PPS_LOOP_FILTER_ACROSS_SLICES_ENABLED;
++
++    if (pps->deblocking_filter_override_enabled_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_DEBLOCKING_FILTER_OVERRIDE_ENABLED;
++
++    if (pps->disable_dbf)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_PPS_DISABLE_DEBLOCKING_FILTER;
++
++    if (pps->lists_modification_present_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_LISTS_MODIFICATION_PRESENT;
++
++    if (pps->slice_header_extension_present_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_SLICE_SEGMENT_HEADER_EXTENSION_PRESENT;
++
++    if (pps->deblocking_filter_control_present_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_DEBLOCKING_FILTER_CONTROL_PRESENT;
++
++    if (pps->uniform_spacing_flag)
++        controls->pps.flags |= V4L2_HEVC_PPS_FLAG_UNIFORM_SPACING;
++
++    if (pps->tiles_enabled_flag) {
++        controls->pps.num_tile_columns_minus1 = pps->num_tile_columns - 1;
++        controls->pps.num_tile_rows_minus1 = pps->num_tile_rows - 1;
++
++        for (int i = 0; i < pps->num_tile_columns && i < FF_ARRAY_ELEMS(controls->pps.column_width_minus1); i++)
++            controls->pps.column_width_minus1[i] = pps->column_width[i] - 1;
++
++        for (int i = 0; i < pps->num_tile_rows && i < FF_ARRAY_ELEMS(controls->pps.row_height_minus1); i++)
++            controls->pps.row_height_minus1[i] = pps->row_height[i] - 1;
++    }
++
++    controls->num_slice_params = 0;
++    controls->num_entry_point_offsets = 0;
++
++    return 0;
++}
++
++static int sfavd_hevc_decode_slice(AVCodecContext *avctx,
++                                   const uint8_t *buffer, uint32_t size)
++{
++    const HEVCContext *h = avctx->priv_data;
++    SFAVDControlsHEVC *controls = h->cur_frame->hwaccel_picture_private;
++    int ret, slice = controls->num_slice_params;
++
++    if (slice >= SFAVD_HEVC_MAX_SLICES)
++        return AVERROR(ENOSYS);
++
++    /* without the zero bytes that may follow a NAL unit in a byte stream (see sfavd_h264.c) */
++    while (size > 2 && buffer[size - 1] == 0)
++        size--;
++
++    if (controls->allocated_slice_params < slice + 1) {
++        int slices = controls->allocated_slice_params ? controls->allocated_slice_params * 2 : 4;
++        void *p = av_realloc_array(controls->slice_params, slices, sizeof(*controls->slice_params));
++        if (!p)
++            return AVERROR(ENOMEM);
++        controls->slice_params = p;
++        controls->allocated_slice_params = slices;
++    }
++
++    ret = fill_slice_params(controls, slice, buffer, size, h);
++    if (ret)
++        return ret;
++
++    ret = ff_sfavd_append(avctx, buffer, size);
++    if (ret)
++        return ret;
++
++    controls->num_slice_params++;
++    return 0;
++}
++
++static int sfavd_hevc_end_frame(AVCodecContext *avctx)
++{
++    const HEVCContext *h = avctx->priv_data;
++    SFAVDControlsHEVC *controls = h->cur_frame->hwaccel_picture_private;
++    struct sfavd_ctrl control[6];
++    int count = 0;
++
++    if (!controls->num_slice_params)
++        return AVERROR_INVALIDDATA;
++
++    control[count++] = (struct sfavd_ctrl) {
++        .id = V4L2_CID_STATELESS_HEVC_SPS,
++        .ptr = (uintptr_t)&controls->sps,
++        .size = sizeof(controls->sps),
++    };
++    control[count++] = (struct sfavd_ctrl) {
++        .id = V4L2_CID_STATELESS_HEVC_PPS,
++        .ptr = (uintptr_t)&controls->pps,
++        .size = sizeof(controls->pps),
++    };
++    control[count++] = (struct sfavd_ctrl) {
++        .id = V4L2_CID_STATELESS_HEVC_DECODE_PARAMS,
++        .ptr = (uintptr_t)&controls->decode_params,
++        .size = sizeof(controls->decode_params),
++    };
++    control[count++] = (struct sfavd_ctrl) {
++        .id = V4L2_CID_STATELESS_HEVC_SCALING_MATRIX,
++        .ptr = (uintptr_t)&controls->scaling_matrix,
++        .size = sizeof(controls->scaling_matrix),
++    };
++    control[count++] = (struct sfavd_ctrl) {
++        .id = V4L2_CID_STATELESS_HEVC_SLICE_PARAMS,
++        .ptr = (uintptr_t)controls->slice_params,
++        .size = sizeof(*controls->slice_params) * controls->num_slice_params,
++    };
++    if (controls->num_entry_point_offsets) {
++        control[count++] = (struct sfavd_ctrl) {
++            .id = V4L2_CID_STATELESS_HEVC_ENTRY_POINT_OFFSETS,
++            .ptr = (uintptr_t)controls->entry_point_offsets,
++            .size = sizeof(*controls->entry_point_offsets) * controls->num_entry_point_offsets,
++        };
++    }
++
++    return ff_sfavd_decode(avctx, h->cur_frame->f, control, count, 0);
++}
++
++static void sfavd_hevc_free_frame_priv(AVRefStructOpaque hwctx, void *data)
++{
++    SFAVDControlsHEVC *controls = data;
++
++    av_freep(&controls->slice_params);
++    av_freep(&controls->entry_point_offsets);
++}
++
++static int sfavd_hevc_frame_params(AVCodecContext *avctx,
++                                   AVBufferRef *hw_frames_ctx)
++{
++    const HEVCContext *h = avctx->priv_data;
++    const HEVCPPS *pps = h ? h->pps : NULL;
++    const HEVCSPS *sps = pps ? pps->sps : NULL;
++    struct v4l2_ctrl_hevc_sps ctrl;
++
++    if (!sps)
++        return AVERROR(EINVAL);
++    fill_sps(&ctrl, pps);
++    return ff_sfavd_frame_params(avctx, hw_frames_ctx, SFAVD_CODEC_HEVC,
++                                 V4L2_CID_STATELESS_HEVC_SPS, &ctrl, sizeof(ctrl),
++                                 sps->temporal_layer[sps->max_sub_layers - 1].max_dec_pic_buffering);
++}
++
++const FFHWAccel ff_hevc_sfavd_hwaccel = {
++    .p.name             = "hevc_sfavd",
++    .p.type             = AVMEDIA_TYPE_VIDEO,
++    .p.id               = AV_CODEC_ID_HEVC,
++    .p.pix_fmt          = AV_PIX_FMT_SFAVD,
++    .start_frame        = sfavd_hevc_start_frame,
++    .decode_slice       = sfavd_hevc_decode_slice,
++    .end_frame          = sfavd_hevc_end_frame,
++    .free_frame_priv    = sfavd_hevc_free_frame_priv,
++    .frame_priv_data_size = sizeof(SFAVDControlsHEVC),
++    .init               = ff_sfavd_init,
++    .uninit             = ff_sfavd_uninit,
++    .priv_data_size     = sizeof(SFAVDContext),
++    .frame_params       = sfavd_hevc_frame_params,
++};
+diff -ruN a/libavcodec/sfavd_vp9.c b/libavcodec/sfavd_vp9.c
+--- a/libavcodec/sfavd_vp9.c	1969-12-31 16:00:00.000000000 -0800
++++ b/libavcodec/sfavd_vp9.c	2026-11-12 00:37:20.211809478 -0800
+@@ -0,0 +1,479 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * VP9 through the Apple Video Decoder. The control filling (frame header and the
++ * forward probability updates of the compressed header) follows the V4L2 request API
++ * hwaccel for VP9 (v4l2_request_vp9.c by Boris Brezillon, Jonas Karlman and others).
++ */
++
++#include "config.h"
++
++#include "hwaccel_internal.h"
++#include "hwconfig.h"
++#include "internal.h"
++#include "sfavd.h"
++#include "vp89_rac.h"
++#include "vp9dec.h"
++
++typedef struct SFAVDControlsVP9 {
++    struct v4l2_ctrl_vp9_frame frame;
++    struct v4l2_ctrl_vp9_compressed_hdr compressed_hdr;
++} SFAVDControlsVP9;
++
++// differential forward probability updates
++static int read_prob_delta(VPXRangeCoder *c)
++{
++    static const uint8_t inv_map_table[255] = {
++          7,  20,  33,  46,  59,  72,  85,  98, 111, 124, 137, 150, 163, 176,
++        189, 202, 215, 228, 241, 254,   1,   2,   3,   4,   5,   6,   8,   9,
++         10,  11,  12,  13,  14,  15,  16,  17,  18,  19,  21,  22,  23,  24,
++         25,  26,  27,  28,  29,  30,  31,  32,  34,  35,  36,  37,  38,  39,
++         40,  41,  42,  43,  44,  45,  47,  48,  49,  50,  51,  52,  53,  54,
++         55,  56,  57,  58,  60,  61,  62,  63,  64,  65,  66,  67,  68,  69,
++         70,  71,  73,  74,  75,  76,  77,  78,  79,  80,  81,  82,  83,  84,
++         86,  87,  88,  89,  90,  91,  92,  93,  94,  95,  96,  97,  99, 100,
++        101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 112, 113, 114, 115,
++        116, 117, 118, 119, 120, 121, 122, 123, 125, 126, 127, 128, 129, 130,
++        131, 132, 133, 134, 135, 136, 138, 139, 140, 141, 142, 143, 144, 145,
++        146, 147, 148, 149, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160,
++        161, 162, 164, 165, 166, 167, 168, 169, 170, 171, 172, 173, 174, 175,
++        177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187, 188, 190, 191,
++        192, 193, 194, 195, 196, 197, 198, 199, 200, 201, 203, 204, 205, 206,
++        207, 208, 209, 210, 211, 212, 213, 214, 216, 217, 218, 219, 220, 221,
++        222, 223, 224, 225, 226, 227, 229, 230, 231, 232, 233, 234, 235, 236,
++        237, 238, 239, 240, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251,
++        252, 253, 253,
++    };
++    int d;
++
++    /* This code is trying to do a differential probability update. For a
++     * current probability A in the range [1, 255], the difference to a new
++     * probability of any value can be expressed differentially as 1-A, 255-A
++     * where some part of this (absolute range) exists both in positive as
++     * well as the negative part, whereas another part only exists in one
++     * half. We're trying to code this shared part differentially, i.e.
++     * times two where the value of the lowest bit specifies the sign, and
++     * the single part is then coded on top of this. This absolute difference
++     * then again has a value of [0, 254], but a bigger value in this range
++     * indicates that we're further away from the original value A, so we
++     * can code this as a VLC code, since higher values are increasingly
++     * unlikely. The first 20 values in inv_map_table[] allow 'cheap, rough'
++     * updates vs. the 'fine, exact' updates further down the range, which
++     * adds one extra dimension to this differential update model. */
++
++    if (!vp89_rac_get(c)) {
++        d = vp89_rac_get_uint(c, 4) + 0;
++    } else if (!vp89_rac_get(c)) {
++        d = vp89_rac_get_uint(c, 4) + 16;
++    } else if (!vp89_rac_get(c)) {
++        d = vp89_rac_get_uint(c, 5) + 32;
++    } else {
++        d = vp89_rac_get_uint(c, 7);
++        if (d >= 65)
++            d = (d << 1) - 65 + vp89_rac_get(c);
++        d += 64;
++        av_assert2(d < FF_ARRAY_ELEMS(inv_map_table));
++    }
++
++    return inv_map_table[d];
++}
++
++static void fill_compressed_hdr(struct v4l2_ctrl_vp9_compressed_hdr *ctrl,
++                                const uint8_t *buffer, uint32_t size,
++                                AVCodecContext *avctx)
++{
++    const VP9Context *s = avctx->priv_data;
++    enum CompPredMode comppredmode;
++    int ret, i, j, k, l, m, n;
++    VPXRangeCoder c;
++
++    ret = ff_vpx_init_range_decoder(&c, buffer + s->s.h.uncompressed_header_size,
++                                    s->s.h.compressed_header_size);
++    if (ret < 0)
++        return;
++
++    if (vpx_rac_get_prob_branchy(&c, 128)) // marker bit
++        return;
++
++    // txfm updates
++    if (s->s.h.lossless) {
++        ctrl->tx_mode = V4L2_VP9_TX_MODE_ONLY_4X4;
++    } else {
++        ctrl->tx_mode = vp89_rac_get_uint(&c, 2);
++        if (ctrl->tx_mode == V4L2_VP9_TX_MODE_ALLOW_32X32)
++            ctrl->tx_mode += vp89_rac_get(&c);
++
++        if (ctrl->tx_mode == V4L2_VP9_TX_MODE_SELECT) {
++            for (i = 0; i < 2; i++)
++                if (vpx_rac_get_prob_branchy(&c, 252))
++                    ctrl->tx8[i][0] = read_prob_delta(&c);
++            for (i = 0; i < 2; i++)
++                for (j = 0; j < 2; j++)
++                    if (vpx_rac_get_prob_branchy(&c, 252))
++                        ctrl->tx16[i][j] = read_prob_delta(&c);
++            for (i = 0; i < 2; i++)
++                for (j = 0; j < 3; j++)
++                    if (vpx_rac_get_prob_branchy(&c, 252))
++                        ctrl->tx32[i][j] = read_prob_delta(&c);
++        }
++    }
++
++    // coef updates
++    for (i = 0; i < 4; i++) {
++        if (vp89_rac_get(&c)) {
++            for (j = 0; j < 2; j++)
++                for (k = 0; k < 2; k++)
++                    for (l = 0; l < 6; l++)
++                        for (m = 0; m < 6; m++) {
++                            if (m >= 3 && l == 0) // dc only has 3 pt
++                                break;
++                            for (n = 0; n < 3; n++)
++                                if (vpx_rac_get_prob_branchy(&c, 252))
++                                    ctrl->coef[i][j][k][l][m][n] =
++                                                            read_prob_delta(&c);
++                        }
++        }
++        if (ctrl->tx_mode == i)
++            break;
++    }
++
++    // mode updates
++    for (i = 0; i < 3; i++)
++        if (vpx_rac_get_prob_branchy(&c, 252))
++            ctrl->skip[i] = read_prob_delta(&c);
++    if (!s->s.h.keyframe && !s->s.h.intraonly) {
++        for (i = 0; i < 7; i++)
++            for (j = 0; j < 3; j++)
++                if (vpx_rac_get_prob_branchy(&c, 252))
++                    ctrl->inter_mode[i][j] = read_prob_delta(&c);
++
++        if (s->s.h.filtermode == FILTER_SWITCHABLE)
++            for (i = 0; i < 4; i++)
++                for (j = 0; j < 2; j++)
++                    if (vpx_rac_get_prob_branchy(&c, 252))
++                        ctrl->interp_filter[i][j] = read_prob_delta(&c);
++
++        for (i = 0; i < 4; i++)
++            if (vpx_rac_get_prob_branchy(&c, 252))
++                ctrl->is_inter[i] = read_prob_delta(&c);
++
++        if (s->s.h.allowcompinter) {
++            comppredmode = vp89_rac_get(&c);
++            if (comppredmode)
++                comppredmode += vp89_rac_get(&c);
++            if (comppredmode == PRED_SWITCHABLE)
++                for (i = 0; i < 5; i++)
++                    if (vpx_rac_get_prob_branchy(&c, 252))
++                        ctrl->comp_mode[i] = read_prob_delta(&c);
++        } else {
++            comppredmode = PRED_SINGLEREF;
++        }
++
++        if (comppredmode != PRED_COMPREF) {
++            for (i = 0; i < 5; i++) {
++                if (vpx_rac_get_prob_branchy(&c, 252))
++                    ctrl->single_ref[i][0] = read_prob_delta(&c);
++                if (vpx_rac_get_prob_branchy(&c, 252))
++                    ctrl->single_ref[i][1] = read_prob_delta(&c);
++            }
++        }
++
++        if (comppredmode != PRED_SINGLEREF) {
++            for (i = 0; i < 5; i++)
++                if (vpx_rac_get_prob_branchy(&c, 252))
++                    ctrl->comp_ref[i] = read_prob_delta(&c);
++        }
++
++        for (i = 0; i < 4; i++)
++            for (j = 0; j < 9; j++)
++                if (vpx_rac_get_prob_branchy(&c, 252))
++                    ctrl->y_mode[i][j] = read_prob_delta(&c);
++
++        for (i = 0; i < 4; i++)
++            for (j = 0; j < 4; j++)
++                for (k = 0; k < 3; k++)
++                    if (vpx_rac_get_prob_branchy(&c, 252))
++                        ctrl->partition[(i * 4) + j][k] = read_prob_delta(&c);
++
++        // mv fields
++        for (i = 0; i < 3; i++)
++            if (vpx_rac_get_prob_branchy(&c, 252))
++                ctrl->mv.joint[i] = (vp89_rac_get_uint(&c, 7) << 1) | 1;
++
++        for (i = 0; i < 2; i++) {
++            if (vpx_rac_get_prob_branchy(&c, 252))
++                ctrl->mv.sign[i] = (vp89_rac_get_uint(&c, 7) << 1) | 1;
++
++            for (j = 0; j < 10; j++)
++                if (vpx_rac_get_prob_branchy(&c, 252))
++                    ctrl->mv.classes[i][j] = (vp89_rac_get_uint(&c, 7) << 1) | 1;
++
++            if (vpx_rac_get_prob_branchy(&c, 252))
++                ctrl->mv.class0_bit[i] = (vp89_rac_get_uint(&c, 7) << 1) | 1;
++
++            for (j = 0; j < 10; j++)
++                if (vpx_rac_get_prob_branchy(&c, 252))
++                    ctrl->mv.bits[i][j] = (vp89_rac_get_uint(&c, 7) << 1) | 1;
++        }
++
++        for (i = 0; i < 2; i++) {
++            for (j = 0; j < 2; j++)
++                for (k = 0; k < 3; k++)
++                    if (vpx_rac_get_prob_branchy(&c, 252))
++                        ctrl->mv.class0_fr[i][j][k] =
++                                            (vp89_rac_get_uint(&c, 7) << 1) | 1;
++
++            for (j = 0; j < 3; j++)
++                if (vpx_rac_get_prob_branchy(&c, 252))
++                    ctrl->mv.fr[i][j] = (vp89_rac_get_uint(&c, 7) << 1) | 1;
++        }
++
++        if (s->s.h.highprecisionmvs) {
++            for (i = 0; i < 2; i++) {
++                if (vpx_rac_get_prob_branchy(&c, 252))
++                    ctrl->mv.class0_hp[i] = (vp89_rac_get_uint(&c, 7) << 1) | 1;
++
++                if (vpx_rac_get_prob_branchy(&c, 252))
++                    ctrl->mv.hp[i] = (vp89_rac_get_uint(&c, 7) << 1) | 1;
++            }
++        }
++    }
++
++    memcpy(ctrl->uv_mode, s->prob.p.uv_mode, sizeof(ctrl->uv_mode));
++}
++
++static void fill_frame(struct v4l2_ctrl_vp9_frame *ctrl, AVCodecContext *avctx)
++{
++    const VP9Context *s = avctx->priv_data;
++    AVFrame *ref;
++    int i;
++
++    *ctrl = (struct v4l2_ctrl_vp9_frame) {
++        .lf = {
++            .level = s->s.h.filter.level,
++            .sharpness = s->s.h.filter.sharpness,
++        },
++
++        .quant = {
++            .base_q_idx = s->s.h.yac_qi,
++            .delta_q_y_dc = s->s.h.ydc_qdelta,
++            .delta_q_uv_dc = s->s.h.uvdc_qdelta,
++            .delta_q_uv_ac = s->s.h.uvac_qdelta,
++        },
++
++        .compressed_header_size = s->s.h.compressed_header_size,
++        .uncompressed_header_size = s->s.h.uncompressed_header_size,
++        .frame_width_minus_1 = avctx->width - 1,
++        .frame_height_minus_1 = avctx->height - 1,
++        .render_width_minus_1 = s->w - 1,
++        .render_height_minus_1 = s->h - 1,
++        .reset_frame_context = s->s.h.resetctx > 0 ? s->s.h.resetctx - 1 : 0,
++        .frame_context_idx = s->s.h.framectxid,
++        .profile = s->s.h.profile,
++        .bit_depth = s->s.h.bpp,
++        .interpolation_filter = s->s.h.filtermode ^ (s->s.h.filtermode <= 1),
++        .tile_cols_log2 = s->s.h.tiling.log2_tile_cols,
++        .tile_rows_log2 = s->s.h.tiling.log2_tile_rows,
++        .reference_mode = s->s.h.comppredmode,
++    };
++
++    for (i = 0; i < 4; i++)
++        ctrl->lf.ref_deltas[i] = s->s.h.lf_delta.ref[i];
++
++    for (i = 0; i < 2; i++)
++        ctrl->lf.mode_deltas[i] = s->s.h.lf_delta.mode[i];
++
++    if (s->s.h.lf_delta.enabled)
++        ctrl->lf.flags |= V4L2_VP9_LOOP_FILTER_FLAG_DELTA_ENABLED;
++
++    if (s->s.h.lf_delta.updated)
++        ctrl->lf.flags |= V4L2_VP9_LOOP_FILTER_FLAG_DELTA_UPDATE;
++
++    for (i = 0; i < 8; i++) {
++        if (s->s.h.segmentation.feat[i].q_enabled) {
++            ctrl->seg.feature_data[i][V4L2_VP9_SEG_LVL_ALT_Q] =
++                                            s->s.h.segmentation.feat[i].q_val;
++            ctrl->seg.feature_enabled[i] |= 1 << V4L2_VP9_SEG_LVL_ALT_Q;
++        }
++
++        if (s->s.h.segmentation.feat[i].lf_enabled) {
++            ctrl->seg.feature_data[i][V4L2_VP9_SEG_LVL_ALT_L] =
++                                            s->s.h.segmentation.feat[i].lf_val;
++            ctrl->seg.feature_enabled[i] |= 1 << V4L2_VP9_SEG_LVL_ALT_L;
++        }
++
++        if (s->s.h.segmentation.feat[i].ref_enabled) {
++            ctrl->seg.feature_data[i][V4L2_VP9_SEG_LVL_REF_FRAME] =
++                                            s->s.h.segmentation.feat[i].ref_val;
++            ctrl->seg.feature_enabled[i] |= 1 << V4L2_VP9_SEG_LVL_REF_FRAME;
++        }
++
++        if (s->s.h.segmentation.feat[i].skip_enabled)
++            ctrl->seg.feature_enabled[i] |= 1 << V4L2_VP9_SEG_LVL_SKIP;
++    }
++
++    for (i = 0; i < 7; i++)
++        ctrl->seg.tree_probs[i] = s->s.h.segmentation.prob[i];
++
++    if (s->s.h.segmentation.temporal) {
++        for (i = 0; i < 3; i++)
++            ctrl->seg.pred_probs[i] = s->s.h.segmentation.pred_prob[i];
++    } else {
++        memset(ctrl->seg.pred_probs, 255, sizeof(ctrl->seg.pred_probs));
++    }
++
++    if (s->s.h.segmentation.enabled)
++        ctrl->seg.flags |= V4L2_VP9_SEGMENTATION_FLAG_ENABLED;
++
++    if (s->s.h.segmentation.update_map)
++        ctrl->seg.flags |= V4L2_VP9_SEGMENTATION_FLAG_UPDATE_MAP;
++
++    if (s->s.h.segmentation.temporal)
++        ctrl->seg.flags |= V4L2_VP9_SEGMENTATION_FLAG_TEMPORAL_UPDATE;
++
++    if (s->frame_header->segmentation_update_data)
++        ctrl->seg.flags |= V4L2_VP9_SEGMENTATION_FLAG_UPDATE_DATA;
++
++    if (s->s.h.segmentation.absolute_vals)
++        ctrl->seg.flags |= V4L2_VP9_SEGMENTATION_FLAG_ABS_OR_DELTA_UPDATE;
++
++    if (s->s.h.keyframe)
++        ctrl->flags |= V4L2_VP9_FRAME_FLAG_KEY_FRAME;
++
++    if (!s->s.h.invisible)
++        ctrl->flags |= V4L2_VP9_FRAME_FLAG_SHOW_FRAME;
++
++    if (s->s.h.errorres)
++        ctrl->flags |= V4L2_VP9_FRAME_FLAG_ERROR_RESILIENT;
++
++    if (s->s.h.intraonly)
++        ctrl->flags |= V4L2_VP9_FRAME_FLAG_INTRA_ONLY;
++
++    if (!s->s.h.keyframe && s->s.h.highprecisionmvs)
++        ctrl->flags |= V4L2_VP9_FRAME_FLAG_ALLOW_HIGH_PREC_MV;
++
++    if (s->s.h.refreshctx)
++        ctrl->flags |= V4L2_VP9_FRAME_FLAG_REFRESH_FRAME_CTX;
++
++    if (s->s.h.parallelmode)
++        ctrl->flags |= V4L2_VP9_FRAME_FLAG_PARALLEL_DEC_MODE;
++
++    if (s->ss_h)
++        ctrl->flags |= V4L2_VP9_FRAME_FLAG_X_SUBSAMPLING;
++
++    if (s->ss_v)
++        ctrl->flags |= V4L2_VP9_FRAME_FLAG_Y_SUBSAMPLING;
++
++    if (avctx->color_range == AVCOL_RANGE_JPEG)
++        ctrl->flags |= V4L2_VP9_FRAME_FLAG_COLOR_RANGE_FULL_SWING;
++
++    ref = s->s.refs[s->s.h.refidx[0]].f;
++    if (ref && ref->buf[0])
++        ctrl->last_frame_ts = ff_sfavd_timestamp(ref);
++
++    ref = s->s.refs[s->s.h.refidx[1]].f;
++    if (ref && ref->buf[0])
++        ctrl->golden_frame_ts = ff_sfavd_timestamp(ref);
++
++    ref = s->s.refs[s->s.h.refidx[2]].f;
++    if (ref && ref->buf[0])
++        ctrl->alt_frame_ts = ff_sfavd_timestamp(ref);
++
++    if (s->s.h.signbias[0])
++        ctrl->ref_frame_sign_bias |= V4L2_VP9_SIGN_BIAS_LAST;
++
++    if (s->s.h.signbias[1])
++        ctrl->ref_frame_sign_bias |= V4L2_VP9_SIGN_BIAS_GOLDEN;
++
++    if (s->s.h.signbias[2])
++        ctrl->ref_frame_sign_bias |= V4L2_VP9_SIGN_BIAS_ALT;
++}
++
++static int sfavd_vp9_start_frame(AVCodecContext *avctx,
++                                 av_unused const AVBufferRef *buf_ref,
++                                 const uint8_t *buffer,
++                                 uint32_t size)
++{
++    const VP9SharedContext *h = avctx->priv_data;
++    const VP9Frame *f = &h->frames[CUR_FRAME];
++    SFAVDControlsVP9 *controls = f->hwaccel_picture_private;
++
++    ff_sfavd_start_frame(avctx, f->tf.f);
++
++    fill_frame(&controls->frame, avctx);
++    memset(&controls->compressed_hdr, 0, sizeof(controls->compressed_hdr));
++    fill_compressed_hdr(&controls->compressed_hdr, buffer, size, avctx);
++
++    return 0;
++}
++
++static int sfavd_vp9_decode_slice(AVCodecContext *avctx,
++                                  const uint8_t *buffer, uint32_t size)
++{
++    return ff_sfavd_append(avctx, buffer, size);
++}
++
++static int sfavd_vp9_end_frame(AVCodecContext *avctx)
++{
++    const VP9SharedContext *h = avctx->priv_data;
++    SFAVDControlsVP9 *controls = h->frames[CUR_FRAME].hwaccel_picture_private;
++
++    struct sfavd_ctrl control[] = {
++        {
++            .id = V4L2_CID_STATELESS_VP9_FRAME,
++            .ptr = (uintptr_t)&controls->frame,
++            .size = sizeof(controls->frame),
++        },
++        {
++            .id = V4L2_CID_STATELESS_VP9_COMPRESSED_HDR,
++            .ptr = (uintptr_t)&controls->compressed_hdr,
++            .size = sizeof(controls->compressed_hdr),
++        },
++    };
++
++    return ff_sfavd_decode(avctx, h->frames[CUR_FRAME].tf.f, control, FF_ARRAY_ELEMS(control), 0);
++}
++
++static int sfavd_vp9_frame_params(AVCodecContext *avctx,
++                                  AVBufferRef *hw_frames_ctx)
++{
++    struct v4l2_ctrl_vp9_frame frame;
++
++    if (!avctx->priv_data)
++        return AVERROR(EINVAL);
++    fill_frame(&frame, avctx);
++    /* eight reference slots */
++    return ff_sfavd_frame_params(avctx, hw_frames_ctx, SFAVD_CODEC_VP9,
++                                 V4L2_CID_STATELESS_VP9_FRAME, &frame, sizeof(frame), 8);
++}
++
++const FFHWAccel ff_vp9_sfavd_hwaccel = {
++    .p.name             = "vp9_sfavd",
++    .p.type             = AVMEDIA_TYPE_VIDEO,
++    .p.id               = AV_CODEC_ID_VP9,
++    .p.pix_fmt          = AV_PIX_FMT_SFAVD,
++    .start_frame        = sfavd_vp9_start_frame,
++    .decode_slice       = sfavd_vp9_decode_slice,
++    .end_frame          = sfavd_vp9_end_frame,
++    .frame_priv_data_size = sizeof(SFAVDControlsVP9),
++    .init               = ff_sfavd_init,
++    .uninit             = ff_sfavd_uninit,
++    .priv_data_size     = sizeof(SFAVDContext),
++    .frame_params       = sfavd_vp9_frame_params,
++};
+diff -ruN a/libavcodec/vp9.c b/libavcodec/vp9.c
+--- a/libavcodec/vp9.c	2026-11-12 00:10:07.582801831 -0800
++++ b/libavcodec/vp9.c	2026-11-12 00:37:20.280789716 -0800
+@@ -167,6 +167,7 @@
+ #define HWACCEL_MAX (CONFIG_VP9_DXVA2_HWACCEL + \
+                      CONFIG_VP9_D3D11VA_HWACCEL * 2 + \
+                      CONFIG_VP9_D3D12VA_HWACCEL + \
++                     CONFIG_VP9_SFAVD_HWACCEL + \
+                      CONFIG_VP9_NVDEC_HWACCEL + \
+                      CONFIG_VP9_VAAPI_HWACCEL + \
+                      CONFIG_VP9_VDPAU_HWACCEL + \
+@@ -202,6 +203,10 @@
+ #if CONFIG_VP9_NVDEC_HWACCEL
+             *fmtp++ = AV_PIX_FMT_CUDA;
+ #endif
++#if CONFIG_VP9_SFAVD_HWACCEL
++            if (s->pix_fmt == AV_PIX_FMT_YUV420P)
++                *fmtp++ = AV_PIX_FMT_SFAVD;
++#endif
+ #if CONFIG_VP9_VAAPI_HWACCEL
+             *fmtp++ = AV_PIX_FMT_VAAPI;
+ #endif
+@@ -1951,6 +1956,9 @@
+ #if CONFIG_VP9_NVDEC_HWACCEL
+                                HWACCEL_NVDEC(vp9),
+ #endif
++#if CONFIG_VP9_SFAVD_HWACCEL
++                               HWACCEL_SFAVD(vp9),
++#endif
+ #if CONFIG_VP9_VAAPI_HWACCEL
+                                HWACCEL_VAAPI(vp9),
+ #endif
+diff -ruN a/libavutil/hwcontext.c b/libavutil/hwcontext.c
+--- a/libavutil/hwcontext.c	2026-11-12 00:10:07.710800309 -0800
++++ b/libavutil/hwcontext.c	2026-11-12 00:14:36.216652076 -0800
+@@ -72,6 +72,9 @@
+ #if CONFIG_OHCODEC
+     &ff_hwcontext_type_oh,
+ #endif
++#if CONFIG_SFAVD
++    &ff_hwcontext_type_sfavd,
++#endif
+     NULL,
+ };
+ 
+@@ -88,6 +91,7 @@
+     [AV_HWDEVICE_TYPE_VIDEOTOOLBOX] = "videotoolbox",
+     [AV_HWDEVICE_TYPE_MEDIACODEC] = "mediacodec",
+     [AV_HWDEVICE_TYPE_VULKAN] = "vulkan",
++    [AV_HWDEVICE_TYPE_SFAVD] = "sfavd",
+     [AV_HWDEVICE_TYPE_AMF] = "amf",
+     [AV_HWDEVICE_TYPE_OHCODEC] = "ohcodec",
+ };
+diff -ruN a/libavutil/hwcontext.h b/libavutil/hwcontext.h
+--- a/libavutil/hwcontext.h	2026-11-12 00:10:07.710800309 -0800
++++ b/libavutil/hwcontext.h	2026-11-12 00:14:36.214065082 -0800
+@@ -41,6 +41,7 @@
+     AV_HWDEVICE_TYPE_AMF,
+     /* OpenHarmony Codec device */
+     AV_HWDEVICE_TYPE_OHCODEC,
++    AV_HWDEVICE_TYPE_SFAVD,
+ };
+ 
+ /**
+diff -ruN a/libavutil/hwcontext_internal.h b/libavutil/hwcontext_internal.h
+--- a/libavutil/hwcontext_internal.h	2026-11-12 00:10:07.711800298 -0800
++++ b/libavutil/hwcontext_internal.h	2026-11-12 00:14:36.217070138 -0800
+@@ -154,6 +154,7 @@
+ extern const HWContextType ff_hwcontext_type_cuda;
+ extern const HWContextType ff_hwcontext_type_d3d11va;
+ extern const HWContextType ff_hwcontext_type_d3d12va;
++extern const HWContextType ff_hwcontext_type_sfavd;
+ extern const HWContextType ff_hwcontext_type_drm;
+ extern const HWContextType ff_hwcontext_type_dxva2;
+ extern const HWContextType ff_hwcontext_type_opencl;
+diff -ruN a/libavutil/hwcontext_sfavd.c b/libavutil/hwcontext_sfavd.c
+--- a/libavutil/hwcontext_sfavd.c	1969-12-31 16:00:00.000000000 -0800
++++ b/libavutil/hwcontext_sfavd.c	2026-11-12 00:12:36.087032605 -0800
+@@ -0,0 +1,297 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "config.h"
++
++#include <errno.h>
++#include <string.h>
++
++#include <sfavd/sfavd.h>
++
++#include "avassert.h"
++#include "buffer.h"
++#include "common.h"
++#include "hwcontext.h"
++#include "hwcontext_internal.h"
++#include "hwcontext_sfavd.h"
++#include "imgutils.h"
++#include "mem.h"
++#include "pixdesc.h"
++#include "pixfmt.h"
++
++typedef struct SFAVDFramesPriv {
++    AVPDAVDFramesContext p;
++    int created;
++    /* decoded buffers handed out so far */
++    unsigned next;
++} SFAVDFramesPriv;
++
++static const enum AVPixelFormat supported_sw_formats[] = {
++    AV_PIX_FMT_NV12,
++    AV_PIX_FMT_P010,
++    AV_PIX_FMT_NV16,
++};
++
++static int sfavd_device_create(AVHWDeviceContext *ctx, const char *device,
++                               AVDictionary *opts, int flags)
++{
++    AVPDAVDDeviceContext *hwctx = ctx->hwctx;
++    struct sfavd_info info;
++
++    hwctx->dev = sfavd_open(device);
++    if (!hwctx->dev) {
++        int err = AVERROR(errno);
++        av_log(ctx, AV_LOG_ERROR, "Cannot open the AVD device %s: %s\n",
++               device ? device : "(default)", av_err2str(err));
++        return err;
++    }
++    if (sfavd_info(hwctx->dev, &info) < 0 || info.abi != SFAVD_ABI_VERSION) {
++        av_log(ctx, AV_LOG_ERROR, "The AVD device has another interface version\n");
++        sfavd_close(hwctx->dev);
++        hwctx->dev = NULL;
++        return AVERROR(ENOSYS);
++    }
++    av_log(ctx, AV_LOG_VERBOSE, "AVD: codecs 0x%x, firmware \"%s\"\n",
++           info.caps, info.firmware);
++    return 0;
++}
++
++static void sfavd_device_uninit(AVHWDeviceContext *ctx)
++{
++    AVPDAVDDeviceContext *hwctx = ctx->hwctx;
++
++    if (hwctx->dev)
++        sfavd_close(hwctx->dev);
++    hwctx->dev = NULL;
++}
++
++static int sfavd_frames_get_constraints(AVHWDeviceContext *ctx,
++                                        const void *hwconfig,
++                                        AVHWFramesConstraints *constraints)
++{
++    int i;
++
++    constraints->valid_sw_formats = av_malloc_array(FF_ARRAY_ELEMS(supported_sw_formats) + 1,
++                                                    sizeof(*constraints->valid_sw_formats));
++    if (!constraints->valid_sw_formats)
++        return AVERROR(ENOMEM);
++    for (i = 0; i < FF_ARRAY_ELEMS(supported_sw_formats); i++)
++        constraints->valid_sw_formats[i] = supported_sw_formats[i];
++    constraints->valid_sw_formats[i] = AV_PIX_FMT_NONE;
++
++    constraints->valid_hw_formats = av_malloc_array(2, sizeof(*constraints->valid_hw_formats));
++    if (!constraints->valid_hw_formats)
++        return AVERROR(ENOMEM);
++    constraints->valid_hw_formats[0] = AV_PIX_FMT_SFAVD;
++    constraints->valid_hw_formats[1] = AV_PIX_FMT_NONE;
++
++    constraints->min_width  = 64;
++    constraints->min_height = 64;
++    constraints->max_width  = 4096;
++    constraints->max_height = 4096;
++    return 0;
++}
++
++static void sfavd_pool_free(void *opaque, uint8_t *data)
++{
++    av_free(data);
++}
++
++static AVBufferRef *sfavd_pool_alloc(void *opaque, size_t size)
++{
++    AVHWFramesContext *hwfc = opaque;
++    SFAVDFramesPriv *priv = hwfc->hwctx;
++    AVPDAVDDeviceContext *dev = hwfc->device_ctx->hwctx;
++    AVPDAVDFrame *frame;
++    AVBufferRef *ref;
++
++    if (priv->next >= priv->p.nb_buffers) {
++        av_log(hwfc, AV_LOG_ERROR, "All %u decoded buffers of the AVD context are in use\n",
++               priv->p.nb_buffers);
++        return NULL;
++    }
++    frame = av_mallocz(sizeof(*frame));
++    if (!frame)
++        return NULL;
++    frame->ctx = priv->p.ctx;
++    frame->index = priv->next;
++    if (sfavd_map(dev->dev, frame->ctx, frame->index, &frame->data, &frame->size) < 0) {
++        av_log(hwfc, AV_LOG_ERROR, "Cannot map decoded buffer %u: %s\n",
++               frame->index, av_err2str(AVERROR(errno)));
++        av_free(frame);
++        return NULL;
++    }
++    ref = av_buffer_create((uint8_t *)frame, sizeof(*frame), sfavd_pool_free, NULL, 0);
++    if (!ref) {
++        av_free(frame);
++        return NULL;
++    }
++    priv->next++;
++    return ref;
++}
++
++static int sfavd_frames_init(AVHWFramesContext *hwfc)
++{
++    SFAVDFramesPriv *priv = hwfc->hwctx;
++    AVPDAVDFramesContext *fctx = &priv->p;
++    AVPDAVDDeviceContext *dev = hwfc->device_ctx->hwctx;
++    struct sfavd_create create = { 0 };
++
++    if (hwfc->pool) {
++        av_log(hwfc, AV_LOG_ERROR, "A frame pool of the caller cannot be used with the AVD\n");
++        return AVERROR(EINVAL);
++    }
++    if (!fctx->codec || !fctx->format_ctrl_size ||
++        fctx->format_ctrl_size > AV_SFAVD_FORMAT_CTRL_MAX) {
++        av_log(hwfc, AV_LOG_ERROR, "An AVD frames context is set up by the decoder "
++               "(avcodec_get_hw_frames_parameters())\n");
++        return AVERROR(EINVAL);
++    }
++
++    create.codec = fctx->codec;
++    create.width = hwfc->width;
++    create.height = hwfc->height;
++    create.buffers = FFMIN(hwfc->initial_pool_size > 0 ? hwfc->initial_pool_size : 20,
++                           SFAVD_MAX_BUFFERS);
++    create.format_ctrl.id = fctx->format_ctrl_id;
++    create.format_ctrl.size = fctx->format_ctrl_size;
++    create.format_ctrl.ptr = (uintptr_t)fctx->format_ctrl;
++    if (sfavd_create(dev->dev, &create) < 0) {
++        int err = AVERROR(errno);
++        av_log(hwfc, AV_LOG_ERROR, "Cannot create an AVD context for %ux%u: %s\n",
++               create.width, create.height, av_err2str(err));
++        return err;
++    }
++    priv->created = 1;
++    fctx->ctx = create.ctx;
++    fctx->pixelformat = create.format.pixelformat;
++    fctx->width = create.format.width;
++    fctx->height = create.format.height;
++    fctx->bytesperline = create.format.bytesperline;
++    fctx->uv_offset = create.format.uv_offset;
++    fctx->sizeimage = create.format.sizeimage;
++    fctx->nb_buffers = create.buffers;
++
++    switch (fctx->pixelformat) {
++    case SFAVD_PIX_NV12: hwfc->sw_format = AV_PIX_FMT_NV12; break;
++    case SFAVD_PIX_NV16: hwfc->sw_format = AV_PIX_FMT_NV16; break;
++    case SFAVD_PIX_P010: hwfc->sw_format = AV_PIX_FMT_P010; break;
++    default:
++        av_log(hwfc, AV_LOG_ERROR, "Unknown decoded format 0x%08x\n", fctx->pixelformat);
++        return AVERROR(ENOSYS);
++    }
++
++    ffhwframesctx(hwfc)->pool_internal =
++        av_buffer_pool_init2(sizeof(AVPDAVDFrame), hwfc, sfavd_pool_alloc, NULL);
++    if (!ffhwframesctx(hwfc)->pool_internal)
++        return AVERROR(ENOMEM);
++
++    av_log(hwfc, AV_LOG_VERBOSE, "AVD context %u: %ux%u (coded %ux%u), %u buffers of %u bytes, %s\n",
++           fctx->ctx, hwfc->width, hwfc->height, fctx->width, fctx->height,
++           fctx->nb_buffers, fctx->sizeimage, av_get_pix_fmt_name(hwfc->sw_format));
++    return 0;
++}
++
++static void sfavd_frames_uninit(AVHWFramesContext *hwfc)
++{
++    SFAVDFramesPriv *priv = hwfc->hwctx;
++    AVPDAVDDeviceContext *dev = hwfc->device_ctx->hwctx;
++
++    if (priv->created && dev->dev)
++        sfavd_destroy(dev->dev, priv->p.ctx);
++    priv->created = 0;
++}
++
++static int sfavd_get_buffer(AVHWFramesContext *hwfc, AVFrame *frame)
++{
++    frame->buf[0] = av_buffer_pool_get(hwfc->pool);
++    if (!frame->buf[0])
++        return AVERROR(ENOMEM);
++
++    frame->data[0] = frame->buf[0]->data;
++    frame->format  = AV_PIX_FMT_SFAVD;
++    frame->width   = hwfc->width;
++    frame->height  = hwfc->height;
++    return 0;
++}
++
++static int sfavd_transfer_get_formats(AVHWFramesContext *hwfc,
++                                      enum AVHWFrameTransferDirection dir,
++                                      enum AVPixelFormat **formats)
++{
++    enum AVPixelFormat *fmts;
++
++    if (dir != AV_HWFRAME_TRANSFER_DIRECTION_FROM)
++        return AVERROR(ENOSYS);
++    fmts = av_malloc_array(2, sizeof(*fmts));
++    if (!fmts)
++        return AVERROR(ENOMEM);
++    fmts[0] = hwfc->sw_format;
++    fmts[1] = AV_PIX_FMT_NONE;
++    *formats = fmts;
++    return 0;
++}
++
++static int sfavd_transfer_data_from(AVHWFramesContext *hwfc, AVFrame *dst,
++                                    const AVFrame *src)
++{
++    SFAVDFramesPriv *priv = hwfc->hwctx;
++    const AVPDAVDFramesContext *fctx = &priv->p;
++    const AVPDAVDFrame *frame = (const AVPDAVDFrame *)src->data[0];
++    const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(hwfc->sw_format);
++    const uint8_t *data[4] = { 0 };
++    int linesize[4] = { 0 };
++    int w = FFMIN(dst->width, (int)fctx->width);
++    int h = FFMIN(dst->height, (int)fctx->height);
++    int bytes = (desc->comp[0].depth + 7) / 8;
++    size_t left, top;
++
++    if (dst->format != hwfc->sw_format)
++        return AVERROR(ENOSYS);
++    if (!frame || !frame->data)
++        return AVERROR(EINVAL);
++
++    /* the caller applies the frame's cropping afterwards, as for a software frame */
++    left = 0;
++    top = 0;
++    data[0] = frame->data + top * fctx->bytesperline + left * bytes;
++    data[1] = frame->data + fctx->uv_offset;
++    linesize[0] = linesize[1] = fctx->bytesperline;
++    av_image_copy2(dst->data, dst->linesize, (uint8_t **)data, linesize,
++                   hwfc->sw_format, w, h);
++    return 0;
++}
++
++const HWContextType ff_hwcontext_type_sfavd = {
++    .type                   = AV_HWDEVICE_TYPE_SFAVD,
++    .name                   = "sfavd",
++
++    .device_hwctx_size      = sizeof(AVPDAVDDeviceContext),
++    .frames_hwctx_size      = sizeof(SFAVDFramesPriv),
++
++    .device_create          = sfavd_device_create,
++    .device_uninit          = sfavd_device_uninit,
++    .frames_get_constraints = sfavd_frames_get_constraints,
++    .frames_init            = sfavd_frames_init,
++    .frames_uninit          = sfavd_frames_uninit,
++    .frames_get_buffer      = sfavd_get_buffer,
++    .transfer_get_formats   = sfavd_transfer_get_formats,
++    .transfer_data_from     = sfavd_transfer_data_from,
++
++    .pix_fmts = (const enum AVPixelFormat[]) { AV_PIX_FMT_SFAVD, AV_PIX_FMT_NONE },
++};
+diff -ruN a/libavutil/hwcontext_sfavd.h b/libavutil/hwcontext_sfavd.h
+--- a/libavutil/hwcontext_sfavd.h	1969-12-31 16:00:00.000000000 -0800
++++ b/libavutil/hwcontext_sfavd.h	2026-11-12 00:52:29.217243238 -0800
+@@ -0,0 +1,104 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVUTIL_HWCONTEXT_SFAVD_H
++#define AVUTIL_HWCONTEXT_SFAVD_H
++
++/**
++ * @file
++ * An API-specific header for AV_HWDEVICE_TYPE_SFAVD: the Apple Video Decoder of Apple
++ * Silicon through SiliconForest's /dev/sfavd (libsfavd).
++ *
++ * The decoder is stateless and writes into buffers that belong to one decoder context,
++ * which is created for a codec and a coded size. A frames context therefore is one
++ * decoder context with its fixed set of decoded buffers.
++ */
++
++#include <stddef.h>
++#include <stdint.h>
++
++struct AVFrame;
++
++/**
++ * This struct is allocated as AVHWDeviceContext.hwctx
++ */
++typedef struct AVPDAVDDeviceContext {
++    /**
++     * The open device (a sfavd_dev *). Owned by the device context.
++     */
++    void *dev;
++
++    /**
++     * If set (before decoding starts), called with each picture as soon as the
++     * hardware has finished it, that is in decoding order, before the decoder's
++     * reordering: for callers that present or reorder pictures themselves. The
++     * frame is the decoder's own (AV_PIX_FMT_SFAVD, coded size with its cropping
++     * fields set, opaque_ref of its packet when AV_CODEC_FLAG_COPY_OPAQUE is used);
++     * it may be referenced with av_frame_ref(). Called on the decoding thread.
++     * Pictures that are never shown (VP9) are reported too; frames that are shown
++     * again without being decoded are not.
++     */
++    void (*picture_decoded)(void *opaque, const struct AVFrame *frame);
++    void *picture_decoded_opaque;
++} AVPDAVDDeviceContext;
++
++#define AV_SFAVD_FORMAT_CTRL_MAX 2048
++
++/**
++ * This struct is allocated as AVHWFramesContext.hwctx
++ *
++ * The first three fields are set (by the decoder's frame_params) before
++ * av_hwframe_ctx_init(); the rest is filled by it.
++ */
++typedef struct AVPDAVDFramesContext {
++    /** SFAVD_CODEC_* */
++    uint32_t codec;
++    /** The control that decides the decoded format (the SPS, the VP9 frame header). */
++    uint32_t format_ctrl_id;
++    uint32_t format_ctrl_size;
++    uint8_t  format_ctrl[AV_SFAVD_FORMAT_CTRL_MAX];
++
++    /** The decoder context number. */
++    uint32_t ctx;
++    /** Layout of the decoded buffers. */
++    uint32_t pixelformat;
++    uint32_t width, height;
++    uint32_t bytesperline;
++    uint32_t uv_offset;
++    uint32_t sizeimage;
++    /** Number of decoded buffers. */
++    uint32_t nb_buffers;
++    /** Names the pictures of this context for references; incremented per picture. */
++    uint64_t timestamp;
++} AVPDAVDFramesContext;
++
++/**
++ * data[0] of an AV_PIX_FMT_SFAVD frame points to one of these.
++ */
++typedef struct AVPDAVDFrame {
++    uint32_t       ctx;
++    /** Decoded buffer of the context. */
++    uint32_t       index;
++    /** Read-only mapping of the buffer: luma at 0, interleaved chroma at uv_offset. */
++    const uint8_t *data;
++    size_t         size;
++    /** The timestamp of the decode that last wrote this buffer. */
++    uint64_t       timestamp;
++} AVPDAVDFrame;
++
++#endif /* AVUTIL_HWCONTEXT_SFAVD_H */
+diff -ruN a/libavutil/Makefile b/libavutil/Makefile
+--- a/libavutil/Makefile	2026-11-12 00:10:07.706535882 -0800
++++ b/libavutil/Makefile	2026-11-12 00:14:36.218174668 -0800
+@@ -45,6 +45,7 @@
+           hwcontext_cuda.h                                              \
+           hwcontext_d3d11va.h                                           \
+           hwcontext_d3d12va.h                                           \
++          hwcontext_sfavd.h                                             \
+           hwcontext_drm.h                                               \
+           hwcontext_dxva2.h                                             \
+           hwcontext_amf.h                                               \
+@@ -206,6 +207,7 @@
+ OBJS-$(CONFIG_CUDA)                     += hwcontext_cuda.o
+ OBJS-$(CONFIG_D3D11VA)                  += hwcontext_d3d11va.o
+ OBJS-$(CONFIG_D3D12VA)                  += hwcontext_d3d12va.o
++OBJS-$(CONFIG_SFAVD)                    += hwcontext_sfavd.o
+ OBJS-$(CONFIG_DXVA2)                    += hwcontext_dxva2.o
+ OBJS-$(CONFIG_AMF)                      += hwcontext_amf.o
+ OBJS-$(CONFIG_LIBDRM)                   += hwcontext_drm.o
+@@ -240,6 +242,7 @@
+                                           cuda_check.h
+ SKIPHEADERS-$(CONFIG_D3D11VA)          += hwcontext_d3d11va.h
+ SKIPHEADERS-$(CONFIG_D3D12VA)          += hwcontext_d3d12va.h
++SKIPHEADERS-$(CONFIG_SFAVD)            += hwcontext_sfavd.h
+ SKIPHEADERS-$(CONFIG_DXVA2)            += hwcontext_dxva2.h
+ SKIPHEADERS-$(CONFIG_AMF)              += hwcontext_amf.h               \
+                                           hwcontext_amf_internal.h
+diff -ruN a/libavutil/pixdesc.c b/libavutil/pixdesc.c
+--- a/libavutil/pixdesc.c	2026-11-12 00:10:07.714800262 -0800
++++ b/libavutil/pixdesc.c	2026-11-12 00:14:36.213505652 -0800
+@@ -3263,6 +3263,10 @@
+         },
+         .flags = AV_PIX_FMT_FLAG_BE,
+     },
++    [AV_PIX_FMT_SFAVD] = {
++        .name = "sfavd",
++        .flags = AV_PIX_FMT_FLAG_HWACCEL,
++    },
+     [AV_PIX_FMT_OHCODEC] = {
+         .name = "ohcodec",
+         .flags = AV_PIX_FMT_FLAG_HWACCEL,
+diff -ruN a/libavutil/pixfmt.h b/libavutil/pixfmt.h
+--- a/libavutil/pixfmt.h	2026-11-12 00:10:07.714800262 -0800
++++ b/libavutil/pixfmt.h	2026-11-12 00:14:36.212781605 -0800
+@@ -499,6 +499,12 @@
+ 
+     AV_PIX_FMT_OHCODEC, /// hardware decoding through openharmony
+ 
++    /**
++     * Hardware surfaces of the Apple Video Decoder (SiliconForest /dev/sfavd).
++     * data[0] points to an AVPDAVDFrame.
++     */
++    AV_PIX_FMT_SFAVD,
++
+     AV_PIX_FMT_NB         ///< number of pixel formats, DO NOT USE THIS if you want to link with shared libav* because the number of formats might differ between versions
+ };
+ 

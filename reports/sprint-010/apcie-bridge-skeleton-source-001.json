@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "author": "Claude",
+  "status": "SOURCE_ONLY_READ_ONLY_SKELETON_HOST_TESTED_SDK_BUNDLE_COMPILED_NOT_IN_ANY_KC_NOT_BOOTED",
+  "step": "W1(a) of reports/sprint-010/wifi-darwin-netif-gap-001.json: first source for the PCIe layer under the J293 BCM4378 Wi-Fi",
+  "leaf": "integrations/puredarwin/m1-apcie-bridge",
+  "source_validation": "integrations/puredarwin/m1-apcie-bridge/source-validation.json (sha256 015f3861726aadf037c6c1b9986bed6ea5088b360b909331b3214fc753d17931; source set ddace5cbcefed9ae4401bf92c1112a2159c89f2b56ca90f525687b3844cce128)",
+  "what_it_is": "PDApcieT8103Bridge, an opt-in (pdapciebridge=1), one-shot, unload-refusing IOService. It validates this exact J293 with the frozen m1-dart-survey board check, then requires apcie pci-bridge0 to be the apcie-bridge carrying the wlan-pcie,bcm4378 function, with no bridge1 or bridge2. It then reads port 0 and publishes an 84-byte PDApcieBridgeObservationV1 snapshot plus one IOLog line. It is a skeleton for a later IOPCIBridge, not one yet: no nubs, no config space, no ownership.",
+  "reads": "At most 14 MMIO reads from exactly ten whitelisted registers, through lazy read-only, cache-inhibited maps of the PMGR, RC, PHY and port0 16 KiB prefixes (DART never mapped): four PMGR guard words, PHY CTRL +0x000, RC PHYIF +0x024, port0 APPCLK +0x800, RESET/PERST +0x814, STATUS +0x804, LINKSTS +0x208, then the four PMGR words again.",
+  "guard_alignment": "Same power and PHY predicates and the same stage order as the m1-dart-survey guard: stop at the first PMGR domain not on; read RC only if the PHY clocks are acked and reset is clear; read the port block only if PHYIF RUN is set. The one documented difference: once in the port block, APPCLK, RESET and STATUS are all recorded rather than stopping at the first clear bit, because nothing is gated behind them. LINKSTS is read only after STATUS RUN, as m1n1 does.",
+  "no_writes": "The core interface has only read32. Static checks find no write, poll, sleep, timer, interrupt, PMGR helper, pcie_init, IOMapper, IOPCIDevice, registerService call or write-direction descriptor. In the compiled bundle, read32 is a single ldr from the mapped address between two dmb osh, and its only store targets the caller's output variable. No shared PHY, power, clock, reset or PERST state is changed.",
+  "expected_first_result": "PHY_NOT_READY (result 2), because nothing initializes PCIe today. This matches what the DART survey guard recorded (PHY reset asserted). It is an observation, not a failure.",
+  "checks": {
+    "host": "test_observe.py exit 0: C tests under ASan/UBSan (stop points, read order, final power loss, IO faults, refusals, binding), static no-write checks, and the saved private J293 guest ADT (5f2ad465...) accepted by both the frozen board profile and the port-0 binding.",
+    "sdk_bundle": "build-bridge-observe.nix exit 0: standalone PDApcieT8103Bridge.kext (ARM64 MH_BUNDLE, executable 110175 B, sha256 6a68c03fc58e09bb251a6e7cdcb804a6b94659aaeffbdccf7a6329630f93b162). Frozen board.c and survey.h hash-verified in the build. Warnings come only from XNU private headers and the metaclass macro."
+  },
+  "provenance": "Original code. Register offsets are facts from m1n1 src/pcie.c (MIT; see the leaf NOTICE). board.c, survey.h and the ADT test helpers are the lab's frozen m1-dart-survey revision 2, used unchanged. No GPL Linux or Apple driver source, no firmware.",
+  "not_done_by_design": ["no kernel collection built, modified or linked", "no RAM disk, packet or boot staged", "no SSH, no hardware", "m1n1, recovery, GPU observer and the network-link, network-egress and default-route files untouched"],
+  "next": "A packet and boot belong to root under the usual gates. On a cold boot the observation will report PHY_NOT_READY. Write-capable port 0 bring-up (W1 b) needs its own scope review, because shared PHY and PMGR state overlaps storage."
+}

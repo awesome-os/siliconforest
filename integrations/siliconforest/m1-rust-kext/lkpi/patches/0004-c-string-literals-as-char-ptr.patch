@@ -1,0 +1,30 @@
+kernel: c"..." literals passed to C: as_char_ptr(), not as_ptr()
+
+`CStr::as_ptr()` is `*const core::ffi::c_char`, which is i8 on Apple targets, while the
+kernel's `ffi::c_char` is u8 everywhere. The three call sites only compile where the two
+happen to agree (arm64 Linux); the crate's own `CStrExt::as_char_ptr` is the portable form.
+
+--- a/kernel/drm/file.rs
++++ b/kernel/drm/file.rs
+@@ -164,7 +164,7 @@
+         // SAFETY: `printer` is the printer `drm_show_fdinfo()` passes, valid for this call; `raw`
+         // and the region name outlive the call.
+         unsafe {
+-            bindings::drm_print_memory_stats(printer, &raw, supported, c"system".as_ptr())
++            bindings::drm_print_memory_stats(printer, &raw, supported, c"system".as_char_ptr())
+         };
+     }
+ 
+--- a/kernel/io/mem.rs
++++ b/kernel/io/mem.rs
+@@ -442,8 +442,8 @@
+ 
+     #[test]
+     fn exclusive_claims_share_global_tree() -> Result {
+-        let mut first_raw = detached(c"rust-io-first".as_ptr());
+-        let mut second_raw = detached(c"rust-io-second".as_ptr());
++        let mut first_raw = detached(c"rust-io-first".as_char_ptr());
++        let mut second_raw = detached(c"rust-io-second".as_char_ptr());
+         // SAFETY: Both descriptors remain live for this test and are accessed
+         // only through their respective Resource wrappers until their last use.
+         let first = unsafe { Resource::from_raw(&raw mut first_raw) };

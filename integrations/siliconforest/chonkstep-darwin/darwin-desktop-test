@@ -1,0 +1,46 @@
+#!/bin/sh
+# This file runs only from the hash-bound, disposable guest RAM root.
+set -eu
+nonce=${1-}
+case "$nonce" in ''|*[!0-9a-f]*) exit 2 ;; esac
+[ "${#nonce}" -eq 48 ] || exit 2
+printf '\nDL10_BEGIN_%s\n' "$nonce"
+/usr/bin/rust-hello
+/usr/bin/chonkstep-darwin --help
+# md0 is writable RAM in this kernel. The pinned mount command has no -uw.
+runtime=/private/var/run/darwin-desktop
+mkdir -p "$runtime"
+chmod 0700 "$runtime"
+printf '%s\n' "$nonce" > "$runtime/write-probe"
+[ "$(cat "$runtime/write-probe")" = "$nonce" ]
+rm "$runtime/write-probe"
+export XDG_RUNTIME_DIR="$runtime"
+export WAYLAND_DISPLAY=wayland-0
+export XKB_CONFIG_ROOT=/usr/share/X11/xkb
+export TMPDIR=/private/tmp
+compositor=
+client=
+cleanup() {
+    trap - EXIT HUP INT TERM
+    if [ -n "$client" ]; then kill -TERM "$client" 2>/dev/null || :; wait "$client" 2>/dev/null || :; fi
+    if [ -n "$compositor" ]; then kill -TERM "$compositor" 2>/dev/null || :; wait "$compositor" 2>/dev/null || :; fi
+    printf '\nDL10_END_%s\n' "$nonce"
+}
+trap cleanup EXIT HUP INT TERM
+/usr/bin/chonkstep-darwin --run --socket "$runtime/wayland-0" &
+compositor=$!
+count=0
+while [ ! -S "$runtime/wayland-0" ]; do
+    kill -0 "$compositor"
+    count=$((count + 1))
+    [ "$count" -le 100 ] || exit 1
+    sleep 0.1
+done
+printf 'DL10_SERVER_SOCKET_%s\n' "$nonce"
+/usr/bin/darwin-wayland-client --socket "$runtime/wayland-0" --nonce "$nonce" --seconds 120 &
+client=$!
+# Keep the real compositor/client alive while the host captures the framebuffer.
+# The host still enforces its independent worker deadline and Linux recovery.
+sleep 100
+kill -0 "$compositor"
+kill -0 "$client"

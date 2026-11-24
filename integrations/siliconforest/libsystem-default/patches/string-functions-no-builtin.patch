@@ -1,0 +1,30 @@
+--- a/src/Libraries/libSystem/libplatform/CMakeLists.txt	2026-11-14 15:30:14.088920135 -0800
++++ b/src/Libraries/libSystem/libplatform/CMakeLists.txt	2026-11-14 15:30:55.307636444 -0800
+@@ -253,3 +253,9 @@
+     atomic_fetch_xor_explicit.3 atomic_init.3 atomic_is_lock_free.3 atomic_load.3 atomic_load_explicit.3 atomic_store.3
+     atomic_store_explicit.3
+ )
++
++# SiliconForest (../../integrations/siliconforest/libsystem-default/build-libsystem-opt.nix): this archive
++# implements memmove/memset/memset_pattern*/bzero/strlen/... in C (src/string/generic). With optimisation
++# the compiler may recognise their loops as the very functions they implement and call them (endless
++# recursion); -fno-builtin keeps it from doing so, as for any libc's own string functions.
++target_compile_options(libplatform_static PRIVATE -fno-builtin)
+--- a/src/Libraries/libSystem/libc/CMakeLists.txt	2026-11-14 15:30:14.088986817 -0800
++++ b/src/Libraries/libSystem/libc/CMakeLists.txt	2026-11-14 15:30:55.308636432 -0800
+@@ -934,3 +934,15 @@
+     gen/FreeBSD/closedir.c gen/FreeBSD/telldir.c gen/FreeBSD/rewinddir.c
+     gen/FreeBSD/seekdir.c
+     PROPERTIES COMPILE_FLAGS "-include${CMAKE_CURRENT_SOURCE_DIR}/gen/__dirent.h")
++
++# SiliconForest (../../integrations/siliconforest/libsystem-default/build-libsystem-opt.nix): the string
++# functions in C (string/, string/FreeBSD, string/NetBSD) must not be compiled into calls to themselves
++# once optimised (a copy or fill loop recognised as memmove/memset/memset_pattern16): -fno-builtin there.
++foreach(_sf_target libc_static libc_internal_static)
++    get_target_property(_sf_srcs ${_sf_target} SOURCES)
++    foreach(_sf_src IN LISTS _sf_srcs)
++        if(_sf_src MATCHES "(^|/)string/")
++            set_property(SOURCE ${_sf_src} APPEND PROPERTY COMPILE_OPTIONS -fno-builtin)
++        endif()
++    endforeach()
++endforeach()

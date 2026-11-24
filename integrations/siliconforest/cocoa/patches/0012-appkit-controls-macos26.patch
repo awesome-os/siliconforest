@@ -1,0 +1,882 @@
+--- a/src/Frameworks/AppKit/NSButtonCell.m
++++ b/src/Frameworks/AppKit/NSButtonCell.m
+@@ -804,13 +804,18 @@
+    return *radio || [name isEqualToString:@"NSSwitch"] || [name isEqualToString:@"NSHighlightedSwitch"];
+ }
+ 
+-// macOS 15 bezel rows, frame heights the bezel centres in, side insets and title baselines per control size
+-static const CGFloat kPushBezelRows[3]={ 22, 18, 15 };
+-static const CGFloat kPushCentreHeight[3]={ 24, 21, 16 };
+-static const CGFloat kPushSideInset[3]={ 6, 5, 1 };
+-static const CGFloat kToggleBox[3]={ 14, 12, 10 };
+-static const CGFloat kToggleBoxInset[3]={ 2, 1, 0 };
+-static const CGFloat kToggleTitleInset[3]={ 22, 17, 14 };
++/* Control geometry per control size (regular, small, mini), as macOS 26 has it - measured on a
++ * Mac with integrations/siliconforest/cocoa/conformance (sizes, title rectangles) and from its
++ * renders (where the bezel and the box sit). A push button's bezel is the whole width of its
++ * frame and 24, 20 or 16 points high, centred in a taller frame; its title sits 12, 10 or 8 points
++ * in. A checkbox or radio button is a 16, 14 or 12 point box at the frame's leading edge with the
++ * title 22, 18 or 16 points in. There are no alignment insets: the frame is what is seen.
++ * (macOS up to 15 drew a 22 point bezel inside a 32 point frame with 6 points to spare each side.) */
++static const CGFloat kPushBezelRows[3]={ 24, 20, 16 };
++static const CGFloat kPushTitlePad[3]={ 12, 10, 8 };
++static const CGFloat kTitleLine[3]={ 16, 14, 11 };
++static const CGFloat kToggleBox[3]={ 16, 14, 12 };
++static const CGFloat kToggleTitleInset[3]={ 22, 18, 16 };
+ 
+ static NSUInteger sizeIndex(NSControlSize size) {
+    return (size==NSSmallControlSize) ? 1 : (size==NSMiniControlSize) ? 2 : 0;
+@@ -828,17 +833,13 @@
+ // the drawn bezel, its visual top centred in the frame as macOS does whatever the frame height
+ -(NSRect)_modernBezelRectForFrame:(NSRect)frame flipped:(BOOL)flipped {
+    NSUInteger i=sizeIndex(_controlSize);
+-   CGFloat inset=(_bezelStyle==NSRegularSquareBezelStyle) ? 2 : kPushSideInset[i];
+-   CGFloat dy=floor((frame.size.height-kPushCentreHeight[i])/2);
++   CGFloat rows=MIN(kPushBezelRows[i],frame.size.height);
++   CGFloat dy=floor((frame.size.height-rows)/2);
+ 
+-   // a popup's bezel runs two points from the sides and a point higher than a push button's
+-   if([self isKindOfClass:[NSPopUpButtonCell class]]){
+-    inset=(i==2) ? 1 : 2;
+-    dy-=1;
+-   }
+-   // macOS offsets the bezel from the frame's origin in either orientation, so unflipped it sits lower
+-   frame=NSInsetRect(frame,inset,0);
+-   return NSMakeRect(frame.origin.x,NSMinY(frame)+dy,frame.size.width,kPushBezelRows[i]);
++   // a square button's bezel is the whole frame
++   if(_bezelStyle==NSRegularSquareBezelStyle)
++    return frame;
++   return NSMakeRect(frame.origin.x,NSMinY(frame)+dy,frame.size.width,rows);
+ }
+ 
+ // the accent box at the trailing end of a popup, inset three points inside the bezel
+@@ -852,10 +853,8 @@
+ 
+ // the title rect macOS reports for a push button, measured from the frame's origin like the bezel
+ static NSRect pushTitleRect(NSRect frame,NSUInteger i) {
+-   static const CGFloat base[3]={ 20, 17, 14 };
+-   static const CGFloat height[3]={ 16, 14, 11 };
+-
+-   return NSMakeRect(frame.origin.x,NSMinY(frame)+floor((frame.size.height-base[i])/2),frame.size.width,height[i]);
++   // the line centred in the frame, the odd point going above it (4 of 24, 3 of 20, 3 of 16)
++   return NSMakeRect(frame.origin.x,NSMinY(frame)+floor((frame.size.height-kTitleLine[i]+1)/2),frame.size.width,kTitleLine[i]);
+ }
+ 
+ -(BOOL)_isModernDefault:(NSView *)controlView {
+@@ -912,7 +911,7 @@
+ 
+    if([self imagePosition]==NSImageLeft && isToggleImage([self image],&radio)){
+     CGFloat size=kToggleBox[i];
+-    NSRect box=SFRectFromTop(NSMakeRect(frame.origin.x+kToggleBoxInset[i],frame.origin.y,size,frame.size.height),c.flipped,floor((frame.size.height-size)/2),size);
++    NSRect box=SFRectFromTop(NSMakeRect(frame.origin.x,frame.origin.y,size,frame.size.height),c.flipped,floor((frame.size.height-size)/2),size);
+     BOOL pressed=[self isHighlighted];
+     CGFloat titleX=frame.origin.x+kToggleTitleInset[i];
+     NSRect titleRect;
+@@ -932,7 +931,7 @@
+    if([self _isModernPushBezel] && ([self image]==nil || [self imagePosition]==NSNoImage)){
+     NSRect bezel=[self _modernBezelRectForFrame:frame flipped:c.flipped];
+     BOOL onAccent=[self _isModernDefault:controlView] && c.active && [self isEnabled] && _bezelStyle!=NSRegularSquareBezelStyle;
+-    CGFloat pad=(i==2) ? 4 : 9;
++    CGFloat pad=kPushTitlePad[i];
+     NSRect body=SFRectFromTop(bezel,c.flipped,1,bezel.size.height-2);
+     NSRect titleRect;
+ 
+@@ -947,7 +946,7 @@
+       [style setLineBreakMode:NSLineBreakByTruncatingTail];
+       [left addAttribute:NSParagraphStyleAttributeName value:style range:NSMakeRange(0,[left length])];
+       title=left;
+-      titleRect=titleLineRect(title,font,NSMinX(bezel)+9,NSMinX(box)-4-(NSMinX(bezel)+9),NSMidY(body),-0.5,c.flipped);
++      titleRect=titleLineRect(title,font,NSMinX(bezel)+pad,NSMinX(box)-4-(NSMinX(bezel)+pad),NSMidY(body),-0.5,c.flipped);
+      }
+      else
+       titleRect=titleLineRect(title,font,NSMinX(bezel)+pad,bezel.size.width-2*pad,NSMidY(pushTitleRect(frame,i)),0.5,c.flipped);
+@@ -1293,27 +1292,46 @@
+      }
+      }
+ 
++// where the title goes, as macOS reports it for the two kinds of button drawn here
++-(NSRect)titleRectForBounds:(NSRect)rect {
++   NSUInteger i=sizeIndex(_controlSize);
++   BOOL radio;
++
++   if([self imagePosition]==NSImageLeft && isToggleImage([self image],&radio))
++    return NSMakeRect(rect.origin.x+kToggleTitleInset[i],rect.origin.y,MAX(0,rect.size.width-kToggleTitleInset[i]),MIN(kTitleLine[i],rect.size.height));
++   if([self _isModernPushBezel] && ([self image]==nil || [self imagePosition]==NSNoImage)){
++    NSRect line=pushTitleRect(rect,i);
++
++    return NSMakeRect(rect.origin.x+kPushTitlePad[i],line.origin.y,MAX(0,rect.size.width-2*kPushTitlePad[i]),line.size.height);
++   }
++   return [super titleRectForBounds:rect];
++}
++
++-(NSRect)drawingRectForBounds:(NSRect)rect {
++   NSUInteger i=sizeIndex(_controlSize);
++   BOOL radio;
++
++   if([self imagePosition]==NSImageLeft && isToggleImage([self image],&radio))
++    return rect;
++   if([self _isModernPushBezel] && ([self image]==nil || [self imagePosition]==NSNoImage))
++    return NSMakeRect(rect.origin.x+kPushTitlePad[i],rect.origin.y,MAX(0,rect.size.width-2*kPushTitlePad[i]),rect.size.height);
++   return [super drawingRectForBounds:rect];
++}
++
+ -(NSSize)cellSize  {
+    NSSize              result=NSMakeSize(0,0);
+    BOOL                radio;
+ 
+-   // the sizes macOS 15 reports for push buttons, checkboxes and radio buttons
++   // the sizes macOS 26 reports: the title's width and the room before it, the box's or the bezel's height
+    if([self imagePosition]==NSImageLeft && isToggleImage([self image],&radio)){
+-    static const CGFloat height[3]={ 18, 16, 11 };
+-    static const CGFloat extra[3]={ 24, 20, 18 };
+     NSUInteger i=sizeIndex(_controlSize);
+-    CGFloat width=ceil([[self attributedTitle] size].width);
+ 
+-    if(radio && i==1)
+-     return NSMakeSize(width+extra[i],height[i]-1);
+-    return NSMakeSize(width+extra[i],height[i]);
++    return NSMakeSize(ceil([[self attributedTitle] size].width)+kToggleTitleInset[i],kToggleBox[i]);
+    }
+    if([self _isModernPushBezel] && ([self image]==nil || [self imagePosition]==NSNoImage)){
+-    static const CGFloat height[3]={ 32, 27, 16 };
+-    static const CGFloat extra[3]={ 34, 30, 20 };
+     NSUInteger i=sizeIndex(_controlSize);
+ 
+-    return NSMakeSize(ceil([[self attributedTitle] size].width)+extra[i],height[i]);
++    return NSMakeSize(ceil([[self attributedTitle] size].width)+2*kPushTitlePad[i],kPushBezelRows[i]);
+    }
+    NSAttributedString *title=[self attributedTitle];
+     NSImage            *image=[self image];
+--- a/src/Frameworks/AppKit/NSPopUpButtonCell.m
++++ b/src/Frameworks/AppKit/NSPopUpButtonCell.m
+@@ -359,9 +359,22 @@
+ 	return result;
+ }
+ 
++// the room macOS 26 keeps at the trailing end for the arrows, per control size
++static CGFloat popUpArrowRoom(NSControlSize size) {
++	return (size==NSSmallControlSize) ? 30 : (size==NSMiniControlSize) ? 24 : 36;
++}
++
+ -(NSRect)titleRectForBounds:(NSRect)rect 
+ {
++	NSRect whole = rect;
++
+ 	rect = [super titleRectForBounds:rect];
++	// with the modern bezel: from the title's inset to where the arrows' room starts
++	if ([self _isModernPushBezel] && ([self image]==nil || [self imagePosition]==NSNoImage)) {
++		if (_arrowPosition != NSPopUpNoArrow)
++			rect.size.width = MAX(0, NSMaxX(whole) - popUpArrowRoom([self controlSize]) - NSMinX(rect));
++		return rect;
++	}
+ 	if (_arrowPosition != NSPopUpNoArrow) {
+ 		// Don't use the room used by the arrow, with some margin
+ 		NSRect arrowRect = [self _arrowRectForRect:rect];
+@@ -390,21 +403,26 @@
+ 	}
+ }
+ 
++// a push button's size (title, 12/10/8 points before and after it, 24/20/16 high) with the
++// arrows' room in place of the trailing inset - what macOS 26 reports
+ -(NSSize)cellSize  {
+    NSSize result=[super cellSize];
+    
+    switch([self controlSize]){
+    
+     case NSRegularControlSize:
+-     result.height=22;
++     result.width+=36-12;
++     result.height=24;
+      break;
+ 			
+     case NSSmallControlSize:
+-     result.height=19;
++     result.width+=30-10;
++     result.height=20;
+      break;
+ 			
+     case NSMiniControlSize:
+-     result.height=15;
++     result.width+=24-8;
++     result.height=16;
+      break;
+    }
+ 
+--- a/src/Frameworks/AppKit/NSTextFieldCell.m
++++ b/src/Frameworks/AppKit/NSTextFieldCell.m
+@@ -141,7 +141,10 @@
+    _placeholder=value;
+ }
+ 
+-// the text rect macOS 15 gives a field, two points in from the sides and three below the top
++// the text rect. macOS 26 gives a field four points all round and a label its whole bounds, and
++// its text container then keeps two more points each side; text here is drawn with no such
++// padding, so the two points are part of this rect (a field's text starts six points in, a
++// label's two, as on macOS)
+ -(NSRect)_valueRectForBounds:(NSRect)rect flipped:(BOOL)flipped {
+    if([self isBezeled] && [self bezelStyle]==NSTextFieldRoundedBezel){
+     CGFloat padX=MAX(6,floor(rect.size.height*0.35));
+@@ -149,9 +152,18 @@
+     rect=NSInsetRect(rect,padX,0);
+    }
+    else
+-    rect=NSInsetRect(rect,2,0);
+-   if(([self isBezeled] || [self isBordered]) && rect.size.height>5)
+-    rect=SFRectFromTop(rect,flipped,3,rect.size.height-5);
++    rect=NSInsetRect(rect,([self isBezeled] || [self isBordered]) ? 6 : 2,0);
++   // one line of text in the middle of the field (four points above it in a field of its own
++   // height); a field with room for more lines keeps the four points above and below
++   if([self isBezeled] || [self isBordered]){
++    NSFont *font=[self font];
++    CGFloat line=font ? ceil([font ascender]-[font descender]) : 16;
++
++    if(rect.size.height>=2*line+8)
++     rect=SFRectFromTop(rect,flipped,4,rect.size.height-8);
++    else if(rect.size.height>line)
++     rect=SFRectFromTop(rect,flipped,floor((rect.size.height-line)/2),line);
++   }
+    return rect;
+ }
+ 
+@@ -215,15 +227,12 @@
+ {
+     NSSize size = [[self attributedStringValue] size];
+ 
+-    if([self isBezeled])
+-    {
+-        size.width += 6;
+-        size.height += 6;
+-    }
+-    else if([self isBordered])
++    // a field: four points around the text, on whole points (macOS 26: 24 high at 13 points);
++    // a label: its text and the two points the text container keeps each side
++    if([self isBezeled] || [self isBordered])
+     {
+-        size.width += 4;
+-        size.height += 4;
++        size.width = ceil(size.width) + 8;
++        size.height = ceil(size.height) + 8;
+     }
+     else
+     {
+--- a/src/Frameworks/AppKit/NSSliderCell.m
++++ b/src/Frameworks/AppKit/NSSliderCell.m
+@@ -60,7 +60,7 @@
+    _isContinuous=YES; // NSCell defaults to NO, NSSliderCell defaults to YES
+    _type=NSLinearSlider;
+    _minValue=0;
+-   _maxValue=0;
++   _maxValue=1;   // as on macOS: a new slider runs from 0 to 1
+    _altIncrementValue=0;
+    _isVertical=-1;
+    _lastRect=NSZeroRect;
+@@ -75,7 +75,7 @@
+    _isContinuous=YES; // NSCell defaults to NO, NSSliderCell defaults to YES
+    _type=NSLinearSlider;
+    _minValue=0;
+-   _maxValue=0;
++   _maxValue=1;   // as on macOS: a new slider runs from 0 to 1
+    _altIncrementValue=0;
+    _isVertical=-1;
+    _lastRect=NSZeroRect;
+@@ -118,7 +118,7 @@
+ }
+ 
+ -(CGFloat)knobThickness {
+-   return 24;
++   return ([self controlSize]==NSSmallControlSize) ? 17 : ([self controlSize]==NSMiniControlSize) ? 15 : 19;
+ }
+ 
+ -(void)setSliderType:(NSSliderType)value {
+@@ -250,7 +250,24 @@
+    return result;
+ }
+ 
+-// the knob rect macOS reports, 24 by 28 with the disc in its top 23 rows and the shadow under it
++/* macOS 26 (measured from the control sheet): the slider is 16, 14 or 12 points thick, the knob a
++ * capsule 19 by 15, 17 by 13 or 15 by 11 across the middle of it, the track 6, 4 or 4 points. */
++static NSSize knobSize(NSControlSize size) {
++   return (size==NSSmallControlSize) ? NSMakeSize(17,13) : (size==NSMiniControlSize) ? NSMakeSize(15,11) : NSMakeSize(19,15);
++}
++
++static CGFloat sliderThickness(NSControlSize size) {
++   return (size==NSSmallControlSize) ? 14 : (size==NSMiniControlSize) ? 12 : 16;
++}
++
++// as long as it is given, as thick as its control size says (macOS answers 40000 for the length)
++-(NSSize)cellSize {
++   CGFloat thick=sliderThickness([self controlSize]);
++
++   // -isVertical is -1 until the cell has been drawn: only a known vertical slider is one
++   return [self isVertical]==1 ? NSMakeSize(thick,40000) : NSMakeSize(40000,thick);
++}
++
+ -(NSRect)knobRectFlipped:(BOOL)flipped {
+    double value=[self doubleValue];
+    double percent=(_maxValue>_minValue) ? (value-_minValue)/(_maxValue-_minValue) : 0;
+@@ -258,39 +275,27 @@
+    NSRect knobRect;
+ 
+    percent=MAX(0,MIN(1,percent));
++   NSSize knob=knobSize([self controlSize]);
++
+    if ([self isVertical]) {
+-    knobRect.size=NSMakeSize(28,24);
+-    knobRect.origin.x=floor(sliderRect.origin.x+(sliderRect.size.width-28)/2);
++    knobRect.size=NSMakeSize(knob.height,knob.width);
++    knobRect.origin.x=sliderRect.origin.x+(sliderRect.size.width-knob.height)/2;
+     if(flipped)
+      percent=1-percent;
+-    knobRect.origin.y=floor(sliderRect.origin.y+percent*(sliderRect.size.height-24));
++    knobRect.origin.y=round((sliderRect.origin.y+percent*(sliderRect.size.height-knob.width))*2)/2;
+    }
+    else {
+-    knobRect.size=NSMakeSize(24,28);
+-    knobRect.origin.x=sliderRect.origin.x+percent*(sliderRect.size.width-24);
+-    knobRect.origin.y=SFRectFromTop(sliderRect,flipped,floor((sliderRect.size.height-28)/2),28).origin.y;
++    knobRect.size=knob;
++    knobRect.origin.x=round((sliderRect.origin.x+percent*(sliderRect.size.width-knob.width))*2)/2;
++    knobRect.origin.y=sliderRect.origin.y+(sliderRect.size.height-knob.height)/2;
+    }
+ 
+    return knobRect;
+ }
+ 
+-static CGFloat knobDiameter(NSControlSize size) {
+-   return (size==NSSmallControlSize) ? 15 : (size==NSMiniControlSize) ? 11 : 21;
+-}
+-
+-// the disc inside a knob rect, a point below its top and centred across it
++// the knob as drawn: the knob rect itself
+ -(NSRect)_knobDiscForKnobRect:(NSRect)knob flipped:(BOOL)flipped {
+-   CGFloat d=knobDiameter([self controlSize]);
+-   NSRect disc;
+-
+-   if([self isVertical]){
+-    disc=NSMakeRect(NSMinX(knob)+1+(21-d)/2,floor(NSMidY(knob)-d/2),d,d);
+-    return disc;
+-   }
+-   disc=SFRectFromTop(knob,flipped,1+(21-d)/2,d);
+-   disc.origin.x=NSMidX(knob)-d/2;
+-   disc.size.width=d;
+-   return disc;
++   return knob;
+ }
+ 
+ -(void)drawKnob {
+@@ -313,15 +318,15 @@
+ {
+     SFDrawContext c=SFCurrentDrawContext(controlView);
+     NSRect knob,disc,track;
+-    CGFloat thick=([self controlSize]==NSRegularControlSize) ? 4 : 3;
++    CGFloat thick=([self controlSize]==NSRegularControlSize) ? 6 : 4;
+ 
+     _isVertical = (frame.size.height>frame.size.width)?1:0;
+     knob=[self knobRectFlipped:c.flipped];
+     disc=[self _knobDiscForKnobRect:knob flipped:c.flipped];
+     if(_isVertical)
+-     track=NSMakeRect(floor(NSMidX(disc)-thick/2),NSMinY([self _sliderRect])+2,thick,[self _sliderRect].size.height-4);
++     track=NSMakeRect(NSMidX(disc)-thick/2,NSMinY([self _sliderRect]),thick,[self _sliderRect].size.height);
+     else {
+-     track=NSMakeRect(NSMinX([self _sliderRect])+2,floor(NSMidY(disc)-thick/2+(c.flipped ? 0.5 : 0)),[self _sliderRect].size.width-4,thick);
++     track=NSMakeRect(NSMinX([self _sliderRect]),NSMidY(disc)-thick/2,[self _sliderRect].size.width,thick);
+     }
+     SFDrawSliderTrack(c,track,_isVertical,_isVertical ? NSMidY(disc) : NSMidX(disc),[self isEnabled]);
+     [self drawTickMarks];
+--- a/src/Frameworks/AppKit/NSSlider.m
++++ b/src/Frameworks/AppKit/NSSlider.m
+@@ -95,6 +95,18 @@
+    return [[self selectedCell] isVertical];
+ }
+ 
++// a slider keeps its length and takes its cell's thickness
++-(void)sizeToFit {
++   NSSize cell=[[self cell] cellSize],size=[self frame].size;
++
++   // by its shape: the cell does not know which way it runs before it is drawn
++   if(size.height>size.width)
++    size.width=MIN(cell.width,cell.height);
++   else
++    size.height=MIN(cell.width,cell.height);
++   [self setFrameSize:size];
++}
++
+ -(NSInteger)indexOfTickMarkAtPoint:(NSPoint)point {
+    return [[self selectedCell] indexOfTickMarkAtPoint:point];
+ }
+--- a/src/Frameworks/AppKit/NSProgressIndicator.m
++++ b/src/Frameworks/AppKit/NSProgressIndicator.m
+@@ -289,7 +289,10 @@
+    [self setDoubleValue:_value+value];
+ }
+ 
++// a bar keeps its length and takes the thickness macOS 26 gives it: 20 points, 12 when small or mini
+ -(void)sizeToFit {
++   if(_style==NSProgressIndicatorBarStyle)
++    [self setFrameSize:NSMakeSize([self frame].size.width,_size==NSRegularControlSize ? 20 : 12)];
+ }
+ 
+ - (void)_runThreadedAnimation:(id)arg
+--- a/src/Frameworks/AppKit/NSSegmentedControl/NSSegmentedCell.m
++++ b/src/Frameworks/AppKit/NSSegmentedControl/NSSegmentedCell.m
+@@ -268,7 +268,17 @@
+    return [self font]?:[NSFont systemFontOfSize:[NSFont systemFontSizeForControlSize:[self controlSize]]];
+ }
+ 
+-// a segment is its label or image plus 14 points, or the width it was given
++// what macOS 26 adds to a segment's label (measured: 148, 131 and 106 points for the labels One, Two,
++// Three at the three control sizes) and how high the control is
++static CGFloat segmentPadding(NSControlSize size) {
++   return (size==NSSmallControlSize) ? 58.0/3 : (size==NSMiniControlSize) ? 15 : 21;
++}
++
++static CGFloat segmentHeight(NSControlSize size) {
++   return (size==NSSmallControlSize) ? 20 : (size==NSMiniControlSize) ? 16 : 24;
++}
++
++// a segment is its label or image plus that padding, or the width it was given
+ -(CGFloat)_naturalWidthOfSegment:(NSInteger)idx {
+    NSSegmentItem *segment=[_segments objectAtIndex:idx];
+    NSString *label=[segment label];
+@@ -278,13 +288,13 @@
+    if(w>0)
+     return w;
+    if([label length])
+-    w=ceil([label sizeWithAttributes:[NSDictionary dictionaryWithObject:[self _segmentFont] forKey:NSFontAttributeName]].width);
++    w=[label sizeWithAttributes:[NSDictionary dictionaryWithObject:[self _segmentFont] forKey:NSFontAttributeName]].width;
+    if(image!=nil)
+     w+=[image size].width+([label length] ? 4 : 0);
+-   return w+14;
++   return w+segmentPadding([self controlSize]);
+ }
+ 
+-// the drawn widths, the outer two include the track's inset so hit testing can walk them from the frame's edge
++// the drawn widths: the track is the whole frame, and what the frame has to spare is shared out
+ -(void)_layoutSegmentsInWidth:(CGFloat)frameWidth {
+    int i,count=[_segments count];
+    CGFloat natural=0,extra;
+@@ -295,14 +305,10 @@
+     [_segmentComputedWidths removeAllObjects];
+    for(i=0;i<count;i++)
+     natural+=[self _naturalWidthOfSegment:i];
+-   extra=(frameWidth>0 && count>0) ? MAX(0,(frameWidth-6-natural)/count) : 0;
++   extra=(frameWidth>0 && count>0) ? MAX(0,(frameWidth-natural)/count) : 0;
+    for(i=0;i<count;i++){
+     CGFloat w=[self _naturalWidthOfSegment:i]+extra;
+ 
+-    if(i==0)
+-     w+=3;
+-    if(i==count-1)
+-     w+=3;
+     [_segmentComputedWidths addObject:[NSNumber numberWithDouble:w]];
+    }
+ }
+@@ -318,10 +324,14 @@
+    NSImage *image=[segment image];
+    BOOL selected=[segment isSelected];
+    BOOL enabled=[self isEnabled] && [segment isEnabled];
+-   NSRect body=SFRectFromTop(frame,c.flipped,1,frame.size.height-2);
++   NSRect body=frame;
++   BOOL onAccent=NO;
+ 
+-   if(selected && [self trackingMode]!=NSSegmentSwitchTrackingMomentary)
++   if(selected && [self trackingMode]!=NSSegmentSwitchTrackingMomentary){
+     SFDrawSegmentSelection(c,body);
++    // the selected segment is the accent colour in an active window, its label white
++    onAccent=c.active && enabled;
++   }
+    if(image!=nil){
+     NSSize size=[image size];
+     CGFloat lw=[label length] ? ceil([label sizeWithAttributes:[NSDictionary dictionaryWithObject:[self _segmentFont] forKey:NSFontAttributeName]].width)+4 : 0;
+@@ -332,7 +342,7 @@
+    }
+    if([label length]){
+     NSFont *font=[self _segmentFont];
+-    NSColor *color=enabled ? [NSColor controlTextColor] : [NSColor disabledControlTextColor];
++    NSColor *color=onAccent ? [NSColor whiteColor] : enabled ? [NSColor controlTextColor] : [NSColor disabledControlTextColor];
+     NSDictionary *attributes=[NSDictionary dictionaryWithObjectsAndKeys:font,NSFontAttributeName,color,NSForegroundColorAttributeName,nil];
+     NSSize size=[label sizeWithAttributes:attributes];
+     CGFloat cap=[font capHeight]>0 ? [font capHeight] : [font ascender]*0.72;
+@@ -349,7 +359,8 @@
+ - (void)drawWithFrame:(NSRect)cellFrame inView:(NSView *)controlView {
+    SFDrawContext c=SFCurrentDrawContext(controlView);
+    int i=0, count=[self segmentCount];
+-   NSRect track=SFRectFromTop(NSInsetRect(cellFrame,2,0),c.flipped,floor((cellFrame.size.height-24)/2)+1,22);
++   CGFloat rows=MIN(segmentHeight([self controlSize]),cellFrame.size.height);
++   NSRect track=SFRectFromTop(cellFrame,c.flipped,floor((cellFrame.size.height-rows)/2),rows);
+    CGFloat x=NSMinX(cellFrame);
+    NSInteger selected=NSNotFound;
+ 
+@@ -362,14 +373,9 @@
+      selected=i;
+    for(i=0; i<count; i++) {
+       CGFloat w=[[_segmentComputedWidths objectAtIndex:i] doubleValue];
+-      NSRect segmentFrame=NSMakeRect(x,track.origin.y,w,track.size.height);
++      // on whole device pixels at 2x, as macOS places them
++      NSRect segmentFrame=NSMakeRect(round(x*2)/2,track.origin.y,round((x+w)*2)/2-round(x*2)/2,track.size.height);
+ 
+-      if(i==0){
+-       segmentFrame.origin.x+=3;
+-       segmentFrame.size.width-=3;
+-      }
+-      if(i==count-1)
+-       segmentFrame.size.width-=3;
+       // dividers sit between two segments that are not selected
+       if(i>0 && i!=selected && i-1!=selected)
+        SFDrawSegmentDivider(c,track,x);
+@@ -380,12 +386,12 @@
+ 
+ -(NSSize)cellSize
+ {
+-    CGFloat width=6;
++    CGFloat width=0;
+     int i;
+ 
+     for (i = 0; i < [self segmentCount]; ++i)
+         width+=[self _naturalWidthOfSegment:i];
+-    return NSMakeSize(ceil(width),24);
++    return NSMakeSize(ceil(width-0.01),segmentHeight([self controlSize]));
+ }
+ 
+ 
+--- a/src/Frameworks/AppKit/NSInterfacePart/SFControlDrawing.m
++++ b/src/Frameworks/AppKit/NSInterfacePart/SFControlDrawing.m
+@@ -1,4 +1,6 @@
+-// SFControlDrawing.m - draws the macOS 15 look of the standard controls with CoreGraphics paths
++// SFControlDrawing.m - draws the standard controls with CoreGraphics paths, in one of two looks:
++// the macOS 26 look (flat translucent fills, measured by SiliconForest from a Mac running 26.5,
++// integrations/siliconforest/cocoa/conformance) and the macOS 15 look this file started with
+ // Copyright (c) 2026 The PureDarwin Project, SPDX-License-Identifier: MPL-2.0 OR BSD-2-Clause
+ 
+ // the colours and offsets are measured from macOS 15 renderings of the same cells (src/Tools/uigallery)
+@@ -107,6 +109,60 @@
+    return r;
+ }
+ 
++/* Which look. The macOS 26 one unless the user default SFControlLook (or the environment variable
++ * SF_CONTROL_LOOK) says "15": the geometry the cells report is macOS 26's in both. */
++#import <Foundation/NSUserDefaults.h>
++#include <stdlib.h>
++#include <string.h>
++
++static BOOL lookIs26(void) {
++   static int look=-1;
++
++   if(look<0){
++    const char *env=getenv("SF_CONTROL_LOOK");
++    NSString *value=env ? [NSString stringWithUTF8String:env] : [[NSUserDefaults standardUserDefaults] stringForKey:@"SFControlLook"];
++
++    look=[value isEqualToString:@"15"] ? 0 : 1;
++   }
++   return look;
++}
++
++/* The macOS 26 look, light appearance, every number measured from the control sheet rendered on
++ * a Mac (runs/cocoa/ref-macos/render-controls*.png; alpha over the window, n/255 as measured):
++ *   push button, pop-up, segmented track   black 20/255; disabled 10/255; corner radius a quarter
++ *                                          of the height (6, 5, 4)
++ *   default button, progress fill          accent, 3478f6 for the standard blue
++ *   checkbox, radio, slider fill, selected segment   accent, 3275f0 for the standard blue
++ *   checkbox and radio off                 black 25/255; on in an inactive window 36/255 with a
++ *                                          dark mark (216/255); disabled 19/255, mark 66/255
++ *   slider track                           black 25/255, the part before the knob 58/255 in an
++ *                                          inactive window; knob a white capsule
++ *   progress track                         black 15/255
++ *   selected segment, inactive window      black 50/255
++ *   text field                             white, a one point ring of black 23/255 around it
++ * The dark appearance is not measured yet: it uses the same alphas in white, which is a guess.
++ * Pressed states cannot be rendered offscreen either: twice the resting alpha, a guess too. */
++static void fill26(SFDrawContext c, CGRect r, CGFloat radius, CGFloat alpha) {
++   fillGrey(r,radius,c.dark ? 1 : 0,c.dark ? MIN(1,alpha*1.6) : alpha);
++}
++
++/* The accent as the standard controls show it. For the standard blue macOS fills a default button
++ * and a progress bar with 3478f6 and a checkbox, radio button, slider and selected segment with
++ * 3275f0, where +controlAccentColor is 007aff (measured; the colour is defined in a wider space
++ * than the bitmap's). Other accents have not been measured and are used as they are. */
++static void fillAccent26(SFDrawContext c, CGRect r, CGFloat radius, BOOL toggle, CGFloat alpha, BOOL pressed) {
++   NSColor *accent=[[NSColor controlAccentColor] colorUsingColorSpaceName:NSCalibratedRGBColorSpace];
++   CGFloat red=[accent redComponent],green=[accent greenComponent],blue=[accent blueComponent];
++   CGFloat k=pressed ? 0.85 : 1.0;
++
++   if(fabs(red)<0.01 && fabs(green-122/255.0)<0.01 && fabs(blue-1)<0.01){
++    red=(toggle ? 50 : 52)/255.0;
++    green=(toggle ? 117 : 120)/255.0;
++    blue=(toggle ? 240 : 246)/255.0;
++   }
++   fillRounded(r,radius,red*k,green*k,blue*k,alpha);
++}
++
+ static void accentGradient(SFDrawContext c, CGFloat top[3], CGFloat bottom[3]) {
+    NSColor *accent=SFAccentColor(c);
+    CGFloat r=[accent redComponent],g=[accent greenComponent],b=[accent blueComponent];
+@@ -117,6 +173,15 @@
+ }
+ 
+ void SFDrawPushBezel(SFDrawContext c, NSRect bezel, BOOL defaulted, BOOL pressed, BOOL enabled) {
++   if(lookIs26()){
++    CGFloat radius=MIN(bezel.size.height/4,6);
++
++    if(defaulted && enabled && c.active)
++     fillAccent26(c,bezel,radius,NO,1,pressed);
++    else
++     fill26(c,bezel,radius,(enabled ? 20 : 10)/255.0*(pressed ? 2 : 1));
++    return;
++   }
+    CGRect outer=SFRectFromTop(bezel,c.flipped,0,bezel.size.height-1);
+    CGRect shadow=down(c,NSInsetRect(outer,1,0),1);
+    CGRect body=SFRectFromTop(NSInsetRect(outer,1,0),c.flipped,1,outer.size.height-1);
+@@ -217,8 +282,47 @@
+    fillRoundedGradient(c,box,radius,top,bottom);
+ }
+ 
++// the box or circle of a checkbox or radio button in the macOS 26 look; YES when the mark goes on accent
++static BOOL toggle26(SFDrawContext c, NSRect box, CGFloat radius, BOOL on, BOOL enabled, BOOL pressed) {
++   if(!on){
++    fill26(c,box,radius,(enabled ? 25 : 19)/255.0*(pressed ? 2 : 1));
++    return NO;
++   }
++   if(c.active){
++    fillAccent26(c,box,radius,YES,enabled ? 1 : 112/255.0,pressed);
++    return YES;
++   }
++   fill26(c,box,radius,(enabled ? 36 : 19)/255.0);
++   return NO;
++}
++
+ void SFDrawCheckBox(SFDrawContext c, NSRect box, NSControlStateValue state, BOOL enabled, BOOL pressed) {
+    CGContextRef ctx=port();
++
++   if(lookIs26()){
++    CGFloat k=box.size.width;
++    BOOL onAccent=toggle26(c,box,k*0.3,state!=NSOffState,enabled,pressed);
++    CGFloat ink=(onAccent || c.dark) ? 1 : 0;
++    CGFloat alpha=onAccent ? (enabled ? 1 : 0.72) : (enabled ? 216 : 66)/255.0;
++
++    if(state==NSOffState)
++     return;
++    CGContextBeginPath(ctx);
++    if(state==NSMixedState){
++     CGContextMoveToPoint(ctx,at(c,box,k*0.25,k*0.5).x,at(c,box,k*0.25,k*0.5).y);
++     CGContextAddLineToPoint(ctx,at(c,box,k*0.75,k*0.5).x,at(c,box,k*0.75,k*0.5).y);
++    }
++    else {
++     // the tick as measured in a 16 point box: from (3.7, 8.6) down to (6.5, 12.2) and up to (11.6, 4.2)
++     CGPoint a=at(c,box,k*0.231,k*0.538),b=at(c,box,k*0.406,k*0.762),e=at(c,box,k*0.725,k*0.262);
++
++     CGContextMoveToPoint(ctx,a.x,a.y);
++     CGContextAddLineToPoint(ctx,b.x,b.y);
++     CGContextAddLineToPoint(ctx,e.x,e.y);
++    }
++    strokePath(ctx,k*0.125,ink,ink,ink,alpha);
++    return;
++   }
+    CGFloat s=box.size.width/14;
+    CGFloat radius=3.5*s;
+    CGFloat mark=enabled ? 1 : (c.dark ? 0.45 : 0.72);
+@@ -251,6 +355,14 @@
+ }
+ 
+ void SFDrawRadioButton(SFDrawContext c, NSRect box, BOOL on, BOOL enabled, BOOL pressed) {
++   if(lookIs26()){
++    CGFloat k=box.size.width,d=k*5/16;
++    BOOL onAccent=toggle26(c,box,k/2,on,enabled,pressed);
++
++    if(on)
++     fillGrey(NSInsetRect(box,(k-d)/2,(k-d)/2),d/2,(onAccent || c.dark) ? 1 : 0,onAccent ? (enabled ? 1 : 0.72) : (enabled ? 216 : 66)/255.0);
++    return;
++   }
+    CGFloat radius=box.size.width/2;
+    CGFloat dot=box.size.width*6/14;
+    CGFloat mark=enabled ? 1 : (c.dark ? 0.45 : 0.72);
+@@ -284,6 +396,21 @@
+ void SFDrawArrowBox(SFDrawContext c, NSRect box, BOOL upAndDown, BOOL enabled) {
+    CGFloat top[3],bottom[3];
+    CGFloat cx=NSMidX(box),cy=NSMidY(box);
++
++   if(lookIs26()){
++    // no box: two chevrons 7 points wide and 3.5 high, their points 10 apart (in a 24 point bezel),
++    // in the title's colour
++    CGFloat k=MIN(1,box.size.height/16);
++    CGFloat ink=c.dark ? 1 : 0,alpha=(enabled ? 219 : 73)/255.0;
++
++    if(upAndDown){
++     chevron(c,cx,cy-3.25*k*(c.flipped ? 1 : -1),YES,7*k,3.5*k,1.6*k,ink,alpha);
++     chevron(c,cx,cy+3.25*k*(c.flipped ? 1 : -1),NO,7*k,3.5*k,1.6*k,ink,alpha);
++    }
++    else
++     chevron(c,cx,cy,NO,8*k,4*k,1.6*k,ink,alpha);
++    return;
++   }
+    BOOL tinted=c.active && enabled;
+    CGFloat ink=tinted ? 1 : (c.dark ? 0.85 : 0.2);
+ 
+@@ -311,6 +438,28 @@
+    CGRect inner=NSInsetRect(frame,1,1);
+    CGRect top=frame,bottom=frame;
+ 
++   if(lookIs26()){
++    /* macOS puts the ring one point outside the frame and the white on the frame itself. A cell
++     * here cannot draw outside its view, so the ring is the frame's outermost point and the white
++     * is one point smaller each side than on macOS: a known difference, listed in SF-U-cocoa.md. */
++    CGFloat r=radius>0 ? radius : MIN(6,frame.size.height/4);
++
++    fill26(c,frame,r,23/255.0);
++    if(c.dark)
++     fillGrey(inner,MAX(0,r-1),0.118,1);
++    else
++     fillGrey(inner,MAX(0,r-1),1,1);
++    if(background!=nil && ![background isEqual:[NSColor textBackgroundColor]]){
++     CGContextSaveGState(port());
++     [background setFill];
++     CGContextBeginPath(port());
++     addRoundedRect(port(),inner,MAX(0,r-1));
++     CGContextFillPath(port());
++     CGContextRestoreGState(port());
++    }
++    return;
++   }
++
+    top.size.height=1;
+    bottom.size.height=1;
+    if(c.flipped)
+@@ -376,6 +525,33 @@
+ // the track is six rows tall, seven rows below the top of a 20 row frame
+ void SFDrawProgressBar(SFDrawContext c, NSRect frame, double fraction, BOOL indeterminate, double phase) {
+    CGFloat h=6;
++
++   if(lookIs26()){
++    // 8 rows of a 20 point frame, 6 of a 12 point one; the fill is the accent, 170 grey when inactive
++    NSRect track;
++    NSRect bar;
++
++    h=frame.size.height>=20 ? 8 : 6;
++    track=SFRectFromTop(frame,c.flipped,floor((frame.size.height-h)/2),h);
++    bar=track;
++    fill26(c,track,h/2,15/255.0);
++    if(indeterminate){
++     CGFloat w=MAX(h,floor(track.size.width*0.3));
++
++     bar.origin.x=NSMinX(track)-w+fmod(phase,1.0)*(track.size.width+w);
++     bar.size.width=w;
++     bar=NSIntersectionRect(bar,track);
++    }
++    else
++     bar.size.width=fraction>0 ? MAX(h,round(track.size.width*MIN(1.0,fraction))) : 0;
++    if(bar.size.width>=h){
++     if(c.active)
++      fillAccent26(c,bar,h/2,NO,1,NO);
++     else
++      fillGrey(bar,h/2,c.dark ? 0.45 : 170/255.0,1);
++    }
++    return;
++   }
+    NSRect track=SFRectFromTop(frame,c.flipped,floor((frame.size.height-h)/2),h);
+    NSColor *accent=SFAccentColor(c);
+ 
+@@ -419,6 +595,28 @@
+    NSColor *accent=c.active ? SFAccentColor(c) : [NSColor colorWithCalibratedWhite:c.dark ? 0.36 : 0.835 alpha:1];
+    NSRect fill=track;
+ 
++   if(lookIs26()){
++    fill26(c,track,thick/2,25/255.0);
++    if(vertical){
++     if(c.flipped){
++      fill.origin.y=fillTo;
++      fill.size.height=NSMaxY(track)-fillTo;
++     }
++     else
++      fill.size.height=fillTo-NSMinY(track);
++    }
++    else
++     fill.size.width=fillTo-NSMinX(track);
++    if(fill.size.width<=0 || fill.size.height<=0)
++     return;
++    // the part before the knob: over the track, so 58/255 in all when the window is inactive
++    if(c.active)
++     fillAccent26(c,fill,thick/2,YES,enabled ? 1 : 0.44,NO);
++    else
++     fill26(c,fill,thick/2,(58-25)/255.0/(1-25/255.0));
++    return;
++   }
++
+    if(c.dark)
+     fillGrey(track,thick/2,1,0.10);
+    else {
+@@ -452,6 +650,17 @@
+    CGFloat d=MIN(knob.size.width,knob.size.height);
+    NSRect disc=NSMakeRect(NSMidX(knob)-d/2,NSMidY(knob)-d/2,d,d);
+ 
++   if(lookIs26()){
++    // a white capsule the size of the knob rect, a soft halo fading over about four points
++    int i;
++
++    for(i=4;i>=1;i--)
++     fillGrey(NSInsetRect(knob,-i,-i),d/2+i,0,0.016);
++    fillGrey(NSInsetRect(knob,-0.5,-0.5),d/2+0.5,0,0.05);
++    fillGrey(knob,d/2,c.dark ? (pressed ? 0.85 : 0.8) : (pressed ? 0.94 : 1),enabled ? 1 : 0.75);
++    return;
++   }
++
+    if(c.dark){
+     fillGrey(down(c,disc,0.5),d/2,0,0.3);
+     fillGrey(disc,d/2,pressed ? 0.7 : 0.6,enabled ? 1 : 0.5);
+@@ -491,6 +700,10 @@
+ }
+ 
+ void SFDrawSegmentTrack(SFDrawContext c, NSRect track) {
++   if(lookIs26()){
++    fill26(c,track,MIN(track.size.height/4,6),20/255.0);
++    return;
++   }
+    if(c.dark)
+     fillGrey(track,6,1,0.10);
+    else {
+@@ -500,6 +713,16 @@
+ }
+ 
+ void SFDrawSegmentSelection(SFDrawContext c, NSRect segment) {
++   if(lookIs26()){
++    CGFloat radius=MIN(segment.size.height/4,6);
++
++    // over the track's 20/255: the accent when active, 50/255 in all when not
++    if(c.active)
++     fillAccent26(c,segment,radius,YES,1,NO);
++    else
++     fill26(c,segment,radius,(50-20)/255.0/(1-20/255.0));
++    return;
++   }
+    if(c.dark){
+     fillGrey(segment,5,1,0.28);
+     return;
+@@ -510,6 +733,9 @@
+ }
+ 
+ void SFDrawSegmentDivider(SFDrawContext c, NSRect track, CGFloat x) {
++   // macOS 26 draws no dividers
++   if(lookIs26())
++    return;
+    NSRect line=NSMakeRect(floor(x),NSMinY(track)+6,1,track.size.height-12);
+ 
+    fillGrey(line,0,c.dark ? 1 : 0,c.dark ? 0.2 : 0.1);
+--- a/src/Frameworks/AppKit/NSStringDrawer.m
++++ b/src/Frameworks/AppKit/NSStringDrawer.m
+@@ -93,6 +93,18 @@
+    [_textStorage setAttributedString:astring];
+ 
+    glyphRange=[_layoutManager glyphRangeForTextContainer:_textContainer];
++   /* A rect lower than one line holds no line at all for the layout, and nothing was drawn: a
++    * label exactly as high as its text (what -sizeToFit gives it) came out empty. macOS draws
++    * the first line there, cut off by whoever clips; so the container is given the height the
++    * text asks for and laid out again. */
++   if(glyphRange.length==0 && [astring length]>0 && rect.size.width>0){
++    NSSize need;
++
++    [_textContainer setContainerSize:NSMakeSize(rect.size.width,NSStringDrawerLargeDimension)];
++    need=[_layoutManager usedRectForTextContainer:_textContainer].size;
++    [_textContainer setContainerSize:NSMakeSize(rect.size.width,MAX(rect.size.height,ceil(need.height)+1))];
++    glyphRange=[_layoutManager glyphRangeForTextContainer:_textContainer];
++   }
+    [_layoutManager drawBackgroundForGlyphRange:glyphRange atPoint:rect.origin];
+    [_layoutManager drawGlyphsForGlyphRange:glyphRange atPoint:rect.origin];
+ }

@@ -1,0 +1,162 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Step 3c, one boot of the WRITE-FENCED build with the root on the memory disk and ext4 with
+# ext4-downgrade.patch; how the boot ENDS is @WMODE@:
+#   unclean    the filesystem is left mounted read-write: seal (Flush, fence closed), stop.
+#              The next mount, Darwin's or Linux's, has a journal to recover
+#   downgrade  mount -o update,rdonly (journal emptied, RECOVER cleared, cache flushed), seal,
+#              stop, the filesystem still mounted: the next mount finds it clean
+# Every file found under /private/sf-wtest at the mount is hashed first (what the previous
+# boot left, after this mount's own journal recovery if one was needed).
+# The phases before the write are those of darwin-disk-rw.in without its refusal tests:
+#   identify, hash   as darwin-disk-ro.in (every range through /dev/sfnvme0 BEFORE any write)
+#   media      the guard holds ALL partitions; the fence is open; the fenced device exists
+#   refuse     writes on every node of the whole disk refused; reads of an owner partition and
+#              of ours through the whole disk refused (read fence = the GPT only); the range
+#              check asked about both boundaries and every owner partition (kern.sf_nvme.wprobe:
+#              nothing is written); one write past the end of the fenced device
+#   write      ext4 read-write on the fenced device: files written, synced, hashed; a stop
+#              request while mounted must be refused; unmount; mounted again read-only: hashes
+#   after      every range again through /dev/sfnvme0; counters
+#   stop       SMART, clean controller shutdown (flush first), final counters
+# sfnvme-test wtest is NEVER pointed at the fenced device (it writes what it reads back).
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nNV_BEGIN_%s\n' "$nonce"
+get() { sysctl -n "$1" 2>/dev/null; }
+t0=$(date +%s)
+phase() { printf 'NV_PHASE %s t=%s\n' "$1" "$(( $(date +%s) - t0 ))"; }
+counters() {
+    printf 'NV_GATE_REJECTED %s\n' "$(get kern.sf_nvme.gate_rejected)"
+    printf 'NV_WRITE_REFUSED %s\n' "$(get kern.sf_nvme.write_refused)"
+    # twice: a kernel log line can land in the middle of one (dr11); the verdict takes a complete reading
+    ws_now=$(get kern.sf_nvme.wstats)
+    printf 'NV_WSTATS %s %s\n' "$1" "$ws_now"; printf 'NV_WSTATS %s %s\n' "$1" "$ws_now"
+}
+finish() {
+    printf 'NV_STATE %s\n' "$(get kern.sf_nvme.state)"
+    printf 'NV_STATS %s\n' "$(get kern.sf_nvme.stats)"
+    counters final
+    printf 'NV_WGATE_SELFTEST final %s\n' "$(get kern.sf_nvme.wgate_selftest)"
+    printf 'NV_STOP %s\n' "$(get kern.sf_nvme.stop)"
+    dmesg 2>/dev/null | grep 'SFAppleNVMe: \(write side\|flush before\|controller stopped\|sealed\|stop refused\|sfnvme_write\|the fenced\)' | tail -12 | sed 's/^/NV_DMESG /'
+    # the filesystem driver's own lines of this boot (they reach the log buffer with a delay, so here at the end)
+    dmesg 2>/dev/null | grep 'ext4: ' | grep -v 'unmount stats' | tail -24 | sed 's/^/NV_DMESG /'
+    printf 'NV_END_%s\n' "$nonce"
+    printf '\nPD_BENCH_DONE\n'
+    exit 0
+}
+stop_now() {
+    printf 'NV_FAIL %s; stopping the controller\n' "$1"
+    sync; umount /tmp/sf 2>/dev/null; sysctl -w kern.sf_nvme.seal=1 > /dev/null 2>&1
+    sysctl -w kern.sf_nvme.stop=1 2>&1 | sed 's/^/NV_STOPCALL /'
+    n=0
+    while [ "$n" -lt 40 ]; do case "$(get kern.sf_nvme.state)" in stopped*|failed*) break;; esac; sleep 1; n=$((n+1)); done
+    finish
+}
+phase bringup
+n=0
+while [ "$n" -lt 60 ]; do
+    case "$(get kern.sf_nvme.state)" in ready*|failed*|stopped*) break;; esac
+    sleep 1; n=$((n+1))
+done
+printf 'NV_STATE %s\n' "$(get kern.sf_nvme.state)"
+printf 'NV_NCPU %s\n' "$(get hw.ncpu)"
+printf 'NV_GATE_SELFTEST %s\n' "$(get kern.sf_nvme.gate_selftest)"
+case "$(get kern.sf_nvme.state)" in ready*) ;; *) printf 'NV_FAIL the driver is not ready\n'; finish;; esac
+
+phase identify
+printf 'NV_IDCTRL %s\n' "$(get kern.sf_nvme.idctrl)"
+printf 'NV_IDNS %s\n' "$(get kern.sf_nvme.idns)"
+printf 'NV_SMART start %s\n' "$(get kern.sf_nvme.smart)"
+printf 'NV_SMARTRAW start %s\n' "$(get kern.sf_nvme.smart_raw)"
+
+phase hash
+sfnvme-test hash /dev/sfnvme0 /etc/sfnvme-ranges 2>&1
+
+phase media
+sleep 3
+census=$(get kern.sf_nvme.media)
+printf 'NV_MEDIA %s\n' "$census"
+printf 'NV_PART %s\n' "$(get kern.sf_nvme.part)"
+mount 2>&1 | sed 's/^/NV_MOUNT /'
+case "$census" in
+"published=1 partitions=@PARTS@ guarded=@PARTS@ foreign=0 ours=1") ;;
+*) stop_now "the guard is not on every partition of the whole disk";;
+esac
+case "$(get kern.sf_nvme.part)" in verified*) ;; *) stop_now "our partition was not identified in both GPT copies";; esac
+if mount 2>/dev/null | grep -q '/dev/disk'; then stop_now "something from a disk is mounted"; fi
+counters start
+printf 'NV_WGATE_SELFTEST start %s\n' "$(get kern.sf_nvme.wgate_selftest)"
+ws=$(get kern.sf_nvme.wstats)
+case "$ws" in "write_arg=1 fence=open first=@PART_LBA@ last=$((@PART_LBA@ + @PART_BLOCKS@ - 1)) device=disk"*) ;; *) stop_now "the fence is not open over exactly our partition";; esac
+dev=$(echo "$ws" | sed 's/.* device=\([a-z0-9]*\) .*/\1/')
+whole=""
+for d in /dev/rdisk[0-9]; do [ "$d" != "/dev/r$dev" ] && gpt -r show "$d" 2>/dev/null | grep -q "^ *@PART_LBA@ *@PART_BLOCKS@ " && whole=$d; done
+[ -n "$whole" ] || stop_now "no whole-disk node"
+printf 'NV_WHOLE %s NV_FENCED /dev/%s\n' "$whole" "$dev"
+ls -l "/dev/$dev" "/dev/r$dev" 2>&1 | sed 's/^/NV_NODE /'
+ls /dev/${dev}s* 2>/dev/null | sed 's/^/NV_FENCED_CHILD /'
+gpt -r show "$whole" 2>&1 | awk '{print "NV_GPT", $1, $2, $3, $4, $5, $6, $7, $8}'
+index=$(gpt -r show "$whole" 2>/dev/null | awk '$1 == @PART_LBA@ && $2 == @PART_BLOCKS@ { print $3 }')
+printf 'NV_OURS index=%s\n' "$index"
+case "$index" in [1-9]|[1-9][0-9]) ;; *) stop_now "our partition is not in the table the stack parsed";; esac
+
+phase write
+mkdir -p /tmp/sf
+mount -t ext4 "/dev/$dev" /tmp/sf 2>&1 | sed 's/^/NV_MOUNT_ERR /'
+mount 2>&1 | grep '/tmp/sf' | sed 's/^/NV_MOUNT_RW /'
+mount 2>/dev/null | grep "^/dev/$dev on /private/tmp/sf (ext4" | grep -qv 'read-only' || stop_now "the read-write mount did not happen"
+dmesg 2>/dev/null | grep 'ext4: \(journal\|.*replay\|.*orphan\)' | tail -6 | sed 's/^/NV_DMESG /'
+W=/tmp/sf/private/sf-wtest
+mkdir -p "$W" || stop_now "mkdir in the mounted filesystem"
+(cd "$W" && find . -type f | sort | sed 's|^\./||' | while read f; do sha256sum "$f"; done) 2>&1 | sed 's/^/NV_WSHA found /'
+printf 'written by @NAME@ (%s), synced\n' "$nonce" > "$W/@NAME@-note.txt"
+for i in 1 2 3; do cat /usr/lib/libSystem.B.dylib; done > "$W/@NAME@-data.bin"
+mkdir -p "$W/@NAME@-dir"; cp /bin/sh "$W/@NAME@-dir/sh.bin"
+sync; sleep 2; sync
+(cd "$W" && sha256sum "@NAME@-note.txt" "@NAME@-data.bin" "@NAME@-dir/sh.bin") 2>&1 | sed 's/^/NV_WSHA written /'
+counters synced
+case "@WMODE@" in
+unclean)
+    # more, without a sync: it may or may not be on the device when the fence closes
+    printf 'written by @NAME@ after the last sync\n' > "$W/@NAME@-late.txt"
+    cp /etc/passwd "$W/@NAME@-late.bin"
+    ;;
+downgrade)
+    printf 'written by @NAME@ just before the downgrade, no sync\n' > "$W/@NAME@-late.txt"
+    (cd "$W" && sha256sum "@NAME@-late.txt") 2>&1 | sed 's/^/NV_WSHA written /'
+    ( exec 3>> "$W/@NAME@-open.txt"; echo "held open across the downgrade" >&3; sleep 120 ) &
+    sleep 1
+    mount -t ext4 -o update,rdonly "/dev/$dev" /tmp/sf > /tmp/down.out 2>&1; printf 'NV_DOWNGRADE rc=%s %s\n' "$?" "$(head -1 /tmp/down.out)"
+    mount 2>&1 | grep '/tmp/sf' | sed 's/^/NV_MOUNT_DOWN /'
+    sh -c "echo x > $W/@NAME@-after.txt" 2>/tmp/w.out; printf 'NV_FSWRITE create rc=%s %s\n' "$?" "$(head -1 /tmp/w.out)"
+    sh -c "echo x >> $W/@NAME@-note.txt" 2>/tmp/w.out; printf 'NV_FSWRITE append rc=%s %s\n' "$?" "$(head -1 /tmp/w.out)"
+    (cd "$W" && sha256sum "@NAME@-note.txt" "@NAME@-data.bin") 2>&1 | sed 's/^/NV_WSHA reread /'
+    dmesg 2>/dev/null | grep 'ext4: downgraded' | tail -1 | sed 's/^/NV_DMESG /'
+    ;;
+esac
+counters before-seal
+sysctl -w kern.sf_nvme.stop=1 > /tmp/stop.out 2>&1; printf 'NV_STOP_WHILE_MOUNTED rc=%s state=%s\n' "$?" "$(get kern.sf_nvme.state)"
+sysctl -w kern.sf_nvme.seal=1 > /tmp/seal.out 2>&1; printf 'NV_SEAL rc=%s seal=%s\n' "$?" "$(get kern.sf_nvme.seal)"
+sync
+sleep 2
+counters sealed
+mount 2>&1 | grep '/tmp/sf' | sed 's/^/NV_MOUNT_END /'
+
+phase after
+sfnvme-test hash /dev/sfnvme0 /etc/sfnvme-ranges 2>&1 | sed 's/^NVT_HASH/NVT_AFTER_WRITE_HASH/'
+printf 'NV_MEDIA %s\n' "$(get kern.sf_nvme.media)"
+counters after
+
+phase stop
+sysctl -w kern.sf_nvme.smart=1 > /dev/null 2>&1
+printf 'NV_SMART end %s\n' "$(get kern.sf_nvme.smart)"
+printf 'NV_SMARTRAW end %s\n' "$(get kern.sf_nvme.smart_raw)"
+sysctl -w kern.sf_nvme.stop=1 2>&1 | sed 's/^/NV_STOPCALL /'
+n=0
+while [ "$n" -lt 40 ]; do
+    case "$(get kern.sf_nvme.state)" in stopped*|failed*) break;; esac
+    sleep 1; n=$((n+1))
+done
+finish

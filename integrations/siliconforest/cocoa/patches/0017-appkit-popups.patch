@@ -1,0 +1,1336 @@
+--- a/src/Frameworks/AppKit/NSPopUpView.m
++++ b/src/Frameworks/AppKit/NSPopUpView.m
+@@ -510,6 +510,10 @@
+         }
+ 
+         event=[[self window] nextEventMatchingMask:NSPeriodicMask|NSLeftMouseUpMask|NSMouseMovedMask|NSLeftMouseDraggedMask|NSKeyDownMask|NSAppKitDefinedMask];
++        if (getenv("SF_POPUP_TRACE") != NULL && [event type] != NSPeriodic)
++            fprintf(stderr, "SFPOPUP event type=%d win=%d at %.1f,%.1f ts=%.3f state=%d moved=%d sel=%d ptr=%.1f,%.1f\n", (int)[event type],
++                    (int)[[event window] windowNumber], [event locationInWindow].x, [event locationInWindow].y, [event timestamp], (int)state,
++                    (int)mouseMoved, (int)_selectedIndex, [NSEvent mouseLocation].x, [NSEvent mouseLocation].y);
+         if (firstTimestamp == 0.) {
+             // Note: we don't do that using the first event, because in case the menu takes a long of time to display, the next event
+             // we get will be actually after our "long click" threshold
+--- a/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.h
++++ b/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.h
+@@ -24,6 +24,8 @@
+     int _macStyleChecked;
+     NSUInteger _macSourceCount;
+     NSMenuItem *_macSourceFirst;
++    // the least width of the panel (a pop-up button's menu is at least as wide as the button)
++    CGFloat _sfMinimumWidth;
+ }
+ 
+ - (void)setMenu:(NSMenu *)menu;
+--- a/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
++++ b/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
+@@ -32,6 +32,25 @@
+ // a clear margin round the panel holds its drop shadow, the demo's 0 10px 30px at a quarter black
+ #define SHADOW_M     16.0
+ #define MENU_MIN_W  210.0
++// the room before the titles for check marks, in a menu that has a checked item
++#define STATE_W      12.0
++// how far the pointer goes from where the button went down before a release picks instead of leaving the menu open
++#define DRAG_SLOP     3.0
++// a release within the double-click time of the press, without such a move, is a click: the menu stays
++// open (the rule of the classic Mac's sticky menus; the time is the user's double-click setting)
++#define CLICK_TIME    [NSEvent doubleClickInterval]
++// a submenu stays this long after the pointer went on to another item, so that a slanted move into it arrives
++#define SUBMENU_LINGER 0.25
++// typing selects by title prefix; a pause this long starts a new prefix
++#define TYPE_SELECT_PAUSE 1.0
++
++#import <WindowServer/rpc.h>
++
++@interface NSWindow (SFPopupPlacement)
+++ (BOOL)_sfCompositorPlacesPopups;
++- (void)_sfSetPopupAnchorRect:(NSRect)rect kind:(int)kind parent:(NSWindow *)parent;
++- (void)_setBackgroundBlurInset:(CGFloat)inset radius:(CGFloat)radius;
++@end
+ 
+ // the Mac glyphs for a shortcut: control, option, shift, command, then the key
+ static NSString *sfKeyEquivalentGlyphs(NSMenuItem *item)
+@@ -260,7 +279,20 @@
+         return _presentedItems;
+     }
+     if (![self _groupsIntoApplicationMenu]) {
+-        return [_menu itemArray];
++        NSArray *all = [_menu itemArray];
++        NSMutableArray *shown = nil;
++        NSUInteger i, count = [all count];
++
++        // hidden items take no room; the array is only copied when there is one
++        for (i = 0; i < count; i++) {
++            if ([[all objectAtIndex:i] isHidden]) {
++                if (shown == nil)
++                    shown = [NSMutableArray arrayWithArray:[all subarrayWithRange:NSMakeRange(0, i)]];
++            }
++            else if (shown != nil)
++                [shown addObject:[all objectAtIndex:i]];
++        }
++        return shown != nil ? shown : all;
+     }
+     // apps may fill the menu in after setMainMenu:, so rebuild when the item count changes
+     NSArray *source = [_menu itemArray];
+@@ -345,6 +377,14 @@
+     if (index != _highlightedIndex) {
+         _highlightedIndex = index;
+         [self setNeedsDisplay:YES];
++        // the menu's delegate hears which item is about to be lit (nil: none), as on macOS
++        if (!_horizontal && _tracking + (_supermenuView != nil) > 0) {
++            id delegate = [_menu delegate];
++            NSArray *items = [self presentedItems];
++
++            if ([delegate respondsToSelector:@selector(menu:willHighlightItem:)])
++                [delegate menu:_menu willHighlightItem:(index >= 0 && index < (NSInteger)[items count]) ? [items objectAtIndex:index] : nil];
++        }
+     }
+ }
+ 
+@@ -354,6 +394,18 @@
+                                        forKey:NSFontAttributeName];
+ }
+ 
++// room before the titles of a vertical menu: there when one of its items is checked, as on macOS
++- (CGFloat)_sfStateColumn
++{
++    if (_horizontal)
++        return 0;
++    for (NSMenuItem *item in [self presentedItems]) {
++        if ([item state] != NSOffState)
++            return STATE_W;
++    }
++    return 0;
++}
++
+ - (NSSize)sizeOfItem:(NSMenuItem *)item
+ {
+     NSSize size;
+@@ -370,7 +422,7 @@
+      * whoever draws the title must measure with the same dictionary, or the
+      * item comes out narrower than its own text and the title is clipped. */
+     size = [(title != nil ? title : @"") sizeWithAttributes:[self itemAttributes]];
+-    size.width += ITEM_PAD_X * 2.0;
++    size.width += ITEM_PAD_X * 2.0 + [self _sfStateColumn];
+     size.height += ITEM_PAD_Y * 2.0;
+ 
+     if (!_horizontal && [item hasSubmenu]) {
+@@ -444,7 +496,8 @@
+     NSRect frame = [self frame];
+ 
+     if (!_horizontal) {
+-        total.width = MAX(total.width + 2 * PANEL_INSET, MENU_MIN_W);
++        // a menu is as wide as its widest item; upstream's own menu bar keeps its wider panels
++        total.width = MAX(total.width + 2 * PANEL_INSET, [NSWindow _sfCompositorPlacesPopups] ? _sfMinimumWidth : MENU_MIN_W);
+         total.width += 2 * SHADOW_M;
+         total.height += 2 * PANEL_INSET + 2 * SHADOW_M;
+     }
+@@ -559,11 +612,15 @@
+     keyAttrs = @{ NSFontAttributeName : _font, NSForegroundColorAttributeName : keyInk };
+ 
+     textRect = NSInsetRect(rect, ITEM_PAD_X, ITEM_PAD_Y);
+-    // a checked item carries its mark in the left padding, the title stays in line with the rest
++    // a checked item carries its mark in the column before the titles, which stay in line
++    w = [self _sfStateColumn];
+     if ([item state] == NSOnState) {
+-        w = [@"\u2713" sizeWithAttributes:attrs].width;
+-        [@"\u2713" drawInRect:NSMakeRect(NSMinX(textRect) - w - 2, NSMinY(textRect), w + 1, NSHeight(textRect)) withAttributes:attrs];
++        CGFloat mark = [@"\u2713" sizeWithAttributes:attrs].width;
++
++        [@"\u2713" drawInRect:NSMakeRect(NSMinX(textRect) - 3, NSMinY(textRect), mark + 1, NSHeight(textRect)) withAttributes:attrs];
+     }
++    textRect.origin.x += w;
++    textRect.size.width -= w;
+     [(title != nil ? title : @"") drawInRect:textRect withAttributes:attrs];
+ 
+     keys = sfKeyEquivalentGlyphs(item);
+@@ -577,6 +634,39 @@
+     }
+ }
+ 
++/* A menu's window: borderless, at the pop-up menu level, clear around the panel so that the panel's
++ * round corners and its shadow lie over what is behind. Where the compositor places popups
++ * (xdg_popup) the window is given what it hangs on, so that the compositor can keep it on the panel:
++ * `anchor` is a rectangle on the screen, `kind` one of WS_POPUP_*. */
+++ (NSWindow *)_sfWindowForView:(NSMenuView *)view frame:(NSRect)frame anchor:(NSRect)anchor kind:(int)kind
++                        parent:(NSWindow *)parent
++{
++    NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
++                                                   styleMask:NSBorderlessWindowMask
++                                                     backing:NSBackingStoreBuffered
++                                                       defer:NO];
++
++    [window setLevel:NSPopUpMenuWindowLevel];
++    [window setOpaque:NO];
++    [window setBackgroundColor:[NSColor clearColor]];
++    // the panel inside the shadow margin gets the compositor's blur where it has one
++    [window _setBackgroundBlurInset:SHADOW_M radius:8];
++    [window _sfSetPopupAnchorRect:anchor kind:kind parent:parent];
++    [[window contentView] addSubview:view];
++    [window orderFront:nil];
++    // drawn now: the tracking loop holds the run loop that would otherwise paint it
++    [window display];
++    return window;
++}
++
++// the panel (the menu without its shadow margin) on the screen
++- (NSRect)_sfPanelOnScreen
++{
++    NSRect frame = [[self window] frame];
++
++    return _horizontal ? frame : NSInsetRect(frame, SHADOW_M, SHADOW_M);
++}
++
+ /* A submenu is a vertical view in its own borderless window above everything
+  * else; the menu bar itself is a layer-shell surface and cannot host it. */
+ - (void)openSubmenuAtIndex:(NSInteger)index
+@@ -593,6 +683,10 @@
+     if (submenu == nil && loose == nil) {
+         return;
+     }
++    // the submenu's owner fills it in and its items are enabled or not as of now
++    [submenu update];
++    if ([[submenu delegate] respondsToSelector:@selector(menuWillOpen:)])
++        [[submenu delegate] menuWillOpen:submenu];
+ 
+     NSMenuView *view = [[NSMenuView alloc] initWithFrame:NSMakeRect(0.0, 0.0, 10.0, 10.0)];
+ 
+@@ -622,26 +716,49 @@
+     }
+ 
+     NSRect itemRect = [self rectOfItemAtIndex:index];
+-    NSPoint origin = [self convertPoint:NSMakePoint(NSMinX(itemRect), NSMaxY(itemRect))
+-                                 toView:nil];
+-
+-    origin = [[self window] convertBaseToScreen:origin];
+-
+     NSRect frame = [view frame];
++    NSRect anchor = NSZeroRect;
++    int kind = WS_POPUP_AT_FRAME;
+ 
+-    frame.origin = origin;
+-    frame.origin.y -= frame.size.height;
+-
+-    NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
+-                                                   styleMask:NSBorderlessWindowMask
+-                                                     backing:NSBackingStoreBuffered
+-                                                       defer:NO];
++    if (_horizontal) {
++        // under a title of the bar
++        NSPoint origin = [self convertPoint:NSMakePoint(NSMinX(itemRect), NSMaxY(itemRect)) toView:nil];
+ 
+-    [window setLevel:NSPopUpMenuWindowLevel];
+-    [[window contentView] addSubview:view];
+-    [window orderFront:nil];
++        origin = [[self window] convertBaseToScreen:origin];
++        frame.origin = origin;
++        frame.origin.y -= frame.size.height;
++    }
++    else {
++        /* Beside its item: the panels overlap by two points and the submenu's first item is level
++         * with the item it belongs to; a compositor that has no room on the right puts the
++         * submenu the same way on the left. */
++        NSRect panel = [self _sfPanelOnScreen];
++        NSPoint itemTop = [[self window] convertBaseToScreen:[self convertPoint:itemRect.origin toView:nil]];
++
++        // a menu that went to the left of its own parent (no room on the right) sends its submenus on leftwards
++        BOOL leftwards = _supermenuView != nil && !_supermenuView->_horizontal &&
++                         NSMinX(panel) < NSMinX([_supermenuView _sfPanelOnScreen]);
++
++        frame.origin.x = leftwards ? NSMinX(panel) + 2 + SHADOW_M - frame.size.width : NSMaxX(panel) - 2 - SHADOW_M;
++        frame.origin.y = itemTop.y + PANEL_INSET + SHADOW_M - frame.size.height;
++        /* The anchor is the item's row drawn in by the overlap and by the submenu's own shadow margin:
++         * the submenu's window then lies edge to edge with it on either side, with no offset (a
++         * positioner's offset is not mirrored when the compositor flips the popup). */
++        anchor = NSMakeRect(NSMinX(panel) + 2 + SHADOW_M, itemTop.y - NSHeight(itemRect),
++                            MAX(1, NSWidth(panel) - 4 - 2 * SHADOW_M), NSHeight(itemRect));
++        kind = leftwards ? WS_POPUP_BESIDE_LEFT : WS_POPUP_BESIDE;
++        if (![NSWindow _sfCompositorPlacesPopups]) {
++            // nobody else keeps it on the screen: to the left when the right has no room, and up from the bottom
++            NSRect visible = [[NSScreen mainScreen] visibleFrame];
++
++            if (NSMaxX(frame) - SHADOW_M > NSMaxX(visible))
++                frame.origin.x = NSMinX(panel) + 2 + SHADOW_M - frame.size.width;
++            if (NSMinY(frame) + SHADOW_M < NSMinY(visible))
++                frame.origin.y = NSMinY(visible) - SHADOW_M;
++        }
++    }
+ 
+-    _submenuWindow = window;
++    _submenuWindow = [NSMenuView _sfWindowForView:view frame:frame anchor:anchor kind:kind parent:[self window]];
+     _submenuView = view;
+     _openSubmenuIndex = index;
+ }
+@@ -649,35 +766,115 @@
+ - (void)closeSubmenu
+ {
+     if (_submenuWindow != nil) {
++        NSMenu *closing = [[[_submenuView menu] retain] autorelease];
++
+         [_submenuView closeSubmenu];
+         [_submenuWindow orderOut:nil];
+         [_submenuWindow release];
+         _submenuWindow = nil;
++        // (the application menu of upstream's bar shows items of the bar's own menu: that one did not open)
++        if (closing != _menu && [[closing delegate] respondsToSelector:@selector(menuDidClose:)])
++            [[closing delegate] menuDidClose:closing];
+     }
+     [_submenuView release];
+     _submenuView = nil;
+     _openSubmenuIndex = -1;
+ }
+ 
+-/* Maps a screen point into whichever view currently owns it: the open submenu
+- * if the pointer is inside it, otherwise this view. */
++// the last menu of the chain that is open from this one
++- (NSMenuView *)_sfDeepestView
++{
++    NSMenuView *view = self;
++
++    while (view->_submenuView != nil)
++        view = view->_submenuView;
++    return view;
++}
++
++/* The open menu a screen point is over, the deepest first (a submenu lies over its parent), and the
++ * item there (-1: the panel's edge or a separator's neighbourhood). nil: over none of them. */
+ - (NSMenuView *)viewForScreenPoint:(NSPoint)screenPoint index:(NSInteger *)indexOut
+ {
+-    if (_submenuView != nil) {
+-        NSPoint base = [_submenuWindow convertScreenToBase:screenPoint];
+-        NSPoint local = [_submenuView convertPoint:base fromView:nil];
++    NSMenuView *view;
+ 
+-        if (NSPointInRect(local, [_submenuView bounds])) {
+-            *indexOut = [_submenuView indexOfItemAtPoint:local];
+-            return _submenuView;
++    for (view = [self _sfDeepestView]; view != nil; view = (view == self) ? nil : view->_supermenuView) {
++        if (NSPointInRect(screenPoint, [view _sfPanelOnScreen])) {
++            NSPoint base = [[view window] convertScreenToBase:screenPoint];
++
++            *indexOut = [view indexOfItemAtPoint:[view convertPoint:base fromView:nil]];
++            return view;
+         }
+     }
++    *indexOut = -1;
++    return nil;
++}
+ 
+-    NSPoint base = [[self window] convertScreenToBase:screenPoint];
+-    NSPoint local = [self convertPoint:base fromView:nil];
++- (BOOL)_sfItemOpensAtIndex:(NSInteger)index
++{
++    NSArray *items = [self presentedItems];
++    NSMenuItem *item;
+ 
+-    *indexOut = [self indexOfItemAtPoint:local];
+-    return self;
++    if (index < 0 || index >= (NSInteger)[items count])
++        return NO;
++    item = [items objectAtIndex:index];
++    return ([item hasSubmenu] || item == _macAppItem) && [item isEnabled];
++}
++
++// an item that can be highlighted and chosen or opened
++- (BOOL)_sfItemIsLiveAtIndex:(NSInteger)index
++{
++    NSArray *items = [self presentedItems];
++    NSMenuItem *item;
++
++    if (index < 0 || index >= (NSInteger)[items count])
++        return NO;
++    item = [items objectAtIndex:index];
++    return [item isEnabled] && ![item isSeparatorItem];
++}
++
++// the next live item from `from` in a direction (+1, -1), -1 when there is none: menus do not wrap
++- (NSInteger)_sfLiveIndexFrom:(NSInteger)from step:(NSInteger)step
++{
++    NSInteger count = (NSInteger)[[self presentedItems] count], i;
++
++    for (i = from; i >= 0 && i < count; i += step) {
++        if ([self _sfItemIsLiveAtIndex:i])
++            return i;
++    }
++    return -1;
++}
++
++// whether a view is this menu or one of the submenus open from it (a closed one is gone)
++- (BOOL)_sfChainHas:(NSMenuView *)wanted
++{
++    NSMenuView *view;
++
++    for (view = self; view != nil; view = view->_submenuView) {
++        if (view == wanted)
++            return YES;
++    }
++    return NO;
++}
++
++- (void)_sfSetMinimumWidth:(CGFloat)width
++{
++    _sfMinimumWidth = width;
++}
++
++// where an item's title starts and its middle line, in the view: what a pop-up button lines its own title up with
++- (NSPoint)_sfTitleOriginOfItemAtIndex:(NSInteger)index
++{
++    NSRect rect = [self rectOfItemAtIndex:index];
++
++    return NSMakePoint(NSMinX(rect) + ITEM_PAD_X + [self _sfStateColumn], NSMidY(rect));
++}
++
++- (void)_sfDisplayChain
++{
++    NSMenuView *view;
++
++    for (view = self; view != nil; view = view->_submenuView)
++        [[view window] displayIfNeeded];
+ }
+ 
+ - (void)mouseDown:(NSEvent *)event
+@@ -695,39 +892,196 @@
+     }
+ }
+ 
+-// runs the menu until a pick, a click on nothing or the app losing focus, and returns the pick
++/* Runs the menu, with the submenus that open from it, until an item is chosen or the menu is
++ * dismissed, and returns the choice (nil: dismissed). `event` is what opened it.
++ *
++ * Pointer. Opened by a button going down, the menu follows the pointer while the button is held
++ * and the release picks the item under it - unless the release comes at once and where the press
++ * was: that was a click, and the menu stays open for a second click (or the keyboard). A press
++ * outside every menu dismisses, and is not passed on. A release on a submenu's title or on nothing
++ * that can be chosen leaves things as they are.
++ * Keyboard. Up and Down move over the items that can be chosen (no wrap), Right opens a submenu,
++ * Left closes one, Return, Enter and Space choose or open, Escape and Command-period dismiss all,
++ * Home/End/Page Up/Page Down go to the ends; typing selects the first item whose title begins
++ * with what was typed.
++ * Dismissal from outside: the compositor ends a popup grab when the pointer is pressed on something
++ * that is not this application's (an NSAppKitDefined/NSApplicationDeactivated event). */
+ - (NSMenuItem *)_trackFromEvent:(NSEvent *)event
+ {
+     NSMenuItem *chosen = nil;
+-    // a menu opened by sliding onto its title is already open, the next click anywhere else closes it
+-    BOOL sticky = ([event type] != NSLeftMouseDown);
+-    // a quick click leaves the menu open, only a drag-and-release picks on the way up
+-    NSTimeInterval opened = [event timestamp];
+-    BOOL dragged = NO;
++    NSEventType startType = (event != nil) ? [event type] : NSKeyDown;
++    BOOL byButton = (startType == NSLeftMouseDown || startType == NSRightMouseDown || startType == NSOtherMouseDown);
++    // not sticky: the opening button is still down and its release may pick
++    BOOL sticky = !byButton;
++    BOOL movedFar = NO;
++    NSTimeInterval opened = byButton ? [event timestamp] : 0;
++    NSPoint pressPoint = NSZeroPoint, lastPoint = NSMakePoint(-1e6, -1e6);
++    NSMenuView *keyView = self;
++    NSMutableString *typed = [NSMutableString string];
++    NSTimeInterval typedAt = 0;
++    // a submenu left open while the pointer is over another item of its parent, and since when
++    NSMenuView *lingerView = nil;
++    NSInteger lingerIndex = -1;
++    NSTimeInterval lingerSince = 0;
++    BOOL trace = getenv("SF_POPUP_TRACE") != NULL;
++
++    if (byButton) {
++        NSWindow *window = [event window];
++
++        pressPoint = (window != nil) ? [window convertBaseToScreen:[event locationInWindow]] : [event locationInWindow];
++        lastPoint = pressPoint;
++    }
+ 
+     // only an activation that arrives while this menu is open cancels it
+     sfCancelTracking = NO;
+     _tracking = YES;
+-    [[NSNotificationCenter defaultCenter]
+-        postNotificationName:NSMenuDidBeginTrackingNotification
+-                      object:_menu];
++    [[NSNotificationCenter defaultCenter] postNotificationName:NSMenuDidBeginTrackingNotification object:_menu];
++    [self retain];
+ 
+     for (;;) {
+-        // once a submenu is open the pointer is over its window, so the event's
+-        // coordinates are relative to that one, not to this view's
++        NSUInteger mask = NSLeftMouseDownMask | NSLeftMouseUpMask | NSLeftMouseDraggedMask | NSRightMouseDownMask |
++                          NSRightMouseUpMask | NSRightMouseDraggedMask | NSOtherMouseDownMask | NSOtherMouseUpMask |
++                          NSOtherMouseDraggedMask | NSMouseMovedMask | NSKeyDownMask | NSAppKitDefinedMask;
++
++        [self _sfDisplayChain];
++        event = [NSApp nextEventMatchingMask:mask
++                                   untilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]
++                                      inMode:NSEventTrackingRunLoopMode
++                                     dequeue:YES];
++        if (event == nil) {
++            // a click in another app reaches upstream's menu bar only through +_sfCancelTracking
++            [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate date]];
++        }
++        if (sfCancelTracking)
++            break;
++        // a submenu the keyboard or a lingering close was in may have been closed since
++        if (![self _sfChainHas:keyView])
++            keyView = [self _sfDeepestView];
++        if (lingerView != nil && ![self _sfChainHas:lingerView])
++            lingerView = nil;
++        // the pointer stayed on another item long enough: the submenu it left goes
++        if (lingerView != nil && [NSDate timeIntervalSinceReferenceDate] - lingerSince >= SUBMENU_LINGER) {
++            if (lingerView->_openSubmenuIndex >= 0 && [lingerView highlightedItemIndex] != lingerView->_openSubmenuIndex) {
++                if ([lingerView _sfItemOpensAtIndex:lingerIndex])
++                    [lingerView openSubmenuAtIndex:lingerIndex];
++                else
++                    [lingerView closeSubmenu];
++                keyView = lingerView;
++            }
++            lingerView = nil;
++        }
++        if (event == nil)
++            continue;
++
++        NSEventType type = [event type];
++
++        if (trace)
++            fprintf(stderr, "SFMENU event type=%d win=%d at %.1f,%.1f sticky=%d moved=%d\n", (int)type, (int)[[event window] windowNumber],
++                    [event locationInWindow].x, [event locationInWindow].y, (int)sticky, (int)movedFar);
++
++        if (type == NSAppKitDefined) {
++            if ([event subtype] == NSApplicationDeactivated)
++                break;
++            continue;
++        }
++
++        if (type == NSKeyDown) {
++            NSString *chars = [event characters];
++            unichar c = ([chars length] > 0) ? [chars characterAtIndex:0] : 0;
++            NSInteger at = [keyView highlightedItemIndex];
++            NSInteger count = (NSInteger)[[keyView presentedItems] count];
++            NSInteger to = -2;
++            BOOL arrow = (c == NSDownArrowFunctionKey || c == NSUpArrowFunctionKey);
++
++            // a held key repeats for Up and Down only: a repeated Left would close menu after menu,
++            // a repeated Return or letter means nothing more than the first
++            if ([event isARepeat] && !arrow)
++                continue;
++
++            // the submenu the keyboard is in may have been closed by the pointer
++            if (c == 0x1b || (c == '.' && ([event modifierFlags] & NSCommandKeyMask)))
++                break;
++            if (c == NSDownArrowFunctionKey)
++                to = [keyView _sfLiveIndexFrom:at + 1 step:1];
++            else if (c == NSUpArrowFunctionKey)
++                to = [keyView _sfLiveIndexFrom:(at < 0 ? count : at) - 1 step:-1];
++            else if (c == NSHomeFunctionKey || c == NSPageUpFunctionKey)
++                to = [keyView _sfLiveIndexFrom:0 step:1];
++            else if (c == NSEndFunctionKey || c == NSPageDownFunctionKey)
++                to = [keyView _sfLiveIndexFrom:count - 1 step:-1];
++            else if (c == NSLeftArrowFunctionKey) {
++                if (keyView != self && keyView->_supermenuView != nil) {
++                    keyView = keyView->_supermenuView;
++                    [keyView closeSubmenu];
++                }
++                continue;
++            }
++            else if (c == NSRightArrowFunctionKey || c == '\r' || c == 0x03 || c == ' ') {
++                if ([keyView _sfItemOpensAtIndex:at]) {
++                    [keyView openSubmenuAtIndex:at];
++                    if (keyView->_submenuView != nil) {
++                        keyView = keyView->_submenuView;
++                        [keyView setHighlightedItemIndex:[keyView _sfLiveIndexFrom:0 step:1]];
++                    }
++                    lingerView = nil;
++                    continue;
++                }
++                if (c == NSRightArrowFunctionKey)
++                    continue;
++                // Return on an item chooses it; with nothing highlighted it leaves the menu
++                if ([keyView _sfItemIsLiveAtIndex:at])
++                    chosen = [[keyView presentedItems] objectAtIndex:at];
++                break;
++            }
++            else if (c >= 0x20 && c != 0x7f && !(c >= 0xf700 && c <= 0xf8ff) &&
++                     !([event modifierFlags] & (NSCommandKeyMask | NSControlKeyMask))) {
++                NSTimeInterval now = [event timestamp];
++                NSArray *items = [keyView presentedItems];
++                NSInteger pass, i;
++
++                if (now - typedAt > TYPE_SELECT_PAUSE)
++                    [typed setString:@""];
++                typedAt = now;
++                [typed appendString:[NSString stringWithCharacters:&c length:1]];
++                // the whole prefix first; when nothing begins with it, what was just typed starts a new one
++                for (pass = 0; pass < 2 && to == -2; pass++) {
++                    for (i = 0; i < count; i++) {
++                        NSString *title = [[items objectAtIndex:i] title];
++
++                        if ([keyView _sfItemIsLiveAtIndex:i] && [title length] >= [typed length] &&
++                            [title compare:typed options:NSCaseInsensitiveSearch range:NSMakeRange(0, [typed length])] == NSOrderedSame) {
++                            to = i;
++                            break;
++                        }
++                    }
++                    if (to == -2 && [typed length] > 1)
++                        [typed setString:[NSString stringWithCharacters:&c length:1]];
++                    else
++                        break;
++                }
++            }
++            if (to >= 0) {
++                [keyView closeSubmenu];
++                [keyView setHighlightedItemIndex:to];
++                lingerView = nil;
++            }
++            continue;
++        }
++
++        // the pointer: every event carries where it is, in the window it was over
+         NSWindow *eventWindow = [event window];
+ 
+-        // motion over another of our windows can arrive without its window set, find it by number
+-        if (eventWindow == nil && [event windowNumber] != 0) {
++        if (eventWindow == nil && [event windowNumber] != 0)
+             eventWindow = [NSApp windowWithWindowNumber:[event windowNumber]];
+-        }
+-        if (eventWindow == nil) {
++        if (eventWindow == nil)
+             eventWindow = [self window];
+-        }
+ 
+         NSPoint screenPoint = [eventWindow convertBaseToScreen:[event locationInWindow]];
+         NSInteger index = -1;
+         NSUInteger exit;
++        BOOL up = (type == NSLeftMouseUp || type == NSRightMouseUp || type == NSOtherMouseUp);
++        BOOL down = (type == NSLeftMouseDown || type == NSRightMouseDown || type == NSOtherMouseDown);
++        BOOL moved = fabs(screenPoint.x - lastPoint.x) >= 0.5 || fabs(screenPoint.y - lastPoint.y) >= 0.5;
+ 
+         for (exit = 0; exit < [sfExitRects count]; exit++) {
+             if (NSPointInRect(screenPoint, [[sfExitRects objectAtIndex:exit] rectValue]))
+@@ -737,89 +1091,75 @@
+             sfExitIndex = exit;
+             break;
+         }
++        if (byButton && !movedFar &&
++            (fabs(screenPoint.x - pressPoint.x) > DRAG_SLOP || fabs(screenPoint.y - pressPoint.y) > DRAG_SLOP))
++            movedFar = YES;
++
+         NSMenuView *view = [self viewForScreenPoint:screenPoint index:&index];
+ 
+-        [view setHighlightedItemIndex:index];
+-        // the run loop is not redrawing while we track, so menus repaint themselves here
+-        [[self window] displayIfNeeded];
+-        [_submenuWindow displayIfNeeded];
+-
+-        if (view == self) {
+-            if (index >= 0) {
+-                NSMenuItem *item = [[self presentedItems] objectAtIndex:index];
+-
+-                // the application menu's slot has no submenu of its own, its
+-                // contents are the loose items
+-                BOOL opens = ([item hasSubmenu] || item == _macAppItem);
++        /* The highlight follows the pointer when the pointer moves (or presses): an event that only
++         * repeats its place - compositors send motion with every button change - must not take the
++         * highlight back from the keyboard, and the release of the click that opened a list beside the
++         * pointer must not put out the item the list opened with. */
++        if (moved || down) {
++            lastPoint = screenPoint;
++            if (view == nil) {
++                NSMenuView *deepest = [self _sfDeepestView];
++
++                // outside every menu: the last menu shows no choice, the submenu titles on the way stay lit
++                [deepest setHighlightedItemIndex:-1];
++            }
++            else {
++                NSMenuView *up_;
+ 
+-                if (opens && [item isEnabled]) {
+-                    [self openSubmenuAtIndex:index];
++                [view setHighlightedItemIndex:[view _sfItemIsLiveAtIndex:index] ? index : -1];
++                for (up_ = view->_supermenuView; up_ != nil && view != self; up_ = (up_ == self) ? nil : up_->_supermenuView)
++                    [up_ setHighlightedItemIndex:up_->_openSubmenuIndex];
++                if (view->_openSubmenuIndex >= 0 && index != view->_openSubmenuIndex) {
++                    // on to another item while a submenu is open: it lingers for a slanted move into it
++                    if (lingerView != view || lingerIndex != index) {
++                        lingerView = view;
++                        lingerIndex = index;
++                        lingerSince = [NSDate timeIntervalSinceReferenceDate];
++                    }
+                 }
+                 else {
+-                    [self closeSubmenu];
++                    if (lingerView == view || (lingerView != nil && view != lingerView))
++                        lingerView = nil;
++                    if (view->_openSubmenuIndex < 0 && [view _sfItemOpensAtIndex:index])
++                        [view openSubmenuAtIndex:index];
+                 }
++                keyView = view;
+             }
+         }
+ 
+-        NSEventType type = [event type];
+-
+-        if (type == NSLeftMouseDragged)
+-            dragged = YES;
+-        if (type == NSLeftMouseUp && !sticky && !dragged && [event timestamp] - opened < 0.4) {
+-            sticky = YES;
+-            type = NSMouseMoved;
+-        }
+-        if (type == NSLeftMouseUp || (sticky && type == NSLeftMouseDown)) {
+-            NSMenuItem *hit = nil;
+-
+-            if (index >= 0) {
+-                NSArray *items = [view presentedItems];
+-
+-                if (index < (NSInteger)[items count]) {
+-                    NSMenuItem *item = [items objectAtIndex:index];
+-
+-                    if ([item isEnabled] && ![item isSeparatorItem] && ![item hasSubmenu]) {
+-                        hit = item;
+-                    }
+-                }
+-            }
+-            if (hit != nil) {
+-                chosen = hit;
+-                break;
+-            }
+-            // nothing actionable under the cursor: the first release opens the
+-            // menu for good, anything after that dismisses it
+-            if (type == NSLeftMouseUp && !sticky) {
++        if (up) {
++            if (!sticky && !movedFar && [event timestamp] - opened < CLICK_TIME) {
++                // the click that opened the menu
+                 sticky = YES;
++                continue;
+             }
+-            else {
+-                break;
++            sticky = YES;
++            if (view == nil)
++                break;                        // released outside: dismissed
++            if ([view _sfItemOpensAtIndex:index]) {
++                [view openSubmenuAtIndex:index];
++                lingerView = nil;
++                continue;
+             }
+-        }
+-
+-        NSUInteger mask = NSLeftMouseUpMask | NSLeftMouseDraggedMask | NSMouseMovedMask;
+-
+-        if (sticky) {
+-            mask |= NSLeftMouseDownMask;
+-        }
+-        // a click in another app reaches us only as lost focus, so wake up to check for it
+-        for (event = nil; event == nil;) {
+-            event = [NSApp nextEventMatchingMask:mask
+-                                       untilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]
+-                                          inMode:NSEventTrackingRunLoopMode
+-                                         dequeue:YES];
+-            if (event == nil) {
+-                // a click in another app never reaches us, its owner says so instead through +_sfCancelTracking
+-                [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate date]];
+-                if (sfCancelTracking)
+-                    break;
++            if ([view _sfItemIsLiveAtIndex:index]) {
++                chosen = [[view presentedItems] objectAtIndex:index];
++                break;
+             }
++            continue;                         // a separator, a disabled item, the panel's edge
+         }
+-        if (event == nil) {
+-            break;
+-        }
++        if (down && sticky && view == nil)
++            break;                            // a press outside the menus: dismissed, and not passed on
+     }
+ 
++    if (trace)
++        fprintf(stderr, "SFMENU end chosen=%s\n", chosen != nil ? [[chosen title] UTF8String] : "(none)");
++    [[chosen retain] autorelease];
+     [self closeSubmenu];
+     [self setHighlightedItemIndex:-1];
+     _tracking = NO;
+@@ -827,9 +1167,8 @@
+     [sfExitRects release];
+     sfExitRects = nil;
+ 
+-    [[NSNotificationCenter defaultCenter]
+-        postNotificationName:NSMenuDidEndTrackingNotification
+-                      object:_menu];
++    [[NSNotificationCenter defaultCenter] postNotificationName:NSMenuDidEndTrackingNotification object:_menu];
++    [self release];
+     return chosen;
+ }
+ 
+--- a/src/Frameworks/AppKit/NSMenu.subproj/NSMenu.m
++++ b/src/Frameworks/AppKit/NSMenu.subproj/NSMenu.m
+@@ -26,6 +26,13 @@
+ 
+ @interface NSMenuView(SFTracking)
+ -(NSMenuItem *)_trackFromEvent:(NSEvent *)event;
++-(void)_sfSetMinimumWidth:(CGFloat)width;
++-(NSPoint)_sfTitleOriginOfItemAtIndex:(NSInteger)index;
+++(NSWindow *)_sfWindowForView:(NSMenuView *)view frame:(NSRect)frame anchor:(NSRect)anchor kind:(int)kind parent:(NSWindow *)parent;
++@end
++
++@interface NSWindow(SFPopupPlacement)
+++(BOOL)_sfCompositorPlacesPopups;
+ @end
+ 
+ @implementation NSMenu
+@@ -44,13 +51,23 @@
+  * previous one is closed when a new one appears. */
+ static NSMutableArray *__NSMenuPopUpWindows = nil;
+ 
+--(BOOL)popUpMenuPositioningItem:(NSMenuItem *)item
+-                     atLocation:(NSPoint)location
+-                         inView:(NSView *)view {
++/* Shows the menu as a popup and tracks it until an item is chosen or it is dismissed; returns the
++ * item (nil: dismissed). Nothing is sent: the caller decides what a choice means.
++ *   screenPoint   where the menu goes, on the screen
++ *   item, offset  the item that is put there and the point of its row (from the row's top left)
++ *                 that lands on screenPoint (a negative y: the row's middle line, a negative x: where
++ *                 its title starts); without an item the panel's top left corner does
++ *   highlight     the item that is lit when the menu opens (nil: none)
++ *   anchor, kind  what the menu hangs on (WS_POPUP_*), for a compositor that places popups
++ *   minimumWidth  the panel's least width; font: nil for the menu font
++ *   parent        the window it was opened from */
++-(NSMenuItem *)_sfTrackAtScreenPoint:(NSPoint)screenPoint positioningItem:(NSMenuItem *)item itemOffset:(NSPoint)offset
++                              anchor:(NSRect)anchor kind:(int)kind minimumWidth:(CGFloat)minimumWidth font:(NSFont *)font
++                              parent:(NSWindow *)parent highlight:(NSMenuItem *)highlight event:(NSEvent *)start {
+    [self update];
+ 
+    if([[self itemArray] count]==0)
+-    return NO;
++    return nil;
+ 
+    if(__NSMenuPopUpWindows==nil)
+     __NSMenuPopUpWindows=[[NSMutableArray alloc] init];
+@@ -59,73 +76,87 @@
+      [open orderOut:nil];
+     [__NSMenuPopUpWindows removeAllObjects];
+    }
++   [[self retain] autorelease];
++   if([_delegate respondsToSelector:@selector(menuWillOpen:)])
++    [_delegate menuWillOpen:self];
+ 
+    NSMenuView *menuView=[[[NSMenuView alloc] initWithFrame:NSMakeRect(0,0,10,10)] autorelease];
+ 
++   if(font!=nil)
++    [menuView setFont:font];
+    [menuView setMenu:self];
++   [menuView _sfSetMinimumWidth:minimumWidth];
+    [menuView sizeToFit];
+ 
+-   NSPoint screenPoint=location;
+-
+-   if(view!=nil){
+-    screenPoint=[view convertPoint:location toView:nil];
+-    screenPoint=[[view window] convertBaseToScreen:screenPoint];
+-   }
+-
+    NSRect frame=[menuView frame];
+-
+-   /* location is the menu's top-left, and window frames are bottom-left. */
+-   frame.origin.x=screenPoint.x;
+-   frame.origin.y=screenPoint.y-frame.size.height;
+-   // the view carries a 16px shadow margin, so the panel itself lands 2px below the location
+-   frame.origin.x-=16;
+-   frame.origin.y+=16-2;
+-
+-   // a positioned item opens centred on the location, as a pop-up button's current value does
+    NSInteger itemIndex=(item!=nil)?[[menuView presentedItems] indexOfObjectIdenticalTo:item]:NSNotFound;
+ 
++   // window frames count from the bottom left; the view is flipped and carries a 16 point shadow margin
+    if(itemIndex!=NSNotFound){
+     NSRect itemRect=[menuView rectOfItemAtIndex:itemIndex];
+-    CGFloat itemMid=[menuView isFlipped]?NSHeight([menuView frame])-NSMidY(itemRect):NSMidY(itemRect);
+ 
+-    frame.origin.y=screenPoint.y-itemMid;
++    NSPoint title=[menuView _sfTitleOriginOfItemAtIndex:itemIndex];
++
++    frame.origin.x=screenPoint.x-(offset.x<0 ? title.x : NSMinX(itemRect)+offset.x);
++    frame.origin.y=screenPoint.y+(offset.y<0 ? title.y : NSMinY(itemRect)+offset.y)-frame.size.height;
++   }
++   else {
++    frame.origin.x=screenPoint.x-16;
++    frame.origin.y=screenPoint.y+16-frame.size.height;
+    }
++   frame.origin.x=floor(frame.origin.x);
++   frame.origin.y=floor(frame.origin.y);
+ 
+-   NSRect visible=[[NSScreen mainScreen] visibleFrame];
++   if(![NSWindow _sfCompositorPlacesPopups]){
++    // nobody else keeps it on the screen
++    NSRect visible=[[NSScreen mainScreen] visibleFrame];
++
++    if(NSMaxY(frame)-16>NSMaxY(visible))
++     frame.origin.y=NSMaxY(visible)-frame.size.height+16;
++    if(NSMinY(frame)+16<NSMinY(visible))
++     frame.origin.y=NSMinY(visible)-16;
++    if(NSMaxX(frame)-16>NSMaxX(visible))
++     frame.origin.x=NSMaxX(visible)-frame.size.width+16;
++   }
+ 
+-   if(NSMaxY(frame)-16>NSMaxY(visible))
+-    frame.origin.y=NSMaxY(visible)-frame.size.height+16;
+-   if(NSMinY(frame)+16<NSMinY(visible))
+-    frame.origin.y=NSMinY(visible)-16;
+-
+-   NSWindow *window=[[NSWindow alloc] initWithContentRect:frame
+-                                                styleMask:NSBorderlessWindowMask
+-                                                  backing:NSBackingStoreBuffered
+-                                                    defer:NO];
+-
+-   [window setLevel:NSPopUpMenuWindowLevel];
+-   [window setOpaque:NO];
+-   [window setBackgroundColor:[NSColor clearColor]];
+-   // the panel inside the 16px shadow margin gets the compositor's blur, like the demo's backdrop-filter
+-   [window _setBackgroundBlurInset:16 radius:8];
+-   [[window contentView] addSubview:menuView];
+-   [window orderFront:nil];
+-   // drawn now, the tracking below holds the run loop that would otherwise paint it
+-   [window display];
++   NSWindow *window=[NSMenuView _sfWindowForView:menuView frame:frame anchor:anchor kind:kind parent:parent];
+ 
+    [__NSMenuPopUpWindows addObject:window];
+    [window release];
+ 
+-   // tracks until the menu closes, as on macOS, and sends the pick once the window is gone
+-   NSEvent *start=[NSApp currentEvent];
++   // tracks until the menu closes, as on macOS; the caller acts once the window is gone
+    NSMenuItem *chosen=nil;
+ 
+    [menuView retain];
+-   if(start!=nil)
+-    chosen=[menuView _trackFromEvent:start];
++   if(highlight!=nil){
++    NSUInteger lit=[[menuView presentedItems] indexOfObjectIdenticalTo:highlight];
++
++    if(lit!=NSNotFound && [highlight isEnabled])
++     [menuView setHighlightedItemIndex:lit];
++   }
++   chosen=[[[menuView _trackFromEvent:start] retain] autorelease];
+    [window orderOut:nil];
+    [__NSMenuPopUpWindows removeObject:window];
+    [menuView release];
++   if([_delegate respondsToSelector:@selector(menuDidClose:)])
++    [_delegate menuDidClose:self];
++   return chosen;
++}
++
++-(BOOL)popUpMenuPositioningItem:(NSMenuItem *)item
++                     atLocation:(NSPoint)location
++                         inView:(NSView *)view {
++   NSPoint screenPoint=location;
++
++   if(view!=nil){
++    screenPoint=[view convertPoint:location toView:nil];
++    screenPoint=[[view window] convertBaseToScreen:screenPoint];
++   }
++
++   NSMenuItem *chosen=[self _sfTrackAtScreenPoint:screenPoint positioningItem:item itemOffset:NSZeroPoint
++                                           anchor:NSZeroRect kind:0 minimumWidth:0 font:nil
++                                           parent:[view window] highlight:nil event:[NSApp currentEvent]];
++
+    if(chosen!=nil && [chosen action]!=NULL)
+     [NSApp sendAction:[chosen action] to:[chosen target] from:chosen];
+    return chosen!=nil;
+@@ -144,9 +175,19 @@
+ 
+ +(void)popUpContextMenu:(NSMenu *)menu withEvent:(NSEvent *)event forView:(NSView *)view {
+    /* Now that NSMenuView exists, a context menu is a popup at the click. */
+-   [menu popUpMenuPositioningItem:nil
+-                      atLocation:[event locationInWindow]
+-                          inView:nil];
++   // at the click: the event's place is in its window, a menu's is on the screen
++   NSWindow *window=(event!=nil)?[event window]:[view window];
++   NSPoint point=(event!=nil)?[event locationInWindow]:NSZeroPoint;
++
++   if(window!=nil)
++    point=[window convertBaseToScreen:point];
++
++   NSMenuItem *chosen=[menu _sfTrackAtScreenPoint:point positioningItem:nil itemOffset:NSZeroPoint
++                                           anchor:NSZeroRect kind:0 minimumWidth:0 font:nil
++                                           parent:window highlight:nil event:event];
++
++   if(chosen!=nil && [chosen action]!=NULL)
++    [NSApp sendAction:[chosen action] to:[chosen target] from:chosen];
+ }
+ 
+ 
+--- a/src/Frameworks/AppKit/NSPopUpButtonCell.m
++++ b/src/Frameworks/AppKit/NSPopUpButtonCell.m
+@@ -8,6 +8,17 @@
+ 
+ #import <AppKit/NSPopUpButtonCell.h>
+ #import <AppKit/NSMenu.h>
++#import <AppKit/NSMenuItem.h>
++#import <AppKit/NSWindow.h>
++#import <AppKit/NSView.h>
++#import <WindowServer/message.h>
++
++@interface NSMenu (SFPopUpTracking)
++-(NSMenuItem *)_sfTrackAtScreenPoint:(NSPoint)screenPoint positioningItem:(NSMenuItem *)item itemOffset:(NSPoint)offset
++                              anchor:(NSRect)anchor kind:(int)kind minimumWidth:(CGFloat)minimumWidth font:(NSFont *)font
++                              parent:(NSWindow *)parent highlight:(NSMenuItem *)highlight event:(NSEvent *)start;
++@end
++#import <AppKit/NSMenu.h>
+ #import <AppKit/NSEvent.h>
+ #import <AppKit/NSGraphics.h>
+ #import <AppKit/NSGraphicsStyle.h>
+@@ -480,71 +491,67 @@
+    return [[self selectedItem] tag];
+ }
+ 
++/* The list is the cell's menu shown as a popup, as on macOS. A pop-up button's menu opens with the
++ * selected item over the button, its title where the button's title is, and a check mark on it; a
++ * pull-down's opens under the button without its first item (which is the button's title). YES when
++ * an item was chosen (it is then the selected item); NO when the menu was dismissed: nothing
++ * changes and no action is sent. */
+ -(BOOL)trackMouse:(NSEvent *)event inRect:(NSRect)cellFrame ofView:(NSView *)controlView untilMouseUp:(BOOL)flag {
+-   NSRect bounds = [controlView bounds];
+-   NSPoint        origin=bounds.origin;
+-   
+-#if 0
+-   // Note: the min options don't mean much unless we don't have room for the menu, so either way we just pop
+-   // up over the button itself. However, maxX and maxY *do* have special meanings
+-   switch( _preferredEdge )
+-   {
+-      case NSMinXEdge:
+-      case NSMinYEdge:
+-	     break;
+-	  case NSMaxXEdge:
+-		 origin.x += [controlView bounds].size.width;
+-	     break;
+-	  case NSMaxYEdge: 
+-         // Remember, our Y axis is flipped in Cocoa. Also, not sure why we need the -4 offset here, 
+-		 // can't figure out where the offset comes from, but it works			
+-		 origin.y -= [controlView bounds].size.height - 4;
+-	     break;
+-   }
+-#endif
+-    origin=[controlView convertPoint:origin toView:nil];
+-    origin=[[controlView window] convertBaseToScreen:origin];
+-
+-    [[_menu delegate] menuNeedsUpdate: _menu];
+-//	[[_menu delegate] menuWillOpen: _menu];
+-    NSMenu *menu = _menu;
+-    if (_pullsDown && [_menu numberOfItems]) {
+-        // Don't display the first item for pullDowns controls
+-        menu = [[_menu copy] autorelease];
+-        [menu removeItemAtIndex:0];
++    NSWindow   *window=[controlView window];
++    NSArray    *items=[_menu itemArray];
++    NSMenuItem *selected=(!_pullsDown && _selectedIndex>=0 && _selectedIndex<(NSInteger)[items count])?[items objectAtIndex:_selectedIndex]:nil;
++    NSMenuItem *titleItem=(_pullsDown && [items count]>0)?[items objectAtIndex:0]:nil;
++    BOOL        titleWasHidden=[titleItem isHidden];
++    NSRect      onScreen=[controlView convertRect:cellFrame toView:nil];
++    NSMenuItem *chosen;
++
++    onScreen.origin=[window convertBaseToScreen:onScreen.origin];
++    if(_pullsDown)
++     [titleItem setHidden:YES];
++    else {
++     for(NSMenuItem *item in items)
++      [item setState:(item==selected)?NSOnState:NSOffState];
+     }
+-    [menu update];
+-
+-    NSPopUpWindow *window=[[NSPopUpWindow alloc] initWithFrame:NSMakeRect(origin.x,origin.y,
+-        cellFrame.size.width,cellFrame.size.height)];
+-    [window setPullsDown:_pullsDown];
+-    [window setMenu:menu];
+-   if([self font]!=nil)
+-    [window setFont:[self font]];
+ 
+-   if(_pullsDown)
+-    [window selectItemAtIndex:-1]; // No initial selection for pullsDown
+-   else
+-    [window selectItemAtIndex:_selectedIndex];
++    if(getenv("SF_POPUP_TRACE")!=NULL){
++     NSMutableString *states=[NSMutableString string];
+ 
+-    [window orderFront:nil];
+-    NSInteger itemIndex=[window runTrackingWithEvent:event];
+-    if(itemIndex!=NSNotFound) {
+-        if (_pullsDown) {
+-            // remember that thing we did with the first menu item?
+-            itemIndex++;
+-        }
+-        // We can be embedded in controls other than a PopUpButton - so don't
+-        // assume selectItemAtIndex: is available
+-        if ([controlView respondsToSelector: @selector(selectItemAtIndex:)]) {
+-            [(id)controlView selectItemAtIndex:itemIndex];
+-        }
++     for(NSMenuItem *item in items)
++      [states appendFormat:@"%d",(int)[item state]];
++     fprintf(stderr,"SFPOPUP open selected=%d states=%s\n",(int)_selectedIndex,[states UTF8String]);
++    }
++    if(selected!=nil){
++     NSRect  titleRect=[self titleRectForBounds:cellFrame];
++     NSPoint at=NSMakePoint(NSMinX(titleRect),NSMidY(cellFrame));
++
++     at=[window convertBaseToScreen:[controlView convertPoint:at toView:nil]];
++     chosen=[_menu _sfTrackAtScreenPoint:at positioningItem:selected itemOffset:NSMakePoint(-1,-1)
++                                  anchor:NSZeroRect kind:WS_POPUP_AT_FRAME minimumWidth:NSWidth(cellFrame) font:[self font]
++                                  parent:window highlight:selected event:event];
+     }
+-    _selectedIndex = (itemIndex == NSNotFound) ? -1 : itemIndex;
+-    [window close]; // release when closed=YES
+-//	[[_menu delegate] menuDidClose: _menu];
++    else {
++     // under the control, three points down, left edges in line
++     NSPoint at=NSMakePoint(NSMinX(onScreen),NSMinY(onScreen)-3);
+ 
+-   return itemIndex!=NSNotFound;
++     chosen=[_menu _sfTrackAtScreenPoint:at positioningItem:nil itemOffset:NSZeroPoint
++                                  anchor:onScreen kind:WS_POPUP_BELOW minimumWidth:NSWidth(cellFrame) font:[self font]
++                                  parent:window highlight:nil event:event];
++    }
++    if(_pullsDown)
++     [titleItem setHidden:titleWasHidden];
++    if(chosen==nil)
++     return NO;
++
++    NSInteger itemIndex=[[_menu itemArray] indexOfObjectIdenticalTo:chosen];
++
++    if(itemIndex==NSNotFound)
++     return NO;
++    // We can be embedded in controls other than a PopUpButton - so don't
++    // assume selectItemAtIndex: is available
++    if([controlView respondsToSelector:@selector(selectItemAtIndex:)])
++     [(id)controlView selectItemAtIndex:itemIndex];
++    _selectedIndex=itemIndex;
++    return YES;
+ }
+ 
+ -(void)moveUp:sender {
+--- a/src/Frameworks/AppKit/NSComboBoxCell.m
++++ b/src/Frameworks/AppKit/NSComboBoxCell.m
+@@ -10,6 +10,16 @@
+ #import <AppKit/SFControlDrawing.h>
+ #import <AppKit/NSButtonCell.h>
+ #import <AppKit/NSComboBoxWindow.h>
++#import <AppKit/NSMenu.h>
++#import <AppKit/NSMenuItem.h>
++#import <AppKit/NSWindow.h>
++#import <WindowServer/message.h>
++
++@interface NSMenu (SFPopUpTracking)
++-(NSMenuItem *)_sfTrackAtScreenPoint:(NSPoint)screenPoint positioningItem:(NSMenuItem *)item itemOffset:(NSPoint)offset
++                              anchor:(NSRect)anchor kind:(int)kind minimumWidth:(CGFloat)minimumWidth font:(NSFont *)font
++                              parent:(NSWindow *)parent highlight:(NSMenuItem *)highlight event:(NSEvent *)start;
++@end
+ #import <Foundation/NSKeyedArchiver.h>
+ #import <AppKit/NSGraphicsStyle.h>
+ #import <AppKit/NSRaise.h>
+@@ -287,11 +297,10 @@
+ }
+ 
+ -(BOOL)trackMouse:(NSEvent *)event inRect:(NSRect)cellFrame ofView:(NSView *)controlView untilMouseUp:(BOOL)flag {
+-   NSComboBoxWindow *window;
+    NSPoint           origin=[controlView bounds].origin;
+    NSSize            size=[self cellSize];
+    NSPoint           check=[controlView convertPoint:[event locationInWindow] fromView:nil];
+-   unsigned          selectedIndex = [_objectValues indexOfObject:[self objectValue]];
++   NSUInteger        selectedIndex = [_objectValues indexOfObject:[self objectValue]];
+ 
+    if([_objectValues count]==0)
+     return NO;
+@@ -299,28 +308,60 @@
+    if(!NSMouseInRect(check,[self buttonRectForBounds:cellFrame],[controlView isFlipped]))
+     return NO;
+ 
+-   origin.y+=size.height;
+-   origin=[controlView convertPoint:origin toView:nil];
+-   origin=[[controlView window] convertBaseToScreen:origin];
+-   size.width+=1.0;
+-
+-   window=[[NSComboBoxWindow alloc] initWithFrame:(NSRect){origin,size}];
+-
+-   [window setObjectArray:_objectValues];
+-   [window setSelectedIndex:selectedIndex];
+-   if([self font] != nil)
+-      [window setFont:[self font]];
+-
+-   _buttonPressed=YES;
+-   [window makeKeyAndOrderFront:self];
+-   selectedIndex = [window runTrackingWithEvent:event];
+-   [window close]; // release when closed=YES
+-   _buttonPressed=NO;
++   /* The list is a menu under the field, as wide as the field, with the current value lit: the same
++    * popup, tracking, keyboard and dismissal as every other menu. (macOS scrolls a long list inside
++    * numberOfVisibleItems rows; this one shows every row.) */
++   {
++      NSMenu   *list=[[[NSMenu alloc] initWithTitle:@""] autorelease];
++      NSWindow *window=[controlView window];
++      NSRect    onScreen=[controlView convertRect:cellFrame toView:nil];
++      NSMenuItem *chosen,*lit=nil;
++      NSUInteger i,count=[_objectValues count];
++
++      (void)origin; (void)size;
++      [list setAutoenablesItems:NO];
++      for(i=0;i<count;i++){
++         id        object=[_objectValues objectAtIndex:i];
++         NSString *title=nil;
++
++         if(_formatter)
++            title=[_formatter stringForObjectValue:object];
++         if(title==nil){
++            if([object isKindOfClass:[NSString class]])
++               title=object;
++            else if([object isKindOfClass:[NSAttributedString class]])
++               title=[object string];
++            else if([object respondsToSelector:@selector(descriptionWithLocale:)])
++               title=[object descriptionWithLocale:[NSLocale currentLocale]];
++            else
++               title=[object description];
++         }
++         [list addItemWithTitle:(title!=nil)?title:@"" action:NULL keyEquivalent:@""];
++      }
++      if(selectedIndex!=NSNotFound && selectedIndex<count)
++         lit=[list itemAtIndex:selectedIndex];
++      onScreen.origin=[window convertBaseToScreen:onScreen.origin];
++      _buttonPressed=YES;
++      [controlView setNeedsDisplay:YES];
++      chosen=[list _sfTrackAtScreenPoint:NSMakePoint(NSMinX(onScreen),NSMinY(onScreen)-2) positioningItem:nil itemOffset:NSZeroPoint
++                                  anchor:onScreen kind:WS_POPUP_BELOW minimumWidth:NSWidth(onScreen) font:[self font]
++                                  parent:window highlight:lit event:event];
++      _buttonPressed=NO;
++      [controlView setNeedsDisplay:YES];
++      selectedIndex=(chosen!=nil)?(NSUInteger)[list indexOfItem:chosen]:NSNotFound;
++   }
+ 
+    if (selectedIndex != NSNotFound)
+    {
+       NSTextView *editor = [controlView currentEditor];
+       NSObject   *object = [_objectValues objectAtIndex:selectedIndex];
++      // not being edited: the chosen value is the field's value, and the action goes out as on macOS
++      if (editor == nil && object != nil)
++      {
++         [self setObjectValue:object];
++         [controlView setNeedsDisplay:YES];
++         [(NSControl *)controlView sendAction:[(NSControl *)controlView action] to:[(NSControl *)controlView target]];
++      }
+       if (editor && object)
+       {
+          NSString           *string = nil;
+@@ -351,8 +392,8 @@
+ 
+          [editor setSelectedRange:NSMakeRange(0, [[editor string] length])];
+          [self endEditing:editor];
+-         if (_sendsActionOnEndEditing)
+-            [(NSControl *)controlView sendAction:[(NSControl *)controlView action] to:[(NSControl *)controlView target]];
++         // a choice from the list sends the action whether or not ending an edit would
++         [(NSControl *)controlView sendAction:[(NSControl *)controlView action] to:[(NSControl *)controlView target]];
+       }
+    }
+ 
+--- a/src/Frameworks/AppKit/NSToolTipWindow.m
++++ b/src/Frameworks/AppKit/NSToolTipWindow.m
+@@ -30,6 +30,8 @@
+     
+     if (singleton == nil){
+         singleton = [[NSToolTipWindow alloc] initWithContentRect:NSMakeRect(0, 0, 20, 20) styleMask:NSBorderlessWindowMask backing:NSBackingStoreBuffered defer:NO];
++        // a tool tip takes no pointer events: the window server then shows it without holding the pointer
++        [singleton setIgnoresMouseEvents:YES];
+         [singleton setLevel:NSPopUpMenuWindowLevel];
+     }
+     
+--- a/src/Frameworks/AppKit/NSWindow.h
++++ b/src/Frameworks/AppKit/NSWindow.h
+@@ -259,6 +259,8 @@
+     BOOL _showsResizeIndicator;
+     BOOL _showsToolbarButton;
+     BOOL _ignoresMouseEvents;
++    // a popup the compositor places: the frame origin last asked for and the one it answered with
++    NSPoint _sfPopupAsked, _sfPopupPlaced;
+     BOOL _isMovableByWindowBackground;
+     BOOL _isMovable;
+     BOOL _allowsConcurrentViewDrawing;
+--- a/src/Frameworks/AppKit/NSWindow.m
++++ b/src/Frameworks/AppKit/NSWindow.m
+@@ -399,7 +399,9 @@
+ 
+         wsWindowShmPath([bundleID cString], (unsigned)getpid(),
+                         (unsigned)_number, shmName, sizeof(shmName));
+-        shmPath = [NSString stringWithUTF8String:shmName];
++        // kept: -dealloc unlinks by this name (it was an autoreleased string, read after it was gone)
++        [shmPath release];
++        shmPath = [[NSString alloc] initWithUTF8String:shmName];
+     }
+ 
+     _context = [self cgContext];
+@@ -424,7 +426,9 @@
+         [_context release];
+     if(buffer && bufsize)
+         munmap(buffer, bufsize);
+-    shm_unlink([shmPath cString]);
++    if(shmPath != nil)
++        shm_unlink([shmPath UTF8String]);
++    [shmPath release];
+     //if(_cglContext)
+     //    [_cglContext release];
+     //if(_caContext)
+@@ -1946,6 +1950,38 @@
+ /* The compositor decides which surface holds keyboard focus, so follow it:
+    these are driven from the window-server receive loop, hopped to the main
+    thread because key state is not safe to touch from that thread. */
++/* Popups (menus, lists, tool tips) where the compositor places them. AppKit works out a frame on
++ * its own screen, which need not be where the compositor has the windows: the window server sends
++ * the frame relative to the popup's parent, the compositor keeps the popup on the panel (sliding it,
++ * or flipping it to the other side of what it hangs on) and the answer comes back here, so that the
++ * frames of a menu and its submenus lie as their surfaces do. */
+++(BOOL)_sfCompositorPlacesPopups {
++   return _windowServerPlacesPopups()!=0;
++}
++
++// what the popup hangs on (a rectangle on the screen, WS_POPUP_*) and the window it belongs to; before it is shown
++-(void)_sfSetPopupAnchorRect:(NSRect)rect kind:(int)kind parent:(NSWindow *)parent {
++   struct wsRPCWindow data = {
++       { kWSWindowSetPopupAnchor, sizeof(struct wsRPCWindow) - sizeof(struct wsRPCBase) },
++       _number, rect.origin.x, rect.origin.y, rect.size.width, rect.size.height, (unsigned)kind,
++       (int)[parent windowNumber], {'\0'}, _level
++   };
++
++   _windowServerRPC(&data, sizeof(data), NULL, NULL);
++}
++
++// values: where the compositor put the popup (x, y: its frame origin) and the origin that was asked for
++-(void)_serverDidPlacePopup:(NSArray *)values {
++   NSPoint placed=NSMakePoint([[values objectAtIndex:0] doubleValue],[[values objectAtIndex:1] doubleValue]);
++   NSPoint asked=NSMakePoint([[values objectAtIndex:2] doubleValue],[[values objectAtIndex:3] doubleValue]);
++
++   // an answer to a frame that has been replaced since says nothing about this one
++   if(!NSEqualPoints(asked,_sfPopupAsked))
++    return;
++   _sfPopupPlaced=placed;
++   _frame.origin=placed;
++}
++
+ // asks the compositor to blur what is behind the window, inside its edges less inset and rounded by radius
+ -(void)_setBackgroundBlurInset:(CGFloat)inset radius:(CGFloat)radius {
+    struct wsRPCSimple data = {
+@@ -3827,6 +3863,9 @@
+ }
+ 
+ -(BOOL)_updateWSState {
++    // a frame that is not just the compositor's placement coming back is a new request
++    if(_level==NSPopUpMenuWindowLevel && !NSEqualPoints(_frame.origin,_sfPopupPlaced))
++        _sfPopupAsked=_frame.origin;
+     struct wsRPCWindow data = {
+         { kWSWindowModifyState, sizeof(struct wsRPCWindow) - sizeof(struct wsRPCBase) },
+         _number, _frame.origin.x, _frame.origin.y,
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -321,6 +321,14 @@
+                                                                  withObject:[NSValue valueWithPoint:NSMakePoint(me.x, me.y)]
+                                                               waitUntilDone:NO];
+                                     break;
++                                case WS_EVENT_POPUP_PLACED:
++                                    if(window != nil)
++                                        [window performSelectorOnMainThread:@selector(_serverDidPlacePopup:)
++                                                                 withObject:[NSArray arrayWithObjects:[NSNumber numberWithDouble:me.x],
++                                                                     [NSNumber numberWithDouble:me.y], [NSNumber numberWithDouble:me.dx],
++                                                                     [NSNumber numberWithDouble:me.dy], nil]
++                                                              waitUntilDone:NO];
++                                    break;
+                                 case WS_EVENT_POPUP_DONE: {
+                                     // a menu's or list's tracking loop ends on this event, as it does when
+                                     // the application is deactivated under it

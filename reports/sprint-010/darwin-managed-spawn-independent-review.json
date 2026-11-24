@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "reviewer": "Grok",
+  "status": "APPROVE_CHECKED_C_SHIM_NO_TARGET_EXECUTION_NO_FD_INHERITANCE",
+  "verdict": "No blocking defect. The frozen shim assigns CLOEXEC_DEFAULT|SETSIGDEF|SETSIGMASK|SETPGROUP once, reads that word back, and does not spawn on mismatch. It duplicates each selected fd with F_DUPFD_CLOEXEC at or above 4 before dup2, and dup2 destinations are only 0..3. Cleanup records every initialized object and owned duplicate, and a positive pid stays owned when cleanup fails. Setup failures fail closed. This is not target execution and not an FD-inheritance proof.",
+  "blockers": [],
+  "reviewed": {
+    "leaf": "integrations/puredarwin/chonkstep-darwin/darwin-spawn/",
+    "source_set_sha256": "c1a3bf825ad9569817f2966aa4d8ec3f382c03c1cf23f80fb68c5472c724d7db",
+    "source_validation_sha256": "19a7d6c49a315e0907a836792f3e17db72708f88ce39549d9599088ab5c410c8",
+    "source_validation_status": "SOURCE_FROZEN_FAKE_POLICY_TESTS_AND_ARM64_OBJECT_ONLY",
+    "files_sha256": {
+      "ABI_PROPOSAL.md": "d50b7deaf2ea08d7e5f03b51ab94eeb0acd08654ef786e34d9c71aeb349e86a1",
+      "README.md": "531ef78e0fc262d4ed24da2969e9ef3c38f46d490ff197df728fcafa4fc4c5bf",
+      "build_target.py": "f9c2130ab626b326dfe9fc714d50adedbd05b26d806ef08044c1ed63b2760447",
+      "darwin_spawn.c": "fd6dd36f575c77f1ff9d996f43e9dedb386811b0623678b812620f36f617db75",
+      "darwin_spawn.h": "080c2e0c9694951bd8d8a689811b8c6bc525d76392aff2f8e2af792ebf947d4c",
+      "spawn_test_api.h": "aa2a3c16b209fd440d4472537ea100775a07ba459f82605899180e80c5caac0c",
+      "test_spawn.c": "fcbd3e8efbc084133597d47dd83326bebfa6f87835e8c15dafd8c1e314ecd717",
+      "test_spawn.py": "65b78e82613a03620aed5ee7b6c6cf0029929ca3725ff5e99d5971fc8de7a85d"
+    },
+    "object": "runs/m1-desktop-010/darwin-spawn-build-002/darwin_spawn.o",
+    "object_sha256": "71c322c1f47bb16373e01f2a3ff7b02690b441faf9a582327304543316a6c729",
+    "object_bytes": 2768,
+    "build_001_object_sha256": "71c322c1f47bb16373e01f2a3ff7b02690b441faf9a582327304543316a6c729",
+    "build_record": "runs/m1-desktop-010/darwin-spawn-build-002/build-record.json",
+    "compiler": "/nix/store/v0x4y2cjbasgmrqsbka2bp8allw8j9ph-darwin-cross-toolchain-nix/bin/arm64-apple-darwin20.4-clang",
+    "compiler_sha256": "eb89ae0525dc32d843a88e95063cf3f157f60c48c40125576d2172de39ebe754",
+    "sdk_spawn_flags": "sys/spawn.h POSIX_SPAWN_CLOEXEC_DEFAULT 0x4000, SETSIGDEF 0x0004, SETSIGMASK 0x0008, SETPGROUP 0x0002; combined 0x400e",
+    "host_tests_log": "runs/m1-desktop-010/darwin-spawn-build-001/host-tests.log",
+    "host_tests_log_sha256": "684805f81bce1fa486b59cb22f24e070c85eb90a6ba61c6a05666eb8aa16b48b"
+  },
+  "checks": [
+    {
+      "id": "DS2",
+      "status": "PASS",
+      "text": "darwin_spawn.c has one posix_spawnattr_setflags of CLOEXEC_DEFAULT|SETSIGDEF|SETSIGMASK|SETPGROUP after setsigdefault, setsigmask and setpgroup(0), then one getflags. Mismatch is EINVAL and does not spawn. The object has one setflags reloc at 0x370 and one getflags reloc at 0x380, both with immediate 0x400e. A mismatch compare branches to cleanup with EINVAL 22 before the single posix_spawn reloc at 0x4b4. The overwrite_combined_flags, omit_cloexec_default and ignore_flag_readback mutants compile and are killed by assertion."
+    },
+    {
+      "id": "dup2_and_source_normalization",
+      "status": "PASS",
+      "text": "Validate rejects only a negative source fd. Aliases and values 0..3 are accepted. Each of the four slots is fcntl(F_DUPFD_CLOEXEC, minimum 4) before any file action. A negative return is system errno or EIO; a return below 4 is EIO and does not spawn. adddup2 uses the owned duplicate and destination index i for i in 0..3. Caller source numbers are not closed and are not the dup2 source. The object loop uses command 67 and stack minimum 4, compares the result with 4, and passes destination x2 as 0..3. The success fixture uses source fds {0,1,2,3}; that is the same four-dup path."
+    },
+    {
+      "id": "cleanup_and_pid",
+      "status": "PASS",
+      "text": "Initialized file actions and attributes are destroyed, then owned duplicates are closed from 3 down to 0. A cleanup error does not stop the remaining destroys or closes, close is not retried, and the first actions, attribute and fd-close errors stay recorded while fd_close_failures counts each close failure. Return is the setup/spawn errno when that is nonzero, otherwise the cleanup errno. primary_error is the setup/spawn error. A positive pid and child_created=1 are stored only after posix_spawn returns 0 with pid>=1, and cleanup does not clear them. A non-positive success pid becomes EIO and is not published. The object matches this control flow. discard_child_on_cleanup_error, skip_owned_fd_close and ignore_dup2_error compile and are killed by assertion."
+    },
+    {
+      "id": "fail_closed_setup",
+      "status": "PASS",
+      "text": "A null result returns EINVAL before any write. Validate failure returns before fcntl or spawn with child_created clear. Every fcntl, init, signal, setpgroup, setflags, getflags, adddup2 and posix_spawn result is checked. The sanitized fake-API run printed PASS: 29 fake API failure boundaries, PID retained on local cleanup failure, exact fd whitelist/flags. Boundaries before spawn leave pid and child_created at 0. The seven validate rejects in the fixture do not enter the fake API."
+    },
+    {
+      "id": "imports",
+      "status": "PASS",
+      "text": "nm -u of the object is exactly the frozen 17-symbol list. ___error is exported by retained libdyld 428e224ec2621bf3a2a7859402603a9a0fd6abe8b3e26c38edeb869e0ce58a0d. The other sixteen are exported by canonical libSystem.B 8ff49e0c2a5f1c6532101c7ed662632444cc97ae9669479090e7968deddd12ff. posix_spawnp, fork, execve, addinherit_np, addopen and addclose are absent. sigemptyset and sigaddset are SDK macros and are constant-folded to mask 0 and default set 0x85003, which is SIGHUP|SIGINT|SIGPIPE|SIGTERM|SIGCHLD. Name closure only."
+    },
+    {
+      "id": "host_policy_tests",
+      "status": "PASS",
+      "text": "The linked log records 3 tests OK in 1.368s and does not itself print the child PASS line. test_spawn.py requires the sanitized run to contain the 29-boundary line, refuses -DNDEBUG because assertions are required, and requires each of the six mutants to compile and exit -SIGABRT with Assertion on stderr. This review re-ran that suite: 3 tests OK, all six mutant subtests passed, the direct sanitized binary printed the 29-boundary line with an empty sanitizer stderr, and -DNDEBUG failed on that #error. No target process was spawned."
+    }
+  ],
+  "notes": [
+    {
+      "id": "N1",
+      "severity": "scope",
+      "text": "Ambient parent descriptors are left unchanged. CLOEXEC_DEFAULT is the spawn attribute word checked by getflags. Whether exec closes unrelated descriptors is the separate runtime fixture. requested_flags and observed_flags are that checked word, not an exec whitelist."
+    },
+    {
+      "id": "N2",
+      "severity": "scope",
+      "text": "The explicit default set is SIGTERM, SIGINT, SIGHUP, SIGPIPE and SIGCHLD, with an empty mask and setpgroup(0). That matches ABI_PROPOSAL.md. It is not a reset of every catchable signal."
+    },
+    {
+      "id": "N3",
+      "severity": "record",
+      "text": "source-validation.json still says independent_review pending. This receipt does not edit that frozen manifest. runtime-probe/ was not opened. The parent runtime object 3471c6ef and its classifier were not reviewed."
+    }
+  ],
+  "not_claimed": [
+    "target execution",
+    "FD inheritance",
+    "CLOEXEC_DEFAULT runtime closure of unrelated descriptors",
+    "dyld load or image execution",
+    "hardware",
+    "parent runtime 3471c6ef",
+    "runtime-probe"
+  ],
+  "scope": "Read-only review of the frozen darwin-spawn C shim, its pinned ARM64 object, SDK flag values, and the host fake-API policy suite. No implementation, frozen manifest, runtime-probe, or other leaf was modified. M1 was not accessed and remains Linux with no actor."
+}

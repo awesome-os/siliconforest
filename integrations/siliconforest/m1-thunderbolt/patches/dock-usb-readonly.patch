@@ -1,0 +1,35 @@
+--- a/src/Kernel/Extensions/RavynXHCIPort/RavynXHCIMassStorageDisk.cpp
++++ b/src/Kernel/Extensions/RavynXHCIPort/RavynXHCIMassStorageDisk.cpp
+@@ -195,6 +195,8 @@
+                                           IOMemoryDescriptor *buffer, UInt64 bufOff, bool write)
+ {
+     if (!fParent) return false;
++    // Dedicated dock qualification: no lower-level SCSI write either.
++    if (write) return false;
+     UInt8 cdb[10];
+     bzero(cdb, sizeof(cdb));
+     cdb[0] = write ? SCSI_WRITE10 : SCSI_READ10;
+@@ -239,6 +241,13 @@
+         return kIOReturnSuccess;
+     }
+ 
++    // Reject before prepare, transfer setup or any device command.
++    // After completion, success is required by the storage-family ABI.
++    if (buffer->getDirection() & kIODirectionOut) {
++        IOStorage::complete(completion, kIOReturnNotWritable, 0);
++        return kIOReturnSuccess;
++    }
++
+     IOReturn ioret = buffer->prepare();
+     if (ioret != kIOReturnSuccess) {
+         IOStorage::complete(completion, ioret, 0);
+@@ -322,6 +331,6 @@
+ IOReturn
+ RavynXHCIMassStorageDisk::reportWriteProtection(bool *isWriteProtected)
+ {
+-    *isWriteProtected = false;
+-    return kIOReturnSuccess;
+-}
++    *isWriteProtected = true;
++    return kIOReturnSuccess;
++}

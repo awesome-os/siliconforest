@@ -1,0 +1,29 @@
+#!/bin/sh
+# Guest side of the zero-copy present test (SFAgx + SFDcp, sfagx=1 sfdcp=2): agx-panel-demo
+# renders with GLES on the GPU straight into buffers that the display driver scans out, and
+# presents by KMS page flip. No readback, no copy.
+# Step 1 (--kms-first): EGL extension strings, one buffer (GPU GEM object -> PRIME fd -> EGLImage
+# -> texture -> FBO, and -> card node -> ADDFB2), one rendered frame, its checks, one modeset
+# commit and its flip-complete event. Step 2 (only if step 1 passed): three buffers, a fixed
+# frame check and 5 s of page flips per scene.
+# Optional: the Linux reference fingerprint staged as /usr/local/share/agx/panel-linux-kms.fp.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin; export PATH
+R=/usr/local/share/agx
+printf '\nDL46_KMS_BEGIN_%s\n' "$nonce"
+ls -l /dev/dri 2>&1 | head -6
+start=$(date +%s)
+ref=; [ -r $R/panel-linux-kms.fp ] && ref="--fp-ref $R/panel-linux-kms.fp"
+agx-panel-demo --require-renderer "Apple M1" --kms-first --scenes plasma 2>&1
+rc=$?
+printf 'DL46_FIRST_RC=%s seconds=%s\n' "$rc" "$(( $(date +%s) - start ))"
+if [ "$rc" = 0 ]; then
+    agx-panel-demo --require-renderer "Apple M1" --kms --kms-seconds 5 $ref 2>&1
+    rc=$?
+    printf 'DL46_KMS_RC=%s seconds=%s\n' "$rc" "$(( $(date +%s) - start ))"
+else
+    printf 'DL46_KMS_SKIPPED first step failed\n'
+fi
+printf 'DL46_RC=%s\n' "$rc"
+printf 'DL46_KMS_END_%s\n' "$nonce"

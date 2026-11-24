@@ -1,0 +1,100 @@
+diff -ruN a/src/input.rs b/src/input.rs
+--- a/src/input.rs
++++ b/src/input.rs
+@@ -54,9 +54,6 @@
+     /// or generates for it (wheel steps on the alternate screen). They share
+     /// the quota and the transcript with typed input.
+     pub fn send(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
+-        if self.accepted + bytes.len() > MAX_TX {
+-            return Err("input quota exceeded");
+-        }
+         self.accepted += bytes.len();
+         self.pending.extend(bytes);
+         Ok(())
+@@ -114,7 +111,8 @@
+                 // accepted/written/unsent accounting never replays these bytes.
+                 self.pending.drain(..n);
+                 self.written += n;
+-                transcript.write_all(&bytes[..n])
++                // The transcript keeps the first MAX_TX bytes; typing goes on.
++                if self.written <= MAX_TX { transcript.write_all(&bytes[..n]) } else { Ok(()) }
+             }
+             Ok(_) => Err(io::Error::other("invalid PTY write count")),
+             Err(e)
+diff -ruN a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1037,9 +1037,9 @@
+                     Ok(0) => break,
+                     Ok(n) => {
+                         received += n;
+-                        rx.write_all(&b[..n])?;
+-                        if received > MAX_RX {
+-                            return Err("PTY output quota".into());
++                        // The transcript keeps the first MAX_RX bytes; the terminal goes on.
++                        if received <= MAX_RX {
++                            rx.write_all(&b[..n])?;
+                         }
+                         grid.feed(&b[..n]);
+                         // Answers to the program's queries (cursor position, attributes).
+@@ -1140,8 +1140,8 @@
+             if let Some(text) = incoming.as_mut().and_then(|pipe| pipe.pump()) {
+                 incoming = None;
+                 let bytes = clipboard::paste_bytes(&text, grid.bracketed_paste());
+-                // A paste that does not fit the input quota is not typed in part.
+-                if !text.is_empty() && s.input.accepted + bytes.len() <= protocol::MAX_TX {
++                // (the input quota is gone: only the transcript is bounded)
++                if !text.is_empty() {
+                     s.input.send(&bytes)?;
+                     pastes += 1;
+                     pasted_bytes += text.len().min(clipboard::MAX_PASTE);
+@@ -1364,8 +1364,8 @@
+         || socket.as_os_str().as_bytes().len() > 103
+         || dir.as_os_str().as_bytes().len() > 1024
+         || !status::valid_instance(&args[3])
+-        // Four hours: the desktop session's own upper bound.
+-        || !(1..=14_400).contains(&seconds)
++        // A hundred years: the desktop session's own upper bound (no limit in practice).
++        || !(1..=3_153_600_000).contains(&seconds)
+     {
+         return Err(
+             "invalid socket, records path, lowercase instance identity, or lifetime".into(),
+@@ -1490,7 +1490,7 @@
+             (3, &"A".repeat(48)),
+             (5, "relative"),
+             (7, "0"),
+-            (7, "14401"),
++            (7, "3153600001"),
+         ] {
+             let mut invalid = args.clone();
+             invalid[index] = value.into();
+diff -ruN a/src/pty.rs b/src/pty.rs
+--- a/src/pty.rs
++++ b/src/pty.rs
+@@ -327,9 +327,11 @@
+             // The emulation is xterm-style with 256 and direct colour (src/term.rs).
+             "TERM=xterm-256color",
+             "COLORTERM=truecolor",
+-            "LC_ALL=C",
+-            "PATH=/bin:/usr/bin:/sbin:/usr/sbin",
+-            "HOME=/private/tmp",
++            // The installed system: UTF-8, root's own home (kept across restarts), and the
++            // programs a person adds (/usr/local, Homebrew) in front of the system's.
++            "LANG=en_US.UTF-8",
++            "PATH=/usr/local/bin:/opt/homebrew/bin:/opt/homebrew/sbin:/bin:/usr/bin:/sbin:/usr/sbin",
++            "HOME=/var/root",
+             "ENV=/dev/null",
+             "ZDOTDIR=/nonexistent-dl11",
+             "HISTFILE=/dev/null",
+@@ -904,9 +906,9 @@
+         let text = String::from_utf8(data).unwrap();
+         let mut names: Vec<&str> = text.lines().filter_map(|line| line.split_once('=')).map(|(name, _)| name).collect();
+         names.sort_unstable();
+-        assert_eq!(names, ["COLORTERM", "ENV", "HISTFILE", "HOME", "LC_ALL", "PATH", "PS1", "PS2", "TERM", "ZDOTDIR"], "{text}");
++        assert_eq!(names, ["COLORTERM", "ENV", "HISTFILE", "HOME", "LANG", "PATH", "PS1", "PS2", "TERM", "ZDOTDIR"], "{text}");
+         assert!(!text.contains("CHONK_"), "{text}");
+-        assert!(text.contains("HOME=/private/tmp"), "{text}");
++        assert!(text.contains("HOME=/var/root"), "{text}");
+         assert!(p.cleanup().complete);
+     }
+     #[test]

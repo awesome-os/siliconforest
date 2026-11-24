@@ -1,0 +1,359 @@
+diff --git a/crates/chonk-shell/src/miniwindows.rs b/crates/chonk-shell/src/miniwindows.rs
+index a828bdc..59e79a4 100644
+--- a/crates/chonk-shell/src/miniwindows.rs
++++ b/crates/chonk-shell/src/miniwindows.rs
+@@ -74,7 +74,9 @@ impl<B: Backend> Miniwindows<B> {
+             rect.pos.y = rect.pos.y.clamp(area.pos.y, area.pos.y + area.size.h.saturating_sub(size) as i32);
+             let fresh = index.is_none();
+             let index = if let Some(index) = index { index } else {
+-                let Some(surface) = wm.backend_mut().create_shell_surface(rect, (0, 0, 0), false) else { continue; };
++                // DESK6: above the windows, as macOS keeps minimised windows in its Dock: at desktop
++                // level a window over the bottom left hid the tile, and a click there went to the window
++                let Some(surface) = wm.backend_mut().create_shell_surface(rect, (0, 0, 0), true) else { continue; };
+                 self.tiles.push(Tile { client: id, surface, rect, manual: false, title: String::new(), mapped: false, missing_preview: true });
+                 self.tiles.len() - 1
+             };
+diff --git a/crates/wm-darwin/Cargo.toml b/crates/wm-darwin/Cargo.toml
+index 9b89dcb..28a9418 100644
+--- a/crates/wm-darwin/Cargo.toml
++++ b/crates/wm-darwin/Cargo.toml
+@@ -33,7 +33,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg"], optio
+ 
+ [dev-dependencies]
+ wayland-client = "0.31"
+-wayland-protocols = { version = "0.32", features = ["client", "staging"] }
++wayland-protocols = { version = "0.32", features = ["client", "staging", "unstable"] }
+ tempfile = "3"
+ 
+ [[bin]]
+diff --git a/crates/wm-darwin/src/gesture.rs b/crates/wm-darwin/src/gesture.rs
+index 2b0f430..3335cb9 100644
+--- a/crates/wm-darwin/src/gesture.rs
++++ b/crates/wm-darwin/src/gesture.rs
+@@ -193,8 +193,13 @@ impl Server {
+                 let _ = self.deliver_hid(crate::hid::Event::Swipe { phase: SwipePhase::Cancel, fingers: 3, dx: 0, dy: 0 }, time);
+                 break;
+             }
+-            let phase = match e.1 { 1 => Some(SwipePhase::Begin), 2 => Some(SwipePhase::Update), 3 => Some(SwipePhase::End), _ => None };
+-            if let Some(phase) = phase {
++            let phase = match e.1 { 1 => Some(SwipePhase::Begin), 2 => Some(SwipePhase::Update), 3 => Some(SwipePhase::End), 4 => Some(SwipePhase::Cancel), _ => None };
++            if let (Some(phase), 1) = (phase, e.6) {
++                // a pinch (ring version 2): to the client under the pointer
++                if let Err(error) = self.deliver_hid(crate::hid::Event::Pinch { phase, fingers: e.2, dx: e.3, dy: e.4, scale_q16: e.7, rotation_cdeg: e.8 }, time) {
++                    eprintln!("WMGESTURE trackpad pinch not delivered: {error}");
++                }
++            } else if let (Some(phase), 0) = (phase, e.6) {
+                 self.gesture.ring_events += 1;
+                 if self.gesture.ring_events == 1 {
+                     eprintln!("WMGESTURE trackpad swipes: first event phase={phase:?} fingers={} synthetic={}", e.2, e.5);
+@@ -273,28 +278,81 @@ impl Server {
+     }
+ }
+ 
+-/// (seq, phase, fingers, dx, dy, synthetic) of one event of the ring.
+-type RingEvent = (u32, u8, u8, i16, i16, u8);
+-/// `kern.sf_trackpad_swipe`: (version, next sequence, the 32 events); None without it.
+-#[cfg(not(target_os = "linux"))]
+-fn read_swipe_ring() -> Option<(u32, u32, [RingEvent; 32])> {
+-    let mut bytes = [0u8; 8 + 32 * 16];
+-    let mut len = bytes.len();
+-    let name = c"kern.sf_trackpad_swipe";
+-    let rc = unsafe { libc::sysctlbyname(name.as_ptr(), bytes.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) };
+-    if rc != 0 || len != bytes.len() {
++/// One event of the ring: (seq, phase, fingers, dx, dy, synthetic, kind, scale_q16, angle_cdeg).
++/// kind 0 = swipe; 1 = pinch (ring version 2, DESK6's request to the kernel: the scale since the
++/// begin, 65536 = 1.0, and the turn since the event before in hundredths of a degree).
++type RingEvent = (u32, u8, u8, i16, i16, u8, u8, u32, i32);
++/// Version 1: 16-byte swipe events (8 + 32 * 16 bytes). Version 2: 24-byte events with a kind,
++/// a scale and an angle (8 + 32 * 24 bytes).
++#[cfg_attr(target_os = "linux", allow(dead_code))]
++fn parse_ring(bytes: &[u8]) -> Option<(u32, u32, [RingEvent; 32])> {
++    if bytes.len() < 8 {
+         return None;
+     }
+     let u32_at = |o: usize| u32::from_ne_bytes(bytes[o..o + 4].try_into().unwrap());
+     let i16_at = |o: usize| i16::from_ne_bytes(bytes[o..o + 2].try_into().unwrap());
+-    let mut events = [(0u32, 0u8, 0u8, 0i16, 0i16, 0u8); 32];
++    let (version, size) = match (u32_at(0), bytes.len()) {
++        (1, 520) => (1, 16),
++        (2, 776) => (2, 24),
++        _ => return None,
++    };
++    let mut events = [(0u32, 0u8, 0u8, 0i16, 0i16, 0u8, 0u8, 65536u32, 0i32); 32];
+     for (i, e) in events.iter_mut().enumerate() {
+-        let o = 8 + i * 16;
+-        *e = (u32_at(o), bytes[o + 4], bytes[o + 5], i16_at(o + 6), i16_at(o + 8), bytes[o + 10]);
++        let o = 8 + i * size;
++        let (kind, scale, angle) = if version == 2 { (bytes[o + 11], u32_at(o + 16), u32_at(o + 20) as i32) } else { (0, 65536, 0) };
++        *e = (u32_at(o), bytes[o + 4], bytes[o + 5], i16_at(o + 6), i16_at(o + 8), bytes[o + 10], kind, scale, angle);
+     }
+-    (u32_at(0) == 1).then(|| (u32_at(0), u32_at(4), events))
++    Some((version, u32_at(4), events))
++}
++/// `kern.sf_trackpad_swipe`: (version, next sequence, the 32 events); None without it.
++#[cfg(not(target_os = "linux"))]
++fn read_swipe_ring() -> Option<(u32, u32, [RingEvent; 32])> {
++    let mut bytes = [0u8; 8 + 32 * 24];
++    let mut len = bytes.len();
++    let name = c"kern.sf_trackpad_swipe";
++    let rc = unsafe { libc::sysctlbyname(name.as_ptr(), bytes.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) };
++    if rc != 0 {
++        return None;
++    }
++    parse_ring(&bytes[..len.min(bytes.len())])
+ }
+ #[cfg(target_os = "linux")]
+ fn read_swipe_ring() -> Option<(u32, u32, [RingEvent; 32])> {
+     None
+ }
++
++#[cfg(test)]
++mod ring_tests {
++    use super::parse_ring;
++    fn event(bytes: &mut Vec<u8>, seq: u32, phase: u8, fingers: u8, dx: i16, dy: i16, kind: u8, scale: u32, angle: i32, v2: bool) {
++        bytes.extend_from_slice(&seq.to_ne_bytes());
++        bytes.extend_from_slice(&[phase, fingers]);
++        bytes.extend_from_slice(&dx.to_ne_bytes());
++        bytes.extend_from_slice(&dy.to_ne_bytes());
++        bytes.extend_from_slice(&[0, kind]);
++        bytes.extend_from_slice(&7u32.to_ne_bytes());
++        if v2 {
++            bytes.extend_from_slice(&scale.to_ne_bytes());
++            bytes.extend_from_slice(&angle.to_ne_bytes());
++        }
++    }
++    /// The kernel's ring as it is (version 1, swipes) and as DESK6 asks for it (version 2: a
++    /// kind, the pinch's scale and turn): both read; anything else is not taken.
++    #[test]
++    fn the_trackpad_ring_reads_swipes_of_version_1_and_pinches_of_version_2() {
++        let mut v1 = [1u32.to_ne_bytes(), 3u32.to_ne_bytes()].concat();
++        for i in 0..32 { event(&mut v1, i, if i == 1 { 1 } else { 2 }, 3, -12, 4, 0, 0, 0, false); }
++        let (version, next, events) = parse_ring(&v1).unwrap();
++        assert_eq!((version, next), (1, 3));
++        assert_eq!(events[1], (1, 1, 3, -12, 4, 0, 0, 65536, 0), "a version-1 event is a swipe");
++        let mut v2 = [2u32.to_ne_bytes(), 5u32.to_ne_bytes()].concat();
++        for i in 0..32 { event(&mut v2, i, 2, 2, 3, -1, 1, 98304, -250, true); }
++        let (version, _, events) = parse_ring(&v2).unwrap();
++        assert_eq!(version, 2);
++        assert_eq!(events[4], (4, 2, 2, 3, -1, 0, 1, 98304, -250), "a pinch: scale 1.5, turned 2.5 degrees anticlockwise");
++        assert!(parse_ring(&v2[..700]).is_none(), "a cut ring is not taken");
++        let mut bad = v1.clone();
++        bad[0] = 9;
++        assert!(parse_ring(&bad).is_none(), "an unknown version is not taken");
++    }
++}
+diff --git a/crates/wm-darwin/src/hid.rs b/crates/wm-darwin/src/hid.rs
+index 77b0bb8..f4bb7aa 100644
+--- a/crates/wm-darwin/src/hid.rs
++++ b/crates/wm-darwin/src/hid.rs
+@@ -17,6 +17,12 @@ pub enum Event {
+     /// A multi-finger swipe (see `crate::gesture`): begin, update by (dx, dy) panel pixels, end
+     /// or cancel. Not a SFHID pointer record either.
+     Swipe { phase:SwipePhase, fingers:u8, dx:i16, dy:i16 },
++    /// A pinch (two or more fingers moving apart or together, turning): begin, update by the
++    /// centre's motion (dx, dy panel pixels), the scale since the begin (65536 = 1.0) and the
++    /// turn since the update before (hundredths of a degree, clockwise); end or cancel. Given to
++    /// the client under the pointer through zwp_pointer_gestures_v1 (DESK6, for Firefox's and
++    /// AppKit's magnify/rotate). Not a SFHID pointer record either.
++    Pinch { phase:SwipePhase, fingers:u8, dx:i16, dy:i16, scale_q16:u32, rotation_cdeg:i32 },
+ }
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum SwipePhase { Begin, Update, End, Cancel }
+diff --git a/crates/wm-darwin/src/inject.rs b/crates/wm-darwin/src/inject.rs
+index 8ee4772..a4c1c07 100644
+--- a/crates/wm-darwin/src/inject.rs
++++ b/crates/wm-darwin/src/inject.rs
+@@ -17,6 +17,10 @@
+ //! swipe begin|update|end|cancel <fingers> <dx> <dy>
+ //!                                  a multi-finger swipe as a multitouch surface would report it
+ //!                                  (2..5 fingers, dx dy in panel pixels); synthetic like the rest
++//! pinch begin|update|end|cancel <fingers> <dx> <dy> <scale> <degrees>
++//!                                  a pinch to the client under the pointer (zwp_pointer_gestures_v1):
++//!                                  the centre's motion (panel pixels), the scale since the begin (1.0 =
++//!                                  none), the turn since the update before (degrees, clockwise) (DESK6)
+ //! wait <milliseconds>              nothing for that long (at most 10 s)
+ //! stream rel <dx> <dy> <count> <ms> pointer records from a thread of their own, one every <ms>
+ //!                                  (1..100), as a device gives them, whatever the frames do; the
+@@ -127,6 +131,15 @@ impl Inject {
+                     let phase = match *phase { "begin" => SwipePhase::Begin, "update" => SwipePhase::Update, "end" => SwipePhase::End, _ => SwipePhase::Cancel };
+                     Step::Event(Event::Swipe { phase, fingers, dx, dy })
+                 }),
++                // DESK6: a pinch as a multitouch surface would report it: the centre's motion (panel
++                // pixels), the scale since the begin and the turn in degrees since the update before
++                ["pinch", phase @ ("begin" | "update" | "end" | "cancel"), fingers, x, y, scale, turn] => fingers.parse::<u8>().ok().filter(|f| (2..=5).contains(f))
++                    .zip(x.parse::<i16>().ok().zip(y.parse::<i16>().ok()))
++                    .zip(scale.parse::<f64>().ok().filter(|s| s.is_finite() && *s > 0.0 && *s < 60_000.0).zip(turn.parse::<f64>().ok().filter(|t| t.is_finite() && t.abs() <= 360.0)))
++                    .map(|((fingers, (dx, dy)), (scale, turn))| {
++                        let phase = match *phase { "begin" => SwipePhase::Begin, "update" => SwipePhase::Update, "end" => SwipePhase::End, _ => SwipePhase::Cancel };
++                        Step::Event(Event::Pinch { phase, fingers, dx, dy, scale_q16: (scale * 65536.0).round() as u32, rotation_cdeg: (turn * 100.0).round() as i32 })
++                    }),
+                 ["stream", "rel", x, y, count, every] => x.parse::<i8>().ok().zip(y.parse::<i8>().ok()).zip(count.parse::<usize>().ok().filter(|c| (1..=20_000).contains(c))).zip(every.parse::<u64>().ok().filter(|e| (1..=100).contains(e))).map(|(((dx, dy), count), every)| {
+                     let buttons = self.buttons;
+                     Step::Stream { events: vec![Event::Pointer { motion: Motion::Relative(dx, dy), buttons, wheel: 0 }; count], every: Duration::from_millis(every) }
+diff --git a/crates/wm-darwin/src/input.rs b/crates/wm-darwin/src/input.rs
+index af0b90e..47e5409 100644
+--- a/crates/wm-darwin/src/input.rs
++++ b/crates/wm-darwin/src/input.rs
+@@ -456,6 +456,24 @@ impl Server {
+             Event::Swipe{phase,fingers,dx,dy}=>{
+                 self.swipe(phase,fingers,dx,dy,time);
+             }
++            // A pinch goes to the client under the pointer, as on macOS (magnify, rotate):
++            // zwp_pointer_gestures_v1, which smithay sends to the pointer's focus.
++            Event::Pinch{phase,fingers,dx,dy,scale_q16,rotation_cdeg}=>{
++                let pointer=self.input.as_ref().unwrap().pointer.clone().ok_or("pinch event rejected; seat has no pointer")?;
++                if !self.wm.interactive_drag_active(){
++                    use smithay::input::pointer::{GesturePinchBeginEvent,GesturePinchUpdateEvent,GesturePinchEndEvent};
++                    let density=self.scale().factor();
++                    match phase {
++                        crate::hid::SwipePhase::Begin=>pointer.gesture_pinch_begin(self,&GesturePinchBeginEvent{serial:SERIAL_COUNTER.next_serial(),time,fingers:u32::from(fingers)}),
++                        crate::hid::SwipePhase::Update=>pointer.gesture_pinch_update(self,&GesturePinchUpdateEvent{time,delta:(f64::from(dx)/density,f64::from(dy)/density).into(),scale:f64::from(scale_q16)/65536.0,rotation:f64::from(rotation_cdeg)/100.0}),
++                        crate::hid::SwipePhase::End|crate::hid::SwipePhase::Cancel=>pointer.gesture_pinch_end(self,&GesturePinchEndEvent{serial:SERIAL_COUNTER.next_serial(),time,cancelled:phase==crate::hid::SwipePhase::Cancel}),
++                    }
++                    if phase==crate::hid::SwipePhase::Begin {
++                        let focus=pointer.current_focus().and_then(|s|crate::server::peer_of(&s)).and_then(|p|p.pid);
++                        eprintln!("WMGESTURE pinch begin fingers={fingers} to the client under the pointer pid={focus:?} (zwp_pointer_gestures_v1)");
++                    }
++                }
++            }
+         }
+         #[cfg(feature = "desktop-shell")]
+         self.service_desktop()?;
+diff --git a/crates/wm-darwin/src/power.rs b/crates/wm-darwin/src/power.rs
+index 3f9f421..212411c 100644
+--- a/crates/wm-darwin/src/power.rs
++++ b/crates/wm-darwin/src/power.rs
+@@ -255,7 +255,7 @@ impl Power {
+                 }
+                 Filtered::Pass
+             }
+-            Event::HWheel(_) | Event::Scroll { .. } | Event::Swipe { .. } => {
++            Event::HWheel(_) | Event::Scroll { .. } | Event::Swipe { .. } | Event::Pinch { .. } => {
+                 if self.off {
+                     self.wake_requested = true;
+                     self.counts.swallowed += 1;
+diff --git a/crates/wm-darwin/src/server.rs b/crates/wm-darwin/src/server.rs
+index 599ac3d..1d46305 100644
+--- a/crates/wm-darwin/src/server.rs
++++ b/crates/wm-darwin/src/server.rs
+@@ -131,6 +131,8 @@ pub struct Server {
+     pub recorder: crate::record::Recorder,
+     compositor: CompositorState,
+     shell: XdgShellState,
++    /// zwp_pointer_gestures_v1: pinches to the client under the pointer (DESK6).
++    _pointer_gestures: smithay::wayland::pointer_gestures::PointerGesturesState,
+     shm: ShmState,
+     _decoration: XdgDecorationState,
+     pub(crate) output: Output,
+@@ -326,6 +328,7 @@ impl Server {
+             recorder: Default::default(),
+             compositor,
+             shell: XdgShellState::new_with_capabilities::<Self>(dh, [WmCapabilities::Maximize, WmCapabilities::Fullscreen, WmCapabilities::Minimize]),
++            _pointer_gestures: smithay::wayland::pointer_gestures::PointerGesturesState::new::<Self>(dh),
+             shm: ShmState::new::<Self>(dh, vec![]),
+             _decoration: XdgDecorationState::new::<Self>(dh),
+             output,
+@@ -2032,6 +2035,7 @@ impl FractionalScaleHandler for Server {
+     }
+ }
+ smithay::delegate_fractional_scale!(Server);
++smithay::delegate_pointer_gestures!(Server);
+ smithay::delegate_viewporter!(Server);
+ delegate_compositor!(Server);
+ delegate_shm!(Server);
+diff --git a/crates/wm-darwin/tests/wayland_shm.rs b/crates/wm-darwin/tests/wayland_shm.rs
+index 52ec1ce..03962ff 100644
+--- a/crates/wm-darwin/tests/wayland_shm.rs
++++ b/crates/wm-darwin/tests/wayland_shm.rs
+@@ -58,6 +58,9 @@ struct Client {
+     selection:Option<wl_data_offer::WlDataOffer>,
+     selection_events:u32,
+     send_requests:Vec<(String,std::os::fd::OwnedFd)>,
++    /// zwp_pointer_gestures_v1 and the pinch events it gave (DESK6).
++    gestures:Option<wayland_protocols::wp::pointer_gestures::zv1::client::zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
++    pinch_events:Vec<String>,
+     source_cancelled:u32,
+ }
+ impl Client {
+@@ -96,6 +99,19 @@ impl Dispatch<wl_data_source::WlDataSource,()> for Client {
+         }
+     }
+ }
++delegate_noop!(Client: ignore wayland_protocols::wp::pointer_gestures::zv1::client::zwp_pointer_gestures_v1::ZwpPointerGesturesV1);
++impl Dispatch<wayland_protocols::wp::pointer_gestures::zv1::client::zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()> for Client {
++    fn event(s: &mut Self, _: &wayland_protocols::wp::pointer_gestures::zv1::client::zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1,
++        e: wayland_protocols::wp::pointer_gestures::zv1::client::zwp_pointer_gesture_pinch_v1::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
++        use wayland_protocols::wp::pointer_gestures::zv1::client::zwp_pointer_gesture_pinch_v1::Event as P;
++        s.pinch_events.push(match e {
++            P::Begin { fingers, .. } => format!("begin {fingers}"),
++            P::Update { dx, dy, scale, rotation, .. } => format!("update {dx:.1} {dy:.1} {scale:.2} {rotation:.2}"),
++            P::End { cancelled, .. } => format!("end {cancelled}"),
++            _ => "other".into(),
++        });
++    }
++}
+ impl Dispatch<wl_registry::WlRegistry, ()> for Client {
+     fn event(
+         s: &mut Self,
+@@ -122,6 +138,7 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Client {
+                 }
+                 "wl_seat" => {s.seat=Some(r.bind(name,version.min(9),q,()));s.data_device(q);}
+                 "wl_data_device_manager" => {s.data_manager=Some(r.bind(name,version.min(3),q,()));s.data_device(q);}
++                "zwp_pointer_gestures_v1" => s.gestures=Some(r.bind(name,version.min(3),q,())),
+                 _ => {}
+             }
+         }
+@@ -293,6 +310,9 @@ enum Request {
+     Reject(bool),
+     Workspace(usize),
+     Keyboard([u8;8]),Mouse([u8;12]),
++    /// Any input event, as the input thread hands it on (DESK6: pinches).
++    #[cfg_attr(not(feature = "desktop-shell"), allow(dead_code))]
++    Hid(wm_darwin::hid::Event),
+     Stop,
+ }
+ struct Harness {
+@@ -369,6 +389,7 @@ impl Harness {
+                     Ok(Request::Workspace(workspace)) => state.wm.switch_workspace(workspace),
+                     Ok(Request::Keyboard(bytes))=>{if let Some(event)=decoder.keyboard(&bytes).unwrap(){state.deliver_hid(event,started.elapsed().as_millis() as u32).unwrap();}},
+                     Ok(Request::Mouse(bytes))=>{state.deliver_hid(decoder.mouse(&bytes).unwrap(),started.elapsed().as_millis() as u32).unwrap();},
++                    Ok(Request::Hid(event))=>{state.deliver_hid(event,started.elapsed().as_millis() as u32).unwrap();},
+                     Ok(Request::Snapshot(reply)) => {
+                         let content = state
+                             .wm
+@@ -1374,6 +1395,35 @@ fn a_minimised_window_whose_client_unmaps_it_stays_minimised_and_comes_back_at_i
+     assert_eq!(back.content.map(|r| r.pos), Some(place.pos), "at its place");
+ }
+ 
++/// DESK6 (the Firefox and AppKit agents' request): a pinch from the trackpad goes to the client under
++/// the pointer through zwp_pointer_gestures_v1 - begin with the fingers, updates with the centre's
++/// motion, the scale since the begin and the turn, end - as a Linux compositor gives libinput's.
++#[test]
++#[cfg(feature = "desktop-shell")]
++fn a_pinch_goes_to_the_client_under_the_pointer_through_pointer_gestures() {
++    let (h, a) = Harness::with_input(true);
++    let (tx, rx) = mpsc::channel();
++    h.tx.send(Request::Desktop(tx)).unwrap();
++    rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
++    let (mut q, mut c, _s, _x, _t) = map_client(&a, "pinched");
++    assert!(c.globals.iter().any(|g| g == "zwp_pointer_gestures_v1"), "the global is offered: {:?}", c.globals);
++    let qh = q.handle();
++    let pointer = c.pointer.clone().expect("a pointer");
++    let _pinch = c.gestures.as_ref().unwrap().get_pinch_gesture(&pointer, &qh, ());
++    q.roundtrip(&mut c).unwrap();
++    // the pointer onto the window, then a pinch out by half and a turn
++    let content = h.snapshot().content.unwrap();
++    use wm_darwin::hid::{Event, Motion, SwipePhase};
++    let at = |v: i32, of: f64| ((f64::from(v) + 0.25) / of * 65535.).round().clamp(0., 65535.) as u16;
++    h.tx.send(Request::Hid(Event::Pointer { motion: Motion::Absolute(at(content.pos.x + 30, 319.), at(content.pos.y + 30, 239.)), buttons: 0, wheel: 0 })).unwrap();
++    for (phase, scale, turn) in [(SwipePhase::Begin, 65536, 0), (SwipePhase::Update, 81920, 150), (SwipePhase::Update, 98304, 100), (SwipePhase::End, 98304, 0)] {
++        h.tx.send(Request::Hid(Event::Pinch { phase, fingers: 2, dx: 4, dy: -2, scale_q16: scale, rotation_cdeg: turn })).unwrap();
++    }
++    h.snapshot();
++    for _ in 0..3 { q.roundtrip(&mut c).unwrap(); }
++    assert_eq!(c.pinch_events, ["begin 2", "update 4.0 -2.0 1.25 1.50", "update 4.0 -2.0 1.50 1.00", "end 0"], "{:?}", c.pinch_events);
++}
++
+ /// Command-Tab: the switcher takes the keyboard while Command is held, and Command's release
+ /// switches. Command went down while the client had the keyboard, so the client must not be
+ /// told Command is still down when it gets the keyboard back (the desk's terminal ends on a

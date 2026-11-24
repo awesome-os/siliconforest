@@ -1,0 +1,197 @@
+--- a/src/Frameworks/AppKit/NSFoundWithTerminalAdditions.m
++++ b/src/Frameworks/AppKit/NSFoundWithTerminalAdditions.m
+@@ -114,3 +114,99 @@
+ }
+ 
+ @end
++
++/* A column that is hidden (macOS 10.5): Terminal's inspector hides some of its table's columns.
++ * Where the table has no hidden columns of its own a hidden column is one of width 0, and showing it
++ * again gives it back its width. Added only where NSTableColumn has no -isHidden (a table that lays
++ * out hidden columns brings its own). */
++#import <AppKit/NSTableColumn.h>
++#include <objc/runtime.h>
++
++static char SFColumnHiddenKey;
++
++static BOOL sfColumnIsHidden(id self, SEL _cmd)
++{
++    return objc_getAssociatedObject(self, &SFColumnHiddenKey) != nil;
++}
++
++static void sfColumnSetHidden(id self, SEL _cmd, BOOL hidden)
++{
++    NSNumber *width = objc_getAssociatedObject(self, &SFColumnHiddenKey);
++
++    if (hidden == (width != nil))
++        return;
++    if (hidden) {
++        objc_setAssociatedObject(self, &SFColumnHiddenKey, [NSNumber numberWithDouble:[self width]], OBJC_ASSOCIATION_RETAIN);
++        [self setMinWidth:0];
++        [self setWidth:0];
++    }
++    else {
++        objc_setAssociatedObject(self, &SFColumnHiddenKey, nil, OBJC_ASSOCIATION_RETAIN);
++        [self setWidth:[width doubleValue]];
++    }
++}
++
++@interface SFHiddenColumnsInstaller : NSObject
++@end
++
++@implementation SFHiddenColumnsInstaller
++
+++ (void)load
++{
++    Class column = [NSTableColumn class];
++
++    if (!class_getInstanceMethod(column, @selector(isHidden)))
++        class_addMethod(column, @selector(isHidden), (IMP)sfColumnIsHidden, "c@:");
++    if (!class_getInstanceMethod(column, @selector(setHidden:)))
++        class_addMethod(column, @selector(setHidden:), (IMP)sfColumnSetHidden, "v@:c");
++}
++
++@end
++
++/* The font bindings of a cell (macOS 10.4): fontBold, fontItalic, fontName, fontFamilyName, fontSize
++ * change the cell's font. Terminal's inspector binds fontBold of its process list to the frontmost
++ * process; the cell had no such key and every redraw raised. */
++#import <AppKit/NSCell.h>
++#import <AppKit/NSFont.h>
++#import <AppKit/NSFontManager.h>
++
++@implementation NSCell (SFFontBindings)
++
++- (id)fontBold { return [NSNumber numberWithBool:([[NSFontManager sharedFontManager] traitsOfFont:[self font]] & NSBoldFontMask) != 0]; }
++- (void)setFontBold:(id)value
++{
++    NSFont *font = [self font];
++    if (font == nil)
++        return;
++    font = [value boolValue] ? [[NSFontManager sharedFontManager] convertFont:font toHaveTrait:NSBoldFontMask]
++                             : [[NSFontManager sharedFontManager] convertFont:font toNotHaveTrait:NSBoldFontMask];
++    if (font != nil)
++        [self setFont:font];
++}
++- (id)fontItalic { return [NSNumber numberWithBool:([[NSFontManager sharedFontManager] traitsOfFont:[self font]] & NSItalicFontMask) != 0]; }
++- (void)setFontItalic:(id)value
++{
++    NSFont *font = [self font];
++    if (font == nil)
++        return;
++    font = [value boolValue] ? [[NSFontManager sharedFontManager] convertFont:font toHaveTrait:NSItalicFontMask]
++                             : [[NSFontManager sharedFontManager] convertFont:font toNotHaveTrait:NSItalicFontMask];
++    if (font != nil)
++        [self setFont:font];
++}
++- (id)fontName { return [[self font] fontName]; }
++- (void)setFontName:(id)value
++{
++    NSFont *font = [value isKindOfClass:[NSString class]] ? [NSFont fontWithName:value size:[[self font] pointSize]] : nil;
++    if (font != nil)
++        [self setFont:font];
++}
++- (id)fontSize { return [NSNumber numberWithDouble:[[self font] pointSize]]; }
++- (void)setFontSize:(id)value
++{
++    NSFont *font = [self font] && [value respondsToSelector:@selector(doubleValue)] ? [NSFont fontWithName:[[self font] fontName] size:[value doubleValue]] : nil;
++    if (font != nil)
++        [self setFont:font];
++}
++
++@end
+--- a/src/Frameworks/AppKit/NSCell.m
++++ b/src/Frameworks/AppKit/NSCell.m
+@@ -642,7 +642,12 @@
+ }
+ 
+ -(void)setObjectValue:(id <NSCopying>)value {
+-    value=[value copyWithZone:NULL];
++    // copied where it can be, kept otherwise, as on macOS (Terminal's inspector shows its own
++    // process objects, which are not NSCopying, in a table)
++    if([(id)value respondsToSelector:@selector(copyWithZone:)])
++     value=[value copyWithZone:NULL];
++    else
++     value=[(id)value retain];
+ 
+     [[self controlView] willChangeValueForKey:@"objectValue"];
+     [_objectValue release];
+--- a/src/Frameworks/AppKit/NSAttributedString.m
++++ b/src/Frameworks/AppKit/NSAttributedString.m
+@@ -406,7 +406,8 @@
+ NSColor *NSForegroundColorAttributeInDictionary(NSDictionary *dictionary) {
+    NSColor *color=[dictionary objectForKey:NSForegroundColorAttributeName];
+ 
+-   if(color==nil)
++   // a value that is not a colour (a binding that set some other object) draws black, as no colour does
++   if(color==nil || ![color isKindOfClass:[NSColor class]])
+     color=[NSColor blackColor];
+ 
+    return color;
+--- a/src/Frameworks/AppKit/NSKeyValueBinding/NSBinder.m
++++ b/src/Frameworks/AppKit/NSKeyValueBinding/NSBinder.m
+@@ -89,7 +89,19 @@
+      return nil;
+      
+     result=[NSValueTransformer valueTransformerForName:name];
+-    
++
++    /* As on macOS: a name nobody registered that is the name of a value transformer class is
++     * an instance of that class, registered under its name (Terminal's inspector names
++     * TTProcessInfoToDisplayNameTransformer, which it never registers). */
++    if(result==nil){
++     Class cls=NSClassFromString(name);
++
++     if(cls!=Nil && [cls isSubclassOfClass:[NSValueTransformer class]]){
++      result=[[[cls alloc] init] autorelease];
++      [NSValueTransformer setValueTransformer:result forName:name];
++     }
++    }
++
+ 	   if(result==nil) {
+ 		   NSBindingDebugLog(kNSBindingDebugLogLevel1, @"[NSValueTransformer valueTransformerForName:%@] failed in NSBinder.m",name);
+ 	   }
+--- a/src/Frameworks/AppKit/NSKeyValueBinding/NSMultipleValueBinder.m
++++ b/src/Frameworks/AppKit/NSKeyValueBinding/NSMultipleValueBinder.m
+@@ -46,7 +46,9 @@
+ -(void)applyToObject:(id)object inRow:(int)row keyPath:(id)path
+ {
+    @try {
+-      [object setValue:[[_rowValues objectAtIndex:row] valueForKeyPath:_valueKeyPath] forKey:path];
++      // through the binding's value transformer, as every other binder (Terminal's inspector
++      // names its processes and colours them with transformers of TTProcessInfo)
++      [object setValue:[self transformedObject:[[_rowValues objectAtIndex:row] valueForKeyPath:_valueKeyPath]] forKey:path];
+    }
+    @catch(id e) {
+         NSLog(@"exception %@ while setting value for key path %@ for row %i", e, _valueKeyPath, row);
+@@ -65,7 +67,7 @@
+ 
+ -(void)applyFromObject:(id)object inRow:(int)row keyPath:(id)keypath
+ {
+-	[[_rowValues objectAtIndex:row] setValue:[object valueForKeyPath:keypath]  forKeyPath:_valueKeyPath];
++	[[_rowValues objectAtIndex:row] setValue:[self reverseTransformedObject:[object valueForKeyPath:keypath]] forKeyPath:_valueKeyPath];
+ }
+ 
+ -(void)applyFromObject:(id)object inRow:(int)row
+@@ -84,7 +86,7 @@
+ }
+ 
+ -(id)objectAtIndex:(unsigned)row {
+-	return [[_rowValues objectAtIndex:row] valueForKeyPath:_valueKeyPath];
++	return [self transformedObject:[[_rowValues objectAtIndex:row] valueForKeyPath:_valueKeyPath]];
+ }
+ 
+ -(void)cacheArrayKeyPath
+--- a/src/Frameworks/AppKit/NSButton.m
++++ b/src/Frameworks/AppKit/NSButton.m
+@@ -232,7 +232,9 @@
+    if((modifiers&(NSCommandKeyMask|NSAlternateKeyMask))==([self keyEquivalentModifierMask]&(NSCommandKeyMask|NSAlternateKeyMask))){
+     NSString *key=[self keyEquivalent];
+ 
+-    if([key isEqualToString:characters]){
++    // an empty key equivalent is none (a modifier key alone arrives with no characters: Shift
++    // pressed in Terminal's inspector opened the process table's pull-down)
++    if([key length]>0 && [key isEqualToString:characters]){
+      [self performClick:nil];
+      return YES;
+     }

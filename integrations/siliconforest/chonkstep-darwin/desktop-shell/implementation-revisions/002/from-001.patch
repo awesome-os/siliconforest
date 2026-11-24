@@ -1,0 +1,1929 @@
+--- /dev/null
++++ b/crates/chonk-ipc/src/darwin_fd_tests.rs
+@@ -0,0 +1,114 @@
++//! Host policy/ownership tests. These do not execute the Darwin ABI on Linux.
++use super::*;
++use std::os::unix::net::UnixStream;
++
++fn pair() -> (OwnedFd, UnixStream) {
++    let (a, b) = UnixStream::pair().unwrap();
++    (a.into(), b)
++}
++
++#[test]
++fn adapter_sets_and_verifies_both_flags_before_returning() {
++    let (fd, _peer) = pair();
++    let raw = fd.as_raw_fd();
++    unsafe {
++        assert_eq!(libc::fcntl(raw, libc::F_SETFL, 0), 0);
++        assert_eq!(libc::fcntl(raw, libc::F_SETFD, 0), 0);
++    }
++    let configured = configure_owned(fd).unwrap();
++    assert_eq!(configured.as_raw_fd(), raw);
++    unsafe {
++        assert_ne!(libc::fcntl(raw, libc::F_GETFL) & libc::O_NONBLOCK, 0);
++        assert_ne!(libc::fcntl(raw, libc::F_GETFD) & libc::FD_CLOEXEC, 0);
++    }
++    drop(configured);
++    assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
++    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
++}
++
++#[test]
++fn every_flag_operation_failure_closes_the_owned_descriptor() {
++    for failure in 1..=6 {
++        let (fd, _peer) = pair();
++        let raw = fd.as_raw_fd();
++        let mut calls = 0;
++        let result = configure_owned_with(fd, |fd, command, value| {
++            calls += 1;
++            if calls == failure {
++                Err(io::Error::from_raw_os_error(libc::EIO))
++            } else {
++                cvt(unsafe { libc::fcntl(fd, command, value) })
++            }
++        });
++        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
++        assert_eq!(calls, failure, "no retry after the first failure");
++        assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
++        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
++    }
++}
++
++#[test]
++fn successful_noop_setters_cannot_return_an_unconfigured_fd() {
++    for missing_command in [libc::F_SETFL, libc::F_SETFD] {
++        let (fd, _peer) = pair();
++        let raw = fd.as_raw_fd();
++        unsafe {
++            assert_eq!(libc::fcntl(raw, libc::F_SETFL, 0), 0);
++            assert_eq!(libc::fcntl(raw, libc::F_SETFD, 0), 0);
++        }
++        let result = configure_owned_with(fd, |fd, command, value| {
++            if command == missing_command { Ok(0) }
++            else { cvt(unsafe { libc::fcntl(fd, command, value) }) }
++        });
++        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
++        assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
++    }
++}
++
++#[test]
++fn live_stream_listener_has_no_blocking_or_inheritable_fd() {
++    let base = std::env::temp_dir().join(format!("chonk-ipc-native-port-{}-{}",
++        std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
++    std::fs::create_dir(&base).unwrap();
++    use std::os::unix::fs::PermissionsExt;
++    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
++    let path = base.join("test.sock");
++    let listener = StreamListener::bind(&path).unwrap();
++    assert!(listener.accept().unwrap().is_none());
++    let client = Stream::connect(&path).unwrap();
++    let accepted = listener.accept().unwrap().expect("queued connection");
++    for fd in [listener.as_raw_fd(), client.as_raw_fd(), accepted.as_raw_fd()] {
++        unsafe {
++            assert_ne!(libc::fcntl(fd, libc::F_GETFL) & libc::O_NONBLOCK, 0);
++            assert_ne!(libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC, 0);
++        }
++    }
++    assert_eq!(peer_credentials_of(accepted.as_raw_fd()).unwrap().uid, unsafe { libc::geteuid() });
++    assert_eq!(peer_credentials_of(client.as_raw_fd()).unwrap().pid, unsafe { libc::getpid() });
++    assert!(StreamListener::bind(&path).is_err(), "do not steal a live listener");
++    drop(accepted); drop(client); drop(listener);
++    std::fs::remove_dir(base).unwrap();
++}
++
++#[test]
++fn darwin_ambiguous_connect_errors_preserve_a_real_listener_path() {
++    // Inject the errno reported by XNU for a full live accept queue. This is
++    // the actual Darwin error-policy helper, with a real owned socket path;
++    // it is not host execution of the XNU connect syscall.
++    let base = std::env::temp_dir().join(format!("chonk-ipc-stale-policy-{}-{}",
++        std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
++    std::fs::create_dir(&base).unwrap();
++    let path = base.join("live.sock");
++    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
++    for code in [libc::ECONNREFUSED, libc::EINPROGRESS, libc::ENOMEM, libc::EACCES] {
++        let error = io::Error::from_raw_os_error(code);
++        let kind = error.kind();
++        assert_eq!(refuse_ambiguous_darwin_endpoint(&path, error).unwrap_err().kind(), kind);
++        assert!(path.exists(), "an ambiguous connect error must not unlink a live owner");
++    }
++    let connected = UnixStream::connect(&path).unwrap();
++    let accepted = listener.accept().unwrap();
++    drop(connected); drop(accepted); drop(listener);
++    std::fs::remove_file(path).unwrap();
++    std::fs::remove_dir(base).unwrap();
++}
+--- a/crates/chonk-ipc/src/lib.rs
++++ b/crates/chonk-ipc/src/lib.rs
+@@ -41,6 +41,14 @@
+     for (slot, &byte) in addr.sun_path.iter_mut().zip(bytes) {
+         *slot = byte as libc::c_char;
+     }
++    #[cfg(target_os = "macos")]
++    {
++        // Pinned XNU sys/un.h: sun_len includes the terminating NUL.
++        let len = std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1;
++        addr.sun_len = u8::try_from(len).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Unix address too long"))?;
++        Ok((addr, len as libc::socklen_t))
++    }
++    #[cfg(not(target_os = "macos"))]
+     Ok((addr, std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t))
+ }
+ 
+@@ -106,14 +114,51 @@
+     Ok(())
+ }
+ 
++// Darwin lacks socket/accept4 creation flags. Complete both flags before
++// publishing an owned descriptor. This is not atomic with concurrent fork/exec;
++// the desktop session must serialize socket creation and application spawning.
++#[cfg(any(target_os = "macos", test))]
++fn configure_owned_with(
++    fd: OwnedFd,
++    mut operation: impl FnMut(RawFd, libc::c_int, libc::c_int) -> io::Result<libc::c_int>,
++) -> io::Result<OwnedFd> {
++    let raw = fd.as_raw_fd();
++    let flags = operation(raw, libc::F_GETFL, 0)?;
++    operation(raw, libc::F_SETFL, flags | libc::O_NONBLOCK)?;
++    let descriptor_flags = operation(raw, libc::F_GETFD, 0)?;
++    operation(raw, libc::F_SETFD, descriptor_flags | libc::FD_CLOEXEC)?;
++    let actual_flags = operation(raw, libc::F_GETFL, 0)?;
++    let actual_descriptor_flags = operation(raw, libc::F_GETFD, 0)?;
++    if actual_flags & libc::O_NONBLOCK == 0 || actual_descriptor_flags & libc::FD_CLOEXEC == 0 {
++        return Err(io::Error::new(io::ErrorKind::InvalidData, "socket flags did not stick"));
++    }
++    Ok(fd)
++}
++
++#[cfg(any(target_os = "macos", test))]
++fn configure_owned(fd: OwnedFd) -> io::Result<OwnedFd> {
++    configure_owned_with(fd, |fd, command, value| {
++        // SAFETY: fd is owned and live throughout this call. All used fcntl
++        // commands take an integer third argument (ignored by the getters).
++        cvt(unsafe { libc::fcntl(fd, command, value) })
++    })
++}
++
++fn new_nonblocking_socket(kind: libc::c_int) -> io::Result<OwnedFd> {
++    #[cfg(not(target_os = "macos"))]
++    let raw = cvt(unsafe { libc::socket(libc::AF_UNIX, kind | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) })?;
++    #[cfg(target_os = "macos")]
++    let raw = cvt(unsafe { libc::socket(libc::AF_UNIX, kind, 0) })?;
++    // SAFETY: socket returned a fresh, checked, nonnegative descriptor.
++    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
++    #[cfg(target_os = "macos")]
++    let fd = configure_owned(fd)?;
++    Ok(fd)
++}
++
+ fn connect_nonblocking(path: &Path, kind: libc::c_int) -> io::Result<OwnedFd> {
+     let (addr, len) = sockaddr_un(path)?;
+-    // SAFETY: `socket` takes only integer arguments and returns a new raw fd,
+-    // whose error sentinel is checked by `cvt`.
+-    let raw = cvt(unsafe { libc::socket(libc::AF_UNIX, kind | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) })?;
+-    // SAFETY: `raw` is newly created and nonnegative, with no other Rust
+-    // owner; ownership transfers to this `OwnedFd` exactly once.
+-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
++    let fd = new_nonblocking_socket(kind)?;
+     // SAFETY: `addr` remains live for the computed initialized length and the
+     // owned descriptor remains open for the duration of the syscall.
+     cvt(unsafe { libc::connect(fd.as_raw_fd(), (&addr as *const libc::sockaddr_un).cast(), len) })?;
+@@ -127,16 +172,9 @@
+     clear_stale_socket(path, kind)?;
+ 
+     let (addr, len) = sockaddr_un(path)?;
+-    // SOCK_NONBLOCK at creation, so there is no instant in this
+-    // process's life where the listening fd could block an
+-    // `accept()` on an event-loop pass that turned out to have no
+-    // pending connection.
+-    // SAFETY: `socket` takes only integer arguments and returns a new raw fd,
+-    // whose error sentinel is checked by `cvt`.
+-    let raw = cvt(unsafe { libc::socket(libc::AF_UNIX, kind | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) })?;
+-    // SAFETY: `raw` is newly created and nonnegative, with no other Rust
+-    // owner; ownership transfers to this `OwnedFd` exactly once.
+-    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
++    // Linux sets flags atomically at creation; Darwin configures and verifies
++    // them before publication. Neither exposes a blocking listener to callers.
++    let fd = new_nonblocking_socket(kind)?;
+     // SAFETY: `addr` remains live for the computed initialized length and the
+     // owned descriptor remains open for the duration of the syscall.
+     cvt(unsafe { libc::bind(fd.as_raw_fd(), (&addr as *const libc::sockaddr_un).cast(), len) })?;
+@@ -154,6 +192,15 @@
+     // arguments or additional memory-safety preconditions.
+     cvt(unsafe { libc::listen(fd.as_raw_fd(), BACKLOG) })?;
+     Ok(fd)
++}
++
++#[cfg(any(target_os = "macos", test))]
++fn refuse_ambiguous_darwin_endpoint(path: &Path, error: io::Error) -> io::Result<()> {
++    // Pinned XNU also returns ECONNREFUSED when a live accept queue is full.
++    // Connect errno cannot establish that we own an abandoned pathname.
++    Err(io::Error::new(error.kind(), format!(
++        "cannot establish that {} is abandoned; refusing to unlink: {error}", path.display()
++    )))
+ }
+ 
+ fn clear_stale_socket(path: &Path, kind: libc::c_int) -> io::Result<()> {
+@@ -195,16 +242,26 @@
+             io::ErrorKind::AddrInUse,
+             format!("{} is a live socket of another type; refusing to replace it", path.display()),
+         )),
++        // No Darwin connect error, including ECONNREFUSED, proves staleness.
++        #[cfg(target_os = "macos")]
++        Err(e) => refuse_ambiguous_darwin_endpoint(path, e),
++        #[cfg(not(target_os = "macos"))]
+         Err(_) => std::fs::remove_file(path),
+     }
+ }
+ 
+ fn accept_nonblocking(listener: RawFd) -> io::Result<Option<OwnedFd>> {
+     // SAFETY: `listener` is used only as a kernel handle; both optional
+-    // address outputs are null, and `accept4` returns a new fd or -1.
++    // address outputs are null; accept4 (Linux) or accept (Darwin) returns
++    // a new descriptor or -1, checked before ownership transfer.
++    #[cfg(not(target_os = "macos"))]
+     let raw = unsafe {
+         libc::accept4(listener, std::ptr::null_mut(), std::ptr::null_mut(), libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC)
+     };
++    // The listener was already verified nonblocking. Configure the accepted
++    // descriptor before making it available to the caller.
++    #[cfg(target_os = "macos")]
++    let raw = unsafe { libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut()) };
+     if raw < 0 {
+         let err = io::Error::last_os_error();
+         return match err.kind() {
+@@ -212,11 +269,15 @@
+             _ => Err(err),
+         };
+     }
+-    // SAFETY: successful `accept4` returned a new nonnegative descriptor with
++    // SAFETY: successful accept returned a new nonnegative descriptor with
+     // no other Rust owner; ownership transfers exactly once.
+-    Ok(Some(unsafe { OwnedFd::from_raw_fd(raw) }))
+-}
+-
++    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
++    #[cfg(target_os = "macos")]
++    let fd = configure_owned(fd)?;
++    Ok(Some(fd))
++}
++
++#[cfg(not(target_os = "macos"))]
+ pub fn peer_credentials_of(fd: RawFd) -> io::Result<PeerCredentials> {
+     // SAFETY: all-zero is a valid initial representation for this C output
+     // structure, and the kernel fills it before fields are read.
+@@ -226,6 +287,28 @@
+     // itself is a live writable socklen; `fd` is only a kernel handle.
+     cvt(unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len) })?;
+     Ok(PeerCredentials { pid: cred.pid, uid: cred.uid, gid: cred.gid })
++}
++
++/// Real Darwin AF_UNIX credentials. PID is XNU's peer socket last_pid,
++/// not a claim of Linux SO_PEERCRED's stable creator-PID semantics. UID/GID
++/// come from the connection credentials via getpeereid; these separate reads
++/// are not an atomic process-identity snapshot or a liveness lease.
++#[cfg(target_os = "macos")]
++pub fn peer_credentials_of(fd: RawFd) -> io::Result<PeerCredentials> {
++    let mut uid = libc::uid_t::MAX;
++    let mut gid = libc::gid_t::MAX;
++    // SAFETY: both output pointers have the exact target uid/gid types.
++    cvt(unsafe { libc::getpeereid(fd, &mut uid, &mut gid) })?;
++    let mut pid: libc::pid_t = 0;
++    let mut len = std::mem::size_of_val(&pid) as libc::socklen_t;
++    // SAFETY: pid and len are live writable outputs of the declared sizes.
++    // Pinned uipc_usrreq.c supports SOL_LOCAL/LOCAL_PEERPID on connected sockets.
++    cvt(unsafe { libc::getsockopt(fd, libc::SOL_LOCAL, libc::LOCAL_PEERPID,
++        (&mut pid as *mut libc::pid_t).cast(), &mut len) })?;
++    if len as usize != std::mem::size_of_val(&pid) || pid <= 0 || uid == libc::uid_t::MAX || gid == libc::gid_t::MAX {
++        return Err(io::Error::new(io::ErrorKind::InvalidData, "incomplete local peer credentials"));
++    }
++    Ok(PeerCredentials { pid, uid, gid })
+ }
+ 
+ pub fn peer_is_this_user_on(fd: RawFd) -> io::Result<bool> {
+@@ -294,8 +377,9 @@
+ 
+     /// Accepts one pending connection as a socket that is already
+     /// `O_NONBLOCK` and `CLOEXEC`, or `Ok(None)` if none is waiting.
+-    /// See the private `accept_nonblocking` helper for why it is `accept4` and not
+-    /// `accept` + `fcntl`.
++    /// Linux sets both flags atomically with accept4. Darwin configures and
++    /// verifies them before publication; concurrent spawning needs the separate
++    /// audited session-spawn contract described by configure_owned_with.
+     pub fn accept(&self) -> io::Result<Option<Stream>> {
+         Ok(accept_nonblocking(self.fd.as_raw_fd())?.map(Stream::from_fd))
+     }
+@@ -457,3 +541,7 @@
+         assert!(peer_is_this_user_or_root_on(theirs.as_raw_fd()).expect("SO_PEERCRED"));
+     }
+ }
++
++#[cfg(test)]
++#[path = "darwin_fd_tests.rs"]
++mod darwin_fd_tests;
+--- a/crates/chonk-shell/src/managed.rs
++++ b/crates/chonk-shell/src/managed.rs
+@@ -3,8 +3,14 @@
+ use std::collections::{BTreeSet, VecDeque};
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum RequestSource {
++    Input,
++    ExplicitStartup,
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub struct TerminalRequest {
+     pub id: u64,
++    pub source: RequestSource,
+ }
+ #[derive(Clone, Debug, PartialEq, Eq)]
+ pub enum LaunchResult {
+@@ -21,20 +27,30 @@
+ }
+ impl ManagedBridge {
+     pub fn request_terminal(&mut self) -> Result<u64, &'static str> {
++        self.request_terminal_from(RequestSource::Input)
++    }
++    pub fn request_terminal_from(&mut self, source: RequestSource) -> Result<u64, &'static str> {
++        self.check_request_admission()?;
++        let next = self
++            .next
++            .checked_add(1)
++            .ok_or("managed launch identity exhausted")?;
++        self.next = next;
++        self.pending.push_back(TerminalRequest { id: next, source });
++        self.outstanding.insert(next);
++        Ok(next)
++    }
++    pub fn check_request_admission(&self) -> Result<(), &'static str> {
+         if self.closing {
+             return Err("session is closing");
+         }
+         if self.outstanding.len() >= 4 {
+             return Err("managed launch queue full");
+         }
+-        let next = self
+-            .next
++        self.next
+             .checked_add(1)
+             .ok_or("managed launch identity exhausted")?;
+-        self.next = next;
+-        self.pending.push_back(TerminalRequest { id: next });
+-        self.outstanding.insert(next);
+-        Ok(next)
++        Ok(())
+     }
+     pub fn take_request(&mut self) -> Option<TerminalRequest> {
+         self.pending.pop_front()
+@@ -74,7 +90,13 @@
+         let mut bridge = ManagedBridge::default();
+         let id = bridge.request_terminal().unwrap();
+         assert!(bridge.complete(id, LaunchResult::ProcessCreated).is_err());
+-        assert_eq!(bridge.take_request(), Some(TerminalRequest { id }));
++        assert_eq!(
++            bridge.take_request(),
++            Some(TerminalRequest {
++                id,
++                source: RequestSource::Input
++            })
++        );
+         bridge
+             .complete(id, LaunchResult::Refused("native shim unavailable".into()))
+             .unwrap();
+--- a/crates/chonk-shell/src/shell.rs
++++ b/crates/chonk-shell/src/shell.rs
+@@ -2049,9 +2049,19 @@
+     }
+ 
+     pub fn run_action(&mut self, wm: &mut WindowManager<B>, action: &Action) -> ShellOutcome {
++        self.run_action_from(wm,action,crate::managed::RequestSource::Input)
++    }
++    /// Explicit packaged startup uses the same typed action/managed queue as
++    /// input. No synthetic keys, config autostart or generic spawn fallback.
++    pub fn run_explicit_startup_terminal(&mut self,wm:&mut WindowManager<B>)->Result<ShellOutcome,&'static str>{
++        let bridge=self.managed.as_ref().ok_or("startup requires managed standalone profile")?;
++        bridge.check_request_admission()?;
++        Ok(self.run_action_from(wm,&Action::SpawnTerminal,crate::managed::RequestSource::ExplicitStartup))
++    }
++    fn run_action_from(&mut self, wm: &mut WindowManager<B>, action: &Action, source:crate::managed::RequestSource) -> ShellOutcome {
+         if let Some(b)=self.managed.as_mut(){
+             match action {
+-                Action::SpawnTerminal => { if let Err(e)=b.request_terminal(){b.refuse(e);} }
++                Action::SpawnTerminal => { if let Err(e)=b.request_terminal_from(source){b.refuse(e);} }
+                 Action::Close => {if let Some(id)=wm.focused_client(){wm.close_client(id);}}
+                 _ => b.refuse("action unsupported in standalone"),
+             }
+--- a/crates/chonk-shell/src/startup.rs
++++ b/crates/chonk-shell/src/startup.rs
+@@ -246,7 +246,10 @@
+     /// Pure fixed profile; deliberately does not call resolve/read_* or inspect HOME.
+     pub fn standalone_darwin() -> Self {
+         let config = Config::default_config();
+-        let base_theme = wm_theme::default_theme::nextstep_classic();
++        let mut base_theme = wm_theme::default_theme::nextstep_classic();
++        // No minimize/restore UI is admitted in this first profile. Filter
++        // actual frame hitboxes as well as menus; generic theme stays intact.
++        base_theme.titlebar.buttons.retain(|b| b.kind == wm_theme_api::ButtonKind::Close);
+         let style = base_theme.resolve_style(wm_theme_api::DecorationStyle::WindowMaker);
+         let keybindings = vec![
+             (KeyCombo { keysym: 0xff0d, modifiers: Modifiers::SUPER }, Action::SpawnTerminal),
+--- a/crates/wm-darwin/Cargo.toml
++++ b/crates/wm-darwin/Cargo.toml
+@@ -10,7 +10,8 @@
+ darwin-backend = ["dep:smithay", "dep:wm-core", "dep:wm-theme", "dep:wm-theme-api", "dep:tiny-skia", "dep:libc"]
+ desktop-shell = ["darwin-backend", "dep:chonk-shell", "dep:wm-config"]
+ # Root links the frozen, reviewed-source C object explicitly. This does not
+-# enable a desktop CLI or establish Darwin FD-whitelist runtime admission.
++# establish Darwin FD-whitelist runtime admission. The separate desktop binary
++# still requires its strict explicit CLI and independently admitted package.
+ native-managed-spawn = ["desktop-shell"]
+ 
+ [dependencies]
+@@ -32,3 +33,8 @@
+ name = "chonkstep-darwin"
+ path = "src/main.rs"
+ required-features = ["darwin-backend"]
++
++[[bin]]
++name = "chonkstep-darwin-desktop"
++path = "src/desktop_main.rs"
++required-features = ["native-managed-spawn"]
+--- a/crates/wm-darwin/src/applications.rs
++++ b/crates/wm-darwin/src/applications.rs
+@@ -527,6 +527,8 @@
+     }
+ }
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
++/// Resource retirement only. A completed cleanup is not application success;
++/// the session must also check has_failures(), including the app exit status.
+ pub enum Completion {
+     Pending,
+     Complete,
+@@ -683,7 +685,14 @@
+             })
+     }
+     pub fn refuse_unadmitted_request(&mut self, request: u64) -> Result<(), &'static str> {
+-        let sequence = self.audit.begin(Some(request), None)?;
++        self.refuse_unadmitted_request_from(request, crate::launch_audit::RequestSource::Input)
++    }
++    pub fn refuse_unadmitted_request_from(
++        &mut self,
++        request: u64,
++        source: crate::launch_audit::RequestSource,
++    ) -> Result<(), &'static str> {
++        let sequence = self.audit.begin_from(Some(request), None, source)?;
+         self.audit
+             .fail(sequence, "native spawn/app runtime admission pending");
+         Ok(())
+@@ -1175,7 +1184,14 @@
+         app.service(now, false, &mut audit, &mut ops);
+         assert_eq!(app.completion(), Completion::Pending);
+         drop(peer);
+-        app.service(now + Duration::from_secs(1), false, &mut audit, &mut ops);
++        // Other concurrent tests may fork before their exec closes borrowed
++        // descriptors. EOF is asynchronous; exercise the same finite polling
++        // path instead of assuming the peer's close is instantly visible.
++        let until = Instant::now() + Duration::from_secs(1);
++        while app.completion() == Completion::Pending && Instant::now() < until {
++            app.service(Instant::now(), false, &mut audit, &mut ops);
++            std::thread::sleep(Duration::from_millis(1));
++        }
+         assert_eq!(app.completion(), Completion::Complete);
+         assert!(!app.status.ready());
+         assert!(ops.signals.is_empty());
+@@ -1202,4 +1218,180 @@
+             assert!(!app.cleanup_complete());
+         }
+     }
+-}
++    #[test]
++    fn h1_complete_pty_and_reaped_application_failure_never_clear_manager_fault() {
++        for raw in [256, 15, 9] {
++            let now = Instant::now();
++            let (app, mut peer, audit) = fake_application(now);
++            let mut manager = OwnedApplications {
++                audit,
++                ..Default::default()
++            };
++            manager.applications.insert(id(), app);
++            peer.write_all((line("READY", "") + &line("CLEANUP", " 1 9 1 1")).as_bytes())
++                .unwrap();
++            drop(peer);
++            let mut ops = FakeWait {
++                result: Ok(Some(raw)),
++                signals: vec![],
++            };
++            manager.applications.get_mut(&id()).unwrap().service(
++                now,
++                false,
++                &mut manager.audit,
++                &mut ops,
++            );
++            let until = Instant::now() + Duration::from_secs(1);
++            while manager.applications()[&id()].completion() == Completion::Pending
++                && Instant::now() < until
++            {
++                manager.applications.get_mut(&id()).unwrap().service(
++                    Instant::now(),
++                    false,
++                    &mut manager.audit,
++                    &mut ops,
++                );
++                std::thread::sleep(Duration::from_millis(1));
++            }
++            manager.begin_shutdown();
++            // Actual resources are retired, but the application failed. No
++            // retry or signal follows the known reap; final session must fail.
++            assert!(
++                manager.shutdown_complete(),
++                "raw={raw} completion={:?} status_error={:?} eof={} cleanup={:?}",
++                manager.applications()[&id()].completion(),
++                manager.applications()[&id()].status.error(),
++                manager.applications()[&id()].status.eof_observed(),
++                manager.applications()[&id()].status.cleanup()
++            );
++            assert!(manager.has_failures());
++            let app = &manager.applications()[&id()];
++            assert_eq!(app.child.state(), WaitState::Reaped(raw));
++            assert_eq!(app.status.cleanup().unwrap().raw_wait_status, 9);
++            assert_eq!(
++                manager.audit.attempts()[0].failure,
++                Some("application exited nonzero or by signal")
++            );
++            assert!(ops.signals.is_empty());
++        }
++    }
++    #[cfg(target_os = "linux")]
++    #[test]
++    #[allow(
++        clippy::zombie_processes,
++        reason = "actual UnixWait is the sole waitpid owner exercised by this regression; std::Child must not compete"
++    )]
++    fn h1_real_host_exit7_and_waitpid_retains_failure_with_complete_pty_ack() {
++        // Real Linux child/reap, synthetic private PTY acknowledgement only.
++        // This is not a Darwin spawn/FD-whitelist runtime qualification.
++        let child = std::process::Command::new("/bin/sh")
++            .args(["-c", "exit 7"])
++            .stdin(std::process::Stdio::null())
++            .stdout(std::process::Stdio::null())
++            .stderr(std::process::Stdio::null())
++            .spawn()
++            .unwrap();
++        let pid = i32::try_from(child.id()).unwrap();
++        let now = Instant::now();
++        let (mut app, mut peer, audit) = fake_application(now);
++        app.child = OwnedChild::new(pid).unwrap();
++        app.status = Status::new(id(), pid).unwrap();
++        peer.write_all(
++            format!(
++                "CHONKTERM/1 READY {} {pid}\nCHONKTERM/1 CLEANUP {} {pid} 1 9 1 1\n",
++                id().as_str(),
++                id().as_str()
++            )
++            .as_bytes(),
++        )
++        .unwrap();
++        drop(peer);
++        let mut manager = OwnedApplications {
++            audit,
++            ..Default::default()
++        };
++        manager.applications.insert(id(), app);
++        let deadline = now + Duration::from_secs(3);
++        while Instant::now() < deadline {
++            manager.poll();
++            if manager.applications()[&id()].child.state() != WaitState::Running {
++                break;
++            }
++            std::thread::sleep(Duration::from_millis(1));
++        }
++        // No std::Child wait or kill: the manager is the sole reaper. If the
++        // real fixture unexpectedly hangs, use its existing bounded shutdown.
++        manager.begin_shutdown();
++        let cleanup_deadline = Instant::now() + Duration::from_secs(9);
++        while !manager.shutdown_complete()
++            && !manager.shutdown_incomplete()
++            && Instant::now() < cleanup_deadline
++        {
++            manager.poll();
++            std::thread::sleep(Duration::from_millis(1));
++        }
++        assert_eq!(
++            manager.applications()[&id()].child.state(),
++            WaitState::Reaped(7 << 8)
++        );
++        assert!(manager.shutdown_complete());
++        assert!(manager.has_failures());
++        assert_eq!(manager.audit.attempts()[0].raw_app_wait_status, Some(1792));
++        assert_eq!(
++            manager.applications()[&id()]
++                .status
++                .cleanup()
++                .unwrap()
++                .raw_wait_status,
++            9
++        );
++    }
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn real_host_wait_owner_reaps_its_exact_child_and_then_refuses_signals() {
++        // Linux syscall exercise only. Normal Command is test-only and does
++        // not stand in for the Darwin C leaf or prove descriptor inheritance.
++        struct Guard(Option<std::process::Child>);
++        impl Drop for Guard {
++            fn drop(&mut self) {
++                if let Some(child) = self.0.as_mut() {
++                    let _ = child.kill();
++                    let until = Instant::now() + Duration::from_secs(3);
++                    while Instant::now() < until {
++                        match child.try_wait() {
++                            Ok(None) => std::thread::sleep(Duration::from_millis(1)),
++                            Ok(Some(_)) | Err(_) => break,
++                        }
++                    }
++                }
++            }
++        }
++        let mut guard = Guard(Some(
++            std::process::Command::new("/bin/sleep")
++                .arg("30")
++                .stdin(std::process::Stdio::null())
++                .stdout(std::process::Stdio::null())
++                .stderr(std::process::Stdio::null())
++                .spawn()
++                .unwrap(),
++        ));
++        let mut child =
++            OwnedChild::new(i32::try_from(guard.0.as_ref().unwrap().id()).unwrap()).unwrap();
++        child.terminate().unwrap();
++        let deadline = Instant::now() + Duration::from_secs(3);
++        while child.poll() == WaitState::Running && Instant::now() < deadline {
++            std::thread::sleep(Duration::from_millis(1));
++        }
++        if child.state() != WaitState::Running {
++            // The test guard must also stop signalling after external wait
++            // ownership is retired; do not let its stale std::Child kill a
++            // subsequently reused PID during unwinding.
++            guard.0.take();
++        }
++        assert!(matches!(child.state(), WaitState::Reaped(_)));
++        assert!(child.kill().is_err());
++        assert!(child.terminate().is_err());
++        // Guard only cleans up an exclusively owned still-running child if an
++        // assertion fails before retirement; it never performs a second reap.
++    }
++}
+--- a/crates/wm-darwin/src/desktop.rs
++++ b/crates/wm-darwin/src/desktop.rs
+@@ -17,9 +17,81 @@
+     pub applications: OwnedApplications,
+     pub closing: bool,
+     launcher: Option<TerminalLauncher>,
++    startup_requested: bool,
+ }
+ 
+ impl crate::server::Server {
++    /// One explicit packaged request, before normal dispatch. Zero is the
++    /// default; it does not synthesize HID/Wayland input or create a process.
++    pub fn queue_startup_terminals(&mut self, count: u8) -> Result<(), String> {
++        if count == 0 {
++            return Ok(());
++        }
++        if count > 2 {
++            return Err("startup terminal count must be1..2".into());
++        }
++        let desktop = self.desktop.as_mut().ok_or("desktop Shell is absent")?;
++        if desktop.startup_requested || desktop.closing {
++            return Err("startup already requested or session closing".into());
++        }
++        desktop.startup_requested = true;
++        for _ in 0..count {
++            let outcome = desktop.shell.run_explicit_startup_terminal(&mut self.wm)?;
++            desktop.outcome(outcome)?;
++        }
++        Ok(())
++    }
++    pub fn adopt_managed_applications(
++        &mut self,
++        launcher: TerminalLauncher,
++        applications: OwnedApplications,
++    ) -> Result<(), String> {
++        let desktop = self.desktop.as_mut().ok_or("desktop Shell is absent")?;
++        if desktop.launcher.is_some() || desktop.closing || !applications.audit.durable() {
++            return Err("managed application owners cannot be adopted".into());
++        }
++        desktop.applications = applications;
++        desktop.launcher = Some(launcher);
++        Ok(())
++    }
++    /// Error-path cleanup does not depend on rendering, input, or successful
++    /// Wayland dispatch. Call on the same loop that exclusively owns children.
++    pub fn begin_desktop_shutdown(&mut self) {
++        if let Some(desktop) = self.desktop.as_mut() {
++            desktop.closing = true;
++            desktop.applications.begin_shutdown();
++            // No Shell/WM operation here: its grab invariants may have caused
++            // the frame panic. Keep cleanup independent of that poisoned UI.
++        }
++    }
++    pub fn poll_desktop_shutdown(&mut self) -> crate::session_entry::CleanupState {
++        let Some(desktop) = self.desktop.as_mut() else {
++            return crate::session_entry::CleanupState::Incomplete;
++        };
++        desktop.applications.poll();
++        if desktop.applications.shutdown_incomplete() {
++            crate::session_entry::CleanupState::Incomplete
++        } else if desktop.applications.shutdown_complete() {
++            crate::session_entry::CleanupState::Complete
++        } else {
++            crate::session_entry::CleanupState::Pending
++        }
++    }
++    pub fn desktop_closing(&self) -> bool {
++        self.desktop.as_ref().is_some_and(|d| d.closing)
++    }
++    pub fn desktop_failed(&self) -> bool {
++        self.desktop
++            .as_ref()
++            .is_some_and(|d| d.applications.has_failures())
++    }
++    pub fn desktop_snapshot(&self, out: &mut impl std::io::Write) -> std::io::Result<()> {
++        if let Some(desktop) = self.desktop.as_ref() {
++            desktop.applications.audit.snapshot(out)
++        } else {
++            Err(std::io::Error::other("desktop manager missing"))
++        }
++    }
+     /// Explicit library entry; the existing native CLI does not select it.
+     /// Source/host testing only until frontend/native dependencies are admitted.
+     pub fn enable_desktop_shell(&mut self, fonts: wm_theme::FontState) -> Result<(), String> {
+@@ -60,16 +132,14 @@
+         Ok(())
+     }
+     pub(crate) fn service_desktop(&mut self) -> Result<(), String> {
+-        let Some(mut desktop) = self.desktop.take() else {
++        let Some(desktop) = self.desktop.as_mut() else {
+             return Ok(());
+         };
+-        let result = desktop.service(&mut self.wm);
+-        self.desktop = Some(desktop);
+-        result
++        desktop.service(&mut self.wm)
+     }
+     pub(crate) fn desktop_key(&mut self, combo: KeyCombo, down: bool) -> Result<bool, String> {
+         use chonk_shell::shell::KeyResolution;
+-        let Some(mut desktop) = self.desktop.take() else {
++        let Some(desktop) = self.desktop.as_mut() else {
+             return Ok(false);
+         };
+         let resolution = if down {
+@@ -86,9 +156,7 @@
+             Some(KeyResolution::Menu(key)) => desktop.shell.run_menu_key(&mut self.wm, key),
+             Some(KeyResolution::Consumed) | None => ShellOutcome::Continue,
+         };
+-        let result = desktop.outcome(outcome).map(|_| consumed);
+-        self.desktop = Some(desktop);
+-        result
++        desktop.outcome(outcome).map(|_| consumed)
+     }
+     /// Returns true only when real shell/root ownership consumes this event.
+     /// Existing client/WM implicit drags must bypass this before calling.
+@@ -110,7 +178,7 @@
+         if !was_popup && matches!(hit, DesktopHit::Frame(..) | DesktopHit::Client(..)) {
+             return Ok(false);
+         }
+-        let mut desktop = self.desktop.take().unwrap();
++        let desktop = self.desktop.as_mut().unwrap();
+         if let DesktopHit::Shell(id, local) = hit {
+             self.wm.backend_mut().queue_shell_motion(id, local);
+         }
+@@ -147,7 +215,6 @@
+                 break;
+             }
+         }
+-        self.desktop = Some(desktop);
+         result.map(|_| true)
+     }
+ }
+@@ -172,6 +239,7 @@
+             applications: OwnedApplications::default(),
+             closing: false,
+             launcher: None,
++            startup_requested: false,
+         })
+     }
+     pub fn outcome(&mut self, outcome: ShellOutcome) -> Result<(), String> {
+@@ -201,8 +269,16 @@
+         }
+         self.shell.tick(wm);
+         while let Some(request) = self.shell.managed().and_then(|b| b.take_request()) {
++            let source = match request.source {
++                chonk_shell::managed::RequestSource::Input => {
++                    crate::launch_audit::RequestSource::Input
++                }
++                chonk_shell::managed::RequestSource::ExplicitStartup => {
++                    crate::launch_audit::RequestSource::ExplicitStartup
++                }
++            };
+             let result = if let Some(launcher) = self.launcher.as_mut() {
+-                match launcher.request(request.id, &mut self.applications) {
++                match launcher.request_from(request.id, source, &mut self.applications) {
+                     Ok(LaunchDisposition::Created {
+                         launch_failed: false,
+                         ..
+@@ -217,7 +293,8 @@
+                     Err(error) => LaunchResult::Refused(error),
+                 }
+             } else {
+-                self.applications.refuse_unadmitted_request(request.id)?;
++                self.applications
++                    .refuse_unadmitted_request_from(request.id, source)?;
+                 LaunchResult::Refused("native spawn/app not admitted".into())
+             };
+             let failed = matches!(result, LaunchResult::Refused(_));
+@@ -312,6 +389,11 @@
+         );
+         let mut session = DesktopSession::new(&mut wm, fonts).unwrap();
+         assert!(session.shell.is_standalone());
++        assert_eq!(session.shell.theme().titlebar.buttons.len(), 1);
++        assert_eq!(
++            session.shell.theme().titlebar.buttons[0].kind,
++            wm_theme_api::ButtonKind::Close
++        );
+         assert!(session.shell.extra_poll_fds().is_empty());
+         assert!(!session.shell.session_state().reads_hyprland_config);
+         session
+@@ -335,4 +417,130 @@
+         assert!(!wm.backend().popup_active());
+         assert!(!wm.backend().keyboard_grabbed);
+     }
++    #[test]
++    fn actual_popup_assertion_cannot_drop_the_desktop_owner() {
++        use smithay::reexports::wayland_server::Display;
++        let display = Display::<crate::server::Server>::new().unwrap();
++        let mut server =
++            crate::server::Server::new(&display.handle(), Size::new(640, 480)).unwrap();
++        server.enable_pdhid_seat(&display.handle()).unwrap();
++        server
++            .enable_desktop_shell(wm_theme::FontState::new())
++            .unwrap();
++        let desktop = server.desktop.as_mut().unwrap();
++        desktop.applications.refuse_unadmitted_request(17).unwrap();
++        let audit_address = &desktop.applications.audit as *const _;
++        // Fault injection: invalidate a real PopupHost precondition between
++        // seat creation and a root click. Its actual assertion must unwind.
++        server.wm.backend_mut().input_enabled = false;
++        assert_eq!(
++            server.wm.backend().desktop_hit(Point::new(500, 300)),
++            DesktopHit::Root
++        );
++        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++            server.desktop_pointer(Point::new(500, 300), 2, 0)
++        }));
++        assert!(result.is_err());
++        let retained = &server.desktop.as_ref().unwrap().applications;
++        assert_eq!(audit_address, &retained.audit as *const _);
++        assert_eq!(retained.audit.attempts().len(), 1);
++        assert!(retained.has_failures());
++        // Shutdown does not revisit the now-invalid popup or grab state.
++        server.begin_desktop_shutdown();
++        assert_eq!(
++            server.poll_desktop_shutdown(),
++            crate::session_entry::CleanupState::Complete
++        );
++        assert!(server.desktop_failed());
++    }
++    #[test]
++    fn menu_shortcut_and_explicit_startup_use_one_typed_request_queue() {
++        use chonk_shell::managed::{RequestSource, TerminalRequest};
++        use chonk_shell::shell::KeyResolution;
++        use smithay::reexports::wayland_server::Display;
++        let display = Display::<crate::server::Server>::new().unwrap();
++        let mut server =
++            crate::server::Server::new(&display.handle(), Size::new(640, 480)).unwrap();
++        server.enable_pdhid_seat(&display.handle()).unwrap();
++        server
++            .enable_desktop_shell(wm_theme::FontState::new())
++            .unwrap();
++        server.queue_startup_terminals(0).unwrap();
++        assert!(server
++            .desktop
++            .as_mut()
++            .unwrap()
++            .shell
++            .managed()
++            .unwrap()
++            .take_request()
++            .is_none());
++        assert!(server.queue_startup_terminals(3).is_err());
++        let d = server.desktop.as_mut().unwrap();
++        d.root_press(&mut server.wm, Point::new(400, 300), MouseButton::Right)
++            .unwrap();
++        let out = d
++            .shell
++            .run_menu_key(&mut server.wm, wm_theme::cascade::MenuKey::Enter);
++        d.outcome(out).unwrap();
++        let combo = KeyCombo {
++            keysym: 0xff0d,
++            modifiers: wm_core::Modifiers::SUPER,
++        };
++        let Some(KeyResolution::Action(action)) = d.shell.keymap_action(&combo) else {
++            panic!("real launch binding absent")
++        };
++        let out = d.shell.run_action(&mut server.wm, &action);
++        d.outcome(out).unwrap();
++        server.queue_startup_terminals(2).unwrap();
++        assert!(server.queue_startup_terminals(1).is_err());
++        let d = server.desktop.as_mut().unwrap();
++        let requests: Vec<TerminalRequest> =
++            std::iter::from_fn(|| d.shell.managed().unwrap().take_request()).collect();
++        assert_eq!(
++            requests,
++            vec![
++                TerminalRequest {
++                    id: 1,
++                    source: RequestSource::Input
++                },
++                TerminalRequest {
++                    id: 2,
++                    source: RequestSource::Input
++                },
++                TerminalRequest {
++                    id: 3,
++                    source: RequestSource::ExplicitStartup
++                },
++                TerminalRequest {
++                    id: 4,
++                    source: RequestSource::ExplicitStartup
++                },
++            ]
++        );
++        assert!(d.applications.applications().is_empty());
++        assert!(d.applications.audit.attempts().is_empty());
++        // Queueing is not fake process creation or READY.
++    }
++    #[test]
++    fn explicit_startup_refusal_keeps_provenance_and_no_fake_child() {
++        use smithay::reexports::wayland_server::Display;
++        let display = Display::<crate::server::Server>::new().unwrap();
++        let mut server =
++            crate::server::Server::new(&display.handle(), Size::new(640, 480)).unwrap();
++        server.enable_pdhid_seat(&display.handle()).unwrap();
++        server
++            .enable_desktop_shell(wm_theme::FontState::new())
++            .unwrap();
++        server.queue_startup_terminals(1).unwrap();
++        server.service_desktop().unwrap();
++        let d = server.desktop.as_ref().unwrap();
++        assert!(d.applications.applications().is_empty());
++        assert_eq!(d.applications.audit.attempts().len(), 1);
++        assert_eq!(
++            d.applications.audit.attempts()[0].source,
++            crate::launch_audit::RequestSource::ExplicitStartup
++        );
++        assert!(d.applications.has_failures());
++    }
+ }
+--- /dev/null
++++ b/crates/wm-darwin/src/desktop_entry.rs
+@@ -0,0 +1,395 @@
++//! Separate finite native Shell entry. Host tests never open PDGOP/HID.
++use crate::{
++    applications::{Instance, OwnedApplications},
++    hid::NativeHid,
++    presenter::Pdgop,
++    server::Server,
++    session_entry::{self, CleanupState, FrameState, Outcome, SessionIo},
++    terminal_launch::{PrivateDirectory, TerminalLauncher},
++};
++use smithay::reexports::wayland_server::{Display, ListeningSocket};
++use std::{
++    fs::{File, OpenOptions},
++    io::{Read, Write},
++    os::unix::fs::OpenOptionsExt,
++    path::{Path, PathBuf},
++    sync::atomic::{AtomicBool, Ordering},
++    time::{Duration, Instant},
++};
++static STOP: AtomicBool = AtomicBool::new(false);
++extern "C" fn stop(_: libc::c_int) {
++    STOP.store(true, Ordering::Relaxed);
++}
++pub const USAGE: &str = "chonkstep-darwin-desktop --run --socket ABS --records ABS --session HEX48 --terminal ABS --seconds 11..180 --font-regular ABS --font-bold ABS --input pdhid [--startup-terminals 1..2]";
++pub struct Options {
++    socket: PathBuf,
++    records: PathBuf,
++    session: Instance,
++    terminal: PathBuf,
++    seconds: u64,
++    regular: PathBuf,
++    bold: PathBuf,
++    startup_terminals: u8,
++}
++impl Options {
++    pub fn parse(args: &[String]) -> Result<Self, String> {
++        let names = [
++            "--socket",
++            "--records",
++            "--session",
++            "--terminal",
++            "--seconds",
++            "--font-regular",
++            "--font-bold",
++            "--input",
++        ];
++        if !matches!(args.len(), 17 | 19)
++            || args[0] != "--run"
++            || names.iter().enumerate().any(|(i, n)| args[1 + i * 2] != *n)
++            || args[16] != "pdhid"
++        {
++            return Err(USAGE.into());
++        }
++        let startup_terminals = if args.len() == 19 {
++            if args[17] != "--startup-terminals" {
++                return Err(USAGE.into());
++            }
++            match args[18].as_str() {
++                "1" => 1,
++                "2" => 2,
++                _ => return Err(USAGE.into()),
++            }
++        } else {
++            0
++        };
++        let seconds: u64 = args[10].parse().map_err(|_| USAGE)?;
++        if !(11..=180).contains(&seconds) || seconds.to_string() != args[10] {
++            return Err(USAGE.into());
++        }
++        let path = |s: &str| -> Result<PathBuf, String> {
++            let p = PathBuf::from(s);
++            if !p.is_absolute()
++                || s.len() > 900
++                || s.as_bytes().contains(&0)
++                || p.components().any(|c| {
++                    matches!(
++                        c,
++                        std::path::Component::ParentDir | std::path::Component::CurDir
++                    )
++                })
++            {
++                return Err("invalid absolute bounded path".into());
++            }
++            Ok(p)
++        };
++        let socket = path(&args[2])?;
++        if socket.as_os_str().as_encoded_bytes().len() > 100 {
++            return Err("Wayland socket pathname too long".into());
++        }
++        Ok(Self {
++            socket,
++            records: path(&args[4])?,
++            session: Instance::parse(&args[6]).map_err(str::to_owned)?,
++            terminal: path(&args[8])?,
++            seconds,
++            regular: path(&args[12])?,
++            bold: path(&args[14])?,
++            startup_terminals,
++        })
++    }
++}
++fn regular_file(path: &Path, max: u64, executable: bool) -> Result<File, String> {
++    use std::os::unix::fs::MetadataExt;
++    let f = OpenOptions::new()
++        .read(true)
++        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
++        .open(path)
++        .map_err(|e| e.to_string())?;
++    let m = f.metadata().map_err(|e| e.to_string())?;
++    if !m.is_file() || m.len() == 0 || m.len() > max || (executable && m.mode() & 0o111 == 0) {
++        return Err("packaged file type/size/mode refused".into());
++    }
++    Ok(f)
++}
++fn font_bytes(path: &Path) -> Result<Vec<u8>, String> {
++    let f = regular_file(path, 8 * 1024 * 1024, false)?;
++    let mut bytes = vec![];
++    f.take(8 * 1024 * 1024 + 1)
++        .read_to_end(&mut bytes)
++        .map_err(|e| e.to_string())?;
++    if bytes.len() > 8 * 1024 * 1024 {
++        return Err("font changed past input bound".into());
++    }
++    Ok(bytes)
++}
++fn require_fresh_socket(path: &Path) -> Result<(), String> {
++    // No stale/live inference from connect errno. A future session receives a
++    // private unused name; an existing socket OR lock pathname is a refusal.
++    for path in [path.to_owned(), path.with_extension("lock")] {
++        match std::fs::symlink_metadata(path) {
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
++            _ => return Err("Wayland socket/lock path is not fresh".into()),
++        }
++    }
++    Ok(())
++}
++struct NativeIo<'a> {
++    display: &'a mut Display<Server>,
++    server: &'a mut Server,
++    listener: &'a ListeningSocket,
++    input: &'a mut NativeHid,
++    presenter: &'a mut Pdgop,
++    result: &'a mut File,
++    started: Instant,
++    shutdown: bool,
++}
++impl SessionIo for NativeIo<'_> {
++    fn elapsed(&self) -> Duration {
++        self.started.elapsed()
++    }
++    fn stop_requested(&self) -> bool {
++        STOP.load(Ordering::Relaxed)
++    }
++    fn frame(&mut self) -> Result<FrameState, String> {
++        // Admission work per frame is finite so incoming clients cannot keep
++        // the loop from observing its wall-time/signal boundary forever.
++        for _ in 0..4 {
++            let Some(stream) = self.listener.accept().map_err(|e| e.to_string())? else {
++                break;
++            };
++            Server::add_client(self.display, stream).map_err(|e| e.to_string())?;
++        }
++        self.display
++            .dispatch_clients(self.server)
++            .map_err(|e| e.to_string())?;
++        let ms = self.elapsed().as_millis() as u32;
++        for event in self.input.drain()? {
++            self.server.deliver_hid(event, ms)?;
++        }
++        self.server.repaint(self.presenter, ms)?;
++        self.display.flush_clients().map_err(|e| e.to_string())?;
++        Ok(if self.server.desktop_closing() {
++            FrameState::Stop
++        } else {
++            FrameState::Continue
++        })
++    }
++    fn begin_shutdown(&mut self) {
++        if !self.shutdown {
++            self.shutdown = true;
++            self.server.begin_desktop_shutdown();
++        }
++    }
++    fn cleanup(&mut self) -> CleanupState {
++        // No UI/Wayland dispatch, input, or framebuffer access after entering
++        // cleanup, including after an assertion panic. App TERM is serviced
++        // through its private status socket and the single owned waitpid path;
++        // no possibly poisoned Shell/WM invariant can bypass that ownership.
++        self.server.poll_desktop_shutdown()
++    }
++    fn pause(&mut self) {
++        std::thread::sleep(Duration::from_millis(8));
++    }
++    fn seal(&mut self, outcome: &Outcome) -> Result<(), String> {
++        writeln!(self.result,"CHONKDESKTOP/1 elapsed_ms={} cleanup={:?} deadline={} frame_error={:?} manager_failed={}",
++            self.elapsed().as_millis(),outcome.cleanup,outcome.deadline_reached,outcome.frame_error,self.server.desktop_failed()).map_err(|e|e.to_string())?;
++        self.server
++            .desktop_snapshot(self.result)
++            .map_err(|e| e.to_string())?;
++        self.result.sync_all().map_err(|e| e.to_string())?;
++        if self.server.desktop_failed() {
++            return Err("managed application/cleanup failure retained in private records".into());
++        }
++        Ok(())
++    }
++}
++
++/// Root must bind exact package bytes and all pending independent/runtime gates
++/// before executing this entry. Compilation alone is never that admission.
++pub fn run(options: Options) -> Result<(), String> {
++    if !cfg!(panic = "unwind") {
++        return Err("native managed desktop requires panic=unwind".into());
++    }
++    if !cfg!(all(
++        target_os = "macos",
++        target_arch = "aarch64",
++        feature = "native-managed-spawn"
++    )) {
++        return Err("native desktop entry is unsupported on this build".into());
++    }
++    let records = PrivateDirectory::open(&options.records).map_err(|e| e.to_string())?;
++    let mut result = records
++        .file("session-result.txt")
++        .map_err(|e| e.to_string())?;
++    let _socket_directory =
++        PrivateDirectory::open(options.socket.parent().ok_or("socket parent missing")?)
++            .map_err(|e| e.to_string())?;
++    let _executable = regular_file(&options.terminal, 64 * 1024 * 1024, true)?;
++    require_fresh_socket(&options.socket)?;
++    let fonts = wm_theme::FontState::from_packaged_fonts(
++        font_bytes(&options.regular)?,
++        font_bytes(&options.bold)?,
++    )?;
++    let mut manager = OwnedApplications::default();
++    let launcher = TerminalLauncher::new(
++        &options.terminal,
++        &options.socket,
++        &options.records,
++        options.session,
++        Duration::from_secs(options.seconds),
++        &mut manager,
++    )
++    .map_err(|e| e.to_string())?;
++    // All path/font/private-log input refusals above precede HID/PDGOP open.
++    let listener = ListeningSocket::bind_absolute(options.socket).map_err(|e| e.to_string())?;
++    let mut display = Display::<Server>::new().map_err(|e| e.to_string())?;
++    STOP.store(false, Ordering::Relaxed);
++    unsafe {
++        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
++            if libc::signal(signal, stop as *const () as libc::sighandler_t) == libc::SIG_ERR {
++                return Err(std::io::Error::last_os_error().to_string());
++            }
++        }
++    }
++    let mut input = NativeHid::open()?;
++    let mut presenter = Pdgop::open()?;
++    let mut server = Server::new_with_fonts(&display.handle(), presenter.size(), fonts.clone())?;
++    server.enable_pdhid_seat_caps(&display.handle(), input.seat_caps())?;
++    server.enable_desktop_shell(fonts)?;
++    server.adopt_managed_applications(launcher, manager)?;
++    server.queue_startup_terminals(options.startup_terminals)?;
++    writeln!(result,"CHONKDESKTOP/1 initialized=1 input=both shell=shared native_runtime_qualification=not_inferred").map_err(|e|e.to_string())?;
++    result.sync_all().map_err(|e| e.to_string())?;
++    // No fallible early returns after this point until the coordinator has
++    // attempted/sealed cleanup. Prior startup errors cannot have spawned apps.
++    let outcome = {
++        let mut io = NativeIo {
++            display: &mut display,
++            server: &mut server,
++            listener: &listener,
++            input: &mut input,
++            presenter: &mut presenter,
++            result: &mut result,
++            started: Instant::now(),
++            shutdown: false,
++        };
++        session_entry::drive(&mut io, Duration::from_secs(options.seconds))
++    };
++    drop(listener);
++    drop(display);
++    drop(server);
++    drop(input);
++    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
++    drop(presenter);
++    if !outcome.successful() {
++        return Err(format!("finite desktop failure: {outcome:?}"));
++    }
++    Ok(())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn args() -> Vec<String> {
++        [
++            "--run",
++            "--socket",
++            "/private/run/wl",
++            "--records",
++            "/private/run/logs",
++            "--session",
++            &"a".repeat(48),
++            "--terminal",
++            "/usr/bin/chonk-terminal-darwin",
++            "--seconds",
++            "120",
++            "--font-regular",
++            "/fonts/regular.ttf",
++            "--font-bold",
++            "/fonts/bold.ttf",
++            "--input",
++            "pdhid",
++        ]
++        .map(str::to_owned)
++        .to_vec()
++    }
++    #[test]
++    fn explicit_cli_only_and_finite_bounds() {
++        assert_eq!(Options::parse(&args()).unwrap().startup_terminals, 0);
++        for (word, count) in [("1", 1), ("2", 2)] {
++            let mut a = args();
++            a.extend(["--startup-terminals".into(), word.into()]);
++            assert_eq!(Options::parse(&a).unwrap().startup_terminals, count);
++        }
++        for word in ["0", "3", "01", "+1", "-1"] {
++            let mut a = args();
++            a.extend(["--startup-terminals".into(), word.into()]);
++            assert!(Options::parse(&a).is_err());
++        }
++        for index in [0, 1, 3, 5, 7, 9, 11, 13, 15, 16] {
++            let mut a = args();
++            a[index] = "bad".into();
++            assert!(Options::parse(&a).is_err());
++        }
++        for seconds in ["0", "10", "181", "+120", "0120"] {
++            let mut a = args();
++            a[10] = seconds.into();
++            assert!(Options::parse(&a).is_err());
++        }
++        for index in [2, 4, 8, 12, 14] {
++            let mut a = args();
++            a[index] = "relative".into();
++            assert!(Options::parse(&a).is_err());
++        }
++        let mut a = args();
++        a.push("extra".into());
++        assert!(Options::parse(&a).is_err());
++    }
++    #[test]
++    fn host_never_opens_native_devices() {
++        assert!(run(Options::parse(&args()).unwrap())
++            .unwrap_err()
++            .contains("unsupported on this build"));
++    }
++    #[test]
++    fn font_input_must_be_regular_bounded_and_not_a_link() {
++        let dir = tempfile::tempdir().unwrap();
++        let p = dir.path().join("font");
++        std::fs::write(&p, b"bad font bytes").unwrap();
++        let bytes = font_bytes(&p).unwrap();
++        assert!(wm_theme::FontState::from_packaged_fonts(bytes.clone(), bytes).is_err());
++        let link = dir.path().join("link");
++        std::os::unix::fs::symlink(&p, &link).unwrap();
++        assert!(font_bytes(&link).is_err());
++        assert!(regular_file(Path::new("/dev/null"), 1024, false).is_err());
++    }
++    #[test]
++    fn explicit_packaged_fonts_have_real_ascii_faces() {
++        // Explicit host font fixtures. Not copied into the product or claimed
++        // to be guest-packaged; root separately binds font licenses/bytes.
++        let regular = font_bytes(Path::new("/usr/share/fonts/TTF/DejaVuSans.ttf")).unwrap();
++        let bold = font_bytes(Path::new("/usr/share/fonts/TTF/DejaVuSans-Bold.ttf")).unwrap();
++        assert!(
++            wm_theme::FontState::from_packaged_fonts(regular.clone(), regular.clone()).is_err()
++        );
++        let fonts = wm_theme::FontState::from_packaged_fonts(regular, bold).unwrap();
++        assert_eq!(fonts.cache_statistics().available_faces, 2);
++    }
++    #[test]
++    fn existing_socket_or_lock_is_refused_without_probe_or_unlink() {
++        let dir = tempfile::tempdir().unwrap();
++        let p = dir.path().join("wayland");
++        require_fresh_socket(&p).unwrap();
++        let listener = std::os::unix::net::UnixListener::bind(&p).unwrap();
++        assert!(require_fresh_socket(&p).is_err());
++        assert!(p.exists());
++        drop(listener);
++        std::fs::remove_file(&p).unwrap();
++        std::fs::write(p.with_extension("lock"), b"existing").unwrap();
++        assert!(require_fresh_socket(&p).is_err());
++        assert_eq!(
++            std::fs::read(p.with_extension("lock")).unwrap(),
++            b"existing"
++        );
++    }
++}
+--- /dev/null
++++ b/crates/wm-darwin/src/desktop_main.rs
+@@ -0,0 +1,13 @@
++fn main() {
++    let args: Vec<String> = std::env::args().skip(1).collect();
++    if args.is_empty() || args == ["--help"] {
++        println!("{}", wm_darwin::desktop_entry::USAGE);
++        return;
++    }
++    let result =
++        wm_darwin::desktop_entry::Options::parse(&args).and_then(wm_darwin::desktop_entry::run);
++    if let Err(error) = result {
++        eprintln!("chonkstep-darwin-desktop: {error}");
++        std::process::exit(1);
++    }
++}
+--- a/crates/wm-darwin/src/launch_audit.rs
++++ b/crates/wm-darwin/src/launch_audit.rs
+@@ -10,6 +10,21 @@
+ 
+ pub const MAX_ATTEMPTS: usize = 128;
+ const MAX_JOURNAL_BYTES: usize = 2 * 1024 * 1024;
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum RequestSource {
++    DirectLibrary,
++    Input,
++    ExplicitStartup,
++}
++impl RequestSource {
++    pub fn name(self) -> &'static str {
++        match self {
++            Self::DirectLibrary => "direct_library",
++            Self::Input => "input",
++            Self::ExplicitStartup => "explicit_startup",
++        }
++    }
++}
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ #[repr(usize)]
+ pub enum Gate {
+@@ -40,6 +55,7 @@
+ pub struct Attempt {
+     pub sequence: usize,
+     pub shell_request: Option<u64>,
++    pub source: RequestSource,
+     pub instance: Option<String>,
+     pub pid: Option<i32>,
+     pub created_ms: u64,
+@@ -122,6 +138,14 @@
+         shell_request: Option<u64>,
+         instance: Option<&str>,
+     ) -> Result<usize, &'static str> {
++        self.begin_from(shell_request, instance, RequestSource::DirectLibrary)
++    }
++    pub fn begin_from(
++        &mut self,
++        shell_request: Option<u64>,
++        instance: Option<&str>,
++        source: RequestSource,
++    ) -> Result<usize, &'static str> {
+         if self.failure.is_some() || self.attempts.len() == MAX_ATTEMPTS {
+             self.failure
+                 .get_or_insert("launch diagnostic capacity exhausted or journal failed");
+@@ -136,6 +160,7 @@
+         self.attempts.push(Attempt {
+             sequence,
+             shell_request,
++            source,
+             instance: instance.map(str::to_owned),
+             pid: None,
+             created_ms: now,
+@@ -149,7 +174,7 @@
+             native_return: None,
+             native_result: None,
+         });
+-        self.append(format!("CHONKLAUNCH/1 attempt={sequence} ms={now} request={shell_request:?} instance={instance:?} event=requested\n"));
++        self.append(format!("CHONKLAUNCH/1 attempt={sequence} ms={now} request={shell_request:?} instance={instance:?} source={} event=requested\n",source.name()));
+         Ok(sequence)
+     }
+     pub fn mark(&mut self, sequence: usize, gate: Gate) {
+@@ -225,6 +250,9 @@
+         if let WaitState::Reaped(raw) = wait {
+             self.mark(sequence, Gate::AppReaped);
+             self.attempts[sequence].raw_app_wait_status = Some(raw);
++            if !libc::WIFEXITED(raw) || libc::WEXITSTATUS(raw) != 0 {
++                self.fail(sequence, "application exited nonzero or by signal");
++            }
+         }
+         if let WaitState::Unknown(error) = wait {
+             self.attempts[sequence].wait_error = Some(error);
+@@ -250,7 +278,7 @@
+     pub fn snapshot(&self, out: &mut impl Write) -> io::Result<()> {
+         writeln!(out, "CHONKLAUNCH/1 snapshot attempts={} journal_error={:?} app_internal_gates=unknown_until_final_app_record", self.attempts.len(), self.failure)?;
+         for a in &self.attempts {
+-            writeln!(out, "attempt={} request={:?} instance={:?} pid={:?} created_ms={} failure={:?} failure_ms={:?} status_bytes={} wait={:?} wait_error={:?} cleanup={:?} native_return={:?} native={:?}", a.sequence, a.shell_request, a.instance, a.pid, a.created_ms, a.failure, a.failure_ms, a.status_bytes, a.raw_app_wait_status, a.wait_error, a.cleanup, a.native_return, a.native_result)?;
++            writeln!(out, "attempt={} source={} request={:?} instance={:?} pid={:?} created_ms={} failure={:?} failure_ms={:?} status_bytes={} wait={:?} wait_error={:?} cleanup={:?} native_return={:?} native={:?}", a.sequence, a.source.name(), a.shell_request, a.instance, a.pid, a.created_ms, a.failure, a.failure_ms, a.status_bytes, a.raw_app_wait_status, a.wait_error, a.cleanup, a.native_return, a.native_result)?;
+             for gate in GATES {
+                 writeln!(
+                     out,
+@@ -290,6 +318,35 @@
+     use super::*;
+     use crate::applications::{Instance, Status, WaitState};
+     use std::os::unix::fs::PermissionsExt;
++    #[test]
++    fn startup_source_is_durable_before_any_spawn_gate() {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("journal");
++        let file = std::fs::OpenOptions::new()
++            .create_new(true)
++            .write(true)
++            .open(&path)
++            .unwrap();
++        file.set_permissions(std::fs::Permissions::from_mode(0o600))
++            .unwrap();
++        let mut audit = LaunchAudit::default();
++        audit.attach_private_journal(file).unwrap();
++        audit
++            .begin_from(
++                Some(1),
++                Some(&"a".repeat(48)),
++                RequestSource::ExplicitStartup,
++            )
++            .unwrap();
++        let text = std::fs::read_to_string(path).unwrap();
++        assert!(text.contains("source=explicit_startup event=requested"));
++        assert!(!text.contains("source=input") && !text.contains("event=PidOwned"));
++        let mut snapshot = Vec::new();
++        audit.snapshot(&mut snapshot).unwrap();
++        assert!(String::from_utf8(snapshot)
++            .unwrap()
++            .contains("source=explicit_startup"));
++    }
+     fn status() -> Status {
+         Status::new(Instance::parse(&"a".repeat(48)).unwrap(), 123).unwrap()
+     }
+@@ -359,7 +416,8 @@
+         let text = std::fs::read_to_string(&path).unwrap();
+         assert!(text.contains("event=Admission") && text.contains("event=AppCleanup"));
+         assert!(text.contains("raw_app_wait=Some(256)") && text.contains("complete: false"));
+-        assert!(text.contains("application never became ready"));
++        assert!(text.contains("application exited nonzero or by signal"));
++        assert!(!text.contains("application never became ready"));
+         assert!(!text.contains("event=AppReady"));
+         let size = std::fs::metadata(&path).unwrap().len();
+         for _ in 0..100 {
+@@ -380,4 +438,23 @@
+         assert_eq!(audit.attempts()[0].failure, Some("child cleanup failed"));
+         assert!(audit.attempts()[0].gates_ms[Gate::PidOwned as usize].is_some());
+     }
+-}
++    #[test]
++    fn complete_pty_cleanup_cannot_hide_nonzero_application_exit() {
++        for raw in [256, 15, 9] {
++            let mut audit = LaunchAudit::default();
++            let key = audit.begin(None, Some(&"a".repeat(48))).unwrap();
++            let mut state = status();
++            state
++                .feed(format!("CHONKTERM/1 CLEANUP {} 123 1 9 1 1\n", "a".repeat(48)).as_bytes())
++                .unwrap();
++            state.finish().unwrap();
++            audit.observe(key, &state, WaitState::Reaped(raw));
++            assert!(state.closed() && state.cleanup().unwrap().complete);
++            assert_eq!(
++                audit.attempts()[0].failure,
++                Some("application exited nonzero or by signal")
++            );
++            assert_eq!(audit.attempts()[0].raw_app_wait_status, Some(raw));
++        }
++    }
++}
+--- a/crates/wm-darwin/src/lib.rs
++++ b/crates/wm-darwin/src/lib.rs
+@@ -5,6 +5,8 @@
+ pub mod applications;
+ #[cfg(feature = "desktop-shell")]
+ pub mod desktop;
++#[cfg(feature = "desktop-shell")]
++pub mod desktop_entry;
+ pub mod hid;
+ mod input;
+ pub mod launch_audit;
+@@ -12,4 +14,6 @@
+ pub mod presenter;
+ pub mod scene;
+ pub mod server;
++#[cfg(feature = "desktop-shell")]
++pub mod session_entry;
+ pub mod terminal_launch;
+--- a/crates/wm-darwin/src/server.rs
++++ b/crates/wm-darwin/src/server.rs
+@@ -43,6 +43,9 @@
+ }
+ impl Server {
+     pub fn new(dh: &DisplayHandle, size: Size) -> Result<Self, String> {
++        Self::new_with_fonts(dh, size, wm_theme::FontState::new())
++    }
++    pub fn new_with_fonts(dh: &DisplayHandle, size: Size, fonts: wm_theme::FontState) -> Result<Self, String> {
+         let backend = CpuBackend::new(size)?;
+         let compositor = CompositorState::new::<Self>(dh);
+         // Subsurface composition is not in this first increment. Do not advertise it.
+@@ -79,8 +82,9 @@
+             output,
+             wm: WindowManager::new(
+                 backend,
+-                Box::new(wm_theme::RasterThemeEngine::new(
++                Box::new(wm_theme::RasterThemeEngine::with_fonts(
+                     wm_theme::default_theme::nextstep_classic(),
++                    fonts,
+                 )),
+             ),
+             seats: SeatState::new(),
+--- /dev/null
++++ b/crates/wm-darwin/src/session_entry.rs
+@@ -0,0 +1,200 @@
++//! Finite frontend lifecycle. Production I/O implements the same coordinator
++//! exercised by host fault tests; a frame error cannot bypass owned cleanup.
++use std::{
++    panic::{catch_unwind, AssertUnwindSafe},
++    time::Duration,
++};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum CleanupState {
++    Pending,
++    Complete,
++    Incomplete,
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum FrameState {
++    Continue,
++    Stop,
++}
++pub trait SessionIo {
++    fn elapsed(&self) -> Duration;
++    fn frame(&mut self) -> Result<FrameState, String>;
++    fn stop_requested(&self) -> bool;
++    fn begin_shutdown(&mut self);
++    fn cleanup(&mut self) -> CleanupState;
++    fn pause(&mut self);
++    fn seal(&mut self, outcome: &Outcome) -> Result<(), String>;
++}
++#[derive(Debug)]
++pub struct Outcome {
++    pub frame_error: Option<String>,
++    pub cleanup: CleanupState,
++    pub seal_error: Option<String>,
++    pub deadline_reached: bool,
++}
++impl Outcome {
++    pub fn successful(&self) -> bool {
++        self.frame_error.is_none()
++            && self.cleanup == CleanupState::Complete
++            && self.seal_error.is_none()
++    }
++}
++pub fn drive(io: &mut impl SessionIo, lifetime: Duration) -> Outcome {
++    let mut result = Outcome {
++        frame_error: None,
++        cleanup: CleanupState::Pending,
++        seal_error: None,
++        deadline_reached: false,
++    };
++    loop {
++        if io.stop_requested() {
++            break;
++        }
++        if io.elapsed() >= lifetime {
++            result.deadline_reached = true;
++            break;
++        }
++        // I/O and child owners remain outside the unwind closure. A poisoned
++        // UI is never resumed; shutdown is restricted to owned status/PIDs.
++        match catch_unwind(AssertUnwindSafe(|| io.frame())) {
++            Ok(Ok(FrameState::Continue)) => io.pause(),
++            Ok(Ok(FrameState::Stop)) => break,
++            Ok(Err(error)) => {
++                result.frame_error = Some(error);
++                break;
++            }
++            Err(_) => {
++                result.frame_error = Some("UI frame panicked; UI will not be resumed".into());
++                break;
++            }
++        }
++    }
++    // Every ordinary Result/error/signal/deadline reaches this one path. A
++    // process abort/OOM cannot be made safe by a destructor and is not claimed.
++    io.begin_shutdown();
++    let stop_at = io.elapsed().saturating_add(Duration::from_secs(10));
++    loop {
++        result.cleanup = io.cleanup();
++        if result.cleanup != CleanupState::Pending {
++            break;
++        }
++        if io.elapsed() >= stop_at {
++            result.cleanup = CleanupState::Incomplete;
++            break;
++        }
++        io.pause();
++    }
++    if let Err(error) = io.seal(&result) {
++        result.seal_error = Some(error);
++    }
++    result
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    struct Fake {
++        time: Duration,
++        frame_fail: bool,
++        frame_panic: bool,
++        stop: bool,
++        cleanup: CleanupState,
++        seal_fail: bool,
++        calls: Vec<&'static str>,
++    }
++    impl SessionIo for Fake {
++        fn elapsed(&self) -> Duration {
++            self.time
++        }
++        fn frame(&mut self) -> Result<FrameState, String> {
++            self.calls.push("frame");
++            assert!(!self.frame_panic, "injected UI invariant failure");
++            if self.frame_fail {
++                Err("injected display/present/input failure".into())
++            } else {
++                Ok(FrameState::Stop)
++            }
++        }
++        fn stop_requested(&self) -> bool {
++            self.stop
++        }
++        fn begin_shutdown(&mut self) {
++            self.calls.push("begin")
++        }
++        fn cleanup(&mut self) -> CleanupState {
++            self.calls.push("cleanup");
++            self.cleanup
++        }
++        fn pause(&mut self) {
++            self.time += Duration::from_secs(1)
++        }
++        fn seal(&mut self, _: &Outcome) -> Result<(), String> {
++            self.calls.push("seal");
++            if self.seal_fail {
++                Err("injected record failure".into())
++            } else {
++                Ok(())
++            }
++        }
++    }
++    fn fake() -> Fake {
++        Fake {
++            time: Duration::ZERO,
++            frame_fail: false,
++            frame_panic: false,
++            stop: false,
++            cleanup: CleanupState::Complete,
++            seal_fail: false,
++            calls: vec![],
++        }
++    }
++    #[test]
++    fn every_result_exit_drives_cleanup_then_seals() {
++        for why in 0..4 {
++            let mut io = fake();
++            match why {
++                0 => {}
++                1 => io.frame_fail = true,
++                2 => io.stop = true,
++                _ => io.time = Duration::from_secs(120),
++            }
++            let result = drive(&mut io, Duration::from_secs(120));
++            let start = io.calls.iter().position(|s| *s == "begin").unwrap();
++            assert_eq!(&io.calls[start..], ["begin", "cleanup", "seal"]);
++            assert_eq!(result.frame_error.is_some(), why == 1);
++            assert_eq!(result.deadline_reached, why == 3);
++        }
++    }
++    #[test]
++    fn hung_or_unowned_child_never_becomes_complete() {
++        for state in [CleanupState::Pending, CleanupState::Incomplete] {
++            let mut io = fake();
++            io.cleanup = state;
++            let result = drive(&mut io, Duration::from_secs(120));
++            assert_eq!(result.cleanup, CleanupState::Incomplete);
++            assert!(!result.successful());
++            assert!(io.time <= Duration::from_secs(10));
++            assert_eq!(io.calls.iter().filter(|s| **s == "begin").count(), 1);
++            assert_eq!(io.calls.last(), Some(&"seal"));
++            assert_eq!(io.calls.iter().filter(|s| **s == "frame").count(), 1);
++        }
++    }
++    #[test]
++    fn sealing_error_stays_failure_after_real_cleanup() {
++        let mut io = fake();
++        io.seal_fail = true;
++        let result = drive(&mut io, Duration::from_secs(120));
++        assert_eq!(result.cleanup, CleanupState::Complete);
++        assert!(!result.successful());
++    }
++    #[test]
++    fn ui_panic_keeps_owner_and_drives_cleanup_without_resuming_ui() {
++        let mut io = fake();
++        io.frame_panic = true;
++        let result = drive(&mut io, Duration::from_secs(120));
++        assert_eq!(io.calls, ["frame", "begin", "cleanup", "seal"]);
++        assert_eq!(result.cleanup, CleanupState::Complete);
++        assert!(result.frame_error.as_ref().unwrap().contains("panicked"));
++        assert!(!result.successful());
++    }
++}
+--- a/crates/wm-darwin/src/terminal_launch.rs
++++ b/crates/wm-darwin/src/terminal_launch.rs
+@@ -21,12 +21,12 @@
+     next: u64,
+     end: Instant,
+ }
+-struct PrivateDirectory {
++pub(crate) struct PrivateDirectory {
+     file: File,
+     path: PathBuf,
+ }
+ impl PrivateDirectory {
+-    fn open(path: &Path) -> io::Result<Self> {
++    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+         checked_path(path)?;
+         let c = CString::new(path.as_os_str().as_encoded_bytes()).map_err(io::Error::other)?;
+         let fd = unsafe {
+@@ -81,7 +81,7 @@
+             self.path.join(instance.as_str()),
+         )
+     }
+-    fn file(&self, name: &'static str) -> io::Result<File> {
++    pub(crate) fn file(&self, name: &'static str) -> io::Result<File> {
+         let c = CString::new(name).unwrap();
+         let fd = unsafe {
+             libc::openat(
+@@ -230,10 +230,18 @@
+         request: u64,
+         manager: &mut OwnedApplications,
+     ) -> Result<LaunchDisposition, String> {
++        self.request_from(request, crate::launch_audit::RequestSource::Input, manager)
++    }
++    pub fn request_from(
++        &mut self,
++        request: u64,
++        source: crate::launch_audit::RequestSource,
++        manager: &mut OwnedApplications,
++    ) -> Result<LaunchDisposition, String> {
+         let instance = self.identity().map_err(|e| e.to_string())?;
+         let sequence = manager
+             .audit
+-            .begin(Some(request), Some(instance.as_str()))
++            .begin_from(Some(request), Some(instance.as_str()), source)
+             .map_err(str::to_owned)?;
+         let result = (|| {
+             if !manager.audit.durable() {
+--- a/crates/wm-darwin/tests/wayland_shm.rs
++++ b/crates/wm-darwin/tests/wayland_shm.rs
+@@ -206,6 +206,8 @@
+     #[cfg(feature = "desktop-shell")]
+     Desktop(mpsc::Sender<Result<(),String>>),
+     #[cfg(feature = "desktop-shell")]
++    Startup(u8,mpsc::Sender<Result<(),String>>),
++    #[cfg(feature = "desktop-shell")]
+     AddClient(UnixStream),
+     Snapshot(mpsc::Sender<Snapshot>),
+     Reject(bool),
+@@ -245,6 +247,8 @@
+                 match rx.try_recv() {
+                     #[cfg(feature = "desktop-shell")]
+                     Ok(Request::Desktop(reply))=>{reply.send(state.enable_desktop_shell(wm_theme::FontState::new())).unwrap();},
++                    #[cfg(feature = "desktop-shell")]
++                    Ok(Request::Startup(count,reply))=>{reply.send(state.queue_startup_terminals(count)).unwrap();},
+                     #[cfg(feature = "desktop-shell")]
+                     Ok(Request::AddClient(stream))=>{Server::add_client(&mut display,stream).unwrap();},
+                     Ok(Request::Stop) => break,
+@@ -564,3 +568,17 @@
+     assert_eq!(cb.keys,vec![(30,Value(wl_keyboard::KeyState::Pressed)),(30,Value(wl_keyboard::KeyState::Released))]);
+     assert_eq!(cb.modifier_masks.last(),Some(&0));
+ }
++#[test]
++#[cfg(feature="desktop-shell")]
++fn explicit_packaged_startup_sends_no_wayland_key_or_held_chord(){
++    let(h,a)=Harness::with_input(true);let(tx,rx)=mpsc::channel();h.tx.send(Request::Desktop(tx)).unwrap();rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
++    let(mut queue,mut client,_s,_x,_t)=map_client(&a,"existing-window");
++    assert!(client.keys.is_empty());
++    let(tx,rx)=mpsc::channel();h.tx.send(Request::Startup(1,tx)).unwrap();rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
++    h.snapshot();queue.roundtrip(&mut client).unwrap();
++    // Unadmitted host spawner shows a genuine refusal. Neither the startup
++    // action nor its menu generates wl_keyboard key or held-launch events.
++    assert!(client.keys.is_empty());
++    assert!(client.held_on_enter.iter().all(Vec::is_empty));
++    assert!(client.modifier_masks.iter().all(|mask|*mask==0));
++}
+--- a/crates/wm-theme/src/raster.rs
++++ b/crates/wm-theme/src/raster.rs
+@@ -95,7 +95,41 @@
+     /// Loads the system font database. Expensive — call it once per
+     /// session and clone the handle thereafter.
+     pub fn new() -> Self {
+-        let mut font_system = cosmic_text::FontSystem::new();
++        Self::from_system(cosmic_text::FontSystem::new())
++    }
++
++    /// Explicit standalone font input. No system database/locale discovery or
++    /// font filename is consulted. Generic FontState::new remains unchanged.
++    pub fn from_packaged_fonts(regular: Vec<u8>, bold: Vec<u8>) -> Result<Self, String> {
++        use cosmic_text::{fontdb, FontSystem};
++        if regular.is_empty() || bold.is_empty() || regular.len() > 8 * 1024 * 1024 || bold.len() > 8 * 1024 * 1024 {
++            return Err("packaged font byte bounds failed".into());
++        }
++        let mut db = fontdb::Database::new();
++        db.load_font_data(regular);
++        db.load_font_data(bold);
++        db.set_sans_serif_family("DejaVu Sans");
++        db.set_serif_family("DejaVu Sans");
++        db.set_monospace_family("DejaVu Sans");
++        let mut fonts = FontSystem::new_with_locale_and_db("en-US".into(), db);
++        for weight in [fontdb::Weight::NORMAL, fontdb::Weight::BOLD] {
++            let id = fonts.db().query(&fontdb::Query {
++                families: &[fontdb::Family::Name("DejaVu Sans")], weight,
++                stretch: fontdb::Stretch::Normal, style: fontdb::Style::Normal,
++            }).ok_or("required packaged DejaVu Sans face missing")?;
++            let face = fonts.db().face(id).ok_or("packaged face disappeared")?;
++            if face.weight != weight || face.style != fontdb::Style::Normal {
++                return Err("packaged face would require weight/style substitution".into());
++            }
++            let font = fonts.get_font(id, weight).ok_or("packaged font could not be loaded")?;
++            if (' '..='~').any(|c| font.as_swash().charmap().map(c) == 0) {
++                return Err("packaged menu/title ASCII glyph missing".into());
++            }
++        }
++        Ok(Self::from_system(fonts))
++    }
++
++    fn from_system(mut font_system: cosmic_text::FontSystem) -> Self {
+         let system7_fallback = system7::Fallback::prepare(&mut font_system);
+         Self {
+             font_system: Rc::new(RefCell::new(font_system)),

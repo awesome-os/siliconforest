@@ -1,0 +1,95 @@
+linuxkpi: synchronize_irq() and free_irq() wait for a platform interrupt's handler
+
+Audit finding P7. _intr_drain() was empty ("handlers run on their own threads, nothing to
+wait out"). Running on a work loop thread is what lets a handler run on another cpu while
+the caller, having masked its device, frees what the handler uses. Each platform interrupt
+counts its handler invocations in progress; synchronize_irq()/synchronize_hardirq() and
+sf_platform_free_irq() wait until there is none. disable_irq()/enable_irq() of a platform
+interrupt are still not implemented (see the audit, open items).
+
+--- a/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_platform.c
++++ b/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_platform.c
+@@ -317,6 +313,9 @@
+ 	uint64_t	count;
+ 	uint64_t	unhandled;
+ 	uint64_t	next_report;
++	// handler invocations in progress and the thread running one, for synchronize_irq()
++	int		running;
++	void		*runner;
+ };
+ 
+ static struct sf_platform_irq sIrqs[16];
+@@ -328,9 +327,13 @@
+ 	irqreturn_t ret;
+ 
+ 	linux_set_current(curthread);
++	__atomic_store_n(&pi->runner, (void *)curthread, __ATOMIC_RELAXED);
++	__atomic_add_fetch(&pi->running, 1, __ATOMIC_SEQ_CST);
+ 	ret = pi->handler != NULL ? pi->handler(pi->irq, pi->arg) : IRQ_WAKE_THREAD;
+ 	if (ret == IRQ_WAKE_THREAD && pi->thread_handler != NULL)
+ 		ret = pi->thread_handler(pi->irq, pi->arg);
++	__atomic_store_n(&pi->runner, NULL, __ATOMIC_RELAXED);
++	__atomic_sub_fetch(&pi->running, 1, __ATOMIC_SEQ_CST);
+ 
+ 	// counts at each power of ten, so a storm shows in the log without flooding it
+ 	pi->count++;
+@@ -369,6 +372,28 @@
+ 	return (0);
+ }
+ 
++// synchronize_irq() for a platform interrupt: returns once no invocation of its handler is
++// in progress. the handlers run on work loop threads, so on another cpu one can be in the
++// middle of the device's state while this caller, having masked the device, goes on to free
++// it. (it does not wait for an interrupt that was signalled but whose handler has not
++// started; a handler started after the device was masked finds nothing to do.) a handler
++// that calls this on its own interrupt returns at once, as it could never finish.
++void
++sf_platform_synchronize_irq(unsigned int irq)
++{
++	for (int i = 0; i < nitems(sIrqs); i++) {
++		struct sf_platform_irq *pi = &sIrqs[i];
++
++		if (pi->irq != irq || (pi->handler == NULL && pi->thread_handler == NULL))
++			continue;
++		if (__atomic_load_n(&pi->runner, __ATOMIC_RELAXED) == (void *)curthread)
++			return;
++		while (__atomic_load_n(&pi->running, __ATOMIC_SEQ_CST) != 0)
++			sfos_sleep_us(50);
++		return;
++	}
++}
++
+ void
+ sf_platform_free_irq(unsigned int irq, void *arg)
+ {
+@@ -377,6 +402,9 @@
+ 
+ 		if (pi->irq == irq && (pi->handler != NULL || pi->thread_handler != NULL)) {
+ 			remove_io_interrupt_handler(irq, sf_platform_irq_handler, pi);
++			// free_irq() promises the handler is not running when it returns
++			while (__atomic_load_n(&pi->running, __ATOMIC_SEQ_CST) != 0)
++				sfos_sleep_us(50);
+ 			memset(pi, 0, sizeof(*pi));
+ 			return;
+ 		}
+--- a/src/Kernel/fbsdkpi/sf/lkpi/sf_lkpi_libkern.c
++++ b/src/Kernel/fbsdkpi/sf/lkpi/sf_lkpi_libkern.c
+@@ -344,10 +344,16 @@
+ 	return (unsigned long)(sfos_uptime_us() / 1000);
+ }
+ 
+-// interrupt handlers run on their own threads, nothing to wait out here
++// synchronize_irq(): interrupt handlers run on work loop threads, which is exactly why one can
++// still be running on another cpu when the caller has masked its device. platform interrupts
++// are waited out (sf_linux_platform.c); a pci interrupt's handler is waited out by its
++// teardown (linux_interrupt.c), as before.
++void sf_platform_synchronize_irq(unsigned int irq);
++
+ void
+ _intr_drain(int irq)
+ {
++	sf_platform_synchronize_irq((unsigned int)irq);
+ }
+ 
+ int
+

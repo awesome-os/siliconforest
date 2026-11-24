@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "SOURCE_REVIEW_NO_HARDWARE_NO_BUILD",
+  "files": {
+    "PDM1SPIHID.cpp": "f7087dc8a2beb79b", "PDM1SPIHID.h": "6dcce58b47f55cca",
+    "PDM1KeyboardHW.cpp": "0483c13af2b72b74", "PDM1KeyboardHW.h": "6d8c889eac0aaed4",
+    "m1kbd_hid.c": "69b9daa64e430310", "m1kbd_hid.h": "ce1aefb388c299f6",
+    "inventory/darwin-keyboard-test": "b9529aae24446ac8",
+    "matches": "integrations/puredarwin/m1-keyboard/adapter-source-validation.json revision 2"
+  },
+  "verdict": "No safety blockers: every failure path stops, powers the keyboard off and leaves the console path untouched. Before hardware, fix K3b (script set -e) and agree the K3 evidence rule. K1 (diagnostic recording) is strongly recommended so one boot is informative rather than a bare stop phase.",
+  "verified": {
+    "lifecycle": [
+      "PureDarwin IOHIDDevice::start (IOHIDDevice.cpp) takes getWorkLoop() (= transportLoop, created before super::start), adds its IOHIDEventSource, calls handleStart before newReportDescriptor, then creates the IOHIDInterface nubs. handleStart's gated synchronous enumeration (bounded, about 3 s worst case) fills the descriptor first.",
+      "On failure, IOHIDDevice::start calls stop(provider): super::stop removes IOHIDDevice's source while the loop is alive, then disposeTransport. PDM1SPIHID::start's own disposeTransport and free() are idempotent.",
+      "Teardown: stopGated (under the gate) cancels the timer, then the timer is removed, then closeAfterQuiesce runs m1kbd_hw_stop (spien low) and releases maps after the stop. No callback frees or unmaps itself. terminate is refused and kmod stop refuses unload."
+    ],
+    "hardware_glue": [
+      "No MMIO unless pdm1kbd=1 (probe and open) and the exact board validation passes. The property cache keeps the borrowed OSData alive through validation. Only the 5 qualified apertures are mapped, inhibit-cache. MMIO accesses are fenced (dmb osh / dsb oshst). Waits of 1 ms or more use IOSleep. The clock is mach_absolute_time based.",
+      "XNU keeps the raw ADT interrupts/interrupt-parent/AAPL,phandle properties; IODTMapInterruptsSharing only adds the IOInterruptControllers/Specifiers keys. m1n1 deletes only ATC/CPU nodes and renames the product node. host_progress allows HOOK_VM, and dispatch() forwards it to m1n1's PMGR hook, so the hooked SIO/SIO_BUSIF reads are serviced."
+    ],
+    "enumeration": [
+      "Requests match the reference: device info rsplen 0; interface info and descriptor rsplen 512; ids start at 0; 1 s waits.",
+      "Vendor/product 05ac:0341 is grounded in root's Linux sysfs (001C:05AC:0341).",
+      "The metadata parsers bound every string offset and copy no strings or serial. The descriptor (<=512) is copied into object storage. Input filter: flags 0x20, command 0x10, device 1, length <= max_input. test_hid_metadata: 5/5 pass here."
+    ],
+    "console_path": "The IOHIDFamily Info.plist 'HID Keyboard Driver' personality matches IOHIDEventDriver on IOHIDInterface with usages (1,6)/(1,7). IOHIDEventService.cpp:1795 calls PDHIDPushKeyboardEvent, which feeds cons_cinput. This requires the device descriptor to contain a Generic Desktop Keyboard application collection; the Linux interface name ends in '/ Boot', which suggests a boot keyboard (inference).",
+    "host_side_parallel_review": "host_progress 45ac5cc4: opt-ins mutually exclusive and validated before reboot; fixed command with a validated nonce, sent once; pdm1kbd only for the keyboard opt-in; the KC member check is by name, with the KC itself bound by manifest hash. 23/23 host and 8/8 controller tests pass. stage_ramdisk 03f1b69b adds only --size-mib 384/480; safe."
+  },
+  "items": [
+    {"id": "K1", "severity": "first-run false-failure risk", "where": "PDM1SPIHID.cpp:99-171", "issue": "Enumeration is stricter than Linux, and each strictness is a terminal stop: (a) any packet/message CRC error or short junk while waiting for boot or for a response (Linux ignores these); (b) any non-boot message before boot ('message-before-boot'); (c) the response must carry packet device 0xd0 and echo the request id, which Linux checks neither (x86 applespi suggests both hold; unproven for interface/descriptor responses); (d) interface_num must be 1; (e) any unsolicited 0x40 message during a wait.", "fix": "Either tolerate and count these like Linux, or at minimum record what was observed on each such stop (packet flags/device, u0/u1/u2/id, lengths, last_error) in registry properties or IOLog. Today 'response-identity' records nothing and 'device-metadata' logs only a length, so a failed run cannot say what to change."},
+    {"id": "K2", "severity": "test-duration risk", "where": "PDM1SPIHID.cpp:180-186", "issue": "At runtime a single bad packet or a device BOOT powers the keyboard off for the rest of the boot. It is an honest failure, but it can cut a typing test short.", "fix": "Drop and count packet-CRC errors within a bounded budget; keep identity, size and HID errors fatal."},
+    {"id": "K3", "severity": "evidence rule (claims, not safety)", "where": "inventory/darwin-keyboard-test", "issue": "DLK_TYPED cannot distinguish the built-in keyboard from VUART bytes: both reach cons_cinput (serial_keyboard_poll and PDHIDEventQueue). (b) set -eu plus an inventory that exits 1 on a query error (line 8) aborts before DLK_READY, losing the typing test.", "fix": "Composite success: a host tx transcript with zero bytes sent after the keyboard command; the PDM1SPIHID IOLog 'first device-1 input report accepted by IOHID' before DLK_TYPED; preferably the PDM1KeyboardReports count printed before READY and after the read (delta >= the keystrokes); plus physical observation. Change line 8 to '|| printf DLK_INVENTORY_FAILED...'. About 100 s remains for typing after the prompt at the display-010 timing."},
+    {"id": "K4", "severity": "fail-closed risk", "where": "m1kbd_board.c", "issue": "The guard is validated against the pre-HV original ADT, but the guest receives m1n1's re-serialized adt.build() blob. Checked nodes are not edited, and the round trip should preserve bytes, but this is unproven.", "fix": "Offline, no hardware: run the guard against the exact blob host_progress builds for this candidate."},
+    {"id": "K5", "severity": "low", "where": "m1n1 hv map_essential rh()", "issue": "The hooked SIO/SIO_BUSIF reads return the first value ever read (setdefault). If that read caught BUSY, power_sample sees BUSY until it times out.", "fix": "Note only; the result is a TIMEOUT with power_before recorded."},
+    {"id": "K6", "severity": "minor", "where": "PDM1SPIHID.cpp:203-205", "issue": "Three setProperty calls with new OSNumbers every 2 ms (about 1500 registry writes per second).", "fix": "Update on change, or every ~100 ms."}
+  ]
+}

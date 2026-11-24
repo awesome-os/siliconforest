@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude (independent quick read-only review; did not author it)",
+  "status": "READ_ONLY_SOURCE_REVIEW_NOT_A_VERDICT",
+  "target": "integrations/puredarwin/m1-desktop-session/shared-shell/export-blocks: decode_exports.py 4e845eef, source set baec2ee0",
+  "verdict": "NO BLOCKING DEFECT. It works as a strict block partitioner. It never accepts a reordered, duplicated, foreign-nonce, unknown-instance, wrong-phase, nonzero-status or noise-contaminated span, and every interior is decoded by the hash-pinned DL22/DL11 decoders with the right nonce or instance, kind and phase. One minor tool-integrity defect (D1) and two integration observations follow. As the README says, it is not a verdict: the footer, failed=0 and C1-C9 remain separate runtime criteria.",
+  "binding": "Recomputed: all 4 files_sha256 entries match and the set equals baec2ee0. The pinned decoders match: shared-shell/records/decode_records.py 60ec1598 and m1-userspace-diagnostics/terminal-records/decode_records.py c8f2193d (the DL11 decoder I reviewed earlier). The DL22 signature decode(raw, nonce, kind, phase) matches the calls. Root's 15 tests rerun in place with PYTHONDONTWRITEBYTECODE=1: OK, no files written.",
+  "checked_behaviour": [
+    "Inputs: raw is bytes of at most 32 MiB; host_nonce is lowercase hex48; instances is exactly two distinct lowercase hex48 values in a tuple or list (str and bytes refused); phase is live or closed.",
+    "Every DL23 marker must fullmatch its pattern. Any other line starting with DL23_ that contains 'EXPORT' raises Malformed, anywhere in the capture.",
+    "Marker nonce must equal host_nonce. Any instance must be one of the two supplied. Every rc, terminal and logs field must be exactly '0' ('00' and '-0' raise). A begin marker's phase must equal the argument, and the footer type must match the phase.",
+    "The state machine is fixed: session begin and end, then for each supplied instance in caller order, app begin, terminal end, app end, then post. A known instance out of order raises Wrapper order. Any marker in post except one footer raises Duplicate. A second footer raises.",
+    "Interiors: session and app-log interiors must be DL22_RECORD_ lines only, and terminal interiors DL11_RECORD_ only. Any other line raises, and an empty interior is Incomplete. The DL22 decoder enforces nonce and kind per line and the DL11 decoder enforces instance, so session/application and cross-instance records cannot be swapped.",
+    "Outside the span, non-record console lines are skipped before the first begin and in post, and record lines there raise. Between blocks, any non-marker line raises.",
+    "Completion requires post, a decoded session and exactly two applications. The footer is optional and failed= is not returned (documented)."
+  ],
+  "defects": {
+    "D1_minor_hash_then_reload": "_load hashes the bytes it reads, but spec.loader.exec_module then reads the file from disk again, so a swap between the check and the exec would run unhashed code. This is low risk on the root host and only affects host-tool integrity. A fix is to compile and exec the already-hashed bytes (compile(data, str(path), 'exec')) instead of re-reading."
+  },
+  "integration_observations": {
+    "O1_unredirected_desktop_stderr": "The observed live wrapper (87be21a6, not frozen) starts chonkstep-darwin-desktop in the background without redirecting stdout or stderr, and runs the live export while the desktop is alive. Normally the desktop is silent: no tracing subscriber, and only the final eprintln on failure. But a failure exit line, or kernel console lines such as the IOGOP console-return messages at PDGOP close, landing inside an export block makes this strict decoder raise. That fails closed (dependent checks not evaluated), but it can lose evidence exactly on a failure. Redirecting the desktop's stdio to a private file in the wrapper would avoid it.",
+    "O2_export_timing": "The live export starts about 85 s after launch, and the desktop's own 120 s lifetime ends about 35 s later, closing PDGOP and printing kernel lines. Typical export volume is small, but in the worst case two 256 KiB pty-rx files become hex lines on the console. If the export could still be running when the desktop exits, the run should take the not-evaluated outcome, not be retried as a pass. Root may want to bound or measure export duration against that margin."
+  },
+  "not_claimed": ["runtime or desktop verdict", "supervisor freeze", "footer or failed=0 evaluation", "C1-C9"],
+  "scope": "Read-only: frozen decoder and manifest, pinned decoder hashes and signature, observed wrapper text, root tests rerun in place without bytecode. No edits, builds or hardware."
+}

@@ -1,0 +1,1115 @@
+--- a/src/Kernel/Extensions/RavynXHCIPort/RavynXHCIPort.h
++++ b/src/Kernel/Extensions/RavynXHCIPort/RavynXHCIPort.h
+@@ -37,6 +37,8 @@
+ #include <IOKit/pci/IOPCIDevice.h>
+ #include <IOKit/usb/USB.h>
+ #include "XHCI.h"
++#include "sf_usb_lifetime.h"
++class SFUSBDart;
+ 
+ extern void XHCI_Log(const char *fmt, ...);
+ 
+@@ -57,6 +59,7 @@
+     IOService *probe(IOService *provider, SInt32 *score) override;
+     bool start(IOService *provider) override;
+     void stop(IOService *provider) override;
++    IOReturn callPlatformFunction(const OSSymbol *, bool, void *, void *, void *, void *) override;
+     void free() override;
+     IOReturn message(UInt32 type, IOService *provider, void *argument = NULL) override;
+ 
+@@ -148,6 +151,15 @@
+         BulkTD                     td[kBulkMaxTDs];
+     };
+ 
++    struct sf_usb_lifetime fLifetime;
++    uint32_t fWorkers;
++    bool fDmaLive;
++    IOLock *fRemovalLock;
++    SFUSBDart *fAppleDart;
++    IOBufferMemoryDescriptor *allocDMABuffer(task_t task, IOOptionBits options,
++                                            mach_vm_size_t bytes, mach_vm_address_t mask);
++    bool startApple(IOService *provider);
++    bool startWorker(thread_continue_t entry);
+     IOService          * fProvider;
+     IOPCIDevice        * fPCI;
+     // dma below this mask, the a733 dwc3 gets 32-bit buffers
+--- a/src/Kernel/Extensions/RavynXHCIPort/RavynXHCIPort.cpp
++++ b/src/Kernel/Extensions/RavynXHCIPort/RavynXHCIPort.cpp
+@@ -29,12 +29,55 @@
+ #include <IOKit/storage/IOMedia.h>
+ #include <kern/thread.h>
+ #include "RavynXHCIPort.h"
++#include "sf_usb_dart.h"
+ #include "RavynXHCIMassStorageDisk.h"
+ #include "RavynXHCIUSBBus.h"
+ #include <IOKit/usb/IOUSBDevice.h>
+ 
+ #define super IOService
+ OSDefineMetaClassAndStructors(RavynXHCIPort, IOService);
++
++static UInt64 dmaAddress(IOBufferMemoryDescriptor *mem)
++{
++    SFUSBDMABuffer *apple = OSDynamicCast(SFUSBDMABuffer, mem);
++    return apple ? apple->dmaAddress() : mem->getPhysicalAddress();
++}
++
++IOBufferMemoryDescriptor *RavynXHCIPort::allocDMABuffer(task_t task, IOOptionBits options,
++                                                      mach_vm_size_t bytes, mach_vm_address_t mask)
++{
++    if (!fAppleDart) return IOBufferMemoryDescriptor::inTaskWithPhysicalMask(task, options, bytes, mask);
++    UInt64 alignment = mask & (~mask + 1);
++    if (alignment < SF_DART_PAGE) alignment = SF_DART_PAGE;
++    return SFUSBDMABuffer::allocate(fAppleDart, bytes, alignment);
++}
++
++bool RavynXHCIPort::startApple(IOService *provider)
++{
++    if (provider->callPlatformFunction("SFAppleUSBDart", false, &fAppleDart, NULL, NULL, NULL)
++        != kIOReturnSuccess || !fAppleDart) return false;
++    fBARMap = provider->mapDeviceMemoryWithIndex(0, kIOMapInhibitCache);
++    if (!fBARMap || fBARMap->getLength() < 0x10000) return false;
++    volatile UInt32 *core = (volatile UInt32 *)fBARMap->getVirtualAddress();
++    if ((core[0xc120 / 4] & 0xffff0000) != 0x33310000 ||
++        (core[0xc110 / 4] & (3u << 12)) != (1u << 12)) return false;
++    fDMAMask = 0x0000000fffffc000ULL;
++    return true;
++}
++
++bool RavynXHCIPort::startWorker(thread_continue_t entry)
++{
++    retain();
++    __atomic_add_fetch(&fWorkers, 1, __ATOMIC_ACQ_REL);
++    thread_t t = THREAD_NULL;
++    if (kernel_thread_start(entry, this, &t) == KERN_SUCCESS) {
++        thread_deallocate(t);
++        return true;
++    }
++    __atomic_sub_fetch(&fWorkers, 1, __ATOMIC_RELEASE);
++    release();
++    return false;
++}
+ 
+ #define kAssignedAddrKey "assigned-addresses"
+ #define kBulkAborted 0xff   // bulk td cc for a transfer cut short by abort
+@@ -45,9 +88,9 @@
+     do { \
+         if (mem) XHCI_Log("DMA %-18s virt=%p phys=%016llx len=%llu%s", \
+             name, (mem)->getBytesNoCopy(), \
+-            (unsigned long long)(mem)->getPhysicalAddress(), \
++            (unsigned long long)dmaAddress(mem), \
+             (unsigned long long)(mem)->getLength(), \
+-            ((mem)->getPhysicalAddress() > 0xFFFFFFFFULL) ? " above4G" : ""); \
++            (dmaAddress(mem) > 0xFFFFFFFFULL) ? " above4G" : ""); \
+         else XHCI_Log("DMA %-18s <null>", name); \
+     } while (0)
+ 
+@@ -268,7 +311,7 @@
+ RavynXHCIPort::probe(IOService *provider, SInt32 *score)
+ {
+     IOPCIDevice *pci = OSDynamicCast(IOPCIDevice, provider);
+-    if (!pci && !isCompatible(provider, kA733Compatible) && !isCompatible(provider, kDWC3Compatible) &&
++    if (!pci && strcmp(provider->getName(), "pd,apple-dwc3-host") != 0 && !isCompatible(provider, kA733Compatible) && !isCompatible(provider, kDWC3Compatible) &&
+         strcmp(provider->getName(), kTegraXHCIName) != 0)
+         return NULL;
+     if (score) *score += 1000;
+@@ -596,15 +639,19 @@
+ 
+ bool RavynXHCIPort::start(IOService *provider)
+ {
++    sf_usb_lifetime_init(&fLifetime);
++    SFUSBOperation starting(&fLifetime);
++    fRemovalLock = IOLockAlloc();
++    if (!fRemovalLock) return false;
+     fPCI = OSDynamicCast(IOPCIDevice, provider);
+     fProvider = provider;
++    fProvider->retain();
+     fDMAMask = fPCI ? 0xFFFFFFFFFFFFFFFFULL : 0xFFFFFFFFULL;
+     fNonCoherent = (fPCI == NULL);
+     gXHCIUseIOLog = gXHCIUseIOLog || fNonCoherent;
+     if (!fPCI) XHCI_Log("start on %s", provider->getName());
+     if (!super::start(provider)) return false;
+ 
+-    fProvider->retain();
+     if (fPCI) {
+         fPCI->setMemoryEnable(true);
+         fPCI->setBusMasterEnable(true);
+@@ -645,6 +692,8 @@
+         fBARMap = mapUsableBAR(fPCI, kIOPCIConfigBaseAddress0);
+         if (!fBARMap) mapBARFromAssignedAddresses(fPCI, &fBARDesc, &fBARMap);
+         if (!fBARMap) mapBARFromConfig(fPCI, &fBARDesc, &fBARMap);
++    } else if (strcmp(provider->getName(), "pd,apple-dwc3-host") == 0) {
++        if (!startApple(provider)) return false;
+     } else if (isCompatible(provider, kDWC3Compatible)) {
+         if (!startDWC3(provider)) return false;
+     } else if (strcmp(provider->getName(), kTegraXHCIName) == 0) {
+@@ -721,6 +770,8 @@
+ 
+     parseExtendedCapabilities();
+ 
++    fDmaLive = true;
++    fProvider->setProperty("sf-usb-dma-live", true);
+     if (!setupDCBAA() || !setupCommandRing() || !setupEventRing()) {
+         XHCI_Log("ring/DCBAA setup failed");
+         return false;
+@@ -792,19 +843,15 @@
+ 
+     scanPorts();
+ 
+-    registerService();
+-
+     fHotplugRunning = true;
+-    thread_t hpThread = THREAD_NULL;
+-    if (kernel_thread_start((thread_continue_t)&RavynXHCIPort::hotplugThread, this, &hpThread) == KERN_SUCCESS) {
+-        thread_deallocate(hpThread);
+-    } else {
++    if (!startWorker((thread_continue_t)&RavynXHCIPort::hotplugThread)) {
+         XHCI_Log("failed to start hotplug poll thread");
+         fHotplugRunning = false;
+     }
+     // a restart or the watchdog deadline halts the controller so no dma outlives this kernel
+     setProperty("sf-quiesce", true);
+     fRestartNotifier = registerPrioritySleepWakeInterest(&RavynXHCIPort::restartHandler, this, NULL);
++    registerService();
+     return true;
+ }
+ 
+@@ -812,35 +859,72 @@
+ {
+     if (fRestartNotifier) { fRestartNotifier->remove(); fRestartNotifier = NULL; }
+     quiesce("stop");
++    if (fQuiesced) {
++        if (fDCBAA && fEventLock)
++            for (UInt32 slot = 1; slot < 64; ++slot) freeSlotResources(slot);
++        for (UInt32 p = 1; p <= fMaxPorts && p <= 64; ++p) disconnectUSBDevices(p, 0, 0);
++        // Break our ownership cycles; outstanding class clients retain the bus
++        // and port until they have observed offline and finished their calls.
++        OSSafeReleaseNULL(fUSBBus);
++    }
+     super::stop(provider);
+ }
+ 
+ // run/stop off, wait for halted, then a host controller reset, and on the a733 vbus goes off too
++// Closing admission and draining CPU access precede hardware halt. A timeout
++// leaves DMA and its mappings alive; the parent must not reset the PHY then.
+ void RavynXHCIPort::quiesce(const char *why)
+ {
+-    UInt32 sts = 0;
+-
+-    if (fQuiesced) return;
+-    fQuiesced = true;
++    if (!fRemovalLock) return;
++    IOLockLock(fRemovalLock);
++    if (fQuiesced) { IOLockUnlock(fRemovalLock); return; }
++    sf_usb_lifetime_close(&fLifetime);
+     fHotplugRunning = false;
++    fBulkStop = true;
++    if (fInterruptSource) fInterruptSource->disable();
++    if (fEventWaitLock) {
++        IOLockLock(fEventWaitLock);
++        ++fEventGeneration;
++        IOLockWakeup(fEventWaitLock, &fEventWaitChannel, false);
++        IOLockWakeup(fEventWaitLock, &fHotplugWaitChannel, false);
++        IOLockUnlock(fEventWaitLock);
++    }
++    unsigned wait;
++    for (wait = 0; wait < 15000; ++wait) {
++        if (!sf_usb_lifetime_active(&fLifetime) &&
++            !__atomic_load_n(&fWorkers, __ATOMIC_ACQUIRE)) break;
++        IOSleep(1);
++    }
++    if (wait == 15000) {
++        IOLog("RavynXHCIPort: %s drain timed out; retaining controller and DMA\n", why);
++        IOLockUnlock(fRemovalLock);
++        return;
++    }
+     if (fOpRegs) {
+         opWrite32(XHCI_USBCMD, opRead32(XHCI_USBCMD) & ~(XHCI_USBCMD_RS | XHCI_USBCMD_INTE));
+-        for (int i = 0; i < 2000 && !(opRead32(XHCI_USBSTS) & XHCI_USBSTS_HCH); i++) {
+-            IODelay(10);
+-        }
++        for (wait = 0; wait < 2000 && !(opRead32(XHCI_USBSTS) & XHCI_USBSTS_HCH); ++wait) IOSleep(1);
++        if (wait == 2000) { IOLockUnlock(fRemovalLock); return; }
+         opWrite32(XHCI_USBCMD, opRead32(XHCI_USBCMD) | XHCI_USBCMD_HCRST);
+-        for (int i = 0; i < 10000 && (opRead32(XHCI_USBCMD) & XHCI_USBCMD_HCRST); i++) {
+-            IODelay(10);
+-        }
+-        sts = opRead32(XHCI_USBSTS);
+-    }
+-    if (!fPCI && fSoCMaps[2]) {
+-        volatile UInt32 *rpio = (volatile UInt32 *)fSoCMaps[2]->getVirtualAddress();
+-
+-        rpio[4] &= ~(1U << 8);
+-    }
+-    IOLog("RavynXHCIPort: quiesced for %s, USBCMD=%08x USBSTS=%08x\n", why,
+-          fOpRegs ? opRead32(XHCI_USBCMD) : 0, sts);
++        for (wait = 0; wait < 2000 && ((opRead32(XHCI_USBCMD) & XHCI_USBCMD_HCRST) ||
++             (opRead32(XHCI_USBSTS) & XHCI_USBSTS_CNR)); ++wait) IOSleep(1);
++        if (wait == 2000) { IOLockUnlock(fRemovalLock); return; }
++    }
++    fDmaLive = false;
++    if (fProvider) fProvider->setProperty("sf-usb-dma-live", false);
++    fQuiesced = true;
++    setProperty("sf-dma-drained", true);
++    IOLockUnlock(fRemovalLock);
++    IOLog("RavynXHCIPort: drained and reset for %s\n", why);
++}
++
++IOReturn RavynXHCIPort::callPlatformFunction(const OSSymbol *name, bool wait,
++                                            void *a, void *b, void *c, void *d)
++{
++    if (name && name->isEqualTo("SFAppleUSBDrain")) {
++        quiesce("cable removal");
++        return fQuiesced ? kIOReturnSuccess : kIOReturnBusy;
++    }
++    return super::callPlatformFunction(name, wait, a, b, c, d);
+ }
+ 
+ IOReturn RavynXHCIPort::restartHandler(void *target, void *, UInt32 messageType,
+@@ -862,6 +946,22 @@
+ 
+ void RavynXHCIPort::free()
+ {
++    if (fDmaLive && !fQuiesced) {
++        IOLog("RavynXHCIPort: refusing to free live DMA after failed start/stop\n");
++        return;
++    }
++    if (fDCBAA && fEventLock)
++        for (UInt32 slot = 1; slot < 64; ++slot) freeSlotResources(slot);
++    OSSafeReleaseNULL(fDCBAAMem);
++    OSSafeReleaseNULL(fCmdRingMem);
++    OSSafeReleaseNULL(fEventRingMem);
++    OSSafeReleaseNULL(fERSTMem);
++    OSSafeReleaseNULL(fScratchpadArrayMem);
++    if (fScratchpadBufMem) {
++        for (UInt32 i = 0; i < fScratchpadCount; ++i) OSSafeReleaseNULL(fScratchpadBufMem[i]);
++        IOFree(fScratchpadBufMem, fScratchpadCount * sizeof(*fScratchpadBufMem));
++    }
++    if (fRemovalLock) { IOLockFree(fRemovalLock); fRemovalLock = NULL; }
+     fBulkStop = true;
+     for (int i = 0; i < 16; i++) {
+         if (fDiskNubs[i]) { fDiskNubs[i]->release(); fDiskNubs[i] = NULL; }
+@@ -1016,7 +1116,7 @@
+ bool RavynXHCIPort::setupDCBAA()
+ {
+     UInt64 mask = fDMAMask;
+-    fDCBAAMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
++    fDCBAAMem = allocDMABuffer(
+         kernel_task, kIOMemoryPhysicallyContiguous | kIODirectionInOut,
+         (fMaxSlots + 1) * sizeof(UInt64), mask);
+     if (!fDCBAAMem) return false;
+@@ -1024,9 +1124,9 @@
+     bzero((void *)fDCBAA, (fMaxSlots + 1) * sizeof(UInt64));
+     dmaFlush(fDCBAA, (fMaxSlots + 1) * sizeof(UInt64));
+     XHCI_DMA_LOG("DCBAA", fDCBAAMem);
+-    opWrite64(XHCI_DCBAAP, fDCBAAMem->getPhysicalAddress());
++    opWrite64(XHCI_DCBAAP, dmaAddress(fDCBAAMem));
+     XHCI_Log("DCBAAP programmed=%016llx readback=%016llx",
+-            (unsigned long long)fDCBAAMem->getPhysicalAddress(),
++            (unsigned long long)dmaAddress(fDCBAAMem),
+             (unsigned long long)opRead64(XHCI_DCBAAP));
+ 
+     // real silicon needs scratchpad pages: with a nonzero HCSPARAMS2 count, DCBAA[0] must point at their
+@@ -1043,7 +1143,7 @@
+         if (!fScratchpadBufMem) return false;
+         bzero(fScratchpadBufMem, maxScratchpadBufs * sizeof(IOBufferMemoryDescriptor *));
+         fScratchpadCount = maxScratchpadBufs;
+-        fScratchpadArrayMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
++        fScratchpadArrayMem = allocDMABuffer(
+             kernel_task, kIOMemoryPhysicallyContiguous | kIODirectionInOut,
+             maxScratchpadBufs * sizeof(UInt64), mask);
+         if (!fScratchpadArrayMem) return false;
+@@ -1052,12 +1152,12 @@
+         bzero((void *)scratchArray, maxScratchpadBufs * sizeof(UInt64));
+ 
+         for (UInt32 i = 0; i < maxScratchpadBufs; i++) {
+-            IOBufferMemoryDescriptor *buf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
++            IOBufferMemoryDescriptor *buf = allocDMABuffer(
+                 kernel_task, kIOMemoryPhysicallyContiguous | kIODirectionInOut, 0x1000, mask);
+             if (!buf) return false;
+             bzero((void *)buf->getBytesNoCopy(), 0x1000);
+             dmaFlush(buf->getBytesNoCopy(), 0x1000);
+-            scratchArray[i] = buf->getPhysicalAddress();
++            scratchArray[i] = dmaAddress(buf);
+             fScratchpadBufMem[i] = buf;
+             if (i < 4 || i + 1 == maxScratchpadBufs) {
+                 XHCI_Log("scratch[%u]=%016llx%s", i,
+@@ -1065,7 +1165,7 @@
+                         (scratchArray[i] > 0xFFFFFFFFULL) ? " above4G" : "");
+             }
+         }
+-        fDCBAA[0] = fScratchpadArrayMem->getPhysicalAddress();
++        fDCBAA[0] = dmaAddress(fScratchpadArrayMem);
+         dmaFlush(scratchArray, maxScratchpadBufs * sizeof(UInt64));
+         dmaFlush(fDCBAA, sizeof(UInt64));
+         XHCI_Log("DCBAA[0] scratch array=%016llx",
+@@ -1077,7 +1177,7 @@
+ bool RavynXHCIPort::allocRing(IOBufferMemoryDescriptor **outMem, volatile XHCITRB **outVirt, UInt32 trbCount)
+ {
+     UInt64 mask = fDMAMask;
+-    IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
++    IOBufferMemoryDescriptor *mem = allocDMABuffer(
+         kernel_task, kIOMemoryPhysicallyContiguous | kIODirectionInOut,
+         trbCount * sizeof(XHCITRB), mask);
+     if (!mem) return false;
+@@ -1097,7 +1197,7 @@
+     fCmdRingCycle = 1;
+ 
+     // link the last TRB back to TRB 0, toggle cycle
+-    UInt64 base = fCmdRingMem->getPhysicalAddress();
++    UInt64 base = dmaAddress(fCmdRingMem);
+     fCmdRing[kRingTRBs - 1].param = base;
+     fCmdRing[kRingTRBs - 1].status = 0;
+     fCmdRing[kRingTRBs - 1].control = TRB_SET_TYPE(TRB_TYPE_LINK) | TRB_TC | TRB_CYCLE; dmaFlush(&fCmdRing[kRingTRBs - 1], sizeof(XHCITRB));
+@@ -1119,12 +1219,12 @@
+     fEventRingCycle = 1;
+ 
+     UInt64 mask = fDMAMask;
+-    fERSTMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
++    fERSTMem = allocDMABuffer(
+         kernel_task, kIOMemoryPhysicallyContiguous | kIODirectionInOut, 16, mask);
+     if (!fERSTMem) return false;
+     XHCI_DMA_LOG("ERST", fERSTMem);
+     volatile UInt32 *erst = (volatile UInt32 *)fERSTMem->getBytesNoCopy();
+-    UInt64 ringBase = fEventRingMem->getPhysicalAddress();
++    UInt64 ringBase = dmaAddress(fEventRingMem);
+     erst[0] = (UInt32)(ringBase & 0xFFFFFFFFU);
+     erst[1] = (UInt32)(ringBase >> 32);
+     erst[2] = kRingTRBs;
+@@ -1133,7 +1233,7 @@
+ 
+     rtWrite32(XHCI_RT_IR0 + XHCI_IR_ERSTSZ, 1);
+     rtWrite64(XHCI_RT_IR0 + XHCI_IR_ERDP, ringBase);
+-    rtWrite64(XHCI_RT_IR0 + XHCI_IR_ERSTBA, fERSTMem->getPhysicalAddress());
++    rtWrite64(XHCI_RT_IR0 + XHCI_IR_ERSTBA, dmaAddress(fERSTMem));
+     XHCI_Log("ERST entry base=%016llx size=%u ERSTBA=%016llx ERDP=%016llx",
+             (unsigned long long)ringBase, kRingTRBs,
+             (unsigned long long)rtRead64(XHCI_RT_IR0 + XHCI_IR_ERSTBA),
+@@ -1176,6 +1276,8 @@
+ 
+ void RavynXHCIPort::interruptOccurred(IOInterruptEventSource *sender, int count)
+ {
++    SFUSBOperation operation(&fLifetime);
++    if (!operation) return;
+     // USBSTS.EINT then IMAN.IP are write-1-to-clear (xhci 1.1 5.4.2). a level-triggered line stays
+     // asserted until IP is clear
+     opWrite32(XHCI_USBSTS, XHCI_USBSTS_EINT);
+@@ -1213,6 +1315,8 @@
+ 
+ void RavynXHCIPort::serviceEventRing(bool fromInterrupt)
+ {
++    SFUSBOperation operation(&fLifetime);
++    if (!operation) return;
+     // sole event ring consumer: files each completion into the per-(slot,DCI) table or the command
+     // slot, so concurrent waiters never discard each other's events
+     bool portChange = false, filed = false;
+@@ -1278,7 +1382,7 @@
+         fEventRingDequeue++;
+         if (fEventRingDequeue == kRingTRBs) { fEventRingDequeue = 0; fEventRingCycle ^= 1; }
+         // write ERDP.EHB as 1 to acknowledge, real hardware posts no new events until it's cleared
+-        UInt64 newErdp = fEventRingMem->getPhysicalAddress() + fEventRingDequeue * sizeof(XHCITRB);
++        UInt64 newErdp = dmaAddress(fEventRingMem) + fEventRingDequeue * sizeof(XHCITRB);
+         rtWrite64(XHCI_RT_IR0 + XHCI_IR_ERDP, (newErdp & ~0xFULL) | XHCI_ERDP_EHB);
+     }
+     if (fromInterrupt) fIntrEvents += consumed;
+@@ -1286,7 +1390,7 @@
+     // a poll can drain the event an interrupt was raised for before the controller sets EHB, and
+     // with EHB left set the interrupter never fires again, so an empty pass clears it too
+     if (!consumed && (rtRead32(XHCI_RT_IR0 + XHCI_IR_ERDP) & XHCI_ERDP_EHB)) {
+-        UInt64 erdp = fEventRingMem->getPhysicalAddress() + fEventRingDequeue * sizeof(XHCITRB);
++        UInt64 erdp = dmaAddress(fEventRingMem) + fEventRingDequeue * sizeof(XHCITRB);
+         rtWrite64(XHCI_RT_IR0 + XHCI_IR_ERDP, (erdp & ~0xFULL) | XHCI_ERDP_EHB);
+     }
+     IOLockUnlock(fEventLock);
+@@ -1338,11 +1442,13 @@
+ bool RavynXHCIPort::doCommand(UInt64 param, UInt32 status, UInt32 controlNoCycle,
+                               UInt8 *outCC, UInt32 *outSlotId, UInt64 timeoutMs)
+ {
++    SFUSBOperation operation(&fLifetime);
++    if (!operation) return false;
+     IOLockLock(fCmdLock);
+ 
+     // the TRB address lets us match the completion to this command. a late completion for an earlier
+     // timed-out command was misattributed to the next one on real hardware
+-    UInt64 cmdTRBPhys = fCmdRingMem->getPhysicalAddress() + (UInt64)fCmdRingEnqueue * sizeof(XHCITRB);
++    UInt64 cmdTRBPhys = dmaAddress(fCmdRingMem) + (UInt64)fCmdRingEnqueue * sizeof(XHCITRB);
+ 
+     fCmdDonePending = false;
+     dmaFlushContexts();
+@@ -1353,6 +1459,7 @@
+     uint64_t deadline;
+     clock_interval_to_deadline((UInt32)timeoutMs, kMillisecondScale, &deadline);
+     for (;;) {
++        if (sf_usb_lifetime_closed(&fLifetime)) break;
+         UInt32 generation = eventGeneration();
+         serviceEventRing();
+         if (fCmdDonePending && fCmdDoneParam == cmdTRBPhys) {
+@@ -1366,7 +1473,7 @@
+         sleepForEvent(generation, deadline);
+     }
+     // a command that never completes holds the ring, every later one queues behind it (xhci 1.2 4.6.1.2)
+-    if (!ok)
++    if (!ok && !sf_usb_lifetime_closed(&fLifetime))
+         abortCommandRing((unsigned)TRB_TYPE(controlNoCycle));
+     dmaFlushContexts();
+     IOLockUnlock(fCmdLock);
+@@ -1425,6 +1532,7 @@
+     nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &reringInterval);
+     rering = mach_absolute_time() + reringInterval;
+     for (;;) {
++        if (sf_usb_lifetime_closed(&fLifetime)) return false;
+         UInt32 generation = eventGeneration();
+         serviceEventRing();
+         IOLockLock(fEventLock);
+@@ -1514,12 +1622,16 @@
+ {
+     RavynXHCIPort *self = (RavynXHCIPort *)arg;
+     self->hotplugLoop();
++    __atomic_sub_fetch(&self->fWorkers, 1, __ATOMIC_RELEASE);
++    self->release();
+     thread_terminate(current_thread());
+ }
+ 
+ void RavynXHCIPort::hotplugLoop()
+ {
+     while (fHotplugRunning) {
++        SFUSBOperation operation(&fLifetime);
++        if (!operation) break;
+         for (UInt32 p = 0; p < fMaxPorts && p < 64; p++) {
+             UInt32 portsc = portRead32(p, XHCI_PORTSC);
+             bool connected = (portsc & XHCI_PORTSC_CCS) != 0;
+@@ -1850,10 +1962,10 @@
+     fSlotRootPort[slotId] = (UInt8)port0based;
+     fSlotRoute[slotId] = routeString;
+ 
+-    sr.deviceCtxMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
++    sr.deviceCtxMem = allocDMABuffer(
+         kernel_task, kIOMemoryPhysicallyContiguous | kIODirectionInOut,
+         deviceCtxBytes(), mask);
+-    sr.inputCtxMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
++    sr.inputCtxMem = allocDMABuffer(
+         kernel_task, kIOMemoryPhysicallyContiguous | kIODirectionInOut,
+         inputCtxBytes(), mask);
+     if (!sr.deviceCtxMem || !sr.inputCtxMem) return false;
+@@ -1867,12 +1979,12 @@
+     sr.ep0Enqueue = 0;
+     sr.ep0Cycle = 1;
+     {
+-        UInt64 base = sr.ep0RingMem->getPhysicalAddress();
++        UInt64 base = dmaAddress(sr.ep0RingMem);
+         sr.ep0Ring[kRingTRBs - 1].param = base;
+         sr.ep0Ring[kRingTRBs - 1].control = TRB_SET_TYPE(TRB_TYPE_LINK) | TRB_TC | TRB_CYCLE; dmaFlush(&sr.ep0Ring[kRingTRBs - 1], sizeof(XHCITRB));
+     }
+ 
+-    fDCBAA[slotId] = sr.deviceCtxMem->getPhysicalAddress();
++    fDCBAA[slotId] = dmaAddress(sr.deviceCtxMem);
+     XHCI_Log("DCBAA[%u]=%016llx DCBAAP=%016llx",
+             slotId,
+             (unsigned long long)fDCBAA[slotId],
+@@ -1920,14 +2032,14 @@
+     inputEp(ic, 1)->dword0 = 0;
+     inputEp(ic, 1)->dword1 = EP_CTX_CERR(3) | (EP_TYPE_CONTROL << EP_CTX_TYPE_SHIFT) |
+                        ((UInt32)maxPkt << EP_CTX_MAXPKT_SHIFT);
+-    inputEp(ic, 1)->trDequeuePtr = sr.ep0RingMem->getPhysicalAddress() | 1 /* DCS */;
++    inputEp(ic, 1)->trDequeuePtr = dmaAddress(sr.ep0RingMem) | 1 /* DCS */;
+     inputEp(ic, 1)->avgTrbLen_maxEsitLo = 8;
+ 
+     UInt8 cc = 0;
+     UInt32 slotOut = 0;
+     UInt32 control = TRB_SET_TYPE(TRB_TYPE_ADDRESS_DEVICE) | TRB_SET_SLOT(slotId);
+     if (bsr) control |= TRB_ADDR_DEV_BSR;
+-    bool ok = doCommand(sr.inputCtxMem->getPhysicalAddress(), 0, control, &cc, &slotOut, 1000);
++    bool ok = doCommand(dmaAddress(sr.inputCtxMem), 0, control, &cc, &slotOut, 1000);
+     if (!ok || cc != TRB_CC_SUCCESS) {
+         XHCI_Log("Address Device (bsr=%d) failed slot=%u port=%u route=%x cc=%u",
+                 bsr, slotId, port0based, routeString, cc);
+@@ -1939,6 +2051,8 @@
+ bool RavynXHCIPort::controlTransfer(UInt32 slotId, const USBSetupPacket &setup,
+                                     void *buf, UInt16 len, bool in, UInt32 *done)
+ {
++    SFUSBOperation operation(&fLifetime);
++    if (!operation) return false;
+     if (done) *done = 0;
+     if (!slotId || slotId >= 64 || (len && !buf)) return false;
+     SlotResources &sr = fSlots[slotId];
+@@ -1955,7 +2069,7 @@
+     IOLockUnlock(fEventLock);
+ 
+     // setup stage: the 8-byte setup packet goes directly in TRB.param (IDT)
+-    UInt64 ep0Base = sr.ep0RingMem->getPhysicalAddress();
++    UInt64 ep0Base = dmaAddress(sr.ep0RingMem);
+     UInt64 setupTRBPhys = ep0Base + (UInt64)sr.ep0Enqueue * sizeof(XHCITRB);
+     UInt64 setupParam;
+     bcopy(&setup, &setupParam, sizeof(setupParam));
+@@ -1967,7 +2081,7 @@
+     UInt64 dataTRBPhys = 0;
+     if (len > 0) {
+         UInt64 mask = fDMAMask;
+-        xferMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
++        xferMem = allocDMABuffer(
+             kernel_task, kIOMemoryPhysicallyContiguous | kIODirectionInOut, len, mask);
+         if (!xferMem) return false;
+         if (!in) bcopy(buf, xferMem->getBytesNoCopy(), len);
+@@ -1976,7 +2090,7 @@
+ 
+         dataTRBPhys = ep0Base + (UInt64)sr.ep0Enqueue * sizeof(XHCITRB);
+         pushTRB(sr.ep0Ring, sr.ep0Enqueue, sr.ep0Cycle, kRingTRBs,
+-               xferMem->getPhysicalAddress(), len,
++               dmaAddress(xferMem), len,
+                TRB_SET_TYPE(TRB_TYPE_DATA_STAGE) | (in ? TRB_DIR_IN | TRB_ISP : 0));
+     }
+ 
+@@ -2009,7 +2123,7 @@
+         // a stalled control request halts ep0 in the xhc until it is reset
+         UInt8 cc1 = 0, cc2 = 0;
+ 
+-        resetHaltedRing(slotId, 1, sr.ep0RingMem->getPhysicalAddress() + (UInt64)sr.ep0Enqueue * sizeof(XHCITRB),
++        resetHaltedRing(slotId, 1, dmaAddress(sr.ep0RingMem) + (UInt64)sr.ep0Enqueue * sizeof(XHCITRB),
+                         sr.ep0Cycle, &cc1, &cc2);
+         XHCI_Log("slot %u ep0 stalled request %u, ring reset cc=%u/%u", slotId, setup.bRequest, cc1, cc2);
+         return false;
+@@ -2057,27 +2171,27 @@
+ 
+     if (!allocRing(&sr.bulkInRingMem, &sr.bulkInRing, kRingTRBs)) return false;
+     sr.bulkInEnqueue = 0; sr.bulkInCycle = 1;
+-    sr.bulkInRing[kRingTRBs - 1].param = sr.bulkInRingMem->getPhysicalAddress();
++    sr.bulkInRing[kRingTRBs - 1].param = dmaAddress(sr.bulkInRingMem);
+     sr.bulkInRing[kRingTRBs - 1].control = TRB_SET_TYPE(TRB_TYPE_LINK) | TRB_TC | TRB_CYCLE; dmaFlush(&sr.bulkInRing[kRingTRBs - 1], sizeof(XHCITRB));
+ 
+     if (!allocRing(&sr.bulkOutRingMem, &sr.bulkOutRing, kRingTRBs)) return false;
+     sr.bulkOutEnqueue = 0; sr.bulkOutCycle = 1;
+-    sr.bulkOutRing[kRingTRBs - 1].param = sr.bulkOutRingMem->getPhysicalAddress();
++    sr.bulkOutRing[kRingTRBs - 1].param = dmaAddress(sr.bulkOutRingMem);
+     sr.bulkOutRing[kRingTRBs - 1].control = TRB_SET_TYPE(TRB_TYPE_LINK) | TRB_TC | TRB_CYCLE; dmaFlush(&sr.bulkOutRing[kRingTRBs - 1], sizeof(XHCITRB));
+ 
+     inputEp(ic, inDCI)->dword1 = EP_CTX_CERR(3) | (EP_TYPE_BULK_IN << EP_CTX_TYPE_SHIFT) |
+                                ((UInt32)inMaxPkt << EP_CTX_MAXPKT_SHIFT);
+-    inputEp(ic, inDCI)->trDequeuePtr = sr.bulkInRingMem->getPhysicalAddress() | 1;
++    inputEp(ic, inDCI)->trDequeuePtr = dmaAddress(sr.bulkInRingMem) | 1;
+     inputEp(ic, inDCI)->avgTrbLen_maxEsitLo = inMaxPkt;
+ 
+     inputEp(ic, outDCI)->dword1 = EP_CTX_CERR(3) | (EP_TYPE_BULK_OUT << EP_CTX_TYPE_SHIFT) |
+                                 ((UInt32)outMaxPkt << EP_CTX_MAXPKT_SHIFT);
+-    inputEp(ic, outDCI)->trDequeuePtr = sr.bulkOutRingMem->getPhysicalAddress() | 1;
++    inputEp(ic, outDCI)->trDequeuePtr = dmaAddress(sr.bulkOutRingMem) | 1;
+     inputEp(ic, outDCI)->avgTrbLen_maxEsitLo = outMaxPkt;
+ 
+     UInt8 cc = 0;
+     UInt32 slotOut = 0;
+-    bool ok = doCommand(sr.inputCtxMem->getPhysicalAddress(), 0,
++    bool ok = doCommand(dmaAddress(sr.inputCtxMem), 0,
+                         TRB_SET_TYPE(TRB_TYPE_CONFIGURE_EP) | TRB_SET_SLOT(slotId),
+                         &cc, &slotOut, 1000);
+     if (!ok || cc != TRB_CC_SUCCESS) {
+@@ -2090,6 +2204,8 @@
+ bool RavynXHCIPort::configureInterruptInEndpoint(UInt32 slotId, UInt8 epNum,
+                                                  UInt16 maxPkt, UInt8 interval)
+ {
++    SFUSBOperation operation(&fLifetime);
++    if (!operation) return false;
+     if (!slotId || slotId >= 64 || !epNum || epNum >= 16)
+         return false;
+     SlotResources &sr = fSlots[slotId];
+@@ -2119,7 +2235,7 @@
+         return false;
+     }
+     if (!intr.reportMem) {
+-        intr.reportMem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
++        intr.reportMem = allocDMABuffer(
+             kernel_task, kIOMemoryPhysicallyContiguous | kIODirectionInOut,
+             reportLen < 8 ? 8 : reportLen, fDMAMask);
+     }
+@@ -2130,7 +2246,7 @@
+     intr.enqueue = 0;
+     intr.cycle = 1;
+     bzero((void *)intr.ring, kRingTRBs * sizeof(XHCITRB));
+-    intr.ring[kRingTRBs - 1].param = intr.ringMem->getPhysicalAddress();
++    intr.ring[kRingTRBs - 1].param = dmaAddress(intr.ringMem);
+     intr.ring[kRingTRBs - 1].control = TRB_SET_TYPE(TRB_TYPE_LINK) | TRB_TC | TRB_CYCLE;
+     dmaFlush(intr.ring, kRingTRBs * sizeof(XHCITRB));
+ 
+@@ -2148,11 +2264,11 @@
+     inputEp(ic, dci)->dword0 = (UInt32)xhciInterval << 16;
+     inputEp(ic, dci)->dword1 = EP_CTX_CERR(3) | (EP_TYPE_INTERRUPT_IN << EP_CTX_TYPE_SHIFT) |
+                              ((transactions - 1) << 8) | ((UInt32)packet << EP_CTX_MAXPKT_SHIFT);
+-    inputEp(ic, dci)->trDequeuePtr = intr.ringMem->getPhysicalAddress() | 1;
++    inputEp(ic, dci)->trDequeuePtr = dmaAddress(intr.ringMem) | 1;
+     inputEp(ic, dci)->avgTrbLen_maxEsitLo = (reportLen << 16) | reportLen;
+     UInt8 cc = 0;
+     UInt32 slotOut = 0;
+-    bool ok = doCommand(sr.inputCtxMem->getPhysicalAddress(), 0,
++    bool ok = doCommand(dmaAddress(sr.inputCtxMem), 0,
+         TRB_SET_TYPE(TRB_TYPE_CONFIGURE_EP) | TRB_SET_SLOT(slotId), &cc, &slotOut, 1000);
+     if (!ok || cc != TRB_CC_SUCCESS) {
+         XHCI_Log("Configure interrupt EP failed slot=%u ep=%u cc=%u", slotId, epNum, cc);
+@@ -2164,7 +2280,7 @@
+     intr.intrEp = epNum;
+     intr.intrMaxPkt = (UInt16)reportLen;
+     intr.reportVirt = (volatile UInt8 *)intr.reportMem->getBytesNoCopy();
+-    intr.reportPhys = intr.reportMem->getPhysicalAddress();
++    intr.reportPhys = dmaAddress(intr.reportMem);
+     intr.tdOutstanding = false;
+     intr.loggedPollArm = false;
+     intr.loggedFirstCompletion = false;
+@@ -2175,7 +2291,7 @@
+     intr.valid = true;
+     XHCI_Log("intr-in: configured slot=%u ep=%u packet=%u interval=%u->%u ring=%016llx",
+         slotId, epNum, packet, interval, xhciInterval,
+-        (unsigned long long)intr.ringMem->getPhysicalAddress());
++        (unsigned long long)dmaAddress(intr.ringMem));
+     IOLockUnlock(intr.lock);
+     return true;
+ }
+@@ -2184,6 +2300,8 @@
+                                           IOMemoryDescriptor *buffer,
+                                           UInt32 len, UInt32 timeoutMs, UInt32 *done)
+ {
++    SFUSBOperation operation(&fLifetime);
++    if (!operation) return kIOReturnOffline;
+     if (done) *done = 0;
+     if (!slotId || slotId >= 64 || !epNum || epNum >= 16 || !buffer || !len || len > buffer->getLength())
+         return kIOReturnBadArgument;
+@@ -2227,7 +2345,7 @@
+         // a transaction error halts only the xhc side of the endpoint, so retry
+         // after a soft reset, a stall report would send the device CLEAR_FEATURE, which it can refuse
+         UInt8 cc1 = 0, cc2 = 0;
+-        UInt64 deq = intr.ringMem->getPhysicalAddress() + (UInt64)intr.enqueue * sizeof(XHCITRB);
++        UInt64 deq = dmaAddress(intr.ringMem) + (UInt64)intr.enqueue * sizeof(XHCITRB);
+ 
+         resetHaltedRing(slotId, dci, deq, intr.cycle, &cc1, &cc2);
+         IOLockLock(fEventLock);
+@@ -2255,6 +2373,8 @@
+ 
+ IOReturn RavynXHCIPort::abortInterruptEndpoint(UInt32 slotId, UInt8 epNum, bool reset)
+ {
++    SFUSBOperation operation(&fLifetime);
++    if (!operation) return kIOReturnOffline;
+     if (!slotId || slotId >= 64 || !epNum || epNum >= 16)
+         return kIOReturnBadArgument;
+     InterruptInEndpoint &intr = fIntrIn[slotId][epNum];
+@@ -2269,7 +2389,7 @@
+     bool stopped = doCommand(0, 0, TRB_SET_TYPE(reset ? TRB_TYPE_RESET_EP : TRB_TYPE_STOP_EP) | TRB_SET_SLOT(slotId) |
+         TRB_SET_EP(dci), &cc, &slotOut, 1000) && cc == TRB_CC_SUCCESS;
+     if (stopped) {
+-        UInt64 next = intr.ringMem->getPhysicalAddress() + intr.enqueue * sizeof(XHCITRB);
++        UInt64 next = dmaAddress(intr.ringMem) + intr.enqueue * sizeof(XHCITRB);
+         stopped = doCommand(next | intr.cycle, 0,
+             TRB_SET_TYPE(TRB_TYPE_SET_TR_DEQUEUE) | TRB_SET_SLOT(slotId) | TRB_SET_EP(dci),
+             &cc, &slotOut, 1000) && cc == TRB_CC_SUCCESS;
+@@ -2295,7 +2415,7 @@
+                                  IOBufferMemoryDescriptor *xferMem, UInt32 len, UInt32 timeoutMs,
+                                  UInt32 *outActual, UInt8 *outCC)
+ {
+-    XferSeg seg = { xferMem->getPhysicalAddress(), len };
++    XferSeg seg = { dmaAddress(xferMem), len };
+     bool leaked = false;
+     bool ok = bulkTransferSegs(slotId, epNum, in, &seg, 1, xferMem, len, timeoutMs, outActual, outCC, &leaked);
+     // the controller may still write it, so the buffer is leaked and never reused, botBufferDone drops it from its cache
+@@ -2323,7 +2443,7 @@
+     UInt32 &enqueue = in ? sr.bulkInEnqueue : sr.bulkOutEnqueue;
+     UInt8 &cycle = in ? sr.bulkInCycle : sr.bulkOutCycle;
+     UInt32 dci = in ? (epNum * 2 + 1) : (epNum * 2);
+-    UInt64 ringBase = (in ? sr.bulkInRingMem : sr.bulkOutRingMem)->getPhysicalAddress();
++    UInt64 ringBase = dmaAddress(in ? sr.bulkInRingMem : sr.bulkOutRingMem);
+ 
+     // the endpoint's max packet size, as the controller holds it, for the TD Size field
+     void *dc = sr.deviceCtxMem->getBytesNoCopy();
+@@ -2475,7 +2595,7 @@
+ {
+     SlotResources &sr = fSlots[slotId];
+     UInt32 dci = in ? (epNum * 2 + 1) : (epNum * 2);
+-    UInt64 deq = (in ? sr.bulkInRingMem : sr.bulkOutRingMem)->getPhysicalAddress() +
++    UInt64 deq = dmaAddress(in ? sr.bulkInRingMem : sr.bulkOutRingMem) +
+                  (UInt64)(in ? sr.bulkInEnqueue : sr.bulkOutEnqueue) * sizeof(XHCITRB);
+     UInt8 cycle = in ? sr.bulkInCycle : sr.bulkOutCycle;
+     UInt8 cc1 = 0, cc2 = 0;
+@@ -2539,7 +2659,7 @@
+     if (intrEp != 0 && intrEp < 16 && allocRing(&sr.bulkInRingMem, &sr.bulkInRing, kRingTRBs)) {
+         sr.bulkInEnqueue = 0;
+         sr.bulkInCycle = 1;
+-        sr.bulkInRing[kRingTRBs - 1].param = sr.bulkInRingMem->getPhysicalAddress();
++        sr.bulkInRing[kRingTRBs - 1].param = dmaAddress(sr.bulkInRingMem);
+         sr.bulkInRing[kRingTRBs - 1].control = TRB_SET_TYPE(TRB_TYPE_LINK) | TRB_TC | TRB_CYCLE; dmaFlush(&sr.bulkInRing[kRingTRBs - 1], sizeof(XHCITRB));
+ 
+         UInt32 intrDCI = intrEp * 2 + 1;
+@@ -2549,7 +2669,7 @@
+         inputEp(ic, intrDCI)->dword0 = (UInt32)sfUSBInterruptInterval(speed, intrInterval) << 16;
+         inputEp(ic, intrDCI)->dword1 = EP_CTX_CERR(3) | (EP_TYPE_INTERRUPT_IN << EP_CTX_TYPE_SHIFT) |
+                                      ((UInt32)maxPkt << EP_CTX_MAXPKT_SHIFT);
+-        inputEp(ic, intrDCI)->trDequeuePtr = sr.bulkInRingMem->getPhysicalAddress() | 1;
++        inputEp(ic, intrDCI)->trDequeuePtr = dmaAddress(sr.bulkInRingMem) | 1;
+         inputEp(ic, intrDCI)->avgTrbLen_maxEsitLo = ((UInt32)maxPkt << 16) | maxPkt;
+ 
+         UInt32 maxDCI = (inputSlot(ic)->dword0 >> SLOT_CTX_ENTRIES_SHIFT) & 0x1F;
+@@ -2561,7 +2681,7 @@
+ 
+     UInt8 cc = 0;
+     UInt32 slotOut = 0;
+-    bool ok = doCommand(sr.inputCtxMem->getPhysicalAddress(), 0,
++    bool ok = doCommand(dmaAddress(sr.inputCtxMem), 0,
+                         TRB_SET_TYPE(TRB_TYPE_CONFIGURE_EP) | TRB_SET_SLOT(slotId),
+                         &cc, &slotOut, 1000);
+     if (!ok || cc != TRB_CC_SUCCESS) {
+@@ -2942,7 +3062,7 @@
+     inputEp(ic, 1)->dword1 = EP_CTX_CERR(3) | (EP_TYPE_CONTROL << EP_CTX_TYPE_SHIFT) |
+                              ((UInt32)maxPkt << EP_CTX_MAXPKT_SHIFT);
+     UInt8 cc = 0;
+-    bool ok = doCommand(sr.inputCtxMem->getPhysicalAddress(), 0,
++    bool ok = doCommand(dmaAddress(sr.inputCtxMem), 0,
+                         TRB_SET_TYPE(TRB_TYPE_EVALUATE_CONTEXT) | TRB_SET_SLOT(slotId),
+                         &cc, NULL, 1000);
+     XHCI_Log("slot %u: evaluate ep0 mps=%u cc=%u", slotId, maxPkt, cc);
+@@ -2983,6 +3103,8 @@
+                                     IOMemoryDescriptor *buffer, UInt64 bufOff,
+                                     bool allowShort)
+ {
++    SFUSBOperation operation(&fLifetime);
++    if (!operation) return kIOReturnOffline;
+     if (!fMSCLock) return kIOReturnNoMemory;
+     IOLockLock(fMSCLock);
+     uint64_t start = mach_absolute_time();
+@@ -2997,6 +3119,8 @@
+ 
+ void RavynXHCIPort::logBOTState(const char *why)
+ {
++    SFUSBOperation operation(&fLifetime);
++    if (!operation) return;
+     IOLockLock(fMSCLock);
+     UInt64 cmds = fBOTCommands, bytes = fBOTBytes;
+     uint64_t ns = 0;
+@@ -3015,11 +3139,11 @@
+ {
+     if (cache && len <= cacheLen) {
+         if (!*cache)
+-            *cache = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
++            *cache = allocDMABuffer(
+                 kernel_task, kIOMemoryPhysicallyContiguous | kIODirectionInOut, cacheLen, fDMAMask);
+         if (*cache) return *cache;
+     }
+-    return IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
++    return allocDMABuffer(
+         kernel_task, kIOMemoryPhysicallyContiguous | kIODirectionInOut, len, fDMAMask);
+ }
+ 
+@@ -3238,13 +3362,13 @@
+     *inputEp(ic, outDCI) = *deviceEp(dc, outDCI);
+     inputEp(ic, inDCI)->dword0 &= ~0x7U;
+     inputEp(ic, outDCI)->dword0 &= ~0x7U;
+-    inputEp(ic, inDCI)->trDequeuePtr = (sr.bulkInRingMem->getPhysicalAddress() +
++    inputEp(ic, inDCI)->trDequeuePtr = (dmaAddress(sr.bulkInRingMem) +
+         (UInt64)sr.bulkInEnqueue * sizeof(XHCITRB)) | sr.bulkInCycle;
+-    inputEp(ic, outDCI)->trDequeuePtr = (sr.bulkOutRingMem->getPhysicalAddress() +
++    inputEp(ic, outDCI)->trDequeuePtr = (dmaAddress(sr.bulkOutRingMem) +
+         (UInt64)sr.bulkOutEnqueue * sizeof(XHCITRB)) | sr.bulkOutCycle;
+     UInt8 cc = 0;
+     UInt32 slotOut = 0;
+-    doCommand(sr.inputCtxMem->getPhysicalAddress(), 0,
++    doCommand(dmaAddress(sr.inputCtxMem), 0,
+               TRB_SET_TYPE(TRB_TYPE_CONFIGURE_EP) | TRB_SET_SLOT(slotId), &cc, &slotOut, 1000);
+ 
+     // and the device side of both endpoints
+@@ -3313,7 +3437,7 @@
+     bzero((void *)sr.ep0Ring, kRingTRBs * sizeof(XHCITRB));
+     sr.ep0Enqueue = 0;
+     sr.ep0Cycle = 1;
+-    sr.ep0Ring[kRingTRBs - 1].param = sr.ep0RingMem->getPhysicalAddress();
++    sr.ep0Ring[kRingTRBs - 1].param = dmaAddress(sr.ep0RingMem);
+     sr.ep0Ring[kRingTRBs - 1].control = TRB_SET_TYPE(TRB_TYPE_LINK) | TRB_TC | TRB_CYCLE;
+     dmaFlush(sr.ep0Ring, kRingTRBs * sizeof(XHCITRB));
+ 
+@@ -3342,6 +3466,8 @@
+ 
+ bool RavynXHCIPort::openBulkEndpoint(UInt32 slotId, UInt8 epNum, bool in, UInt16 maxPkt)
+ {
++    SFUSBOperation operation(&fLifetime);
++    if (!operation) return false;
+     if (!slotId || slotId >= 64 || !epNum || epNum >= 16)
+         return false;
+     SlotResources &sr = fSlots[slotId];
+@@ -3363,7 +3489,7 @@
+     be->dci = dci;
+     be->maxPkt = maxPkt & 0x7ff;
+     be->cycle = 1;
+-    be->ring[kRingTRBs - 1].param = be->ringMem->getPhysicalAddress();
++    be->ring[kRingTRBs - 1].param = dmaAddress(be->ringMem);
+     be->ring[kRingTRBs - 1].control = TRB_SET_TYPE(TRB_TYPE_LINK) | TRB_TC | TRB_CYCLE;
+     dmaFlush(&be->ring[kRingTRBs - 1], sizeof(XHCITRB));
+ 
+@@ -3378,12 +3504,12 @@
+     inputEp(ic, dci)->dword1 = EP_CTX_CERR(3) |
+         ((in ? EP_TYPE_BULK_IN : EP_TYPE_BULK_OUT) << EP_CTX_TYPE_SHIFT) |
+         ((UInt32)be->maxPkt << EP_CTX_MAXPKT_SHIFT);
+-    inputEp(ic, dci)->trDequeuePtr = be->ringMem->getPhysicalAddress() | 1;
++    inputEp(ic, dci)->trDequeuePtr = dmaAddress(be->ringMem) | 1;
+     inputEp(ic, dci)->avgTrbLen_maxEsitLo = 1024;
+ 
+     UInt8 cc = 0;
+     UInt32 slotOut = 0;
+-    bool ok = doCommand(sr.inputCtxMem->getPhysicalAddress(), 0,
++    bool ok = doCommand(dmaAddress(sr.inputCtxMem), 0,
+         TRB_SET_TYPE(TRB_TYPE_CONFIGURE_EP) | TRB_SET_SLOT(slotId), &cc, &slotOut, 1000);
+     if (!ok || cc != TRB_CC_SUCCESS) {
+         XHCI_Log("bulk: configure slot=%u ep=%u in=%d failed cc=%u", slotId, epNum, in, cc);
+@@ -3397,13 +3523,8 @@
+     IOLockUnlock(fEventLock);
+     XHCI_Log("bulk: slot=%u ep=%u in=%d maxPkt=%u ready", slotId, epNum, in, be->maxPkt);
+ 
+-    if (!fBulkThreadStarted) {
+-        thread_t t;
+-        fBulkThreadStarted = true;
+-        if (kernel_thread_start((thread_continue_t)&RavynXHCIPort::bulkThread, this, &t) == KERN_SUCCESS)
+-            thread_deallocate(t);
+-        else
+-            fBulkThreadStarted = false;
++    if (!__atomic_exchange_n(&fBulkThreadStarted, true, __ATOMIC_ACQ_REL)) {
++        fBulkThreadStarted = startWorker((thread_continue_t)&RavynXHCIPort::bulkThread);
+     }
+     return true;
+ }
+@@ -3411,6 +3532,8 @@
+ IOReturn RavynXHCIPort::submitBulk(UInt32 slotId, UInt8 epNum, bool in, IOMemoryDescriptor *buffer,
+                                    UInt32 len, IOUSBCompletion *completion)
+ {
++    SFUSBOperation operation(&fLifetime);
++    if (!operation) return kIOReturnOffline;
+     if (!slotId || slotId >= 64 || !epNum || epNum >= 16 || !buffer || !completion)
+         return kIOReturnBadArgument;
+     if (!len || len > kBulkMaxTRB || len > buffer->getLength())
+@@ -3418,7 +3541,7 @@
+     UInt32 dci = epNum * 2 + (in ? 1 : 0);
+ 
+     // 64KB aligned so the single trb below never crosses a 64KB boundary
+-    IOBufferMemoryDescriptor *bounce = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
++    IOBufferMemoryDescriptor *bounce = allocDMABuffer(
+         kernel_task, kIOMemoryPhysicallyContiguous | kIODirectionInOut, len, fDMAMask & ~0xFFFFULL);
+     if (!bounce) return kIOReturnNoMemory;
+     if (!in && buffer->readBytes(0, bounce->getBytesNoCopy(), len) != len) {
+@@ -3443,8 +3566,8 @@
+     td.done = false;
+     td.cc = 0;
+     td.residual = 0;
+-    td.trbPhys = be->ringMem->getPhysicalAddress() + (UInt64)be->enqueue * sizeof(XHCITRB);
+-    pushTRB(be->ring, be->enqueue, be->cycle, kRingTRBs, bounce->getPhysicalAddress(), len,
++    td.trbPhys = dmaAddress(be->ringMem) + (UInt64)be->enqueue * sizeof(XHCITRB);
++    pushTRB(be->ring, be->enqueue, be->cycle, kRingTRBs, dmaAddress(bounce), len,
+             TRB_SET_TYPE(TRB_TYPE_NORMAL) | TRB_IOC | (in ? TRB_ISP : 0));
+     be->count++;
+     IOLockUnlock(fEventLock);
+@@ -3544,6 +3667,8 @@
+ 
+ IOReturn RavynXHCIPort::abortBulk(UInt32 slotId, UInt8 epNum, bool in, bool reset)
+ {
++    SFUSBOperation operation(&fLifetime);
++    if (!operation) return kIOReturnOffline;
+     if (!slotId || slotId >= 64 || !epNum || epNum >= 16)
+         return kIOReturnBadArgument;
+     UInt32 dci = epNum * 2 + (in ? 1 : 0);
+@@ -3561,7 +3686,7 @@
+     serviceEventRing();
+ 
+     IOLockLock(fEventLock);
+-    UInt64 next = be->ringMem->getPhysicalAddress() + (UInt64)be->enqueue * sizeof(XHCITRB);
++    UInt64 next = dmaAddress(be->ringMem) + (UInt64)be->enqueue * sizeof(XHCITRB);
+     UInt8 cycle = be->cycle;
+     for (UInt32 i = 0; i < be->count; i++) {
+         if (be->isoch) {
+@@ -3591,6 +3716,8 @@
+ IOReturn RavynXHCIPort::bulkSync(UInt32 slotId, UInt8 epNum, bool in, IOMemoryDescriptor *buffer,
+                                  UInt32 len, UInt32 timeoutMs, UInt32 *done)
+ {
++    SFUSBOperation operation(&fLifetime);
++    if (!operation) return kIOReturnOffline;
+     volatile UInt32 result[3] = { 0, 0, 0 };
+     IOUSBCompletion c = { NULL, &sfBulkSyncDone, (void *)result };
+     if (done) *done = 0;
+@@ -3621,6 +3748,8 @@
+ 
+ UInt32 RavynXHCIPort::microframeIndex()
+ {
++    SFUSBOperation operation(&fLifetime);
++    if (!operation) return 0;
+     return rtRead32(XHCI_RT_MFINDEX) & 0x3fff;
+ }
+ 
+@@ -3628,6 +3757,8 @@
+ // in 125 us steps, a full-speed bInterval counts frames of eight of those
+ bool RavynXHCIPort::openIsochEndpoint(UInt32 slotId, UInt8 epNum, bool in, UInt16 maxPkt, UInt8 bInterval, UInt8 usbSpeed)
+ {
++    SFUSBOperation operation(&fLifetime);
++    if (!operation) return false;
+     if (!slotId || slotId >= 64 || !epNum || epNum >= 16)
+         return false;
+     SlotResources &sr = fSlots[slotId];
+@@ -3667,7 +3798,7 @@
+     be->dci = dci;
+     be->maxPkt = size;
+     be->cycle = 1;
+-    be->ring[kRingTRBs - 1].param = be->ringMem->getPhysicalAddress();
++    be->ring[kRingTRBs - 1].param = dmaAddress(be->ringMem);
+     be->ring[kRingTRBs - 1].control = TRB_SET_TYPE(TRB_TYPE_LINK) | TRB_TC | TRB_CYCLE;
+     dmaFlush(&be->ring[kRingTRBs - 1], sizeof(XHCITRB));
+ 
+@@ -3688,12 +3819,12 @@
+     inputEp(ic, dci)->dword0 = (interval << 16) | (mult << 8);
+     inputEp(ic, dci)->dword1 = ((in ? EP_TYPE_ISOCH_IN : EP_TYPE_ISOCH_OUT) << EP_CTX_TYPE_SHIFT) |
+         (size << EP_CTX_MAXPKT_SHIFT);
+-    inputEp(ic, dci)->trDequeuePtr = be->ringMem->getPhysicalAddress() | 1;
++    inputEp(ic, dci)->trDequeuePtr = dmaAddress(be->ringMem) | 1;
+     inputEp(ic, dci)->avgTrbLen_maxEsitLo = (esit << 16) | esit;
+ 
+     UInt8 cc = 0;
+     UInt32 slotOut = 0;
+-    bool ok = doCommand(sr.inputCtxMem->getPhysicalAddress(), 0,
++    bool ok = doCommand(dmaAddress(sr.inputCtxMem), 0,
+         TRB_SET_TYPE(TRB_TYPE_CONFIGURE_EP) | TRB_SET_SLOT(slotId), &cc, &slotOut, 1000);
+     if (!ok || cc != TRB_CC_SUCCESS) {
+         XHCI_Log("isoch: configure slot=%u ep=%u in=%d failed cc=%u", slotId, epNum, in, cc);
+@@ -3707,13 +3838,8 @@
+     IOLockUnlock(fEventLock);
+     XHCI_Log("isoch: slot=%u ep=%u in=%d maxPkt=%u mult=%u interval=%u ready", slotId, epNum, in, size, mult, interval);
+ 
+-    if (!fBulkThreadStarted) {
+-        thread_t t;
+-        fBulkThreadStarted = true;
+-        if (kernel_thread_start((thread_continue_t)&RavynXHCIPort::bulkThread, this, &t) == KERN_SUCCESS)
+-            thread_deallocate(t);
+-        else
+-            fBulkThreadStarted = false;
++    if (!__atomic_exchange_n(&fBulkThreadStarted, true, __ATOMIC_ACQ_REL)) {
++        fBulkThreadStarted = startWorker((thread_continue_t)&RavynXHCIPort::bulkThread);
+     }
+     return true;
+ }
+@@ -3723,6 +3849,8 @@
+ IOReturn RavynXHCIPort::submitIsoch(UInt32 slotId, UInt8 epNum, bool in, IOMemoryDescriptor *buffer, UInt32 numFrames,
+                                     IOUSBIsocFrame *frames, IOUSBCompletion *completion)
+ {
++    SFUSBOperation operation(&fLifetime);
++    if (!operation) return kIOReturnOffline;
+     if (!slotId || slotId >= 64 || !epNum || epNum >= 16 || !buffer || !frames || !completion)
+         return kIOReturnBadArgument;
+     if (!numFrames || numFrames > kIsocMaxFrames)
+@@ -3733,7 +3861,7 @@
+     if (!len || len > kBulkMaxTRB || len > buffer->getLength())
+         return kIOReturnBadArgument;
+ 
+-    IOBufferMemoryDescriptor *bounce = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
++    IOBufferMemoryDescriptor *bounce = allocDMABuffer(
+         kernel_task, kIOMemoryPhysicallyContiguous | kIODirectionInOut, len, fDMAMask & ~0xFFFFULL);
+     if (!bounce) return kIOReturnNoMemory;
+     if (!in && buffer->readBytes(0, bounce->getBytesNoCopy(), len) != len) {
+@@ -3763,12 +3891,12 @@
+     td.framesDone = 0;
+     td.len = len;
+     td.done = td.aborted = false;
+-    UInt64 phys = bounce->getPhysicalAddress();
++    UInt64 phys = dmaAddress(bounce);
+     for (UInt32 f = 0; f < numFrames; f++) {
+         UInt32 n = frames[f].frReqCount;
+         frames[f].frActCount = 0;
+         frames[f].frStatus = kIOReturnNotReady;
+-        td.trbPhys[f] = be->ringMem->getPhysicalAddress() + (UInt64)be->enqueue * sizeof(XHCITRB);
++        td.trbPhys[f] = dmaAddress(be->ringMem) + (UInt64)be->enqueue * sizeof(XHCITRB);
+         pushTRB(be->ring, be->enqueue, be->cycle, kRingTRBs, phys, n,
+                 TRB_SET_TYPE(TRB_TYPE_ISOCH) | TRB_IOC | TRB_SIA | (in ? TRB_ISP : 0));
+         phys += n;
+@@ -3819,6 +3947,8 @@
+ {
+     RavynXHCIPort *self = (RavynXHCIPort *)arg;
+     while (!self->fBulkStop) {
++        SFUSBOperation operation(&self->fLifetime);
++        if (!operation) break;
+         // an event filed while this thread delivered would wake nobody, so it only sleeps on an unchanged generation
+         UInt32 generation = self->eventGeneration();
+         self->serviceEventRing();
+@@ -3831,5 +3961,7 @@
+             IOLockSleepDeadline(self->fEventWaitLock, &self->fEventWaitChannel, deadline, THREAD_UNINT);
+         IOLockUnlock(self->fEventWaitLock);
+     }
++    __atomic_sub_fetch(&self->fWorkers, 1, __ATOMIC_RELEASE);
++    self->release();
+     thread_terminate(current_thread());
+ }
+--- a/src/Kernel/Extensions/RavynXHCIPort/CMakeLists.txt
++++ b/src/Kernel/Extensions/RavynXHCIPort/CMakeLists.txt
+@@ -22,3 +22,6 @@
+     -Wno-unused-variable -Wno-unused-function -Wno-cast-qual)
+ set_property(TARGET RavynXHCIPort.kext PROPERTY CXX_STANDARD 14)
+ install(TARGETS RavynXHCIPort.kext DESTINATION System/Library/Extensions COMPONENT BaseSystem)
++
++# Apple DMA backend retains its GPL-2.0 notices in source and NOTICE.
++target_sources(RavynXHCIPort.kext PRIVATE sf_usb_dart.cpp sf_dart_table.c sf_soc.cpp)
+--- a/src/Kernel/Extensions/RavynXHCIPort/Info.plist
++++ b/src/Kernel/Extensions/RavynXHCIPort/Info.plist
+@@ -7,7 +7,7 @@
+     <key>CFBundleExecutable</key>
+     <string>RavynXHCIPort</string>
+     <key>CFBundleGetInfoString</key>
+-    <string>1.0.0, Copyright (C) 2026 ravynOS Project. All rights reserved.</string>
++    <string>1.0.0, ravynOS MIT; Apple DMA backend GPL-2.0, Copyright (C) 2021 The Asahi Linux Contributors; ARM Limited 2013, 2014, 2015; Samsung Electronics 2011, 2016. See NOTICE.</string>
+     <key>CFBundleIdentifier</key>
+     <string>com.ravynos.driver.RavynXHCIPort</string>
+     <key>CFBundleInfoDictionaryVersion</key>
+@@ -24,6 +24,14 @@
+     <string>1.0.0</string>
+     <key>IOKitPersonalities</key>
+     <dict>
++        <key>Apple prepared DWC3</key>
++        <dict>
++            <key>CFBundleIdentifier</key><string>com.ravynos.driver.RavynXHCIPort</string>
++            <key>IOClass</key><string>RavynXHCIPort</string>
++            <key>IONameMatch</key><string>pd,apple-dwc3-host</string>
++            <key>IOProviderClass</key><string>IOPlatformDevice</string>
++            <key>IOProbeScore</key><integer>5000</integer>
++        </dict>
+         <key>A733 DWC3</key>
+         <dict>
+             <key>CFBundleIdentifier</key>
+--- a/src/Kernel/Extensions/RavynXHCIPort/RavynXHCIUSBBus.h
++++ b/src/Kernel/Extensions/RavynXHCIPort/RavynXHCIUSBBus.h
+@@ -15,6 +15,7 @@
+ 
+ public:
+     bool initWithPort(RavynXHCIPort *port);
++    void free() override;
+ 
+     virtual IOReturn UIMOpenPipe(USBDeviceAddress address, UInt8 speed, Endpoint *endpoint) APPLE_KEXT_OVERRIDE;
+     virtual IOReturn UIMClosePipe(USBDeviceAddress address, Endpoint *endpoint) APPLE_KEXT_OVERRIDE;
+--- a/src/Kernel/Extensions/RavynXHCIPort/RavynXHCIUSBBus.cpp
++++ b/src/Kernel/Extensions/RavynXHCIPort/RavynXHCIUSBBus.cpp
+@@ -11,6 +11,7 @@
+ {
+     if (!init(NULL)) return false;
+     fPort = port;
++    fPort->retain();
+     return true;
+ }
+ 
+@@ -198,3 +199,9 @@
+         *(IOByteCount *)completion->parameter = done;
+     return ret;
+ }
++
++void RavynXHCIUSBBus::free()
++{
++    OSSafeReleaseNULL(fPort);
++    IOUSBController::free();
++}
+--- a/src/Kernel/Extensions/RavynXHCIPort/RavynXHCIMassStorageDisk.cpp
++++ b/src/Kernel/Extensions/RavynXHCIPort/RavynXHCIMassStorageDisk.cpp
+@@ -49,6 +49,7 @@
+     if (!parent) return false;
+     if (!init(NULL)) return false;
+     fParent = parent;
++    fParent->retain();
+     fMscIndex = mscIndex;
+     fSlotId = parent->fMSC[mscIndex].slotId;
+     fCapacityBlocks = 0;
+@@ -106,7 +107,7 @@
+ void
+ RavynXHCIMassStorageDisk::free()
+ {
+-    fParent = NULL;
++    OSSafeReleaseNULL(fParent);
+     super::free();
+ }
+ 

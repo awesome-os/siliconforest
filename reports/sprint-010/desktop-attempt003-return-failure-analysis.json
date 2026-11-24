@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_FAILURE_ANALYSIS_NO_HARDWARE",
+  "capture": "runs/m1-desktop-010/attempt-003 (private); root's failure report desktop-hardware-attempt-003.json is not modified",
+  "milestone": "CONSOLE RETURN FAILED (preserved). Not qualified.",
+  "observed": {
+    "console": "Fresh nonce 7e39e3d9... Ordered markers: BEGIN, PAGE_BEGIN, page JSON, PAGE_END rc=0, SERVER_SOCKET, SSD_CONFIGURED before FRAME 1, frames 1..35, CLIENT_DONE callbacks=35 paints=36. Then the IOFB user-client teardown ([FB??-A-UC] clientClose/terminate/finalize/stop, '[FB??-A]::close', UC free), then RETURN_STATUS client=0 compositor=0, the footer, RETURN, uname Darwin/arm64/25.5.0 and END. After '[FB??-A]::close' there is no kPEEnableScreen line and no other console-ownership line.",
+    "pixels": "The post-close framebuffer (sha 815852d0...) is exactly the client's last paint: client at (1,24), all text glyph-exact including the fresh nonce, 'FRAME 35' (paint index 35 of 36), and the full 802x513 Chonkstep chrome. There are zero non-desktop pixels anywhere outside the window (sampled every 2 px). Nothing at all was drawn after close: no clear, no text, no cursor.",
+    "open_side": "At server open: newUserClient waitQuietController, then the release (no log), then open(): 'kPEDisableScreen 1' (route was video, index 1; now serial), 'console disabled', enableController 0x0, displaysOnline (online, so open() records gIOFBConsoleFramebuffer = this).",
+    "power": "The whole console has no '[FB??-A]::setPowerState' line, although IOFramebuffer::setPowerState starts with an unconditional DEBG1 and other DEBG1 lines from the same object print. The framebuffer never received a power-state change; the only setPowerState line is the display wrangler's ('[W]::setPowerState (4)')."
+  },
+  "mechanism_from_source": {
+    "design": "Patched kernel: the server open path releases (kPEReleaseScreen with NULL, so gc_reacquire_text stays FALSE and gc_acquired becomes FALSE) and then disables (route to serial, last_console=1). Text comes back only through an explicit kPEAcquireScreen from IOFramebuffer::close(). PE_initialize_console then restores the route and initialize_screen(kPEAcquireScreen) runs gc_enable(!graphics_now) with gc_acquired FALSE. kPEAcquireScreen deliberately prints nothing, so the log cannot show whether it ran.",
+    "gate": "IOFramebuffer::close() (IOFramebuffer.cpp:10341-10347) issues kPEAcquireScreen only if (this == gIOFBConsoleFramebuffer) && getPowerState() && !(timingInfo.flags & kDisplayModeAcceleratorBackedFlag).",
+    "condition_results": [
+      {"condition": "timingInfo accelerator-backed flag clear", "result": "PASSES (source-proven)", "why": "IOGOPFramebuffer does not override getTimingInfoForDisplayMode; the base returns kIOReturnUnsupported, so timingInfo is zeroed (IOFramebuffer.cpp:10710-10716)."},
+      {"condition": "this == gIOFBConsoleFramebuffer", "result": "PROBABLY PASSES", "why": "open() sets it when updateOnline() is true and it is unset (IOFramebuffer.cpp:9300-9304), and 'displaysOnline' was logged. This is the only framebuffer, and nothing in the log shows suspend or findConsole clearing it."},
+      {"condition": "getPowerState() != 0", "result": "FAILS (source-proven, runtime-corroborated)", "why": "In every PureDarwin tree here (IOFramebuffer.cpp 1bb98e66 in baseline/bringup/firstboot/desktop/ram-probe), neither IOFramebuffer nor IOGOPFramebuffer calls registerPowerDriver. start() only does PMinit/joinPMtree/temporaryPowerClampOn. With no power states, fCurrentPowerState stays kPowerStateZero and IOService::getPowerState() returns 0 (IOServicePM.cpp:3591-3597). The missing '[FB??-A]::setPowerState' line agrees. In Apple's stack the power driver is registered by the framebuffer subclass; the PureDarwin IOGOP subclass never does."}
+    ],
+    "conclusion": "Most likely cause: the stock close() gate requires a power-managed framebuffer, and IOGOPFramebuffer is not power-managed. So kPEAcquireScreen is never issued, the route stays serial, gc_enable stays FALSE, and the last compositor frame remains in the framebuffer. This fits every observation (no pixel change at all, serial output continuing). It is not runtime-proven, because the acquire path has no log."
+  },
+  "explicit_unknowns": [
+    "Whether close() actually skipped kPEAcquireScreen: no log exists on that branch.",
+    "Whether gIOFBConsoleFramebuffer was still this framebuffer at close (strongly expected, but not logged).",
+    "Whether, if the acquire had run, text would have reached the panel memory unchanged. vinfo still describes the boot framebuffer, which is the same physical memory PDGOP used, as the attempt-002/003 pixels show."
+  ],
+  "proposal_inputs_for_astra_source_only": [
+    "Observability first, so the next return run decides it from the log: in PE_initialize_console log 'kPEAcquireScreen %d' (last_console); in IOFramebuffer::close log the three gate values (console==this, getPowerState(), accelerator flag) before the if.",
+    "Narrow fix candidate: let close() treat a framebuffer with no registered power driver as powered for this console return only, e.g. through a PureDarwin-local property set by IOGOPFramebuffer that close() checks next to getPowerState(). The other two conditions stay unchanged.",
+    "Avoid as a quick fix: registering a real power driver in IOGOPFramebuffer. That puts the framebuffer under the display wrangler's idle/dim policy, and IOFramebuffer::setPowerState(0) carries WindowServer and system-sleep handshakes never exercised on this platform. If it is ever done, it needs its own review and run.",
+    "Keep the existing rules: no forced VC acquire while a compositor owns the framebuffer, and console return is qualified only from post-close pixels with the fresh RETURN nonce."
+  ],
+  "page_probe_note": "Recorded as observations only (no verdict): getpagesize/sysconf/host_page_size 16384, vm_page_size 4096 with vm_page_mask 16383 and vm_page_shift 14, vm_kernel_page_* 16384/16383/14. The libSystem vm_page_size global disagrees with its own mask and shift; that is Grok's thread.",
+  "not_claimed": ["console return", "input", "physical panel", "GPU"],
+  "scope": "Read-only. No hardware, builds or fetches; private capture read locally only."
+}

@@ -1,0 +1,103 @@
+--- a/src/Frameworks/IOSurface/IOSurface.c
++++ b/src/Frameworks/IOSurface/IOSurface.c
+@@ -70,6 +70,7 @@
+     // values too large for the shared header stay with this process
+     CFMutableDictionaryRef localValues;
+     int gpuFD;
++    _Atomic int32_t localUseCount;
+ };
+ 
+ static CFTypeID surfaceType;
+@@ -228,22 +229,39 @@
+     pthread_mutex_unlock(&gpuLock);
+     return valid;
+ }
++/* Bound every product before checking mapped DMA-BUF metadata. Padding after
++ * visible planes is allowed: AVD needs coded rows and a private hardware tail. */
++static int validGPULayout(const struct shared_header *h) {
++    if(!h->width||h->width>16384||!h->height||h->height>16384||
++       !h->allocSize||h->allocSize>GPU_MAX_ALLOCATION||
++       h->elementWidth!=1||h->elementHeight!=1)return 0;
++    if(h->pixelFormat==0x42475241)
++        return h->nplanes==0&&h->bytesPerElement==4&&
++          h->bytesPerRow>=h->width*4&&h->bytesPerRow<=1048576&&
++          h->allocSize>=h->bytesPerRow*h->height;
++    if((h->pixelFormat!=0x34323076&&h->pixelFormat!=0x34323066)||
++       h->nplanes!=2||h->bytesPerElement!=1)return 0;
++    const struct shared_plane *y=&h->planes[0],*uv=&h->planes[1];
++    for(unsigned i=0;i<2;i++){
++        const struct shared_plane *p=&h->planes[i];
++        uint64_t w=i?(h->width+1)/2:h->width,ht=i?(h->height+1)/2:h->height;
++        if(p->width!=w||p->height!=ht||p->bytesPerElement!=(i?2:1)||
++           p->elementWidth!=1||p->elementHeight!=1||
++           p->bytesPerRow<w*p->bytesPerElement||p->bytesPerRow>1048576||
++           p->size<p->bytesPerRow*ht||p->offset>h->allocSize||
++           p->size>h->allocSize-p->offset)return 0;
++    }
++    return h->bytesPerRow>0&&h->bytesPerRow<=1048576&&
++      uv->offset>=y->offset+y->size;
++}
+ static int validGPUHeader(const struct shared_header *h,uint64_t size) {
+-    return h->magic==HEADER_MAGIC&&h->version==HEADER_VERSION&&
++    return size>=GPU_HEADER_SIZE&&h->magic==HEADER_MAGIC&&h->version==HEADER_VERSION&&
+         h->reserved==GPU_HEADER_TAG&&h->dataOffset==GPU_HEADER_SIZE&&
+-        h->pixelFormat==0x42475241&&h->nplanes==0&&h->bytesPerElement==4&&
+-        h->elementWidth==1&&h->elementHeight==1&&h->width>0&&h->width<=16384&&
+-        h->height>0&&h->height<=16384&&h->bytesPerRow>=h->width*4&&
+-        h->bytesPerRow<=1048576&&h->allocSize>=h->bytesPerRow*h->height&&
+-        h->allocSize<=GPU_MAX_ALLOCATION&&h->allocSize<=size-GPU_HEADER_SIZE;
++        validGPULayout(h)&&h->allocSize<=size-GPU_HEADER_SIZE;
+ }
+ static int allocateGPU(IOSurfaceRef s,struct shared_header *h) {
+     const char *enabled=getenv("SFFX_IOSURFACE_GPU");
+-    if(!enabled||strcmp(enabled,"1")||h->pixelFormat!=0x42475241||h->nplanes||
+-       h->bytesPerElement!=4||h->elementWidth!=1||h->elementHeight!=1||
+-       !h->width||h->width>16384||!h->height||h->height>16384||
+-       h->bytesPerRow<h->width*4||h->bytesPerRow>1048576||
+-       h->allocSize>GPU_MAX_ALLOCATION||h->allocSize<h->bytesPerRow*h->height)
++    if(!enabled||strcmp(enabled,"1")||!validGPULayout(h))
+         return 0;
+     size_t size=(GPU_HEADER_SIZE+h->allocSize+GPU_HEADER_SIZE-1)&~(size_t)(GPU_HEADER_SIZE-1);
+     int fd=gpuBufferFD(size);
+@@ -286,6 +304,14 @@
+ // surfaces report -1 and retain the original upload/readback path.
+ int IOSurfaceSFGPUCopyFD(IOSurfaceRef s) { return s&&s->gpuFD>=0?dup(s->gpuFD):-1; }
+ size_t IOSurfaceSFGPUGetOffset(IOSurfaceRef s) { return s&&s->gpuFD>=0?s->header->dataOffset:0; }
++/* Absolute DMA-BUF offset; existing GetOffset remains the pixel-storage base. */
++size_t IOSurfaceSFGPUGetPlaneOffset(IOSurfaceRef s,size_t plane) {
++    if(!s||s->gpuFD<0)return 0;
++    if(!s->header->nplanes)return plane?0:s->header->dataOffset;
++    if(plane>=s->header->nplanes)return 0;
++    return s->header->dataOffset+s->header->planes[plane].offset;
++}
++
+ 
+ static void findDaemon(void) {
+     const char *name = getenv("SFFX_IOSURFACE_SERVICE");
+@@ -440,6 +466,10 @@
+         return NULL;
+     h.magic = HEADER_MAGIC, h.version = HEADER_VERSION, h.dataOffset = HEADER_SIZE;
+     h.global = flag(properties, kIOSurfaceIsGlobal);
++    if(getenv("SFFX_IOSURFACE_GPU")&&
++       (h.pixelFormat==0x34323076||h.pixelFormat==0x34323066)&&!validGPULayout(&h))
++        return NULL;
++
+ 
+     if (!(s = newSurface()))
+         return NULL;
+@@ -575,9 +605,12 @@
+ }
+ 
+ // the use count lives in the shared header, so every process sees the others' uses
+-void IOSurfaceIncrementUseCount(IOSurfaceRef s) { if (s) atomic_fetch_add(&s->header->useCount, 1); }
+-void IOSurfaceDecrementUseCount(IOSurfaceRef s) { if (s) atomic_fetch_sub(&s->header->useCount, 1); }
+-int32_t IOSurfaceGetUseCount(IOSurfaceRef s) { return s ? atomic_load(&s->header->useCount) : 0; }
++// Native GetUseCount is per process; IsInUse observes any process. This shared
++// counter is lifetime metadata, never a GPU completion fence. Abnormal exits
++// can quarantine a live count rather than risk decoder reuse before completion.
++void IOSurfaceIncrementUseCount(IOSurfaceRef s) { if (s) {atomic_fetch_add(&s->localUseCount,1);atomic_fetch_add(&s->header->useCount, 1);} }
++void IOSurfaceDecrementUseCount(IOSurfaceRef s) { if (s) {atomic_fetch_sub(&s->header->useCount, 1);atomic_fetch_sub(&s->localUseCount,1);} }
++int32_t IOSurfaceGetUseCount(IOSurfaceRef s) { return s ? atomic_load(&s->localUseCount) : 0; }
+ int IOSurfaceIsInUse(IOSurfaceRef s) { return s && atomic_load(&s->header->useCount) > 0; }
+ 
+ static void valuesLock(IOSurfaceRef s) {

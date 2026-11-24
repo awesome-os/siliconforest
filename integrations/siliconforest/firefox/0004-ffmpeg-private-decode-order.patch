@@ -1,0 +1,67 @@
+--- a/libavcodec/avcodec.h
++++ b/libavcodec/avcodec.h
+@@ -357,6 +357,10 @@
+ /**
+  * Show all frames before the first keyframe
+  */
++/* Private SiliconForest VT bridge: emit completed pictures in decode order.
++ * This opt-in bit is used only by the paired private FFmpeg/VT build. */
++#define AV_CODEC_FLAG2_SF_DECODE_ORDER (1 << 24)
++
+ #define AV_CODEC_FLAG2_SHOW_ALL       (1 << 22)
+ /**
+  * Export motion vectors through frame side data
+--- a/libavcodec/h264_slice.c
++++ b/libavcodec/h264_slice.c
+@@ -1303,6 +1303,15 @@
+     cur->mmco_reset = h->mmco_reset;
+     h->mmco_reset = 0;
+ 
++    /* VT clients reorder by PTS themselves and may submit only one packet
++     * before awaiting its callback. Keep the DPB/reference decoder intact;
++     * bypass only the display-order output queue for this private opt-in. */
++    if ((h->avctx->flags2 & AV_CODEC_FLAG2_SF_DECODE_ORDER) &&
++        !h->avctx->hwaccel) {
++        h->next_output_pic = cur;
++        return 0;
++    }
++
+     if (sps->bitstream_restriction_flag ||
+         h->avctx->strict_std_compliance >= FF_COMPLIANCE_STRICT) {
+         h->avctx->has_b_frames = FFMAX(h->avctx->has_b_frames, sps->num_reorder_frames);
+--- a/libavcodec/hevc/hevcdec.c
++++ b/libavcodec/hevc/hevcdec.c
+@@ -3381,7 +3381,9 @@
+ 
+     s->cur_frame->f->pict_type = 3 - s->sh.slice_type;
+ 
+-    ret = ff_hevc_output_frames(s, s->layers_active_decode, s->layers_active_output,
++    ret = ((s->avctx->flags2 & AV_CODEC_FLAG2_SF_DECODE_ORDER) &&
++           !s->avctx->hwaccel) ? 0 :
++          ff_hevc_output_frames(s, s->layers_active_decode, s->layers_active_output,
+                                 sps->temporal_layer[sps->max_sub_layers - 1].num_reorder_pics,
+                                 sps->temporal_layer[sps->max_sub_layers - 1].max_dec_pic_buffering, 0);
+     if (ret < 0)
+@@ -3523,6 +3525,22 @@
+         }
+     }
+     s->sei.picture_hash.is_md5 = 0;
++
++    /* Queue only after every slice/filter and grain operation has completed.
++     * Clear OUTPUT alone: short/long-term reference flags and buffers survive. */
++    if ((s->avctx->flags2 & AV_CODEC_FLAG2_SF_DECODE_ORDER) &&
++        !s->avctx->hwaccel && (out->flags & HEVC_FRAME_FLAG_OUTPUT)) {
++        if (s->layers_active_output & (1 << (l - s->layers))) {
++            AVFrame *f = out->needs_fg ? out->frame_grain : out->f;
++            if (out->flags & HEVC_FRAME_FLAG_CORRUPT)
++                f->flags |= AV_FRAME_FLAG_CORRUPT;
++            f->pkt_dts = s->pkt_dts;
++            ret = av_container_fifo_write(s->output_fifo, f, AV_CONTAINER_FIFO_FLAG_REF);
++            if (ret < 0)
++                return ret;
++        }
++        ff_hevc_unref_frame(out, HEVC_FRAME_FLAG_OUTPUT);
++    }
+ 
+     av_log(s->avctx, AV_LOG_DEBUG, "Decoded frame with POC %zu/%d.\n",
+            l - s->layers, s->poc);

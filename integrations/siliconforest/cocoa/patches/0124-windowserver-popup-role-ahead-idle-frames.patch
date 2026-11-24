@@ -1,0 +1,169 @@
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -48,6 +48,7 @@
+     int pointsW, pointsH;
+     int busy;
+     int ownerID;           // the window the frame belongs to (0: a frame presenter's)
++    double usedAt;         // when a flush last took it (ms, wall clock): frames unused a while are let go
+ };
+ 
+ #define WS_FRAMES 4
+@@ -86,6 +87,8 @@
+     double x, y, w, h;
+     int state;
+     int configured;
++    // the role was asked for ahead of the first flush (kWSWindowPrepareRole): that flush waits for its configure
++    int rolePrepared;
+     int attached;          // a buffer is on the surface: the compositor has it mapped
+     // a popup (xdg_popup): a menu, a pop-up list or a tool tip, placed against the window it belongs to
+     struct xdg_popup *popup;
+@@ -1146,6 +1149,36 @@
+     return 1;
+ }
+ 
++/* A window keeps at most two frames once the others have gone unused for two seconds: a burst of flushes (a
++ * window settling, a resize, a flood of output) takes a third and a fourth while the compositor still holds
++ * the two before, and each is the whole window (8 MB for Activity Monitor's at 150 %); kept for good they were
++ * most of what an idle application's memory grew by. Asked at each flush, before a frame is picked. */
++static void windowTrimFrames(struct wsWindow *window) {
++    static int keepAll = -1;
++    double now = wsNowMs();
++    int have = 0;
++
++    if (keepAll < 0)
++        keepAll = getenv("SF_WS_KEEP_FRAMES") != NULL;
++    if (keepAll)
++        return;
++    pthread_mutex_lock(&ws.queueLock);
++    for (int i = 0; i < WS_FRAMES; i++)
++        if (window->frames[i].buffer != NULL)
++            have++;
++    for (int i = 0; i < WS_FRAMES && have > 2; i++) {
++        struct wsFrame *frame = &window->frames[i];
++
++        if (frame->buffer != NULL && !frame->busy && now - frame->usedAt > 2000) {
++            if (getenv("SF_WS_TRACE") != NULL)
++                fprintf(stderr, "WindowServer: surface %d: frame %d unused %.0f ms, let go (%zu bytes)\n", window->windowID, i, now - frame->usedAt, frame->size);
++            frameDestroy(frame);
++            have--;
++        }
++    }
++    pthread_mutex_unlock(&ws.queueLock);
++}
++
+ // a frame the compositor has let go of, the one on screen and the one before it (until its release
+ // arrives) are busy, so a third covers the round trip; past that a window's flush is left pending
+ // (framePresentPending) and a frame presenter's waits briefly
+@@ -1177,8 +1210,10 @@
+         if (pthread_cond_timedwait(&ws.queueReady, &ws.queueLock, &deadline) != 0)
+             break;
+     }
+-    if (pick != NULL)
++    if (pick != NULL) {
+         pick->busy = 1;
++        pick->usedAt = wsNowMs();
++    }
+     else if (!wait)
+         window->presentPending = 1;
+     pthread_mutex_unlock(&ws.queueLock);
+@@ -1219,20 +1254,28 @@
+         return;
+     last[slot] = now;
+     char path[512], tmp[540];
+-    snprintf(path, sizeof(path), "%s/window-%d.ppm", dir, window->windowID);
++    // SF_WS_DUMP_ALPHA=1: window-<number>.pam with the alpha too (premultiplied red, green, blue, alpha)
++    static int alpha = -1;
++    if (alpha < 0) alpha = getenv("SF_WS_DUMP_ALPHA") != NULL;
++    int n = alpha ? 4 : 3;
++    snprintf(path, sizeof(path), "%s/window-%d.%s", dir, window->windowID, alpha ? "pam" : "ppm");
+     snprintf(tmp, sizeof(tmp), "%s.part", path);
+     FILE *out = fopen(tmp, "wb");
+     if (out == NULL)
+         return;
+-    fprintf(out, "P6\n%d %d\n255\n", frame->w, frame->h);
++    if (alpha)
++        fprintf(out, "P7\nWIDTH %d\nHEIGHT %d\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n", frame->w, frame->h);
++    else
++        fprintf(out, "P6\n%d %d\n255\n", frame->w, frame->h);
+     const uint32_t *argb = frame->pixels;
+-    unsigned char *row = malloc((size_t)frame->w * 3);
++    unsigned char *row = malloc((size_t)frame->w * n);
+     for (int y = 0; row != NULL && y < frame->h; y++) {
+         for (int x = 0; x < frame->w; x++) {
+             uint32_t p = argb[(size_t)y * frame->w + x];
+-            row[x * 3] = p >> 16; row[x * 3 + 1] = p >> 8; row[x * 3 + 2] = p;
++            row[x * n] = p >> 16; row[x * n + 1] = p >> 8; row[x * n + 2] = p;
++            if (alpha) row[x * n + 3] = p >> 24;
+         }
+-        fwrite(row, 3, (size_t)frame->w, out);
++        fwrite(row, n, (size_t)frame->w, out);
+     }
+     free(row);
+     fclose(out);
+@@ -1262,6 +1305,7 @@
+         return 0;
+     }
+ 
++    windowTrimFrames(window);
+     struct wsFrame *frame = windowFreeFrame(window, window->pixelsW, window->pixelsH);
+     if (frame == NULL) {
+         pthread_mutex_unlock(&ws.pixelsLock);
+@@ -2872,12 +2916,14 @@
+ 
+ static int windowEnsureRole(struct wsWindow *window) {
+     if (window->layerSurface != NULL || window->toplevel != NULL || window->popup != NULL) {
+-        return 1;
++        if (!window->rolePrepared)
++            return 1;
++    } else {
++        windowCreateRole(window, window->title);
++        wl_surface_commit(window->surface);
++        wl_display_flush(ws.display);
+     }
+-
+-    windowCreateRole(window, window->title);
+-    wl_surface_commit(window->surface);
+-    wl_display_flush(ws.display);
++    window->rolePrepared = 0;
+ 
+     pthread_mutex_lock(&ws.queueLock);
+     while (!window->configured && ws.dispatchRunning) {
+@@ -3293,6 +3339,26 @@
+             return KERN_SUCCESS;
+         }
+ 
++        case kWSWindowPrepareRole: {
++            struct wsRPCSimple *msg = (struct wsRPCSimple *)data;
++            struct wsWindow *window = windowForID(msg->val1);
++
++            // only a popup that has none yet (a menu, a list, a tool tip about to be drawn)
++            if (window == NULL || window->layerSurface != NULL || window->toplevel != NULL || window->popup != NULL ||
++                window->level < kWSPopUpMenuLevel || getenv("SF_WS_NO_PREPARE") != NULL)
++                return KERN_SUCCESS;
++            // as -windowCreateRole would make it: a popup where the compositor places popups, else nothing now
++            uint32_t layer;
++
++            if (layerForWindowLevel(window->level, &layer) || !windowCreatePopupRole(window))
++                return KERN_SUCCESS;
++            window->rolePrepared = 1;
++            wl_surface_commit(window->surface);
++            wl_display_flush(ws.display);
++            if (wsTiming()) fprintf(stderr, "WSTIME %.1f role-prepared surface=%d\n", wsNowMs(), window->windowID);
++            return KERN_SUCCESS;
++        }
++
+         case kWSWindowOrder: {
+             struct wsRPCSimple *msg = (struct wsRPCSimple *)data;
+             struct wsWindow *window = windowForID(msg->val1);
+--- a/src/Frameworks/WindowServer/message.h
++++ b/src/Frameworks/WindowServer/message.h
+@@ -46,6 +46,9 @@
+     kWSWindowSetParent = 15,
+     // wsRPCSimple: window, 1 when AppKit's window is opaque (the compositor gets an opaque region)
+     kWSWindowSetOpaque = 16,
++    // wsRPCSimple: window. A popup about to be drawn and shown: its role is asked for now and not waited for,
++    // so that the compositor's configure comes while AppKit draws; the flush after the drawing waits for it
++    kWSWindowPrepareRole = 17,
+     kCGGetLastMouseDelta = 100,
+     kCGGetMouseLocation = 101,
+     /* windowID 0 asks for the active application window. */

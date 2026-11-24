@@ -1,0 +1,47 @@
+--- a/vt-decode-test.c
++++ b/vt-decode-test.c
+@@ -100,7 +100,7 @@
+ int main(int argc, char **argv)
+ {
+     const char *path = NULL;
+-    int software = 0, planar = 0, video = -1;
++    int software = 0, planar = 0, video = -1, require_callback = 0;
+     AVFormatContext *in = NULL;
+     AVPacket *packet = av_packet_alloc();
+     CMVideoFormatDescriptionRef format = NULL;
+@@ -117,6 +117,8 @@
+     for (int i = 1; i < argc; i++) {
+         if (!strcmp(argv[i], "--software"))
+             software = 1;
++        else if (!strcmp(argv[i], "--require-callback"))
++            require_callback = 1;
+         else if (!strcmp(argv[i], "--planar"))
+             planar = 1;
+         else
+@@ -194,6 +196,7 @@
+                 printf("VT_SAMPLE_FAILED\n");
+                 return 1;
+             }
++            uint64_t before = g_frames;
+             t0 = now_us();
+             g_last_us = 0;
+             g_callback_us = 0;
+@@ -206,6 +209,10 @@
+                 printf("VT_DECODE_FAILED sample %" PRIu64 " %d\n", samples, (int)err);
+                 g_errors++;
+             }
++            if (require_callback && g_frames != before + 1) {
++                printf("VT_CALLBACK_FAILURE sample %" PRIu64 " pictures_before %" PRIu64 " after %" PRIu64 "\n", samples, before, g_frames);
++                g_errors++;
++            }
+             samples++;
+             CFRelease(sample);
+             CFRelease(block);
+@@ -222,5 +229,5 @@
+     CFRelease(session);
+     CFRelease(format);
+     avformat_close_input(&in);
+-    return g_errors || g_frames == 0 ? 1 : 0;
+-}
++    return g_errors || g_frames == 0 || g_frames != samples ? 1 : 0;
++}

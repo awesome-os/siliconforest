@@ -1,0 +1,163 @@
+--- a/kernel/SFAppleAVD.cpp
++++ b/kernel/SFAppleAVD.cpp
+@@ -59,6 +59,10 @@
+ extern "C" {
+ vnode_t vfs_rootvnode(void);
+ task_t proc_task(proc_t); /* retained XNU BSD/KPI signature; no SDK header copy */
++/* Exact frozen XNU arm/caches_internal.h ABI. Unlike flush_dcache on this
++ * coherent-I/O build, Force enables Apple's DC MVA operations and executes
++ * DC CIVAC. Collection linking must resolve this real kernel symbol. */
++void CleanPoC_DcacheRegion_Force(vm_offset_t address, size_t length);
+ }
+ 
+ #define LOG(fmt, ...) IOLog("SFAppleAVD: " fmt "\n", ##__VA_ARGS__)
+@@ -251,6 +255,28 @@
+ 	*iova = c->iova;
+ 	*cookie = c;
+ 	return memory->getBytesNoCopy();
++}
++
++extern "C" int
++sf_avd_os_dma_sync(void *cookie, enum sf_avd_dma_phase phase)
++{
++    DmaCookie *c = (DmaCookie *)cookie;
++    if (!c || phase < SF_AVD_DMA_INITIAL || phase > SF_AVD_DMA_PUBLISH_CPU)
++        return -EINVAL;
++    if (!c->kernelMap) return 0; /* legacy private allocations unchanged */
++    if (gDart.poisoned || !c->prepared || !c->md || !c->bytes ||
++        c->bytes > SIZE_MAX - 16383) return -EIO;
++    const size_t length = (c->bytes + 16383) & ~(size_t)16383;
++    const vm_offset_t address = (vm_offset_t)c->kernelMap->getAddress();
++    if (!address || address > (vm_offset_t)-1 - length ||
++        c->md->getLength() < length || c->kernelMap->getLength() < length)
++        return -EIO;
++    /* The retained mapping shares the original device-pager VM object and
++     * cache attributes. It is NOT a new pager over raw physical addresses.
++     * Bound each Force preemption-disabled interval to one 16 KiB page. */
++    for (size_t offset = 0; offset < length; offset += 16384)
++        CleanPoC_DcacheRegion_Force(address + offset, 16384);
++    return 0;
+ }
+ 
+ static void quarantine_dma(DmaCookie *c)
+@@ -664,6 +690,8 @@
+         /* One-time initialization matches the old zeroed capture allocation.
+          * No frame contents are copied by this import operation. */
+         bzero(cpu[i],needed);
++        error=-sf_avd_os_dma_sync(next[i],SF_AVD_DMA_INITIAL);
++        if(error)goto done;
+         error=gDart.mapMemory(next[i]->md,needed,&next[i]->iova);
+         if(error)goto done;
+         iova[i]=next[i]->iova;cookies[i]=next[i];
+@@ -711,6 +739,14 @@
+ 	req->decode_us = sf_avd_os_now_us() - t0;
+ 	if (gDart.check("decode") != 0 && ret == 0)
+ 		ret = -EIO;
++    if (ret && c->imported) {
++        /* Includes failed/ambiguous completion or reset: do not recycle any
++         * backing that a decoder job might still reference. gLock serializes
++         * this with destruction; dma_free retains pins/maps/IOVAs on poison.
++         * Deliberately conservative even for a rejected imported job. */
++        gDart.poisoned = true;
++        set_state("imported decode failed: backing quarantined until reboot");
++    }
+ 	return ret == 0 ? 0 : (ret < 0 ? -ret : EIO);
+ }
+ 
+@@ -755,7 +791,7 @@
+ 		struct sfavd_info *info = (struct sfavd_info *)data;
+ 		bzero(info, sizeof(*info));
+ 		info->abi = SFAVD_ABI_VERSION;
+-		info->caps = sf_avd_device_caps(gDev) | SFAVD_CAP_EXTERNAL_BUFFERS;
++		info->caps = sf_avd_device_caps(gDev) | (gDart.poisoned ? 0 : SFAVD_CAP_EXTERNAL_BUFFERS);
+ 		info->booted = contexts_in_use() != 0;
+ 		info->contexts = contexts_in_use();
+ 		strlcpy(info->firmware, gFirmwareText, sizeof(info->firmware));
+--- a/kernel/sf_avd_core.c
++++ b/kernel/sf_avd_core.c
+@@ -594,6 +594,12 @@
+ 	bool finish = false, stale = false;
+ 	u32 status;
+ 
++	/* Keep mailbox consumption and job attribution in one critical section.
++	 * A completed job's owner may publish the next job on another CPU. If it
++	 * does so between this read and the ownership check, an old completion
++	 * can otherwise finish the new job. Session destruction uses this lock
++	 * too, so current remains valid through the VP submit callback. */
++	spin_lock_irqsave(&avd->job_lock, flags);
+ 	status = readl(avd->mbox + AVD_REG_MBOX1_RETRIEVE);
+ 
+ 	writel(AVD_MBOX1_NOT_EMPTY, avd->mbox + AVD_REG_MBOX_IRQ_CLR);
+@@ -604,10 +610,10 @@
+ 	if (status & 0x10000) { /* dbg */
+ 		dev->stats.unhandled++;
+ 		writel_relaxed(0, avd->mbox + AVD_REG_MBOX_IRQ_ENABLE);
++		spin_unlock_irqrestore(&avd->job_lock, flags);
+ 		return true;
+ 	}
+ 
+-	spin_lock_irqsave(&avd->job_lock, flags);
+ 	s = dev->current;
+ 	if (status & 0x1000) {
+ 		/* pp is done ! we are done */
+@@ -1101,6 +1107,7 @@
+ 	bool finish = false, wait = false;
+ 	u64 seq, t0;
+ 	int ret;
++	void *capture_cookie = NULL;
+ 
+ 	if (status)
+ 		*status = 0;
+@@ -1109,6 +1116,14 @@
+ 	if (!dev->booted)
+ 		return -ENODEV;
+ 
++    if (s->imported) {
++        void *cpu;
++        size_t size;
++        ret = sf_avd_session_buffer(s, dst, &cpu, &size, &capture_cookie);
++        if (ret) return ret;
++        ret = sf_avd_os_dma_sync(capture_cookie, SF_AVD_DMA_BEFORE_DEVICE);
++        if (ret) return ret; /* no job publication or hardware submission */
++    }
+ 	s->submitted = true; /* freezes capture backing even for a HOLD slice */
+ 	/* the source buffer of this run */
+ 	memset(&s->src, 0, sizeof(s->src));
+@@ -1206,7 +1221,20 @@
+ 		if (!(flags_in & SFAVD_DECODE_HOLD)) {
+ 			u64 us = sf_avd_os_now_us() - t0;
+ 
++            /* Hardware completion precedes CPU access to decoded pages.
++             * BEFORE_DEVICE removed dirty CPU lines; userland must not write
++             * until completion. CIVAC here must never publish stale dirt over
++             * new device pixels. HOLD only queues slices, not device output. */
++            if (capture_cookie) {
++                ret = sf_avd_os_dma_sync(capture_cookie, SF_AVD_DMA_AFTER_DEVICE);
++                if (ret) return ret;
++            }
++            const bool grey = s->cap[dst]->grey_chroma_offset != 0;
+ 			grey_chroma(s, s->cap[dst]);
++            if (capture_cookie && grey) {
++                ret = sf_avd_os_dma_sync(capture_cookie, SF_AVD_DMA_PUBLISH_CPU);
++                if (ret) return ret;
++            }
+ 			dev->stats.done++;
+ 			dev->stats.last_decode_us = us;
+ 			dev->stats.total_decode_us += us;
+--- a/kernel/sf_avd_os.h
++++ b/kernel/sf_avd_os.h
+@@ -46,6 +46,14 @@
+  */
+ void *sf_avd_os_dma_alloc(size_t bytes, uint64_t *iova, void **cookie);
+ void  sf_avd_os_dma_free(void *cookie);
++/* Imported WB DATA pages only; the shared BO header is never in this range.
++ * Userland must not CPU-write or GPU-write a capture owned by the decoder.
++ * GPU readers must finish before the capture is reused for a new picture. */
++enum sf_avd_dma_phase {
++    SF_AVD_DMA_INITIAL = 1, SF_AVD_DMA_BEFORE_DEVICE,
++    SF_AVD_DMA_AFTER_DEVICE, SF_AVD_DMA_PUBLISH_CPU
++};
++int sf_avd_os_dma_sync(void *cookie, enum sf_avd_dma_phase phase);
+ 
+ #ifdef __cplusplus
+ }

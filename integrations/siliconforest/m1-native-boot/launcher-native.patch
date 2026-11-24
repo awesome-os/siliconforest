@@ -1,0 +1,255 @@
+diff -ru a/integrations/puredarwin/m1-bringup/host_progress.py b/integrations/puredarwin/m1-bringup/host_progress.py
+--- a/integrations/puredarwin/m1-bringup/host_progress.py	2026-11-12 08:14:45.424314567 -0800
++++ b/integrations/puredarwin/m1-bringup/host_progress.py	2026-11-12 08:14:45.425327529 -0800
+@@ -39,6 +39,12 @@
+ image.require(image.sha(image.bounded_file(HERE/'terminal_input_progress.py')) == TERMINAL_INPUT_SHA,
+               'Terminal-input helper source changed')
+ from terminal_input_progress import TerminalInput
++# Native boot and its console probe (integrations/puredarwin/m1-native-boot): only when
++# native_boot.py and a native_mode.txt naming a mode were placed next to this file.
++try:
++    import native_boot
++except ImportError:
++    native_boot = None
+ 
+ FROZEN = LAB / 'integrations/puredarwin/m1-firstboot/host_console.py'
+ FROZEN_SHA = 'a9f68695c6465bc5a3c1a9df04f67da6a72f99265e899cf3b89ba671ab6d4417'
+@@ -227,7 +233,7 @@
+ 
+ 
+ BOOTARGS = ('-v -s debug=0x14e keepsyms=1 serial=3 serial-device-name=uart0 '
+-            'disable-uart-irq=1 cpus=1 rd=md0 serial_video_mirror=1 pdtextboot=1')
++            'disable-uart-irq=1 cpus=1 rd=md0 serial_video_mirror=0 pdtextboot=0 -noprogress')
+ # Guest processors. One (`cpus=1`, the hypervisor's device tree pruned to the boot CPU,
+ # secondary start refused) unless the extra boot arguments carry `cpus=N` with N > 1: then
+ # all eight /cpus nodes stay in the tree, that argument replaces `cpus=1`, and the pinned
+@@ -256,17 +262,64 @@
+ 
+ 
+ def configure_display_console(hv, backend, carveouts):
+-    # Pinned HV.set_bootargs(-v) uses legacy display=0. This kernel requires
+-    # nonzero to enter PE_create_console's video/mirror branch; 2 means text.
++    # Quiet boot. Pinned HV.set_bootargs(-v) uses legacy display=0, which this kernel
++    # treats as a text console; 1 is its graphics boot: the video console is initialised
++    # on the firmware framebuffer but paints no character and does not clear it. The
++    # console stays on the UART (serial=3, no mirror), -noprogress keeps the kernel's
++    # progress indicator off, and -v stays for launchd's console log.
+     # Retain firmware's actual framebuffer, pixel format, stride and geometry.
+     video = hv.tba.video
+     fields = framebuffer_geometry(video, backend, carveouts)
+-    video.display = 2
+-    return dict(guest_display=2, mode='text', geometry=fields,
+-                serial_video_mirror=True, pdtextboot=True,
++    video.display = 1
++    return dict(guest_display=1, mode='graphics', geometry=fields,
++                serial_video_mirror=False, pdtextboot=False,
++                boot_logo=getattr(backend, 'boot_logo', None),
+                 framebuffer_geometry_preserved=True, physical_panel_observed=False)
+ 
+ 
++def paint_boot_logo(backend, carveouts):
++    """Put boot-logo.gz (next to this file, with boot-logo.json; made by
++    integrations/puredarwin/m1-quiet-boot/boot_logo.py) on the panel: m1n1's own
++    framebuffer console is shut down without restoring its saved logo, then the picture is
++    decompressed on the target straight into the firmware framebuffer and read back.
++    After the shutdown the pinned HV.start()'s fb_improve_logo/fb_shutdown do nothing, so the
++    picture stays until a guest driver changes the display. Without the two files, or with
++    another framebuffer geometry, nothing is painted and the screen is left as it was."""
++    here = Path(__file__).resolve().parent
++    try:
++        meta = json.loads((here / 'boot-logo.json').read_text())
++        payload = (here / 'boot-logo.gz').read_bytes()
++    except OSError:
++        return dict(painted=False, reason='no boot-logo.gz/boot-logo.json in the launcher tree')
++    fields = framebuffer_geometry(backend.ba.video, backend, carveouts)
++    size = fields['stride'] * fields['height']
++    if (fields['width'], fields['height'], fields['stride'], fields['depth'] & 0xff, size) != (
++            meta['width'], meta['height'], meta['stride'], meta['depth'], meta['bytes']):
++        return dict(painted=False, reason='framebuffer geometry differs from the picture', geometry=fields)
++    image.require(0 < len(payload) <= 32 << 20, 'Boot picture payload size')
++    import gzip
++    raw = gzip.decompress(payload)
++    image.require(len(raw) == size and image.sha(raw) == meta['sha256'], 'Boot picture payload is not the recorded picture')
++    backend.p.fb_shutdown(False)
++    began = time.time()
++    # Decompressed into ordinary memory and copied: gzdec straight into the framebuffer took
++    # 2.8 s for a 0.4 MB payload (inflate reads its own output back, and the framebuffer is
++    # not cached memory). tinf checks the gzip CRC-32 of what it wrote.
++    with backend.u.heap.guarded_malloc(len(payload)) as address, backend.u.heap.guarded_malloc(size) as staging:
++        backend.iface.writemem(address, payload)
++        written = backend.p.gzdec(address, len(payload), staging, size)
++        image.require(written == size, 'Boot picture decompressed to an unexpected size')
++        backend.p.memcpy64(fields['base'], staging, size)
++    painted = time.time()
++    # Read back 16 rows spread over the panel instead of all 16 MB (1.9 s over USB).
++    stride, rows = fields['stride'], [fields['height'] * (2 * i + 1) // 32 for i in range(16)]
++    matches = all(backend.iface.readmem(fields['base'] + row * stride, stride) == raw[row * stride:(row + 1) * stride]
++                  for row in rows)
++    return dict(painted=True, sha256=meta['sha256'], readback='16 of %d rows' % fields['height'],
++                readback_matches=matches, painted_at=round(painted, 3),
++                paint_seconds=round(painted - began, 3), readback_seconds=round(time.time() - painted, 3))
++
++
+ def configure_entropy(hv):
+     # ARM64 prng_random.c requests 4*SHA512_DIGEST_LENGTH (256 bytes).
+     # Fresh OS CSPRNG output, never repetition/padding or a weakened XNU check.
+@@ -1326,24 +1379,59 @@
+     bootargs = guest_bootargs(inputs)
+     backend = ContinuingBackend(inputs, directory)
+     console = None
++    native = native_boot.mode() if native_boot is not None else None
++    uart_tap = uart_marker = None
+     try:
+         bq_mark('worker_begin')
+         backend.open(args.device)
+         snapshot, ba, adt, layout = backend.collect(inputs)
++        if native and native.native and getattr(native, 'rechain', False):
++            # Diagnostic: the pinned m1n1 started once more, as the stage image is started,
++            # and the ordinary native boot from its proxy (m1-native-boot/b1/native_stage.py).
++            import native_stage
++            native_stage.rechain(backend, inputs, ba, args.device, directory, old.write_private)
++            snapshot, ba, adt, layout = backend.collect(inputs)
++        if native and native.probe:
++            # The M1's real UART as the controller hears it, for the whole hypervisor boot.
++            uart_marker = 'PDNB-UART-PROBE-' + secrets.token_hex(8)
++            if native.vdm_serial:
++                native_boot.serial_mode()
++            uart_tap = native_boot.UartTap(directory)
++            native_boot.uart_marker(backend, '\r\n' + uart_marker + '\r\n')
+         bq_mark('proxy_collected')
+         old.preflight.observe(snapshot)
+         old.write_private(directory, 'original-bootargs.bin', ba)
+         old.write_private(directory, 'original-adt.bin', adt)
+         carveouts = read_carveouts(backend, directory)
++        backend.boot_logo = paint_boot_logo(backend, carveouts)
++        print('QUIET_BOOT_LOGO ' + json.dumps(backend.boot_logo), flush=True)
++        bq_mark('boot_logo_done')
+         reservation = check_reservation(backend, inputs, layout, carveouts)
+         old.write_private(directory, 'original-observations.json',
+                           dict(snapshot=snapshot, layout=layout, packet=inputs.report,
+                                inventory_sha256=inputs.inventory_sha256, reservation=reservation))
++        if native and native.native and getattr(native, 'stage', False):
++            # One image, one vector (m1-native-boot/b1): the stage m1n1 loads the collection,
++            # rewrites the device tree, builds the boot arguments and enters XNU by itself.
++            import native_stage
++            native_stage.start(native, backend, inputs, native_boot.bootargs(native, bootargs), ba, layout,
++                               directory, args.runtime,
++                               lambda port: ConsoleSession(
++                                   port, directory, desktop=desktop, keyboard=keyboard,
++                                   virtual_input=virtual_input, terminal_input=terminal_input,
++                                   native_keyboard_desktop=native_keyboard_desktop,
++                                   native_trackpad_child=native_trackpad_child),
++                               old.write_private)
++            return
+         hv = backend.new_hv()
+         smp = smp_enabled()
+         if smp:
+             enable_smp(hv)
+-        hv.init()
++        if native and native.native:
++            bootargs = native_boot.bootargs(native, bootargs)
++            native_boot.native_init(hv, backend)
++        else:
++            hv.init()
+         bq_mark('hv_init_done')
+         # hv_init() runs m1n1's pcie_shutdown(), so PCIe is brought up after it:
+         # pcie_init, SMC radio power, port-0 link sequence. XNU inherits the link.
+@@ -1397,6 +1485,17 @@
+                                hardware_boot_observed=False, image_sha256=image.sha(inputs.contents['kernel']),
+                                prepared_image_sha256=image.sha(prepared), prepared_image_bytes=len(prepared)))
+         bq_mark('hv_start')
++        if native and native.native:
++            # No hypervisor and no virtual UART: the console session is the same, on the
++            # M1's real uart0 as the controller's debug port receives it.
++            native_boot.start(native, hv, backend, layout, directory, args.runtime,
++                              lambda port: ConsoleSession(
++                                  port, directory, desktop=desktop, keyboard=keyboard,
++                                  virtual_input=virtual_input, terminal_input=terminal_input,
++                                  native_keyboard_desktop=native_keyboard_desktop,
++                                  native_trackpad_child=native_trackpad_child),
++                              old.write_private)
++            return
+         console = ConsoleSession(args.console_device, directory, desktop=desktop, keyboard=keyboard,
+                                  virtual_input=virtual_input, terminal_input=terminal_input,
+                                  native_keyboard_desktop=native_keyboard_desktop,
+@@ -1408,7 +1507,11 @@
+             if console is not None:
+                 console.close()
+         finally:
+-            backend.close()
++            try:
++                if uart_tap is not None:
++                    uart_tap.stop(uart_marker)
++            finally:
++                backend.close()
+ 
+ 
+ def worker_entry(args):
+diff -ru a/tools/m1_bringup_cycle.py b/tools/m1_bringup_cycle.py
+--- a/tools/m1_bringup_cycle.py	2026-11-12 08:14:45.424041528 -0800
++++ b/tools/m1_bringup_cycle.py	2026-11-12 08:14:45.425054461 -0800
+@@ -105,6 +105,19 @@
+         result.update(status='RECOVERY_INCOMPLETE_NO_RETRY', recovery_error=f'{type(error).__name__}: {error}')
+ 
+ 
++def native_return_requested(ops):
++    """Native boots (integrations/puredarwin/m1-native-boot): XNU runs without m1n1, so no proxy
++    USB device shows that the M1 is ours to reset. The launcher's own record that it vectored
++    into XNU takes that place, and only when this boot's native_mode.txt asks for it
++    (`vdm-return`). The reset itself is the same single `macvdmtool reboot serial`."""
++    try:
++        words = (LAB/'integrations/puredarwin/m1-bringup/native_mode.txt').read_text().split()
++        record = base.read_json(ops.cycle/'guest'/'native-start.json')
++        return 'native' in words and 'vdm-return' in words and record.get('hypervisor') is False
++    except (OSError, ValueError, AttributeError):
++        return False
++
++
+ def worker_timeout(runtime):
+     return 240 if runtime <= 180 else runtime + 60
+ 
+@@ -321,9 +334,32 @@
+                 else:
+                     cdc = ops.discover()
+                     ops.save('recovery-cdc.json', dict(primary_cdc=cdc, linux_probe_failed=True))
+-                    if cdc is not None:
++                    native = cdc is None and native_return_requested(ops)
++                    if native:
++                        # A Linux that is already booting (the M1 reset by itself) is waited
++                        # for, never reset: 45 s is longer than its boot takes.
++                        # (Not recover_linux(): its one neighbour refresh and that record are
++                        # left to the wait after the reset; boot nb04 failed on the second record.)
++                        returned, waited = None, ops.clock()
++                        while returned is None and ops.clock() - waited < 45:
++                            try:
++                                value = ops.observe()
++                            except (ConnectionError, TimeoutError):
++                                value = None
++                            if value is not None:
++                                base.check_linux(value)
++                                if value['boot_id'] != baseline['boot_id']:
++                                    returned = value
++                                    break
++                            ops.sleep(1)
++                        if returned is None:
++                            cdc = ops.discover()
++                        ops.save('native-return.json', dict(linux_returned_by_itself=returned is not None,
++                                                            primary_cdc=cdc))
++                    if returned is None and (cdc is not None or native):
+                         ops.save('reset-intent.json', dict(attempt=1, workers_stopped=True,
+-                                  acquisition_probes_stopped=True, primary_cdc=cdc, args=['reboot', 'serial']))
++                                  acquisition_probes_stopped=True, primary_cdc=cdc, args=['reboot', 'serial'],
++                                  native_without_proxy=native and cdc is None))
+                         result['reset_attempts'] = 1
+                         try:
+                             ops.reset()
+@@ -335,7 +371,8 @@
+                             ops.save('native-reset-error-passive-only.json', dict(
+                                 error=result['native_reset_error'], retry_permitted=False,
+                                 target_state_inferred_from_native_output=False))
+-                    returned = base.recover_linux(ops, baseline['boot_id'])
++                    if returned is None:
++                        returned = base.recover_linux(ops, baseline['boot_id'])
+             ops.save('returned-linux.json', returned)
+             result['linux_verified'] = True
+             ops.clear()

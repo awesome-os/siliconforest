@@ -1,0 +1,81 @@
+--- a/src/Frameworks/AppKit/NSEvent.subproj/NSEvent.m
++++ b/src/Frameworks/AppKit/NSEvent.subproj/NSEvent.m
+@@ -7,6 +7,7 @@
+ 
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+ 
++#include <mach/mach_time.h>
+ #import <AppKit/NSEvent.h>
+ #import <AppKit/NSEvent_mouse.h>
+ #import <AppKit/NSEvent_keyboard.h>
+@@ -111,9 +112,19 @@
+    return [[NSDisplay currentDisplay] currentModifierFlags];
+ }
+ 
++// (TERM9, FX-023) an event's time is seconds since the system started (mach_absolute_time), as on macOS: it was
++// seconds since 2001 (NSDate's reference), 26 years off for anything comparing it with the uptime clock
++// (Firefox's Event.timeStamp, input latency measurements)
+++(NSTimeInterval)_sfTimestampNow {
++   static mach_timebase_info_data_t tb;
++   if(tb.denom==0)
++    mach_timebase_info(&tb);
++   return (double)mach_absolute_time()*tb.numer/tb.denom/1e9;
++}
++
+ -initWithType:(NSEventType)type location:(NSPoint)location modifierFlags:(unsigned)modifierFlags window:(NSWindow *)window {
+    _type=type;
+-   _timestamp=[NSDate timeIntervalSinceReferenceDate];
++   _timestamp=[NSEvent _sfTimestampNow];
+    _locationInWindow=location;
+    _modifierFlags=modifierFlags;
+    _windowNumber=[window windowNumber];
+--- a/src/Frameworks/AppKit/NSWindow.m
++++ b/src/Frameworks/AppKit/NSWindow.m
+@@ -211,6 +211,11 @@
+ 
+ static void sfSendOpaque(NSWindow *self,BOOL value);
+ 
++// (TERM9) NSEvent.m: seconds since the system started, the base of every event's timestamp
++@interface NSEvent(SFTimestamp)
+++(NSTimeInterval)_sfTimestampNow;
++@end
++
+ @implementation NSWindow
+ 
+ +(NSWindowDepth)defaultDepthLimit {
+@@ -3919,7 +3924,7 @@
+       NSEvent *event=[NSEvent enterExitEventWithType:NSMouseExited
+                                             location:mousePoint
+                                        modifierFlags:[NSEvent modifierFlags]
+-                                           timestamp:[NSDate timeIntervalSinceReferenceDate]
++                                           timestamp:[NSEvent _sfTimestampNow]
+                                         windowNumber:[self windowNumber]
+                                              context:[self graphicsContext]
+                                          eventNumber:0 // NSEvent currently ignores this.
+@@ -3936,7 +3941,7 @@
+       NSEvent *event=[NSEvent enterExitEventWithType:NSMouseEntered
+                                             location:mousePoint
+                                        modifierFlags:[NSEvent modifierFlags]
+-                                           timestamp:[NSDate timeIntervalSinceReferenceDate]
++                                           timestamp:[NSEvent _sfTimestampNow]
+                                         windowNumber:[self windowNumber]
+                                              context:[self graphicsContext]
+                                          eventNumber:0 // NSEvent currently ignores this.
+@@ -3953,7 +3958,7 @@
+       NSEvent *event=[NSEvent mouseEventWithType:NSMouseMoved
+                                         location:mousePoint
+                                    modifierFlags:[NSEvent modifierFlags]
+-                                       timestamp:[NSDate timeIntervalSinceReferenceDate]
++                                       timestamp:[NSEvent _sfTimestampNow]
+                                     windowNumber:[self windowNumber]
+                                          context:[self graphicsContext]
+                                      eventNumber:0 // NSEvent currently ignores this.
+@@ -3970,7 +3975,7 @@
+       NSEvent *event=[NSEvent enterExitEventWithType:NSCursorUpdate
+                                             location:mousePoint
+                                        modifierFlags:[NSEvent modifierFlags]
+-                                           timestamp:[NSDate timeIntervalSinceReferenceDate]
++                                           timestamp:[NSEvent _sfTimestampNow]
+                                         windowNumber:[self windowNumber]
+                                              context:[self graphicsContext]
+                                          eventNumber:0 // NSEvent currently ignores this.

@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude (independent read-only source review; I reviewed the original 216de1cd and did not author rev002)",
+  "status": "READ_ONLY_SOURCE_REVIEW_NO_BUILD_NO_TARGET_EXECUTION",
+  "target": "client-terminal-application/revisions/002: source set 44d6cee6b22cc8b55d74e207881c43e7f41009a490b4d9646ac3d7326f6708eb, receipt 0e9f2f631855e808, fd-boundary.patch 65361dea",
+  "base": "Original 216de1cd (receipt a4fd6be6; my review terminal-application-216de1cd-source-review.json, 5017ea2c). That review still applies to every unchanged module.",
+  "verdict": "APPROVED AT SOURCE LEVEL, AND MY DS4 DECISION IS YES WITH A BOUNDED SCOPE. The only production changes are pty.rs and main.rs. After the existing close sweep, the PTY child checks every fd in [0,bound) with real fcntl(F_GETFD), using the parent's exact unchanged _SC_OPEN_MAX bound: fds 0-2 must be present with CLOEXEC clear, the owned exec-status pipe present with CLOEXEC set, and everything else EBADF. Otherwise it writes a failure record and exits without exec. Only then does it send FD_CHECKED(stage 9, exact bound, pipe fd) before READY(stage 10). The parent requires both, in order, matched against its own pre-fork values, then real pipe EOF. A partial or erroneous record at EOF is now sticky. The public CLI and the CHONKTERM/1 protocol are unchanged. Not a runtime pass.",
+  "binding": {
+    "rev002": "Recomputed: all 28 files_sha256 entries match, the set equals 44d6cee6 and the receipt hashes to 0e9f2f63. Against 216, the only changed or new files are the docs/logs/validation files plus src/main.rs and src/pty.rs.",
+    "original_unchanged": "The parent directory's 19 files recompute to 216de1cd, and the 09643f14 binary is not touched.",
+    "patch_replay": "On a scratch copy, applying fd-boundary.patch with --fuzz=0 to the 216 pty.rs and main.rs reproduces both rev002 files byte-for-byte."
+  },
+  "delta_checks": {
+    "child_verification": "verify_child_fds (pty.rs) runs below fork with only fcntl, errno and write. Any mismatch emits stage 7 (the errno, or EINVAL for wrong CLOEXEC, or EBUSY for a live extra fd) and calls _exit(126). It runs after 'for fd in 3..maxfd: close(fd) if fd != pipe', so a close that silently failed is caught by the real query rather than assumed. Nothing is repaired or re-swept. Between the verification and execve the child only writes the two records, so the verified table is the table at execve.",
+    "bound_and_pipe": "The parent refuses before fork unless the write pipe is in [3,maxfd); maxfd keeps the unchanged accepted range 3-1048576, with no clamp. The child sweeps and verifies with exactly that maxfd. FD_CHECKED carries (maxfd, pipe), and the parent compares both with its own fd_bound and child_exec_pipe.",
+    "protocol_parser": "Status.feed accepts FD_CHECKED only when neither FD_CHECKED nor READY has been seen and the values match. It accepts READY only after FD_CHECKED, with pid/pid. Anything else (failure stages 1-7, a stage-6 exec error after READY, duplicates, wrong values) sets failed. Overflow and bytes after EOF now also set failed. end() sets failed unless FD_CHECKED, READY, no prior failure and an empty buffer all hold. exec_ok requires FD_CHECKED, READY, EOF, no failure and an empty buffer.",
+    "closed_216_diagnostic_gap": "In 216, end() returned Err on trailing partial bytes but did not set failed, so exec_ok() could still read true after READY. The session still faulted through setup()?, so no outcome was wrong, but pty_exec_checked in the records could overstate. My 216 review missed this. Rev002 makes it sticky (host test partial_error_after_checked_setup_cannot_become_exec_success_at_eof).",
+    "records": "child-ready.json, the session audit and result.json gain exec_boundary/child_exec_boundary with separate fields: pre_exec_fd_check_observed, pre_exec_fd_scan_bound_exclusive (null when unobserved), exec_status_pipe_eof_observed, shell_exec_checked and inventory_scope 'pre_exec_only_not_after_exec_inventory'. The pre-exec fact is kept even after a later exec error (host test host_exec_failure_retains_pre_exec_fd_fact_without_exec_success).",
+    "unchanged": "Fault injection 7 (a test-only leaked slave) is reachable only through the cfg(test) constructor; Pty::shell passes 0. The session/ctty checks, signal reset, stage-6 exec-error handling, CHONKTERM status, DS1/DS5 input and records/cleanup ordering are all as reviewed in 216."
+  },
+  "host_evidence": {
+    "recorded": "43 host tests pass, including host_real_pre_exec_fd_check_and_exec_without_proc (real fork/fcntl/exec without /proc), host_live_extra_fd_cannot_become_checked_setup_or_exec, missing_partial_wrong_bound_pipe_and_order_fail_closed and split_fd_check_and_exec_protocol_requires_all_observations. Two freshly compiled source mutants are each rejected by their target test (exit 101, panics at pty.rs:764 and :781): skip-close and skip-verification. I did not rerun cargo, to keep the tree unchanged.",
+    "limit": "These are Linux host PTY/fcntl/exec results, not Darwin execution."
+  },
+  "ds4_decision": {
+    "question": "Would source-bound actual pre-exec closure plus exec-pipe EOF plus a real PTY prompt/result address DS4's private-FD exclusion boundary, without claiming a general after-exec fd inventory?",
+    "answer": "YES, for descriptors /bin/sh could inherit from the application, within [0,bound), provided all four runtime observations below come from the exact source-bound binary in one run.",
+    "required_runtime_observations": [
+      "1. The validated FD_CHECKED fact with pre_exec_fd_scan_bound_exclusive equal to the app's actual RLIMIT_NOFILE soft limit, and the pipe fd matching (in child-ready.json and result.json).",
+      "2. READY followed by actual exec-status pipe EOF with no error record (shell_exec_checked true).",
+      "3. Real PTY output from the fixed /bin/sh -i +m (its prompt, and ideally a command result in pty-rx.bin and the grid). This closes the one ambiguity EOF alone cannot: the child dying after READY but before execve.",
+      "4. The owned process outcome and complete cleanup as already required (CLEANUP COMPLETE with an actual wait status)."
+    ],
+    "reasoning": "At execve, the child's table within [0,bound) is observed to be exactly {0,1,2 (PTY slave, CLOEXEC clear), pipe (CLOEXEC set)}. execve adds no descriptor from the parent's private objects and closes the CLOEXEC pipe, so the shell can inherit only the PTY slave on 0-2. The app's private descriptors cannot be present: fd 3 status, rx/tx transcripts and record files are open before fork and are closed and verified absent; the Wayland socket and SHM files are opened only after fork. Descriptors at or above the bound cannot exist, because the app never raises its soft limit and the session's CLOEXEC_DEFAULT launch passes only 0-3. That last point depends on the launcher contract and is not re-proved here.",
+    "explicitly_not_claimed": [
+      "An after-exec inventory: descriptors the shell or loader legitimately open after exec (for example sh/zsh opening its own fds) are not app-private and are outside this boundary.",
+      "Descriptors already open at or above the soft limit (impossible by construction under the stated launch contract, but not proven at runtime).",
+      "Mach ports or other non-fd inheritable resources.",
+      "The C spawn adapter's own FD whitelist (that is the separate managed-spawn fixture's job).",
+      "Final DS4 admission (that needs this runtime run and the session-level gates)."
+    ],
+    "optional_corroboration": "A low-numbered sentinel check at the shell prompt (for example that /dev/fd/3 is absent) would only corroborate and could false-fail if the shell itself uses low fds. It is not required by this decision."
+  },
+  "notes": {
+    "R1_guarded_descriptors": "This is unchanged from 216, but on Darwin a close() of a guarded fd in the child would raise EXC_GUARD. That fails closed (no FD_CHECKED or READY), never a false pass; it is a possible false negative to diagnose if it ever happens.",
+    "R2_sweep_cost": "With a very large soft limit (up to 1048576), the child performs up to about 2 million syscalls (close plus fcntl) inside the parent's unchanged 5 s setup deadline. On the expected default limits this is negligible; a timeout would fail closed."
+  },
+  "not_claimed": ["Darwin SDK build or execution", "after-exec fd inventory", "final DS4 admission", "C spawn runtime FD proof", "physical input", "shared Shell or two-window workflow"],
+  "scope": "Read-only: rev002 manifest and patch replay on a scratch copy, delta reading against the reviewed 216, recorded host and mutant logs. No edits, builds, SSH or hardware."
+}

@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_STRUCTURE_REVIEW_NO_HARDWARE",
+  "reviewed": {
+    "script": "integrations/puredarwin/m1-trackpad-child/darwin-passive-child-test 604953f5c9b338e3 (71 lines; root record reports/sprint-010/passive-child-supervisor-source-001.json)",
+    "baseline": "integrations/puredarwin/chonkstep-darwin/darwin-native-startup-test dcba72de (qualified native001/live001/survey001 lifecycle). The T1 supervisor d62fc267 and dcba72de are unchanged."
+  },
+  "verdict": "STRUCTURE APPROVED. The script is the qualified native script with exactly the stated substitutions: a raw T1 enumeration that must return 0, a stat-only wait for both nodes followed by exactly one identity-gate run, and the Both seat instead of keyboard-only. The observer, the 80 s window, the closed six-record export, compositor TERM/wait, the STATUS check, uname and the trap are byte-identical apart from marker names and footer text. There is no typing prompt, mode write or host-input path. The gate and kernel implementations are not reviewed here.",
+  "diff_vs_native": [
+    "darwin-keyboard-inventory --require-native-keyboard (DL12_NATIVE_NOT_READY, exit 77) is replaced by darwin-trackpad-enum --nonce, run once inside if/else so its raw rc is printed (DL15_CHILD_ENUM rc=) before any decision. rc 0 continues, 77 exits 77, anything else exits 1. The collector's own DL14_TP_* output is unchanged.",
+    "The keyboard-node wait (≤100 x 0.1 s, then exit 1) now waits for both /dev/usb_hid_kbd and /dev/usb_hid_mouse with '[ -c ]' (stat only, no open). On timeout it breaks out instead of exiting, so the gate always records the exact cause.",
+    "The deliberate mouse refusal '[ ! -e /dev/usb_hid_mouse ] || exit 1' is replaced by exactly one darwin-native-input-inventory --nonce run, also inside if/else with its raw rc printed (DL15_CHILD_IDENTITY rc=). 0 continues; 77 prints DL15_CHILD_NOT_READY source=identity_gate and exits 77; anything else prints DL15_CHILD_FAILED and exits 1. All of these exit before the compositor, socket, client or runtime records exist.",
+    "chonkstep-darwin --input pdhid-keyboard becomes --input pdhid. In the RAM's patched Chonkstep (keyboard-only/pdhid-keyboard.patch), 'pdhid' is InputMode::Both. It must open both character queues before advertising keyboard and pointer, and NativeHid::open()? fails the compositor otherwise. A node that disappears after the gate therefore makes the socket-wait 'kill -0' fail and the script exit 1.",
+    "DL12_NATIVE_* script markers become DL15_CHILD_*, and the footer becomes 'CHONKSTEP PASSIVE NATIVE CHILD STARTUP ONLY - INPUT UNVERIFIED'. The unchanged observer still prints its own DL12_NATIVE_STARTUP_* lines, and DL16_GATE_* is reserved for the gate."
+  ],
+  "branch_exercise": "Scratch copy only, with stub collectors, a no-op sleep, node paths rewritten to plain files and absolute paths redirected; this tests branch logic, not the real binaries. enum 77 -> rc 77, no gate call. enum 1 -> rc 1, no gate call. enum 0 with no nodes -> wait times out, gate runs exactly once: 77 -> NOT_READY rc 77, 1 -> FAILED rc 1. Keyboard node only -> one gate run, 77. Both nodes with gate 0 -> compositor launched; a compositor exiting early makes kill -0 fail, rc 1, no SERVER_SOCKET. Bad nonce -> 2. 'sh -n' syntax OK.",
+  "observer_and_seat": "The unchanged observer darwin-wayland-terminal-native-startup binds only wl_keyboard when the seat has the Keyboard capability (client-terminal-native-startup/src/main.rs:171-173). It never binds a pointer, so trackpad pointer or button events cannot reach its PTY, and PTY TX 0 stays meaningful. Chonkstep discards the bounded pre-open backlog at startup.",
+  "notes": [
+    {"id": "S1", "severity": "qualification", "text": "In Both mode the compositor advertises a pointer and draws its cursor sprite, the 008 pointer-seat behaviour I source-verified for live001 (input.rs caps.pointer, arrow at (0,0)). Closed-run console-return pixels are unaffected because the compositor has exited. Any live-frame qualification must apply the exact source-derived cursor exclusion rather than relax its geometry checks."},
+    {"id": "S2", "severity": "timing", "text": "The node wait adds up to about 10 s only when a node is late. Normally both nodes are published at BSD readiness (about 115 s uptime), well before the shell runs, so the wait is near zero. A late node that appears near the 10 s limit followed by the full 80 s observer reduces the 180 s host margin. Any resulting host timeout must be preserved as a failure. Root should confirm the margin from T1-002's host timestamps."},
+    {"id": "S3", "severity": "cosmetic", "text": "Enumeration rc 77 exits 77 with only the DL15_CHILD_ENUM line, and no 'DL15_CHILD_NOT_READY source=enumeration' marker to parallel the gate path. The raw rc is still recorded, so this is non-blocking."},
+    {"id": "S4", "severity": "packet", "text": "Bind this script hash, the unchanged observer, Chonkstep 717da106 (Both-capable), the collector 451ea0ce and the not-yet-built darwin-native-input-inventory in the concrete T2 RAM review, with the child-capable SDK/KC (host H1)."}
+  ],
+  "not_claimed": ["gate collector implementation", "kernel child implementation", "runtime", "pointer input", "physical panel"],
+  "scope": "Read-only script diff, Chonkstep/observer source reading, scratch-only stub branch exercise. No builds, edits, SSH or hardware."
+}

@@ -1,0 +1,146 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# SFAppleTouchBar, one boot without the desktop:
+#   bringup   wait for the driver; state, the display pipe's registers, the panel's answers
+#   display   the picture's CRC against the host renderer's, the fetch probe, the vertical
+#             blank rate, brightness, both layers' pictures
+#   touch     the digitizer's protocol counters, read requests, five quiet seconds
+#   keys      sftbtest: finger records injected at the driver's parser, key records read from
+#             /dev/usb_hid_kbd (the queue the compositor reads): the media layer (the default),
+#             a held key's picture, the function layer while Fn is held, a held key released
+#             when Fn changes, sliding off a key, two fingers, the held-key failsafe, the
+#             other default layer, the dark strip, typing lighting the dark strip.
+#             Fn is not pressed by anybody: the keyboard's driver is handed a made-up
+#             keyboard report with the Fn bit of its own descriptor set or clear
+#             (kern.sf_touchbar.kbd_report) and treats it as one the keyboard sent.
+# Nobody touches the strip in this test, and nobody looks at it: what the panel shows is not
+# proven by it. tools/tb_summary.sh reads the result. (@SSID@/@PSK@ are unused; the
+# assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nTB_BEGIN_%s\n' "$nonce"
+t0=$(date +%s)
+now() { echo $(( $(date +%s) - t0 )); }
+phase() { printf 'TB_PHASE %s t=%s\n' "$1" "$(now)"; }
+get() { sysctl -n "kern.sf_touchbar.$1" 2>/dev/null; }
+put() { sysctl -w "kern.sf_touchbar.$1" > /dev/null 2>&1; }
+check() {
+    if [ "$2" = "$3" ]; then r=PASS; else r=FAILED; fi
+    printf 'TB_CHECK %s got=%s expected=%s result=%s\n' "$1" "$2" "$3" "$r"
+}
+show() {
+    printf 'TB_STATE %s %s\n' "$1" "$(get state)"
+    printf 'TB_DISPLAY %s %s\n' "$1" "$(get display)"
+    printf 'TB_TOUCH %s %s\n' "$1" "$(get touch)"
+}
+
+phase bringup
+sysctl hw.ncpu hw.activecpu 2>&1
+n=0
+while [ "$n" -lt 150 ]; do
+    case "$(get state)" in ready*|display-only*|display-failed*|surveyed*|off*|'') break;; esac
+    sleep 1; n=$((n+1))
+done
+show bringup
+printf 'TB_PANEL %s\n' "$(get panel)"
+printf 'TB_KEYS layer=%s %s\n' "$(get layer)" "$(get keys)"
+ls -l /Library/Firmware/apple/ 2>&1 | sed 's/^/TB_FIRMWARE /'
+case "$(get state)" in
+ready*|display-only*) ;;
+*)  printf 'TB_FAIL the driver has no display\n'
+    sysctl kern.sf_touchbar 2>&1
+    printf 'TB_END_%s\n' "$nonce"; printf '\nPD_BENCH_DONE\n'; exit 0;;
+esac
+
+phase display
+check crc_media "$(get fb_crc)" @CRC_MEDIA@
+put fetch_probe=300
+printf 'TB_FETCH %s\n' "$(get fetch)"
+case "$(get fetch)" in FETCHED*) r=PASS;; *) r=FAILED;; esac     # with the pipe running
+printf 'TB_CHECK fetch_probe result=%s\n' "$r"
+put flush_probe=1
+printf 'TB_FLUSH %s\n' "$(get trace)"
+case "$(get trace)" in *'mask 0x440,'*) r=PASS;; *) r=FAILED;; esac    # the flush was taken (ctrl[11:8] left 6) and finished (back at 6)
+printf 'TB_CHECK flush_completes result=%s\n' "$r"
+sleep 1
+check dart_faults_after_probe "$(get dart_faults)" 0
+put vblank_hz=1
+check fb_crc_after_probe "$(get fb_crc)" @CRC_MEDIA@
+printf 'TB_VBLANK hz=%s\n' "$(get vblank_hz)"
+put brightness=40;  check brightness_40 "$(get actual_brightness)" 40
+put brightness=128; check brightness_128 "$(get actual_brightness)" 128
+put default_layer=0
+check crc_fn "$(get fb_crc)" @CRC_FN@
+printf 'TB_KEYS layer=%s %s\n' "$(get layer)" "$(get keys)"
+put default_layer=1
+check crc_media_again "$(get fb_crc)" @CRC_MEDIA@
+check dsi_errors "$(get dsi_errors)" 0
+show display
+
+phase touch
+r0=$(get reports); p0=$(get polls)
+put z2_poll=1; put z2_poll=1; put z2_poll=1
+printf 'TB_TOUCH polled %s\n' "$(get touch)"
+sleep 5
+printf 'TB_TOUCH quiet %s\n' "$(get touch)"
+printf 'TB_BASELINE polls=%s->%s reports=%s->%s fingers=%s bad_reports=%s spi_errors=%s spi_timeouts=%s irqs=%s irq_polled=%s\n' \
+    "$p0" "$(get polls)" "$r0" "$(get reports)" "$(get fingers)" "$(get bad_reports)" "$(get spi_errors)" \
+    "$(get spi_timeouts)" "$(get irqs)" "$(get irq_polled)"
+check spi_errors "$(get spi_errors)" 0
+check bad_reports "$(get bad_reports)" 0
+
+phase keys
+put brightness=128
+ls -l /dev/usb_hid_kbd 2>&1
+printf 'TB_FN fn_known=%s fn=%s kbd_notes=%s layer=%s default_layer=%s\n' "$(get fn_known)" "$(get fn)" "$(get kbd_notes)" "$(get layer)" "$(get default_layer)"
+sftbtest --label media tap:3a tap:3b tap:43 tap:44 tap:45 2>&1
+out=$(sftbtest --label held hold:43 crc lift crc 2>&1); echo "$out"
+check crc_mute_held "$(echo "$out" | sed -n 's/^TBCRC //p' | head -1)" @CRC_MUTE_HELD@
+check crc_released "$(echo "$out" | sed -n 's/^TBCRC //p' | tail -1)" @CRC_MEDIA@
+# Fn held: the function keys; released: the media keys again
+out=$(sftbtest --label fn-held fn:1 crc tap:3a tap:3b tap:3c tap:3d tap:3e tap:3f tap:40 tap:41 tap:42 tap:43 tap:44 tap:45 fn:0 crc 2>&1); echo "$out" | grep -v TBKEY
+check crc_fn_while_fn_held "$(echo "$out" | sed -n 's/^TBCRC //p' | head -1)" @CRC_FN@
+check crc_media_after_fn "$(echo "$out" | sed -n 's/^TBCRC //p' | tail -1)" @CRC_MEDIA@
+printf 'TB_FN fn_known=%s fn=%s kbd_notes=%s layer=%s layer_changes=%s\n' "$(get fn_known)" "$(get fn)" "$(get kbd_notes)" "$(get layer)" "$(get layer_changes)"
+check fn_known "$(get fn_known)" 1
+check layer_back "$(get layer)" 1
+# a key held on the strip when Fn goes down is released first; the resting finger presses nothing
+sftbtest --label fn-releases hold:44 fn:1 up:44 release fn:0 2>&1
+sftbtest --label slide slide:3a:3b 2>&1
+sftbtest --label two-fingers hold:44 hold:45 lift 2>&1
+# a finger whose lift never comes: the key is released after hold_ms without a report
+put hold_ms=1500
+sftbtest --label failsafe hold:45 wait:2500 up:45 release tap:45 2>&1
+check failsafes "$(get failsafes)" 1
+put hold_ms=3000
+# the function layer as the default: Fn then shows the media keys
+put default_layer=0
+out=$(sftbtest --label default-fn crc tap:3c fn:1 crc tap:45 fn:0 2>&1); echo "$out"
+check crc_default_fn "$(echo "$out" | sed -n 's/^TBCRC //p' | head -1)" @CRC_FN@
+check crc_default_fn_fn_held "$(echo "$out" | sed -n 's/^TBCRC //p' | tail -1)" @CRC_MEDIA@
+put default_layer=1
+check layer_default_media "$(get layer)" 1
+# the dark strip: a touch lights it and presses nothing, the next one presses
+put dim_ms=500; put off_ms=1500
+sleep 3
+check dark_brightness "$(get actual_brightness)" 0
+w0=$(get wakes)
+sftbtest --label dark dark:44 tap:44 2>&1
+printf 'TB_WAKE wakes=%s->%s actual_brightness=%s\n' "$w0" "$(get wakes)" "$(get actual_brightness)"
+# typing lights the dark strip: a keyboard report (Fn up) through the keyboard's driver
+put dim_ms=3000; put off_ms=4000
+sleep 6
+check dark_again "$(get actual_brightness)" 0
+k0=$(get kbd_wakes)
+sftbtest --label typing fn:0 2>&1
+check lit_by_typing "$(get actual_brightness)" 128
+printf 'TB_TYPING kbd_wakes=%s->%s\n' "$k0" "$(get kbd_wakes)"
+put dim_ms=30000; put off_ms=60000
+check hid_errors "$(get hid_errors)" 0
+check dart_faults "$(get dart_faults)" 0
+
+phase end
+show end
+sysctl kern.sf_touchbar 2>&1 | grep -v 'display:\|touch:\|keys:' | tr '\n' ' ' | cut -c1-1500 | sed 's/^/TB_COUNTERS /'
+printf '\nTB_END_%s\n' "$nonce"
+printf '\nPD_BENCH_DONE\n'

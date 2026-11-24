@@ -1,0 +1,96 @@
+#!/bin/sh
+# Guest side of the Wi-Fi lifecycle boot: join, radio off/on, rejoin, leave, join, off/on
+# again. @SSID@ and @PSK@ are filled in from private/wifi.env at packet assembly (select
+# this file with PCIE_GUEST_TEMPLATE); the filled script is never committed.
+#
+# What "wifiutil off" does is the kernel's boot-arg bwfm_off: 0 (default) stops the
+# interface and keeps the firmware loaded, 1 also stops the firmware and releases
+# everything (on loads it again), 2 also shuts the PCIe port down and switches the radio's
+# power off. The script is the same for all three; with 1 and 2 every "on" costs a firmware
+# load, so give the boot more than the 150 s the default needs.
+#
+# Every step prints DL37_<STEP>_RC=<exit code>, or DL37_<STEP>_STALLED when the command did
+# not come back in its time (it is then killed and the test goes on). Expected: every RC 0
+# and nothing STALLED, except the two pings with the radio off, DL37_OFF1_PING and
+# DL37_OFF2_PING: those must NOT report RC=0 (a non-zero RC or STALLED is the pass).
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+GATEWAY=10.1.1.1
+INTERNET=1.1.1.1
+
+# step SECONDS LABEL COMMAND...: run with a deadline, print the exit code
+step() {
+    limit=$1; label=$2; shift 2
+    ( "$@" ) 2>&1 &
+    pid=$!
+    t=0
+    while kill -0 $pid 2>/dev/null && [ $t -lt $limit ]; do sleep 1; t=$((t+1)); done
+    if kill -0 $pid 2>/dev/null; then
+        kill -9 $pid 2>/dev/null
+        printf 'DL37_%s_STALLED after %ss\n' "$label" "$t"
+        return 1
+    fi
+    wait $pid
+    rc=$?
+    printf 'DL37_%s_RC=%s\n' "$label" "$rc"
+    return $rc
+}
+
+# net LABEL: is the network there?
+net() {
+    step 8 "$1_PING_GATEWAY" ping -c 2 $GATEWAY
+}
+
+# join LABEL: associate and say what came of it
+join() {
+    step 25 "$1" wifiutil join '@SSID@' '@PSK@'
+    sleep 3
+    wifiutil info 2>&1
+}
+
+printf '\nDL37_LIFECYCLE_BEGIN_%s\n' "$nonce"
+sleep 4
+step 10 IFUP sf-dhcp --up en0
+sleep 2
+step 15 ON0 wifiutil on
+sleep 6
+
+printf 'DL37_STAGE join, dhcp, ping\n'
+join JOIN1
+step 20 DHCP1 sf-dhcp en0
+net JOIN1
+step 8 JOIN1_PING_INTERNET ping -c 2 $INTERNET
+
+printf 'DL37_STAGE radio off\n'
+step 30 OFF1 wifiutil off
+sleep 2
+wifiutil info 2>&1
+step 4 OFF1_PING ping -c 1 $GATEWAY
+
+printf 'DL37_STAGE radio on, rejoin, ping\n'
+step 40 ON1 wifiutil on
+sleep 4
+wifiutil info 2>&1
+join JOIN2
+net JOIN2
+
+printf 'DL37_STAGE leave\n'
+step 20 LEAVE wifiutil leave
+sleep 2
+wifiutil info 2>&1
+
+printf 'DL37_STAGE join again, ping\n'
+join JOIN3
+net JOIN3
+
+printf 'DL37_STAGE radio off and on a second time\n'
+step 30 OFF2 wifiutil off
+sleep 2
+wifiutil info 2>&1
+step 4 OFF2_PING ping -c 1 $GATEWAY
+step 40 ON2 wifiutil on
+sleep 4
+join JOIN4
+net JOIN4
+
+printf 'DL37_LIFECYCLE_END_%s\n' "$nonce"

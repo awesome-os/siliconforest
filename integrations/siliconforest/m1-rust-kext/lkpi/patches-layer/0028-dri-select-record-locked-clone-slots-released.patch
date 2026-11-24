@@ -1,0 +1,129 @@
+sf_dri: the select/kqueue record is locked, a closed node gives its slot back
+
+Found by the 8-cpu audit (docs/roadmap/research/smp-lock-audit.md, D1, D2, D3).
+
+- sSel[] was recorded (dri_select) and woken (sf_dri_wakeup, dri_close) with no lock.
+  xnu requires the owner's lock around selrecord()/selwakeup(): a kqueue waiter attaching on
+  one cpu while the flip-complete wakeup runs on another loses its knote for good (the
+  compositor then never wakes for an event), and select() can use a wait queue the wakeup
+  is tearing down. One mutex, never held across a drm kext's poll().
+- A clone's slot was only ever freed by DEVFS_CLONE_FREE, which xnu calls just when it could
+  not make the vnode: every open since boot kept its slot and the 1024th open of any dri
+  node failed. The slot goes back at the last close and after a failed open.
+- The locks are made when this kext starts instead of at the first sf_dri_register(), and
+  the character major is made under the lock, so two drm kexts registering at once agree.
+
+--- a/src/Kernel/Extensions/SFDRMDri/SFDRMDri.cpp
++++ b/src/Kernel/Extensions/SFDRMDri/SFDRMDri.cpp
+@@ -40,6 +40,11 @@
+ static struct selinfo sSel[SF_DRI_SLOTS];
+ static lck_grp_t *sLockGroup;
+ static lck_mtx_t *sLock;
++// xnu wants the owner of a selinfo to hold its own lock around selrecord() and around
++// selwakeup(): without it a waiter attaching on one cpu and a wakeup on another lose the
++// waiter (kqueue: the SI_SELSPEC flag is cleared under the attach) or use a wait queue the
++// other side is tearing down. never held across a drm kext's poll().
++static lck_mtx_t *sSelLock;
+ static const struct sf_dri_ops *sProviders[SF_DRI_PROVIDERS];
+ // for each system-wide minor, the kext that owns it and its own number for it
+ static struct {
+@@ -98,8 +103,14 @@
+ 	if (slot <= 0 || slot >= SF_DRI_SLOTS || owner_ops(dev) == NULL)
+ 		return ENXIO;
+ 	error = owner_ops(dev)->open(sOwner[SF_DRI_DRM_MINOR(dev)].minor, flags, &cookie);
+-	if (error != 0)
++	if (error != 0) {
++		// xnu frees a clone's minor only when it could not make the vnode: the slot of
++		// an open that failed is ours to give back
++		lck_mtx_lock(sLock);
++		sSlotUsed[slot] = false;
++		lck_mtx_unlock(sLock);
+ 		return error;
++	}
+ 	sSlots[slot] = cookie;
+ 	return 0;
+ }
+@@ -110,11 +121,21 @@
+ 	void *cookie = slot_cookie(dev);
+ 
+ 	if (cookie != NULL) {
++		int slot = SF_DRI_SLOT(dev);
++
+ 		owner_ops(dev)->close(cookie);
+-		sSlots[SF_DRI_SLOT(dev)] = NULL;
++		sSlots[slot] = NULL;
+ 		// nobody may stay recorded on a slot the next open reuses
+-		selwakeup(&sSel[SF_DRI_SLOT(dev)]);
+-		selthreadclear(&sSel[SF_DRI_SLOT(dev)]);
++		lck_mtx_lock(sSelLock);
++		selwakeup(&sSel[slot]);
++		selthreadclear(&sSel[slot]);
++		lck_mtx_unlock(sSelLock);
++		// the last close of a clone is where its minor goes back (as xnu's own cloning
++		// devices do it in d_close): without this every open since boot kept its slot,
++		// and the 1024th open of a dri node failed. no fd operation is in flight here.
++		lck_mtx_lock(sLock);
++		sSlotUsed[slot] = false;
++		lck_mtx_unlock(sLock);
+ 	}
+ 	return 0;
+ }
+@@ -166,7 +187,9 @@
+ 	if (!ready) {
+ 		// record the waiter, then look again: an event queued in between has already
+ 		// called sf_dri_wakeup() with nobody recorded
++		lck_mtx_lock(sSelLock);
+ 		selrecord(p, &sSel[SF_DRI_SLOT(dev)], wql);
++		lck_mtx_unlock(sSelLock);
+ 		ready = owner_ops(dev)->poll(cookie, which, wql);
+ 	}
+ 	return ready;
+@@ -182,7 +205,9 @@
+ 		return 0;
+ 	for (int slot = 1; slot < SF_DRI_SLOTS; slot++) {
+ 		if (sSlots[slot] == cookie) {
++			lck_mtx_lock(sSelLock);
+ 			selwakeup(&sSel[slot]);
++			lck_mtx_unlock(sSelLock);
+ 			return 1;
+ 		}
+ 	}
+@@ -222,12 +247,15 @@
+ {
+ 	int k;
+ 
++	// the locks exist since this kext started (sf_dri_start); the major is made under one
++	// of them, so that two drm kexts registering at once agree on it
++	lck_mtx_lock(sLock);
+ 	if (sMajor < 0) {
+-		sLockGroup = lck_grp_alloc_init("pd dri", LCK_GRP_ATTR_NULL);
+-		sLock = lck_mtx_alloc_init(sLockGroup, LCK_ATTR_NULL);
+ 		sMajor = cdevsw_add(-1, &sDriCdevsw);
+-		if (sMajor < 0)
++		if (sMajor < 0) {
++			lck_mtx_unlock(sLock);
+ 			return ENXIO;
++		}
+ 		sf_cdev_mmap_register(sMajor, dri_mmap_pages);
+ 		// kqueue (and so poll(), which xnu implements with it) only works on a character
+ 		// device that says its d_select may be used that way
+@@ -235,7 +263,6 @@
+ 			IOLog("sf_dri: kqueue not enabled for the dri devices\n");
+ 		IOLog("sf_dri: character major %d\n", sMajor);
+ 	}
+-	lck_mtx_lock(sLock);
+ 	for (k = 0; k < SF_DRI_PROVIDERS && sProviders[k] != NULL && sProviders[k] != ops; k++)
+ 		;
+ 	if (k < SF_DRI_PROVIDERS)
+@@ -434,6 +461,10 @@
+ extern "C" kern_return_t
+ sf_dri_start(kmod_info_t *ki, void *data)
+ {
++	// before any drm kext can call in: kext start routines run one at a time
++	sLockGroup = lck_grp_alloc_init("pd dri", LCK_GRP_ATTR_NULL);
++	sLock = lck_mtx_alloc_init(sLockGroup, LCK_ATTR_NULL);
++	sSelLock = lck_mtx_alloc_init(sLockGroup, LCK_ATTR_NULL);
+ 	return KERN_SUCCESS;
+ }
+ 
+

@@ -1,0 +1,106 @@
+fbsdkpi: backlight: ops_lock, and get/set brightness as linux has them
+
+The display driver's backlight (drivers/gpu/drm/apple/dcp_backlight.c) is a backlight
+class device; these are the class pieces it and its user-space interface rely on, checked
+against include/linux/backlight.h and drivers/video/backlight/backlight.c of the pin:
+
+- struct backlight_device has ops_lock (initialised at registration, which now also copies
+  props.scale);
+- backlight_get_brightness() is 0 for a blanked backlight (it returned the remembered
+  level, so the driver's set path sent that level while powered off);
+- backlight_device_set_brightness() takes ops_lock and returns a negative errno (it
+  returned positive EINVAL and took no lock);
+- BACKLIGHT_POWER_ON/OFF.
+backlight_is_blank() (patch 0017) also looks at BL_CORE_SUSPENDED and BL_CORE_FBBLANK now.
+There is still no class registry or sysfs here: the SFDcp kext exposes its one backlight
+as sysctls (integrations/siliconforest/m1-dcp/kext/sf_dcp_backlight.c).
+UPSTREAM: yes.
+
+--- a/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/include/linux/backlight.h
++++ b/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/include/linux/backlight.h
+@@ -30,11 +30,20 @@
+ #define _LINUXKPI_LINUX_BACKLIGHT_H_
+ 
+ #include <linux/notifier.h>
++#include <linux/mutex.h>	/* ops_lock */
+ 
+ struct backlight_device;
+ 
+ enum backlight_type {
+ 	BACKLIGHT_RAW = 0,
++	BACKLIGHT_PLATFORM,
++	BACKLIGHT_FIRMWARE,
++};
++
++enum backlight_scale {
++	BACKLIGHT_SCALE_UNKNOWN = 0,
++	BACKLIGHT_SCALE_LINEAR,
++	BACKLIGHT_SCALE_NON_LINEAR,
+ };
+ 
+ struct backlight_properties {
+@@ -66,6 +82,8 @@
+ 	void *data;
+ 	struct device *dev;
+ 	char *name;
++	/* SiliconForest: linux's ops_lock, serialises the ops for whoever sets a level */
++	struct mutex ops_lock;
+ };
+ 
+ #define bl_get_data(bd) (bd)->data
+@@ -89,21 +107,39 @@
+ 	bd->props.brightness = bd->ops->get_brightness(bd);
+ }
+ 
++/* SiliconForest: the three below as linux's include/linux/backlight.h and backlight.c have them */
++#define	BACKLIGHT_POWER_ON	(0)
++#define	BACKLIGHT_POWER_OFF	(4)
++
++static inline bool backlight_is_blank(struct backlight_device *bd);
++
++/* a blanked backlight's brightness is 0, whatever level is remembered for it */
+ static inline int
+ backlight_get_brightness(struct backlight_device *bd)
+ {
+ 
++	if (backlight_is_blank(bd))
++		return (0);
+ 	return (bd->props.brightness);
+ }
+ 
++/* 0 or a negative errno, under ops_lock */
+ static inline int
+-backlight_device_set_brightness(struct backlight_device *bd, int brightness)
++backlight_device_set_brightness(struct backlight_device *bd, unsigned long brightness)
+ {
++	int rc = -ENXIO;
+ 
+-	if (brightness > bd->props.max_brightness)
+-		return (EINVAL);
+-	bd->props.brightness = brightness;
+-	return (bd->ops->update_status(bd));
++	mutex_lock(&bd->ops_lock);
++	if (bd->ops != NULL) {
++		if (brightness > (unsigned long)bd->props.max_brightness)
++			rc = -EINVAL;
++		else {
++			bd->props.brightness = brightness;
++			rc = backlight_update_status(bd);
++		}
++	}
++	mutex_unlock(&bd->ops_lock);
++	return (rc);
+ }
+ 
+ static inline int
+--- a/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/src/linux_pci.c
++++ b/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/src/linux_pci.c
+@@ -2612,6 +2612,8 @@
+ 	dev->bd->props.max_brightness = props->max_brightness;
+ 	dev->bd->props.brightness = props->brightness;
+ 	dev->bd->props.power = props->power;
++	dev->bd->props.scale = props->scale;	/* ops_lock: with the lock, what linux's register also sets up */
++	mutex_init(&dev->bd->ops_lock);
+ 	dev->bd->data = data;
+ 	dev->bd->dev = dev;
+ 	dev->bd->name = strdup(name, M_DEVBUF);

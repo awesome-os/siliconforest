@@ -1,0 +1,27 @@
+FXNET: -debug keeps mdnsd in the foreground with LogMsg() on stderr, but no longer turns on
+mDNS_LoggingEnabled (every LogInfo(), dozens of lines per lookup and one per mDNS packet on the
+LAN). On the M1's root file system 10 % of small appends take 13-33 ms, and mdnsd writes its log
+synchronously from its only thread: lookups waited 0.2-10 s behind their own log lines. -verbose
+as a second argument brings the old behaviour back for diagnosis.
+
+--- a/src/Libraries/mDNSResponder/mDNSPosix/PosixDaemon.c
++++ b/src/Libraries/mDNSResponder/mDNSPosix/PosixDaemon.c
+@@ -117,11 +117,13 @@
+ {
+     if (argc > 1)
+     {
+-        /* -debug also turns on mDNS_LoggingEnabled: without it every LogInfo()
+-         * in the resolution path (including SetValidDNSServers' own
+-         * diagnostics) is dropped, leaving only hard errors in the log. */
+-        if (0 == strcmp(argv[1], "-debug")) { mDNS_DebugMode = mDNStrue; mDNS_LoggingEnabled = mDNStrue; }
+-        else printf("Usage: %s [-debug]\n", argv[0]);
++        /* -debug: foreground, LogMsg() to stderr. -debug -verbose also turns on
++         * mDNS_LoggingEnabled (every LogInfo() in the resolution path). Not by
++         * default: the log is written synchronously from the daemon's only
++         * thread, so a slow disk delays every lookup behind its own log lines. */
++        if (0 == strcmp(argv[1], "-debug")) mDNS_DebugMode = mDNStrue;
++        else printf("Usage: %s [-debug [-verbose]]\n", argv[0]);
++        if (argc > 2 && 0 == strcmp(argv[2], "-verbose")) mDNS_LoggingEnabled = mDNStrue;
+     }
+ 
+     if (!mDNS_DebugMode)

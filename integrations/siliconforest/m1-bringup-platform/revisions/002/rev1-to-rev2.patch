@@ -1,0 +1,62 @@
+diff --git a/src/Kernel/Extensions/PDArmPlatformExpert/PDArmPlatformExpert.cpp b/src/Kernel/Extensions/PDArmPlatformExpert/PDArmPlatformExpert.cpp
+index 0ae151c..3e7f50d 100644
+--- a/src/Kernel/Extensions/PDArmPlatformExpert/PDArmPlatformExpert.cpp
++++ b/src/Kernel/Extensions/PDArmPlatformExpert/PDArmPlatformExpert.cpp
+@@ -48,6 +48,7 @@ protected:
+ 	virtual bool startProcessors(void);
+ 	virtual void initPlatformInterruptsLate(void);
+ 	virtual const char *platformModelName(void);
++	virtual bool usesPSCIHaltRestart(void);
+ 	void publishBcm2835EMMC(void);
+ 	void publishBcm283xFramebuffer(void);
+ 	void startQemuRTC(void);
+@@ -106,7 +107,9 @@ PDArmPlatformExpert::start(IOService *provider)
+ #if defined(__arm64__)
+ 	pd_perfcontrol_start();
+ 	PDSun60iDVFS_start();
+-	PE_halt_restart = pdArmHaltRestart;
++	if (usesPSCIHaltRestart()) {
++		PE_halt_restart = pdArmHaltRestart;
++	}
+ 	if (PDSun50i_isPlatform()) {
+ 		PDSun50iWatchdog_start();
+ 		PDSun50iMMC_publish(this);
+@@ -581,6 +584,13 @@ PDArmPlatformExpert::platformModelName(void)
+ 	return sPDVirtualMac ? "VirtualMac2,1" : "QEMU Virtual ARM64";
+ }
+ 
++// Halt and restart go to PSCI firmware (pdArmHaltRestart)
++bool
++PDArmPlatformExpert::usesPSCIHaltRestart(void)
++{
++	return true;
++}
++
+ /*
+  * Apple SoCs. The device tree root of every one of them carries "AppleARM" in
+  * its compatible property, alongside the board and product names, so a single
+@@ -595,6 +605,7 @@ protected:
+ 	bool startProcessors(void) APPLE_KEXT_OVERRIDE;
+ 	void initPlatformInterruptsLate(void) APPLE_KEXT_OVERRIDE;
+ 	const char *platformModelName(void) APPLE_KEXT_OVERRIDE;
++	bool usesPSCIHaltRestart(void) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ #undef super
+@@ -662,3 +673,16 @@ PDAppleARMPlatformExpert::platformModelName(void)
+ {
+ 	return "Apple ARM";
+ }
++
++/*
++ * Apple SoCs have no PSCI firmware, and pdArmHaltRestart's PSCI probe walks
++ * the IORegistry, whose locks may not be taken from the panic path. No Apple
++ * reset driver exists here yet, so install no handler: PE_halt_restart stays
++ * NULL, IOPlatformExpert::haltRestart() returns -1, and halt_all_cpus() spins
++ * once pd_psci_halt() finds no /psci node. Recovery is external.
++ */
++bool
++PDAppleARMPlatformExpert::usesPSCIHaltRestart(void)
++{
++	return false;
++}

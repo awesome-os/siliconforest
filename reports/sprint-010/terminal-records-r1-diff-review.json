@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_DIFF_REVIEW_NO_HARDWARE",
+  "diff": {
+    "terminal-records.c": "0bd086e9 -> 28a786709996180caac908b57c490e574b63b364229ba73a398d1c7157639c04 (diff base is my reconstruction of the reviewed file, which hashes exactly to 0bd086e9)",
+    "decode_records.py": "new, c8f2193dbf843d1970b56f9c0aaed06f2aab43c6348a66f5201a08408977c37f",
+    "test_records.py": "8fd14307f89ff325",
+    "build.nix": "a0e4275fa8aa61b5 (unchanged)",
+    "binary": "/nix/store/d4mp8j3p.../usr/bin/darwin-terminal-records, sha256 3a30b23a1e992b0c, from drv 64dajggw whose terminal-records.c input hashes to 28a78670"
+  },
+  "verdict": "APPROVE R1. The exported bytes are now one consistent snapshot, with SHA-256, chunk indices and a strict host decoder that fails closed on any interleaving, loss, reordering, truncation or mismatch.",
+  "verified": [
+    "Collector change: the open and stat checks are unchanged. The whole file (at most its cap) is read into a malloc'd buffer, then the same-inode/no-shrink/closed-size recheck runs, then CC_SHA256 over exactly that buffer (return value checked; CC_LONG cast is safe below 256 KiB). Then 'BEGIN ... bytes=N chunk_bytes=64', one 'DL11_RECORD_HEX <nonce> <name> index=i <hex>' line per 64-byte chunk, and 'END ... bytes=N chunks=C file_bytes_after=M sha256=<hex>'. Buffers are freed on every path. The live phase is still a prefix snapshot, now digest-consistent.",
+    "Binary: an arm64 executable linking only /usr/lib/libSystem.B.dylib. Imports: _CC_SHA256, open/openat/fstat/read/close, geteuid, malloc/free, printf/fflush/ferror/strcmp/strlen and the stack guard. No write, unlink or kill. CC_SHA256 is exported by libSystem 8ff49e0c.",
+    "Decoder: only lines starting with 'DL11_RECORD_' are considered, with CR removed and the input capped at 32 MiB. Each must match BEGIN/HEX/END/MISSING(errno=2) exactly, with the expected lowercase nonce and one of the 6 fixed names; REFUSED or any other form raises. BEGIN cannot nest or repeat and must be within the cap. HEX indices must be sequential with exactly min(64, remaining)*2 hex characters. END must match size, the payload length, a chunk count of ceil(N/64), after >= size (and == size when closed) and the SHA-256 of the reassembled payload. MISSING is allowed only in live and only for grid-final/result. All 6 names must be accounted for. A kernel line interleaved inside a record line, or prepended to one, causes a malformed line or a missing chunk, so it fails closed.",
+    "Tests re-run here: 7/7 OK, including the digest/chunk-count/order/complete-export test with corruption mutations."
+  ],
+  "notes": [
+    {"id": "D1", "severity": "note", "text": "One export per capture: a second export of the same nonce in the same console (for example live and closed in one boot) raises 'Repeated'. The planned separate bounded close cycle matches this; otherwise the host must slice the console per export."},
+    {"id": "D2", "severity": "runtime unknown", "text": "Indexed lines are about 215 bytes per 64 raw bytes, so a maximal export (about 312 KiB raw) is about 1.05 MB of console output. That is within the 32 MiB host bound, but the export time depends on unmeasured guest console throughput. Size the runtime from the first run."}
+  ],
+  "not_claimed": ["any terminal runtime", "record contents"],
+  "scope": "Read-only diff/source review, a .drv input check and host tests. No SDK build or hardware."
+}

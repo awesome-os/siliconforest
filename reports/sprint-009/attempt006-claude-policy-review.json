@@ -1,0 +1,99 @@
+{
+ "report": "attempt-006 independent review: ml_unsafe_kernel_text assert and the guest-ADT kernel-text policy fix",
+ "author_role": "independent reviewer (Claude), read-only",
+ "date": "2026-11-07",
+ "claim_class": "source_binary_and_capture_review",
+ "verdict": "APPROVE root's host fix: guest-only /chosen/kernel-ctrr-to-be-enabled = 4 zero bytes is the truthful, minimal input for this unprotected DEBUG kernel. Declare the DTrace behaviour change.",
+ "inputs": {
+  "booted_kc": {
+   "path": "/nix/store/z981hgxkw8s03ddi3cf15bdgxvl1zih9-puredarwin-kc-arm64-0.1/kernel",
+   "sha256": "518d90c935ecf6c1fafc6c6cd975063e1dc08e077878461671b2975a2a2e5c9d"
+  },
+  "kernel002": {
+   "path": "/nix/store/7fjh48gkqgrhy4q29ji9c2nk5hdnr8h6-puredarwin-kernel-arm64-t8103-bringup-0.1/System/Library/Kernels/kernel.debug.t8103",
+   "sha256": "ae5ff9414abc68e3b155ed8807ab87b2454a64bc334ae59b9ffe2db8ce605bc2",
+   "uuid": "856572B2-C5F1-3663-AB60-8E3314B9FF16 (equals the panic Kernel UUID)"
+  },
+  "capture": {
+   "attempt-006.tgz_sha256": "747df79994aa23507e2bc8554f03f8a45ee2673e212bebb10deb2633f47f7e6c",
+   "guest-006-console-partial.bin_sha256": "5ccf7c92ef52b99f8aa5c4d596dab87dfde8275d4fa65abee4d67e7bb1ff159c",
+   "note": "private; panic lines read locally, not copied"
+  },
+  "host_helper": {
+   "path": "integrations/puredarwin/m1-bringup/host_progress.py",
+   "sha256": "843e4d6140709d57e70760c8e00722b65f8825e58ea58b21a65ab967048acb3b",
+   "reviewed": "configure_kernel_text_policy (lines 58-76) and its call in run_worker (line 498)"
+  },
+  "xnu_sources_sha256 (bringup tree, unmodified files)": {
+   "osfmk/arm64/machine_routines.c": "6be2e7a03c2f8ef012c7d081f29fb61d39559832aceff52aeb627c099214c935",
+   "bsd/dev/dtrace/dtrace_subr.c": "1469e313ed1732f7cdfee246a3639cef0768637032c47609142099cac96e11c8",
+   "bsd/dev/dtrace/sdt.c": "7c04118cd00c34a0fb8d7fbdf2fc6b305a76c60d3b7b4a845a6060adfe3cf896",
+   "bsd/dev/dtrace/systrace.c": "be8c6f8fca90cf95d97bd653056b2ad1c6b1c7a19ca36ba95eac5c848ac4efdd",
+   "bsd/dev/dtrace/fbt.c": "52914300e7366f8a677a5659fcc429db7f01bd806cd9ccd43414c814ded99a12",
+   "iokit/Kernel/IOPlatformExpert.cpp": "8f3c03ac386a1d50ab35c61eadbe079ffb9fd77b59d1d803d346a74bc6af0b97"
+  }
+ },
+ "primary_panic": {
+  "message": "machine_routines.c:3426 Assertion failed: _unsafe_kernel_text_initialized",
+  "symbolicated_chain": "kernel_bootstrap_thread+0x298 -> bsd_init+0x8ac -> bsd_autoconf+0x54 -> sdt_init+0x40 -> dtrace_sdt_probes_restricted+0x10 -> ml_unsafe_kernel_text+0x5c (assert); KC slide 0xc0e8000",
+  "selector": "machine_routines.c:3419 '#if DEVELOPMENT || DEBUG || CONFIG_DTRACE || CONFIG_CSR_FROM_DT' compiles the assert variant (DEBUG kernel; config_dtrace via PERF_DBG_BASE in MASTER.arm64.t8103). Otherwise ml_unsafe_kernel_text() is a constant false.",
+  "writer_semantics": "ml_unsafe_kernel_text_init (STARTUP TUNABLES, RANK_FIRST) sets initialized only if /chosen has kernel-ctrr-to-be-enabled with size == 4; unsafe = (value == 0). It is the only reader of that property in xnu. The captured iBoot original ADT (attempt-005 copy and observed-original-adt.bin) does not contain it."
+ },
+ "consumers_in_this_build": [
+  {
+   "caller": "sdt_init (bsd/dev/dtrace/sdt.c:698)",
+   "when": "boot",
+   "via": "dtrace_sdt_probes_restricted"
+  },
+  {
+   "caller": "systrace_init (bsd/dev/dtrace/systrace.c:962)",
+   "when": "boot",
+   "via": "dtrace_sdt_probes_restricted"
+  },
+  {
+   "caller": "fbt_provide_module (fbt.c:476), DTRACEIOC paths (dtrace.c:18660, 18806)",
+   "when": "lazy, on DTrace consumer/module provide",
+   "via": "dtrace_fbt_probes_restricted (also CSR-gated)"
+  },
+  {
+   "caller": "platform_tests CTRR test (platform_tests.c:1570)",
+   "when": "only if tests run"
+  },
+  {
+   "caller": "pmap_ppl_disable (arm/pmap/pmap.c:2256)",
+   "when": "never here: inside #if XNU_MONITOR, compiled out"
+  }
+ ],
+ "truth_check": {
+  "kernel002_symbols_absent": [
+   "_rorgn_stash_range",
+   "_rorgn_lockdown",
+   "_find_lock_group_data",
+   "_pmap_ppl_disable",
+   "_ppl_handler_table",
+   "_pmap_cs_init"
+  ],
+  "kernel002_symbols_present": [
+   "_ml_unsafe_kernel_text",
+   "_ml_unsafe_kernel_text_init",
+   "_sdt_init",
+   "_systrace_init",
+   "_fbt_init"
+  ],
+  "conclusion": "No CTRR, PPL or PMAP_CS implementation is linked, so 'CTRR not to be enabled' (0) is accurate. A nonzero value would falsely claim CTRR."
+ },
+ "host_fix_review": {
+  "encoding": "m1n1 adt.py __setattr__ maps kernel_ctrr_to_be_enabled to 'kernel-ctrr-to-be-enabled'; _types (None, False) => raw bytes, size = len(value) = 4, template bit clear; value struct.pack('<I', 0); written into hv.adt['chosen'], the guest copy only",
+  "gate": "requires implementation_selectors_omitted to include KERNEL_INTEGRITY_CTRR, XNU_MONITOR, PMAP_CS and PMAP_CS_ENABLE, plus explicit kernel_text_hardware_locked False and PPL_protection_claimed False; the build record is bound to the KC via normal_image.verify_manifest (record.kernel_sha256 == artifact hash)",
+  "optional_hardening": "also derive the policy from the KC bytes (assert absence of rorgn/PPL symbols) so that a mislabeled record cannot pass"
+ },
+ "software_protection_impact": {
+  "page_tables": "unchanged; arm_vm_prot_init/finalize protections for __TEXT, __TEXT_EXEC and __DATA_CONST do not read this flag",
+  "dtrace_risk": "unsafe=true un-restricts DTrace. sdt_attach and systrace attach at boot (provider registration only, no text writes at boot). Enabling SDT/FBT probes later lets root userland patch kernel text through DTrace. That is consistent with an unprotected DEBUG kernel but must be declared in the receipt. These attach paths are first-time code on this target, so they are a plausible next breakpoint. If DTrace must stay disabled, that is a kernel-config decision (omit config_dtrace), not a false ADT value."
+ },
+ "secondary_finding": "Nested panics (entries 2 and 3) come from the platform kext reboot path (PSCI handler taking IORegistry locks during panic). Fix prepared separately: reports/sprint-009/platform-reboot-fix.json.",
+ "hardware_or_build_actions": "none",
+ "files_written": [
+  "reports/sprint-009/attempt006-claude-policy-review.json"
+ ]
+}

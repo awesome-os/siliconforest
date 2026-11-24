@@ -1,0 +1,303 @@
+--- a/src/Frameworks/AppKit/NSLayoutConstraint.m
++++ b/src/Frameworks/AppKit/NSLayoutConstraint.m
+@@ -254,6 +254,16 @@
+     return view;
+ }
+ 
++// the view of a tab view's selected item, which the tab view keeps the size of its content area
++static BOOL sfIsSelectedTabItemView(NSView *view) {
++    static Class tabView;
++    NSView *above = [view superview];
++
++    if (tabView == Nil)
++        tabView = NSClassFromString(@"NSTabView");
++    return tabView != Nil && [above isKindOfClass:tabView] && [[(id)above selectedTabViewItem] view] == view;
++}
++
+ // an item of a constraint that is the view taken out or a view inside it
+ static BOOL sfIsWithin(id item, NSView *removed) {
+     return item == removed || ([item isKindOfClass:[NSView class]] && [(NSView *)item isDescendantOf:removed]);
+@@ -548,6 +558,19 @@
+             // `above` is known by its alignment rectangle, the place was measured in its bounds
+             require(&layout, item->left, 1, above->left, -1, -(place.origin.x - insets.left), SFSolverEqual, SFSolverRequired);
+             require(&layout, item->top, 1, above->top, -1, -(place.origin.y - insets.top), SFSolverEqual, SFSolverRequired);
++            /* A tab view's selected item view fills the tab view's content area whatever its size (the tab
++             * view resizes it): its margins are held, not its size, so that what is in it can make the tab
++             * view, and the window, as large as it needs (Activity Monitor's inspector: the Memory rows were
++             * squeezed into the 90 points the nib's window left, one over another). */
++            if ([view superview] == above->view && sfIsSelectedTabItemView(view)) {
++                NSRect bounds = [above->view bounds];
++                CGFloat aboveWidth = bounds.size.width - insets.left - insets.right;
++                CGFloat aboveHeight = bounds.size.height - insets.top - insets.bottom;
++
++                require(&layout, item->width, 1, above->width, -1, aboveWidth - place.size.width, SFSolverEqual, SFSolverRequired);
++                require(&layout, item->height, 1, above->height, -1, aboveHeight - place.size.height, SFSolverEqual, SFSolverRequired);
++                continue;
++            }
+             require(&layout, item->width, 1, 0, 0, -place.size.width, SFSolverEqual, SFSolverRequired);
+             require(&layout, item->height, 1, 0, 0, -place.size.height, SFSolverEqual, SFSolverRequired);
+             continue;
+--- a/src/Frameworks/AppKit/NSWindow.m
++++ b/src/Frameworks/AppKit/NSWindow.m
+@@ -38,6 +38,7 @@
+ #import <AppKit/NSColorSpace.h>
+ #import <AppKit/NSTextField.h>
+ #import <objc/runtime.h>
++#import <objc/message.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <sys/stat.h>
+@@ -2659,9 +2660,43 @@
+    [self setFrame:frame display:YES];
+ }
+ 
++/* As macOS keeps a window at least as large as the required constraints of its content: a window about to be
++ * shown, or whose tab view showed another tab, is made larger (its top left kept) where its content's fitting
++ * size is larger than its content. Activity Monitor's inspector came out at its nib's 274 points, its tab's rows
++ * squeezed one over another. Only for a content view laid out by constraints; never past contentMaxSize. */
++-(void)_sfGrowToFitContent {
++   NSView *content=[self contentView];
++
++   if(content==nil || [[content performSelector:@selector(constraints)] count]==0)
++    return;
++
++   NSSize fit=((NSSize (*)(id,SEL))objc_msgSend)(content,@selector(fittingSize)),now=[content frame].size;
++
++   if(fit.width<=now.width+0.5 && fit.height<=now.height+0.5)
++    return;
++
++   NSSize want=NSMakeSize(MAX(now.width,ceil(fit.width)),MAX(now.height,ceil(fit.height)));
++   NSSize max=[self contentMaxSize];
++
++   if(max.width>0 && want.width>max.width) want.width=MAX(now.width,max.width);
++   if(max.height>0 && want.height>max.height) want.height=MAX(now.height,max.height);
++
++   NSRect frame=[self frame];
++   NSRect newFrame=[self frameRectForContentRect:NSMakeRect(0,0,want.width,want.height)];
++
++   newFrame.origin.x=frame.origin.x;
++   newFrame.origin.y=NSMaxY(frame)-newFrame.size.height;
++   if(getenv("SF_WINFRAME_TRACE")!=NULL)
++    fprintf(stderr,"PD-WINFRAME %p grows to fit its content: content %s, fitting %s\n",self,[NSStringFromSize(now) UTF8String],[NSStringFromSize(fit) UTF8String]);
++   [self setFrame:newFrame display:_isVisible];
++}
++
+ -(void)orderWindow:(NSWindowOrderingMode)place relativeTo:(int)relativeTo {
+    BOOL wasVisible=_isVisible;
+ 
++   if(!wasVisible && place!=NSWindowOut)
++    [self _sfGrowToFitContent];
++
+    // a tab of a group: it takes the group's toplevel, or hands it to the tab beside it (NSWindowTabbing.m)
+    if([self _sfTabOrderWindow:place relativeTo:relativeTo])
+     return;
+--- a/src/Frameworks/AppKit/NSTabView.m
++++ b/src/Frameworks/AppKit/NSTabView.m
+@@ -384,6 +384,9 @@
+ // Since we're not opaque, we need to redraw the superview too
+ // Shouldn't the view machinery do this automatically?? it might now
+        [[self superview] setNeedsDisplay:YES];
++       // the tab shown may need more room than the one before (NSWindow.m)
++       if([[self window] isVisible] && [[self window] respondsToSelector:@selector(_sfGrowToFitContent)])
++        [[self window] performSelector:@selector(_sfGrowToFitContent)];
+     }
+ }
+ 
+--- a/src/Frameworks/AppKit/NSViewLayout.m
++++ b/src/Frameworks/AppKit/NSViewLayout.m
+@@ -166,6 +166,30 @@
+ - (NSRect)boundingRectWithSize:(NSSize)size options:(NSStringDrawingOptions)options;
+ @end
+ 
++// the view's width is set by something other than its own size: its frame, or a constraint that fixes its trailing
++// edge or its width (held by the view or by any view above it)
++static BOOL sfWidthSetFromOutside(NSView *view) {
++    if ([view translatesAutoresizingMaskIntoConstraints])
++        return YES;
++    for (NSView *holder = view; holder != nil; holder = [holder superview]) {
++        for (NSLayoutConstraint *c in [holder constraints]) {
++            NSLayoutAttribute a;
++
++            if (![c isActive] || [c priority] < NSLayoutPriorityDefaultHigh || [c relation] != NSLayoutRelationEqual)
++                continue;
++            if ([c firstItem] == view)
++                a = [c firstAttribute];
++            else if ([c secondItem] == view)
++                a = [c secondAttribute];
++            else
++                continue;
++            if (a == NSLayoutAttributeTrailing || a == NSLayoutAttributeRight || a == NSLayoutAttributeWidth)
++                return YES;
++        }
++    }
++    return NO;
++}
++
+ @implementation NSControl (NSViewLayout)
+ 
+ // a label: text only, nothing drawn around it and nothing to type into
+@@ -203,10 +227,17 @@
+     /* A wrapping label longer than the width it was given (a nib's explanatory text, whose preferred
+      * width is "automatic": the width it is laid out at) is as tall as its lines at that width, as on
+      * macOS; it answered one line, and the rest of the text was cut off (Terminal's Profiles > Tab). */
+-    if ([self _sfIsLabel] && [cell wraps]) {
++    if ([self _sfIsLabel] && [cell wraps] && ![cell usesSingleLineMode]) {
+         CGFloat width = [self frame].size.width - insets.left - insets.right;
++        /* ... only when something else sets that width: its frame (a view placed by its autoresizing mask), or a
++         * required or high constraint that fixes its trailing edge or its width. A label whose width is its own (its
++         * leading edge or its centre placed, Activity Monitor's inspector values and its sample window's status)
++         * asks for its text on one line, as macOS widens it: it had kept the width of an earlier, shorter text
++         * ("0 bytes", "<Status>") and wrapped "391.08 GB" onto the row below, the status one word per line */
++        NSUInteger length = [[cell stringValue] length];
++        BOOL shortValue = length <= 40 && size.width <= width * 1.5;   // a value a little too wide for its column
+ 
+-        if (width > 8 && size.width > width + 1) {
++        if (width > 8 && size.width > width + 1 && !shortValue && sfWidthSetFromOutside(self)) {
+             NSRect lines = [[cell attributedStringValue] boundingRectWithSize:NSMakeSize(width - 4, 100000)
+                                                                        options:NSStringDrawingUsesLineFragmentOrigin];
+ 
+--- a/src/Frameworks/AppKit/NSControl.m
++++ b/src/Frameworks/AppKit/NSControl.m
+@@ -68,6 +68,13 @@
+     NSKeyedUnarchiver *keyed=(NSKeyedUnarchiver *)coder;
+ 
+     [self setCell:[keyed decodeObjectForKey:@"NSCell"]];
++    /* nibs since 10.10 say the line break mode and single line mode on the control too; the control's word is the
++     * one Interface Builder shows (Activity Monitor's inspector values: single line, read as wrapping from the
++     * cell's flags, wrapped "391.08 GB" over two lines on a label as wide as "0 bytes") */
++    if([keyed containsValueForKey:@"NSControlLineBreakMode"])
++     [_cell setLineBreakMode:(NSLineBreakMode)[keyed decodeIntegerForKey:@"NSControlLineBreakMode"]];
++    if([keyed containsValueForKey:@"NSControlUsesSingleLineMode"])
++     [_cell setUsesSingleLineMode:[keyed decodeBoolForKey:@"NSControlUsesSingleLineMode"]];
+    }
+    else {
+     [NSException raise:NSInvalidArgumentException format:@"%@ can not initWithCoder:%@",[self class],[coder class]];
+--- a/src/Frameworks/AppKit/NSCell.h
++++ b/src/Frameworks/AppKit/NSCell.h
+@@ -153,6 +153,8 @@
+ - (NSImage *)image;
+ - (NSTextAlignment)alignment;
+ - (NSLineBreakMode)lineBreakMode;
++- (BOOL)usesSingleLineMode;
++- (void)setUsesSingleLineMode:(BOOL)flag;
+ - (NSWritingDirection)baseWritingDirection;
+ - (BOOL)wraps;
+ - (NSString *)title;
+--- a/src/Frameworks/AppKit/NSCell.m
++++ b/src/Frameworks/AppKit/NSCell.m
+@@ -16,6 +16,9 @@
+ #import <AppKit/NSAttributedString.h>
+ #import <AppKit/NSColor.h>
+ #import <AppKit/NSCursor.h>
++#import <objc/runtime.h>
++
++static char sfSingleLineModeKey;
+ #import <AppKit/NSControl.h>
+ #import <AppKit/NSClipView.h>
+ #import <Foundation/NSKeyedArchiver.h>
+@@ -87,7 +90,9 @@
+ 
+        // invalidFont   = (flags & 0x00008000)
+        // cellReserved1 = (flags & 0x00001800)
+-       // singleLineMode= (flags & 0x00000400)
++       // singleLineMode= (flags & 0x00000400): a label that keeps to one line whatever its line break mode
++       if(flags & 0x00000400)
++        objc_setAssociatedObject(self,&sfSingleLineModeKey,[NSNumber numberWithBool:YES],OBJC_ASSOCIATION_RETAIN);
+        // actOnMouseDrag= (flags & 0x00000100)
+        // isLoaded      = (flags & 0x00000080)
+        // truncLastLine = (flags & 0x00000040)
+@@ -272,6 +277,15 @@
+    return _lineBreakMode;
+ }
+ 
++// macOS's single line mode (the nib's flag): the text keeps to one line (NSViewLayout.m: no wrapped height)
++-(BOOL)usesSingleLineMode {
++   return [objc_getAssociatedObject(self,&sfSingleLineModeKey) boolValue];
++}
++
++-(void)setUsesSingleLineMode:(BOOL)flag {
++   objc_setAssociatedObject(self,&sfSingleLineModeKey,flag?[NSNumber numberWithBool:YES]:nil,OBJC_ASSOCIATION_RETAIN);
++}
++
+ -(NSWritingDirection)baseWritingDirection {
+    return _writingDirection;
+ }
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -114,6 +114,55 @@
+ static BOOL sfMenuNeedsPublish = YES;
+ static NSTimeInterval sfMenuNextAttempt;
+ static NSTimeInterval sfMenuNextValidate;
++
++/* SF_VIEW_DUMP=1: SIGUSR2 asks for every window's view tree on stderr (class, frame, hidden, text, the constraints a
++ * view holds, its intrinsic size), written at the next pass of the event loop: where a nib's layout came out wrong */
++static volatile sig_atomic_t sfViewDumpAsked;
++
++static void sfViewDumpSignal(int sig) {
++   sfViewDumpAsked=1;
++}
++
++static void sfViewDumpView(NSView *view,int depth) {
++   NSRect f=[view frame];
++   NSString *text=nil;
++
++   char cellInfo[96]="";
++
++   if([view isKindOfClass:[NSControl class]]){
++    text=[(NSControl *)view stringValue];
++    NSCell *cell=[(NSControl *)view cell];
++    if(cell!=nil)
++     snprintf(cellInfo,sizeof(cellInfo)," lineBreak=%d singleLine=%d wraps=%d",(int)[cell lineBreakMode],[cell usesSingleLineMode],[cell wraps]);
++   }
++   if(text==nil && [view isKindOfClass:NSClassFromString(@"NSTextView")])
++    text=[(id)view string];
++   if([text length]>48)
++    text=[[text substringToIndex:48] stringByAppendingString:@"..."];
++   NSArray *held=[view respondsToSelector:@selector(constraints)]?[view performSelector:@selector(constraints)]:nil;
++   NSSize ics=[view respondsToSelector:@selector(intrinsicContentSize)]?((NSSize (*)(id,SEL))objc_msgSend)(view,@selector(intrinsicContentSize)):NSZeroSize;
++   BOOL tamic=[view respondsToSelector:@selector(translatesAutoresizingMaskIntoConstraints)]?((BOOL (*)(id,SEL))objc_msgSend)(view,@selector(translatesAutoresizingMaskIntoConstraints)):YES;
++
++   fprintf(stderr,"PD-VIEW %*s%s %p {%.1f %.1f %.1f %.1f}%s%s%s%s constraints=%lu intrinsic={%.1f %.1f}%s%s%s\n",depth*2,"",
++           object_getClassName(view),view,f.origin.x,f.origin.y,f.size.width,f.size.height,
++           [view isHidden]?" hidden":"",[view isFlipped]?" flipped":"",
++           tamic?"":" noTAMIC",
++           cellInfo,(unsigned long)[held count],ics.width,ics.height,
++           text?" \"":"",text?[text UTF8String]:"",text?"\"":"");
++   for(NSView *sub in [view subviews])
++    sfViewDumpView(sub,depth+1);
++}
++
++static void sfViewDumpWindows(void) {
++   for(NSWindow *w in [NSApp windows]){
++    if(![w isVisible])
++     continue;
++    fprintf(stderr,"PD-VIEW window %s %p \"%s\" frame %s content %s\n",object_getClassName(w),w,[[w title] UTF8String],
++            [NSStringFromRect([w frame]) UTF8String],[NSStringFromRect([[w contentView] frame]) UTF8String]);
++    sfViewDumpView([w contentView],1);
++   }
++   fflush(stderr);
++}
+ static BOOL sfMenuLoggedWaitingForMenu;
+ static BOOL sfMenuLoggedWaitingForServer;
+ 
+@@ -1612,6 +1661,8 @@
+ 
+    [self _listenForOtherApplications];
+    [NSWindow _sfStartAppMenuServer];   // the desk's window menu reads the main menu through it (NSWindowMenuStrip.m)
++   if(getenv("SF_VIEW_DUMP")!=NULL)
++    signal(SIGUSR2,sfViewDumpSignal);
+ 
+    NS_DURING
+     [[NSNotificationCenter defaultCenter] postNotificationName: NSApplicationWillFinishLaunchingNotification object:self];
+@@ -1878,6 +1929,11 @@
+    if(pthread_main_np())
+     _dispatch_main_queue_callback_4CF(NULL);
+ 
++   if (sfViewDumpAsked) {
++    sfViewDumpAsked = 0;
++    sfViewDumpWindows();
++   }
++
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    // the menu bar never asks, so enabled states are revalidated here a few times a second
+    // and a change goes out with the next publish; only while a menu bar server takes them: a window's

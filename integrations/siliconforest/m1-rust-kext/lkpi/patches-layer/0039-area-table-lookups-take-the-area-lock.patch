@@ -1,0 +1,110 @@
+haiku areas: lookups and delete take the area lock
+
+Audit finding W6. area_add() wrote a slot under sAreaLock, but area_for(),
+_get_area_info() and delete_area() read and freed slots without it. ksize()/krealloc()/
+kfree() of any allocation above 16 KiB (the Rust side's large vectors, contiguous
+buffers) go through them from every cpu: a slot being reused was read half written, and
+the size copied by krealloc, or the block freed, came from the wrong record.
+
+--- a/src/Kernel/fbsdkpi/sf/sf_haiku_kernel.cpp
++++ b/src/Kernel/fbsdkpi/sf/sf_haiku_kernel.cpp
+@@ -1054,47 +1054,82 @@
+ 	return id;
+ }
+ 
++// the lookups and the delete take sAreaLock as area_add does: a slot being reused on another
++// cpu was read half written (kind of the new area, address or size of the old), and a large
++// block's size, or the block to free, was taken from the wrong record
+ area_id
+ area_for(void *address)
+ {
++	area_id found = B_ERROR;
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&sAreaLock);
+ 	for (int i = 0; i < SF_AREA_SLOTS; i++) {
+ 		if (sAreas[i].kind != AREA_FREE && (uint8 *)address >= (uint8 *)sAreas[i].address
+-				&& (uint8 *)address < (uint8 *)sAreas[i].address + sAreas[i].size)
+-			return sAreas[i].id;
++				&& (uint8 *)address < (uint8 *)sAreas[i].address + sAreas[i].size) {
++			found = sAreas[i].id;
++			break;
++		}
+ 	}
+-	return B_ERROR;
++	release_spinlock(&sAreaLock);
++	restore_interrupts(state);
++	return found;
+ }
+ 
+ status_t
+ _get_area_info(area_id id, area_info *info, size_t size)
+ {
++	status_t status = B_BAD_VALUE;
++	void *address = NULL;
++	size_t areaSize = 0;
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&sAreaLock);
+ 	for (int i = 0; i < SF_AREA_SLOTS; i++) {
+ 		if (sAreas[i].kind != AREA_FREE && sAreas[i].id == id) {
+-			memset(info, 0, size);
+-			info->area = id;
+-			info->address = sAreas[i].address;
+-			info->size = sAreas[i].size;
+-			info->ram_size = sAreas[i].size;
+-			return B_OK;
++			address = sAreas[i].address;
++			areaSize = sAreas[i].size;
++			status = B_OK;
++			break;
+ 		}
+ 	}
+-	return B_BAD_VALUE;
++	release_spinlock(&sAreaLock);
++	restore_interrupts(state);
++	if (status == B_OK) {
++		memset(info, 0, size);
++		info->area = id;
++		info->address = address;
++		info->size = areaSize;
++		info->ram_size = areaSize;
++	}
++	return status;
+ }
+ 
+ status_t
+ delete_area(area_id id)
+ {
++	void *address = NULL;
++	size_t areaSize = 0;
++	int kind = AREA_FREE;
++	// the slot is given up under the lock, the memory is released after it
++	cpu_status state = disable_interrupts();
++	acquire_spinlock(&sAreaLock);
+ 	for (int i = 0; i < SF_AREA_SLOTS; i++) {
+ 		if (sAreas[i].kind != AREA_FREE && sAreas[i].id == id) {
+-			if (sAreas[i].kind == AREA_CONTIG)
+-				sfos_free_contig(sAreas[i].address, sAreas[i].size);
+-			else
+-				sfos_unmap_phys(sAreas[i].address, sAreas[i].size);
++			address = sAreas[i].address;
++			areaSize = sAreas[i].size;
++			kind = sAreas[i].kind;
+ 			sAreas[i].kind = AREA_FREE;
+-			return B_OK;
++			break;
+ 		}
+ 	}
+-	return B_BAD_VALUE;
++	release_spinlock(&sAreaLock);
++	restore_interrupts(state);
++	if (kind == AREA_FREE)
++		return B_BAD_VALUE;
++	if (kind == AREA_CONTIG)
++		sfos_free_contig(address, areaSize);
++	else
++		sfos_unmap_phys(address, areaSize);
++	return B_OK;
+ }
+ 
+ int32
+

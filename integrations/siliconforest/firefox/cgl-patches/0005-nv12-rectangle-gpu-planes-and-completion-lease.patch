@@ -1,0 +1,147 @@
+--- a/src/Frameworks/OpenGL/CGL.c
++++ b/src/Frameworks/OpenGL/CGL.c
+@@ -1004,6 +1004,8 @@
+ 	size_t (*elementBytes)(IOSurfaceRef, size_t);
+ 	int (*gpuCopyFD)(IOSurfaceRef);
+ 	size_t (*gpuOffset)(IOSurfaceRef);
++    size_t (*gpuPlaneOffset)(IOSurfaceRef,size_t),(*planeWidth)(IOSurfaceRef,size_t),(*planeHeight)(IOSurfaceRef,size_t);
++    void (*incrementUse)(IOSurfaceRef),(*decrementUse)(IOSurfaceRef);
+ 	size_t (*width)(IOSurfaceRef),(*height)(IOSurfaceRef);
+ 	uint32_t (*pixelFormat)(IOSurfaceRef);
+ } sf_iosurface;
+@@ -1022,6 +1024,11 @@
+ 	sf_iosurface.elementBytes = dlsym(lib, "IOSurfaceGetBytesPerElementOfPlane");
+ 	sf_iosurface.gpuCopyFD = dlsym(lib, "IOSurfaceSFGPUCopyFD");
+ 	sf_iosurface.gpuOffset = dlsym(lib, "IOSurfaceSFGPUGetOffset");
++    sf_iosurface.gpuPlaneOffset=dlsym(lib,"IOSurfaceSFGPUGetPlaneOffset");
++    sf_iosurface.planeWidth=dlsym(lib,"IOSurfaceGetWidthOfPlane");
++    sf_iosurface.planeHeight=dlsym(lib,"IOSurfaceGetHeightOfPlane");
++    sf_iosurface.incrementUse=dlsym(lib,"IOSurfaceIncrementUseCount");
++    sf_iosurface.decrementUse=dlsym(lib,"IOSurfaceDecrementUseCount");
+ 	sf_iosurface.width=dlsym(lib,"IOSurfaceGetWidth");
+ 	sf_iosurface.height=dlsym(lib,"IOSurfaceGetHeight");
+ 	sf_iosurface.pixelFormat=dlsym(lib,"IOSurfaceGetPixelFormat");
+@@ -1349,19 +1356,24 @@
+     t->gpu_texture=0;t->gpu_image=EGL_NO_IMAGE_KHR;
+ }
+ static int sf_cgl_ensure_gpu(struct sf_cgl_surftex *t) {
+-    if(!sf_iosurface.gpuCopyFD||!sf_iosurface.gpuOffset||t->plane||
+-       !sf_iosurface.gpuOffset(t->surface)||t->format!=GL_BGRA||
+-       t->type!=GL_UNSIGNED_INT_8_8_8_8_REV||t->element_bytes!=4)
+-        return 0;
++    int nv12=(t->format==GL_RED||t->format==GL_RG)&&t->type==GL_UNSIGNED_BYTE;
++    if(!sf_iosurface.gpuCopyFD||!sf_iosurface.gpuOffset||!sf_iosurface.gpuOffset(t->surface))return 0;
++    if(nv12){
++        // Rectangle sampling has independent GL storage after the GPU blit.
++        // Do not enable direct NV12 aliases without a cross-context fence lease.
++        if(t->target!=GL_TEXTURE_RECTANGLE||!sf_iosurface.gpuPlaneOffset||t->plane>1||
++           t->element_bytes!=(t->plane?2:1))return 0;
++    }else if(t->plane||t->format!=GL_BGRA||t->type!=GL_UNSIGNED_INT_8_8_8_8_REV||t->element_bytes!=4)return 0;
+     pthread_once(&sf_cgl_present_once,sf_cgl_load_present);
+     if(!sf_present.createImage||!sf_present.destroyImage||!sf_present.targetTexture)return 0;
+     if(t->gpu_image)return 1;
+     int fd=sf_iosurface.gpuCopyFD(t->surface);
+     if(fd<0)return 0;
+-    size_t offset=sf_iosurface.gpuOffset(t->surface);
+-    if(offset>INT32_MAX||t->row_bytes>INT32_MAX){close(fd);return 0;}
++    size_t offset=nv12?sf_iosurface.gpuPlaneOffset(t->surface,t->plane):sf_iosurface.gpuOffset(t->surface);
++    if(!offset||offset>INT32_MAX||t->row_bytes>INT32_MAX){close(fd);return 0;}
++    EGLint fourcc=nv12?(t->plane?0x38385247:0x20203852):0x34325241;
+     EGLint attributes[]={EGL_WIDTH,t->width,EGL_HEIGHT,t->height,
+-        EGL_LINUX_DRM_FOURCC_EXT,0x34325241, // DRM_FORMAT_ARGB8888: native BGRA bytes
++        EGL_LINUX_DRM_FOURCC_EXT,fourcc, // DRM_FORMAT_ARGB8888: native BGRA bytes
+         EGL_DMA_BUF_PLANE0_FD_EXT,fd,EGL_DMA_BUF_PLANE0_OFFSET_EXT,(EGLint)offset,
+         EGL_DMA_BUF_PLANE0_PITCH_EXT,(EGLint)t->row_bytes,
+         EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,0,EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,0,EGL_NONE};
+@@ -1369,7 +1381,7 @@
+     close(fd);
+     return t->gpu_image!=EGL_NO_IMAGE_KHR;
+ }
+-static int sf_cgl_gpu_transfer(struct sf_cgl_surftex *t,int to_surface) {
++static int sf_cgl_gpu_transfer_unleased(struct sf_cgl_surftex *t,int to_surface) {
+     if(!sf_cgl_ensure_gpu(t))return 0;
+     void (*finish)(void)=(void *)eglGetProcAddress("glFinish");
+     if(!finish)return 0;
+@@ -1411,13 +1423,29 @@
+         blit(0,0,t->width,t->height,0,0,t->width,t->height,GL_COLOR_BUFFER_BIT,GL_NEAREST);
+         good=glGetError()==GL_NO_ERROR;
+         if(to_surface)finish(); // publish only after the writer is complete
+-        if(good)sf_gpu_stats[2]+=(uint64_t)t->width*t->height*4;
++        if(good)sf_gpu_stats[2]+=(uint64_t)t->width*t->height*t->element_bytes;
+     }
+     if(scissor)glEnable(GL_SCISSOR_TEST);if(srgb)glEnable(GL_FRAMEBUFFER_SRGB);
+     glBindFramebuffer(GL_READ_FRAMEBUFFER,(GLuint)read_fbo);
+     glBindFramebuffer(GL_DRAW_FRAMEBUFFER,(GLuint)draw_fbo);
+     deleteFBOs(2,framebuffers);
+     return good;
++}
++// NV12 RECT reads complete before returning: GL owns an independent texture,
++// so later sampling (including shared contexts) cannot touch decoder storage.
++// The global use covers import+blit+actual glFinish, not just metadata retention.
++static int sf_cgl_gpu_transfer(struct sf_cgl_surftex *t,int to_surface) {
++    int nv12=(t->format==GL_RED||t->format==GL_RG)&&t->type==GL_UNSIGNED_BYTE;
++    if(!nv12)return sf_cgl_gpu_transfer_unleased(t,to_surface);
++    void (*finish)(void)=(void *)eglGetProcAddress("glFinish");
++    if(t->target!=GL_TEXTURE_RECTANGLE||!finish||!sf_iosurface.incrementUse||!sf_iosurface.decrementUse)return 0;
++    sf_iosurface.incrementUse(t->surface);
++    int good=sf_cgl_gpu_transfer_unleased(t,to_surface);
++    finish();
++    int completed=glGetError()==GL_NO_ERROR;
++    if(completed)sf_iosurface.decrementUse(t->surface);
++    else fprintf(stderr,"FXNV12LEASE completion=0 quarantined=1\n");
++    return good&&completed;
+ }
+ static int sf_cgl_try_gpu_binding(CGLContextObj ctx,GLenum target,IOSurfaceRef surface,GLuint plane,
+     GLsizei width,GLsizei height,GLenum internal_format,GLenum format,GLenum type,size_t row_bytes,size_t element_bytes);
+@@ -1465,7 +1493,9 @@
+     EGLImage gpu_image=EGL_NO_IMAGE_KHR;GLuint gpu_texture=0;
+     if(i>=0){
+         struct sf_cgl_surftex *old=&sf_cgl_surftexs[i];
+-        if(old->surface==surface&&old->width==width&&old->height==height&&old->target==target){
++        if(old->surface==surface&&old->width==width&&old->height==height&&old->target==target&&
++           old->plane==plane&&old->format==format&&old->type==type&&
++           old->row_bytes==row_bytes&&old->element_bytes==element_bytes){
+             gpu_image=old->gpu_image;gpu_texture=old->gpu_texture;
+         }else sf_cgl_drop_gpu(old);
+     }
+@@ -1498,10 +1528,25 @@
+ 
+ static int sf_cgl_try_gpu_binding(CGLContextObj ctx,GLenum target,IOSurfaceRef surface,GLuint plane,
+     GLsizei width,GLsizei height,GLenum internal_format,GLenum format,GLenum type,size_t row_bytes,size_t element_bytes) {
+-    if(!sf_iosurface.gpuOffset||!sf_iosurface.gpuOffset(surface)||plane||
+-       (target!=GL_TEXTURE_2D&&target!=GL_TEXTURE_RECTANGLE)||format!=GL_BGRA||
+-       type!=GL_UNSIGNED_INT_8_8_8_8_REV||element_bytes!=4||
+-       (internal_format!=GL_RGBA&&internal_format!=GL_RGBA8))return 0;
++    if(!sf_iosurface.gpuOffset||!sf_iosurface.gpuOffset(surface)||
++       (target!=GL_TEXTURE_2D&&target!=GL_TEXTURE_RECTANGLE))return 0;
++    GLenum storage=GL_RGBA8;
++    if(format==GL_BGRA){
++        if(plane||type!=GL_UNSIGNED_INT_8_8_8_8_REV||element_bytes!=4||
++           (internal_format!=GL_RGBA&&internal_format!=GL_RGBA8))return 0;
++    }else{
++        if(target!=GL_TEXTURE_RECTANGLE||!sf_iosurface.pixelFormat||
++           !sf_iosurface.planeWidth||!sf_iosurface.planeHeight||!sf_iosurface.gpuPlaneOffset||
++           !sf_iosurface.incrementUse||!sf_iosurface.decrementUse)return 0;
++        uint32_t pixel=sf_iosurface.pixelFormat(surface);
++        if((pixel!=0x34323076&&pixel!=0x34323066)||sf_iosurface.planeCount(surface)!=2||plane>1||
++           type!=GL_UNSIGNED_BYTE||element_bytes!=(plane?2:1)||format!=(plane?GL_RG:GL_RED)||
++           sf_iosurface.planeWidth(surface,plane)!=(size_t)width||
++           sf_iosurface.planeHeight(surface,plane)!=(size_t)height||
++           row_bytes<(size_t)width*element_bytes)return 0;
++        storage=plane?0x822b:0x8229; // GL_RG8 / GL_R8
++        if(internal_format!=format&&internal_format!=storage)return 0;
++    }
+     sf_cgl_track_surface(ctx,target,surface,plane,width,height,format,type,row_bytes,element_bytes);
+     GLint texture=0;
+     glGetIntegerv(target==GL_TEXTURE_RECTANGLE?GL_TEXTURE_BINDING_RECTANGLE:GL_TEXTURE_BINDING_2D,&texture);
+@@ -1513,8 +1558,8 @@
+             glGetTexLevelParameteriv(target,0,GL_TEXTURE_WIDTH,&tw);
+             glGetTexLevelParameteriv(target,0,GL_TEXTURE_HEIGHT,&th);
+             glGetTexLevelParameteriv(target,0,GL_TEXTURE_INTERNAL_FORMAT,&tf);
+-            if(tw!=width||th!=height||tf!=GL_RGBA8)
+-                glTexImage2D(target,0,GL_RGBA8,width,height,0,format,type,NULL);
++            if(tw!=width||th!=height||tf!=(GLint)storage)
++                glTexImage2D(target,0,storage,width,height,0,format,type,NULL);
+         }
+         good=sf_cgl_gpu_transfer(&sf_cgl_surftexs[index],0);
+     }

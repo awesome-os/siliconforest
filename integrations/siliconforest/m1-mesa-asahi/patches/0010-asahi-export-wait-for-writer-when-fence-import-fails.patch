@@ -1,0 +1,32 @@
+--- b/src/asahi/lib/agx_device.c	2026-11-10 13:21:18.291050497 -0800
++++ c/src/asahi/lib/agx_device.c	2026-11-10 13:21:47.968125383 -0800
+@@ -638,9 +638,26 @@
+       ret = agx_import_sync_file(dev, bo, out_sync_fd);
+       close(out_sync_fd);
+       if (ret) {
+-         error = ret < -1 ? -ret : (errno ? errno : EIO);
+-         stage = "DMA_BUF_IOCTL_IMPORT_SYNC_FILE on the new dma-buf fd (attaching the pending writer's fence)";
+-         goto error;
++         /* The fence could not be attached to the dma-buf.  The submit path
++          * already copes with that by waiting (agx_batch_submit); do the same
++          * here instead of refusing the export: once the writer has finished
++          * there is nothing left to synchronise.  Said out loud, because it
++          * means the kernel's dma-buf lacks the ioctl. */
++         int import_errno = ret < -1 ? -ret : (errno ? errno : EIO);
++         uint32_t writer_syncobj = agx_bo_writer_syncobj(writer);
++
++         ret = drmSyncobjWait(dev->fd, &writer_syncobj, 1, INT64_MAX,
++                              DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL, NULL);
++         fprintf(stderr,
++                 "asahi: DMA_BUF_IOCTL_IMPORT_SYNC_FILE failed on export of BO "
++                 "handle %u: errno %d (%s); waited for the writer instead: %s\n",
++                 bo->handle, import_errno, strerror(import_errno),
++                 ret ? "wait failed" : "done");
++         if (ret) {
++            error = import_errno;
++            stage = "DMA_BUF_IOCTL_IMPORT_SYNC_FILE on the new dma-buf fd, and the fallback wait for the writer";
++            goto error;
++         }
+       }
+    }
+ 

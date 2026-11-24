@@ -1,0 +1,41 @@
+--- a/src/Frameworks/AppKit/NSStringDrawer.m
++++ b/src/Frameworks/AppKit/NSStringDrawer.m
+@@ -84,6 +84,17 @@
+ // a generation of laid out strings: a table window's worth of cells and more
+ #define SF_TYPESET_LIMIT 800
+ 
++// SF_TYPESET_LIMIT=<n>: a smaller generation (to test the generations' turnover)
++static NSUInteger sfTypesetLimit(void) {
++    static NSUInteger limit;
++
++    if (limit == 0) {
++        const char *v = getenv("SF_TYPESET_LIMIT");
++        limit = (v != NULL && atoi(v) > 0) ? (NSUInteger)atoi(v) : SF_TYPESET_LIMIT;
++    }
++    return limit;
++}
++
+ @implementation NSStringDrawer
+ 
+ +(NSStringDrawer *)sharedStringDrawer {
+@@ -230,7 +241,10 @@
+ 
+    if(typeset!=nil)
+     return typeset;
+-   typeset=[_sfTypesetOld objectForKey:key];
++   /* kept by this call: the generation it was found in is let go below when the current one is full (the
++    * layout was then freed while it was drawn and kept: Activity Monitor's text came out garbled after a few
++    * minutes, cocoa 0131) */
++   typeset=[[[_sfTypesetOld objectForKey:key] retain] autorelease];
+    if(typeset==nil){
+     typeset=[[[SFTypeset alloc] init] autorelease];
+     // as the shared text system is made (NSTextStorage's -initWithAttributedString: answers a plain attributed string)
+@@ -253,7 +267,7 @@
+      typeset->_glyphs=[typeset->_layout glyphRangeForTextContainer:typeset->_container];
+     }
+    }
+-   if([_sfTypeset count]>=SF_TYPESET_LIMIT){
++   if([_sfTypeset count]>=sfTypesetLimit()){
+     [_sfTypesetOld release];
+     _sfTypesetOld=_sfTypeset;
+     _sfTypeset=nil;

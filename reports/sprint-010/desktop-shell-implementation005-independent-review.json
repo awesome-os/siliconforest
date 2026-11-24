@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "reviewer": "Grok (independent read-only source review; did not author 005)",
+  "status": "READ_ONLY_SOURCE_DELTA_REVIEW_NO_NATIVE_BUILD_NO_ADMISSION",
+  "prepared_utc": "2026-11-08T18:06:56+00:00",
+  "target": "integrations/puredarwin/chonkstep-darwin/desktop-shell/implementation-revisions/005",
+  "verdict": "NO_CONCRETE_DEFECT. The frozen three-file delta matches the stated D1 diagnostic and F1 cleanup contract. Source acceptance only. Host tests are not a Darwin run, and this review does not admit a native build or a boot.",
+  "pins": {
+    "source_validation_sha256": "e42f2db2ecf7156a13951cede799fc2e9f98ebf37c6cedab54499e6ea2112d54",
+    "source_set_sha256": "7454a5bb11f198a1f33755077855f37373f3ed8bed627236cf32aae7e667273b",
+    "incremental_source_set_sha256": "8e1faa96209b599d6db59fe9feb011a6e605283bff5316982561150a894da664",
+    "full_source_tree_sha256": "566870e3b88900e4d11b868ac783d031c7778964ab15f6b5feb483830baa4488",
+    "full_source_tree_logical_file_count": 3966,
+    "from_004_patch_sha256": "dfea110b263150a22617209320b56b5e7ba0c0b645225854807495ee80c7ffc8",
+    "previous_004_full_tree_sha256": "b1531f62a245dde0465b941cbfba0ef2935cf967a131da56174bef2ce6fc4b9d",
+    "previous_004_source_set_sha256": "949e3ec98938e5891c763b285c8203216970ab175bfcf4b855659facc77f09da"
+  },
+  "binding": {
+    "replay": "verify_checkpoint.py with assertions enabled printed: Verified005 cumulative 23 and incremental 3 files, full tree and dependencies; source only. It wrote only a temp scratch directory.",
+    "source_sets": "Recomputed cumulative after-hashes equal 7454a5bb and incremental after-hashes equal 8e1faa96. Both use sha256, two spaces, relative path, LF, sorted.",
+    "tree_delta": "Independent logical-byte compare of 004/source and 005/source, skipping target/.git/__pycache__, is 3966 files each. Exactly three paths differ, and their before/after hashes match incremental_changed_files: applications.rs 1e5fb445 -> 66749201, desktop.rs 17531785 -> fe870304, launch_audit.rs 27c6c55e -> d1ec474d. The cumulative changed_files list of 23 is the history versus the keyboard-only baseline, not a fourth 004-to-005 edit."
+  },
+  "defects": [],
+  "d1": {
+    "placement": "OwnedChild::poll_using calls exit_reason while WaitState is Running, then the existing WNOHANG waitpid. Application::service journals that reason before observe. A second poll after Reaped does not query again. The reason field is not an input to wait status, signals, completion, or has_failures.",
+    "waitid": "exited_without_reaping zero-fills siginfo_t and calls waitid(P_PID, pid, WEXITED|WNOHANG|WNOWAIT) through libc constants. Success is returned==0 and the reported pid equals the child. Apple reads the si_pid field; other targets call si_pid(). Pinned XNU bsd/kern/kern_exit.c:3387-3424 copyout's si_pid for SZOMB+WEXITED and calls reap_child_locked only when WNOWAIT is clear; the WNOWAIT path returns through out without a reap. bsd/kern/kern_exit.c:3520-3536 says WNOHANG leaves siginfo untouched, so zeroing si_pid first is the portable check. bsd/sys/wait.h defines WNOHANG 0x1, WEXITED 0x4, WNOWAIT 0x20.",
+    "proc_pidinfo": "Apple-only query_exit_reason uses flavor 24 then, only on ENOMEM, flavor 25. Packed Info is asserted 32 bytes (u32,u64,u64,u32,u64) and Basic 24 bytes (u32,u64,u64,u32), matching bsd/sys/proc_info.h proc_exitreasoninfo and proc_exitreasonbasicinfo. Flavors match bsd/sys/proc_info_private.h:172-176. bsd/kern/proc_info.c sets findzomb=1 for both flavors, copyin/copyout the struct, and returns the struct size on success. libproc proc_pidinfo returns that size, or 0 when __proc_info returns -1, leaving errno set. proc_pidexitreasoninfo allows the parent or tracer, returns ENOENT when p_exit_reason is null, and returns ENOMEM before any struct copyout when eri_kcd_buf is 0 or the payload buffer is shorter than the kcdata. The Rust call passes a 320-byte payload pointer in kcd_buf and copies min(reported, 320) bytes. ENOENT and every other errno become QueryFailed; the type comment states ENOENT means the kernel recorded no reason.",
+    "signal_reason_source": "bsd/kern/kern_sig.c build_signal_reason uses OS_REASON_SIGNAL and kcdata types KCDATA_TYPE_PID 0x36 and KCDATA_TYPE_PROCNAME 0x37 (osfmk/kern/kcdata.h:446-447 and the libkdd copy). SIGKILL and default-kill signals store that reason on the thread, and postsig_locked passes it to exit_with_reason, which assigns p_exit_reason. The 005 fixture payload beginning 0x36 is a hex example, not a kcdata parser. This review does not claim a SIGKILL will always have a reason: a null p_exit_reason is ENOENT and stays QueryFailed.",
+    "journal_bound": "LaunchAudit::append refuses a line longer than 1024 bytes and sets a sticky journal failure instead of writing it. now_ms is u64. The largest Full line this writer can emit, attempt 127 and ms u64::MAX and a 320-byte payload, is 825 bytes. The pinned host log records largest_exit_reason_journal_line_fits_the_journal_bound as passed. The diagnostic line cannot by itself trip the bound.",
+    "outcome": "The SIGKILL-shaped unit test reaps raw status 9, keeps the failure, and still records the reason. Linux real_host_exit_check_leaves_the_zombie_for_the_owner_to_reap passed in the pinned log: a live child is not reported exited, an exited child stays unreaped across a second waitid, and the owner then reaps exit status 3. On that host the reason is Unsupported. Darwin proc_pidinfo was not executed."
+  },
+  "f1": {
+    "behavior": "poll_desktop_shutdown still polls every owned application, then cleanup_state returns Pending if any completion is Pending, otherwise Incomplete if any is Incomplete, otherwise Complete only when shutdown_complete is true. shutdown_complete still requires closing and every application Complete. Empty-and-closing stays Complete. Incomplete is never rewritten to Complete. has_failures still treats Incomplete as a failure, and the seal still returns an error when desktop_failed is true.",
+    "attempt001_shape": "The 004 poll returned Incomplete as soon as shutdown_incomplete was true, so one terminal failure ended the coordinator loop while a sibling was still Pending. Pending now wins. The unit test one_incomplete_application_does_not_end_the_wait_for_another and the cleanup_state truth table passed in the pinned host log.",
+    "bound": "session_entry::drive is outside the three-file delta. After begin_shutdown it keeps calling cleanup only while the result is Pending, and after elapsed+10s it forces Incomplete. NativeIo::pause sleeps 8ms. The per-application schedule remains TERM, then KILL 5s later, then the reap deadline 3s after KILL, which fits in that 10s window when both applications are serviced on the same polls. F1 does not remove the bound and does not make a hung child Complete."
+  },
+  "residuals": [
+    "waitid and the following waitpid are not atomic. A child that exits after waitid reports not-exited, or a waitid EINTR followed by a successful waitpid in the same poll, is reaped with exit_reason left unset. The snapshot then says not_observed. Wait status, ownership, and the failure rule are unchanged.",
+    "The Apple proc_pidinfo path is compiled by the Darwin type-check only. It has not run. Host evidence for the syscall is the Linux WNOWAIT test, which records Unsupported.",
+    "005 session-result snapshots gain a line attempt=N exit_reason=... before the gate lines, and the journal gains event=ExitReason. That is required by this revision. The frozen attempt-001 qualification helper rejects unknown session-result lines, so that helper must not grade a 005 capture.",
+    "Darwin cargo check exit 0 reports one dead_code warning: UnavailableShim is unconstructed on the Apple + native-managed-spawn type-check. The host clippy log shows no warning. The warning does not change D1 or F1."
+  ],
+  "host_evidence": {
+    "tests_log_sha256": "6f92dac0a357578ac9da92c1f093efed5c87de10d95dc11788b7b8d5d66e5d22",
+    "tests": "Pinned validation/host-tests-005.log shows wm-darwin library tests 60 passed, 0 failed, and wayland_shm 5 passed, 0 failed, then exit=0. The log does not echo the cargo command. I did not re-run cargo.",
+    "clippy_log_sha256": "3097ff1686e07ba53342e1b7148f09fc67da0f4ad09c36a78be6f7368f26b97e",
+    "clippy": "Pinned validation/clippy-005.log is the two-line transcript 'Finished dev profile [unoptimized + debuginfo] target(s) in 0.11s' and exit=0. No warning text and no command echo. I did not re-run clippy.",
+    "darwin_typecheck_log_sha256": "8a3b886b8a9b4fa9f59c05a5bc998b515e2fa76889b840a9ba957d4bfcc433c6",
+    "darwin_typecheck": "Pinned validation/darwin-typecheck-005.log checks wm-darwin for the recorded aarch64-apple-darwin command, prints the UnavailableShim dead_code warning, finishes, and exit=0. The receipt's scope line says this is a type-check, not a link or run. I did not re-run it."
+  },
+  "xnu_tree": "Compared with sources/puredarwin-m1-desktop/src/Kernel/xnu and that tree's libSystem sources. _waitid and _proc_pidinfo are present in Libraries/libSystem/stub/libSystem.exports. This review did not disassemble the canonical libSystem.B.dylib 8ff49e0c binary and did not prove these headers are the bytes inside kernel 02fe2d41.",
+  "not_claimed": [
+    "a fix for APP14 SIGKILL",
+    "native 005 build, link, or execution",
+    "a runtime or boot result",
+    "physical input",
+    "performance",
+    "two visible windows or a framebuffer qualification",
+    "that the attempt-001 qualification helper can parse a 005 capture"
+  ],
+  "scope": "Read-only. verify_checkpoint.py, from-004.patch, the three Rust sources, session_entry drive, pinned XNU and libproc, kcdata headers, libSystem.exports, and the three validation logs. No edits to 005, no cargo, no SSH, no hardware."
+}

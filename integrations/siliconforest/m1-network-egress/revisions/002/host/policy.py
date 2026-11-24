@@ -1,0 +1,380 @@
+"""Original bounded DNS-correlation and fixed example.com HTTP egress policy.
+
+No sockets/configuration or system resolver calls. Packet decisions use bytes
+observed on the opted-in slirp channel, never a host getaddrinfo substitute.
+Every exception is terminal at the backend; direct callers must discard state.
+"""
+import ipaddress
+import struct
+import time
+
+GUEST = bytes([10, 0, 2, 15])
+DNS = bytes([10, 0, 2, 3])
+QUESTION = b"\x07example\x03com\0\0\1\0\1"
+MAX_HTTP = 65536
+
+
+def checksum(data):
+    if len(data) & 1:
+        data += b"\0"
+    total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while total >> 16:
+        total = (total & 65535) + (total >> 16)
+    return (~total) & 65535
+
+
+def parse_packet(packet):
+    if not 20 <= len(packet) <= 1500 or packet[0] != 0x45:
+        raise ValueError("IPv4 fixed header/length")
+    if struct.unpack_from("!H", packet, 2)[0] != len(packet) or checksum(packet[:20]):
+        raise ValueError("IPv4 total/checksum")
+    if struct.unpack_from("!H", packet, 6)[0] & 0xbfff:
+        raise ValueError("IPv4 fragments/reserved forbidden")
+    proto, src, dst, body = packet[9], packet[12:16], packet[16:20], packet[20:]
+    if proto not in (6, 17) or len(body) < (20 if proto == 6 else 8):
+        raise ValueError("TCP/UDP packet shape")
+    sport, dport = struct.unpack_from("!HH", body)
+    if not sport or not dport:
+        raise ValueError("zero transport port")
+    if proto == 17:
+        if struct.unpack_from("!H", body, 4)[0] != len(body):
+            raise ValueError("UDP length")
+        payload = body[8:]
+    else:
+        hlen = (body[12] >> 4) * 4
+        if not 20 <= hlen <= 60 or hlen > len(body) or body[12] & 15:
+            raise ValueError("TCP header/reserved")
+        payload = body[hlen:]
+    pseudo = src + dst + struct.pack("!BBH", 0, proto, len(body))
+    if (proto == 6 or body[6:8] != b"\0\0") and checksum(pseudo + body):
+        raise ValueError("transport checksum")
+    return proto, src, dst, sport, dport, body, payload
+
+
+def dns_name(data, offset):
+    labels, used, visited, cursor = [], None, set(), offset
+    for _ in range(64):
+        if cursor in visited or cursor >= len(data):
+            raise ValueError("DNS name loop/bounds")
+        visited.add(cursor)
+        length = data[cursor]
+        if length & 0xc0 == 0xc0:
+            if cursor + 1 >= len(data):
+                raise ValueError("DNS short pointer")
+            target = ((length & 63) << 8) | data[cursor + 1]
+            if target < 12 or target >= cursor:
+                raise ValueError("DNS pointer direction/bounds")
+            if used is None:
+                used = cursor + 2
+            cursor = target
+            continue
+        if length & 0xc0 or length > 63 or cursor + 1 + length > len(data):
+            raise ValueError("DNS label shape")
+        cursor += 1
+        if not length:
+            name = b".".join(labels).lower()
+            if len(name) > 253:
+                raise ValueError("DNS long name")
+            return name, cursor if used is None else used
+        label = data[cursor:cursor+length]
+        if any(c < 33 or c > 126 or c == 46 for c in label):
+            raise ValueError("DNS label characters")
+        labels.append(label); cursor += length
+    raise ValueError("DNS name step budget")
+
+
+def global_address(raw):
+    ip = ipaddress.IPv4Address(raw)
+    return (ip.is_global and not ip.is_multicast and not ip.is_reserved and
+            not ip.is_loopback and not ip.is_link_local and not ip.is_unspecified)
+
+
+def dns_answer(data, request):
+    if not 12 <= len(data) <= 512:
+        raise ValueError("DNS response size")
+    ident, flags, qd, an, ns, ar = struct.unpack_from("!6H", data)
+    if ident != struct.unpack_from("!H", request)[0] or not flags & 0x8000:
+        raise ValueError("DNS transaction/QR")
+    if flags & 0x7a4f or not flags & 0x0100:  # opcode, TC, reserved Z, rcode
+        raise ValueError("DNS opcode/truncation/rcode/RD")
+    if qd != 1 or not 1 <= an <= 16 or ns > 16 or ar > 16 or an + ns + ar > 32:
+        raise ValueError("DNS record count")
+    name, end = dns_name(data, 12)
+    if name != b"example.com" or data[12:end+4] != request[12:] or data[end:end+4] != b"\0\1\0\1":
+        raise ValueError("DNS question correlation")
+    offset, answers = end + 4, []
+    for index in range(an + ns + ar):
+        owner, offset = dns_name(data, offset)
+        if offset + 10 > len(data):
+            raise ValueError("DNS RR header")
+        kind, klass, ttl, n = struct.unpack_from("!HHIH", data, offset)
+        offset += 10
+        if offset + n > len(data):
+            raise ValueError("DNS RDATA bounds")
+        value = data[offset:offset+n]
+        if index < an:
+            if klass != 1:
+                raise ValueError("DNS answer class")
+            if kind == 5:
+                value, consumed = dns_name(data, offset)
+                if consumed != offset + n:
+                    raise ValueError("DNS CNAME exact RDATA")
+            elif kind == 1 and n != 4:
+                raise ValueError("DNS A length")
+            answers.append((owner, kind, ttl, value))
+        offset += n
+    if offset != len(data):
+        raise ValueError("DNS trailing bytes")
+    current, seen, cname_ttls = b"example.com", set(), []
+    for _ in range(8):
+        if current in seen:
+            raise ValueError("DNS CNAME cycle")
+        seen.add(current)
+        cnames = [(ttl, value) for owner, kind, ttl, value in answers if owner == current and kind == 5]
+        addresses = [(ttl, value) for owner, kind, ttl, value in answers if owner == current and kind == 1]
+        if cnames:
+            if addresses or len(set(v for _, v in cnames)) != 1:
+                raise ValueError("DNS CNAME ambiguity")
+            cname_ttls.extend(ttl for ttl, _ in cnames)
+            current = cnames[0][1]
+            continue
+        if not 1 <= len(addresses) <= 4 or any(not global_address(v) for _, v in addresses):
+            raise ValueError("DNS no bounded global A answer")
+        ttl = min([t for t, _ in addresses] + cname_ttls + [60])
+        if ttl == 0:
+            raise ValueError("DNS zero TTL authorization")
+        return [v for _, v in addresses], ttl
+    raise ValueError("DNS CNAME budget")
+
+
+def http_response(data, eof=False):
+    if len(data) > MAX_HTTP:
+        raise ValueError("HTTP response cap")
+    end = data.find(b"\r\n\r\n")
+    if end < 0:
+        if len(data) > 8192 or eof:
+            raise ValueError("HTTP missing/large headers")
+        return None
+    if end > 8192:
+        raise ValueError("HTTP header cap")
+    lines = data[:end].split(b"\r\n")
+    status = lines[0].split(b" ", 2)
+    if any(c < 32 or c > 126 for c in lines[0]):
+        raise ValueError("HTTP status controls")
+    if len(status) < 2 or status[0] not in (b"HTTP/1.0", b"HTTP/1.1") or status[1] != b"200":
+        raise ValueError("HTTP status must be observed200")
+    fields = {}
+    for line in lines[1:]:
+        if b":" not in line or line[:1] in (b" ", b"\t"):
+            raise ValueError("HTTP header shape")
+        key, value = line.split(b":", 1)
+        key, value = key.lower(), value.strip(b" \t")
+        if not key or any(c not in b"abcdefghijklmnopqrstuvwxyz0123456789-" for c in key):
+            raise ValueError("HTTP header name")
+        if key in fields:
+            raise ValueError("HTTP duplicate header")
+        if any(c < 32 and c != 9 or c > 126 for c in value):
+            raise ValueError("HTTP header value")
+        fields[key] = value
+    if fields.get(b"content-encoding", b"identity").lower() != b"identity":
+        raise ValueError("HTTP encoded content forbidden")
+    if fields.get(b"content-type", b"").split(b";",1)[0].strip().lower() != b"text/html":
+        raise ValueError("HTTP expected HTML type")
+    body = data[end+4:]
+    if b"transfer-encoding" in fields:
+        if b"content-length" in fields or fields[b"transfer-encoding"].lower() != b"chunked":
+            raise ValueError("HTTP ambiguous transfer framing")
+        offset, decoded = 0, bytearray()
+        for _ in range(1024):
+            line_end = body.find(b"\r\n", offset)
+            if line_end < 0:
+                if eof:
+                    raise ValueError("HTTP truncated chunk header")
+                return None
+            line = body[offset:line_end]
+            if not 1 <= len(line) <= 8 or any(c not in b"0123456789abcdefABCDEF" for c in line):
+                raise ValueError("HTTP chunk size")
+            size = int(line, 16); offset = line_end + 2
+            if size > MAX_HTTP or len(decoded) + size > MAX_HTTP:
+                raise ValueError("HTTP chunk cap")
+            if not size:
+                if len(body) < offset + 2:
+                    if eof:
+                        raise ValueError("HTTP truncated final chunk")
+                    return None
+                if body[offset:] != b"\r\n":
+                    raise ValueError("HTTP trailers/extra bytes forbidden")
+                body = bytes(decoded); break
+            if len(body) < offset + size + 2:
+                if eof:
+                    raise ValueError("HTTP truncated chunk data")
+                return None
+            if body[offset+size:offset+size+2] != b"\r\n":
+                raise ValueError("HTTP chunk delimiter")
+            decoded.extend(body[offset:offset+size]); offset += size + 2
+        else:
+            raise ValueError("HTTP chunk count")
+    elif b"content-length" in fields:
+        value = fields[b"content-length"]
+        if not value.isdigit() or len(value) > 6 or int(value) > MAX_HTTP:
+            raise ValueError("HTTP content length")
+        size = int(value)
+        if len(body) < size:
+            if eof:
+                raise ValueError("HTTP short body")
+            return None
+        if len(body) != size:
+            raise ValueError("HTTP extra body")
+    elif not eof:
+        return None
+    if b"Example Domain" not in body:
+        raise ValueError("HTTP observed example content missing")
+    return {"status":200,"body_bytes":len(body),"header_bytes":end+4}
+
+
+class Policy:
+    def __init__(self, nonce, clock=time.monotonic):
+        if len(nonce) != 48 or any(c not in "0123456789abcdef" for c in nonce):
+            raise ValueError("nonce")
+        self.clock, self.nonce = clock, nonce
+        self.query = self.reply = None
+        self.dns_port = self.dns_at = self.expires = self.endpoint = None
+        self.lease_seconds = None
+        self.dns_attempts, self.dns_duplicates = 0, 0
+        self.tcp_port = self.client_isn = self.server_isn = None
+        self.request = (b"GET / HTTP/1.1\r\nHost: example.com\r\n"
+            b"User-Agent: darwin-lab-egress/1\r\nAccept-Encoding: identity\r\n"
+            b"X-Darwin-Lab-Nonce: " + nonce.encode() + b"\r\nConnection: close\r\n\r\n")
+        self.coverage = bytearray(len(self.request))
+        self.observed_request = bytearray(len(self.request))
+        self.response = bytearray(MAX_HTTP)
+        self.present = bytearray(MAX_HTTP)
+        self.contiguous = self.highest = 0
+        self.fin_offset = None
+        self.http = None
+        self.allowed_addresses = []
+
+    def outgoing(self, packet):
+        proto, src, dst, sp, dp, body, payload = parse_packet(packet)
+        if src != GUEST:
+            raise ValueError("guest source")
+        if proto == 17:
+            if dst != DNS or dp != 53 or sp < 1024 or len(payload) != 12 + len(QUESTION):
+                raise ValueError("fixed DNS endpoint/query size")
+            ident, flags, qd, an, ns, ar = struct.unpack_from("!6H", payload)
+            if (flags, qd, an, ns, ar) != (0x0100, 1, 0, 0, 0) or payload[12:] != QUESTION:
+                raise ValueError("fixed DNS A question")
+            if self.query is not None and (self.query != payload or self.dns_port != sp or self.reply is not None):
+                raise ValueError("DNS session/query changed")
+            self.dns_attempts += 1
+            if self.dns_attempts > 3:
+                raise ValueError("DNS retry budget")
+            if self.query is None:
+                self.query, self.dns_port, self.dns_at = payload, sp, self.clock()
+            return
+        if self.endpoint is None or self.clock() >= self.expires:
+            raise ValueError("TCP before DNS or expired lease")
+        if dst != self.endpoint or dp != 80 or sp < 1024:
+            raise ValueError("answer-bound single TCP endpoint")
+        seq = struct.unpack_from("!I", body, 4)[0]
+        flags = body[13]
+        if self.tcp_port is None:
+            if not flags & 2 or flags & (1 | 4 | 16) or payload:
+                raise ValueError("first TCP packet must be SYN")
+            self.tcp_port, self.client_isn = sp, seq
+        if sp != self.tcp_port:
+            raise ValueError("single TCP flow")
+        if flags & 2:
+            if seq != self.client_isn or flags & (1 | 4 | 16) or payload:
+                raise ValueError("TCP SYN changed")
+            return
+        start = (seq - self.client_isn - 1) & 0xffffffff
+        if start > len(self.request) + 1 or (payload and start + len(payload) > len(self.request)):
+            raise ValueError("TCP request sequence bound")
+        if payload:
+            if self.server_isn is None or payload != self.request[start:start+len(payload)]:
+                raise ValueError("only exact read-only example HTTP request")
+            self.coverage[start:start+len(payload)] = b"\1" * len(payload)
+            self.observed_request[start:start+len(payload)] = payload
+
+    def incoming(self, packet):
+        proto, src, dst, sp, dp, body, payload = parse_packet(packet)
+        if dst != GUEST:
+            raise ValueError("reply destination")
+        if proto == 17:
+            if src != DNS or sp != 53 or self.query is None or dp != self.dns_port:
+                raise ValueError("DNS reply endpoint correlation")
+            if self.clock() - self.dns_at > 10:
+                raise ValueError("DNS reply deadline")
+            addresses, ttl = dns_answer(payload, self.query)
+            if self.reply is not None:
+                self.dns_duplicates += 1
+                if payload != self.reply or self.dns_duplicates > 2:
+                    raise ValueError("DNS reply changed/duplicate budget")
+                return
+            self.reply = payload
+            self.allowed_addresses = addresses
+            self.endpoint = addresses[0]
+            self.expires = self.clock() + ttl
+            self.lease_seconds = ttl
+            return
+        if (self.endpoint is None or src != self.endpoint or sp != 80 or
+                self.tcp_port is None or dp != self.tcp_port):
+            raise ValueError("TCP reply single endpoint correlation")
+        seq, ack = struct.unpack_from("!II", body, 4)
+        flags = body[13]
+        if flags & 4:
+            raise ValueError("external TCP reset")
+        if flags & 2:
+            if not flags & 16 or ack != (self.client_isn + 1) & 0xffffffff or payload:
+                raise ValueError("TCP SYNACK correlation")
+            if self.server_isn is not None and self.server_isn != seq:
+                raise ValueError("TCP SYNACK changed")
+            self.server_isn = seq
+            return
+        if self.server_isn is None:
+            raise ValueError("TCP response before SYNACK")
+        if not flags & 16 or ((ack - self.client_isn - 1) & 0xffffffff) > len(self.request) + 1:
+            raise ValueError("TCP response ACK bound")
+        start = (seq - self.server_isn - 1) & 0xffffffff
+        if start + len(payload) > MAX_HTTP:
+            raise ValueError("TCP response sequence/size cap")
+        for i, byte in enumerate(payload, start):
+            if self.present[i] and self.response[i] != byte:
+                raise ValueError("TCP inconsistent overlap")
+            self.response[i], self.present[i] = byte, 1
+        if payload:
+            self.highest = max(self.highest, start + len(payload))
+        if flags & 1:
+            value = start + len(payload)
+            if self.fin_offset is not None and self.fin_offset != value:
+                raise ValueError("TCP FIN changed")
+            self.fin_offset = value
+        while self.contiguous < MAX_HTTP and self.present[self.contiguous]:
+            self.contiguous += 1
+        data = bytes(self.response[:self.contiguous])
+        if data:
+            self.http = http_response(data, self.fin_offset == self.contiguous)
+
+    def complete(self):
+        return (self.reply is not None and all(self.coverage) and self.http is not None and
+                self.highest == self.contiguous and self.fin_offset == self.contiguous)
+
+    def summary(self):
+        prefix = 0
+        while prefix < len(self.coverage) and self.coverage[prefix]:
+            prefix += 1
+        return {"domain":"example.com","dns_attempts":self.dns_attempts,
+            "dns_source_port":self.dns_port,
+            "dns_transaction_id":int.from_bytes(self.query[:2],"big") if self.query else None,
+            "dns_query_hex":self.query.hex() if self.query else None,
+            "dns_reply_hex":self.reply.hex() if self.reply else None,
+            "answer_ipv4":[str(ipaddress.IPv4Address(x)) for x in self.allowed_addresses],
+            "selected_ipv4":str(ipaddress.IPv4Address(self.endpoint)) if self.endpoint else None,
+            "selected_answer_index":0 if self.endpoint else None,"lease_seconds":self.lease_seconds,
+            "permitted_tcp_port":80,"guest_tcp_port":self.tcp_port,
+            "request_complete":all(self.coverage),"request_expected_hex":self.request.hex(),
+            "request_observed_contiguous_bytes":prefix,"request_observed_covered_bytes":sum(self.coverage),
+            "response_contiguous_bytes":self.contiguous,"response_highest_bytes":self.highest,
+            "response_fin_offset":self.fin_offset,"http":self.http,
+            "complete":self.complete(),"tls_or_dnssec_identity_claimed":False}

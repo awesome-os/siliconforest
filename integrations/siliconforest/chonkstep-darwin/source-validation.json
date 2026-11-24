@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "revision": 2,
+  "status": "SOURCE_CHECKED_NATIVE_LINK_AND_RUNTIME_OWNED_BY_ROOT",
+  "base_commit": "e0fe3a000aec71b1db46b940e2a75670be4e0f31",
+  "rust": "1.98.1 (48a229cea 2026-09-01)",
+  "source_set_sha256": "36788d2155131f9875b251c6d2b0038f7d152c8372c8c4a5b02e4d973f66c99e",
+  "source_set_digest_format": "sha256(sorted path + NUL + file_sha256 + LF); explicit files below exclude receipts/history",
+  "files_sha256": {
+    "Cargo.lock": "33622017b138310ef4ff90d796cdd35671fd928efaf20e8ca050dad795948846",
+    "crates/wm-darwin/Cargo.toml": "af8b7c7dae484fb9bb98106769ea8656870eb2fab68c2611c68b323e0dde8fed",
+    "crates/wm-darwin/README.md": "7ac2b7e623ff4600e2d0afc0cc7a234ba93ca9c11ca2a8b95640b7f41730d8c7",
+    "crates/wm-darwin/src/hid.rs": "eace58887c692cef0f160960eb52c9888f71e50d9e909f609b8c344a8a024bd9",
+    "crates/wm-darwin/src/input.rs": "26bbb8637e0f8902069128f144347c3d6ca8aa4fea5dde3f712053abc0cb0431",
+    "crates/wm-darwin/src/lib.rs": "e189ddecc1bd8673853ce63b0cf7685c9280b179c3bf035605232501692385b1",
+    "crates/wm-darwin/src/main.rs": "99ffbeaa82375db72bfc27f2a64694664216ceec76d0aa5955004692b3e9977e",
+    "crates/wm-darwin/src/pixels.rs": "474aea0c8f44d11355b7d01f08dce5d2ee0f8b741a45d3639c32a1810783f847",
+    "crates/wm-darwin/src/presenter.rs": "e3a05d0b12d9702449184a16e8559b29ce3b38a34c462769fcc75515a2556e8a",
+    "crates/wm-darwin/src/scene.rs": "33ab78c279cebb3565d6757e6c1badaa982a4943ce241536211273fc557c8d51",
+    "crates/wm-darwin/src/server.rs": "c4378f87f4114a68b2d6a7dce319680d49bd7905b0bfcf4c10d1cc123e205218",
+    "crates/wm-darwin/tests/wayland_shm.rs": "5c182254a9c9b754616ca734419be05a91122d78f4bd3c969a46638f360a5e6b"
+  },
+  "checks": [
+    {
+      "command": "cargo check --offline -p wm-darwin --features darwin-backend",
+      "exit_code": 0,
+      "scope": "Linux host type check"
+    },
+    {
+      "command": "cargo check --offline -p wm-darwin --features darwin-backend --target aarch64-apple-darwin",
+      "exit_code": 0,
+      "scope": "Target type check including native SFHID and static SFGOP/IOKit FFI; no link"
+    },
+    {
+      "command": "cargo check --offline -p wm-darwin --no-default-features",
+      "exit_code": 0,
+      "scope": "Feature disabled"
+    },
+    {
+      "command": "cargo test --offline -p wm-darwin --features darwin-backend",
+      "exit_code": 0,
+      "tests_passed": 7,
+      "scope": "Four unit groups and three real host Wayland wire tests; no device"
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0
+    }
+  ],
+  "implementation": [
+    "Pure Smithay wayland_frontend; existing wm-core WindowManager and wm-theme RasterThemeEngine",
+    "Owned SHM and CPU composition; release after copy, successful-presentation-only frame callbacks",
+    "xdg configure/ack, server decorations, placement, title/parent/size hints, workspace visibility, unmap/remap/destruction",
+    "Original 64-byte/8-aligned SFGOP ABI; explicit static SFGOP plus minimal IOKit (not CF) linking",
+    "Three-argument kern_return_t IOObjectConformsTo with boolean_t int output; validate kr and conforms",
+    "IOGOP class validation, bounded RGB8/RGB10 stores, dsb oshst, lifetime-owned map/connection",
+    "Opt-in fixed SFHID character devices, bounded nonblocking queue reads, exact byte records, sequence/format refusal",
+    "Real XKB keyboard delivery, modifiers, client pointer/scroll, copied client cursor, wm-core drag/close and authenticated client move/resize requests"
+  ],
+  "host_wire_input_test": [
+    "Synthetic raw SFHID records through real decoder (not native device evidence)",
+    "Client receives real XKB keymap, shift/A press/release and modifier events",
+    "Client receives real pointer click and presents copied SHM cursor",
+    "Chonkstep theme titlebar drag moves wm-core window without leaking clicks",
+    "Invalid client drag serial refused; active matching left-button serial authorizes movement",
+    "Chonkstep close button emits xdg_toplevel.close"
+  ],
+  "native_input_contract": {
+    "flag": "--input sfhid",
+    "paths": [
+      "/dev/usb_hid_kbd",
+      "/dev/usb_hid_mouse"
+    ],
+    "keyboard_record_bytes": 8,
+    "mouse_record_bytes": 12,
+    "requires_both_character_devices_before_seat": true,
+    "poll_ms": 8,
+    "max_records_per_queue_per_tick": 64,
+    "fatal_conditions": [
+      "short/EOF/malformed record",
+      "sequence discontinuity",
+      "unsupported key usage",
+      "native read error",
+      "XKB initialization failure"
+    ],
+    "startup": "discard bounded pre-open backlog; release all keys/buttons before acquisition",
+    "runtime_unknowns": [
+      "M1 native device publication and ABI execution",
+      "queue-to-client delivery",
+      "actual producer (serial virtual HID versus built-in keyboard/trackpad)",
+      "exclusive reader is an operational contract, not kernel enforced"
+    ],
+    "source_caveat": "keyboard sequence increments outside kernel queue lock; concurrent producer reordering may trigger deliberate refusal"
+  },
+  "native_prerequisites": [
+    "root SDK linker and matching libSFGOP.a/minimal libIOKit.a through Rust -L native",
+    "libxkbcommon and packaged xkeyboard-config evdev/pc105/us data; guest XKB_CONFIG_ROOT",
+    "guest DejaVu Sans font",
+    "root-owned native-link and input/scanout qualification"
+  ],
+  "unimplemented": [
+    "subsurfaces",
+    "popups",
+    "layer shell",
+    "clipboard/DND",
+    "GPU/dmabuf",
+    "X11",
+    "touch/tablet",
+    "output management",
+    "lock/privileged IPC",
+    "scaled/transformed/cropped client buffers",
+    "desktop menus/restore UI"
+  ],
+  "source_evidence_sha256": {
+    "SFGOP/include/SFGOP.h": "c1b80e3bf0bd4ba640f503e8297749bc03ca3165c23e6e4c3478ff740449930a",
+    "IOKit/include/SFIOKitLib.h": "22617ad9234b80b1153ca5b6d7eb5eaa6fb9fd2ab820bc334641ce51f47f75e2",
+    "IOKit/IOKitLib.c": "3550629168210f9b3d0d5f85156742fbebe35de1b6b6d68380c74b369c94ce61",
+    "IOHIDSystem/SFHIDEventQueue.h": "b2fdd4610c5810099dde560d1f000e854f9aed21ddd332ede08cb17c4f9001bb",
+    "IOHIDSystem/SFHIDEventQueue.cpp": "c7a2f35bd86bc2da17c766d39728d930fe80aedf1526935b739e74e74204a602",
+    "SFSerialHID/SFSerialHID.cpp": "39f718cf93af77098bdd7c1b3fcf95fe591db9f374785cfb73c0f14eefc37b07"
+  },
+  "history": {
+    "previous_receipt": "crates/wm-darwin/evidence/001-source-validation.json",
+    "previous_candidate_patch": "crates/wm-darwin/evidence/001-candidate.patch.gz",
+    "previous_source_set_sha256": "4ce52f26690e621ccfb2209a8dff56287f8b85a62472e7ed61b61876dd6d82a0",
+    "previous_native_link": "not qualified; superseded dynamic IOKitCF choice",
+    "previous_candidate_patch_uncompressed_sha256": "aa813e42bca59ebb8604db1ebc6d7b54a27a79147ffbaec92960b27a23e18548",
+    "previous_candidate_patch_compressed_sha256": "acb32d70f9ae627b4b4df4cb56870c2de2f39c63bc98c90b9e6e08e8ad773944"
+  },
+  "linux_backend_modified": false,
+  "hardware_accessed": false,
+  "fetched": false,
+  "toolchain_installed_by_this_agent": false,
+  "desktop_claim": false,
+  "physical_M1_shell_confirmation": "User confirmed root display test 002; separate prior milestone, not this compositor running",
+  "next_owner": "Root native link/guest tests; Claude independent review; source frozen pending findings"
+}

@@ -1,0 +1,214 @@
+--- a/src/Frameworks/AppKit/NSLayoutConstraint.m
++++ b/src/Frameworks/AppKit/NSLayoutConstraint.m
+@@ -13,6 +13,8 @@
+ #import <Foundation/NSValue.h>
+ #import <objc/runtime.h>
+ #include <math.h>
++#include <stdio.h>
++#include <stdlib.h>
+ 
+ const NSLayoutPriority NSLayoutPriorityRequired = 1000;
+ const NSLayoutPriority NSLayoutPriorityDefaultHigh = 750;
+@@ -29,10 +31,65 @@
+  * synthesized accessor; they belong in the class once it can see NSView.) */
+ @interface NSLayoutConstraint (SFActivation)
+ - (void)_sfInstalledOn:(NSView *)holder;
++- (void)_sfResolveSymbolicSpace;
+ @end
+ 
++/* A nib's "standard space" constraint carries no constant but NSSymbolicConstant = "NSSpace", which
++ * Foundation's decoder does not read: every such constraint (246 of the 692 in Terminal's
++ * preferences) was 0 points, and the controls it spaces overlapped once the nib's booleans made those
++ * views laid out by their constraints. Kept as a mark at decoding and resolved when the constraint is
++ * first laid out, when the items' superviews are known: 20 points to the superview's edge, 8 between
++ * siblings (macOS's standard spacing; the same values as Finch's CoreAutoLayout, MIT OR Apache-2.0,
++ * commit 2d9b1bb, NSLayoutConstraint.m -constant). */
++
++// SF_LAYOUT_TRACE=1: every constraint of a layout and every frame it sets, on stderr (a diagnostic)
++static int sfLayoutTrace = -1;
++static NSString *sfTraceName(id item) {
++    NSString *text = nil;
++
++    if (item == nil)
++        return @"-";
++    if ([item respondsToSelector:@selector(stringValue)] && [item isKindOfClass:NSClassFromString(@"NSControl")])
++        text = [item stringValue];
++    if ([text length] > 18)
++        text = [text substringToIndex:18];
++    return [NSString stringWithFormat:@"%s:%p%@%@%@", object_getClassName(item), item, text ? @"'" : @"", text ? text : @"", text ? @"'" : @""];
++}
++static const char symbolicSpaceKey;
++static id (*sfDecodeConstraint)(id, SEL, NSCoder *);
++
++static id sfDecodeConstraintWithSymbolicSpace(id self, SEL _cmd, NSCoder *coder) {
++    self = sfDecodeConstraint(self, _cmd, coder);
++    if (self != nil && [coder allowsKeyedCoding]) {
++        id symbolic = [coder decodeObjectForKey:@"NSSymbolicConstant"];
++
++        if ([symbolic isKindOfClass:[NSString class]] && [symbolic isEqualToString:@"NSSpace"])
++            objc_setAssociatedObject(self, &symbolicSpaceKey, [NSNumber numberWithBool:YES], OBJC_ASSOCIATION_RETAIN);
++    }
++    return self;
++}
++
+ @implementation NSLayoutConstraint (SFActivation)
+ 
+++ (void)load {
++    Method m = class_getInstanceMethod(self, @selector(initWithCoder:));
++
++    if (m != NULL && sfDecodeConstraint == NULL)
++        sfDecodeConstraint = (id (*)(id, SEL, NSCoder *))method_setImplementation(m, (IMP)sfDecodeConstraintWithSymbolicSpace);
++}
++
++- (void)_sfResolveSymbolicSpace {
++    id first = _firstItem, second = _secondItem;
++    BOOL toSuperview;
++
++    if (objc_getAssociatedObject(self, &symbolicSpaceKey) == nil)
++        return;
++    toSuperview = second != nil && (([first isKindOfClass:[NSView class]] && [(NSView *)first superview] == second) ||
++                                    ([second isKindOfClass:[NSView class]] && [(NSView *)second superview] == first));
++    _constant = toSuperview ? 20 : 8;
++    objc_setAssociatedObject(self, &symbolicSpaceKey, nil, OBJC_ASSOCIATION_RETAIN);
++}
++
+ - (void)_sfInstalledOn:(NSView *)holder {
+     _owner = holder;
+     _active = holder != nil;
+@@ -463,8 +520,16 @@
+         int first = [firstItem isKindOfClass:[NSView class]] ? layoutItemFor(&layout, firstItem) : -1;
+         int second = [secondItem isKindOfClass:[NSView class]] ? layoutItemFor(&layout, secondItem) : -1;
+         CGFloat multiplier = [c multiplier] ? [c multiplier] : 1;
++        [c _sfResolveSymbolicSpace];
+         SFExpression e = { { 0 }, { 0 }, 0, -[c constant] };
+ 
++        if (sfLayoutTrace < 0)
++            sfLayoutTrace = getenv("SF_LAYOUT_TRACE") != NULL;
++        if (sfLayoutTrace && apply)
++            fprintf(stderr, "SFLC %s.%d %s %s.%d *%g %+g @%g\n", [sfTraceName(firstItem) UTF8String], (int)[c firstAttribute],
++                    [c relation] == 0 ? "==" : [c relation] < 0 ? "<=" : ">=", [sfTraceName(secondItem) UTF8String],
++                    (int)[c secondAttribute], multiplier, [c constant], (double)[c priority]);
++
+         if (first < 0 || (secondItem != nil && second < 0))
+             continue;
+         if (!attributeTerms(&e, &layout.items[first], [c firstAttribute], 1))
+@@ -525,6 +590,11 @@
+                     frame.size.width = right - frame.origin.x;
+                     frame.size.height = top - frame.origin.y;
+                 }
++                if (sfLayoutTrace > 0)
++                    fprintf(stderr, "SFLF %s %s -> %s h%g,%g c%g,%g i%s\n", [sfTraceName(view) UTF8String], [NSStringFromRect([view frame]) UTF8String],
++                            [NSStringFromRect(frame) UTF8String], (double)[view contentHuggingPriorityForOrientation:0],
++                            (double)[view contentHuggingPriorityForOrientation:1], (double)[view contentCompressionResistancePriorityForOrientation:0],
++                            (double)[view contentCompressionResistancePriorityForOrientation:1], [NSStringFromSize([view intrinsicContentSize]) UTF8String]);
+                 if (fabs(frame.origin.x - [view frame].origin.x) > 0.01 || fabs(frame.origin.y - [view frame].origin.y) > 0.01 ||
+                     fabs(frame.size.width - [view frame].size.width) > 0.01 ||
+                     fabs(frame.size.height - [view frame].size.height) > 0.01) {
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -13,6 +13,8 @@
+ #import <AppKit/NSTextInputContext.h>
+ #import <objc/runtime.h>
+ #import <AppKit/NSLayoutConstraint.h>
++#import <AppKit/NSModernAppKit.h>
++#import <AppKit/NSViewLayout.h>
+ #import <objc/runtime.h>
+ #import <AppKit/NSApplication.h>
+ #import <AppKit/NSEvent.h>
+@@ -146,6 +148,23 @@
+     [self addConstraints:[keyed decodeObjectForKey:@"NSViewConstraints"]];
+     if([keyed containsValueForKey:@"NSDoNotTranslateAutoresizingMask"])
+      [self setTranslatesAutoresizingMaskIntoConstraints:![keyed decodeBoolForKey:@"NSDoNotTranslateAutoresizingMask"]];
++    // the content hugging and compression resistance priorities IB archived, as "{horizontal, vertical}"
++    // (they were left at the defaults: a label that should give way to its neighbour did not)
++    {
++     NSString *hugging=[keyed decodeObjectForKey:@"NSHuggingPriority"];
++     NSString *resisting=[keyed decodeObjectForKey:@"NSAntiCompressionPriority"];
++
++     if([hugging isKindOfClass:[NSString class]]){
++      NSSize p=NSSizeFromString(hugging);
++      [self setContentHuggingPriority:p.width forOrientation:NSLayoutConstraintOrientationHorizontal];
++      [self setContentHuggingPriority:p.height forOrientation:NSLayoutConstraintOrientationVertical];
++     }
++     if([resisting isKindOfClass:[NSString class]]){
++      NSSize p=NSSizeFromString(resisting);
++      [self setContentCompressionResistancePriority:p.width forOrientation:NSLayoutConstraintOrientationHorizontal];
++      [self setContentCompressionResistancePriority:p.height forOrientation:NSLayoutConstraintOrientationVertical];
++     }
++    }
+    }
+    else {
+     [NSException raise:NSInvalidArgumentException format:@"%@ can not initWithCoder:%@",[self class], [coder class]];
+--- a/src/Frameworks/AppKit/NSViewLayout.m
++++ b/src/Frameworks/AppKit/NSViewLayout.m
+@@ -18,6 +18,7 @@
+ #import <AppKit/NSTextField.h>
+ #import <AppKit/NSButton.h>
+ #import <AppKit/NSSlider.h>
++#import <AppKit/NSMatrix.h>
+ #import <AppKit/NSProgressIndicator.h>
+ #import <AppKit/NSFont.h>
+ #import <AppKit/NSWindow.h>
+@@ -246,3 +247,39 @@
+ }
+ 
+ @end
++
++@implementation NSMatrix (NSViewLayout)
++
++/* its cells as they are laid out: the rows and columns of the cell size with the spacing between them
++ * (NSControl's answer, the size of a cell, was that of a cell with no title: 10000 points each way, and a
++ * pair of radio buttons pushed the labels beside it narrower than their text) */
++- (NSSize)intrinsicContentSize {
++    NSSize cell = [self cellSize], gap = [self intercellSpacing];
++    NSInteger rows = [self numberOfRows], columns = [self numberOfColumns];
++
++    if (rows <= 0 || columns <= 0)
++        return NSMakeSize(NSViewNoIntrinsicMetric, NSViewNoIntrinsicMetric);
++    return NSMakeSize(raised(self, columns * cell.width + (columns - 1) * gap.width),
++                      raised(self, rows * cell.height + (rows - 1) * gap.height));
++}
++
++// the first row's text, as a control of one cell's height
++- (CGFloat)firstBaselineOffsetFromTop {
++    NSSize cell = [self cellSize];
++    NSFont *font = [self font];
++
++    if (font == nil || cell.height <= 0)
++        return 0;
++    return cell.height - (floor((cell.height - round([font ascender]) - round(-[font descender])) / 2 * 2) / 2 + round(-[font descender]));
++}
++
++- (CGFloat)baselineOffsetFromBottom {
++    NSSize cell = [self cellSize];
++    NSFont *font = [self font];
++
++    if (font == nil || cell.height <= 0)
++        return 0;
++    return floor((cell.height - round([font ascender]) - round(-[font descender])) / 2 * 2) / 2 + round(-[font descender]);
++}
++
++@end
+--- a/src/Frameworks/AppKit/NSScrollView.m
++++ b/src/Frameworks/AppKit/NSScrollView.m
+@@ -209,7 +209,10 @@
+ 
+     NSRect  result=[self insetBounds];
+     result.size.height=[headerView bounds].size.height;
+-    result.size.width-=[NSScroller scrollerWidth];
++    // the header is as wide as the clip view under it: the corner is there only over a vertical scroller
++    // that takes room (a table without one had its last column's title under an empty corner)
++    if([self hasVerticalScroller] && ![_verticalScroller isHidden])
++     result.size.width-=[NSScroller scrollerWidth];
+ 
+     return result;
+ }
+@@ -222,6 +225,8 @@
+ 
+     NSRect bounds = [self insetBounds];
+     NSRect frame;
++    if (![self hasVerticalScroller] || [_verticalScroller isHidden])
++        return NSMakeRect(bounds.origin.x + bounds.size.width, bounds.origin.y, 0, [headerView bounds].size.height);
+     frame.origin.x = bounds.origin.x+bounds.size.width-[NSScroller scrollerWidth];
+     frame.origin.y = bounds.origin.y;
+     frame.size.width = [NSScroller scrollerWidth];

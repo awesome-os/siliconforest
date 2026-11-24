@@ -1,0 +1,63 @@
+SiliconForest QEMU loop: sfgopmode=WxH selects the firmware graphics mode.
+
+The loader keeps whatever GOP mode the firmware left, and QEMU's ramfb under AAVMF comes up
+at 800x600 (the firmware's PlatformConfig variable did not change that here; its ramfb driver
+offers 640x480, 800x600 and 1024x768). With sfgopmode=1024x768 in boot-args.txt the loader switches to that linear mode before it hands
+the framebuffer to the kernel. Without the argument nothing changes.
+
+--- a/src/boot.c	2026-11-11 20:24:40.141772334 -0800
++++ b/src/boot.c	2026-11-11 20:24:40.159722126 -0800
+@@ -665,6 +665,53 @@
+     return EFI_SUCCESS;
+   }
+ 
++  /* sfgopmode=WxH in the boot-args: switch to that linear mode when the firmware
++   * offers it (QEMU's ramfb comes up at the firmware's 800x600 otherwise). An
++   * unknown size leaves the current mode alone. */
++  {
++    static const CHAR8 key[] = "sfgopmode=";
++    UINT32 want_w = 0, want_h = 0;
++    for (UINTN i = 0; cmdline && cmdline[i]; i++) {
++      UINTN j = 0;
++      const CHAR8 *p;
++      if (i != 0 && cmdline[i - 1] != ' ')
++        continue;
++      while (key[j] && cmdline[i + j] == key[j])
++        j++;
++      if (key[j])
++        continue;
++      p = cmdline + i + j;
++      for (; *p >= '0' && *p <= '9'; p++)
++        want_w = want_w * 10 + (UINT32)(*p - '0');
++      if (*p == 'x' || *p == 'X')
++        for (p++; *p >= '0' && *p <= '9'; p++)
++          want_h = want_h * 10 + (UINT32)(*p - '0');
++      break;
++    }
++    log_info(L"boot_probe_video: sfgopmode wants %ux%u, current %ux%u, %u modes\r\n", want_w, want_h,
++             gop->Mode->Info->HorizontalResolution, gop->Mode->Info->VerticalResolution, gop->Mode->MaxMode);
++    if (want_w && want_h &&
++        (gop->Mode->Info->HorizontalResolution != want_w ||
++         gop->Mode->Info->VerticalResolution != want_h)) {
++      for (UINT32 m = 0; m < gop->Mode->MaxMode; m++) {
++        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi = NULL;
++        UINTN misz = 0;
++        if (EFI_ERROR(uefi_call_wrapper(gop->QueryMode, 4, gop, m, &misz, &mi)) || !mi)
++          continue;
++        log_info(L"boot_probe_video: mode %u is %ux%u format %u\r\n", m, mi->HorizontalResolution,
++                 mi->VerticalResolution, (UINT32)mi->PixelFormat);
++        if (mi->HorizontalResolution != want_w || mi->VerticalResolution != want_h)
++          continue;
++        if (mi->PixelFormat != PixelRedGreenBlueReserved8BitPerColor &&
++            mi->PixelFormat != PixelBlueGreenRedReserved8BitPerColor)
++          continue;
++        status = uefi_call_wrapper(gop->SetMode, 2, gop, m);
++        log_info(L"boot_probe_video: sfgopmode %ux%u is mode %u: %r\r\n", want_w, want_h, m, status);
++        break;
++      }
++    }
++  }
++
+   /* XNU needs a LINEAR framebuffer.  The firmware's current GOP mode is
+    * normally the native panel resolution with a linear framebuffer, so keep it
+    * when it is RGBX(0)/BGRX(1).  Only if the current mode is BltOnly/bitmask

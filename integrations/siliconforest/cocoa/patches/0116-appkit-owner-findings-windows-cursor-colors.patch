@@ -1,0 +1,721 @@
+--- a/src/Frameworks/AppKit/NSWindow.m
++++ b/src/Frameworks/AppKit/NSWindow.m
+@@ -305,6 +305,8 @@
+    return self;
+ }
+ 
++static char sfWindowServerWindowGone;   // set once the window server's window of this NSWindow is destroyed
++
+ -initWithContentRect:(NSRect)contentRect styleMask:(unsigned int)styleMask backing:(unsigned)backing defer:(BOOL)defer screen:(NSScreen *)screen {
+     NSRect backgroundFrame;
+     NSRect contentViewFrame;
+@@ -441,6 +443,7 @@
+ }
+ 
+ -(void)dealloc {
++   [self _sfDestroyWindowServerWindow];
+    [_representedURL release];
+    [_colorSpace release];
+     [[NSNotificationCenter defaultCenter] removeObserver:self];
+@@ -2558,15 +2561,26 @@
+ 
+     [self postNotificationName:NSWindowWillCloseNotification];
+ 
++    /* A window kept after -close (releasedWhenClosed NO: Terminal's Preferences, Activity Monitor's CPU
++     * History...) can be ordered front again, as on macOS: it keeps its window-server window, only
++     * ordered out above; that window goes when the object does (-dealloc). Destroying it here left
++     * nothing for a later -makeKeyAndOrderFront: (Terminal's Preferences did not open a second time). */
++    if(_releaseWhenClosed){
++        [self _sfDestroyWindowServerWindow];
++        [self autorelease];
++    }
++}
++
++-(void)_sfDestroyWindowServerWindow {
++    if(objc_getAssociatedObject(self, &sfWindowServerWindowGone) != nil)
++        return;
++    objc_setAssociatedObject(self, &sfWindowServerWindowGone, (id)kCFBooleanTrue, OBJC_ASSOCIATION_ASSIGN);
+     struct wsRPCWindow data = {
+         { kWSWindowDestroy, sizeof(struct wsRPCWindow) - sizeof(struct wsRPCBase) },
+         _number, _frame.origin.x, _frame.origin.y,
+         _frame.size.width, _frame.size.height, (_styleMask&~NSFullScreenWindowMask), 0, {'\0'}, _level
+     };
+     _windowServerRPC(&data, sizeof(data), NULL, NULL);
+-
+-    if(_releaseWhenClosed)
+-        [self autorelease];
+ }
+ 
+ -(void)center {
+--- a/src/Frameworks/AppKit/NSCursor.m
++++ b/src/Frameworks/AppKit/NSCursor.m
+@@ -7,6 +7,7 @@
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+ 
+ #import <AppKit/NSCursor.h>
++void _windowServerSetCursorHidden(int hidden); /* WindowServer (rpc.h): 0 shown, 1 hidden, 2 until the pointer moves */
+ #import <AppKit/NSDisplay.h>
+ #import <AppKit/NSImage.h>
+ #import <Foundation/NSNull.h>
+@@ -393,19 +394,26 @@
+    return shared;
+ }
+ 
++/* As macOS counts them: +hide and +unhide balance, and +setHiddenUntilMouseMoves:YES hides the pointer only
++ * until it moves (Terminal calls it at every key typed). The WindowServer library shows such a pointer again on
++ * its next motion (_windowServerSetCursorHidden(2)); before, nothing did, and the pointer stayed invisible over
++ * the application's windows after typing (seen after resizing a Terminal window and coming back to it). */
++static int sfCursorHideCount;
++
+ +(void)hide {
+-   [[NSDisplay currentDisplay] hideCursor];
++   if(sfCursorHideCount++==0)
++    _windowServerSetCursorHidden(1);
+ }
+ 
+ +(void)unhide {
+-   [[NSDisplay currentDisplay] unhideCursor];
++   if(sfCursorHideCount>0 && --sfCursorHideCount==0)
++    _windowServerSetCursorHidden(0);
+ }
+ 
+ +(void)setHiddenUntilMouseMoves:(BOOL)flag {
+-   if(flag)
+-    [self hide];
+-   else
+-    [self unhide];
++   if(sfCursorHideCount>0)
++    return;
++   _windowServerSetCursorHidden(flag ? 2 : 0);
+ }
+ 
+ -initWithImage:(NSImage *)image foregroundColorHint:(NSColor *)foregroundHint backgroundColorHint:(NSColor *)backgroundHint hotSpot:(NSPoint)hotSpot {
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -234,7 +234,10 @@
+         if(_windowServerReceiveMessage(&msg) == 0) {
+             break;
+         }
++        /* each message's autoreleased objects (the NSEvent made for it, the numbers and values handed to the
++         * main thread) go with it: this thread never returns to an outer pool, so they all stayed (COCOA4) */
+         else {
++            NSAutoreleasePool *messagePool=[NSAutoreleasePool new];
+             switch(msg.header.msgh_id) {
+                 case MSG_ID_INLINE:
+                     switch(msg.code) {
+@@ -640,6 +643,7 @@
+             // we received _something_ so wake the main event loop in case we posted
+             if([self _wakeUp] < 0)
+                 NSLog(@"Error waking runloop - write: %s", strerror(errno));
++            [messagePool release];
+         }
+     }
+ }
+@@ -1485,6 +1489,7 @@
+    BOOL               needsUntitled=YES;
+ 
+    [self _listenForOtherApplications];
++   [NSWindow _sfStartAppMenuServer];   // the desk's window menu reads the main menu through it (NSWindowMenuStrip.m)
+ 
+    NS_DURING
+     [[NSNotificationCenter defaultCenter] postNotificationName: NSApplicationWillFinishLaunchingNotification object:self];
+@@ -1588,11 +1593,12 @@
+ -(void)_checkForTerminate {
+    int  count=[_windows count];
+ 
+-   /* As on macOS an app outlives its last window unless its delegate asks otherwise - where
+-    * there is a menu bar or a Dock to reach it by. On a desktop whose windows carry the menu
+-    * (NSWindowMenuStrip.m) an application without a window can never be reached again: there it
+-    * ends once its last window has been closed (the default SFQuitsWithLastWindow=NO keeps it),
+-    * through -terminate:, so its delegate is still asked. */
++   /* As on macOS an app outlives its last window unless its delegate asks otherwise: the desk
++    * keeps an AppKit application without windows in Command-Tab and the Dock and brings it back
++    * through org.siliconforest.appkit.reopen (-_reopen). SFQuitsWithLastWindow=YES ends it once its
++    * last window has been closed on a desktop whose windows carry the menu (NSWindowMenuStrip.m),
++    * as before the desk knew windowless applications, through -terminate:, so its delegate is
++    * still asked. */
+    BOOL asks=[_delegate respondsToSelector:@selector(applicationShouldTerminateAfterLastWindowClosed:)];
+    BOOL unreachable=[self _sfEndsWithLastWindow];
+ 
+@@ -1628,7 +1634,7 @@
+    if(allowed<0){
+     id value=[[NSUserDefaults standardUserDefaults] objectForKey:@"SFQuitsWithLastWindow"];
+ 
+-    allowed=(value!=nil && ![value boolValue]) ? 0 : 1;
++    allowed=(value!=nil && [value boolValue]) ? 1 : 0;
+    }
+    if(!allowed)
+     return NO;
+--- a/src/Frameworks/AppKit/NSPathCell.m
++++ b/src/Frameworks/AppKit/NSPathCell.m
+@@ -220,12 +220,16 @@
+      [currentPath appendString: @"/"];
+      [currentPath appendString: path];
+      
+-     NSURL    *currentURL = [[[NSURL alloc] initWithScheme: scheme host: host path: currentPath] autorelease];
++     // (not -initWithScheme:host:path:, which this Foundation lacks: its exception left Terminal's
++     // Preferences window unshown)
++     NSURL    *currentURL = isFileURL ? [NSURL fileURLWithPath: currentPath]
++         : [NSURL URLWithString: [NSString stringWithFormat: @"%@://%@%@", scheme, host ? host : @"",
++             [currentPath stringByAddingPercentEscapesUsingEncoding: NSUTF8StringEncoding]]];
+      NSString *title;
+      NSImage  *image;
+ 				
+      if (isFileURL) {
+-      title = [fm displayNameAtPath: currentPath]; 
++      title = [fm respondsToSelector:@selector(displayNameAtPath:)] ? [fm displayNameAtPath: currentPath] : [currentPath lastPathComponent];
+       image = [ws iconForFile: currentPath];
+      }
+      else {
+--- a/src/Frameworks/AppKit/NSModernAppKit.m
++++ b/src/Frameworks/AppKit/NSModernAppKit.m
+@@ -61,6 +61,12 @@
+     return [self colorWithCalibratedRed:red green:green blue:blue alpha:alpha];
+ }
+ 
++// macOS 10.7's generic constructor: components in sRGB (Activity Monitor's CPU Usage and History bars)
+++ (NSColor *)colorWithRed:(CGFloat)red green:(CGFloat)green blue:(CGFloat)blue alpha:(CGFloat)alpha
++{
++    return [self colorWithCalibratedRed:red green:green blue:blue alpha:alpha];
++}
++
+ // display p3 shares sRGB's transfer curve, so only the primaries need converting, in linear light
+ + (NSColor *)colorWithDisplayP3Red:(CGFloat)red green:(CGFloat)green blue:(CGFloat)blue alpha:(CGFloat)alpha
+ {
+--- a/src/Frameworks/AppKit/NSColorPanel.m
++++ b/src/Frameworks/AppKit/NSColorPanel.m
+@@ -37,8 +37,17 @@
+ 
+ +(NSColorPanel *)sharedColorPanel {
+    if(_colorPanel==nil){
+-    if(![NSBundle loadNibNamed:@"NSColorPanel" owner:self])
+-     NSLog(@"Cannot load NSColorPanel.nib");
++    /* The panel is built here in code (SiliconForest): AppKit's NSColorPanel nib is not on this system
++     * (and the pickers' own nibs are of an archive format the nib loader does not read), so the panel was
++     * never made: a colour well opened nothing ("Cannot load NSColorPanel.nib" at each). A nib named
++     * NSColorPanel, if one is installed, is still preferred. */
++    if([[NSBundle bundleForClass:[NSColorPanel class]] pathForResource:@"NSColorPanel" ofType:@"nib"]==nil ||
++       ![NSBundle loadNibNamed:@"NSColorPanel" owner:self]){
++     // known as the shared panel before it is built: its colour well asks for the shared panel while it is made
++     // (a panel made before this asked for another, and so on: thousands of windows, Terminal ended)
++     _colorPanel=[NSColorPanel alloc];
++     [_colorPanel _sfInitInCode];
++    }
+ 
+     if(![_colorPanel setFrameUsingName:@"NSColorPanel"])
+      [_colorPanel center];
+@@ -172,6 +181,8 @@
+ 
+ - (NSColorPicker*)_selectedColorPicker
+ {
++    if ([_colorPickers count] == 0)   // the panel built in code has its own sliders, no pickers
++        return nil;
+     int index = [colorPickersMatrix selectedTag];
+     NSColorPicker *picker = [_colorPickers objectAtIndex: index];
+     return picker;
+@@ -188,6 +199,7 @@
+     float alpha = [color alphaComponent];
+     [opacitySlider setFloatValue: alpha * 100.f];
+     [opacityTextField setFloatValue: alpha * 100.f];
++    [self _sfShowComponentsOf:color];
+ 
+    [[NSNotificationQueue defaultQueue] enqueueNotification:[NSNotification notificationWithName:NSColorPanelColorDidChangeNotification object:self] postingStyle:NSPostNow coalesceMask:NSNotificationCoalescingOnName forModes:nil];
+ }
+@@ -249,3 +261,143 @@
+ }
+ 
+ @end
++
++/* ---- the panel built in code (SiliconForest): a colour swatch, a palette, red/green/blue sliders with their
++ * values, the opacity slider and field (shown when the application does not ignore alpha: [NSColor
++ * setIgnoresAlpha:NO], as Terminal's profile colours are). Tags 901..903: the sliders; 911..913: their fields. */
++
++@interface SFColorPaletteView : NSView
++@end
++
++@implementation SFColorPaletteView
++static NSColor *SFPaletteColor(int i) {
++   static const float rgb[16][3]={
++    {1,0,0},{1,0.5,0},{1,0.85,0},{0.2,0.8,0.2},{0,0.75,0.75},{0,0.45,1},{0.35,0.25,0.85},{0.85,0.3,0.75},
++    {0,0,0},{0.2,0.2,0.2},{0.4,0.4,0.4},{0.6,0.6,0.6},{0.75,0.75,0.75},{0.88,0.88,0.88},{0.95,0.95,0.95},{1,1,1}};
++   return [NSColor colorWithCalibratedRed:rgb[i][0] green:rgb[i][1] blue:rgb[i][2] alpha:1];
++}
++-(BOOL)isFlipped { return YES; }
++-(void)drawRect:(NSRect)rect {
++   NSRect b=[self bounds];
++   CGFloat w=b.size.width/8, h=b.size.height/2;
++   for(int i=0;i<16;i++){
++    NSRect cell=NSMakeRect((i%8)*w,(i/8)*h,w,h);
++    [SFPaletteColor(i) set];
++    NSRectFill(NSInsetRect(cell,1,1));
++   }
++}
++-(BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
++-(void)mouseDown:(NSEvent *)event {
++   NSPoint p=[self convertPoint:[event locationInWindow] fromView:nil];
++   NSRect b=[self bounds];
++   int col=(int)(p.x/(b.size.width/8)), row=(int)(p.y/(b.size.height/2));
++   if(col<0 || col>7 || row<0 || row>1)
++    return;
++   NSColorPanel *panel=(NSColorPanel *)[self window];
++   [panel setColor:[SFPaletteColor(row*8+col) colorWithAlphaComponent:[panel showsAlpha] ? [[panel color] alphaComponent] : 1]];
++}
++@end
++
++@implementation NSColorPanel (SFInCode)
++
++static NSTextField *SFLabel(NSView *parent, NSRect frame, NSString *text) {
++   NSTextField *label=[[[NSTextField alloc] initWithFrame:frame] autorelease];
++   [label setStringValue:text];
++   [label setBezeled:NO];
++   [label setDrawsBackground:NO];
++   [label setEditable:NO];
++   [label setSelectable:NO];
++   [label setFont:[NSFont systemFontOfSize:11]];
++   [parent addSubview:label];
++   return label;
++}
++
++-(id)_sfInitInCode {
++   self=[self initWithContentRect:NSMakeRect(0,0,260,250) styleMask:NSTitledWindowMask|NSClosableWindowMask|NSUtilityWindowMask
++                          backing:NSBackingStoreBuffered defer:YES];
++   if(self==nil)
++    return nil;
++   [self setTitle:@"Colors"];
++   [self setFloatingPanel:YES];
++   [self setHidesOnDeactivate:YES];
++   [self setReleasedWhenClosed:NO];
++   NSView *content=[self contentView];
++   CGFloat y=250-12-40;
++
++   colorWell=[[NSColorWell alloc] initWithFrame:NSMakeRect(12,y,236,40)];
++   [colorWell setBordered:NO];
++   [colorWell setEnabled:NO];
++   [colorWell setColor:[NSColor whiteColor]];
++   [content addSubview:colorWell];
++   y-=8+44;
++   SFColorPaletteView *palette=[[[SFColorPaletteView alloc] initWithFrame:NSMakeRect(12,y,236,44)] autorelease];
++   [content addSubview:palette];
++   NSArray *names=[NSArray arrayWithObjects:@"Red",@"Green",@"Blue",nil];
++   for(int i=0;i<3;i++){
++    y-=28;
++    SFLabel(content,NSMakeRect(12,y+2,44,16),[names objectAtIndex:i]);
++    NSSlider *slider=[[[NSSlider alloc] initWithFrame:NSMakeRect(58,y,140,20)] autorelease];
++    [slider setMinValue:0];
++    [slider setMaxValue:255];
++    [slider setContinuous:YES];
++    [slider setTag:901+i];
++    [slider setTarget:self];
++    [slider setAction:@selector(_sfComponentChanged:)];
++    [content addSubview:slider];
++    NSTextField *field=[[[NSTextField alloc] initWithFrame:NSMakeRect(204,y,44,20)] autorelease];
++    [field setTag:911+i];
++    [field setTarget:self];
++    [field setAction:@selector(_sfComponentChanged:)];
++    [field setFont:[NSFont systemFontOfSize:11]];
++    [content addSubview:field];
++   }
++   y-=34;
++   opacityTitle=[SFLabel(content,NSMakeRect(12,y+2,44,16),@"Opacity") retain];
++   opacitySlider=[[NSSlider alloc] initWithFrame:NSMakeRect(58,y,124,20)];
++   [opacitySlider setMinValue:0];
++   [opacitySlider setMaxValue:100];
++   [opacitySlider setContinuous:YES];
++   [opacitySlider setTarget:self];
++   [opacitySlider setAction:@selector(_alphaChanged:)];
++   [content addSubview:opacitySlider];
++   opacityTextField=[[NSTextField alloc] initWithFrame:NSMakeRect(188,y,44,20)];
++   [opacityTextField setFont:[NSFont systemFontOfSize:11]];
++   [opacityTextField setTarget:self];
++   [opacityTextField setAction:@selector(_alphaChanged:)];
++   [content addSubview:opacityTextField];
++   opacityPercentLabel=[SFLabel(content,NSMakeRect(234,y+2,16,16),@"%") retain];
++   _colorPickers=[[NSMutableArray alloc] init];
++   [self setShowsAlpha:![NSColor ignoresAlpha]];
++   [self setColor:[NSColor whiteColor]];
++   return self;
++}
++
++-(void)_sfShowComponentsOf:(NSColor *)color {
++   NSColor *rgb=[color colorUsingColorSpaceName:NSCalibratedRGBColorSpace];
++   if(rgb==nil)
++    return;
++   CGFloat c[3]={[rgb redComponent],[rgb greenComponent],[rgb blueComponent]};
++   for(int i=0;i<3;i++){
++    [[[self contentView] viewWithTag:901+i] setDoubleValue:round(c[i]*255)];
++    [[[self contentView] viewWithTag:911+i] setIntValue:(int)round(c[i]*255)];
++   }
++}
++
++-(void)_sfComponentChanged:sender {
++   CGFloat c[3];
++   NSInteger tag=[sender tag];
++   for(int i=0;i<3;i++){
++    NSControl *control=(tag==911+i) ? sender : [[self contentView] viewWithTag:901+i];
++    c[i]=MIN(MAX([control doubleValue],0),255)/255.0;
++   }
++   [self setColor:[NSColor colorWithCalibratedRed:c[0] green:c[1] blue:c[2] alpha:[self showsAlpha] ? [[self color] alphaComponent] : 1]];
++}
++
++-(void)orderFront:sender {
++   // whether opacity is offered is the application's choice at the time it shows the panel
++   if(_colorPickers!=nil && [_colorPickers count]==0)
++    [self setShowsAlpha:![NSColor ignoresAlpha]];
++   [super orderFront:sender];
++}
++
++@end
+--- a/src/Frameworks/AppKit/NSSymbolImages.m
++++ b/src/Frameworks/AppKit/NSSymbolImages.m
+@@ -118,6 +118,21 @@
+     [NSGraphicsContext restoreGraphicsState];
+ }
+ 
++// three rounded rectangles off a grid (a large one left, two small ones stacked right): Terminal's Window Groups
++// (our drawing of what the symbol's name says)
++static void sfRectangle3Offgrid(NSRect box, CGFloat line) {
++    CGFloat w = box.size.width, h = box.size.height, x = box.origin.x, y = box.origin.y, r = w * 0.08;
++    NSRect big = NSMakeRect(x + line / 2, y + h * 0.18, w * 0.52, h * 0.64);
++    NSRect top = NSMakeRect(x + w * 0.62, y + h * 0.52, w * 0.36 - line / 2, h * 0.36);
++    NSRect bottom = NSMakeRect(x + w * 0.62, y + h * 0.10, w * 0.36 - line / 2, h * 0.34);
++    NSRect rects[3] = { big, top, bottom };
++    for (int i = 0; i < 3; i++) {
++        NSBezierPath *path = sfStroke(line);
++        [path appendBezierPathWithRoundedRect:rects[i] xRadius:r yRadius:r];
++        [path stroke];
++    }
++}
++
+ NSImage *SFFinchSymbolImage(NSString *name, NSImageSymbolConfiguration *config);
+ 
+ @implementation NSImage (SFSymbolImages)
+@@ -130,6 +145,7 @@
+         { "xmark.octagon", sfXmarkOctagon },
+         { "magnifyingglass", sfMagnifyingGlass },
+         { "arrow.forward.circle.fill", sfArrowForwardCircleFill },
++        { "rectangle.3.offgrid", sfRectangle3Offgrid },
+     };
+     SFSymbolDrawer draw = NULL;
+     NSImage *image;
+--- a/src/Frameworks/AppKit/NSWindowMenuStrip.m
++++ b/src/Frameworks/AppKit/NSWindowMenuStrip.m
+@@ -135,16 +135,25 @@
+ 
+ @implementation NSWindow (SFMenuStrip)
+ 
++static int sfMenuStripsEnabled = -1;
++
+ + (BOOL)_sfMenuStripsEnabled
+ {
+-    static int enabled = -1;
+-
+-    if (enabled < 0) {
++    if (sfMenuStripsEnabled < 0) {
+         id value = [[NSUserDefaults standardUserDefaults] objectForKey:@"SFWindowMenuStrip"];
+ 
+-        enabled = (value == nil || [value boolValue]) ? 1 : 0;
++        sfMenuStripsEnabled = (value == nil || [value boolValue]) ? 1 : 0;
+     }
+-    return enabled > 0;
++    return sfMenuStripsEnabled > 0;
++}
++
++// the desk's title-bar menu (Show/Hide Menu Bar): every window of the application, remembered in its defaults
+++ (void)_sfSetMenuStripsEnabled:(BOOL)on
++{
++    sfMenuStripsEnabled = on ? 1 : 0;
++    [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"SFWindowMenuStrip"];
++    for (NSWindow *window in [NSApp windows])
++        [window _sfUpdateMenuStrip];
+ }
+ 
+ - (BOOL)_sfWantsMenuStrip
+@@ -231,4 +240,210 @@
+     return YES;
+ }
+ 
++
++
++/* ---- the desk's window menu (DESK3's per-application socket, runs/m1-coord/answers-from-DESK3.md):
++ * $XDG_RUNTIME_DIR/app-menu/<pid>, UTF-8 lines. `menu 1` answers the main menu depth first, one line per item
++ * (`item <id> <depth> <flags> <key> <title>`, then `end`), validated at that moment; `invoke <id>` runs an item as a
++ * click in the strip does; `menubar [show|hide|toggle]` reads or sets the in-window strip. Nothing runs until the
++ * compositor connects (a listening socket and a dispatch source). */
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <dispatch/dispatch.h>
++
++static char sfAppMenuPath[256];
++
++static void sfAppMenuRemove(void) {
++    if (sfAppMenuPath[0])
++        unlink(sfAppMenuPath);
++}
++
++static NSString *sfAppMenuKey(NSMenuItem *item) {
++    NSString *key = [item keyEquivalent];
++    if ([key length] == 0)
++        return @"-";
++    NSUInteger mods = [item keyEquivalentModifierMask];
++    unichar c = [key characterAtIndex:0];
++    if (c >= 'A' && c <= 'Z') {
++        mods |= NSShiftKeyMask;
++        c = c - 'A' + 'a';
++    }
++    NSMutableString *s = [NSMutableString string];
++    if (mods & NSCommandKeyMask) [s appendString:@"cmd+"];
++    if (mods & NSShiftKeyMask) [s appendString:@"shift+"];
++    if (mods & NSAlternateKeyMask) [s appendString:@"opt+"];
++    if (mods & NSControlKeyMask) [s appendString:@"ctrl+"];
++    switch (c) {
++    case '\r': case '\n': case 3: [s appendString:@"return"]; break;
++    case '\t': [s appendString:@"tab"]; break;
++    case 8: case 0x7f: [s appendString:@"delete"]; break;
++    case 0x1b: [s appendString:@"esc"]; break;
++    case ' ': [s appendString:@"space"]; break;
++    case NSLeftArrowFunctionKey: [s appendString:@"left"]; break;
++    case NSRightArrowFunctionKey: [s appendString:@"right"]; break;
++    case NSUpArrowFunctionKey: [s appendString:@"up"]; break;
++    case NSDownArrowFunctionKey: [s appendString:@"down"]; break;
++    default:
++        if (c >= NSF1FunctionKey && c <= NSF35FunctionKey)
++            [s appendFormat:@"f%d", (int)(c - NSF1FunctionKey + 1)];
++        else
++            [s appendString:[NSString stringWithCharacters:&c length:1]];
++    }
++    return s;
++}
++
++static void sfAppMenuAppend(NSMutableString *out, NSMenu *menu, NSString *prefix, int depth) {
++    [menu update];  // validateMenuItem: / autoenabling, as when the menu opens
++    NSArray *items = [menu itemArray];
++    for (NSUInteger i = 0; i < [items count]; i++) {
++        NSMenuItem *item = [items objectAtIndex:i];
++        if ([item respondsToSelector:@selector(isHidden)] && [item isHidden])
++            continue;
++        NSString *ident = prefix ? [NSString stringWithFormat:@"%@.%lu", prefix, (unsigned long)i]
++                                 : [NSString stringWithFormat:@"%lu", (unsigned long)i];
++        if ([item isSeparatorItem]) {
++            [out appendFormat:@"item %@ %d p - \n", ident, depth];
++            continue;
++        }
++        NSMutableString *flags = [NSMutableString string];
++        if ([item hasSubmenu]) [flags appendString:@"s"];
++        if (![item isEnabled]) [flags appendString:@"d"];
++        if ([item state] == NSOnState) [flags appendString:@"c"];
++        if ([item state] == NSMixedState) [flags appendString:@"m"];
++        NSString *title = [item title];
++        if (depth == 0 && i == 0) {
++            [flags appendString:@"a"];
++            title = [[NSProcessInfo processInfo] processName];
++        }
++        title = [[[title stringByReplacingOccurrencesOfString:@"\t" withString:@" "]
++                    stringByReplacingOccurrencesOfString:@"\n" withString:@" "] stringByReplacingOccurrencesOfString:@"\r" withString:@" "];
++        [out appendFormat:@"item %@ %d %@ %@ %@\n", ident, depth, [flags length] ? flags : @"-", sfAppMenuKey(item), title];
++        if ([item hasSubmenu])
++            sfAppMenuAppend(out, [item submenu], ident, depth + 1);
++    }
++}
++
++// on the main thread: the answer to one request line
++static NSString *sfAppMenuAnswer(NSString *line) {
++    NSArray *words = [line componentsSeparatedByString:@" "];
++    NSString *verb = [words count] ? [words objectAtIndex:0] : @"";
++    if ([verb isEqualToString:@"menu"]) {
++        NSMutableString *out = [NSMutableString string];
++        if ([NSApp mainMenu] != nil)
++            sfAppMenuAppend(out, [NSApp mainMenu], nil, 0);
++        [out appendString:@"end\n"];
++        return out;
++    }
++    if ([verb isEqualToString:@"invoke"] && [words count] > 1) {
++        NSArray *path = [[words objectAtIndex:1] componentsSeparatedByString:@"."];
++        NSMenu *menu = [NSApp mainMenu];
++        for (NSUInteger k = 0; menu != nil && k + 1 < [path count]; k++) {
++            NSInteger i = [[path objectAtIndex:k] integerValue];
++            menu = (i >= 0 && i < [menu numberOfItems]) ? [[menu itemAtIndex:i] submenu] : nil;
++        }
++        NSInteger last = [[path lastObject] integerValue];
++        if (menu == nil || last < 0 || last >= [menu numberOfItems])
++            return @"error gone\n";
++        [menu update];
++        NSMenuItem *item = [menu itemAtIndex:last];
++        if (![item isEnabled] || [item hasSubmenu] || [item isSeparatorItem])
++            return @"error disabled\n";
++        // after the answer, as a click in the strip does it (an action may run a modal session)
++        dispatch_async(dispatch_get_main_queue(), ^{ [NSApp sendAction:[item action] to:[item target] from:item]; });
++        return @"ok\n";
++    }
++    if ([verb isEqualToString:@"menubar"]) {
++        NSString *how = [words count] > 1 ? [words objectAtIndex:1] : nil;
++        BOOL on = [NSWindow _sfMenuStripsEnabled];
++        if (how == nil)
++            return on ? @"shown\n" : @"hidden\n";
++        if ([how isEqualToString:@"show"]) on = YES;
++        else if ([how isEqualToString:@"hide"]) on = NO;
++        else if ([how isEqualToString:@"toggle"]) on = !on;
++        else return @"error request\n";
++        [NSWindow _sfSetMenuStripsEnabled:on];
++        return on ? @"ok shown\n" : @"ok hidden\n";
++    }
++    return @"error request\n";
++}
++
++static void sfAppMenuServe(int fd) {
++    char buf[1024];
++    size_t used = 0;
++    struct timeval tv = { 2, 0 };
++    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
++    for (;;) {
++        ssize_t n = read(fd, buf + used, sizeof buf - 1 - used);
++        if (n <= 0)
++            break;
++        used += (size_t)n;
++        char *nl;
++        while ((nl = memchr(buf, '\n', used)) != NULL) {
++            *nl = 0;
++            NSString *line = [NSString stringWithUTF8String:buf];
++            __block NSString *answer = nil;
++            if (line != nil)
++                dispatch_sync(dispatch_get_main_queue(), ^{
++                    NSAutoreleasePool *pool = [NSAutoreleasePool new];
++                    answer = [sfAppMenuAnswer(line) retain];
++                    [pool release];
++                });
++            const char *text = answer ? [answer UTF8String] : "error request\n";
++            size_t left = strlen(text);
++            while (left > 0) {
++                ssize_t w = write(fd, text, left);
++                if (w <= 0) break;
++                text += w; left -= (size_t)w;
++            }
++            [answer release];
++            used -= (size_t)(nl + 1 - buf);
++            memmove(buf, nl + 1, used);
++        }
++        if (used == sizeof buf - 1)  // a line longer than any request
++            break;
++    }
++    close(fd);
++}
++
+++ (void)_sfStartAppMenuServer
++{
++    static BOOL started;
++    const char *runtime = getenv("XDG_RUNTIME_DIR");
++    if (started || runtime == NULL || runtime[0] == 0)
++        return;
++    started = YES;
++    char dir[200];
++    snprintf(dir, sizeof dir, "%s/app-menu", runtime);
++    mkdir(dir, 0700);
++    snprintf(sfAppMenuPath, sizeof sfAppMenuPath, "%s/%d", dir, (int)getpid());
++    unlink(sfAppMenuPath);
++    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
++    struct sockaddr_un addr = { 0 };
++    addr.sun_family = AF_UNIX;
++    strlcpy(addr.sun_path, sfAppMenuPath, sizeof addr.sun_path);
++    if (fd < 0 || bind(fd, (struct sockaddr *)&addr, sizeof addr) != 0 || listen(fd, 4) != 0) {
++        if (fd >= 0) close(fd);
++        sfAppMenuPath[0] = 0;
++        return;
++    }
++    chmod(sfAppMenuPath, 0600);
++    atexit(sfAppMenuRemove);
++    dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, (uintptr_t)fd, 0,
++                                                      dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0));
++    dispatch_source_set_event_handler(source, ^{
++        int client = accept(fd, NULL, NULL);
++        if (client < 0)
++            return;
++        uid_t uid; gid_t gid;
++        if (getpeereid(client, &uid, &gid) != 0 || uid != getuid()) {
++            close(client);
++            return;
++        }
++        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{ sfAppMenuServe(client); });
++    });
++    dispatch_resume(source);
++}
++
+ @end
+--- a/src/Frameworks/AppKit/NSWindow-Private.h
++++ b/src/Frameworks/AppKit/NSWindow-Private.h
+@@ -53,6 +53,8 @@
+ // the main menu as a strip at the top of a standard window: NSWindowMenuStrip.m
+ @interface NSWindow (SFMenuStrip)
+ + (BOOL)_sfMenuStripsEnabled;
+++ (void)_sfSetMenuStripsEnabled:(BOOL)on;
+++ (void)_sfStartAppMenuServer;
+ - (NSView *)_sfMenuStripView;
+ - (void)_sfUpdateMenuStrip;
+ - (BOOL)_sfMenuStripTakesKeyEvent:(NSEvent *)event;
+--- a/src/Frameworks/AppKit/NSColor.subproj/conversions.h
++++ b/src/Frameworks/AppKit/NSColor.subproj/conversions.h
+@@ -7,27 +7,31 @@
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+ 
+ // NSColorHSBToRGB, NSColorRGBToHSB
++// (SiliconForest: CGFloat throughout. The pointers were CGFloat *, and NSColor_CGColor passes CGFloat * (double):
++// each conversion wrote 4 bytes into an 8-byte variable, so -getHue:saturation:brightness:alpha: answered
++// near-zero denormals and +colorWithCalibratedHue:... gave colours made of stack garbage: Terminal's line
++// marks drawn pure blue and a red line around its window.)
+ // Algorithms derived from: http://en.wikipedia.org/wiki/HSL_and_HSV
+ 
+-static inline void NSColorHSBToRGB(float hue, float saturation, float brightness, float *redp, float *greenp, float *bluep) {
+-    float red = brightness, green = brightness, blue = brightness;
++static inline void NSColorHSBToRGB(CGFloat hue, CGFloat saturation, CGFloat brightness, CGFloat *redp, CGFloat *greenp, CGFloat *bluep) {
++    CGFloat red = brightness, green = brightness, blue = brightness;
+ 
+-    float H = hue * 360.f; // convert to degrees
+-    float S = saturation;
+-    float V = brightness;
+-    float m = 0; // the brightness delta.
++    CGFloat H = hue * 360.f; // convert to degrees
++    CGFloat S = saturation;
++    CGFloat V = brightness;
++    CGFloat m = 0; // the brightness delta.
+ 
+     if(V != 0) {
+         // We have enough color information to do a conversion
+ 
+-        float C = V * S;
++        CGFloat C = V * S;
+ 
+         H = fmod(H, 360.f);
+         H /= 60.f; // convert to hexagonal segments
+ 
+         int hueFace = H; // cube face index
+ 
+-        float X = C * (1 - fabs(fmod(H, 2) - 1));
++        CGFloat X = C * (1 - fabs(fmod(H, 2) - 1));
+ 
+         switch(hueFace) {
+             case 0:
+@@ -73,17 +77,17 @@
+     //	NSLog(@"RGB(%f, %f, %f) <- HSB(%f, %f, %f)", *redp, *greenp, *bluep, hue, saturation, brightness);
+ }
+ 
+-static inline void NSColorRGBToHSB(float red, float green, float blue, float *huep, float *saturationp, float *brightnessp) {
++static inline void NSColorRGBToHSB(CGFloat red, CGFloat green, CGFloat blue, CGFloat *huep, CGFloat *saturationp, CGFloat *brightnessp) {
+ 
+-    float M = MAX(red, MAX(green, blue));
+-    float m = MIN(red, MIN(green, blue));
++    CGFloat M = MAX(red, MAX(green, blue));
++    CGFloat m = MIN(red, MIN(green, blue));
+ 
+-    float H = 0;
+-    float S = 0;
+-    float V = M;
++    CGFloat H = 0;
++    CGFloat S = 0;
++    CGFloat V = M;
+ 
+     if(V > 0) {
+-        float C = M - m;
++        CGFloat C = M - m;
+         S = C / V;
+         if(C == 0) {
+             H = 0;

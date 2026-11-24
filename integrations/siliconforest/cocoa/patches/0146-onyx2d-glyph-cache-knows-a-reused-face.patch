@@ -1,0 +1,53 @@
+--- a/src/Frameworks/Onyx2D/O2Context_builtin.m
++++ b/src/Frameworks/Onyx2D/O2Context_builtin.m
+@@ -844,6 +844,7 @@
+ // rendered glyphs by face, size and glyph, text redraws the same few hundred glyphs every frame
+ typedef struct {
+    FT_Face face;
++   uintptr_t generation;
+    FT_F26Dot6 size;
+    FT_UInt glyph;
+    FT_Bitmap bitmap;
+@@ -855,16 +856,32 @@
+ static O2GlyphCacheEntry *glyphCache;
+ static unsigned glyphCacheCount;
+ 
++/* (TERM8) A face is known in the cache by its address and a number it is given the first time it is seen, kept in
++ * FreeType's client slot of the face (nothing else here uses it). By the address alone, a face freed and another
++ * made at the same address was given the first one's glyph bitmaps: Firefox makes and frees a face for each
++ * subset of a web font (each unicode-range part of nytimes.com's Franklin), so glyph numbers of one subset were
++ * drawn with another subset's shapes (FX-010: "Busness", "Mope to pead"). Called with the showGlyphs lock held. */
++static uintptr_t faceGeneration(FT_Face face){
++   static uintptr_t next;
++
++   if(face->generic.data==NULL){
++    face->generic.data=(void *)++next;
++    face->generic.finalizer=NULL;
++   }
++   return (uintptr_t)face->generic.data;
++}
++
+ static O2GlyphCacheEntry *cachedGlyph(FT_Face face,FT_F26Dot6 size,FT_UInt glyph){
+    unsigned i,hash;
++   uintptr_t generation=faceGeneration(face);
+ 
+    if(glyphCache==NULL)
+     glyphCache=calloc(O2_GLYPH_CACHE_SIZE,sizeof(O2GlyphCacheEntry));
+-   hash=(unsigned)(((uintptr_t)face>>4)*31+size*17+glyph*2654435761u);
++   hash=(unsigned)(((uintptr_t)face>>4)*31+generation*131+size*17+glyph*2654435761u);
+    for(i=0;i<O2_GLYPH_CACHE_SIZE;i++){
+     O2GlyphCacheEntry *entry=&glyphCache[(hash+i)%O2_GLYPH_CACHE_SIZE];
+ 
+-    if(entry->face==face && entry->size==size && entry->glyph==glyph)
++    if(entry->face==face && entry->generation==generation && entry->size==size && entry->glyph==glyph)
+      return entry;
+     if(entry->face!=NULL)
+      continue;
+@@ -886,6 +903,7 @@
+     size_t bytes=(size_t)abs(slot->bitmap.pitch)*slot->bitmap.rows;
+ 
+     entry->face=face;
++    entry->generation=generation;
+     entry->size=size;
+     entry->glyph=glyph;
+     entry->bitmap=slot->bitmap;

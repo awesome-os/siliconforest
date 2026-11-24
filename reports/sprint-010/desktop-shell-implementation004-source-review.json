@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude (independent read-only delta review; did not author 003 or 004)",
+  "status": "READ_ONLY_SOURCE_DELTA_REVIEW_NO_NATIVE_BUILD_NO_ADMISSION",
+  "target": "desktop-shell/implementation-revisions/004: source set 949e3ec98938e5891c763b285c8203216970ab175bfcf4b855659facc77f09da, incremental 8b209877, full tree b1531f62",
+  "base": "Approved 003 (set ee989413, receipt cdc2096c; my review desktop-shell-implementation003-source-review.json d81bb360)",
+  "verdict": "APPROVED. The delta touches only TerminalLauncher::identity and adds two tests. The instance becomes lowercase_hex(counter, 4 digits) + session[0:44], with the counter limited to 1-0xffff, and exhaustion or overflow is refused before any state change, directory or spawn. This fixes the real caption collision: in 003 every app's 'Terminal <instance[0:12]>' showed the same session prefix. Now the visible prefixes differ per app (for example 000101234567 and 000201234567). The full 48-hex identity, the app CLI, CHONKTERM/1, HID, commands, readiness and cleanup are unchanged. A title is only a visual label, never process or input authority.",
+  "binding": {
+    "replay": "verify_checkpoint.py (temp dir in scratch): 'Verified004 cumulative 23 and incremental 1 files, full tree and dependencies'. The 003 receipt recomputes as cdc2096c497f5bd7 (unchanged).",
+    "delta": "from-003.patch changes only crates/wm-darwin/src/terminal_launch.rs: a MAX_INSTANCE_COUNTER constant, the identity() body and two tests. All other source bytes equal 003."
+  },
+  "checks": {
+    "allocation": "next = self.next.checked_add(1) filtered to at most 0xffff, else 'instance counter exhausted'. The Instance is built with format!(\"{next:04x}{}\", &session[..44]) and validated by Instance::parse, and only then is self.next assigned. A refusal therefore never advances the counter, and u64::MAX cannot wrap.",
+    "uniqueness": "Within one launcher, counters 1-65535 are distinct, so both the full instances and the 12-hex visible prefixes (counter + session[0:8]) are distinct. Across sessions, uniqueness rests on the fresh host-selected session nonce, which now keeps 176 bits in the instance (003 kept 128). Per-instance record directories are still created exclusively with mkdirat, so a collision would be refused, not reused.",
+    "no_reuse_after_failure": "request() still calls identity() first and only then begins the audit and prepare. A failed preparation or spawn consumes that counter value, matching the layout's 'no reuse after failed launch'.",
+    "layout_contract": "I recomputed INSTANCE_LAYOUT.json: all three vectors (counters 1, 2 and 65535) give exactly the stated instance and title. Its application_source_evidence hashes match app revision 002's main.rs (bb82f9f2) and pty.rs (292a213e), and rev002 main.rs:446 still sets the title as 'Terminal ' + instance[0:12], so the caption derivation is the app's unchanged code.",
+    "tests": "first_two_instances_have_distinct_visible_prefixes_and_exact_full_ids checks the exact IDs, distinct prefixes, the 44-hex suffix, and that the CLI argument and record directory use the same full ID with no child created. four_hex_counter_accepts_last_value_then_refuses_without_wrap_or_side_effects checks that ffff is accepted, then the 0xffff and u64::MAX states are refused without advancing, with no application, audit attempt or directory created."
+  },
+  "host_evidence": {
+    "serial": "The recorded serial run (--test-threads=1) passes 54 library tests, 5 Wayland tests and both new identity tests.",
+    "parallel_failure_preserved": "The recorded parallel run exits 101 with 53 passed and 1 failed: hid::tests::open_flags_character_rejection_and_nofollow_do_not_use_hid_nodes, a fd_closed(fd) assertion. That baseline test checks a numeric descriptor after close, which concurrent tests can reuse, so it can fail falsely in parallel. The HID source is unchanged and the excerpt is kept as a failure, not reclassified. I accept that explanation for this identity-only delta, but the test stays order-sensitive until it stops checking reusable descriptor numbers.",
+    "rerun": "I did not rerun cargo (no build output written into the tree)."
+  },
+  "notes": {
+    "I1_title_not_identity": "As frozen: root's new supervisors must bind each app by actual PID, status, records and the requested startup count. Distinct captions help visual matching in a capture but authenticate nothing.",
+    "I2_old_layout_captures": "Earlier supervisors, packets and captures that used the old session[0:32] + counter16 layout keep that layout. Only new revision-004 packets derive IDs this way."
+  },
+  "unchanged": "003 and every earlier revision; app rev002 44d6cee6 (approved, terminal-application-rev002-source-review.json 067ac7de) with my DS4 decision and its four required runtime observations; C object 71c322c1.",
+  "not_claimed": ["native 004 build or execution", "different PTY prompts", "actual two-app pixels or window identity", "authentication from a title", "physical typing or menu activation"],
+  "scope": "Read-only: verifier replay, from-003.patch, layout vector recomputation, app rev002 hash and title-line check, recorded logs. No edits, cargo build, SSH or hardware."
+}

@@ -1,0 +1,92 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# The end of a boot whose ROOT is the SiliconForest partition READ-WRITE (step 3d; the
+# write-fenced build, rd=uuid boot-uuid=<filesystem UUID>, sfnvme_write=1). This script is in
+# the RAM root image, mounted read-only on /private/ram by the disk root's
+# /usr/bin/darwin-desktop-test. Order at the end: sync; the root downgraded to read-only
+# (ext4-downgrade.patch: journal emptied, RECOVER cleared, cache flushed); the fence sealed;
+# the controller stopped by one process already in memory. After the downgrade nothing here
+# redirects into a file of the root.
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/private/ram/usr/bin; export PATH
+printf '\nNV_BEGIN_%s\n' "$nonce"
+get() { sysctl -n "$1" 2>/dev/null; }
+t0=$(date +%s)
+phase() { printf 'NV_PHASE %s t=%s\n' "$1" "$(( $(date +%s) - t0 ))"; }
+wstats() { ws_now=$(get kern.sf_nvme.wstats); printf 'NV_WSTATS %s %s\n' "$1" "$ws_now"; printf 'NV_WSTATS %s %s\n' "$1" "$ws_now"; printf 'NV_GATE_REJECTED %s\n' "$(get kern.sf_nvme.gate_rejected)"; }
+phase root
+printf 'NV_STATE %s\n' "$(get kern.sf_nvme.state)"
+printf 'NV_NCPU %s\n' "$(get hw.ncpu)"
+printf 'NV_GATE_SELFTEST %s\n' "$(get kern.sf_nvme.gate_selftest)"
+printf 'NV_WGATE_SELFTEST start %s\n' "$(get kern.sf_nvme.wgate_selftest)"
+printf 'NV_BOOTARGS %s\n' "$(get kern.bootargs | sed 's/[0-9A-Fa-f]\{8\}-[0-9A-Fa-f-]\{27\}/GUID/g')"
+mount 2>&1 | sed 's/^/NV_MOUNT /'
+printf 'NV_PART %s\n' "$(get kern.sf_nvme.part)"
+printf 'NV_MEDIA %s\n' "$(get kern.sf_nvme.media)"
+printf 'NV_FENCE %s\n' "$(get kern.sf_nvme.fence)"
+wstats start
+ls -ld / /var /tmp /private/var /private/tmp /private/ram /etc/resolv.conf 2>&1 | sed 's/^/NV_LS /'
+rootdev=$(dmesg 2>/dev/null | sed -n 's/.*BSD root: \(disk[0-9s]*\).*/\1/p' | head -1)
+fenced=$(get kern.sf_nvme.wstats | sed 's/.* device=\([a-z0-9]*\) .*/\1/')
+printf 'NV_ROOTDEV %s fenced=%s\n' "$rootdev" "$fenced"
+if mount | grep '^root_device on / (ext4' | grep -qv 'read-only' && [ -n "$rootdev" ] && [ "$rootdev" = "$fenced" ]; then
+    printf 'NV_ROOT disk read-write: %s on %s\n' "$(mount | grep ' on / ')" "$rootdev"
+else
+    printf 'NV_FAIL the root is not the fenced device read-write: %s (%s, fenced %s)\n' "$(mount | grep ' on / ')" "$rootdev" "$fenced"
+fi
+for d in /dev/rdisk[0-9]; do [ "$d" != "/dev/r$fenced" ] && gpt -r show "$d" 2>/dev/null | awk '{print "NV_GPT", $1, $2, $3, $4, $5, $6, $7, $8}'; done
+ps -ax 2>/dev/null | wc -l | sed 's/^ */NV_PROCESSES /'
+
+phase identify
+printf 'NV_IDCTRL %s\n' "$(get kern.sf_nvme.idctrl)"
+printf 'NV_IDNS %s\n' "$(get kern.sf_nvme.idns)"
+printf 'NV_SMART start %s\n' "$(get kern.sf_nvme.smart)"
+printf 'NV_SMARTRAW start %s\n' "$(get kern.sf_nvme.smart_raw)"
+
+phase persist
+for f in /var/run/dr-x /tmp/dr-x /private/var/tmp/dr-x /etc/dr-x /usr/dr-x; do
+    sh -c "echo hello >> $f" 2>/dev/null; printf 'NV_STATEWRITE %s rc=%s\n' "$f" "$?"; rm -f "$f" < /dev/null
+done
+printf 'second line, written at the end of @NAME@\n' >> /private/var/sf-persist/@NAME@.txt
+(cd /private/var/sf-persist && find . -type f | sort | sed 's|^\./||' | while read f; do sha256sum "$f"; done) 2>&1 | sed 's/^/NV_PSHA written /'
+D=/private/var/db/desktop-state
+if [ -e $D/appearance-request ]; then
+    # the session did not take the request: the setting is stored where the Theme menu stores it
+    rm -f $D/appearance-request < /dev/null
+    if [ ! -e $D/appearance ]; then printf 'dark' > $D/appearance; printf 'NV_DESKSET the session left the request; appearance=dark written by this script\n'; fi
+fi
+[ ! -e $D/appearance ] || printf 'NV_DESKSET at the end appearance=%s\n' "$(cat $D/appearance)"
+(cd /private/var/db/desktop-state && find . -type f | sort | sed 's|^\./||' | while read f; do sha256sum "$f"; done) 2>&1 | sed 's/^/NV_DSHA written /'
+# the libSystem in use reads back with bytes changed in the cache; on disk it must stay as it is (Linux compares)
+printf 'NV_LIBSYSTEM in use %s; memory-disk copy %s\n' "$(sha256sum /usr/lib/libSystem.B.dylib | cut -c1-64)" "$(sha256sum /private/ram/usr/lib/libSystem.B.dylib | cut -c1-64)"
+
+phase hash
+sfnvme-test hash /dev/sfnvme0 /private/ram/etc/sfnvme-ranges 2>&1
+dmesg 2>/dev/null | grep -i 'ext4\|Waiting on\|BSD root\|Got boot\|boot-uuid' | sed 's/[0-9A-Fa-f]\{8\}-[0-9A-Fa-f-]\{27\}/GUID/g' | tail -24 | sed 's/^/NV_DMESG /'
+
+phase downgrade
+sync; sleep 1; sync
+wstats before-downgrade
+out=$(mount -t ext4 -o update,rdonly "/dev/$rootdev" / 2>&1); printf 'NV_DOWNGRADE rc=%s %s\n' "$?" "$(echo "$out" | head -1)"
+mount 2>&1 | grep ' on / ' | sed 's/^/NV_MOUNT_DOWN /'
+out=$(touch /usr/dr-y 2>&1); printf 'NV_FSWRITE create rc=%s %s\n' "$?" "$out"
+out=$(sh -c 'echo x >> /private/var/sf-persist/@NAME@.txt' 2>&1); printf 'NV_FSWRITE append rc=%s %s\n' "$?" "$(echo "$out" | head -1)"
+dmesg 2>/dev/null | grep 'ext4: downgraded' | tail -1 | sed 's/^/NV_DMESG /'
+wstats before-seal
+out=$(sysctl -w kern.sf_nvme.stop=1 2>&1); printf 'NV_STOP_WHILE_MOUNTED rc=%s state=%s\n' "$?" "$(get kern.sf_nvme.state)"
+out=$(sysctl -w kern.sf_nvme.seal=1 2>&1); printf 'NV_SEAL rc=%s seal=%s\n' "$?" "$(get kern.sf_nvme.seal)"
+sync
+sleep 2
+wstats sealed
+sfnvme-test hash /dev/sfnvme0 /private/ram/etc/sfnvme-ranges 2>&1 | sed 's/^NVT_HASH/NVT_AFTER_WRITE_HASH/'
+printf 'NV_MEDIA %s\n' "$(get kern.sf_nvme.media)"
+mount 2>&1 | grep ' on / ' | sed 's/^/NV_MOUNT_END /'
+
+phase stop
+sysctl -w kern.sf_nvme.smart=1 > /dev/null 2>&1
+printf 'NV_SMART end %s\n' "$(get kern.sf_nvme.smart)"
+printf 'NV_SMARTRAW end %s\n' "$(get kern.sf_nvme.smart_raw)"
+wstats after
+# from here on nothing is read from the root: one process, already in memory, stops the
+# controller, reports and prints the bench's end marker
+exec sfnvme-test stopreport "$nonce"

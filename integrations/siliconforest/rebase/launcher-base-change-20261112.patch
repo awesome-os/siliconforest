@@ -1,0 +1,99 @@
+The change made to the launcher base tree (runs/m1-desktop-010/pcie-m2-host-001/lab, not in git) on
+12 November 2026, when the tip became the default. Kept as the record and as the way back
+(`patch -R -p1 -d <tree>`, or the copy host_progress.py.before-tip-20261112 beside the file):
+  - the member gate no longer requires org.puredarwin.kext.PDSun50iMMC, which upstream removed. A
+    collection that has it (every pin collection) still passes: names starting org.puredarwin.
+    beyond the required set are accepted, as before;
+  - the console challenge is typed once the console has been silent for a second, in every boot
+    (these are the hunks m1-boot-speed/launcher-fast-quiet.patch used to carry). At the tip the
+    kernel no longer waits 30 s for a clock, the root mounts while the Wi-Fi driver still logs,
+    and a kernel line inside the challenge's answer fails the proof (boot rb03).
+Every per-boot launcher patch was regenerated against the new tree the same day.
+
+diff -ru a/integrations/puredarwin/m1-bringup/host_progress.py e/integrations/puredarwin/m1-bringup/host_progress.py
+--- a/integrations/puredarwin/m1-bringup/host_progress.py	2026-11-11 23:57:41.032392638 -0800
++++ e/integrations/puredarwin/m1-bringup/host_progress.py	2026-11-12 00:32:47.026387171 -0800
+@@ -61,6 +61,8 @@
+ # A guest script that prints this at the start of a line ends the capture about a second
+ # later instead of waiting out --runtime (which stays the upper bound).
+ DONE_MARKER = b'PD_BENCH_DONE'
++# Seconds of console silence after a prompt before the challenge is typed.
++SETTLE = 1.0
+ 
+ 
+ def done_mode():
+@@ -441,25 +443,40 @@
+                             'wb', buffering=0) as tx_log):
+                 self.tx_log = tx_log
+                 shell_path_sent = False
++                # The kernel no longer leaves 5 s of silence before the shell: drivers that
++                # finish in the background (Wi-Fi firmware, Touch Bar digitizer, sound) still
++                # log while the prompt is up, and a kernel line inside the challenge's answer
++                # fails the proof (boot bs01). The challenge is typed once a prompt has been
++                # seen and the console has then been silent for SETTLE seconds; the desktop
++                # command as before at a clean prompt, or after the same silence when kernel
++                # lines follow the prompt. The proof itself is unchanged.
++                prompt_seen, last_rx = False, time.monotonic()
+                 while not self.finish.is_set():
+                     data = self.dev.read(4096)
+-                    if not data:
++                    if data:
++                        log.write(data)
++                        self.proof.feed(data)
++                        self.note_time()
++                        last_rx = time.monotonic()
++                    tail = console_prompt_text(bytes(self.proof.output[-1024:]))
++                    at_prompt = re.search(rb'(?:^|\n)[^\n]{0,100}[#$] ?$', tail) is not None
++                    # a prompt anywhere in what just arrived (kernel lines may follow it in the same read)
++                    prompt_seen = prompt_seen or (bool(data) and re.search(
++                        rb'(?:^|\n)[^\n ]{0,30}[#$] ', console_prompt_text(bytes(self.proof.output[-(len(data) + 256):]))) is not None)
++                    settled = prompt_seen and time.monotonic() - last_rx >= SETTLE
++                    if not data and not settled:
+                         self.advance_virtual(b'')
+                         continue
+-                    log.write(data)
+-                    self.proof.feed(data)
+-                    self.note_time()
+-                    tail = console_prompt_text(bytes(self.proof.output[-1024:]))
+                     if not shell_path_sent and self.proof.sent_at is None and b'Enter full pathname of shell' in tail:
+                         shell_path_sent = True
+                         self.send(b'/bin/sh\r')
+-                    if self.proof.sent_at is None and re.search(rb'(?:^|\n)[^\n]{0,100}[#$] ?$', tail):
++                    if self.proof.sent_at is None and settled:
++                        prompt_seen = False
+                         self.proof.sent()
+                         bq_mark('shell_prompt')
+                         old.write_private(self.directory, 'challenge-input.bin', self.proof.command())
+                         self.send(self.proof.command())
+-                    elif self.desktop and self.proof.complete and not self.desktop_sent and re.search(
+-                            rb'(?:^|\n)[^\n]{0,100}[#$] ?$', tail):
++                    elif self.desktop and self.proof.complete and not self.desktop_sent and (at_prompt or settled):
+                         # Fixed, single-use RAM-root experiment. Never accept a
+                         # command string from guest output or arbitrary metadata.
+                         command = desktop_command(self.proof.nonce)
+@@ -467,12 +484,14 @@
+                         self.desktop_sent = True
+                         bq_mark('guest_command')
+                         self.send(command)
+-                    elif self.keyboard and self.proof.complete and not self.keyboard_sent and re.search(
+-                            rb'(?:^|\n)[^\n]{0,100}[#$] ?$', tail):
++                    elif self.keyboard and self.proof.complete and not self.keyboard_sent and (at_prompt or settled):
+                         command = keyboard_command(self.proof.nonce)
+                         old.write_private(self.directory, 'keyboard-input.bin', command)
+                         self.keyboard_sent = True
+                         self.send(command)
++                    if not data:
++                        self.advance_virtual(b'')
++                        continue
+                     self.check_done(tail)
+                     self.advance_virtual(data)
+         except BaseException as error:
+@@ -790,7 +809,7 @@
+ 
+ 
+ # Original isolated opt-in. No hardware operation; consumed by prepare.py.
+-APCIE_NATIVE_MEMBERS = ('com.apple.AppleFileSystemDriver', 'com.apple.driver.AppleUSBEHCI', 'com.apple.driver.AppleUSBOHCI', 'com.apple.filesystems.apfs', 'com.apple.filesystems.ext4', 'com.apple.filesystems.hfs.encodings.kext', 'com.apple.filesystems.hfs.kext', 'com.apple.filesystems.msdosfs', 'com.apple.iokit.IOGraphicsFamily', 'com.apple.iokit.IOHIDFamily', 'com.apple.iokit.IONVMEFamily', 'com.apple.iokit.IONetworkingFamily', 'com.apple.iokit.IOPCIFamily', 'com.apple.iokit.IOStorageFamily', 'com.apple.kec.amfi', 'com.apple.kec.corecrypto', 'com.apple.kec.pthread', 'com.apple.kernel', 'com.apple.security.sandbox', 'com.ravynos.driver.ApfsFileSystemDriver', 'com.ravynos.driver.Ext4FileSystemDriver', 'com.ravynos.driver.RavynAHCIPort', 'com.ravynos.driver.RavynXHCIPort', 'com.ravynos.iokit.IOGOPFramebuffer', 'org.puredarwin.driver.AppleUSBMergeNub', 'org.puredarwin.driver.IOUSBCompositeDriver', 'org.puredarwin.driver.IOUSBHIDDriver', 'org.puredarwin.driver.IOVirtIOBlock', 'org.puredarwin.driver.IOVirtIOGPU', 'org.puredarwin.driver.IOVirtIONet', 'org.puredarwin.driver.PDArmPCI', 'org.puredarwin.driver.PDDiskImages2', 'org.puredarwin.driver.PDEcamPCI', 'org.puredarwin.driver.PDIOSurface', 'org.puredarwin.driver.PDKeyStore', 'org.puredarwin.driver.PDM1SPIHID', 'org.puredarwin.driver.PDSg2002Eth', 'org.puredarwin.driver.PDWatchdog', 'org.puredarwin.filesystems.PDLifs', 'org.puredarwin.iokit.IOUSBFamily', 'org.puredarwin.iokit.IOVirtIOFamily', 'org.puredarwin.iokit.PDI2CFamily', 'org.puredarwin.kext.PDArmPlatformExpert', 'org.puredarwin.kext.PDI2CHID', 'org.puredarwin.kext.PDPowerVR', 'org.puredarwin.kext.PDQcomGeniI2C', 'org.puredarwin.kext.PDQcomTLMM', 'org.puredarwin.kext.PDSg2002SD', 'org.puredarwin.kext.PDSun50iMMC', 'org.puredarwin.kext.PDSun60iDisplay')
++APCIE_NATIVE_MEMBERS = ('com.apple.AppleFileSystemDriver', 'com.apple.driver.AppleUSBEHCI', 'com.apple.driver.AppleUSBOHCI', 'com.apple.filesystems.apfs', 'com.apple.filesystems.ext4', 'com.apple.filesystems.hfs.encodings.kext', 'com.apple.filesystems.hfs.kext', 'com.apple.filesystems.msdosfs', 'com.apple.iokit.IOGraphicsFamily', 'com.apple.iokit.IOHIDFamily', 'com.apple.iokit.IONVMEFamily', 'com.apple.iokit.IONetworkingFamily', 'com.apple.iokit.IOPCIFamily', 'com.apple.iokit.IOStorageFamily', 'com.apple.kec.amfi', 'com.apple.kec.corecrypto', 'com.apple.kec.pthread', 'com.apple.kernel', 'com.apple.security.sandbox', 'com.ravynos.driver.ApfsFileSystemDriver', 'com.ravynos.driver.Ext4FileSystemDriver', 'com.ravynos.driver.RavynAHCIPort', 'com.ravynos.driver.RavynXHCIPort', 'com.ravynos.iokit.IOGOPFramebuffer', 'org.puredarwin.driver.AppleUSBMergeNub', 'org.puredarwin.driver.IOUSBCompositeDriver', 'org.puredarwin.driver.IOUSBHIDDriver', 'org.puredarwin.driver.IOVirtIOBlock', 'org.puredarwin.driver.IOVirtIOGPU', 'org.puredarwin.driver.IOVirtIONet', 'org.puredarwin.driver.PDArmPCI', 'org.puredarwin.driver.PDDiskImages2', 'org.puredarwin.driver.PDEcamPCI', 'org.puredarwin.driver.PDIOSurface', 'org.puredarwin.driver.PDKeyStore', 'org.puredarwin.driver.PDM1SPIHID', 'org.puredarwin.driver.PDSg2002Eth', 'org.puredarwin.driver.PDWatchdog', 'org.puredarwin.filesystems.PDLifs', 'org.puredarwin.iokit.IOUSBFamily', 'org.puredarwin.iokit.IOVirtIOFamily', 'org.puredarwin.iokit.PDI2CFamily', 'org.puredarwin.kext.PDArmPlatformExpert', 'org.puredarwin.kext.PDI2CHID', 'org.puredarwin.kext.PDPowerVR', 'org.puredarwin.kext.PDQcomGeniI2C', 'org.puredarwin.kext.PDQcomTLMM', 'org.puredarwin.kext.PDSg2002SD', 'org.puredarwin.kext.PDSun60iDisplay')
+ APCIE_OBSERVER_MEMBER = 'org.puredarwin.driver.PDApcieT8103Bridge'
+ 
+ def apcie_port_observer_enabled(inputs):

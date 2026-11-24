@@ -1,0 +1,89 @@
+--- a/src/Frameworks/QuartzCore/CARenderer.m
++++ b/src/Frameworks/QuartzCore/CARenderer.m
+@@ -445,13 +445,41 @@
+    return chroma;
+ }
+ 
++// (FXPERF2) the planes go up as red / red-green textures (R8, RG8, R16, RG16): Mesa copies those rows as they are,
++// where luminance / luminance-alpha went through its per-pixel format conversion (a 1080p frame cost Firefox's parent
++// main thread more than half of its time on a page with a video). Luminance stays the fallback.
++#ifndef GL_RED
++#define GL_RED 0x1903
++#endif
++#ifndef GL_RG
++#define GL_RG 0x8227
++#endif
++#define SFCA_GL_R8 0x8229
++#define SFCA_GL_R16 0x822A
++#define SFCA_GL_RG8 0x822B
++#define SFCA_GL_RG16 0x822C
++static int sfcaPlanesAsRG=-1;   // -1 unknown, 1 red/red-green work, 0 they failed once: luminance
++
+ static void uploadPlane(CFTypeRef surface,size_t plane,GLenum format,GLenum type,size_t sampleBytes) {
+    size_t width=surfaceAPI.planeWidth(surface,plane),height=surfaceAPI.planeHeight(surface,plane);
+    size_t rowBytes=surfaceAPI.planeRowBytes(surface,plane),channels=format==GL_LUMINANCE_ALPHA ? 2 : 1;
+ 
+    glPixelStorei(GL_UNPACK_ALIGNMENT,1);
+    glPixelStorei(GL_UNPACK_ROW_LENGTH,(GLint)(rowBytes/(sampleBytes*channels)));
+-   glTexImage2D(GL_TEXTURE_2D,0,format,(GLsizei)width,(GLsizei)height,0,format,type,surfaceAPI.planeBase(surface,plane));
++   if(sfcaPlanesAsRG!=0){
++    BOOL wide=type==GL_UNSIGNED_SHORT;
++    GLenum rgFormat=channels==2 ? GL_RG : GL_RED;
++    GLint internal=channels==2 ? (wide ? SFCA_GL_RG16 : SFCA_GL_RG8) : (wide ? SFCA_GL_R16 : SFCA_GL_R8);
++
++    while(glGetError()!=GL_NO_ERROR){}
++    glTexImage2D(GL_TEXTURE_2D,0,internal,(GLsizei)width,(GLsizei)height,0,rgFormat,type,surfaceAPI.planeBase(surface,plane));
++    if(glGetError()==GL_NO_ERROR)
++     sfcaPlanesAsRG=1;
++    else if(sfcaPlanesAsRG<0)
++     sfcaPlanesAsRG=0;
++   }
++   if(sfcaPlanesAsRG==0)
++    glTexImage2D(GL_TEXTURE_2D,0,format,(GLsizei)width,(GLsizei)height,0,format,type,surfaceAPI.planeBase(surface,plane));
+    glPixelStorei(GL_UNPACK_ROW_LENGTH,0);
+    glPixelStorei(GL_UNPACK_ALIGNMENT,4);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
+@@ -499,16 +527,27 @@
+    "   vec3 yuv=vec3(texture2D(luma,gl_TexCoord[0].st).r,texture2D(chroma,gl_TexCoord[0].st).ra);\n"
+    "   gl_FragColor=vec4(clamp(matrix*((yuv-offset)*scale),0.0,1.0),1.0)*gl_Color;\n"
+    "}\n";
++// (FXPERF2) the same for red-green chroma planes
++static const char *yuvFragmentSourceRG=
++   "uniform sampler2D luma, chroma;\n"
++   "uniform vec3 offset, scale;\n"
++   "uniform mat3 matrix;\n"
++   "void main() {\n"
++   "   vec3 yuv=vec3(texture2D(luma,gl_TexCoord[0].st).r,texture2D(chroma,gl_TexCoord[0].st).rg);\n"
++   "   gl_FragColor=vec4(clamp(matrix*((yuv-offset)*scale),0.0,1.0),1.0)*gl_Color;\n"
++   "}\n";
+ 
+ static GLuint yuvProgram(void) {
+-   static GLuint program;
+-   static BOOL failed;
++   static GLuint programs[2];
++   static BOOL failedFor[2];
++   int rg=sfcaPlanesAsRG==1;
++   GLuint program=programs[rg];
+    GLint ok=0;
+ 
+-   if(program!=0 || failed)
++   if(program!=0 || failedFor[rg])
+     return program;
+    GLuint shader=glCreateShader(GL_FRAGMENT_SHADER);
+-   glShaderSource(shader,1,&yuvFragmentSource,NULL);
++   glShaderSource(shader,1,rg ? &yuvFragmentSourceRG : &yuvFragmentSource,NULL);
+    glCompileShader(shader);
+    glGetShaderiv(shader,GL_COMPILE_STATUS,&ok);
+    if(ok){
+@@ -521,9 +560,10 @@
+     char log[512]="";
+     glGetShaderInfoLog(shader,sizeof(log),NULL,log);
+     NSLog(@"CARenderer: no YUV shader: %s",log);
+-    failed=YES;
++    failedFor[rg]=YES;
+     program=0;
+    }
++   programs[rg]=program;
+    return program;
+ }
+ 

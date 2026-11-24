@@ -1,0 +1,75 @@
+--- a/src/Kernel/Extensions/SFDRMDri/SFDRMDri.cpp
++++ b/src/Kernel/Extensions/SFDRMDri/SFDRMDri.cpp
+@@ -35,6 +35,8 @@
+ static int sMajor = -1;
+ static void *sSlots[SF_DRI_SLOTS];
+ static bool sSlotUsed[SF_DRI_SLOTS];
++static unsigned sCloneUsed, sClonePeak;
++static unsigned long long sCloneAllocations, sCloneFrees, sCloneFailures;
+ // select/poll/kqueue: one waiter record per open file. a drm kext reports "this file became
+ // readable" with sf_dri_wakeup(cookie); dri_select records the waiter when nothing is ready
+ static struct selinfo sSel[SF_DRI_SLOTS];
+@@ -75,9 +77,12 @@
+ 		for (slot = 1; slot < SF_DRI_SLOTS; slot++) {
+ 			if (!sSlotUsed[slot]) {
+ 				sSlotUsed[slot] = true;
++                sCloneAllocations++;
++                if (++sCloneUsed > sClonePeak) sClonePeak = sCloneUsed;
+ 				break;
+ 			}
+ 		}
++        if (slot == SF_DRI_SLOTS) sCloneFailures++;
+ 		lck_mtx_unlock(sLock);
+ 		if (slot == SF_DRI_SLOTS)
+ 			return -1;
+@@ -92,6 +97,7 @@
+             lck_mtx_unlock(sLock);
+             return EBUSY;
+         }
++        if (sSlotUsed[slot]) { sCloneFrees++; sCloneUsed--; }
+ 		sSlotUsed[slot] = false;
+ 		sSlots[slot] = NULL;
+ 		lck_mtx_unlock(sLock);
+@@ -318,12 +324,34 @@
+ 	return error;
+ }
+ 
++/* Snapshot owned clone state only; no timer, worker, device query or ioctl. */
++static int
++dri_sysctl_clone_slots(struct sysctl_oid *, void *, int, struct sysctl_req *req)
++{
++    char text[256];
++    unsigned used, scan = 0, peak;
++    unsigned long long allocations, frees, failures;
++    if (!sLock) return ENXIO;
++    lck_mtx_lock(sLock);
++    used = sCloneUsed; peak = sClonePeak;
++    allocations = sCloneAllocations; frees = sCloneFrees; failures = sCloneFailures;
++    for (unsigned slot = 1; slot < SF_DRI_SLOTS; slot++) scan += sSlotUsed[slot];
++    lck_mtx_unlock(sLock);
++    snprintf(text, sizeof(text),
++        "used=%u scan=%u capacity=%u allocations=%llu frees=%llu failures=%llu peak=%u",
++        used, scan, SF_DRI_SLOTS - 1, allocations, frees, failures, peak);
++    return SYSCTL_OUT(req, text, strlen(text) + 1);
++}
++
+ SYSCTL_DECL(_kern);
+ SYSCTL_NODE(_kern, OID_AUTO, sf_dri, CTLFLAG_RD | CTLFLAG_LOCKED, 0, "drm devices");
+ SYSCTL_INT(_kern_sf_dri, OID_AUTO, major, CTLFLAG_RD | CTLFLAG_LOCKED, &sMajor, 0, "dri character major");
+ SYSCTL_PROC(_kern_sf_dri, OID_AUTO, devices, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, dri_sysctl_devices, "A", "drm minors and their pci devices");
+ 
++SYSCTL_PROC(_kern_sf_dri, OID_AUTO, clone_slots, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, dri_sysctl_clone_slots, "A", "owned DRM clone reservations");
++
+ static bool sSysctls;
+ 
+ static void
+@@ -333,6 +361,7 @@
+ 		return;
+ 	sysctl_register_oid(&sysctl__kern_sf_dri);
+ 	sysctl_register_oid(&sysctl__kern_sf_dri_major);
++    sysctl_register_oid(&sysctl__kern_sf_dri_clone_slots);
+ 	sysctl_register_oid(&sysctl__kern_sf_dri_devices);
+ 	sSysctls = true;
+ }

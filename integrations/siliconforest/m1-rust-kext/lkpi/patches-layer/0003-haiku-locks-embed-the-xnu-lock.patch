@@ -1,0 +1,167 @@
+fbsdkpi: Haiku mutex and rw_lock hold their xnu lock instead of allocating it
+
+The xnu lock behind a mutex/rw_lock (and so behind every FreeBSD mtx/sx and LinuxKPI mutex,
+spinlock_t and wait queue) was allocated on first use and freed only by *_destroy. Linux code
+never has to destroy a lock (mutex_destroy is a debug no-op there, spinlocks have none), so
+every lock that was dropped with its container leaked one xnu lock: the Rust crate's Mutex,
+SpinLock and CondVar, and equally the DRM C core. The lock is now two words inside the Haiku
+lock; nothing is allocated and nothing needs freeing.
+UPSTREAM: yes (fixes the leak for all LinuxKPI/DRM kexts).
+
+--- a/src/Kernel/fbsdkpi/sf/haiku-api/kernel/lock.h
++++ b/src/Kernel/fbsdkpi/sf/haiku-api/kernel/lock.h
+@@ -6,9 +6,17 @@
+ #include <OS.h>
+ #include <KernelExport.h>
+ 
++// The xnu lock lives inside the lock itself (two words of opaque storage, set up on first
++// use so static initialisers work). Nothing is allocated, so a lock that is simply dropped
++// or freed with its container, which is all linux code ever does, leaks nothing.
++#define SF_LOCK_UNSET	0
++#define SF_LOCK_SETUP	1
++#define SF_LOCK_READY	2
++
+ typedef struct haiku_mutex {
+ 	const char		*name;
+-	void			*impl;		// created on first use, so static initialisers work
++	uint64			impl[2];	// xnu lck_mtx_t
++	int32			impl_state;	// SF_LOCK_*
+ 	thread_id		holder;
+ 	uint32			flags;
+ } haiku_mutex;
+@@ -26,7 +34,7 @@
+ #endif
+ 
+ #define MUTEX_FLAG_CLONE_NAME	0x1
+-#define MUTEX_INITIALIZER(name)	{ name, NULL, -1, 0 }
++#define MUTEX_INITIALIZER(name)	{ name, { 0, 0 }, SF_LOCK_UNSET, -1, 0 }
+ 
+ typedef struct recursive_lock {
+ 	haiku_mutex		lock;
+@@ -38,12 +46,13 @@
+ 
+ typedef struct rw_lock {
+ 	const char		*name;
+-	void			*impl;
++	uint64			impl[2];	// xnu lck_rw_t
++	int32			impl_state;	// SF_LOCK_*
+ 	thread_id		holder;
+ 	int32			owner_count;
+ } rw_lock;
+ 
+-#define RW_LOCK_INITIALIZER(name)	{ name, NULL, -1, 0 }
++#define RW_LOCK_INITIALIZER(name)	{ name, { 0, 0 }, SF_LOCK_UNSET, -1, 0 }
+ #define RW_LOCK_FLAG_CLONE_NAME	0x1
+ 
+ #ifdef __cplusplus
+--- a/src/Kernel/fbsdkpi/sf/sf_haiku_kernel.cpp
++++ b/src/Kernel/fbsdkpi/sf/sf_haiku_kernel.cpp
+@@ -583,27 +626,39 @@
+ 
+ // mutexes, recursive locks and rw locks
+ 
+-static void *
++// the embedded xnu lock, set up by whoever gets there first; the others wait out the few
++// instructions that takes
++static inline void
++lock_setup(int32 *state, void *storage, void (*setup)(void *))
++{
++	for (;;) {
++		int32 seen = __atomic_load_n(state, __ATOMIC_ACQUIRE);
++		if (seen == SF_LOCK_READY)
++			return;
++		// anything but "being set up" counts as unset: a lock in memory nobody initialised
++		// must not hang here
++		if (seen != SF_LOCK_SETUP && __atomic_compare_exchange_n(state, &seen, SF_LOCK_SETUP,
++				0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
++			setup(storage);
++			__atomic_store_n(state, SF_LOCK_READY, __ATOMIC_RELEASE);
++			return;
++		}
++	}
++}
++
++static inline void *
+ mutex_impl(mutex *lock)
+ {
+-	void *impl = __atomic_load_n(&lock->impl, __ATOMIC_ACQUIRE);
+-	if (impl != NULL)
+-		return impl;
+-	void *fresh = sfos_mtx_alloc(lock->name);
+-	void *expected = NULL;
+-	if (!__atomic_compare_exchange_n(&lock->impl, &expected, fresh, 0,
+-			__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+-		sfos_mtx_free(fresh);
+-		return expected;
+-	}
+-	return fresh;
++	if (__atomic_load_n(&lock->impl_state, __ATOMIC_ACQUIRE) != SF_LOCK_READY)
++		lock_setup(&lock->impl_state, lock->impl, sfos_mtx_setup);
++	return lock->impl;
+ }
+ 
+ void
+ mutex_init(mutex *lock, const char *name)
+ {
+ 	lock->name = name;
+-	lock->impl = NULL;
++	lock->impl_state = SF_LOCK_UNSET;
+ 	lock->holder = -1;
+ 	lock->flags = 0;
+ }
+@@ -617,9 +672,8 @@
+ void
+ mutex_destroy(mutex *lock)
+ {
+-	if (lock->impl != NULL)
+-		sfos_mtx_free(lock->impl);
+-	lock->impl = NULL;
++	// nothing was allocated; the lock may be initialised again
++	lock->impl_state = SF_LOCK_UNSET;
+ }
+ 
+ status_t
+@@ -715,27 +769,19 @@
+ 	return -1;
+ }
+ 
+-static void *
++static inline void *
+ rw_impl(rw_lock *lock)
+ {
+-	void *impl = __atomic_load_n(&lock->impl, __ATOMIC_ACQUIRE);
+-	if (impl != NULL)
+-		return impl;
+-	void *fresh = sfos_rw_alloc();
+-	void *expected = NULL;
+-	if (!__atomic_compare_exchange_n(&lock->impl, &expected, fresh, 0,
+-			__ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+-		sfos_rw_free(fresh);
+-		return expected;
+-	}
+-	return fresh;
++	if (__atomic_load_n(&lock->impl_state, __ATOMIC_ACQUIRE) != SF_LOCK_READY)
++		lock_setup(&lock->impl_state, lock->impl, sfos_rw_setup);
++	return lock->impl;
+ }
+ 
+ void
+ rw_lock_init(rw_lock *lock, const char *name)
+ {
+ 	lock->name = name;
+-	lock->impl = NULL;
++	lock->impl_state = SF_LOCK_UNSET;
+ 	lock->holder = -1;
+ 	lock->owner_count = 0;
+ }
+@@ -749,9 +795,7 @@
+ void
+ rw_lock_destroy(rw_lock *lock)
+ {
+-	if (lock->impl != NULL)
+-		sfos_rw_free(lock->impl);
+-	lock->impl = NULL;
++	lock->impl_state = SF_LOCK_UNSET;
+ }
+ 
+ status_t

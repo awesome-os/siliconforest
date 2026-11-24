@@ -1,0 +1,93 @@
+--- a/src/Frameworks/QuartzCore/CARenderer.m
++++ b/src/Frameworks/QuartzCore/CARenderer.m
+@@ -1469,6 +1469,50 @@
+ }
+ 
+ 
++/* (TERM12) Core Animation draws a layer's sublayers in order, those with a greater zPosition later (painter's order).
++ * The renderer drew each sublayer "a step nearer than its parent" with the depth test on, so a later sibling was hidden
++ * wherever an earlier sibling's deeper-nested layers had drawn: Firefox's position:fixed layer under the page's tiles
++ * when those sat under clip layers (pages with rounded or rotated boxes) */
++static int sfcaOldOrder(void){
++   static int old=-1;
++   if(old<0)old=getenv("SF_CA_OLD_ORDER")!=NULL;
++   return old;
++}
++
++static NSArray *sublayersInPaintOrder(CALayer *layer) {
++   NSArray *sublayers=layer.sublayers;
++   BOOL ordered=YES;
++
++   if(sfcaOldOrder())
++    return sublayers;
++   for(CALayer *child in sublayers)
++    if(child.zPosition!=0){
++     ordered=NO;
++     break;
++    }
++   if(ordered)
++    return sublayers;
++   // a stable insertion sort: equal zPositions keep their order
++   NSUInteger count=[sublayers count];
++   CALayer *sorted[count];
++   CGFloat keys[count];
++
++   for(NSUInteger i=0;i<count;i++){
++    CALayer *child=[sublayers objectAtIndex:i];
++    CGFloat key=child.zPosition;
++    NSUInteger j=i;
++
++    while(j>0 && keys[j-1]>key){
++     sorted[j]=sorted[j-1];
++     keys[j]=keys[j-1];
++     j--;
++    }
++    sorted[j]=child;
++    keys[j]=key;
++   }
++   return [NSArray arrayWithObjects:sorted count:count];
++}
++
+ -(void)_renderLayer:(CALayer *)layer z:(float)z currentTime:(CFTimeInterval)currentTime {
+    if(layer.isHidden)
+     return;
+@@ -1538,8 +1582,13 @@
+         glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,minFilter);
+         glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,magFilter);
+ 
+-        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_REPEAT);
+-        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_REPEAT);
++        // (TERM12) contents end at their edges, as Core Animation samples them: with GL_REPEAT a linear sample at an edge
++        // (a layer at a fraction of a pixel, a video scaled to its element) took in the opposite edge's pixels: a line
++        // of the bottom rows over a video's top, of the next text line at a tile's edge
++        // (SF_CA_OLD_ORDER=1: as before, for A/B)
++        GLint wrap=sfcaOldOrder() ? GL_REPEAT : GL_CLAMP_TO_EDGE;
++        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,wrap);
++        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,wrap);
+    }
+    
+    CGPoint anchorPoint=interpolatePointInLayerKey(layer,sfcaKeyAnchorPoint,currentTime);
+@@ -1698,7 +1747,7 @@
+     glScalef(1,-1,1);
+    }
+    sfcaDepth++;
+-   for(CALayer *child in layer.sublayers)
++   for(CALayer *child in sublayersInPaintOrder(layer))
+     [self _renderLayer:child z:z+1 currentTime:currentTime];
+    sfcaDepth--;
+    if(layer.isGeometryFlipped){
+@@ -1745,8 +1794,12 @@
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+ 
+-   glEnable(GL_DEPTH_TEST);
+-   glDepthFunc(GL_LEQUAL);					
++   // (TERM12) painter's order, as Core Animation composites (zPosition orders siblings): no depth test
++   if(sfcaOldOrder())
++    glEnable(GL_DEPTH_TEST);
++   else
++    glDisable(GL_DEPTH_TEST);
++   glDepthFunc(GL_LEQUAL);
+ 
+    //glEnable( GL_TEXTURE_2D );
+    //glEnableClientState(GL_VERTEX_ARRAY);

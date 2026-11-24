@@ -1,0 +1,75 @@
+platform/of/clk registries: the locks are not set up behind a flag
+
+Audit finding P3. Each lock was mutex_init()ed at first use behind a plain int flag; a
+second cpu seeing the flag still clear ran mutex_init() on the lock the first one held.
+A zero-filled mutex of this layer sets its xnu lock up by compare-and-swap at the first
+lock, so the flags and the mutex_init() calls go.
+
+--- a/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_platform.c
++++ b/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_platform.c
+@@ -28,17 +28,13 @@
+ device_t sf_platform_bsddev(const char *name, const char *desc);
+ 
+ static LIST_HEAD(sDrivers);
+-// set up on first use, which is single threaded (module init or the first attach)
++// zero-filled, the layer's mutex sets itself up at its first lock with a compare-and-swap:
++// no flag of our own, which two cpus could both find clear and then wipe a held lock
+ static struct mutex sf_platform_lock;
+-static int sf_platform_lock_ready;
+ 
+ static struct mutex *
+ sf_platform_lock_get(void)
+ {
+-	if (!sf_platform_lock_ready) {
+-		mutex_init(&sf_platform_lock);
+-		sf_platform_lock_ready = 1;
+-	}
+ 	return (&sf_platform_lock);
+ }
+ static struct platform_device *sDevices[16];
+--- a/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_of.c
++++ b/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_of.c
+@@ -14,17 +14,13 @@
+ #include "sf_fbsd_os.h"
+ 
+ static struct device_node *sNodes;
+-// set up on first use, which is single threaded (module init or the first attach)
++// zero-filled, the layer's mutex sets itself up at its first lock with a compare-and-swap:
++// no flag of our own, which two cpus could both find clear and then wipe a held lock
+ static struct mutex sf_of_nodes_lock;
+-static int sf_of_nodes_lock_ready;
+ 
+ static struct mutex *
+ sf_of_nodes_lock_get(void)
+ {
+-	if (!sf_of_nodes_lock_ready) {
+-		mutex_init(&sf_of_nodes_lock);
+-		sf_of_nodes_lock_ready = 1;
+-	}
+ 	return (&sf_of_nodes_lock);
+ }
+ 
+
+--- a/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_clk.c
++++ b/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_clk.c
+@@ -24,17 +24,13 @@
+ 
+ static struct sf_provider sProviders[32];
+ static int sProviderCount;
+-// set up on first use, which is single threaded (module init or the first attach)
++// zero-filled, the layer's mutex sets itself up at its first lock with a compare-and-swap:
++// no flag of our own, which two cpus could both find clear and then wipe a held lock
+ static struct mutex sf_provider_lock;
+-static int sf_provider_lock_ready;
+ 
+ static struct mutex *
+ sf_provider_lock_get(void)
+ {
+-	if (!sf_provider_lock_ready) {
+-		mutex_init(&sf_provider_lock);
+-		sf_provider_lock_ready = 1;
+-	}
+ 	return (&sf_provider_lock);
+ }
+ 
+

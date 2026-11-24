@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: GPL-2.0
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../fbsdkpi/fbsdkpi.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../fbsdkpi/drm/drm.cmake")
+set(drmkmod "${SF_DRMKMOD_DIR}")
+sf_drm_layout("${drmkmod}" drminc drmdefs drmopts)
+set(lkpiinc ${drminc}
+    "${FBSDKPI_DIR}/sf/lkpi-override"
+    "${FBSDKPI_DIR}/freebsd/linuxkpi/common/include"
+    "${FBSDKPI_DIR}/freebsd/linuxkpi/dummy/include"
+    "${FBSDKPI_DIR}/sf/fbsd-extra" "${FBSDKPI_DIR}/freebsd"
+    "${FBSDKPI_DIR}/haiku/freebsd_iflib/compat")
+set(lkpiopt "SHELL:-include ${FBSDKPI_DIR}/sf/fbsd-extra/sf_lkpi_pre.h"
+    ${drmopts} -Werror=implicit-function-declaration)
+# Object-target validation includes the same private LinuxKPI devres unit a
+# future kext's layer will compile once, not a second parallel devres runtime.
+set(sources "${CMAKE_CURRENT_SOURCE_DIR}/sf_tb_device.c" "${CMAKE_CURRENT_SOURCE_DIR}/sf_tb_registry.c" "${CMAKE_CURRENT_SOURCE_DIR}/sf_tb_dma.c" "${CMAKE_CURRENT_SOURCE_DIR}/sf_tb_pm.c"
+)
+if(NOT SF_TB_CM_EMBEDDED)
+    list(APPEND sources "${FBSDKPI_DIR}/freebsd/linuxkpi/common/src/linux_devres.c")
+endif()
+set(cmcore cap clx ctl dma_port lc path property tmu tunnel usb4)
+if(SF_TB_CM_FULL)
+    list(APPEND sources "${CMAKE_CURRENT_SOURCE_DIR}/sf_tb_nhi.c")
+    list(APPEND cmcore domain eeprom icm nhi nvm retimer switch tb xdomain usb4_port quirks)
+    list(APPEND sources "${CMAKE_CURRENT_SOURCE_DIR}/lib/crypto/sha256.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/lib/crypto/memneq.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/lib/uuid.c"
+        "${CMAKE_CURRENT_SOURCE_DIR}/lib/component.c")
+endif()
+foreach(f ${cmcore})
+    list(APPEND sources "${CMAKE_CURRENT_SOURCE_DIR}/driver/${f}.c")
+endforeach()
+_fbsdkpi_objects(SFThunderboltCM SOURCES ${sources}
+    INCLUDES "${CMAKE_CURRENT_SOURCE_DIR}/driver" "${CMAKE_CURRENT_SOURCE_DIR}/pininc" ${lkpiinc}
+    DEFINITIONS guid_null=sf_tb_guid_null uuid_null=sf_tb_uuid_null at_least=static CONFIG_USB4=1 FBSD_DRIVER=1 _XOPEN_SOURCE ${drmdefs} KBUILD_MODNAME="thunderbolt" LINUXKPI_PARAM_PREFIX=thunderbolt_
+    OPTIONS ${lkpiopt} "SHELL:-include ${CMAKE_CURRENT_SOURCE_DIR}/sf_tb_cm_compat.h" -Os -Wno-everything -Werror=implicit-function-declaration)

@@ -1,0 +1,128 @@
+fbsdkpi: the layer's first-use initialisation and the attach lock are made once
+
+Audit findings P1, P2.
+
+- sfos_xnu_init() tested sGroup, which it set two statements before the global wait lock
+  and the list lock existed: a second cpu could run lck_spin_lock(NULL), and two first
+  callers each made their own wait lock (waiters and wakers then used different locks).
+  One caller is elected by compare-and-swap, the others wait, and "done" is published last.
+- The lock that serialises a nub's attach (sf_fbsd_init, the sysinits, the probe state of
+  sf_driver.c, none of it reentrant) was IOLockAlloc()ed at first use by each nub class
+  with no lock: two nubs starting on two cpus each got their own. It is made in
+  sfos_xnu_init() and handed out by sfos_attach_iolock().
+
+--- a/src/Kernel/fbsdkpi/xnu/sf_fbsd_os.cpp
++++ b/src/Kernel/fbsdkpi/xnu/sf_fbsd_os.cpp
+@@ -59,11 +59,36 @@
+ static uint64_t sNowaitAllocs;
+ static int64_t sLiveBytes;
+ 
++// 0 not started, 1 one caller is doing it, 2 done. every sleep, wakeup and lock setup of the
++// layer comes through here first, from any cpu: the first caller does the work, a caller
++// arriving meanwhile waits the few microseconds out, and nobody sees sGroup, sWaitLock or
++// sListLock before all of them exist. (before: the test was sGroup != NULL, set two
++// statements before sWaitLock, so a second cpu could take a null wait lock, and two first
++// callers each made their own.)
++static int sXnuInitState;
++static IOLock *sAttachIOLock;
++
++// the one lock under which a nub attaches its linux driver: sf_fbsd_init, the sysinits and
++// the probe state of sf_driver.c are not reentrant
++extern "C" void *
++sfos_attach_iolock(void)
++{
++	sfos_xnu_init();
++	return sAttachIOLock;
++}
++
+ void
+ sfos_xnu_init(void)
+ {
+-	if (sGroup != NULL)
++	if (__atomic_load_n(&sXnuInitState, __ATOMIC_ACQUIRE) == 2)
++		return;
++	int expected = 0;
++	if (!__atomic_compare_exchange_n(&sXnuInitState, &expected, 1, 0, __ATOMIC_ACQ_REL,
++			__ATOMIC_ACQUIRE)) {
++		while (__atomic_load_n(&sXnuInitState, __ATOMIC_ACQUIRE) != 2)
++			IODelay(10);
+ 		return;
++	}
+ 	lck_grp_t *group = lck_grp_alloc_init("fbsdkpi", LCK_GRP_ATTR_NULL);
+ 	lck_mtx_t mtx;
+ 	lck_rw_t rw;
+@@ -80,6 +105,8 @@
+ 	sGroup = group;
+ 	sWaitLock = lck_spin_alloc_init(sGroup, LCK_ATTR_NULL);
+ 	sListLock = lck_mtx_alloc_init(sGroup, LCK_ATTR_NULL);
++	sAttachIOLock = IOLockAlloc();
++	__atomic_store_n(&sXnuInitState, 2, __ATOMIC_RELEASE);
+ }
+ 
+ // console
+
+--- a/src/Kernel/fbsdkpi/xnu/SFDRMPlatformDevice.cpp
++++ b/src/Kernel/fbsdkpi/xnu/SFDRMPlatformDevice.cpp
+@@ -32,6 +32,7 @@
+ 
+ OSDefineMetaClassAndStructors(SFFBSD_CLASS, IOService);
+ 
++extern "C" void *sfos_attach_iolock(void);
+ static IOLock *sAttachLock;
+ 
+ #ifdef SFDRM_OPT_IN_BOOTARG
+@@ -200,8 +201,9 @@
+ 	setProperty("SFDRMState", "init");
+ 	sfos_xnu_init();
+ 	setProperty("SFDRMState", "attaching");
+-	if (sAttachLock == NULL)
+-		sAttachLock = IOLockAlloc();
++	// one lock for every nub of this kext, made once (two nubs starting on two cpus each
++	// used to allocate their own and attach side by side)
++	sAttachLock = (IOLock *)sfos_attach_iolock();
+ 	IOLockLock(sAttachLock);
+ 	fDevice = sf_fbsd_attach_platform_device(&pd);
+ 	IOLockUnlock(sAttachLock);
+
+--- a/src/Kernel/fbsdkpi/xnu/SFDRMDevice.cpp
++++ b/src/Kernel/fbsdkpi/xnu/SFDRMDevice.cpp
+@@ -64,6 +64,7 @@
+ 
+ OSDefineMetaClassAndStructors(SFFBSD_CLASS, IOService);
+ 
++extern "C" void *sfos_attach_iolock(void);
+ static IOLock *sAttachLock;
+ 
+ // an unclean stop leaves the PSP ring behind and the next create fails, so destroy rings
+@@ -252,8 +253,7 @@
+ SFFBSD_CLASS::attachLinux(void)
+ {
+ 	sfos_xnu_init();
+-	if (sAttachLock == NULL)
+-		sAttachLock = IOLockAlloc();
++	sAttachLock = (IOLock *)sfos_attach_iolock();
+ 
+ 	SFDRM_LOG(SFDRM_STR(SFFBSD_CLASS) ": attaching the linux driver\n");
+ 	IOLockLock(sAttachLock);
+
+--- a/src/Kernel/fbsdkpi/xnu/SFFBSDEthernet.cpp
++++ b/src/Kernel/fbsdkpi/xnu/SFFBSDEthernet.cpp
+@@ -22,6 +22,7 @@
+ #define SFFBSD_STR(x)	SFFBSD_STR2(x)
+ 
+ static IOLock *sTxLock;
++extern "C" void *sfos_attach_iolock(void);
+ static IOLock *sAttachLock;
+ 
+ bool
+@@ -59,8 +60,7 @@
+ 	sfos_xnu_init();
+ 	if (sTxLock == NULL)
+ 		sTxLock = IOLockAlloc();
+-	if (sAttachLock == NULL)
+-		sAttachLock = IOLockAlloc();
++	sAttachLock = (IOLock *)sfos_attach_iolock();
+ 
+ 	IOLog(SFFBSD_STR(SFFBSD_CLASS) ": attaching the FreeBSD driver\n");
+ 
+

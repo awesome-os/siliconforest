@@ -1,0 +1,58 @@
+diff -ru a/src/Libraries/objc4/runtime/NSObject.mm b/src/Libraries/objc4/runtime/NSObject.mm
+--- a/src/Libraries/objc4/runtime/NSObject.mm	2026-11-14 15:31:59.205845518 -0800
++++ b/src/Libraries/objc4/runtime/NSObject.mm	2026-11-14 15:31:59.302648790 -0800
+@@ -22,6 +22,11 @@
+  */
+ 
+ #include "objc-private.h"
++
++/* SiliconForest: SF_POOL_TRACE (the pool trace below) is read once, by environ_init() at
++ * _objc_init (objc-runtime.mm), not by getenv() at every autorelease and at every release of
++ * a pool pop: that getenv walked the whole environment each time (Activity Monitor, sf-prof). */
++extern bool SFPoolTrace;
+ #include "NSObject.h"
+ 
+ #include "objc-weak.h"
+@@ -942,7 +947,7 @@
+                 /* SiliconForest: pool-drain trace. Prints each object about to be
+                  * released so an over-release shows which one faulted; the last
+                  * line before the crash names the culprit. */
+-                bool sfTrace = (getenv("SF_POOL_TRACE") != NULL);
++                bool sfTrace = SFPoolTrace;
+ 
+                 if (sfTrace) {
+                     /* Pointer first, without touching the object: if the entry
+@@ -1088,7 +1093,7 @@
+ 
+     static inline id *autoreleaseFast(id obj)
+     {
+-        if (obj != POOL_BOUNDARY && getenv("SF_POOL_TRACE") != NULL) {
++        if (slowpath(SFPoolTrace) && obj != POOL_BOUNDARY) {
+             Class cls = object_getClass(obj);
+             fprintf(stderr, "pool: ADD %p %s\n", (void *)obj,
+                     cls ? class_getName(cls) : "?");
+diff -ru a/src/Libraries/objc4/runtime/objc-runtime.mm b/src/Libraries/objc4/runtime/objc-runtime.mm
+--- a/src/Libraries/objc4/runtime/objc-runtime.mm	2026-11-14 15:31:59.205845518 -0800
++++ b/src/Libraries/objc4/runtime/objc-runtime.mm	2026-11-14 15:31:59.306643735 -0800
+@@ -364,6 +364,9 @@
+ * Read environment variables that affect the runtime.
+ * Also print environment variable help, if requested.
+ **********************************************************************/
++// SiliconForest: getenv("SF_POOL_TRACE") != NULL, as environ_init() found it (NSObject.mm).
++bool SFPoolTrace = false;
++
+ void environ_init(void) 
+ {
+     if (issetugid()) {
+@@ -386,6 +389,11 @@
+     // Scan environ[] directly instead of calling getenv() a lot.
+     // This optimizes the case where none are set.
+     for (char **p = *_NSGetEnviron(); *p != nil; p++) {
++        // SiliconForest's pool trace (NSObject.mm), read here once.
++        if (0 == strncmp(*p, "SF_POOL_TRACE=", 14)) {
++            SFPoolTrace = true;
++            continue;
++        }
+         if (0 == strncmp(*p, "Malloc", 6)  ||  0 == strncmp(*p, "DYLD", 4)  ||  
+             0 == strncmp(*p, "NSZombiesEnabled", 16))
+         {

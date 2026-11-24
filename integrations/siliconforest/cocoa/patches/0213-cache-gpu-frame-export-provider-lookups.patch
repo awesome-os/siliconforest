@@ -1,0 +1,42 @@
+--- a/src/Frameworks/QuartzCore/CALayerContext.m
++++ b/src/Frameworks/QuartzCore/CALayerContext.m
+@@ -248,12 +248,33 @@
+ -(CFTypeRef)copySFFXRenderedSurface {
+    const char *enabled=getenv("SFFX_GPU_PRESENT");
+    if(!enabled||strcmp(enabled,"1"))return NULL;
+-   void *library=dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",RTLD_LAZY|RTLD_GLOBAL);
+-   CFTypeRef (*create)(CFDictionaryRef)=library?dlsym(library,"IOSurfaceCreate"):NULL;
+-   size_t (*width)(CFTypeRef)=library?dlsym(library,"IOSurfaceGetWidth"):NULL;
+-   size_t (*height)(CFTypeRef)=library?dlsym(library,"IOSurfaceGetHeight"):NULL;
+-   int (*copy)(CFTypeRef,int)=dlsym(RTLD_DEFAULT,"CGLSFFXCopyFramebuffer");
+-   if(library)dlclose(library);
++   static dispatch_once_t once;
++   static void *cachedLibrary;
++   static CFTypeRef (*cachedCreate)(CFDictionaryRef);
++   static size_t (*cachedWidth)(CFTypeRef),(*cachedHeight)(CFTypeRef);
++   static int (*cachedCopy)(CFTypeRef,int);
++   CFTypeRef (*create)(CFDictionaryRef)=NULL;
++   size_t (*width)(CFTypeRef)=NULL,(*height)(CFTypeRef)=NULL;
++   int (*copy)(CFTypeRef,int)=NULL;
++   if(getenv("SFFX_GPU_CACHE_LOOKUPS")){
++    dispatch_once(&once,^{
++     cachedLibrary=dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",RTLD_LAZY|RTLD_GLOBAL);
++     if(cachedLibrary){
++      cachedCreate=dlsym(cachedLibrary,"IOSurfaceCreate");
++      cachedWidth=dlsym(cachedLibrary,"IOSurfaceGetWidth");
++      cachedHeight=dlsym(cachedLibrary,"IOSurfaceGetHeight");
++     }
++     cachedCopy=dlsym(RTLD_DEFAULT,"CGLSFFXCopyFramebuffer");
++    });
++    create=cachedCreate;width=cachedWidth;height=cachedHeight;copy=cachedCopy;
++   }else{
++    void *library=dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",RTLD_LAZY|RTLD_GLOBAL);
++    create=library?dlsym(library,"IOSurfaceCreate"):NULL;
++    width=library?dlsym(library,"IOSurfaceGetWidth"):NULL;
++    height=library?dlsym(library,"IOSurfaceGetHeight"):NULL;
++    copy=dlsym(RTLD_DEFAULT,"CGLSFFXCopyFramebuffer");
++    if(library)dlclose(library);
++   }
+    if(!create||!width||!height||!copy)return NULL;
+    int w=(int)ceil(_frame.size.width*_backingScale),h=(int)ceil(_frame.size.height*_backingScale);
+    if(w<=0||h<=0||w>16384||h>16384)return NULL;

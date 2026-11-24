@@ -1,0 +1,408 @@
+--- a/src/Frameworks/CoreGraphics/CGImageMetadata.h
++++ b/src/Frameworks/CoreGraphics/CGImageMetadata.h
+@@ -0,0 +1,47 @@
++/* SPDX-License-Identifier: MIT
++ * SiliconForest (cocoa 0109): ImageIO's thumbnail call and image metadata, declared from macOS's
++ * public names (no SDK header copied). ImageIO.framework re-exports CoreGraphics, where these live.
++ */
++#import "CoreGraphicsExport.h"
++#import <CoreFoundation/CoreFoundation.h>
++#import "CGImageSource.h"
++
++COREGRAPHICS_EXPORT const CFStringRef kCGImageSourceCreateThumbnailFromImageIfAbsent;
++COREGRAPHICS_EXPORT const CFStringRef kCGImageSourceCreateThumbnailFromImageAlways;
++COREGRAPHICS_EXPORT const CFStringRef kCGImageSourceThumbnailMaxPixelSize;
++COREGRAPHICS_EXPORT const CFStringRef kCGImageSourceCreateThumbnailWithTransform;
++COREGRAPHICS_EXPORT CGImageRef CGImageSourceCreateThumbnailAtIndex(CGImageSourceRef isrc, size_t index, CFDictionaryRef options);
++
++typedef const struct CGImageMetadata *CGImageMetadataRef;
++typedef struct CGImageMetadata *CGMutableImageMetadataRef;
++typedef struct CGImageMetadataTag *CGImageMetadataTagRef;
++
++typedef int32_t CGImageMetadataType;
++enum {
++    kCGImageMetadataTypeInvalid = -1,
++    kCGImageMetadataTypeDefault = 0,
++    kCGImageMetadataTypeString = 1,
++    kCGImageMetadataTypeArrayUnordered = 2,
++    kCGImageMetadataTypeArrayOrdered = 3,
++    kCGImageMetadataTypeAlternateArray = 4,
++    kCGImageMetadataTypeAlternateText = 5,
++    kCGImageMetadataTypeStructure = 6
++};
++
++COREGRAPHICS_EXPORT const CFStringRef kCGImageDestinationMetadata;
++
++COREGRAPHICS_EXPORT CGMutableImageMetadataRef CGImageMetadataCreateMutable(void);
++COREGRAPHICS_EXPORT CGMutableImageMetadataRef CGImageMetadataCreateMutableCopy(CGImageMetadataRef metadata);
++COREGRAPHICS_EXPORT CGImageMetadataTagRef CGImageMetadataTagCreate(CFStringRef xmlns, CFStringRef prefix, CFStringRef name, CGImageMetadataType type, CFTypeRef value);
++COREGRAPHICS_EXPORT CFStringRef CGImageMetadataTagCopyNamespace(CGImageMetadataTagRef tag);
++COREGRAPHICS_EXPORT CFStringRef CGImageMetadataTagCopyPrefix(CGImageMetadataTagRef tag);
++COREGRAPHICS_EXPORT CFStringRef CGImageMetadataTagCopyName(CGImageMetadataTagRef tag);
++COREGRAPHICS_EXPORT CFTypeRef CGImageMetadataTagCopyValue(CGImageMetadataTagRef tag);
++COREGRAPHICS_EXPORT CGImageMetadataType CGImageMetadataTagGetType(CGImageMetadataTagRef tag);
++COREGRAPHICS_EXPORT CFArrayRef CGImageMetadataCopyTags(CGImageMetadataRef metadata);
++COREGRAPHICS_EXPORT CGImageMetadataTagRef CGImageMetadataCopyTagWithPath(CGImageMetadataRef metadata, CGImageMetadataTagRef parent, CFStringRef path);
++COREGRAPHICS_EXPORT CFStringRef CGImageMetadataCopyStringValueWithPath(CGImageMetadataRef metadata, CGImageMetadataTagRef parent, CFStringRef path);
++COREGRAPHICS_EXPORT bool CGImageMetadataSetTagWithPath(CGMutableImageMetadataRef metadata, CGImageMetadataTagRef parent, CFStringRef path, CGImageMetadataTagRef tag);
++COREGRAPHICS_EXPORT bool CGImageMetadataSetValueWithPath(CGMutableImageMetadataRef metadata, CGImageMetadataTagRef parent, CFStringRef path, CFTypeRef value);
++COREGRAPHICS_EXPORT bool CGImageMetadataRemoveTagWithPath(CGMutableImageMetadataRef metadata, CGImageMetadataTagRef parent, CFStringRef path);
++COREGRAPHICS_EXPORT CGImageMetadataRef CGImageSourceCopyMetadataAtIndex(CGImageSourceRef isrc, size_t index, CFDictionaryRef options);
+--- a/src/Frameworks/CoreGraphics/CGImageMetadata.m
++++ b/src/Frameworks/CoreGraphics/CGImageMetadata.m
+@@ -0,0 +1,355 @@
++// SPDX-License-Identifier: MIT
++// SiliconForest (cocoa 0109; the Finch frameworks' requests, runs/m1-coord/requests-for-CLAUDE.md:
++// Contacts and MediaAccessibility). ImageIO.framework re-exports CoreGraphics, where Onyx2D's image
++// source lives, so ImageIO's calls are made here:
++//   CGImageSourceCreateThumbnailAtIndex: the image at the index, oriented when asked
++//     (kCGImageSourceCreateThumbnailWithTransform: the source's EXIF orientation) and scaled so its
++//     longer side is at most kCGImageSourceThumbnailMaxPixelSize, drawn into an RGBA bitmap. Images
++//     carry no embedded thumbnail here: one is always made from the image (Finch's ImageIO does the same).
++//   Image metadata: a tag (namespace, prefix, name, type, value) and a metadata object that keeps tags
++//     by path ("prefix:name"; "prefix:name.prefix:field" inside a structure tag), with macOS's
++//     functions to make, copy, set, read and remove them. CGImageSourceCopyMetadataAtIndex gives the
++//     source's EXIF and TIFF properties as exif: and tiff: tags (Onyx2D reads no XMP packet), or NULL
++//     when it has none. kCGImageDestinationMetadata is the key; the image destination does not write
++//     metadata into files.
++// Written for SiliconForest from macOS's public names; Finch's ImageIO (CGImageSource.cpp,
++// CGImageMetadata.cpp) was read for the behaviour, no code was taken.
++#import <Foundation/Foundation.h>
++#import <CoreGraphics/CGImageMetadata.h>
++#import <CoreGraphics/CGImageProperties.h>
++#import <CoreGraphics/CGBitmapContext.h>
++#import <CoreGraphics/CGColorSpace.h>
++#import <CoreGraphics/CGContext.h>
++#include <math.h>
++
++const CFStringRef kCGImageSourceCreateThumbnailFromImageIfAbsent = CFSTR("kCGImageSourceCreateThumbnailFromImageIfAbsent");
++const CFStringRef kCGImageSourceCreateThumbnailFromImageAlways = CFSTR("kCGImageSourceCreateThumbnailFromImageAlways");
++const CFStringRef kCGImageSourceThumbnailMaxPixelSize = CFSTR("kCGImageSourceThumbnailMaxPixelSize");
++const CFStringRef kCGImageSourceCreateThumbnailWithTransform = CFSTR("kCGImageSourceCreateThumbnailWithTransform");
++const CFStringRef kCGImageDestinationMetadata = CFSTR("kCGImageDestinationMetadata");
++
++static BOOL option_bool(CFDictionaryRef options, CFStringRef key)
++{
++    id v = options ? [(NSDictionary *)options objectForKey:(NSString *)key] : nil;
++    return [v respondsToSelector:@selector(boolValue)] && [v boolValue];
++}
++
++CGImageRef CGImageSourceCreateThumbnailAtIndex(CGImageSourceRef source, size_t index, CFDictionaryRef options)
++{
++    if (source == NULL)
++        return NULL;
++    CGImageRef full = CGImageSourceCreateImageAtIndex(source, index, NULL);
++    if (full == NULL)
++        return NULL;
++    id maxValue = options ? [(NSDictionary *)options objectForKey:(NSString *)kCGImageSourceThumbnailMaxPixelSize] : nil;
++    double max = [maxValue respondsToSelector:@selector(doubleValue)] ? [maxValue doubleValue] : 0;
++    int orientation = 1;
++    if (option_bool(options, kCGImageSourceCreateThumbnailWithTransform)) {
++        NSDictionary *props = [(NSDictionary *)CGImageSourceCopyPropertiesAtIndex(source, index, NULL) autorelease];
++        id o = [props objectForKey:(NSString *)kCGImagePropertyOrientation];
++        if ([o respondsToSelector:@selector(intValue)] && [o intValue] >= 1 && [o intValue] <= 8)
++            orientation = [o intValue];
++    }
++    size_t w = CGImageGetWidth(full), h = CGImageGetHeight(full);
++    size_t ow = orientation >= 5 ? h : w, oh = orientation >= 5 ? w : h;
++    double longer = ow > oh ? ow : oh, scale = (max > 0 && max < longer) ? max / longer : 1;
++    if (scale == 1 && orientation == 1)
++        return full;
++    size_t tw = (size_t)lround(ow * scale), th = (size_t)lround(oh * scale);
++    if (tw == 0) tw = 1;
++    if (th == 0) th = 1;
++    CGColorSpaceRef rgb = CGColorSpaceCreateDeviceRGB();
++    CGContextRef c = CGBitmapContextCreate(NULL, tw, th, 8, tw * 4, rgb, kCGImageAlphaPremultipliedLast);
++    CGColorSpaceRelease(rgb);
++    if (c == NULL) {
++        CGImageRelease(full);
++        return NULL;
++    }
++    CGContextSetInterpolationQuality(c, kCGInterpolationHigh);
++    // the EXIF orientations: where the stored image's rows and columns go in the upright picture
++    double W = tw, H = th;
++    CGAffineTransform t = CGAffineTransformIdentity;
++    switch (orientation) {
++    case 2: t = CGAffineTransformMake(-1, 0, 0, 1, W, 0); break;
++    case 3: t = CGAffineTransformMake(-1, 0, 0, -1, W, H); break;
++    case 4: t = CGAffineTransformMake(1, 0, 0, -1, 0, H); break;
++    case 5: t = CGAffineTransformMake(0, -1, -1, 0, W, H); break;
++    case 6: t = CGAffineTransformMake(0, -1, 1, 0, 0, H); break;
++    case 7: t = CGAffineTransformMake(0, 1, 1, 0, 0, 0); break;
++    case 8: t = CGAffineTransformMake(0, 1, -1, 0, W, 0); break;
++    default: break;
++    }
++    CGContextConcatCTM(c, t);
++    CGRect r = orientation >= 5 ? CGRectMake(0, 0, H, W) : CGRectMake(0, 0, W, H);
++    CGContextDrawImage(c, r, full);
++    CGImageRelease(full);
++    CGImageRef thumb = CGBitmapContextCreateImage(c);
++    CGContextRelease(c);
++    return thumb;
++}
++
++/* ---- metadata ---- */
++
++@interface SFImageMetadataTag : NSObject {
++@public
++    NSString *_xmlns, *_prefix, *_name;
++    CGImageMetadataType _type;
++    id _value;
++}
++@end
++
++@implementation SFImageMetadataTag
++- (void)dealloc
++{
++    [_xmlns release]; [_prefix release]; [_name release]; [_value release];
++    [super dealloc];
++}
++- (NSString *)description
++{
++    return [NSString stringWithFormat:@"%@:%@ = %@", _prefix, _name, _value];
++}
++@end
++
++@interface SFImageMetadata : NSObject {
++@public
++    NSMutableArray *_paths;          // insertion order, as CGImageMetadataCopyTags answers
++    NSMutableDictionary *_tags;      // path -> tag
++}
++@end
++
++@implementation SFImageMetadata
++- (instancetype)init
++{
++    if ((self = [super init])) {
++        _paths = [NSMutableArray new];
++        _tags = [NSMutableDictionary new];
++    }
++    return self;
++}
++- (void)dealloc
++{
++    [_paths release]; [_tags release];
++    [super dealloc];
++}
++@end
++
++static NSString *namespace_of(NSString *prefix)
++{
++    static NSDictionary *known;
++    if (known == nil)
++        known = [@{ @"exif": @"http://ns.adobe.com/exif/1.0/", @"exifEX": @"http://cipa.jp/exif/1.0/",
++                    @"tiff": @"http://ns.adobe.com/tiff/1.0/", @"xmp": @"http://ns.adobe.com/xap/1.0/",
++                    @"dc": @"http://purl.org/dc/elements/1.1/", @"photoshop": @"http://ns.adobe.com/photoshop/1.0/",
++                    @"Iptc4xmpCore": @"http://iptc.org/std/Iptc4xmpCore/1.0/xmlns/",
++                    @"Iptc4xmpExt": @"http://iptc.org/std/Iptc4xmpExt/2008-02-29/",
++                    @"xmpRights": @"http://ns.adobe.com/xap/1.0/rights/", @"exifaux": @"http://ns.adobe.com/exif/1.0/aux/" } retain];
++    return [known objectForKey:prefix];
++}
++
++static SFImageMetadataTag *make_tag(NSString *xmlns, NSString *prefix, NSString *name, CGImageMetadataType type, id value)
++{
++    if (name == nil || value == nil)
++        return nil;
++    if (xmlns == nil)
++        xmlns = namespace_of(prefix);
++    if (xmlns == nil)
++        return nil;       // a namespace nobody registered: macOS fails the same way
++    SFImageMetadataTag *t = [SFImageMetadataTag new];
++    t->_xmlns = [xmlns copy];
++    t->_prefix = [prefix copy];
++    t->_name = [name copy];
++    if (type == kCGImageMetadataTypeDefault)
++        type = [value isKindOfClass:[NSArray class]] ? kCGImageMetadataTypeArrayOrdered
++             : [value isKindOfClass:[NSDictionary class]] ? kCGImageMetadataTypeStructure : kCGImageMetadataTypeString;
++    t->_type = type;
++    t->_value = [value respondsToSelector:@selector(copyWithZone:)] ? [value copy] : [value retain];
++    return t;
++}
++
++// "prefix:name" -> prefix, name
++static BOOL split_path(NSString *path, NSString **prefix, NSString **name)
++{
++    NSRange colon = [path rangeOfString:@":"];
++    if (path == nil || colon.location == NSNotFound || colon.location == 0 || NSMaxRange(colon) >= [path length])
++        return NO;
++    *prefix = [path substringToIndex:colon.location];
++    *name = [path substringFromIndex:NSMaxRange(colon)];
++    return YES;
++}
++
++static SFImageMetadataTag *tag_at(SFImageMetadata *m, SFImageMetadataTag *parent, NSString *path)
++{
++    if (path == nil)
++        return nil;
++    if (parent != nil) {
++        if (![parent->_value isKindOfClass:[NSDictionary class]])
++            return nil;
++        id v = [(NSDictionary *)parent->_value objectForKey:path];
++        return [v isKindOfClass:[SFImageMetadataTag class]] ? v : nil;
++    }
++    SFImageMetadataTag *t = [m->_tags objectForKey:path];
++    if (t != nil)
++        return t;
++    // a field of a structure tag: "prefix:name.prefix:field"
++    NSRange dot = [path rangeOfString:@"." options:NSBackwardsSearch];
++    if (dot.location == NSNotFound)
++        return nil;
++    SFImageMetadataTag *outer = tag_at(m, nil, [path substringToIndex:dot.location]);
++    return outer ? tag_at(m, outer, [path substringFromIndex:NSMaxRange(dot)]) : nil;
++}
++
++CGMutableImageMetadataRef CGImageMetadataCreateMutable(void)
++{
++    return (CGMutableImageMetadataRef)[SFImageMetadata new];
++}
++
++CGMutableImageMetadataRef CGImageMetadataCreateMutableCopy(CGImageMetadataRef metadata)
++{
++    SFImageMetadata *from = (SFImageMetadata *)metadata, *m = [SFImageMetadata new];
++    if (from != nil) {
++        [m->_paths addObjectsFromArray:from->_paths];
++        [m->_tags addEntriesFromDictionary:from->_tags];   // tags are not changed in place: shared
++    }
++    return (CGMutableImageMetadataRef)m;
++}
++
++CGImageMetadataTagRef CGImageMetadataTagCreate(CFStringRef xmlns, CFStringRef prefix, CFStringRef name, CGImageMetadataType type, CFTypeRef value)
++{
++    return (CGImageMetadataTagRef)make_tag((NSString *)xmlns, (NSString *)prefix, (NSString *)name, type, (id)value);
++}
++
++CFStringRef CGImageMetadataTagCopyNamespace(CGImageMetadataTagRef tag) { return tag ? (CFStringRef)[((SFImageMetadataTag *)tag)->_xmlns copy] : NULL; }
++CFStringRef CGImageMetadataTagCopyPrefix(CGImageMetadataTagRef tag) { return tag ? (CFStringRef)[((SFImageMetadataTag *)tag)->_prefix copy] : NULL; }
++CFStringRef CGImageMetadataTagCopyName(CGImageMetadataTagRef tag) { return tag ? (CFStringRef)[((SFImageMetadataTag *)tag)->_name copy] : NULL; }
++CGImageMetadataType CGImageMetadataTagGetType(CGImageMetadataTagRef tag) { return tag ? ((SFImageMetadataTag *)tag)->_type : kCGImageMetadataTypeInvalid; }
++
++CFTypeRef CGImageMetadataTagCopyValue(CGImageMetadataTagRef tag)
++{
++    if (tag == NULL)
++        return NULL;
++    id v = ((SFImageMetadataTag *)tag)->_value;
++    return (CFTypeRef)([v respondsToSelector:@selector(copyWithZone:)] ? [v copy] : [v retain]);
++}
++
++CFArrayRef CGImageMetadataCopyTags(CGImageMetadataRef metadata)
++{
++    SFImageMetadata *m = (SFImageMetadata *)metadata;
++    if (m == nil || [m->_paths count] == 0)
++        return NULL;
++    NSMutableArray *a = [NSMutableArray new];
++    for (NSString *p in m->_paths)
++        [a addObject:[m->_tags objectForKey:p]];
++    return (CFArrayRef)a;
++}
++
++CGImageMetadataTagRef CGImageMetadataCopyTagWithPath(CGImageMetadataRef metadata, CGImageMetadataTagRef parent, CFStringRef path)
++{
++    return (CGImageMetadataTagRef)[tag_at((SFImageMetadata *)metadata, (SFImageMetadataTag *)parent, (NSString *)path) retain];
++}
++
++CFStringRef CGImageMetadataCopyStringValueWithPath(CGImageMetadataRef metadata, CGImageMetadataTagRef parent, CFStringRef path)
++{
++    SFImageMetadataTag *t = tag_at((SFImageMetadata *)metadata, (SFImageMetadataTag *)parent, (NSString *)path);
++    id v = t ? t->_value : nil;
++    if ([v isKindOfClass:[NSArray class]] && [v count])       // an alternate text: its first entry
++        v = [v objectAtIndex:0];
++    if ([v isKindOfClass:[SFImageMetadataTag class]])
++        v = ((SFImageMetadataTag *)v)->_value;
++    return [v isKindOfClass:[NSString class]] ? (CFStringRef)[v copy] : NULL;
++}
++
++bool CGImageMetadataSetTagWithPath(CGMutableImageMetadataRef metadata, CGImageMetadataTagRef parent, CFStringRef path, CGImageMetadataTagRef tag)
++{
++    SFImageMetadata *m = (SFImageMetadata *)metadata;
++    NSString *p = (NSString *)path;
++    if (m == nil || tag == NULL)
++        return false;
++    if (p == nil) {
++        SFImageMetadataTag *t = (SFImageMetadataTag *)tag;
++        p = [NSString stringWithFormat:@"%@:%@", t->_prefix, t->_name];
++    }
++    if (parent != NULL) {
++        SFImageMetadataTag *pt = (SFImageMetadataTag *)parent;
++        if (pt->_type != kCGImageMetadataTypeStructure)
++            return false;
++        NSMutableDictionary *d = [NSMutableDictionary dictionaryWithDictionary:([pt->_value isKindOfClass:[NSDictionary class]] ? pt->_value : @{})];
++        [d setObject:(id)tag forKey:p];
++        [pt->_value release];
++        pt->_value = [d copy];
++        return true;
++    }
++    if ([m->_tags objectForKey:p] == nil)
++        [m->_paths addObject:p];
++    [m->_tags setObject:(id)tag forKey:p];
++    return true;
++}
++
++bool CGImageMetadataSetValueWithPath(CGMutableImageMetadataRef metadata, CGImageMetadataTagRef parent, CFStringRef path, CFTypeRef value)
++{
++    NSString *prefix, *name, *last = (NSString *)path;
++    NSRange dot = [last rangeOfString:@"." options:NSBackwardsSearch];
++    if (dot.location != NSNotFound)
++        last = [last substringFromIndex:NSMaxRange(dot)];
++    if (!split_path(last, &prefix, &name))
++        return false;
++    SFImageMetadataTag *t = make_tag(nil, prefix, name, kCGImageMetadataTypeDefault, (id)value);
++    if (t == nil)
++        return false;
++    SFImageMetadataTag *outer = (SFImageMetadataTag *)parent;
++    if (outer == nil && dot.location != NSNotFound)
++        outer = tag_at((SFImageMetadata *)metadata, nil, [(NSString *)path substringToIndex:dot.location]);
++    bool ok = CGImageMetadataSetTagWithPath(metadata, (CGImageMetadataTagRef)outer, (CFStringRef)(outer ? last : (NSString *)path), (CGImageMetadataTagRef)t);
++    [t release];
++    return ok;
++}
++
++bool CGImageMetadataRemoveTagWithPath(CGMutableImageMetadataRef metadata, CGImageMetadataTagRef parent, CFStringRef path)
++{
++    SFImageMetadata *m = (SFImageMetadata *)metadata;
++    if (m == nil || path == NULL)
++        return false;
++    if (parent != NULL) {
++        SFImageMetadataTag *pt = (SFImageMetadataTag *)parent;
++        if (![pt->_value isKindOfClass:[NSDictionary class]] || [pt->_value objectForKey:(NSString *)path] == nil)
++            return false;
++        NSMutableDictionary *d = [[pt->_value mutableCopy] autorelease];
++        [d removeObjectForKey:(NSString *)path];
++        [pt->_value release];
++        pt->_value = [d copy];
++        return true;
++    }
++    if ([m->_tags objectForKey:(NSString *)path] == nil)
++        return false;
++    [m->_tags removeObjectForKey:(NSString *)path];
++    [m->_paths removeObject:(NSString *)path];
++    return true;
++}
++
++CGImageMetadataRef CGImageSourceCopyMetadataAtIndex(CGImageSourceRef source, size_t index, CFDictionaryRef options)
++{
++    if (source == NULL)
++        return NULL;
++    NSDictionary *props = [(NSDictionary *)CGImageSourceCopyPropertiesAtIndex(source, index, NULL) autorelease];
++    SFImageMetadata *m = nil;
++    NSString *groups[][2] = { { (NSString *)kCGImagePropertyExifDictionary, @"exif" }, { (NSString *)kCGImagePropertyTIFFDictionary, @"tiff" } };
++    for (int g = 0; g < 2; g++) {
++        NSDictionary *d = [props objectForKey:groups[g][0]];
++        if (![d isKindOfClass:[NSDictionary class]])
++            continue;
++        for (NSString *key in d) {
++            id v = [d objectForKey:key];
++            if ([v isKindOfClass:[NSNumber class]])
++                v = [v stringValue];
++            if (![v isKindOfClass:[NSString class]] && ![v isKindOfClass:[NSArray class]])
++                continue;
++            SFImageMetadataTag *t = make_tag(nil, groups[g][1], key, kCGImageMetadataTypeDefault, v);
++            if (t == nil)
++                continue;
++            if (m == nil)
++                m = [SFImageMetadata new];
++            CGImageMetadataSetTagWithPath((CGMutableImageMetadataRef)m, NULL, (CFStringRef)[NSString stringWithFormat:@"%@:%@", groups[g][1], key], (CGImageMetadataTagRef)t);
++            [t release];
++        }
++    }
++    return (CGImageMetadataRef)m;
++}

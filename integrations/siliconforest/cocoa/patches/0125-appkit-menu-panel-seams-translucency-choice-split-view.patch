@@ -1,0 +1,246 @@
+--- a/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
++++ b/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
+@@ -177,15 +177,15 @@
+                                                           xRadius:PANEL_R yRadius:PANEL_R];
+ 
+     // stacked faint rounded rects make the soft shadow, dropped a few pixels as in the demo; each
+-    // is a ring round the panel (even-odd), not the panel's whole area again: eight fills of
+-    // the whole menu were half the time it took to open
+-    NSRect inner = NSInsetRect(box, PANEL_R, PANEL_R);
++    // is a ring round the panel (even-odd): its hole is the panel's own shape, so no shadow lies under
++    // the translucent panel (a hole of a plain rectangle eight points in left a darker band along the
++    // panel's inside edges, seen as lines down a menu)
+     for (int k = 8; k >= 1; k--) {
+         NSRect r = NSOffsetRect(NSInsetRect(box, -k * 1.5, -k * 1.5), 0, 5);
+         NSBezierPath *ring = [NSBezierPath bezierPathWithRoundedRect:r xRadius:PANEL_R + k yRadius:PANEL_R + k];
+ 
+-        if (inner.size.width > 0 && inner.size.height > 0) {
+-            [ring appendBezierPathWithRect:inner];
++        if (box.size.width > 2 * PANEL_R && box.size.height > 2 * PANEL_R) {
++            [ring appendBezierPath:[NSBezierPath bezierPathWithRoundedRect:box xRadius:PANEL_R yRadius:PANEL_R]];
+             [ring setWindingRule:NSEvenOddWindingRule];
+         }
+         [[NSColor colorWithCalibratedWhite:0 alpha:0.018] setFill];
+@@ -317,6 +317,9 @@
+     CGContextConcatCTM(ctx, CGAffineTransformInvert(m));
+     CGContextSetBlendMode(ctx, kCGBlendModeCopy);
+     CGContextSetInterpolationQuality(ctx, kCGInterpolationNone);
++    // whole pixels each: an antialiased edge of a piece left a half-covered (with the copy, half-transparent)
++    // line where two pieces meet
++    CGContextSetShouldAntialias(ctx, false);
+     for (int j = 0; j < 3; j++) {
+         for (int k = 0; k < 3; k++) {
+             CGRect r = CGRectMake(xs[k], ys[j], xs[k + 1] - xs[k], ys[j + 1] - ys[j]);
+@@ -1161,9 +1164,13 @@
+ {
+     [self closeSubmenu];
+     [self setHighlightedItemIndex:index];
+-    // the title is lit before its menu is built and drawn
++    // the title is lit before its menu is built and drawn: the strip alone (the window's other views that wait
++    // to be drawn, a terminal's text, are not drawn before the menu opens)
+     double t0 = sfTiming() ? sfNowMs() : 0;
+-    [[self window] displayIfNeeded];
++    if (_sfInWindow)
++        [self displayIfNeeded];
++    else
++        [[self window] displayIfNeeded];
+     if (sfTiming())
+         fprintf(stderr, "WSTIME %.1f menu-title-lit took=%.1f\n", sfNowMs(), sfNowMs() - t0);
+     if (![self _sfItemOpensAtIndex:index])
+@@ -1269,7 +1276,12 @@
+     if (_horizontal && _sfInWindow) {
+         double t0 = sfTiming() ? sfNowMs() : 0;
+ 
+-        [_menu update];
++        /* The strip's titles open their menus and are always enabled; each menu is validated when it opens.
++         * The whole main menu was validated here first (each of Terminal's 196 items, every submenu's
++         * delegate): one to three milliseconds before every menu. A delegate of the main menu itself still
++         * fills it in. */
++        if ([[_menu delegate] respondsToSelector:@selector(menuNeedsUpdate:)])
++            [[_menu delegate] menuNeedsUpdate:_menu];
+         if (sfTiming())
+             fprintf(stderr, "WSTIME %.1f menu-track-start bar-update=%.1f\n", sfNowMs(), sfNowMs() - t0);
+         if (byButton) {
+--- a/src/Frameworks/AppKit/NSColor.subproj/NSColor.m
++++ b/src/Frameworks/AppKit/NSColor.subproj/NSColor.m
+@@ -7,6 +7,8 @@
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+ 
+ #import <AppKit/NSColor.h>
++#include <sys/stat.h>
++#include <string.h>
+ #import <AppKit/NSColorSpace.h>
+ #import <AppKit/NSDisplay.h>
+ #include <string.h>
+@@ -222,18 +224,30 @@
+         { -1, 0x8c, 0x8c, 0x8c }, { 0, 0xe5, 0x48, 0x3f }, { 1, 0xf0, 0x8a, 0x24 }, { 2, 0xf2, 0xc2, 0x30 },
+         { 3, 0x4c, 0xae, 0x4f }, { 4, 0x00, 0x7a, 0xff }, { 5, 0x9b, 0x4f, 0xd1 }, { 6, 0xe0, 0x45, 0x7b },
+     };
+-    // the global domain is read again at most once a second: reading it (CFPreferencesAppSynchronize reads
+-    // the file) was a millisecond or two each time, and every highlighted menu row and selection asked
++    /* The global domain is read again only when its file changed: CFPreferencesAppSynchronize reads every
++     * domain the process has (Terminal's own preferences with their profiles too), two milliseconds and more,
++     * and every highlighted menu row and selection asked. */
+     static NSColor *cached;
+-    static CFAbsoluteTime readAt;
+-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
++    static struct timespec seen[2];
++    static char paths[2][1024];
++    struct timespec now[2] = { { 0, 0 }, { 0, 0 } };
++    struct stat st;
+     CFPropertyListRef v;
+     int value = 4;
+     NSColor *color = nil;
+ 
+-    if (cached != nil && now - readAt < 1.0 && now >= readAt)
++    if (paths[0][0] == 0) {
++        const char *home = getenv("CFFIXED_USER_HOME") ?: getenv("HOME") ?: "/var/root";
++
++        snprintf(paths[0], sizeof(paths[0]), "%s/Library/Preferences/.GlobalPreferences.plist", home);
++        snprintf(paths[1], sizeof(paths[1]), "/Library/Preferences/.GlobalPreferences.plist");
++    }
++    for (int i = 0; i < 2; i++)
++        if (stat(paths[i], &st) == 0)
++            now[i] = st.st_mtimespec;
++    if (cached != nil && memcmp(now, seen, sizeof(now)) == 0)
+         return cached;
+-    readAt = now;
++    memcpy(seen, now, sizeof(now));
+     CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
+     v = CFPreferencesCopyAppValue(CFSTR("AppleAccentColor"), kCFPreferencesAnyApplication);
+     if (v != NULL) {
+--- a/src/Frameworks/AppKit/NSColorPanel.m
++++ b/src/Frameworks/AppKit/NSColorPanel.m
+@@ -13,6 +13,7 @@
+ #import <AppKit/NSColorPickerWheel.h>
+ #import <AppKit/NSRaise.h>
+ #import <objc/runtime.h>
++#import <AppKit/NSWorkspace.h>
+ 
+ NSString * const NSColorPanelColorDidChangeNotification=@"NSColorPanelColorDidChangeNotification";
+ 
+@@ -295,6 +296,14 @@
+    CGFloat  alpha=MIN(MAX(0.0,[sender floatValue]/100.0),1.0);
+    NSColor *color=[[self color] colorWithAlphaComponent:alpha];
+ 
++   /* The user chose an opacity below 100 %: translucency is what this application's user wants, whatever the
++    * automatic Reduce Transparency answer was (NSWorkspace): remembered in its defaults and announced, so that
++    * windows that read it (Terminal's views) draw with the opacity at once. */
++   if(alpha<0.995 && ![[NSUserDefaults standardUserDefaults] boolForKey:@"SFTranslucencyChosen"]){
++    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"SFTranslucencyChosen"];
++    [[[NSWorkspace sharedWorkspace] notificationCenter] postNotificationName:NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification object:[NSWorkspace sharedWorkspace]];
++   }
++
+     if (sender == opacitySlider) {
+         [opacityTextField setFloatValue: [sender floatValue]];
+     } else {
+--- a/src/Frameworks/AppKit/NSWorkspaceOpenConfiguration.m
++++ b/src/Frameworks/AppKit/NSWorkspaceOpenConfiguration.m
+@@ -152,12 +152,19 @@
+  * hole: there transparency is reduced, as macOS reduces it when the user asks (Accessibility > Display),
+  * and applications draw their windows opaque. The user's own setting decides when there is one:
+  * `defaults write com.apple.universalaccess reduceTransparency -bool false` gives translucency back. */
++/* Reduce Transparency: the user's own setting (com.apple.universalaccess reduceTransparency) when there is one;
++ * else NO in an application whose user chose an opacity below 100 % in the colour panel (SFTranslucencyChosen
++ * in its own defaults, written by NSColorPanel: what the user asked for is shown, Terminal's profile opacity
++ * is not a dead slider); else YES while the compositor cannot blur behind a window (translucency without blur
++ * shows the desk sharp through the text: opaque by default, as macOS with Reduce Transparency). */
+ - (BOOL)accessibilityDisplayShouldReduceTransparency
+ {
+     id value = [(id)CFPreferencesCopyAppValue(CFSTR("reduceTransparency"), CFSTR("com.apple.universalaccess")) autorelease];
+ 
+     if ([value respondsToSelector:@selector(boolValue)])
+         return [value boolValue];
++    if ([[NSUserDefaults standardUserDefaults] boolForKey:@"SFTranslucencyChosen"])
++        return NO;
+     return _windowServerCanBlurBehind == NULL || !_windowServerCanBlurBehind();
+ }
+ 
+--- a/src/Frameworks/AppKit/NSStringDrawer.m
++++ b/src/Frameworks/AppKit/NSStringDrawer.m
+@@ -237,14 +237,34 @@
+ 		// Create a "..." attributed string with the attributes of the last char of this string
+ 		NSDictionary *attributes = [string attributesAtIndex:[string length]-1 effectiveRange:NULL];
+ 		NSAttributedString *ellipsis = [[[NSAttributedString alloc] initWithString:@"..." attributes:attributes] autorelease];
+-		NSAttributedString *clippedTitle = string;
+-		do {
+-			clippedTitle = [clippedTitle attributedSubstringFromRange:NSMakeRange(0,[clippedTitle length]-1)];
+-			NSMutableAttributedString *tmpString = [[clippedTitle mutableCopy] autorelease];
++		/* The longest beginning that fits with the ellipsis, found by halving (a measure is a pass of the text
++		 * system; one character off at a time measured a long name as many times as it had characters too
++		 * many: Activity Monitor's process names, a sixth of its drawing time) */
++		NSAttributedString *original = string;
++		NSUInteger lo = 0, hi = [original length] - 1;
++		NSMutableAttributedString *best = nil;
++
++		while (lo <= hi) {
++			NSUInteger mid = (lo + hi + 1) / 2;
++			NSMutableAttributedString *tmpString = [[[original attributedSubstringFromRange:NSMakeRange(0, mid)] mutableCopy] autorelease];
++
+ 			[tmpString appendAttributedString:ellipsis];
+-			string = tmpString;
+-			size = [string size];
+-		} while ([clippedTitle length] && size.width > rect.size.width);
++			if ([tmpString size].width <= rect.size.width) {
++				best = tmpString;
++				lo = mid + 1;
++				if (mid == [original length] - 1)
++					break;
++			}
++			else {
++				if (mid == 0)
++					break;
++				hi = mid - 1;
++			}
++		}
++		if (best == nil) {
++			best = [[[NSMutableAttributedString alloc] initWithAttributedString:ellipsis] autorelease];
++		}
++		string = best;
+ 	}
+ 	[[NSStringDrawer sharedStringDrawer] drawAttributedString:string inRect:rect];
+    CGContextRestoreGState(graphicsPort);
+--- a/src/Frameworks/AppKit/NSSplitView.m
++++ b/src/Frameworks/AppKit/NSSplitView.m
+@@ -395,16 +395,25 @@
+    }
+ }
+ 
++// the divider can go from where the subview before it begins to where the subview after it ends
+ - (CGFloat)minPossiblePositionOfDividerAtIndex:(int)index
+ {
+-    NSUnimplementedMethod();
+-    return 0;
++    NSArray *subviews = [self subviews];
++
++    if (index < 0 || index + 1 >= (int)[subviews count])
++        return 0;
++    NSRect r = [[subviews objectAtIndex:index] frame];
++    return [self isVertical] ? NSMinX(r) : NSMinY(r);
+ }
+ 
+ - (CGFloat)maxPossiblePositionOfDividerAtIndex:(int)index
+ {
+-    NSUnimplementedMethod();
+-    return 0;
++    NSArray *subviews = [self subviews];
++
++    if (index < 0 || index + 1 >= (int)[subviews count])
++        return 0;
++    NSRect r = [[subviews objectAtIndex:index + 1] frame];
++    return ([self isVertical] ? NSMaxX(r) : NSMaxY(r)) - [self dividerThickness];
+ }
+ 
+ /** adjusts the subviews on either side of the divider while
+@@ -412,7 +421,10 @@
+  */
+ - (void)setPosition:(CGFloat)position ofDividerAtIndex:(int)index
+ {
+-    NSAssert(index >= 0 && index < [[self subviews] count] - 1, @"divider index out of range");
++    // a divider that is not there (a split view with one pane: Terminal asks when a split closes) moves nothing,
++    // as on macOS; the assertion raised and the event that asked was lost
++    if (index < 0 || index + 1 >= (int)[[self subviews] count])
++        return;
+     
+     NSView *subview0 = [[self subviews] objectAtIndex: index];
+     NSView *subview1 = [[self subviews] objectAtIndex: index + 1];

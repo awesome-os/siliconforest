@@ -1,0 +1,18 @@
+Finite guest PTY smoke. This is not an interactive shell and not the Wayland terminal.
+
+`pty-smoke --nonce HEX48` opens a PTY with `openpty(master, slave, NULL, NULL, NULL)`, then checks `tcsetattr` and an 80x24 winsize. The child calls `setsid`, `TIOCSCTTY`, and `dup2` onto stdio, reports that on a pipe, and execs `/bin/sh -c` with a fixed script. The script reads two nonce halves from the PTY, prints the joined nonce, runs `/bin/uname -s`, `/bin/uname -m`, and `/bin/uname -r`, and exits 0. The parent polls for 10 seconds. On every error it signals the owned child and reaps it. Closing the master is not the shutdown path.
+
+`PASS` is only that guest result: the joined nonce line immediately followed by `Darwin`, `arm64`, and one release token, with the child exiting 0 and no signal. A host `uname` stays `FAIL`. Filling the 64KiB capture fails at once as `output_cap`, including when that tuple was already seen, and that result cannot be `PASS`. The child is still reaped.
+
+The first line is the classifier JSON (`status`, `failure`, `cleanup`, `exec_boundary`). It does not print device names. The next lines are `rx_hex` and `tx_hex`: the stored master bytes (at most 64KiB) and the prepared nonce halves, written as hex so the joined nonce is not printed as text.
+
+Root owns `build.nix` and the guest run. Do not boot a terminal UI before this smoke passes on the guest.
+
+Host checks, not a Darwin result:
+
+```
+cc -std=c11 -Wall -Wextra -Werror -o host-test host-test.c transcript.c -lutil
+./host-test
+```
+
+`HOST_ONLY` means the parser and a Linux PTY control path ran. It is not `PASS`.

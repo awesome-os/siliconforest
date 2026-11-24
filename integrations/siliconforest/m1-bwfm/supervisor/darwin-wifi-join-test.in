@@ -1,0 +1,39 @@
+#!/bin/sh
+# Guest side of the Wi-Fi join boot (M5). @SSID@ and @PSK@ are filled in from
+# private/wifi.env at packet assembly; the filled script is never committed.
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nDL34_JOIN_BEGIN_%s\n' "$nonce"
+sleep 4
+sf-dhcp --up en0 2>&1
+sleep 2
+wifiutil on 2>&1
+printf 'DL34_ON_RC=%s\n' "$?"
+sleep 8
+wifiutil info 2>&1
+printf 'DL34_SCAN\n'
+wifiutil scan 2>&1 | head -6
+printf 'DL34_JOIN\n'
+wifiutil join '@SSID@' '@PSK@' 2>&1
+printf 'DL34_JOIN_RC=%s\n' "$?"
+sleep 4
+wifiutil info 2>&1
+printf 'DL34_NET_UP\n'
+sf-net-up en0 2>&1
+printf 'DL34_NET_UP_RC=%s\n' "$?"
+printf 'DL34_PING_GATEWAY\n'
+ping -c 3 10.1.1.1 2>&1
+printf 'DL34_PING_GATEWAY_RC=%s\n' "$?"
+printf 'DL34_PING_INTERNET\n'
+ping -c 3 1.1.1.1 2>&1
+printf 'DL34_PING_INTERNET_RC=%s\n' "$?"
+printf 'DL34_HTTP_BY_ADDRESS\n'
+printf 'GET / HTTP/1.0\r\nHost: one.one.one.one\r\n\r\n' | netcat 1.1.1.1 80 2>&1 | head -4
+printf 'DL34_HTTP_BY_ADDRESS_DONE\n'
+printf 'DL34_DNS\n'
+ping -c 2 example.com 2>&1
+printf 'DL34_DNS_PING_RC=%s\n' "$?"
+printf 'GET / HTTP/1.0\r\nHost: example.com\r\n\r\n' | netcat -4 example.com 80 2>&1 | head -4
+printf 'DL34_DNS_DONE\n'
+wifiutil info 2>&1
+printf 'DL34_JOIN_END_%s\n' "$nonce"

@@ -1,0 +1,68 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Guest SMP check and load: ../../m1-apcie-host/supervisor/darwin-cpu-bench.in scaled to N
+# workers. Each worker counts megabytes of zeros hashed with sha256 in a fixed time (the
+# same loop as the single-CPU baseline, so the numbers compare), which also forks three
+# processes per 8 MB. @SOAK@ is the length of the all-CPU soak in seconds (0: none).
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nSMP_BEGIN_%s\n' "$nonce"
+sysctl hw.ncpu hw.activecpu hw.physicalcpu hw.logicalcpu hw.nperflevels \
+    hw.perflevel0.name hw.perflevel0.physicalcpu hw.perflevel1.name hw.perflevel1.physicalcpu \
+    hw.cpufrequency hw.tbfrequency 2>&1
+ncpu=$(sysctl -n hw.ncpu 2>/dev/null); ncpu=${ncpu:-1}
+
+worker() {      # tag id seconds [megabytes per pipeline, default 8]
+    i=0; chunk=${4:-8}; start=$(date +%s); end=$(( start + $3 ))
+    while [ "$(date +%s)" -lt "$end" ]; do
+        dd if=/dev/zero bs=1048576 count="$chunk" 2>/dev/null | sha256sum > /dev/null
+        i=$((i+1))
+    done
+    printf 'SMP_WORKER tag=%s id=%s megabytes=%s seconds=%s elapsed=%s\n' "$1" "$2" "$((i*chunk))" "$3" "$(( $(date +%s) - start ))"
+}
+group() {       # tag workers seconds [megabytes per pipeline]
+    w=0; while [ "$w" -lt "$2" ]; do worker "$1" "$w" "$3" "${4:-8}" & w=$((w+1)); done
+    wait
+    printf 'SMP_GROUP_DONE tag=%s workers=%s\n' "$1" "$2"
+}
+
+# Pure shell arithmetic, no system calls but one `date` per 20000 iterations: what a core
+# does when nothing but the core is involved. Unpinned, so the per-worker counts of a full
+# group show which cores the scheduler used (the P cores count faster).
+spin() {        # tag id seconds
+    n=0; start=$(date +%s); end=$(( start + $3 ))
+    while [ "$(date +%s)" -lt "$end" ]; do
+        j=0; while [ "$j" -lt 20000 ]; do j=$((j+1)); done
+        n=$((n+1))
+    done
+    printf 'SMP_SPIN tag=%s id=%s kiloiterations=%s seconds=%s elapsed=%s\n' "$1" "$2" "$((n*20))" "$3" "$(( $(date +%s) - start ))"
+}
+spingroup() {   # tag workers seconds
+    w=0; while [ "$w" -lt "$2" ]; do spin "$1" "$w" "$3" & w=$((w+1)); done
+    wait
+    printf 'SMP_GROUP_DONE tag=%s workers=%s\n' "$1" "$2"
+}
+for t in top ps taskpolicy vm_stat nice renice; do printf 'SMP_TOOL %s=%s\n' "$t" "$(command -v "$t" 2>/dev/null || echo none)"; done
+sysctl kern.sched kern.sched_amp_idle_steal kern.sched_amp_spill_steal kern.sched_amp_spill_count 2>&1 | head -8
+
+spingroup spin1 1 10
+for n in 2 4 8; do
+    [ "$n" -le "$ncpu" ] && spingroup "spin$n" "$n" 10
+done
+group single1 1 20
+group single2 1 20
+for n in 2 4 8; do
+    [ "$n" -le "$ncpu" ] && group "par$n" "$n" 20
+done
+# The 8 MB loop above spends most of its time starting processes. These hash 256 MB per
+# pipeline, so the megabytes follow the cores' speed (elapsed is the real time taken).
+group big1 1 30 256
+[ "$ncpu" -gt 1 ] && group "big$ncpu" "$ncpu" 30 256
+soak=@SOAK@; minute=0
+while [ $((minute * 60)) -lt "$soak" ]; do
+    minute=$((minute+1))
+    group "soak$minute" "$ncpu" 60
+done
+sysctl hw.ncpu hw.activecpu 2>&1
+printf 'SMP_END_%s\n' "$nonce"

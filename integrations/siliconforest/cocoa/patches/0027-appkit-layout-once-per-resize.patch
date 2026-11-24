@@ -1,0 +1,79 @@
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -1382,12 +1382,19 @@
+    return NO;
+ }
+ 
++// the constraint solves asked for while this view's subviews resize theirs are done once, at the
++// end of the outermost resize (NSLayoutConstraint.m)
++extern void _NSViewLayoutBeginResize(void);
++extern void _NSViewLayoutEndResize(void);
++
+ -(void)resizeSubviewsWithOldSize:(NSSize)oldSize {
+    int i,count=[_subviews count];
+ 
++   _NSViewLayoutBeginResize();
+    for(i=0;i<count;i++)
+     [[_subviews objectAtIndex:i] resizeWithOldSuperviewSize:oldSize];
+    [self _sfLayoutConstraints];
++   _NSViewLayoutEndResize();
+ }
+ 
+ -(void)resizeWithOldSuperviewSize:(NSSize)oldSize {
+--- a/src/Frameworks/AppKit/NSLayoutConstraint.m
++++ b/src/Frameworks/AppKit/NSLayoutConstraint.m
+@@ -193,6 +193,35 @@
+ static int sfLayoutApplying;       // frames are being set from a solution: the layouts that sets off are not run
+ static BOOL sfLayoutSubtreePass;   // one -layoutSubtreeIfNeeded is under way, and its tree has been solved
+ 
++/* One resize is many: a view given a new size resizes its subviews, each of which resizes its own.
++ * Every view of that cascade that holds constraints asked for the whole tree to be solved (twice),
++ * so a tree of n such views was solved 2n times for one change: decoding the tab view of a
++ * preferences window ran 388 solves, 4.8 s. The solves asked for inside a cascade are put off to
++ * its end and done once. (A subclass's own -layout still runs where it is asked for.) */
++static int sfResizeDepth;          // -resizeSubviewsWithOldSize: calls under way
++static NSView *sfResizePending;    // the top of a tree whose solve was put off (retained)
++static NSView *sfResizeSolved;     // the top solved inside the outermost call (not retained; compared only)
++
++void _NSViewLayoutBeginResize(void) {
++    sfResizeDepth++;
++}
++
++void _NSViewLayoutEndResize(void) {
++    if (--sfResizeDepth > 0)
++        return;
++    sfResizeDepth = 0;
++
++    NSView *top = sfResizePending;
++
++    sfResizePending = nil;
++    if (top != nil && top != sfResizeSolved && sfLayoutApplying == 0 && !sfLayoutSubtreePass) {
++        for (int pass = 0; pass < 2; pass++)
++            [top _sfLayoutTreeFitting:NO apply:YES];
++    }
++    sfResizeSolved = nil;
++    [top release];
++}
++
+ @implementation NSView (NSConstraintBasedLayout)
+ 
+ 
+@@ -507,8 +536,18 @@
+         return;
+     while ([top superview] != nil)
+         top = [top superview];
++    if (sfResizeDepth > 1) {
++        // inside a resize cascade: once, at its end
++        if (sfResizePending != top) {
++            [sfResizePending release];
++            sfResizePending = [top retain];
++        }
++        return;
++    }
+     for (int pass = 0; pass < 2; pass++)
+         [top _sfLayoutTreeFitting:NO apply:YES];
++    if (sfResizeDepth == 1)
++        sfResizeSolved = top;
+ }
+ 
+ // the smallest box the constraints in this view's tree leave room for (-fittingSize), as an alignment size

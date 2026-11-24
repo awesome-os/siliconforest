@@ -1,0 +1,165 @@
+{
+  "status": "ABI_RECEIPT_COMPILE_ONLY",
+  "native_input_claimed": false,
+  "native_input_run": false,
+  "devices_opened": false,
+  "linked": false,
+  "nix_build": false,
+  "hardware_used": false,
+  "panel_observed_by_this_receipt": false,
+  "command_line_observed_by_this_receipt": false,
+  "wayland_desktop_claimed": false,
+  "display_stop": {
+    "user_physical_confirmation": "Yes, it is the M1's own screen",
+    "user_reported_photo": "fresh c369 nonce photo at 9:37 matches the raw shell",
+    "observed_by_this_receipt": false,
+    "next_goal": "Wayland desktop on actual Chonkstep. This receipt is the input contract for that step."
+  },
+  "clang": {
+    "binary": "/nix/store/v79myw3b0pnc2cmg7mvnpgg13qvcgivp-darwin-cross-toolchain-nix/bin/arm64-apple-darwin20.4-clang",
+    "version": "21.1.8",
+    "target": "arm64-apple-macosx26.5",
+    "sysroot": "/nix/store/6zpwyx6p9swad42f0vx6rl4z0dp2kj1g-puredarwin-oss-sdk-26.5/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
+    "mode": "-c -std=c11 only. No -lSystem, -lIOKit, -lIOKitCF, or other link.",
+    "fixture": "/tmp/darwin-backend-abi.c included the real PDGOP.h and PDHIDEventQueue.h",
+    "exit_code": 0,
+    "object": "Mach-O 64-bit arm64 object, not an executable",
+    "proof": "Every _Static_assert in the fixture passed. A failed assert would have made the compile fail."
+  },
+  "pdgop": {
+    "header": "sources/puredarwin-baseline/src/Libraries/PDGOP/include/PDGOP.h",
+    "struct": "PDGOPFramebuffer",
+    "frozen": "The public struct stays this 64-byte, 8-aligned layout. Service kind or pixel-format additions are query functions or a versioned new API. PDGOPOpen must keep accepting a caller compiled against this struct.",
+    "sizeof": 64,
+    "alignof": 8,
+    "offsets": {
+      "masterPort": 0,
+      "service": 4,
+      "connect": 8,
+      "address": 16,
+      "size": 24,
+      "width": 32,
+      "height": 36,
+      "stride": 40,
+      "bpp": 44,
+      "pixelType": 48,
+      "componentMasks": 52
+    },
+    "types_from_header": "mach_port_t is unsigned int. mach_vm_address_t and mach_vm_size_t are uint64_t. Four bytes of padding sit between connect and address.",
+    "astra_raw_framebuffer": "sources/chonkstep-darwin/crates/wm-darwin/src/presenter.rs RawFramebuffer is #[repr(C)] with u32 ports, u64 address and size, then u32 width, height, stride, bpp, pixel_type, and [u32; 3] masks. Those widths match this layout. This receipt did not cargo-check the crate."
+  },
+  "iokit": {
+    "supersedes": "The earlier lines in this object that named IOKitLibCF.c:673 as the built definition and told Astra to link libIOKitCF.dylib are withdrawn. That file is not a compiled target. The built CF library is the Apple 2-argument boolean form.",
+    "chosen_surface": "tiny static IOKit",
+    "tiny_static": {
+      "header": "src/Libraries/IOKit/include/PDIOKitLib.h via the tiny IOKit/IOKitLib.h. The header defines _PD_IOKITLIB_H.",
+      "library": "libIOKit.a from src/Libraries/IOKit/IOKitLib.c. CMake target IOKit lists that file. It does not list IOKitLibCF.c.",
+      "IOObjectConformsTo": "src/Libraries/IOKit/include/PDIOKitLib.h:92 and src/Libraries/IOKit/IOKitLib.c:237. kern_return_t IOObjectConformsTo(io_object_t, const char *, boolean_t *). NULL className or conforms returns KERN_INVALID_ARGUMENT. A short name is copied into io_name_t and passed to io_object_conforms_to.",
+      "matching": "char *IOServiceMatching(const char *). kern_return_t IOServiceGetMatchingService(mach_port_t, char *, io_service_t *)."
+    },
+    "cf_surface": {
+      "header": "src/Libraries/IOKit/iokituser/include/IOKit/IOKitLib.h:297. boolean_t IOObjectConformsTo(io_object_t, const io_name_t). Two arguments.",
+      "source": "iokituser/IOKitLib.c:365 returns _IOObjectConformsTo(object, className, 0). The third argument of the private function is a uint64_t options value, not a conforms pointer.",
+      "built_library": "CMake target IOKitCF, under PUREDARWIN_ENABLE_IOKITCF, compiles iokituser/IOKitLib.c into libIOKitCF.a. libIOKitCF.dylib is a -force_load of that archive. IOKitLibCF.c is not in that target.",
+      "disassembly_evidence": "Claude's read of the built CF dylib at the Nox path usr/lib/libIOKitCF.dylib, store object 7w57gc8x...-puredarwin-iokit-0.1: _IOObjectConformsTo reads w0 and x1, sets x2 to 0, and calls __IOObjectConformsTo(object, name, options). This receipt did not repeat that disassembly.",
+      "not_built": "src/Libraries/IOKit/IOKitLibCF.c:674 defines a 3-argument pointer form, and no CMake target compiles that file at pin e7aa00a."
+    },
+    "link": "Presenter links #[link(name = \"IOKit\", kind = \"static\")] and #[link(name = \"PDGOP\")]. That 3-argument prototype matches the tiny static library only. PDGOP.a must be compiled against the same tiny PDIOKitLib.h headers. Do not pair it with libIOKitCF. A 3-argument call into the built CF library does not write the conforms pointer and reads the boolean return as a kern_return_t. That is not memory corruption. The M1 IOGOP case only gets a success status by accident when that boolean is 0. Root is building minimal PDGOP and static libIOKit.a together.",
+    "mispairing": "CF header with the tiny library writes through an uninitialized x2. Tiny header with the CF library ignores x2 and returns a boolean that the caller reads as a status, so PDGOPOpen fails closed. Matching signatures differ on the two surfaces and must stay paired the same way.",
+    "boolean_t_sizeof": 4,
+    "boolean_t_sizeof_scope": "The scratch clang -c fixture asserted sizeof(boolean_t) == 4 against the OSS SDK headers. That fixture linked neither libIOKit.a nor libIOKitCF.",
+    "presenter_rs": "sources/chonkstep-darwin/crates/wm-darwin/src/presenter.rs uses #[link(name = \"IOKit\", kind = \"static\")] and fn IOObjectConformsTo(object: u32, class: *const libc::c_char, conforms: *mut i32) -> i32. It checks the service against IOGOPFramebuffer. This receipt did not edit or cargo-check that file.",
+    "documented_in": "integrations/puredarwin/m1-wayland/M1_WAYLAND_PATCHES.md section Two IOKit surfaces, and patches.json iokit_surfaces.",
+    "xkb_data": "/nix/store/8gmk0cyawlbvcw6yzpplgrg3gjr398kk-xkeyboard-config-2.47. Root will stage it to /usr/share/X11/xkb. This receipt did not copy it."
+  },
+  "hid_packets": {
+    "header": "src/Kernel/Extensions/IOHIDFamily/IOHIDSystem/PDHIDEventQueue.h",
+    "c_names": "struct PDHIDKbdEvent and struct PDHIDMouseEvent. There is no typedef. C++ can use the tag as a type name; a C or Rust binding cannot.",
+    "keyboard": {
+      "sizeof": 8,
+      "alignof": 4,
+      "offsets": {
+        "sequence": 0,
+        "usage": 4,
+        "down": 5,
+        "reserved": 6
+      },
+      "encoding": "sequence is the kernel UInt32, little-endian on this arm64 target. usage is the USB HID usage. down is 0 or 1. reserved[2] is zero."
+    },
+    "mouse": {
+      "sizeof": 12,
+      "alignof": 4,
+      "offsets": {
+        "sequence": 0,
+        "mouseIndex": 4,
+        "buttons": 5,
+        "dx": 6,
+        "dy": 7,
+        "wheel": 8,
+        "flags": 9,
+        "absY": 10
+      },
+      "absolute_flag": "kPDHIDMouseAbsolute is 0x01",
+      "absolute_packing": "PDHIDPushAbsoluteMouseEvent bcopies the little-endian UInt16 x onto dx, so x occupies bytes 6 and 7. absY at offset 10 is the UInt16 y. Both axes are screen fractions 0 through 65535. flags is 0x01.",
+      "relative_packing": "PDHIDPushMouseEvent zeros the record, then sets mouseIndex, buttons, dx, dy, and wheel. flags and absY stay 0. dx, dy, and wheel are SInt8."
+    },
+    "wlroots_copy": "backend/puredarwin/input.c pd_hid_keyboard_event and pd_hid_mouse_event match these sizes. Mouse dx, flags, and abs_y match the kernel offsets. The fixture static-asserted that match."
+  },
+  "hid_read": {
+    "nodes": ["/dev/usb_hid_kbd", "/dev/usb_hid_mouse"],
+    "ps2_alias": "When requested, /dev/ps2_kbd is makedev of the keyboard major, minor 0, the same node identity as usb_hid_kbd. /dev/ps2_mouse is the same relationship for the mouse. Opening either keyboard name grabs the keyboard.",
+    "publication_on_m1_boot": "not established",
+    "queue_depth": 64,
+    "overflow": "The writer advances the read index so the queue keeps the newest 64 events.",
+    "one_event_per_read": "pd_hid_kbd_read and pd_hid_mouse_read uiomove exactly one struct.",
+    "short_read": "uio_resid smaller than the struct returns EINVAL.",
+    "empty": "EAGAIN. The read does not sleep. d_select is eno_select.",
+    "wait": "The wlroots backend opens O_RDONLY|O_NONBLOCK and drains from an 8 ms timer. Its comment says the devices are readable and are not kqueue-filterable.",
+    "timestamp": "The packet has sequence, not a timestamp. wlroots stamps events with get_current_time_msec."
+  },
+  "keyboard_grab": {
+    "open": "pd_hid_kbd_open sets gKbdGrabbed. PDHIDKeyboardIsGrabbed is that flag.",
+    "close": "The matching close clears it. spec_close runs when the vnode count drops to zero, so the flag means somebody holds the device.",
+    "console": "pd_hid_console_key still tracks modifiers 0xE0 through 0xE7 and toggles lock LEDs, then returns without feeding the console while gKbdGrabbed is set.",
+    "consequence": "Opening /dev/usb_hid_kbd takes the keyboard away from the text shell on the panel for as long as the file stays open. The mouse open does not grab."
+  },
+  "code_conversion": {
+    "packet_usage_is_usb": "IOHIDEventService.cpp pushes PDHIDPushKeyboardEvent for usage page KeyboardOrKeypad when usage <= 0xE7. The queued byte is that USB usage.",
+    "adb_is_console_only": "PDHIDUsageToADB maps 0xE0-0xE7 through gUSBModToADB and other usages through gUSBToADB. kPDHIDNoADBCode is 0xFF. The device packet is not an ADB code.",
+    "wlroots_table": "input.c usb_to_evdev maps a usage to an evdev code and skips 0. Shared entries match hid.rs usage_to_evdev, including usage 0x04 -> 30 and 0xE1 -> 42. hid.rs also maps usages the wlroots table leaves at 0. Those extra codes were not checked against input-event-codes.h here.",
+    "smithay_plus_8": "vendor/smithay-0.7.0 keyboard/mod.rs key_input comments that evdev XKB codes start at 8, then calls xkb.state.update_key(keycode) with no added 8. libinput/mod.rs key_code returns self.key() + 8. winit/input.rs key_code returns self.key + 8. raw_code() is already that shifted X keycode.",
+    "where_to_add_8": "Keep hid.rs Event::Key.evdev as the Linux evdev number. The Darwin KeyboardKeyEvent::key_code that enters Smithay adds 8 once. usage_to_evdev must not add 8. Pointer buttons must not add 8.",
+    "wl_keyboard": "The Wayland keycode is the evdev code plus 8. wm-wayland test_door.rs and the input tests apply that shift at the Smithay seam.",
+    "buttons": "IOHIDEventService masks buttons with 7 and wlroots reads bits 0, 1, and 2. Changed bits become button 0x110 + bit, pressed or released from the new mask. 0x110 is BTN_LEFT.",
+    "wheel": "wlroots emits a vertical axis with delta = -wheel * 10.0 and delta_discrete = -wheel * 120, then a pointer frame.",
+    "absolute_scale": "wlroots copies the UInt16 at dx and divides both axes by 65535.0.",
+    "relative_range": "IOHIDEventService pdHIDPushMotion emits SInt8 steps of at most 127 and at least -127. One packet is one step.",
+    "leds": "Kernel lock bits are Num 0x01, Caps 0x02, Scroll 0x04."
+  },
+  "astra_hid_rs": {
+    "path": "sources/chonkstep-darwin/crates/wm-darwin/src/hid.rs",
+    "edited_by_this_receipt": false,
+    "cargo_checked_by_this_receipt": false,
+    "wired_to_smithay": false,
+    "layout_match": "The decoder's 8-byte and 12-byte offsets match the clang-proven packets, including absolute x in bytes 6..8 and y in bytes 10..12, little-endian.",
+    "keep": "Event::Key.evdev stays the unshifted evdev code. Tests expect usage 0x04 to produce 30 and usage 0xE1 to produce 42.",
+    "consumer_must": "Add 8 only at KeyboardKeyEvent::key_code. Edge-detect pointer buttons per mouse and emit 0x110 + bit. Apply the wheel sign and the 10.0 / 120 scales. Divide absolute axes by 65535.0. Emit the pointer frame after the motion, button, and axis events. Stamp time in userspace.",
+    "drain_behavior": "An unsupported usage, a button bit above the low three, or a flag other than 0 or 1 returns Err, and NativeHid::drain stops. The wlroots reader skips an unmapped usage and ignores button bits above bit 2. A skip keeps the pointer stream alive.",
+    "open_not_run": "NativeHid::open on aarch64-apple-darwin opens /dev/usb_hid_kbd and /dev/usb_hid_mouse O_NONBLOCK and discards a bounded backlog. That function was not executed. Opening the keyboard grabs the console."
+  },
+  "rust_and_source": {
+    "rustc": "1.98.1 (48a229cea 2026-09-01)",
+    "installed_targets_observed": [
+      "aarch64-apple-darwin",
+      "aarch64-unknown-none-softfloat",
+      "x86_64-unknown-linux-gnu"
+    ],
+    "root_reported_std_probe": "A std probe using thread, Vec, getpagesize, and println crosslinked as a native Mach-O with the OS 26.5 SDK libSystem, and linked only libSystem, libc, and libm. This receipt did not rerun it.",
+    "isolated_tree": "/home/chrisk/src/darwin-lab/sources/chonkstep-darwin",
+    "isolated_head": "e0fe3a000aec71b1db46b940e2a75670be4e0f31",
+    "original_worktree": "/home/chrisk/src/chonkstep remains f7a8edd1b6e111487c45070c8774c51ba7847628 and was not edited",
+    "wm_darwin_owner": "Astra owns the crate source and cargo checks",
+    "nox_deps": "/nix/store/zyf8bqlc4cs5g24r9ni5y9a5fkmzb7cb-puredarwin-chonkstep-target-deps",
+    "xkbcommon_observed": "/nix/store/zyf8bqlc4cs5g24r9ni5y9a5fkmzb7cb-puredarwin-chonkstep-target-deps/lib/libxkbcommon.a"
+  }
+}

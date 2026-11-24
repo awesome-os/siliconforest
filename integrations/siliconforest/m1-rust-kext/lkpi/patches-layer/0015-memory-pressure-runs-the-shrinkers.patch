@@ -1,0 +1,26 @@
+fbsdkpi: xnu memory pressure runs the Linux shrinkers and trims the page pool
+
+One kernel thread per kext waits in mach_vm_pressure_monitor() (com.apple.kpi.mach) and, at
+most once a second while the pageout daemon wants pages, calls linuxkpi's shrinkers
+(sf_lkpi_lowmem(), the entry FreeBSD's vm_lowmem event would have used) and then returns
+every free pool chunk to xnu (sf_linux_page_trim()). The seam half (sfos_pressure_start) is
+in patch 0002's files, the pool half in 0011's.
+UPSTREAM: yes.
+
+--- a/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/src/linux_shrinker.c
++++ b/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/src/linux_shrinker.c
+@@ -131,6 +131,14 @@
+ 	sx_xunlock(&sx_shrinker);
+ }
+ 
++// SiliconForest: nothing raises FreeBSD's vm_lowmem event here; the page allocator's pressure
++// callback (sf_linux_page.c) calls this instead
++void
++sf_lkpi_lowmem(void)
++{
++	linuxkpi_vm_lowmem(NULL, 0);
++}
++
+ static eventhandler_tag lowmem_tag;
+ 
+ static void

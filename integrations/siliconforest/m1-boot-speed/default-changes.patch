@@ -1,0 +1,155 @@
+diff -ru a/integrations/siliconforest/chonkstep-darwin/darwin-gpu-desktop-interactive.in b/integrations/siliconforest/chonkstep-darwin/darwin-gpu-desktop-interactive.in
+--- a/integrations/siliconforest/chonkstep-darwin/darwin-gpu-desktop-interactive.in	2026-11-11 19:46:37.756276559 -0800
++++ b/integrations/siliconforest/chonkstep-darwin/darwin-gpu-desktop-interactive.in	2026-11-11 19:46:37.757194023 -0800
+@@ -1,5 +1,8 @@
+ #!/bin/sh
+-# Guest side of an interactive GPU desktop session (tools/gpu_desktop.sh). Joins Wi-Fi in the
++# Guest side of an interactive GPU desktop session (tools/gpu_desktop.sh), without fixed
++# sleeps: every wait is for the thing waited for (boot-speed stream, issue #27). The kernel no
++# longer spends 60 s before the root mounts, so nothing here may assume the drivers had that
++# long. Joins Wi-Fi in the
+ # background when the tools and firmware are staged, then runs the shared-shell desktop on the
+ # GL renderer with page flips, real keyboard and trackpad input, and two terminals, for
+ # @SECONDS@ seconds. No synthetic input. @SSID@/@PSK@ are filled from private/wifi.env at
+@@ -18,14 +21,41 @@
+ export XKB_CONFIG_ROOT=/usr/share/X11/xkb TMPDIR=/private/tmp
+ export CHONKSTEP_DARWIN_FRAME_STATS=3600
+ [ -d /usr/share/backgrounds/siliconforest ] && export CHONKSTEP_BACKGROUND_DIR=/usr/share/backgrounds/siliconforest
++get() { sysctl -n "$1" 2>/dev/null; }
++# until <tenths of a second> <command...>: poll every 0.1 s until the command succeeds
++until_ok() {
++    limit=$1; shift; tries=0
++    until "$@" >/dev/null 2>&1; do
++        tries=$((tries + 1)); [ "$tries" -le "$limit" ] || return 1; sleep 0.1
++    done
++}
++wifi_has() { wifiutil info 2>/dev/null | grep -q "$1"; }
+ printf '\nGPUDESK_BEGIN_%s seconds=@SECONDS@\n' "$nonce"
++until_ok 50 test -c /dev/dri/card0
+ ls -l /dev/dri 2>&1 | head -6
+ (
+     if command -v wifiutil >/dev/null 2>&1 && [ -d /Library/Firmware/brcm ]; then
+-        sleep 4; sf-dhcp --up en0 >/dev/null 2>&1; sleep 2
+-        wifiutil on >/dev/null 2>&1; sleep 8
+-        wifiutil join '@SSID@' '@PSK@' >/dev/null 2>&1; printf 'GPUDESK_WIFI_JOIN_RC=%s\n' "$?"
+-        sleep 4; sf-net-up en0 >/dev/null 2>&1; printf 'GPUDESK_NET_UP_RC=%s\n' "$?"
++        # en0 exists once the firmware is up (about 2.3 s after the root mounts)
++        until_ok 200 wifi_has '^interface: *en0'; printf 'GPUDESK_WIFI_IF_RC=%s\n' "$?"
++        until_ok 50 sf-dhcp --up en0
++        wifiutil on >/dev/null 2>&1; until_ok 100 wifi_has '^power: *on'
++        # the join scans by itself; a first attempt that finds nothing is repeated
++        rc=1; attempt=0
++        while [ "$attempt" -lt 4 ]; do
++            attempt=$((attempt + 1))
++            wifiutil join '@SSID@' '@PSK@' >/dev/null 2>&1; rc=$?
++            [ "$rc" -eq 0 ] && break
++            sleep 2
++        done
++        printf 'GPUDESK_WIFI_JOIN_RC=%s attempts=%s\n' "$rc" "$attempt"
++        rc=1; attempt=0
++        while [ "$attempt" -lt 4 ]; do
++            attempt=$((attempt + 1))
++            sf-net-up en0 >/dev/null 2>&1; rc=$?
++            [ "$rc" -eq 0 ] && break
++            sleep 1
++        done
++        printf 'GPUDESK_NET_UP_RC=%s attempts=%s\n' "$rc" "$attempt"
+         ping -c 2 1.1.1.1 >/dev/null 2>&1; printf 'GPUDESK_PING_RC=%s\n' "$?"
+     else
+         printf 'GPUDESK_WIFI_SKIPPED\n'
+@@ -33,17 +63,22 @@
+ ) &
+ # Sound: the audio server, as the desktop session starts it. The speakers stay 20 dB under the
+ # protection model's limit when hold_probe is 1.
+-get() { sysctl -n "$1" 2>/dev/null; }
+ if [ -x /usr/sbin/coreaudiod ]; then
+-    sysctl -w kern.sf_speaker.hold_probe=@HOLD@ kern.sf_sound.volume_db=@VOLUME@ > /dev/null 2>&1
+-    mkdir -p /var/log /var/run /Library/Preferences
+-    /usr/sbin/coreaudiod > /var/log/coreaudiod.log 2>&1 &
+-    printf 'GPUDESK_COREAUDIOD pid=%s hold_probe=%s sound=%s | speakers=%s\n' "$!" "$(get kern.sf_speaker.hold_probe)" "$(get kern.sf_sound.state)" "$(get kern.sf_speaker.state | cut -c1-60)"
++    # In the background: the sound driver starts 2 s into the boot and publishes its node
++    # after that, and the desktop does not wait for sound.
++    (
++        until_ok 100 test -c /dev/sfaudio
++        sysctl -w kern.sf_speaker.hold_probe=@HOLD@ kern.sf_sound.volume_db=@VOLUME@ > /dev/null 2>&1
++        mkdir -p /var/log /var/run /Library/Preferences
++        /usr/sbin/coreaudiod > /var/log/coreaudiod.log 2>&1 &
++        printf 'GPUDESK_COREAUDIOD pid=%s hold_probe=%s sound=%s | speakers=%s\n' "$!" "$(get kern.sf_speaker.hold_probe)" "$(get kern.sf_sound.state)" "$(get kern.sf_speaker.state | cut -c1-60)"
++    ) &
+ fi
++# the digitizer's firmware loads after the root mounts (1.24 s); at most 30 s as before
+ n=0
+-while [ "$n" -lt 30 ]; do
++while [ "$n" -lt 300 ]; do
+     case "$(get kern.sf_touchbar.state)" in ready*|display-only*|display-failed*|off*|'') break;; esac
+-    sleep 1; n=$((n+1))
++    sleep 0.1; n=$((n+1))
+ done
+ printf 'GPUDESK_TOUCHBAR state=%s\n' "$(get kern.sf_touchbar.state)"
+ [ -x /usr/bin/darwin-trackpad-enum ] && { /usr/bin/darwin-trackpad-enum --nonce "$session"; printf 'GPUDESK_ENUM rc=%s\n' "$?"; }
+@@ -65,3 +100,5 @@
+ [ -r "$records/session-result.txt" ] && grep -v ' gate=\| kernel_messages=\| cs_at_spawn=\| exit_reason=' "$records/session-result.txt" | cut -c1-260 | sed 's/^/GPUDESK_RESULT /' | head -60
+ printf 'GPUDESK_SOUND_END speakers=%s trips=%s sessions=%s | touchbar=%s key_events=%s reports=%s spi_errors=%s dart_faults=%s\n' "$(get kern.sf_speaker.state | cut -c1-40)" "$(get kern.sf_speaker.trips)" "$(get kern.sf_speaker.sessions)" "$(get kern.sf_touchbar.state)" "$(get kern.sf_touchbar.key_events)" "$(get kern.sf_touchbar.reports)" "$(get kern.sf_touchbar.spi_errors)" "$(get kern.sf_touchbar.dart_faults)"
+ printf 'GPUDESK_END_%s\n' "$nonce"
++# ends the capture a second later instead of running out the session's upper bound
++printf '\nPD_BENCH_DONE\n'
+diff -ru a/tools/gpu_desktop.sh b/tools/gpu_desktop.sh
+--- a/tools/gpu_desktop.sh	2026-11-11 19:46:37.754619167 -0800
++++ b/tools/gpu_desktop.sh	2026-11-11 20:21:35.601438530 -0800
+@@ -16,14 +16,19 @@
+ ROOT=$(cd "$(dirname "$0")/.." && pwd); cd "$ROOT"; export PATH=$HOME/.nix-profile/bin:$PATH
+ N=${1:?name}; MIN=${2:-30}
+ [ "$MIN" -ge 2 ] && [ "$MIN" -le 235 ] || { echo "minutes must be 2..235" >&2; exit 2; }
+-BOOT=140                                   # seconds from hypervisor start to the guest script
++BOOT=20                                    # seconds from hypervisor start to the guest script (measured 5.7; was 140 for 66.6)
+ RUNTIME=$((MIN * 60 + BOOT)); DESK=$((MIN * 60))
+-# The default collection: the desktop collection with sound and the Touch Bar
+-# (m1-touchbar/build-kc.nix: the quiet-boot kernel, SFAppleSound, SFAppleTouchBar; boots tb05, tb06).
+-KC=${GPU_DESKTOP_KC:-/nix/store/wadn9g1r46g28gdhh0c4k3qcgnxxpvkr-puredarwin-kc-arm64-0.1}
+-[ -f "$KC/kernel" ] || KC=$(cd integrations/siliconforest/m1-touchbar && nix-build --extra-experimental-features nix-command --extra-experimental-features flakes build-kc.nix --no-out-link | tail -1)
+-NB="nix-build --extra-experimental-features nix-command --extra-experimental-features flakes --no-out-link"
+-T=$(cd integrations/siliconforest/m1-mesa-asahi && $NB agx-offscreen-test.nix 2>/dev/null | tail -1)
++# The default collection: the desktop collection with sound and the Touch Bar and the kernel
++# that does not wait a minute for a clock and a daemon this system does not have
++# (m1-boot-speed/build-kc.nix: m1-touchbar/build-kc.nix with m1-boot-speed/kernel.nix; boots bs02, bs03).
++# It needs sf_quiet_wait=0 sf_rtc_wait=0 in the boot-args and the launcher patch below (which waits
++# for a silent console before it types): without the patch the harness fails its console proof.
++KC=${GPU_DESKTOP_KC:-/nix/store/z66w83kk8gj61xv5ych34rz1zv18hk70-puredarwin-kc-arm64-0.1}
++# Store paths of the staged builds, without evaluating a recipe whose inputs are unchanged
++# (each evaluation is 20 to 70 s; BS_NIX_CACHE=0 evaluates always).
++NP=integrations/siliconforest/m1-boot-speed/tools/bs_nix_path.py
++[ -f "$KC/kernel" ] || KC=$($NP m1-boot-speed build-kc.nix)
++T=$($NP m1-mesa-asahi agx-offscreen-test.nix)
+ # The compositor with display scaling, the settings menu, volume keys and the Touch Bar phase (wm-darwin merge, boot ds06).
+ D=${GPU_DESKTOP_BIN:-runs/m1-desktop-010/wm-darwin-scale-desktop-build-007/target/aarch64-apple-darwin/release/chonkstep-darwin-desktop}
+ [ -x "$D" ] || { echo "no compositor binary at $D" >&2; exit 2; }
+@@ -45,9 +50,9 @@
+ for l in libEGL.1.dylib libGLESv2.2.dylib libgallium-26.3.0-devel.dylib libdrm.2.dylib; do X="$X;$T/usr/local/lib/mesa-asahi/$l=/usr/local/lib/mesa-asahi/$l"; done
+ # Sound: the audio server, its frameworks and the tools (as m1-sound/tools/sd_desktop_boot.sh).
+ SOUND=integrations/siliconforest/m1-sound
+-A=$(cd $SOUND/sysaudio && $NB build-sysaudio.nix -A all 2>/dev/null | tail -1)
++A=$($NP m1-sound/sysaudio build-sysaudio.nix -A all)
+ [ -x "$A/usr/sbin/coreaudiod" ] || { echo "sysaudio build failed" >&2; exit 2; }
+-PLAY=$(cd $SOUND && $NB build-sfplay.nix 2>/dev/null | tail -1)
++PLAY=$($NP m1-sound build-sfplay.nix)
+ FW=System/Library/Frameworks
+ X="$X;$A/usr/sbin/coreaudiod=/usr/sbin/coreaudiod;$A/usr/bin/sftone=/usr/bin/sftone;$A/usr/bin/sfvolume=/usr/bin/sfvolume;$PLAY/usr/bin/sfplay=/usr/bin/sfplay"
+ for f in CoreAudio AudioToolbox AudioUnit; do X="$X;$A/$FW/$f.framework/Versions/A/$f=/$FW/$f.framework/Versions/A/$f"; done
+@@ -66,11 +71,14 @@
+   [ -f "$SPLASH" ] || { echo "no boot picture at $SPLASH" >&2; exit 2; }
+   QD=$(mktemp -d); python3 "$Q/boot_logo.py" pack "$SPLASH" "$QD" > /dev/null
+   B=integrations/siliconforest/m1-bringup
+-  QUIET=(PCIE_LAB_PATCH="$ROOT/$Q/quiet-boot.patch" PCIE_LAB_FILES="$QD/boot-logo.gz=$B/boot-logo.gz;$QD/boot-logo.json=$B/boot-logo.json")
++  # the quiet boot's launcher patch, with the boot picture painted in 0.2 s instead of 4.7 s and
++  # the challenge typed only once the console is silent
++  QUIET=(PCIE_LAB_PATCH="$ROOT/integrations/siliconforest/m1-boot-speed/launcher-fast-quiet.patch" PCIE_LAB_FILES="$QD/boot-logo.gz=$B/boot-logo.gz;$QD/boot-logo.json=$B/boot-logo.json")
+ fi
+ S=$(mktemp); sed -e "s/@SECONDS@/$DESK/g" -e "s/@HOLD@/$HOLD/g" -e "s/@VOLUME@/$VOL/g" integrations/siliconforest/chonkstep-darwin/darwin-gpu-desktop-interactive.in > "$S"
+-echo "GPU desktop: $MIN minutes; the desktop appears about 2.5 minutes after the M1 reboots"
+-env "${QUIET[@]}" PCIE_KC="$KC" PCIE_BOOTARGS="cpus=${GPU_DESKTOP_CPUS:-8} sfgpudt=2 sfgpudt_stringprops=1 sfagx=1 sfdispdt=2 sfdcp=2" PCIE_EXTRA_FILES="$X" PCIE_GUEST_TEMPLATE="$S" \
++echo "GPU desktop: $MIN minutes; the desktop appears about 50 seconds after the M1 reboots"
++# The RAM root without the unused kernel archive, 384 MiB, free blocks zeroed: 92 MB on the wire instead of 150.
++env "${QUIET[@]}" PCIE_STAGER="$ROOT/integrations/siliconforest/m1-boot-speed/tools/stage_ramdisk_slim.py" PCIE_KC="$KC" PCIE_BOOTARGS="cpus=${GPU_DESKTOP_CPUS:-8} sfgpudt=2 sfgpudt_stringprops=1 sfagx=1 sfdispdt=2 sfdcp=2 sf_quiet_wait=0 sf_rtc_wait=0" PCIE_EXTRA_FILES="$X" PCIE_GUEST_TEMPLATE="$S" \
+ PCIE_SKIP_BUILD=1 PCIE_WIFI=1 PCIE_WIFI_JOIN=1 LINES_MAX=1 tools/pcie_iterate.sh "$N" "$RUNTIME" 2>&1 | grep -a '"status"\|rror\|delivered' | cut -c1-240
+ rm -rf "$S" ${QD:+"$QD"}
+ strings -n 6 "runs/m1-desktop-010/pcie-enum-attempt-$N/guest/console.bin" | grep -a 'GPUDESK\|WMSTAT\|panic\|SFSpeakers:\|SFTouchBar:' | cut -c1-260 | tail -40

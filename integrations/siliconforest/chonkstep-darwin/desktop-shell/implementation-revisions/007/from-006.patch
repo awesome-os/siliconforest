@@ -1,0 +1,341 @@
+--- a/crates/wm-darwin/src/applications.rs
++++ b/crates/wm-darwin/src/applications.rs
+@@ -273,11 +273,99 @@
+         CsStatus::Unsupported
+     }
+ }
++/// Kernel message-buffer lines about per-process resource limits, read once
++/// after an owned child is reaped by a signal. Diagnostic only: it never
++/// changes the wait status, ownership or outcome.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum KernelMessages {
++    /// Non-Apple host build: no proc_kmsgbuf.
++    Unsupported,
++    /// proc_kmsgbuf returned no bytes; EPERM means this process is not root.
++    QueryFailed { euid: u32, errno: i32 },
++    /// `matched` counts every matching line; `lines` keeps the most recent
++    /// KERNEL_MESSAGE_LINE_LIMIT of them, sanitized and truncated.
++    Read { euid: u32, bytes: usize, matched: usize, lines: Vec<String> },
++}
++/// Substrings of the pinned XNU os_log lines on the resource-limit fatal-port
++/// path (osfmk/kern/task.c SENDING_NOTIFICATION__THIS_PROCESS_HAS_TOO_MANY_*).
++pub const KERNEL_MESSAGE_NEEDLES: [&str; 3] = [
++    "caught allocating too many",
++    "Unable to create task token ident object",
++    "send_resource_violation",
++];
++pub const KERNEL_MESSAGE_LINE_LIMIT: usize = 8;
++pub const KERNEL_MESSAGE_LINE_BYTES: usize = 240;
++/// log_dmesg copies the newest bytes when the buffer is smaller than the log.
++pub const KERNEL_MESSAGE_BUFFER_BYTES: usize = 256 * 1024;
++impl std::fmt::Display for KernelMessages {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::Unsupported => write!(f, "unsupported"),
++            Self::QueryFailed { euid, errno } => write!(f, "query_failed euid={euid} errno={errno}"),
++            Self::Read { euid, bytes, matched, lines } => write!(
++                f,
++                "read euid={euid} bytes={bytes} matched={matched} kept={}",
++                lines.len()
++            ),
++        }
++    }
++}
++/// Keeps the most recent matching lines, each limited to printable ASCII
++/// (others become '?') and KERNEL_MESSAGE_LINE_BYTES bytes.
++pub fn select_kernel_messages(buffer: &[u8]) -> (usize, Vec<String>) {
++    let mut matched = 0;
++    let mut kept = std::collections::VecDeque::with_capacity(KERNEL_MESSAGE_LINE_LIMIT);
++    for raw in buffer.split(|&b| b == b'\n') {
++        if !KERNEL_MESSAGE_NEEDLES
++            .iter()
++            .any(|needle| raw.windows(needle.len()).any(|w| w == needle.as_bytes()))
++        {
++            continue;
++        }
++        matched += 1;
++        if kept.len() == KERNEL_MESSAGE_LINE_LIMIT {
++            kept.pop_front();
++        }
++        kept.push_back(
++            raw.iter()
++                .take(KERNEL_MESSAGE_LINE_BYTES)
++                .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '?' })
++                .collect::<String>(),
++        );
++    }
++    (matched, kept.into())
++}
++/// Reads the kernel message buffer (root only in pinned XNU proc_kmsgbuf).
++pub fn query_kernel_messages() -> KernelMessages {
++    #[cfg(target_vendor = "apple")]
++    {
++        unsafe extern "C" {
++            fn proc_kmsgbuf(buffer: *mut libc::c_void, buffersize: u32) -> libc::c_int;
++        }
++        let euid = unsafe { libc::geteuid() };
++        let mut buffer = vec![0u8; KERNEL_MESSAGE_BUFFER_BYTES];
++        let returned = unsafe {
++            proc_kmsgbuf(buffer.as_mut_ptr().cast(), KERNEL_MESSAGE_BUFFER_BYTES as u32)
++        };
++        if returned <= 0 {
++            let errno = io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
++            return KernelMessages::QueryFailed { euid, errno };
++        }
++        let bytes = (returned as usize).min(KERNEL_MESSAGE_BUFFER_BYTES);
++        let (matched, lines) = select_kernel_messages(&buffer[..bytes]);
++        KernelMessages::Read { euid, bytes, matched, lines }
++    }
++    #[cfg(not(target_vendor = "apple"))]
++    {
++        KernelMessages::Unsupported
++    }
++}
+ pub struct OwnedChild {
+     pid: NonZeroI32,
+     state: WaitState,
+     exit_reason: Option<ExitReason>,
+     exit_cs_status: Option<CsStatus>,
++    kernel_messages: Option<KernelMessages>,
+ }
+ impl OwnedChild {
+     fn new(pid: i32) -> Option<Self> {
+@@ -286,6 +374,7 @@
+             state: WaitState::Running,
+             exit_reason: None,
+             exit_cs_status: None,
++            kernel_messages: None,
+         })
+     }
+     pub fn pid(&self) -> i32 {
+@@ -300,6 +389,9 @@
+     pub fn exit_cs_status(&self) -> Option<CsStatus> {
+         self.exit_cs_status
+     }
++    pub fn kernel_messages(&self) -> Option<&KernelMessages> {
++        self.kernel_messages.as_ref()
++    }
+     pub fn poll(&mut self) -> WaitState {
+         self.poll_using(&mut UnixWait)
+     }
+@@ -320,6 +412,13 @@
+                 Ok(None) | Err(libc::EINTR) => WaitState::Running,
+                 Err(error) => WaitState::Unknown(error),
+             };
++            // After a signal death only: the kernel message buffer outlives
++            // the process, so reading it after the reap loses nothing.
++            if let WaitState::Reaped(status) = self.state {
++                if libc::WIFSIGNALED(status) && self.kernel_messages.is_none() {
++                    self.kernel_messages = ops.kernel_messages();
++                }
++            }
+         }
+         self.state
+     }
+@@ -347,6 +446,10 @@
+     fn cs_status(&mut self, _pid: i32) -> Option<CsStatus> {
+         None
+     }
++    /// Called at most once per child, after a reap whose status is a signal.
++    fn kernel_messages(&mut self) -> Option<KernelMessages> {
++        None
++    }
+ }
+ /// Non-reaping exit check: WEXITED|WNOHANG|WNOWAIT leaves the zombie waitable.
+ /// si_pid is zeroed first because XNU leaves siginfo untouched when nothing
+@@ -441,6 +544,9 @@
+     fn cs_status(&mut self, pid: i32) -> Option<CsStatus> {
+         Some(query_cs_status(pid))
+     }
++    fn kernel_messages(&mut self) -> Option<KernelMessages> {
++        Some(query_kernel_messages())
++    }
+     fn exit_reason(&mut self, pid: i32) -> Option<ExitReason> {
+         match exited_without_reaping(pid) {
+             Ok(false) | Err(libc::EINTR) => None,
+@@ -780,6 +886,9 @@
+         if let Some(cs) = self.child.exit_cs_status() {
+             audit.cs_status(self.audit_sequence, crate::launch_audit::CsPhase::Exit, cs);
+         }
++        if let Some(messages) = self.child.kernel_messages() {
++            audit.kernel_messages(self.audit_sequence, messages);
++        }
+         audit.observe(self.audit_sequence, &self.status, self.child.state());
+         // Late reaps are still recorded after an incomplete deadline, but no
+         // new signals or attempted success reclassification follow that result.
+@@ -1860,4 +1969,112 @@
+         assert_eq!(audit.attempts()[0].cs_at_exit, Some(CsStatus::Flags(0x0100_0201)));
+         assert_eq!(audit.attempts()[0].raw_app_wait_status, Some(9));
+     }
++
++    #[test]
++    fn kernel_messages_keep_the_newest_matching_lines_sanitized_and_bounded() {
++        let mut log = Vec::new();
++        log.extend_from_slice(b"unrelated boot line\n");
++        for i in 0..10 {
++            log.extend_from_slice(
++                format!("process chonk-terminal-d[{i}] caught allocating too many file descriptors. \tNum of fds allocated 9; \n")
++                    .as_bytes(),
++            );
++        }
++        log.extend_from_slice(b"process x[14] Unable to create task token ident object\x01\xff\n");
++        log.extend_from_slice(format!("send_resource_violation(ports, ...): error 0x10000003 {}\n", "z".repeat(400)).as_bytes());
++        let (matched, lines) = select_kernel_messages(&log);
++        assert_eq!(matched, 12);
++        assert_eq!(lines.len(), KERNEL_MESSAGE_LINE_LIMIT);
++        assert!(lines[0].starts_with("process chonk-terminal-d[4] caught"), "{lines:?}");
++        assert!(lines[0].contains("descriptors. ?Num"), "tab sanitized: {lines:?}");
++        assert!(lines[6].ends_with("ident object??"), "{lines:?}");
++        assert_eq!(lines[7].len(), KERNEL_MESSAGE_LINE_BYTES);
++        assert!(lines.iter().all(|l| l.bytes().all(|b| (0x20..0x7f).contains(&b))));
++        assert_eq!(select_kernel_messages(b"nothing here\n"), (0, vec![]));
++        assert_eq!(select_kernel_messages(b""), (0, vec![]));
++        #[cfg(not(target_vendor = "apple"))]
++        assert_eq!(query_kernel_messages(), KernelMessages::Unsupported);
++    }
++    #[test]
++    fn kernel_messages_are_read_once_and_only_after_a_signal_reap() {
++        struct KmsgWait {
++            status: Option<i32>,
++            calls: usize,
++        }
++        impl WaitApi for KmsgWait {
++            fn wait(&mut self, _: i32) -> Result<Option<i32>, i32> {
++                Ok(self.status)
++            }
++            fn signal(&mut self, _: i32, _: i32) -> Result<(), i32> {
++                Ok(())
++            }
++            fn kernel_messages(&mut self) -> Option<KernelMessages> {
++                self.calls += 1;
++                Some(KernelMessages::Read {
++                    euid: 0,
++                    bytes: 4096,
++                    matched: 1,
++                    lines: vec!["process chonk-terminal-d[14] caught allocating too many mach ports.".into()],
++                })
++            }
++        }
++        let now = Instant::now();
++        let (mut app, _peer, mut audit) = fake_application(now);
++        let mut running = KmsgWait { status: None, calls: 0 };
++        app.service(now, false, &mut audit, &mut running);
++        assert_eq!(running.calls, 0, "no read while the child runs");
++        let mut killed = KmsgWait { status: Some(9), calls: 0 };
++        app.service(now, false, &mut audit, &mut killed);
++        app.service(now, false, &mut audit, &mut killed);
++        assert_eq!(killed.calls, 1, "one read after the signal reap");
++        let attempt = &audit.attempts()[0];
++        assert_eq!(attempt.raw_app_wait_status, Some(9));
++        assert!(attempt.failure.is_some(), "SIGKILL stays a failure");
++        let mut out = Vec::new();
++        audit.snapshot(&mut out).unwrap();
++        let text = String::from_utf8(out).unwrap();
++        assert!(text.contains("attempt=0 kernel_messages=read euid=0 bytes=4096 matched=1 kept=1\n"), "{text}");
++        assert!(text.contains("attempt=0 kernel_message[0]=process chonk-terminal-d[14] caught allocating too many mach ports.\n"), "{text}");
++
++        let (mut clean, _clean_peer, mut clean_audit) = fake_application(now);
++        let mut exited = KmsgWait { status: Some(0), calls: 0 };
++        clean.service(now, false, &mut clean_audit, &mut exited);
++        assert_eq!(exited.calls, 0, "a normal exit is not followed by a read");
++        let mut out = Vec::new();
++        clean_audit.snapshot(&mut out).unwrap();
++        assert!(String::from_utf8(out).unwrap().contains("attempt=0 kernel_messages=not_observed"));
++    }
++    #[test]
++    fn kernel_message_records_are_kept_once_and_fit_the_journal_bound() {
++        let now = Instant::now();
++        let (_app, _peer, mut audit) = fake_application(now);
++        let failed = KernelMessages::QueryFailed { euid: 501, errno: libc::EPERM };
++        audit.kernel_messages(0, &failed);
++        audit.kernel_messages(0, &KernelMessages::Unsupported);
++        assert_eq!(audit.attempts()[0].kernel_messages, Some(failed));
++        let mut out = Vec::new();
++        audit.snapshot(&mut out).unwrap();
++        assert!(String::from_utf8(out).unwrap().contains(&format!(
++            "attempt=0 kernel_messages=query_failed euid=501 errno={}",
++            libc::EPERM
++        )));
++        let largest = KernelMessages::Read {
++            euid: u32::MAX,
++            bytes: usize::MAX,
++            matched: usize::MAX,
++            lines: vec!["~".repeat(KERNEL_MESSAGE_LINE_BYTES); KERNEL_MESSAGE_LINE_LIMIT],
++        };
++        let summary = format!(
++            "CHONKLAUNCH/1 attempt={} ms={} event=KernelMessages kernel_messages={largest}\n",
++            crate::launch_audit::MAX_ATTEMPTS - 1,
++            u64::MAX
++        );
++        let line = format!(
++            "CHONKLAUNCH/1 attempt={} event=KernelMessage index={} text={}\n",
++            crate::launch_audit::MAX_ATTEMPTS - 1,
++            KERNEL_MESSAGE_LINE_LIMIT - 1,
++            "~".repeat(KERNEL_MESSAGE_LINE_BYTES)
++        );
++        assert!(summary.len() <= 1024 && line.len() <= 1024, "{} {}", summary.len(), line.len());
++    }
+ }
+--- a/crates/wm-darwin/src/launch_audit.rs
++++ b/crates/wm-darwin/src/launch_audit.rs
+@@ -79,6 +79,8 @@
+     /// csops CS_OPS_STATUS right after spawn and at exit (before reap).
+     pub cs_at_spawn: Option<crate::applications::CsStatus>,
+     pub cs_at_exit: Option<crate::applications::CsStatus>,
++    /// Kernel message-buffer resource-limit lines after a signal reap.
++    pub kernel_messages: Option<crate::applications::KernelMessages>,
+ }
+ pub struct LaunchAudit {
+     origin: Instant,
+@@ -186,6 +188,7 @@
+             exit_reason: None,
+             cs_at_spawn: None,
+             cs_at_exit: None,
++            kernel_messages: None,
+         });
+         self.append(format!("CHONKLAUNCH/1 attempt={sequence} ms={now} request={shell_request:?} instance={instance:?} source={} event=requested\n",source.name()));
+         Ok(sequence)
+@@ -258,6 +261,25 @@
+             "CHONKLAUNCH/1 attempt={sequence} ms={now} event=CsStatus phase={phase:?} cs_status={status}\n"
+         ));
+     }
++    /// Recorded once per attempt. Each kept line is at most
++    /// KERNEL_MESSAGE_LINE_BYTES, so every journal line stays under 1024 bytes.
++    pub fn kernel_messages(&mut self, sequence: usize, messages: &crate::applications::KernelMessages) {
++        if self.attempts[sequence].kernel_messages.is_some() {
++            return;
++        }
++        let now = self.now_ms();
++        self.attempts[sequence].kernel_messages = Some(messages.clone());
++        self.append(format!(
++            "CHONKLAUNCH/1 attempt={sequence} ms={now} event=KernelMessages kernel_messages={messages}\n"
++        ));
++        if let crate::applications::KernelMessages::Read { lines, .. } = messages {
++            for (index, line) in lines.iter().enumerate() {
++                self.append(format!(
++                    "CHONKLAUNCH/1 attempt={sequence} event=KernelMessage index={index} text={line}\n"
++                ));
++            }
++        }
++    }
+     /// The frontend's own code-signing flags, journaled once at adoption.
+     pub fn manager_cs_status(&mut self, status: crate::applications::CsStatus) {
+         self.append(format!("CHONKLAUNCH/1 scope=manager self_cs_status={status}\n"));
+@@ -337,6 +359,17 @@
+                 cs(&a.cs_at_spawn),
+                 cs(&a.cs_at_exit)
+             )?;
++            match &a.kernel_messages {
++                Some(messages) => {
++                    writeln!(out, "attempt={} kernel_messages={messages}", a.sequence)?;
++                    if let crate::applications::KernelMessages::Read { lines, .. } = messages {
++                        for (index, line) in lines.iter().enumerate() {
++                            writeln!(out, "attempt={} kernel_message[{index}]={line}", a.sequence)?;
++                        }
++                    }
++                }
++                None => writeln!(out, "attempt={} kernel_messages=not_observed", a.sequence)?,
++            }
+             for gate in GATES {
+                 writeln!(
+                     out,

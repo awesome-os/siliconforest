@@ -1,0 +1,33 @@
+#!/bin/sh
+# Guest side of the on-screen GPU demo: three GLES scenes rendered off-screen on the GPU at panel
+# resolution and shown on the built-in panel through the SFGOP framebuffer mapping, timed in
+# three modes each (render, +readback, +present). The demo saves the console image first and
+# puts it back before it prints, so every AGX* line reaches this console.
+#
+# Run 1 is the benchmark as before plus passive fingerprints of the fixed frames (--tiles, and
+# --fp-ref when the Linux reference is staged): they only read the frames the run reads anyway,
+# so its hashes are those of a plain run. Run 2 is a fresh process with the mesh scene only and
+# the active checks (repeats, variants, depth probe, fresh-memory checks).
+# Stage the bundle of agx-offscreen-test.nix (see the README for the PCIE_EXTRA_FILES list) and,
+# optionally, the two Linux reference files as /usr/local/share/agx/panel-linux.fp and
+# /usr/local/share/agx/panel-linux-mesh.fp.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin; export PATH
+R=/usr/local/share/agx
+printf '\nDL42_PANEL_BEGIN_%s\n' "$nonce"
+start=$(date +%s)
+if ls /dev/dri/renderD* >/dev/null 2>&1; then
+    ref=; [ -r $R/panel-linux.fp ] && ref="--fp-ref $R/panel-linux.fp"
+    # 40 s of measurements at most; each present run stays on the panel 250 ms before the
+    # console comes back. No pipe: the exit status below is the demo's own.
+    agx-panel-demo --require-renderer "Apple M1" --frames 30 --budget 40 --hold-ms 250 --tiles $ref 2>&1
+    printf 'DL42_PANEL_RC=%s seconds=%s\n' "$?" "$(( $(date +%s) - start ))"
+    ref=; [ -r $R/panel-linux-mesh.fp ] && ref="--fp-ref $R/panel-linux-mesh.fp"
+    printf 'DL42_DIAG_BEGIN\n'
+    agx-panel-demo --require-renderer "Apple M1" --no-present --no-bench --scenes mesh --diag --repeat-hash 5 --fresh $ref 2>&1
+    printf 'DL42_DIAG_RC=%s seconds=%s\n' "$?" "$(( $(date +%s) - start ))"
+else
+    printf 'DL42_PANEL_SKIPPED no render node\n'
+fi
+printf 'DL42_PANEL_END_%s\n' "$nonce"

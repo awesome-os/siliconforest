@@ -1,0 +1,428 @@
+--- a/src/Frameworks/Onyx2D/O2Context_builtin.m
++++ b/src/Frameworks/Onyx2D/O2Context_builtin.m
+@@ -21,6 +21,7 @@
+  * THE USE OR OTHER DEALINGS IN THE MATERIALS.
+  */
+ #import <Onyx2D/O2Context_builtin.h>
++#include <pthread.h>
+ #import <Onyx2D/O2MutablePath.h>
+ #import <Onyx2D/O2Image.h>
+ #import <Onyx2D/O2Color.h>
+@@ -150,13 +151,60 @@
+    return [name isEqual:@"Onyx"];
+ }
+ 
++/* The winding buffer: a count per sample of every column, 256 samples a column, so 2 MB for a window
++ * as wide as the screen. It was a fresh calloc each time a context was made, and a window gets a new
++ * context at every size it takes: while a window was resized each step faulted in and cleared 2 MB
++ * of new pages (a third of the time from the compositor's configure to the next frame). The buffer
++ * of a context that goes away is kept for the next one (a quarter larger than asked, so that a
++ * window that grows step by step keeps reusing it). The rasterizer
++ * leaves every count it used at zero (O2DContextFillEdgesOnSurface clears each as it reads it),
++ * so a kept buffer needs no clearing but for the spare count past the last column. */
++static pthread_mutex_t sfWindingLock=PTHREAD_MUTEX_INITIALIZER;
++static int *sfWindingKept;
++
++// two words before the counts: the capacity, and how many the context that has the buffer uses
++static int *sfWindingTake(size_t count){
++   int *base=NULL;
++
++   pthread_mutex_lock(&sfWindingLock);
++   if(sfWindingKept!=NULL && (size_t)sfWindingKept[-2]>=count){
++    base=sfWindingKept-2;
++    sfWindingKept=NULL;
++   }
++   pthread_mutex_unlock(&sfWindingLock);
++   if(base==NULL){
++    size_t capacity=count+count/4;
++    if((base=calloc(capacity+2,sizeof(int)))!=NULL)
++     base[0]=(int)capacity;
++   }
++   if(base==NULL)
++    return NULL;
++   base[1]=(int)count;
++   return base+2;
++}
++
++static void sfWindingGive(int *winding){
++   if(winding==NULL)
++    return;
++   // the spare count past the last column may hold what an edge left there
++   winding[winding[-1]-1]=0;
++   pthread_mutex_lock(&sfWindingLock);
++   if(sfWindingKept==NULL || sfWindingKept[-2]<winding[-2]){
++    int *old=sfWindingKept;
++    sfWindingKept=winding;
++    winding=old;
++   }
++   pthread_mutex_unlock(&sfWindingLock);
++   if(winding!=NULL)
++    free(winding-2);
++}
++
+ -(void)reallocateForSurface {
+    size_t width=O2ImageGetWidth(_surface);
+    
+-   if(self->_winding!=NULL)
+-    free(self->_winding);
++   sfWindingGive(self->_winding);
+     // +1 is so we can modify the the next winding value without a bounds check
+-    self->_winding=calloc((width*MAX_SAMPLES)+1,sizeof(int));
++    self->_winding=sfWindingTake((width*MAX_SAMPLES)+1);
+    if(self->_increase!=NULL)
+     free(self->_increase);
+     self->_increase=malloc(width*sizeof(int));
+@@ -223,8 +271,8 @@
+    if(_sortCache!=NULL)
+     NSZoneFree(NULL,_sortCache);
+ 
+-   if(_winding!=NULL) 
+-    free(_winding);
++   sfWindingGive(_winding);
++   _winding=NULL;
+    if(_increase!=NULL)
+     free(_increase);
+    if(samplesX!=NULL)
+@@ -379,6 +427,293 @@
+    return result;
+    }
+ 
++/* Rectangles in device space (an NSRectFill, a hairline stroked straight across) are by far the
++ * most frequent things drawn: their coverage is computed directly, a row at a time, rather than by
++ * the edge rasterizer (edge tables, coverage lists allocated per call, a winding count per sample
++ * of every row). A terminal fills and strokes several of them for every frame it draws; the edge
++ * rasterizer made them a quarter of its drawing time. The result is the same coverage, exact
++ * instead of sampled. */
++static BOOL sfDeviceRectFromPoints(O2Point p[4],O2AffineTransform xform,double r[4]){
++   O2Point d[4];
++   int i;
++
++   if(fabs(xform.b)>1e-9 || fabs(xform.c)>1e-9)
++    return NO;
++   for(i=0;i<4;i++)
++    d[i]=O2PointApplyAffineTransform(p[i],xform);
++   // the four corners in either order of turning, edges parallel to the axes
++   BOOL horizontalFirst=fabs(d[0].y-d[1].y)<1e-4 && fabs(d[1].x-d[2].x)<1e-4 && fabs(d[2].y-d[3].y)<1e-4 && fabs(d[3].x-d[0].x)<1e-4;
++   BOOL verticalFirst=fabs(d[0].x-d[1].x)<1e-4 && fabs(d[1].y-d[2].y)<1e-4 && fabs(d[2].x-d[3].x)<1e-4 && fabs(d[3].y-d[0].y)<1e-4;
++   if(!horizontalFirst && !verticalFirst)
++    return NO;
++   r[0]=MIN(d[0].x,d[2].x); r[1]=MIN(d[0].y,d[2].y);
++   r[2]=MAX(d[0].x,d[2].x); r[3]=MAX(d[0].y,d[2].y);
++   return YES;
++}
++
++// a path that is one rectangle: move, three lines (a fourth back to the start may follow), close
++static BOOL sfPathIsDeviceRect(O2Path *path,O2AffineTransform xform,double r[4]){
++   unsigned n=O2PathNumberOfElements(path),np=O2PathNumberOfPoints(path);
++   const unsigned char *e=O2PathElements(path);
++   const O2Point *pts=O2PathPoints(path);
++
++   if(n<4 || n>6 || np<4 || np>5)
++    return NO;
++   if(e[0]!=kO2PathElementMoveToPoint || e[1]!=kO2PathElementAddLineToPoint || e[2]!=kO2PathElementAddLineToPoint || e[3]!=kO2PathElementAddLineToPoint)
++    return NO;
++   if(n>=5 && e[4]!=kO2PathElementCloseSubpath && e[4]!=kO2PathElementAddLineToPoint)
++    return NO;
++   if(n==6 && (e[4]!=kO2PathElementAddLineToPoint || e[5]!=kO2PathElementCloseSubpath))
++    return NO;
++   // (not closed: filled as closed all the same)
++   if(np==5 && (fabs(pts[4].x-pts[0].x)>1e-6 || fabs(pts[4].y-pts[0].y)>1e-6))
++    return NO;
++   O2Point p[4]={pts[0],pts[1],pts[2],pts[3]};
++   return sfDeviceRectFromPoints(p,xform,r);
++}
++
++// a path that is one straight segment along an axis, stroked with a butt or square cap: the rectangle it covers
++static BOOL sfStrokeIsDeviceRect(O2Path *path,O2GState *gState,O2AffineTransform xform,double r[4]){
++   const unsigned char *e=O2PathElements(path);
++   O2Float w=gState->_lineWidth/2;
++
++   if(O2PathNumberOfElements(path)!=2 || O2PathNumberOfPoints(path)!=2 || e[0]!=kO2PathElementMoveToPoint || e[1]!=kO2PathElementAddLineToPoint)
++    return NO;
++   if(gState->_dashLengthsCount!=0 || (gState->_lineCap!=kO2LineCapButt && gState->_lineCap!=kO2LineCapSquare))
++    return NO;
++   O2Point a=O2PathPoints(path)[0],b=O2PathPoints(path)[1];
++   O2Float cap=gState->_lineCap==kO2LineCapSquare ? w : 0;
++   O2Point p[4];
++
++   if(fabs(a.x-b.x)<1e-6 && fabs(a.y-b.y)>1e-6){
++    O2Float y0=MIN(a.y,b.y)-cap,y1=MAX(a.y,b.y)+cap;
++    p[0]=O2PointMake(a.x-w,y0); p[1]=O2PointMake(a.x+w,y0); p[2]=O2PointMake(a.x+w,y1); p[3]=O2PointMake(a.x-w,y1);
++   }
++   else if(fabs(a.y-b.y)<1e-6 && fabs(a.x-b.x)>1e-6){
++    O2Float x0=MIN(a.x,b.x)-cap,x1=MAX(a.x,b.x)+cap;
++    p[0]=O2PointMake(x0,a.y-w); p[1]=O2PointMake(x1,a.y-w); p[2]=O2PointMake(x1,a.y+w); p[3]=O2PointMake(x0,a.y+w);
++   }
++   else
++    return NO;
++   return sfDeviceRectFromPoints(p,xform,r);
++}
++
++static void sfFillDeviceRect(O2Context_builtin *self,double x0,double y0,double x1,double y1);
++
++/* A rectangle's outline (a closed path of four sides along the axes) stroked with mitred corners:
++ * the band between the rectangle grown and shrunk by half the line width, as four rectangles that
++ * do not overlap (a translucent colour is laid once on every pixel, as the edge rasterizer does). */
++static BOOL sfStrokeRectOutline(O2Context_builtin *self,O2Path *path,O2GState *gState,O2AffineTransform xform){
++   double r[4];
++   O2Float w=gState->_lineWidth/2;
++
++   if(gState->_dashLengthsCount!=0 || gState->_lineJoin!=kO2LineJoinMiter || gState->_miterLimit<1.42)
++    return NO;
++   if(!sfPathIsDeviceRect(path,O2AffineTransformIdentity,r))
++    return NO;
++   // r is the rectangle in user space here; both rectangles go to device space
++   O2Point outer[4]={O2PointMake(r[0]-w,r[1]-w),O2PointMake(r[2]+w,r[1]-w),O2PointMake(r[2]+w,r[3]+w),O2PointMake(r[0]-w,r[3]+w)};
++   O2Point inner[4]={O2PointMake(r[0]+w,r[1]+w),O2PointMake(r[2]-w,r[1]+w),O2PointMake(r[2]-w,r[3]-w),O2PointMake(r[0]+w,r[3]-w)};
++   double o[4],i[4];
++
++   if(!sfDeviceRectFromPoints(outer,xform,o))
++    return NO;
++   if(r[2]-r[0]<=2*w || r[3]-r[1]<=2*w || !sfDeviceRectFromPoints(inner,xform,i)){
++    sfFillDeviceRect(self,o[0],o[1],o[2],o[3]);
++    return YES;
++   }
++   sfFillDeviceRect(self,o[0],o[1],o[2],i[1]);
++   sfFillDeviceRect(self,o[0],i[3],o[2],o[3]);
++   sfFillDeviceRect(self,o[0],i[1],i[0],i[3]);
++   sfFillDeviceRect(self,i[2],i[1],o[2],i[3]);
++   return YES;
++}
++
++static void sfFillDeviceRect(O2Context_builtin *self,double x0,double y0,double x1,double y1);
++static BOOL sfDeviceRectFromPoints(O2Point p[4],O2AffineTransform xform,double r[4]);
++
++/* An outline whose pieces meet without corners (a rounded rectangle: straight sides joined by
++ * quarter arcs), stroked: each straight side along an axis is a band covered directly, each arc
++ * is stroked on its own, with butt ends where it meets the sides. The edge rasterizer walks every
++ * pixel of every row between a path's leftmost and rightmost edges: a hairline round the whole
++ * window cost as much as filling the window, once per frame (Terminal strokes its view's rounded
++ * outline each time it draws). */
++static BOOL sfStrokeInPieces(O2Context_builtin *self,O2Path *path,O2GState *gState,O2AffineTransform xform){
++   unsigned ne=O2PathNumberOfElements(path),pi=0,ns=0;
++   const unsigned char *e=O2PathElements(path);
++   const O2Point *pt=O2PathPoints(path);
++   struct { int curve; O2Point p0,c1,c2,p1; } seg[16];
++   O2Point start,at;
++   BOOL closed=NO,longLine=NO;
++   O2Float w=gState->_lineWidth/2;
++
++   if(ne<3 || ne>18 || e[0]!=kO2PathElementMoveToPoint || fabs(xform.b)>1e-9 || fabs(xform.c)>1e-9)
++    return NO;
++   start=at=pt[pi++];
++   for(unsigned k=1;k<ne;k++){
++    if(ns>=15)
++     return NO;
++    switch(e[k]){
++     case kO2PathElementAddLineToPoint:
++      seg[ns].curve=0; seg[ns].p0=at; seg[ns].p1=pt[pi]; at=pt[pi++]; ns++; break;
++     case kO2PathElementAddCurveToPoint:
++      seg[ns].curve=1; seg[ns].p0=at; seg[ns].c1=pt[pi]; seg[ns].c2=pt[pi+1]; seg[ns].p1=pt[pi+2]; at=pt[pi+2]; pi+=3; ns++; break;
++     case kO2PathElementCloseSubpath:
++      if(k!=ne-1)
++       return NO;
++      closed=YES;
++      if(fabs(at.x-start.x)>1e-6 || fabs(at.y-start.y)>1e-6){
++       seg[ns].curve=0; seg[ns].p0=at; seg[ns].p1=start; ns++;
++      }
++      break;
++     default:
++      return NO;
++    }
++   }
++   // pieces of no length (a corner of radius 0 is a curve that goes nowhere) are dropped
++   {
++    unsigned kept=0;
++    for(unsigned k=0;k<ns;k++){
++     double span=fabs(seg[k].p1.x-seg[k].p0.x)+fabs(seg[k].p1.y-seg[k].p0.y);
++     if(seg[k].curve)
++      span+=fabs(seg[k].c1.x-seg[k].p0.x)+fabs(seg[k].c1.y-seg[k].p0.y)+fabs(seg[k].c2.x-seg[k].p0.x)+fabs(seg[k].c2.y-seg[k].p0.y);
++     if(span>1e-6)
++      seg[kept++]=seg[k];
++    }
++    ns=kept;
++   }
++   if(ns<2)
++    return NO;
++   int extend[16][2]={{0}};   // a straight piece that takes a mitred right-angle corner at its start [0] or end [1]
++   // every straight piece along an axis, every junction without a corner
++   for(unsigned k=0;k<ns;k++){
++    if(!seg[k].curve){
++     double dx=seg[k].p1.x-seg[k].p0.x,dy=seg[k].p1.y-seg[k].p0.y;
++     if(fabs(dx)>1e-6 && fabs(dy)>1e-6)
++      return NO;
++     if(fabs(dx)+fabs(dy)>20)
++      longLine=YES;
++    }
++   }
++   if(!longLine)
++    return NO;
++   for(unsigned k=0;k<ns;k++){
++    unsigned n=k+1;
++    if(n==ns){
++     if(!closed)
++      break;
++     n=0;
++    }
++    O2Point a0,a1,b0,b1;
++    if(seg[k].curve){ a1=seg[k].p1; a0=(fabs(seg[k].c2.x-a1.x)+fabs(seg[k].c2.y-a1.y)>1e-9) ? seg[k].c2 : seg[k].c1; }
++    else { a0=seg[k].p0; a1=seg[k].p1; }
++    if(seg[n].curve){ b0=seg[n].p0; b1=(fabs(seg[n].c1.x-b0.x)+fabs(seg[n].c1.y-b0.y)>1e-9) ? seg[n].c1 : seg[n].c2; }
++    else { b0=seg[n].p0; b1=seg[n].p1; }
++    double ax=a1.x-a0.x,ay=a1.y-a0.y,bx=b1.x-b0.x,by=b1.y-b0.y,la=hypot(ax,ay),lb=hypot(bx,by);
++    if(la<1e-9 || lb<1e-9)
++     return NO;
++    double cosine=(ax*bx+ay*by)/(la*lb);
++    if(cosine>=0.9999)
++     continue;
++    // a right angle between two straight pieces with a mitred join: the horizontal one covers the corner
++    if(fabs(cosine)<1e-6 && !seg[k].curve && !seg[n].curve && gState->_lineJoin==kO2LineJoinMiter && gState->_miterLimit>=1.42){
++     if(fabs(ay)<1e-6)
++      extend[k][1]=1;
++     else
++      extend[n][0]=1;
++     continue;
++    }
++    return NO;
++   }
++   if(!closed)
++    return NO;
++
++   O2Paint *paint=paintFromColor(self,gState->_strokeColor,O2AffineTransformInvert(xform));
++   O2ContextSetupPaintAndBlendMode(self,paint,gState->_blendMode);
++   O2PaintRelease(paint);
++   for(unsigned k=0;k<ns;k++){
++    if(!seg[k].curve){
++     O2Point a=seg[k].p0,b=seg[k].p1,q[4];
++     double r[4];
++     // a horizontal piece grows by half the line width where it takes a corner
++     if(fabs(a.y-b.y)<1e-6){
++      O2Float dir=b.x>a.x ? 1 : -1;
++      if(extend[k][0]) a.x-=dir*w;
++      if(extend[k][1]) b.x+=dir*w;
++     }
++     if(fabs(a.x-b.x)<1e-6){
++      O2Float y0=MIN(a.y,b.y),y1=MAX(a.y,b.y);
++      q[0]=O2PointMake(a.x-w,y0); q[1]=O2PointMake(a.x+w,y0); q[2]=O2PointMake(a.x+w,y1); q[3]=O2PointMake(a.x-w,y1);
++     }
++     else {
++      O2Float x0=MIN(a.x,b.x),x1=MAX(a.x,b.x);
++      q[0]=O2PointMake(x0,a.y-w); q[1]=O2PointMake(x1,a.y-w); q[2]=O2PointMake(x1,a.y+w); q[3]=O2PointMake(x0,a.y+w);
++     }
++     if(sfDeviceRectFromPoints(q,xform,r))
++      sfFillDeviceRect(self,r[0],r[1],r[2],r[3]);
++    }
++    else {
++     O2MutablePathRef piece=O2PathCreateMutable();
++     O2PathMoveToPoint(piece,NULL,seg[k].p0.x,seg[k].p0.y);
++     O2PathAddCurveToPoint(piece,NULL,seg[k].c1.x,seg[k].c1.y,seg[k].c2.x,seg[k].c2.y,seg[k].p1.x,seg[k].p1.y);
++     VGPath *vg=[[VGPath alloc] initWithKGPath:piece];
++     VGPathSetDeviceScale(vg,sqrt(fabs(xform.a*xform.d-xform.b*xform.c)));
++     O2RasterizerClear(self);
++     VGPathStroke(vg,xform,self,NULL,0,0,YES,gState->_lineWidth,kO2LineCapButt,gState->_lineJoin,RI_MAX(gState->_miterLimit,1.0f));
++     O2DContextClipAndFillEdges(self,VG_NON_ZERO);
++     [vg release];
++     O2PathRelease(piece);
++    }
++   }
++   return YES;
++}
++
++static void sfFillDeviceRect(O2Context_builtin *self,double x0,double y0,double x1,double y1){
++   O2Image *mask=(self->_clipContext!=nil)?self->_clipContext->_surface:nil;
++   O2Surface *surface=([self->_layerStack count]>0)?O2LayerGetSurface([self->_layerStack lastObject]):self->_surface;
++   double vx0=self->_vpx,vy0=self->_vpy,vx1=self->_vpx+self->_vpwidth,vy1=self->_vpy+self->_vpheight;
++   int ix0,ix1,iy0,iy1,x,y;
++
++   if(self->alias){
++    // whole pixels whose centres are inside
++    x0=ceil(x0-0.5); x1=ceil(x1-0.5); y0=ceil(y0-0.5); y1=ceil(y1-0.5);
++   }
++   x0=MAX(x0,vx0); y0=MAX(y0,vy0); x1=MIN(x1,vx1); y1=MIN(y1,vy1);
++   if(x1<=x0 || y1<=y0)
++    return;
++   ix0=(int)floor(x0); ix1=(int)ceil(x1); iy0=(int)floor(y0); iy1=(int)ceil(y1);
++   for(y=iy0;y<iy1;y++){
++    double cy=MIN(y+1.0,y1)-MAX((double)y,y0);
++    int full=(int)(cy*256.0+0.5);
++
++    if(full<=0)
++     continue;
++    if(ix1-ix0==1){
++     int c=(int)((x1-x0)*cy*256.0+0.5);
++     if(c>0)
++      self->_writeCoverageFunction(surface,mask,self->_paint,ix0,y,c,1,self->_blendFunction);
++     continue;
++    }
++    int left=(int)(((ix0+1)-x0)*cy*256.0+0.5),right=(int)((x1-(ix1-1))*cy*256.0+0.5);
++
++    x=ix0;
++    if(left>=full)
++     left=full;
++    else {
++     if(left>0)
++      self->_writeCoverageFunction(surface,mask,self->_paint,ix0,y,left,1,self->_blendFunction);
++     x=ix0+1;
++    }
++    int end=ix1-1;
++    if(right>=full)
++     end=ix1;
++    if(end>x)
++     self->_writeCoverageFunction(surface,mask,self->_paint,x,y,full,end-x,self->_blendFunction);
++    if(right<full && right>0)
++     self->_writeCoverageFunction(surface,mask,self->_paint,ix1-1,y,right,1,self->_blendFunction);
++   }
++}
++
+ -(void)drawPath:(O2PathDrawingMode)drawingMode {
+    O2GState *gState=O2ContextCurrentGState(self);
+    
+@@ -389,6 +724,48 @@
+    O2AffineTransform userToSurfaceMatrix=gState->_deviceSpaceTransform;
+ 
+    O2PathApplyTransform(_path,O2AffineTransformInvert(gState->_userSpaceTransform));
++
++   double rect[4];
++   BOOL fillRect=(drawingMode==kO2PathFill || drawingMode==kO2PathEOFill) && sfPathIsDeviceRect(_path,userToSurfaceMatrix,rect);
++   BOOL strokeRect=!fillRect && drawingMode==kO2PathStroke && gState->_lineWidth>0 && sfStrokeIsDeviceRect(_path,gState,userToSurfaceMatrix,rect);
++   static int noFastPath=-1;
++
++   if(noFastPath<0)
++    noFastPath=getenv("O2_NO_RECT_FAST_PATH")!=NULL;
++   if(!noFastPath && !fillRect && !strokeRect && drawingMode==kO2PathStroke && gState->_lineWidth>0 &&
++      gState->_dashLengthsCount==0 && sfStrokeInPieces(self,_path,gState,userToSurfaceMatrix)){
++    O2ContextSetPaint(self,nil);
++    O2RasterizerClear(self);
++    O2PathReset(_path);
++    return;
++   }
++   if(!noFastPath && !fillRect && !strokeRect && drawingMode==kO2PathStroke && gState->_lineWidth>0 &&
++      O2PathNumberOfElements(_path)>=4 && O2PathNumberOfElements(_path)<=6){
++    O2Paint *paint=paintFromColor(self,gState->_strokeColor,O2AffineTransformInvert(userToSurfaceMatrix));
++
++    O2ContextSetupPaintAndBlendMode(self,paint,gState->_blendMode);
++    O2PaintRelease(paint);
++    if(sfStrokeRectOutline(self,_path,gState,userToSurfaceMatrix)){
++     O2ContextSetPaint(self,nil);
++     O2RasterizerClear(self);
++     O2PathReset(_path);
++     return;
++    }
++    O2ContextSetPaint(self,nil);
++   }
++
++   if((fillRect || strokeRect) && !noFastPath){
++    O2Paint *paint=paintFromColor(self,fillRect ? gState->_fillColor : gState->_strokeColor,O2AffineTransformInvert(userToSurfaceMatrix));
++
++    O2ContextSetupPaintAndBlendMode(self,paint,gState->_blendMode);
++    O2PaintRelease(paint);
++    sfFillDeviceRect(self,rect[0],rect[1],rect[2],rect[3]);
++    O2ContextSetPaint(self,nil);
++    O2RasterizerClear(self);
++    O2PathReset(_path);
++    return;
++   }
++
+    VGPath *vgPath=[[VGPath alloc] initWithKGPath:_path];
+ 
+    VGPathSetDeviceScale(vgPath,sqrt(fabs(userToSurfaceMatrix.a*userToSurfaceMatrix.d-userToSurfaceMatrix.b*userToSurfaceMatrix.c)));

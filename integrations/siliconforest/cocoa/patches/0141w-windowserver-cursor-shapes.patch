@@ -1,0 +1,205 @@
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -23,6 +23,7 @@
+ #include "pointer-gestures-unstable-v1-client-protocol.h"
+ static const struct zwp_pointer_gesture_pinch_v1_listener pinchListener;   // (TERM8) below
+ #include "xdg-activation-v1-client-protocol.h"
++#include "cursor-shape-v1-client-protocol.h"
+ #include <CoreGraphics/CGDirectDisplay_siliconforest.h>
+ #include <CoreGraphics/CGWindowLevel.h>
+ #include <CoreFoundation/CFBundle.h>
+@@ -144,6 +145,8 @@
+     struct wl_pointer *pointer;
+     struct zwp_pointer_gestures_v1 *gestures;      // (TERM8) pinches, when the compositor offers them
+     struct zwp_pointer_gesture_pinch_v1 *pinch;
++    struct wp_cursor_shape_manager_v1 *cursorShapes;  // (TERM8) named pointer shapes, when the compositor offers them
++    struct wp_cursor_shape_device_v1 *shapeDevice;
+     struct xkb_context *xkbContext;
+     struct xkb_keymap *xkbKeymap;
+     struct xkb_state *xkbState;
+@@ -549,6 +552,10 @@
+             ws.pinch = zwp_pointer_gestures_v1_get_pinch_gesture(ws.gestures, ws.pointer);
+             zwp_pointer_gesture_pinch_v1_add_listener(ws.pinch, &pinchListener, NULL);
+         }
++    } else if (strcmp(interface, wp_cursor_shape_manager_v1_interface.name) == 0) {
++        ws.cursorShapes = wl_registry_bind(registry, name, &wp_cursor_shape_manager_v1_interface, 1);
++        if (ws.pointer != NULL && ws.shapeDevice == NULL)
++            ws.shapeDevice = wp_cursor_shape_manager_v1_get_pointer(ws.cursorShapes, ws.pointer);
+     } else if (strcmp(interface, wp_viewporter_interface.name) == 0) {
+         ws.viewporter = wl_registry_bind(registry, name, &wp_viewporter_interface, 1);
+     } else if (strcmp(interface, xdg_activation_v1_interface.name) == 0) {
+@@ -1441,6 +1448,10 @@
+     int hidden;
+     uint32_t enterSerial;
+     int inside;
++    /* (TERM8) a named shape the compositor draws (wp_cursor_shape_v1), 0 when the cursor is a buffer: the desk's own
++     * pointer set at the display's scale, the same pointer family over every window, instead of libwayland-cursor's
++     * built-in X11 images stretched to 150 % (DESK7, runs/m1-coord/requests-for-TERM5.md) */
++    uint32_t shape;
+     // an image cursor's own buffer, which the theme does not own
+     struct wl_buffer *imageBuffer;
+     void *imagePixels;
+@@ -1477,16 +1488,113 @@
+     { "frameResizeBottomRightCursor", "se-resize", "bottom_right_corner", NULL },
+ };
+ 
++// (TERM8) the cursor-shape protocol's shape for an NSCursor name or an xcursor name, 0 when it has none
++static const struct { const char *name; uint32_t shape; } cursorShapeNames[] = {
++    { "arrowCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT },
++    { "IBeamCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT },
++    { "IBeamCursorForVerticalLayout", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_VERTICAL_TEXT },
++    { "pointingHandCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER },
++    { "openHandCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRAB },
++    { "closedHandCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRABBING },
++    { "crosshairCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_CROSSHAIR },
++    { "resizeLeftRightCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_EW_RESIZE },
++    { "resizeLeftCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_W_RESIZE },
++    { "resizeRightCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_E_RESIZE },
++    { "resizeUpDownCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NS_RESIZE },
++    { "resizeUpCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_N_RESIZE },
++    { "resizeDownCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_S_RESIZE },
++    { "columnResizeCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_COL_RESIZE },
++    { "rowResizeCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ROW_RESIZE },
++    { "operationNotAllowedCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NOT_ALLOWED },
++    { "dragCopyCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_COPY },
++    { "dragLinkCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ALIAS },
++    { "contextualMenuCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_CONTEXT_MENU },
++    { "busyButClickableCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_PROGRESS },
++    { "zoomInCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ZOOM_IN },
++    { "zoomOutCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ZOOM_OUT },
++    { "frameResizeTopLeftCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NW_RESIZE },
++    { "frameResizeTopRightCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NE_RESIZE },
++    { "frameResizeBottomLeftCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_SW_RESIZE },
++    { "frameResizeBottomRightCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_SE_RESIZE },
++    { "_windowResizeNorthWestSouthEastCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NWSE_RESIZE },
++    { "_windowResizeNorthEastSouthWestCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NESW_RESIZE },
++    { "_windowResizeEastWestCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_EW_RESIZE },
++    { "_windowResizeNorthSouthCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NS_RESIZE },
++    { "_moveCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_MOVE },
++    { "_helpCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_HELP },
++    { "_waitCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_WAIT },
++    { "_crosshairCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_CROSSHAIR },
++    { "_handCursor", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER },
++    // the X11 names AppKit gives the window's resize edges, then the xcursor names, which are the protocol's own
++    { "top_side", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_N_RESIZE },
++    { "bottom_side", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_S_RESIZE },
++    { "left_side", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_W_RESIZE },
++    { "right_side", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_E_RESIZE },
++    { "top_left_corner", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NW_RESIZE },
++    { "top_right_corner", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NE_RESIZE },
++    { "bottom_left_corner", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_SW_RESIZE },
++    { "bottom_right_corner", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_SE_RESIZE },
++    { "left_ptr", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT },
++    { "xterm", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT },
++    { "default", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT },
++    { "context-menu", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_CONTEXT_MENU },
++    { "help", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_HELP },
++    { "pointer", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_POINTER },
++    { "progress", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_PROGRESS },
++    { "wait", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_WAIT },
++    { "cell", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_CELL },
++    { "crosshair", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_CROSSHAIR },
++    { "text", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT },
++    { "vertical-text", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_VERTICAL_TEXT },
++    { "alias", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ALIAS },
++    { "copy", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_COPY },
++    { "move", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_MOVE },
++    { "no-drop", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NO_DROP },
++    { "not-allowed", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NOT_ALLOWED },
++    { "grab", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRAB },
++    { "grabbing", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_GRABBING },
++    { "e-resize", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_E_RESIZE },
++    { "n-resize", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_N_RESIZE },
++    { "ne-resize", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NE_RESIZE },
++    { "nw-resize", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NW_RESIZE },
++    { "s-resize", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_S_RESIZE },
++    { "se-resize", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_SE_RESIZE },
++    { "sw-resize", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_SW_RESIZE },
++    { "w-resize", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_W_RESIZE },
++    { "ew-resize", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_EW_RESIZE },
++    { "ns-resize", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NS_RESIZE },
++    { "nesw-resize", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NESW_RESIZE },
++    { "nwse-resize", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_NWSE_RESIZE },
++    { "col-resize", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_COL_RESIZE },
++    { "row-resize", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ROW_RESIZE },
++    { "all-scroll", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ALL_SCROLL },
++    { "zoom-in", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ZOOM_IN },
++    { "zoom-out", WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_ZOOM_OUT },
++};
++
++static uint32_t cursorShapeFor(const char *name) {
++    for (size_t i = 0; name != NULL && i < sizeof(cursorShapeNames) / sizeof(cursorShapeNames[0]); i++) {
++        if (strcmp(cursorShapeNames[i].name, name) == 0)
++            return cursorShapeNames[i].shape;
++    }
++    return 0;
++}
++
+ // with the lock held: show the current image if the pointer is over one of our surfaces
+ static void cursorApplyLocked(void) {
+     static int trace = -1;  // SF_CURSOR_TRACE=1: each cursor the compositor is given, on standard error
+     if (trace < 0)
+         trace = getenv("SF_CURSOR_TRACE") != NULL;
+     if (trace)
+-        fprintf(stderr, "SF_CURSOR %s inside=%d hidden=%d buffer=%p serial=%u\n", ws.pointer == NULL || !cursor.inside ? "skip" :
+-                (cursor.hidden || cursor.buffer == NULL) ? "none" : "shown", cursor.inside, cursor.hidden, (void *)cursor.buffer, cursor.enterSerial);
++        fprintf(stderr, "SF_CURSOR %s inside=%d hidden=%d buffer=%p shape=%u serial=%u\n", ws.pointer == NULL || !cursor.inside ? "skip" :
++                cursor.hidden ? "none" : (cursor.shape != 0 && ws.shapeDevice != NULL) ? "named" : cursor.buffer == NULL ? "none" : "shown",
++                cursor.inside, cursor.hidden, (void *)cursor.buffer, cursor.shape, cursor.enterSerial);
+     if (ws.pointer == NULL || !cursor.inside)
+         return;
++    if (!cursor.hidden && cursor.shape != 0 && ws.shapeDevice != NULL) {
++        wp_cursor_shape_device_v1_set_shape(ws.shapeDevice, cursor.enterSerial, cursor.shape);
++        return;
++    }
+     if (cursor.hidden || cursor.buffer == NULL) {
+         wl_pointer_set_cursor(ws.pointer, cursor.enterSerial, NULL, 0, 0);
+         return;
+@@ -1539,6 +1647,19 @@
+     if (!ensureConnected())
+         return;
+     pthread_mutex_lock(&cursor.lock);
++    if (ws.shapeDevice != NULL) {
++        // (TERM8) the compositor draws the shape: only a change goes to it
++        uint32_t named = cursorShapeFor(name != NULL ? name : "arrowCursor");
++        if (named == 0)
++            named = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
++        if (named != cursor.shape) {
++            cursor.shape = named;
++            cursorApplyLocked();
++            wl_display_flush(ws.display);
++        }
++        pthread_mutex_unlock(&cursor.lock);
++        return;
++    }
+     shape = cursorLookup(name != NULL ? name : "arrowCursor");
+     if (shape == NULL && name != NULL)
+         shape = cursorLookup("arrowCursor");
+@@ -1587,6 +1708,7 @@
+         close(fd);
+     }
+     if (cursor.imageBuffer != NULL) {
++        cursor.shape = 0;   // an application's own image: its bitmap, not a named shape
+         cursor.buffer = cursor.imageBuffer;
+         cursor.hotX = hotX;
+         cursor.hotY = hotY;
+@@ -1644,7 +1766,9 @@
+     cursor.inside = 1;
+     if (cursor.hidden == 2)
+         cursor.hidden = 0;
+-    if (cursor.buffer == NULL)
++    if (cursor.shape == 0 && ws.shapeDevice != NULL && cursor.buffer == NULL)
++        cursor.shape = WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT;
++    else if (cursor.buffer == NULL && cursor.shape == 0)
+         cursorUseLocked(cursorLookup("arrowCursor"));
+     cursorApplyLocked();
+     pthread_mutex_unlock(&cursor.lock);
+@@ -2282,6 +2406,8 @@
+             ws.pinch = zwp_pointer_gestures_v1_get_pinch_gesture(ws.gestures, ws.pointer);
+             zwp_pointer_gesture_pinch_v1_add_listener(ws.pinch, &pinchListener, NULL);
+         }
++        if (ws.cursorShapes != NULL && ws.shapeDevice == NULL)
++            ws.shapeDevice = wp_cursor_shape_manager_v1_get_pointer(ws.cursorShapes, ws.pointer);
+     }
+ }
+ 

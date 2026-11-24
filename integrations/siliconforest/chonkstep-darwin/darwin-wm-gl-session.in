@@ -1,0 +1,117 @@
+#!/bin/sh
+# Guest side of the GPU desktop session test (SFAgx + SFDcp, sfagx=1 sfdcp=2): one boot that
+# shows an interactive-capable desktop composited on the GPU and presented by page flip.
+#
+# Part A, the real desktop: chonkstep-darwin-desktop (shared shell, both-seat SFHID input,
+# two explicitly requested managed terminals, as darwin-shared-desktop-live-test) with
+# --renderer gl for 110 s. Needs /dev/usb_hid_kbd and /dev/usb_hid_mouse; the script runs the
+# same enumeration helper and endpoint wait as the existing test, without failing on them.
+# Nobody has to be there: CHONKSTEP_DARWIN_AUTOPILOT=1 makes the compositor feed itself raw
+# SFHID keyboard and pointer records (decoded by the device path's own decoder) once a
+# terminal is focused, in phases, about 100 s in all: settle, pointer sweep, title bar drag,
+# typing "echo wmgl" + Enter, a full-screen program in the terminal (vi: it must take the
+# alternate screen, draw its tilde rows, and leave back to the prompt on Escape :q! Enter),
+# scrollback (seq 1 300, ten wheel steps up, Shift+PageUp, wheel down, typing returns to the
+# bottom; both checked from the terminal's own state in <records>/<instance>/term-live.txt:
+# "WMAUTO fullscreen ... result=PASS" and "WMAUTO scrollback ... result=PASS"), clipboard (a
+# word selected by dragging in one terminal, Control+Shift+C, a click on the other terminal,
+# Control+Shift+V: "WMAUTO clipboard ... result=PASS"), brightness (F1, F1, F2, F2 and
+# kern.sf_backlight.brightness read back after each: "WMAUTO brightness ... result=PASS", or
+# SKIPPED with the errno when the collection has no backlight sysctls), idle display sleep
+# (the idle time shortened to 3 s: display off, no frames or flips while off, one key wakes it
+# and is not delivered: "WMAUTO idle ... result=PASS"; "WMPOWER display=off|on" lines), corner resize, a second drag (the size must not change),
+# miniaturize by the title bar button and restore by the miniwindow, the desktop menu by a
+# right-button click and by Control-click, Command-Q and Command-Return, a terminal opened by
+# clicking the menu's Terminal row, and (with the limit set to three for this test) one more
+# such click that must be refused in a notice, not in the menu. These records are
+# compositor-generated and labelled input=synthetic-autopilot: not evidence of a physical
+# keyboard or trackpad, and a right-button record says nothing about what a two-finger click
+# on the real trackpad reports. Keep hands off the machine while it runs: real input is
+# delivered too and would disturb the script.
+# Part B, when the input nodes or the terminal are missing or part A did not come up: the bare
+# compositor (input off) with the GL renderer and the finite SHM test client for 20 s, which
+# still proves client buffer -> texture -> page flip -> frame callback.
+#
+# Lines: "WMSTAT selected renderer=gl output=kms ..." once; per phase "WMSTAT phase=..."
+# (frames, fps, missed_refreshes, steady avg/max composite and present) and "WMAUTO check
+# phase=..." (the GL frame read back against the CPU render of the same scene: differing
+# pixels, max channel difference, hashes; the focused window's title bar: titlebar_hash=,
+# titlebar_colours=, buttons=miniaturize+close decorations=present); one WMAUTO line per phase
+# (drag, type, fullscreen, scrollback, clipboard, brightness, idle, resize, redrag, minimize, menu, chords, menuterm, limit) and "WMAUTO done result=ok|FAILED";
+# WMSTAT every 120
+# frames and a final one, the first with first_frame_* costs; "chonkstep-gl: step:" before each
+# first-time display call; DL10_CLIENT_* from the test client; WMGL3_* from this script.
+# Both new binaries are staged over the RAM root's own /usr/bin/chonkstep-darwin-desktop and
+# /usr/bin/chonkstep-darwin (tools/wm_gl_boot.sh), replacing the old ones.
+# (@SSID@/@PSK@ are unused; the placeholders exist because the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin; export PATH
+case "$nonce" in *[!0-9a-f]*|'') session=000000000000000000000000000000000000000000000001 ;; *) session=$nonce ;; esac
+[ "${#session}" -eq 48 ] || session=000000000000000000000000000000000000000000000001
+runtime=/private/var/run/wm-gl-session
+mkdir -p "$runtime" && chmod 0700 "$runtime"
+export XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=wayland-0
+export XKB_CONFIG_ROOT=/usr/share/X11/xkb TMPDIR=/private/tmp
+export CHONKSTEP_DARWIN_FRAME_STATS=120
+printf '\nWMGL3_BEGIN_%s\n' "$nonce"
+ls -l /dev/dri 2>&1 | head -6
+for f in /usr/bin/chonkstep-darwin-desktop /usr/bin/chonkstep-darwin /usr/bin/chonk-terminal-darwin /usr/bin/darwin-wayland-client /usr/bin/darwin-trackpad-enum /usr/share/darwin-desktop/DejaVuSans.ttf /usr/share/X11/xkb/rules/evdev; do
+    [ -e "$f" ] && s=present || s=MISSING
+    printf 'WMGL3_FILE %s %s\n' "$s" "$f"
+done
+
+# ---- Part A: the shared-shell desktop on GL ----
+a_rc=skipped
+if [ -x /usr/bin/darwin-trackpad-enum ]; then
+    /usr/bin/darwin-trackpad-enum --nonce "$session"
+    printf 'WMGL3_ENUM rc=%s\n' "$?"
+fi
+count=0
+while [ ! -c /dev/usb_hid_kbd ] || [ ! -c /dev/usb_hid_mouse ]; do
+    count=$((count + 1))
+    [ "$count" -le 100 ] || break
+    sleep 0.1
+done
+printf 'WMGL3_ENDPOINT_WAIT missing_checks=%s max_sleeps=100\n' "$count"
+if [ -c /dev/usb_hid_kbd ] && [ -c /dev/usb_hid_mouse ] && [ -x /usr/bin/chonk-terminal-darwin ]; then
+    records=$runtime/session-$session
+    mkdir -m 0700 "$records"
+    printf 'WMGL3_DESKTOP_START renderer=gl seconds=160 terminals=2 input=sfhid+synthetic-autopilot start=%s\n' "$(date +%s)"
+    CHONKSTEP_DARWIN_AUTOPILOT=1 CHONKSTEP_DARWIN_MAX_TERMINALS=3 /usr/bin/chonkstep-darwin-desktop --run --socket "$runtime/wayland-0" --records "$records" --session "$session" --terminal /usr/bin/chonk-terminal-darwin --seconds 160 --font-regular /usr/share/darwin-desktop/DejaVuSans.ttf --font-bold /usr/share/darwin-desktop/DejaVuSans-Bold.ttf --input sfhid --startup-terminals 2 --renderer gl 2>&1
+    a_rc=$?
+    printf 'WMGL3_DESKTOP_RC=%s end=%s\n' "$a_rc" "$(date +%s)"
+    # What each terminal says about itself at the end (its emulator's state line).
+    for f in "$records"/*/term-live.txt; do [ -r "$f" ] && printf 'WMGL3_TERMINAL %s\n' "$(head -1 "$f" | cut -c1-220)"; done
+    printf 'WMGL3_BACKLIGHT %s\n' "$(sysctl kern.sf_backlight 2>&1 | tr '\n' ' ' | cut -c1-200)"
+    printf 'WMGL3_TERMINFO %s\n' "$(ls /usr/share/terminfo/x/xterm-256color /usr/share/terminfo/78/xterm-256color 2>&1 | tr '\n' ' ')"
+    [ -r "$records/session-result.txt" ] && grep -v ' gate=\| kernel_messages=\| cs_at_spawn=\| exit_reason=' "$records/session-result.txt" | cut -c1-260 | sed 's/^/WMGL3_RESULT /' | head -40
+else
+    printf 'WMGL3_DESKTOP_SKIPPED kbd=%s mouse=%s terminal=%s\n' "$([ -c /dev/usb_hid_kbd ] && echo yes || echo no)" "$([ -c /dev/usb_hid_mouse ] && echo yes || echo no)" "$([ -x /usr/bin/chonk-terminal-darwin ] && echo yes || echo no)"
+fi
+
+# ---- Part B: bare compositor on GL with the SHM test client ----
+b_rc=skipped
+if [ "$a_rc" != 0 ] && [ -x /usr/bin/chonkstep-darwin ] && [ -x /usr/bin/darwin-wayland-client ]; then
+    rm -f "$runtime/wayland-0" "$runtime/wayland-0.lock"
+    printf 'WMGL3_BARE_START renderer=gl input=off start=%s\n' "$(date +%s)"
+    CHONKSTEP_DARWIN_RENDERER=gl /usr/bin/chonkstep-darwin --run --socket "$runtime/wayland-0" 2>&1 &
+    compositor=$!
+    count=0
+    while [ ! -S "$runtime/wayland-0" ] && kill -0 "$compositor" 2>/dev/null; do
+        count=$((count + 1))
+        [ "$count" -le 100 ] || break
+        sleep 0.1
+    done
+    if [ -S "$runtime/wayland-0" ]; then
+        /usr/bin/darwin-wayland-client --socket "$runtime/wayland-0" --nonce "$session" --seconds 20 2>&1 | tail -12
+        printf 'WMGL3_CLIENT_DONE end=%s\n' "$(date +%s)"
+    else
+        printf 'WMGL3_BARE_NO_SOCKET\n'
+    fi
+    kill -TERM "$compositor" 2>/dev/null
+    wait "$compositor"
+    b_rc=$?
+    printf 'WMGL3_BARE_RC=%s end=%s\n' "$b_rc" "$(date +%s)"
+fi
+printf 'WMGL3_RESULT desktop=%s bare=%s\n' "$a_rc" "$b_rc"
+printf 'WMGL3_END_%s\n' "$nonce"

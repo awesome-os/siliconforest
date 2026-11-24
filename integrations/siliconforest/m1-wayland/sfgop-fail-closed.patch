@@ -1,0 +1,222 @@
+diff --git a/src/Libraries/SFGOP/SFGOP.c b/src/Libraries/SFGOP/SFGOP.c
+index fdf4354..eae53fb 100644
+--- a/src/Libraries/SFGOP/SFGOP.c
++++ b/src/Libraries/SFGOP/SFGOP.c
+@@ -16,6 +16,21 @@ typedef struct SFGOPPresentRect {
+ 
+ static const char *gSFGOPLastErrorStage = "none";
+ 
++/* One-entry cache so a per-frame present does not repeat the registry
++ * query. Keyed by the service port; SFGOPClose drops it. */
++static mach_port_t gSFGOPKindService = MACH_PORT_NULL;
++static uint32_t gSFGOPKind = kSFGOPServiceUnknown;
++
++/* Callers (C, and Rust bindings built against the original header) rely on
++ * this exact 64-byte layout. The queries below must not grow it. */
++_Static_assert(sizeof(SFGOPFramebuffer) == 64, "SFGOPFramebuffer ABI size");
++_Static_assert(_Alignof(SFGOPFramebuffer) == 8, "SFGOPFramebuffer ABI alignment");
++_Static_assert(__builtin_offsetof(SFGOPFramebuffer, address) == 16, "SFGOPFramebuffer ABI");
++_Static_assert(__builtin_offsetof(SFGOPFramebuffer, size) == 24, "SFGOPFramebuffer ABI");
++_Static_assert(__builtin_offsetof(SFGOPFramebuffer, width) == 32, "SFGOPFramebuffer ABI");
++_Static_assert(__builtin_offsetof(SFGOPFramebuffer, bpp) == 44, "SFGOPFramebuffer ABI");
++_Static_assert(__builtin_offsetof(SFGOPFramebuffer, componentMasks) == 52, "SFGOPFramebuffer ABI");
++
+ #define SFGOP_SET_STAGE(stage) do { gSFGOPLastErrorStage = (stage); } while (0)
+ 
+ typedef uint32_t IODisplayModeID;
+@@ -38,6 +53,33 @@ typedef struct IOPixelInformation {
+     uint32_t reserved[2];
+ } IOPixelInformation;
+ 
++/* Virtio needs a present call per update; every other match is an
++ * IOFramebuffer whose mapped VRAM is the scanout buffer. */
++static uint32_t
++sfgop_service_kind(mach_port_t service)
++{
++    boolean_t virtio = 0;
++#ifdef _SF_IOKITLIB_H
++    if (IOObjectConformsTo(service, "IOVirtIOGPU", &virtio) != KERN_SUCCESS)
++        return kSFGOPServiceUnknown;
++#else
++    virtio = IOObjectConformsTo(service, "IOVirtIOGPU");
++#endif
++    return virtio ? kSFGOPServiceVirtioTransfer : kSFGOPServiceDirectMemory;
++}
++
++static int
++sfgop_geometry_valid(const IOPixelInformation *pi)
++{
++    if (pi->activeWidth == 0 || pi->activeHeight == 0)
++        return 0;
++    if (pi->bitsPerPixel == 0 || pi->bitsPerPixel > 32 || (pi->bitsPerPixel % 8) != 0)
++        return 0;
++    if ((uint64_t)pi->bytesPerRow < (uint64_t)pi->activeWidth * (pi->bitsPerPixel / 8))
++        return 0;
++    return 1;
++}
++
+ kern_return_t
+ SFGOPOpen(SFGOPFramebuffer *fb)
+ {
+@@ -101,6 +143,11 @@ SFGOPOpen(SFGOPFramebuffer *fb)
+         kr = KERN_FAILURE;
+         goto fail;
+     }
++    if (SFGOPGetServiceKind(fb) == kSFGOPServiceUnknown) {
++        SFGOP_SET_STAGE("ServiceKind");
++        kr = KERN_FAILURE;
++        goto fail;
++    }
+ 
+     SFGOP_SET_STAGE("IOServiceOpen");
+     kr = IOServiceOpen(fb->service, mach_task_self(), 0, &fb->connect);
+@@ -111,7 +158,13 @@ SFGOPOpen(SFGOPFramebuffer *fb)
+     SFGOP_SET_STAGE("GetCurrentDisplayMode");
+     kr = IOConnectCallScalarMethod(fb->connect,
+         kIOFBGetCurrentDisplayModeSelector, NULL, 0, scalarOut, &scalarOutCnt);
+-    if (kr != KERN_SUCCESS || scalarOutCnt < 2) {
++    if (kr != KERN_SUCCESS) {
++        goto fail;
++    }
++    if (scalarOutCnt < 2) {
++        /* A short reply must not reach the success return below. */
++        SFGOP_SET_STAGE("GetCurrentDisplayMode:short");
++        kr = KERN_FAILURE;
+         goto fail;
+     }
+ 
+@@ -126,6 +179,16 @@ SFGOPOpen(SFGOPFramebuffer *fb)
+     if (kr != KERN_SUCCESS) {
+         goto fail;
+     }
++    if (pixelInfoSize != sizeof(pixelInfo)) {
++        SFGOP_SET_STAGE("GetPixelInformation:short");
++        kr = KERN_FAILURE;
++        goto fail;
++    }
++    if (!sfgop_geometry_valid(&pixelInfo)) {
++        SFGOP_SET_STAGE("PixelInformation:invalid");
++        kr = KERN_FAILURE;
++        goto fail;
++    }
+ 
+     SFGOP_SET_STAGE("MapVRAM");
+     kr = IOConnectMapMemory64(fb->connect, kIOFBVRAMMemory, mach_task_self(),
+@@ -133,6 +196,12 @@ SFGOPOpen(SFGOPFramebuffer *fb)
+     if (kr != KERN_SUCCESS) {
+         goto fail;
+     }
++    if (fb->address == 0 ||
++        fb->size < (mach_vm_size_t)pixelInfo.bytesPerRow * pixelInfo.activeHeight) {
++        SFGOP_SET_STAGE("MapVRAM:short");
++        kr = KERN_FAILURE;
++        goto fail;
++    }
+ 
+     fb->width = pixelInfo.activeWidth;
+     fb->height = pixelInfo.activeHeight;
+@@ -165,6 +234,10 @@ SFGOPClose(SFGOPFramebuffer *fb)
+         (void)IOServiceClose(fb->connect);
+     }
+     if (fb->service != IO_OBJECT_NULL) {
++        if (fb->service == gSFGOPKindService) {
++            gSFGOPKindService = MACH_PORT_NULL;
++            gSFGOPKind = kSFGOPServiceUnknown;
++        }
+         (void)IOObjectRelease(fb->service);
+     }
+     if (fb->masterPort != MACH_PORT_NULL) {
+@@ -181,6 +254,10 @@ SFGOPPresent(SFGOPFramebuffer *fb, uint32_t x, uint32_t y,
+ 
+     if (fb == NULL || fb->connect == IO_OBJECT_NULL)
+         return KERN_INVALID_ARGUMENT;
++    /* Selector 11 is virtio-gpu's present. On an IOFramebuffer user client
++     * the same number is extSetGammaTable, so never send it there. */
++    if (SFGOPGetServiceKind(fb) != kSFGOPServiceVirtioTransfer)
++        return KERN_NOT_SUPPORTED;
+     rect.x = x;
+     rect.y = y;
+     rect.width = width;
+@@ -189,6 +266,39 @@ SFGOPPresent(SFGOPFramebuffer *fb, uint32_t x, uint32_t y,
+                                       &rect, sizeof(rect), NULL, NULL);
+ }
+ 
++SFGOPPixelFormat
++SFGOPGetPixelFormat(const SFGOPFramebuffer *fb)
++{
++    if (fb == NULL || fb->bpp != 32)
++        return kSFGOPFormatUnknown;
++    if (fb->componentMasks[0] == 0x00ff0000 &&
++        fb->componentMasks[1] == 0x0000ff00 &&
++        fb->componentMasks[2] == 0x000000ff)
++        return kSFGOPFormatXRGB8888;
++    if (fb->componentMasks[0] == 0x3ff00000 &&
++        fb->componentMasks[1] == 0x000ffc00 &&
++        fb->componentMasks[2] == 0x000003ff)
++        return kSFGOPFormatXRGB2101010;
++    return kSFGOPFormatUnknown;
++}
++
++SFGOPServiceKind
++SFGOPGetServiceKind(const SFGOPFramebuffer *fb)
++{
++    uint32_t kind;
++
++    if (fb == NULL || fb->service == IO_OBJECT_NULL)
++        return kSFGOPServiceUnknown;
++    if (fb->service == gSFGOPKindService)
++        return (SFGOPServiceKind)gSFGOPKind;
++    kind = sfgop_service_kind(fb->service);
++    if (kind != kSFGOPServiceUnknown) {
++        gSFGOPKindService = fb->service;
++        gSFGOPKind = kind;
++    }
++    return (SFGOPServiceKind)kind;
++}
++
+ const char *
+ SFGOPLastErrorStage(void)
+ {
+diff --git a/src/Libraries/SFGOP/include/SFGOP.h b/src/Libraries/SFGOP/include/SFGOP.h
+index 55ad55f..af70f82 100644
+--- a/src/Libraries/SFGOP/include/SFGOP.h
++++ b/src/Libraries/SFGOP/include/SFGOP.h
+@@ -24,11 +24,38 @@ typedef struct SFGOPFramebuffer {
+     uint32_t componentMasks[3];
+ } SFGOPFramebuffer;
+ 
++/* How pixels written to the mapped VRAM reach the display. */
++typedef enum SFGOPServiceKind {
++    kSFGOPServiceUnknown = 0,
++    /* IOGOPFramebuffer / IOFramebuffer: the mapped VRAM is the scanout
++     * buffer. There is no transfer step; SFGOPPresent does not apply. */
++    kSFGOPServiceDirectMemory = 1,
++    /* IOVirtIOGPU: VRAM is guest memory; SFGOPPresent transfers a rect. */
++    kSFGOPServiceVirtioTransfer = 2,
++} SFGOPServiceKind;
++
++/* Layout of one 32-bit native pixel word, from bpp and componentMasks. */
++typedef enum SFGOPPixelFormat {
++    kSFGOPFormatUnknown = 0,
++    kSFGOPFormatXRGB8888 = 1,      /* x8 r8 g8 b8 */
++    kSFGOPFormatXRGB2101010 = 2,   /* x2 r10 g10 b10 */
++} SFGOPPixelFormat;
++
++/* Returns KERN_SUCCESS only with a validated, mapped framebuffer: every
++ * driver reply is complete, the geometry is self-consistent and the mapping
++ * covers stride * height bytes. On failure fb is zeroed and
++ * SFGOPLastErrorStage() names the step. */
+ kern_return_t SFGOPOpen(SFGOPFramebuffer *fb);
+ void SFGOPClose(SFGOPFramebuffer *fb);
++/* Transfers a rect to the display for kSFGOPServiceVirtioTransfer only.
++ * Any other service returns KERN_NOT_SUPPORTED without a driver call:
++ * a direct-memory framebuffer has no present step. */
+ kern_return_t SFGOPPresent(SFGOPFramebuffer *fb,
+                            uint32_t x, uint32_t y,
+                            uint32_t width, uint32_t height);
++/* Queries derived from the fields above; the struct layout is unchanged. */
++SFGOPServiceKind SFGOPGetServiceKind(const SFGOPFramebuffer *fb);
++SFGOPPixelFormat SFGOPGetPixelFormat(const SFGOPFramebuffer *fb);
+ const char *SFGOPLastErrorStage(void);
+ 
+ __END_DECLS

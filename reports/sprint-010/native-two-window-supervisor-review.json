@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "INDEPENDENT_READ_ONLY_SOURCE_REVIEW_NO_HARDWARE",
+  "reviewed": {
+    "script": "integrations/puredarwin/m1-desktop-session/darwin-two-window-live-test 6a92a6e4c529f3c8 (frozen in source-validation.json; identical to the copy I read before the freeze)",
+    "tests": "test_two_window_supervisor.py 81f24fbc: 13/13 OK in a scratch copy; 'sh -n' OK",
+    "criteria": "reports/sprint-010/native-two-window-qualification-criteria-001.json (W1-W8, frozen before capture)",
+    "baselines": "passive-child supervisor c361a868 (gating) and live supervisor c06a481f (live structure)"
+  },
+  "verdict": "APPROVE THE STRUCTURE, WITH ONE REQUIRED FIX (TW2). The script is the reviewed passive-child gating prefix (enumeration rc 0/77/else, stat-only wait for both nodes, one identity gate with NOT_READY/FAILED) plus the reviewed live pattern (85 s pause, live records export, no cleanup claim) on the Both seat, launching the existing SSD client and native observer as distinct owned processes. There are no new binaries, input paths or typing prompts. TW1 is a recorded runtime risk that the frozen criteria already handle without assuming an order.",
+  "findings": [
+    {"id": "TW1", "severity": "runtime-risk", "text": "Focus race. The pinned wm-core focuses every newly mapped window (handle_map_request ends with focus_client(id) unless a rule says no focus; manager.rs:2495-2497). The observer latches READY only when its current keyboard focus, PTY, keymap, SSD and first visible frame all hold together (client-terminal-native-startup main.rs:745-756), and a focus leave clears that focus (:226-231). If the SSD window maps after the observer but before the observer's readiness, focus never returns without input. The observer then errors at its 20 s readiness deadline (:669-671), and the script fails at the 85 s kill -0. That fails closed and must be preserved. Launching SSD first makes the favourable order likely, not guaranteed. W3/W5 correctly avoid assuming map order. The qualifier should record observed focus from the frame: decoration requests carry the focused flag (manager.rs:5556) and the scene sets xdg_toplevel Activated (scene.rs:404-406). It should also record READY's presence or absence."},
+    {"id": "TW2", "severity": "required-fix", "text": "'if wait \"$pause\"; then :; else :; fi' ignores a nonzero pause status. A trapped signal during wait already runs 'cleanup 143' and exits, so the else-branch is reached only if the background sleep itself fails. The script would then advance to the live export early with no recorded cause. Refuse it: record the raw status (for example DL18_TWO_WINDOW_FAILED_<n> source=pause rc=N) and exit 1, so the trap reaps all three processes."},
+    {"id": "TW3", "severity": "timing", "text": "From root's T1-002 baseline (command birth +78.2 s, prefix about 1 s): the live export lands around +164-166 s, about 14 s inside the 180 s bound. Both clients run 120 s from about +79 s, so they are alive at the host stop and framebuffer capture (+180-182 s), and neither DL10_CLIENT_DONE nor the observer DONE can precede capture. The STATUS/RETURN/END tail stays unreachable inside the bound, as in live001."},
+    {"id": "TW4", "severity": "qualification", "text": "On the Both seat the pointer starts at (0,0) and the compositor draws its cursor there. A window placed at the workarea origin would have the cursor over its chrome. Only W5's exact frozen cursor bitmap may explain that, as for live001."},
+    {"id": "TW5", "severity": "qualification", "text": "Default placement is Smart (wm-config lib.rs:1095): a zero-overlap search, then a cascade (placement.rs:108-142). An 800x480 SSD window and the terminal should fit without overlap on 2560x1600, but the qualifier must measure actual geometry. Any overlap that hides required body or chrome fails W4 rather than being excused."},
+    {"id": "TW6", "severity": "note", "text": "The SSD client prints one DL10_CLIENT_FRAME line per paint, at most one per 500 ms (desktop002: 127 callbacks), plus DL10_SSD_CONFIGURED. That is fine for console volume, and it causes a full compositor repaint about twice a second during the run."}
+  ],
+  "not_claimed": ["runtime", "focus outcome", "placement outcome", "input", "latency"],
+  "scope": "Read-only script and diff review, wm-core focus/placement and observer readiness source, SSD client markers, scratch test run. No edits, builds or hardware."
+}

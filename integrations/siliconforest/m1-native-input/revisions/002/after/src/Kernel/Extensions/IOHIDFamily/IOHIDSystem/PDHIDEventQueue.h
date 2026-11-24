@@ -1,0 +1,88 @@
+#ifndef _PD_HID_EVENT_QUEUE_H
+#define _PD_HID_EVENT_QUEUE_H
+
+#include <IOKit/IOTypes.h>
+
+/*
+ * The raw event queues behind /dev/usb_hid_kbd and /dev/usb_hid_mouse. Key
+ * events carry USB HID usages whatever the transport, so a PS/2 driver has to
+ * translate its scan codes to usages before pushing here.
+ */
+
+struct PDHIDKbdEvent {
+    UInt32 sequence;
+    UInt8  usage;
+    UInt8  down;
+    UInt8  reserved[2];
+};
+
+struct PDHIDMouseEvent {
+    UInt32 sequence;
+    UInt8  mouseIndex;
+    UInt8  buttons;
+    SInt8  dx;
+    SInt8  dy;
+    SInt8  wheel;
+    UInt8  flags;
+    UInt16 absY;
+};
+
+// an absolute record holds 0..0xffff screen fractions, absY above and absX in the dx/dy bytes
+#define kPDHIDMouseAbsolute 0x01
+
+
+/* Request asynchronous endpoint publication, without generating any event.
+ * Repeated requests are safe. Allocation/devfs failures leave the endpoint
+ * absent; callers must observe devfs readiness rather than infer success from
+ * this void API. Call only from a successfully attached producer's startup,
+ * never from an input callback. Shared queues/callouts have boot lifetime. */
+void PDHIDPublishKeyboardDevice(void);
+void PDHIDPublishMouseDevice(void);
+void PDHIDPublishPS2KeyboardDevice(void);
+void PDHIDPublishPS2MouseDevice(void);
+void PDHIDPushKeyboardEvent(UInt8 usage, bool down);
+
+/* True while a userspace client holds /dev/usb_hid_kbd open. A compositor or
+ * X server reading the raw HID queue is the sole owner of the keyboard for as
+ * long as it runs, so the driver must stop feeding the same keys to the
+ * console keyboard path as well. */
+bool PDHIDKeyboardIsGrabbed(void);
+
+void PDHIDPushMouseEvent(UInt8 mouseIndex, UInt8 buttons, SInt8 dx, SInt8 dy, SInt8 wheel);
+
+// for tablets and other absolute pointers, x and y run 0 to 0xffff across the screen
+void PDHIDPushAbsoluteMouseEvent(UInt8 mouseIndex, UInt8 buttons, UInt16 x, UInt16 y, SInt8 wheel);
+
+/* Claims the next mouseIndex. Shared so a PS/2 and a USB mouse cannot both
+ * report as device 0. */
+UInt8 PDHIDAllocateMouseIndex(void);
+
+/* No ADB keycode corresponds to this usage. */
+#define kPDHIDNoADBCode 0xFF
+
+/*
+ * HID keyboard usage -> ADB keycode for the console path, covering both the
+ * ordinary keys and the 0xE0-0xE7 modifiers.
+ */
+UInt8 PDHIDUsageToADB(UInt8 usage);
+
+// lock LED bits in the HID 1.11 appendix B.1 boot keyboard output report order
+#define kPDHIDLEDNumLock    0x01
+#define kPDHIDLEDCapsLock   0x02
+#define kPDHIDLEDScrollLock 0x04
+
+// Called under the shared LED lock from a thread call. Handlers must not
+// re-enter Register/Unregister or acquire a lock that can call either API.
+// Existing handlers may block; do not add native SPI LED work without a
+// separate bounded-callback/quiescence review. This patch adds no LED handler.
+typedef void (*PDHIDLEDHandler)(void *target, UInt8 leds);
+
+// a keyboard driver registers to have its LEDs follow the kernel's lock state
+bool PDHIDRegisterLEDHandler(PDHIDLEDHandler handler, void *target);
+
+// waits for a running handler call to finish before returning
+void PDHIDUnregisterLEDHandler(PDHIDLEDHandler handler, void *target);
+
+UInt8 PDHIDKeyboardLEDState(void);
+
+#endif

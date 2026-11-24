@@ -1,0 +1,88 @@
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -103,6 +103,7 @@
+ 
+ @interface NSObject(SFFXGPUFrame)
+ -(CFTypeRef)copySFFXRenderedSurface;
++-(BOOL)_sffxExportDamage:(int *)box;
+ @end
+ // (TERM9) the whole-window GPU presenter is asked for only with SFFX_GPU_PRESENT=1 (Firefox's launcher sets it);
+ // the answer and WindowServer's entry are looked up once: every other application never calls it
+@@ -123,6 +124,40 @@
+  return set&&window?set((int)[window windowNumber],(uintptr_t)view,(void *)surface,sx,sy,sw,sh,dx,dy,dw,dh):0;
+ }
+ static void sfSFFXClearGPULayer(NSView *view,NSWindow *window){sfSFFXSetGPULayer(view,window,NULL,0,0,0,0,0,0,0,0);}
++// (FXPERF2) with the rectangle of the surface that differs from the one registered before (x0,y0,x1,y1, surface pixels,
++// rows top-down), so the window server composes and commits only that; the plain call when it does not know it
++typedef int (*sfSFFXSetGPULayerDamagedFn)(int,uintptr_t,void *,double,double,double,double,double,double,double,double,const int *);
++static int sfSFFXSetGPULayerDamaged(NSView *view,NSWindow *window,CFTypeRef surface,const int *damage,
++ double sx,double sy,double sw,double sh,double dx,double dy,double dw,double dh){
++ static sfSFFXSetGPULayerDamagedFn set;
++ static BOOL looked;
++ if(!looked){set=(sfSFFXSetGPULayerDamagedFn)dlsym(RTLD_DEFAULT,"_windowServerSFFXSetGPULayerDamaged");looked=YES;}
++ if(set==NULL||sfSFFXGPUPresenter()==NULL||window==nil)return sfSFFXSetGPULayer(view,window,surface,sx,sy,sw,sh,dx,dy,dw,dh);
++ return set((int)[window windowNumber],(uintptr_t)view,(void *)surface,sx,sy,sw,sh,dx,dy,dw,dh,damage);
++}
++
++// (FXPERF2) whether anything was drawn into a window's own backing store since its last layer-only flush: when not,
++// that flush tells the window server so (it skips comparing the whole backing store with what it uploaded last)
++static char sfSFFXBaseDrawnKey;
++static void sfSFFXNoteBaseDrawn(NSWindow *window){
++ if(window!=nil&&objc_getAssociatedObject(window,&sfSFFXBaseDrawnKey)==nil)
++  objc_setAssociatedObject(window,&sfSFFXBaseDrawnKey,(id)kCFBooleanTrue,OBJC_ASSOCIATION_ASSIGN);
++}
++static void sfSFFXFlushLayersOnly(NSWindow *window){
++ static void (*unchanged)(int);
++ static int looked;
++ if(!looked){
++  const char *gpu=getenv("SFFX_GPU_DAMAGE");
++  unchanged=(gpu&&!strcmp(gpu,"1"))?(void (*)(int))dlsym(RTLD_DEFAULT,"_windowServerSFFXBaseUnchanged"):NULL;
++  looked=1;
++ }
++ BOOL drawn=objc_getAssociatedObject(window,&sfSFFXBaseDrawnKey)!=nil;
++ if(drawn)
++  objc_setAssociatedObject(window,&sfSFFXBaseDrawnKey,nil,OBJC_ASSOCIATION_ASSIGN);
++ if(unchanged!=NULL&&!drawn&&![window isFlushWindowDisabled])
++  unchanged((int)[window windowNumber]);
++ [window flushWindow];
++}
+ 
+ @implementation NSView
+ 
+@@ -1932,7 +1967,7 @@
+    if(_layerContext!=nil && [_layerContext respondsToSelector:@selector(_sfcaTakeNewFrame)] &&
+       ![(id)_layerContext _sfcaTakeNewFrame] && ![[self window] viewsNeedDisplay])
+     return;
+-   [[self window] flushWindow];
++   sfSFFXFlushLayersOnly([self window]);
+ }
+ 
+ // the layer tree renders offscreen, its pixels go into the window over what the views drew
+@@ -1956,7 +1991,9 @@
+       NSRect bounds=[self bounds],visible=[self visibleRect],target=[self convertRect:visible toView:nil];
+       CGFloat scale=[_window backingScaleFactor];
+       CGFloat sy=[self isFlipped]?NSMinY(visible)-NSMinY(bounds):NSMaxY(bounds)-NSMaxY(visible);
+-      BOOL registered=sfSFFXSetGPULayer(self,_window,surface,
++      int damage[4];
++      BOOL partial=[_layerContext respondsToSelector:@selector(_sffxExportDamage:)] && [(id)_layerContext _sffxExportDamage:damage];
++      BOOL registered=sfSFFXSetGPULayerDamaged(self,_window,surface,partial?damage:NULL,
+        (NSMinX(visible)-NSMinX(bounds))*scale,sy*scale,NSWidth(visible)*scale,NSHeight(visible)*scale,
+        NSMinX(target)*scale,(NSHeight([_window frame])-NSMaxY(target))*scale,NSWidth(target)*scale,NSHeight(target)*scale);
+       CFRelease(surface);
+@@ -1969,6 +2006,7 @@
+     return;
+    // a view with a layer draws into a bitmap of its own, so this goes to the window's context directly
+    NSGraphicsContext *windowContext=[[self window] graphicsContext];
++   sfSFFXNoteBaseDrawn([self window]);
+    CGContextRef port=[windowContext graphicsPort];
+    NSRect bounds=[self bounds];
+ 
+@@ -2403,6 +2441,8 @@
+ 
+ -(void)_lockFocusInContext:(NSGraphicsContext *)context {
+     CGContextRef graphicsPort=[context graphicsPort];
++    if(_window!=nil && context==[_window graphicsContext])
++     sfSFFXNoteBaseDrawn(_window);
+     [NSGraphicsContext saveGraphicsState];
+     [NSGraphicsContext setCurrentContext:context];
+     [[context focusStack] addObject:self];

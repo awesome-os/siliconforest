@@ -1,0 +1,412 @@
+--- a/crates/wm-darwin/src/desktop_entry.rs
++++ b/crates/wm-darwin/src/desktop_entry.rs
+@@ -217,6 +217,16 @@
+     )) {
+         return Err("native desktop entry is unsupported on this build".into());
+     }
++    crate::session_signals::with_process_signals(
++        &STOP,
++        stop as *const () as libc::sighandler_t,
++        || run_session(options),
++    )
++}
++
++// The signal scope outlives all device, UI and application owners below. Its
++// checked restoration happens only after this function's cleanup/drop paths.
++fn run_session(options: Options) -> Result<(), String> {
+     let records = PrivateDirectory::open(&options.records).map_err(|e| e.to_string())?;
+     let mut result = records
+         .file("session-result.txt")
+@@ -243,14 +253,6 @@
+     // All path/font/private-log input refusals above precede HID/PDGOP open.
+     let listener = ListeningSocket::bind_absolute(options.socket).map_err(|e| e.to_string())?;
+     let mut display = Display::<Server>::new().map_err(|e| e.to_string())?;
+-    STOP.store(false, Ordering::Relaxed);
+-    unsafe {
+-        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+-            if libc::signal(signal, stop as *const () as libc::sighandler_t) == libc::SIG_ERR {
+-                return Err(std::io::Error::last_os_error().to_string());
+-            }
+-        }
+-    }
+     let mut input = NativeHid::open()?;
+     let mut presenter = Pdgop::open()?;
+     let mut server = Server::new_with_fonts(&display.handle(), presenter.size(), fonts.clone())?;
+--- a/crates/wm-darwin/src/lib.rs
++++ b/crates/wm-darwin/src/lib.rs
+@@ -16,4 +16,6 @@
+ pub mod server;
+ #[cfg(feature = "desktop-shell")]
+ pub mod session_entry;
++#[cfg(feature = "desktop-shell")]
++mod session_signals;
+ pub mod terminal_launch;
+--- /dev/null
++++ b/crates/wm-darwin/src/session_signals.rs
+@@ -0,0 +1,366 @@
++//! Process-global signal policy for the single native entry. No app is spawned
++//! here. Other code must not concurrently replace these dispositions. The
++//! entry guard excludes only another invocation of our own managed session.
++use std::{
++    panic::{catch_unwind, AssertUnwindSafe},
++    sync::atomic::{AtomicBool, Ordering},
++};
++
++static ACTIVE: AtomicBool = AtomicBool::new(false);
++static POISONED: AtomicBool = AtomicBool::new(false);
++
++trait SignalOps {
++    type Saved;
++    fn replace(&mut self, signal: i32, handler: libc::sighandler_t) -> Result<Self::Saved, i32>;
++    fn restore(&mut self, signal: i32, saved: &Self::Saved) -> Result<(), i32>;
++}
++struct UnixSignals;
++fn new_action(signal: i32, handler: libc::sighandler_t) -> Result<libc::sigaction, i32> {
++    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
++    action.sa_sigaction = handler;
++    action.sa_flags = 0;
++    if matches!(signal, libc::SIGINT | libc::SIGTERM | libc::SIGHUP) {
++        // Preserve the ordinary restart behavior of the previous signal()
++        // stop handlers; SIGCHLD's autoreap flags remain explicitly clear.
++        action.sa_flags = libc::SA_RESTART;
++    }
++    if unsafe { libc::sigemptyset(&mut action.sa_mask) } != 0 {
++        return Err(std::io::Error::last_os_error()
++            .raw_os_error()
++            .unwrap_or(libc::EIO));
++    }
++    Ok(action)
++}
++impl SignalOps for UnixSignals {
++    type Saved = libc::sigaction;
++    fn replace(&mut self, signal: i32, handler: libc::sighandler_t) -> Result<Self::Saved, i32> {
++        // Use sigaction rather than signal: in particular SIGCHLD must clear
++        // an inherited SA_NOCLDWAIT as well as SIG_IGN. Save the entire old
++        // action, including flags and handler mask, for exact restoration.
++        let action = new_action(signal, handler)?;
++        let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
++        if unsafe { libc::sigaction(signal, &action, &mut old) } != 0 {
++            return Err(std::io::Error::last_os_error()
++                .raw_os_error()
++                .unwrap_or(libc::EIO));
++        }
++        Ok(old)
++    }
++    fn restore(&mut self, signal: i32, old: &Self::Saved) -> Result<(), i32> {
++        if unsafe { libc::sigaction(signal, old, std::ptr::null_mut()) } != 0 {
++            return Err(std::io::Error::last_os_error()
++                .raw_os_error()
++                .unwrap_or(libc::EIO));
++        }
++        Ok(())
++    }
++}
++
++#[derive(Debug)]
++struct Failure {
++    setup: Option<(i32, i32)>,
++    restore: Vec<(i32, i32)>,
++    body: Option<String>,
++    panicked: bool,
++}
++impl Failure {
++    fn message(&self) -> String {
++        format!(
++            "managed signal scope failed: setup={:?} restore={:?} body={:?} body_panicked={}",
++            self.setup, self.restore, self.body, self.panicked
++        )
++    }
++}
++fn restore_all<O: SignalOps>(ops: &mut O, saved: &mut Vec<(i32, O::Saved)>) -> Vec<(i32, i32)> {
++    let mut errors = vec![];
++    while let Some((signal, action)) = saved.pop() {
++        // Every saved action gets one restoration attempt, even after a prior
++        // failure. No blind retry or successful-restoration claim on error.
++        if let Err(error) = ops.restore(signal, &action) {
++            errors.push((signal, error));
++        }
++    }
++    errors
++}
++fn checked_scope<T, O: SignalOps>(
++    ops: &mut O,
++    stop: libc::sighandler_t,
++    body: impl FnOnce() -> Result<T, String>,
++) -> Result<T, Failure> {
++    let mut saved = Vec::with_capacity(5);
++    for (signal, handler) in [
++        (libc::SIGPIPE, libc::SIG_IGN),
++        (libc::SIGCHLD, libc::SIG_DFL),
++        (libc::SIGINT, stop),
++        (libc::SIGTERM, stop),
++        (libc::SIGHUP, stop),
++    ] {
++        match ops.replace(signal, handler) {
++            Ok(action) => saved.push((signal, action)),
++            Err(error) => {
++                return Err(Failure {
++                    setup: Some((signal, error)),
++                    restore: restore_all(ops, &mut saved),
++                    body: None,
++                    panicked: false,
++                })
++            }
++        }
++    }
++    // This outer boundary only restores dispositions after an unwind. The
++    // inner frame coordinator owns app cleanup; an unwind outside it is a
++    // failed/incomplete session, never an invented app/PTY cleanup result.
++    let result = catch_unwind(AssertUnwindSafe(body));
++    let restore = restore_all(ops, &mut saved);
++    match result {
++        Ok(Ok(value)) if restore.is_empty() => Ok(value),
++        result => Err(Failure {
++            setup: None,
++            restore,
++            body: match &result {
++                Ok(Err(error)) => Some(error.clone()),
++                _ => None,
++            },
++            panicked: result.is_err(),
++        }),
++    }
++}
++
++struct EntryClaim<'a> {
++    active: &'a AtomicBool,
++}
++impl<'a> EntryClaim<'a> {
++    fn new(active: &'a AtomicBool, poisoned: &AtomicBool) -> Result<Self, String> {
++        if active
++            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
++            .is_err()
++        {
++            return Err("another managed entry owns process signal dispositions".into());
++        }
++        let claim = Self { active };
++        if poisoned.load(Ordering::Acquire) {
++            return Err(
++                "previous signal restoration failed; process cannot start another session".into(),
++            );
++        }
++        Ok(claim)
++    }
++}
++impl Drop for EntryClaim<'_> {
++    fn drop(&mut self) {
++        self.active.store(false, Ordering::Release);
++    }
++}
++
++pub(crate) fn with_process_signals<T>(
++    stop_flag: &AtomicBool,
++    stop: libc::sighandler_t,
++    body: impl FnOnce() -> Result<T, String>,
++) -> Result<T, String> {
++    let _claim = EntryClaim::new(&ACTIVE, &POISONED)?;
++    stop_flag.store(false, Ordering::Relaxed);
++    checked_scope(&mut UnixSignals, stop, body).map_err(|failure| {
++        if !failure.restore.is_empty() {
++            POISONED.store(true, Ordering::Release);
++        }
++        failure.message()
++    })
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::{cell::Cell, collections::BTreeMap};
++    #[test]
++    fn real_action_builder_clears_autoreap_and_handler_mask_without_global_changes() {
++        for handler in [libc::SIG_DFL, libc::SIG_IGN] {
++            let action = new_action(libc::SIGCHLD, handler).unwrap();
++            assert_eq!(action.sa_sigaction, handler);
++            assert_eq!(action.sa_flags, 0);
++            for signal in [
++                libc::SIGPIPE,
++                libc::SIGCHLD,
++                libc::SIGINT,
++                libc::SIGTERM,
++                libc::SIGHUP,
++                libc::SIGUSR1,
++            ] {
++                assert_eq!(unsafe { libc::sigismember(&action.sa_mask, signal) }, 0);
++            }
++        }
++        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
++            let action = new_action(signal, 42).unwrap();
++            assert_eq!(action.sa_flags, libc::SA_RESTART);
++        }
++    }
++    #[derive(Clone, Debug, PartialEq, Eq)]
++    struct Action {
++        handler: usize,
++        flags: i32,
++        mask: u64,
++    }
++    struct Fake {
++        actions: BTreeMap<i32, Action>,
++        original: BTreeMap<i32, Action>,
++        calls: Vec<(bool, i32, usize)>,
++        fail_setup: Option<usize>,
++        fail_restore: Option<i32>,
++        setup_calls: usize,
++    }
++    impl Fake {
++        fn new() -> Self {
++            let actions = [
++                libc::SIGPIPE,
++                libc::SIGCHLD,
++                libc::SIGINT,
++                libc::SIGTERM,
++                libc::SIGHUP,
++            ]
++            .into_iter()
++            .map(|s| {
++                (
++                    s,
++                    Action {
++                        handler: libc::SIG_IGN,
++                        flags: 0x1234,
++                        mask: s as u64,
++                    },
++                )
++            })
++            .collect::<BTreeMap<_, _>>();
++            Self {
++                original: actions.clone(),
++                actions,
++                calls: vec![],
++                fail_setup: None,
++                fail_restore: None,
++                setup_calls: 0,
++            }
++        }
++    }
++    impl SignalOps for Fake {
++        type Saved = Action;
++        fn replace(&mut self, signal: i32, handler: usize) -> Result<Action, i32> {
++            let index = self.setup_calls;
++            self.setup_calls += 1;
++            self.calls.push((true, signal, handler));
++            if self.fail_setup == Some(index) {
++                return Err(libc::EINVAL);
++            }
++            Ok(self
++                .actions
++                .insert(
++                    signal,
++                    Action {
++                        handler,
++                        flags: 0,
++                        mask: 0,
++                    },
++                )
++                .unwrap())
++        }
++        fn restore(&mut self, signal: i32, saved: &Action) -> Result<(), i32> {
++            self.calls.push((false, signal, saved.handler));
++            if self.fail_restore == Some(signal) {
++                return Err(libc::EIO);
++            }
++            self.actions.insert(signal, saved.clone());
++            Ok(())
++        }
++    }
++    #[test]
++    fn policy_precedes_body_and_restores_full_actions_in_reverse_order() {
++        let mut ops = Fake::new();
++        assert_eq!(checked_scope(&mut ops, 42, || Ok(7)).unwrap(), 7);
++        assert_eq!(ops.actions, ops.original);
++        assert_eq!(
++            &ops.calls[..5],
++            &[
++                (true, libc::SIGPIPE, libc::SIG_IGN),
++                (true, libc::SIGCHLD, libc::SIG_DFL),
++                (true, libc::SIGINT, 42),
++                (true, libc::SIGTERM, 42),
++                (true, libc::SIGHUP, 42)
++            ]
++        );
++        let restored: Vec<_> = ops.calls[5..].iter().map(|v| v.1).collect();
++        assert_eq!(
++            restored,
++            [
++                libc::SIGHUP,
++                libc::SIGTERM,
++                libc::SIGINT,
++                libc::SIGCHLD,
++                libc::SIGPIPE
++            ]
++        );
++    }
++    #[test]
++    fn every_setup_failure_rolls_back_and_never_enters_device_or_spawn_body() {
++        for failed in 0..5 {
++            let mut ops = Fake::new();
++            ops.fail_setup = Some(failed);
++            let called = Cell::new(false);
++            let error = checked_scope(&mut ops, 42, || {
++                called.set(true);
++                Ok(())
++            })
++            .unwrap_err();
++            assert!(!called.get());
++            assert!(error.setup.is_some());
++            assert!(error.restore.is_empty());
++            assert_eq!(ops.actions, ops.original);
++            assert_eq!(ops.calls.iter().filter(|c| !c.0).count(), failed);
++        }
++    }
++    #[test]
++    fn body_error_and_panic_restore_without_claiming_owned_process_cleanup() {
++        let mut ops = Fake::new();
++        let error = checked_scope::<(), _>(&mut ops, 42, || Err("actual session failed".into()))
++            .unwrap_err();
++        assert_eq!(error.body.as_deref(), Some("actual session failed"));
++        assert!(!error.panicked);
++        assert_eq!(ops.actions, ops.original);
++        let error =
++            checked_scope::<(), _>(&mut ops, 42, || panic!("outside frame cleanup")).unwrap_err();
++        assert!(error.panicked);
++        assert_eq!(ops.actions, ops.original);
++        assert!(!error.message().contains("cleanup=Complete"));
++    }
++    #[test]
++    fn every_restore_failure_disqualifies_success_and_does_not_skip_other_restores() {
++        for signal in [
++            libc::SIGPIPE,
++            libc::SIGCHLD,
++            libc::SIGINT,
++            libc::SIGTERM,
++            libc::SIGHUP,
++        ] {
++            let mut ops = Fake::new();
++            ops.fail_restore = Some(signal);
++            let error = checked_scope(&mut ops, 42, || Ok(())).unwrap_err();
++            assert_eq!(error.restore, [(signal, libc::EIO)]);
++            assert_eq!(ops.calls.iter().filter(|c| !c.0).count(), 5);
++        }
++        let mut ops = Fake::new();
++        ops.fail_setup = Some(2);
++        ops.fail_restore = Some(libc::SIGPIPE);
++        let error = checked_scope(&mut ops, 42, || Ok(())).unwrap_err();
++        assert!(error.setup.is_some());
++        assert_eq!(error.restore, [(libc::SIGPIPE, libc::EIO)]);
++    }
++    #[test]
++    fn shared_process_entry_is_exclusive_and_restore_failure_is_sticky() {
++        // Local atomics only: tests never change the harness's global signals.
++        let active = AtomicBool::new(false);
++        let poisoned = AtomicBool::new(false);
++        let first = EntryClaim::new(&active, &poisoned).unwrap();
++        assert!(EntryClaim::new(&active, &poisoned).is_err());
++        drop(first);
++        let next = EntryClaim::new(&active, &poisoned).unwrap();
++        poisoned.store(true, Ordering::Release);
++        drop(next);
++        assert!(EntryClaim::new(&active, &poisoned).is_err());
++        assert!(!active.load(Ordering::Acquire));
++    }
++}

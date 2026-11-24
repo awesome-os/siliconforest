@@ -1,0 +1,298 @@
+diff --git a/crates/wm-darwin/src/displays.rs b/crates/wm-darwin/src/displays.rs
+index 978e8cb..17d45e0 100644
+--- a/crates/wm-darwin/src/displays.rs
++++ b/crates/wm-darwin/src/displays.rs
+@@ -74,6 +74,9 @@ impl Server {
+             .collect();
+         // the renderer first: an output it cannot drive is not given windows
+         self.renderer.set_outputs(outputs)?;
++        // the wallpaper on the other outputs (DESK6)
++        let externals: Vec<wm_core::Rect> = outputs.iter().filter(|o| o.kind != OutputKind::Internal).map(|o| o.rect).collect();
++        self.wm.backend_mut().set_external_rects(externals);
+         let departed: Vec<MonitorInfo> = before.iter().filter(|m| !monitors.iter().any(|n| n.name == m.name)).cloned().collect();
+         let added: Vec<String> = monitors.iter().filter(|m| !before.iter().any(|b| b.name == m.name)).map(|m| m.name.clone()).collect();
+         self.wm.backend_mut().set_outputs(monitors.clone());
+diff --git a/crates/wm-darwin/src/glrender.rs b/crates/wm-darwin/src/glrender.rs
+index f040161..7d16e26 100644
+--- a/crates/wm-darwin/src/glrender.rs
++++ b/crates/wm-darwin/src/glrender.rs
+@@ -823,7 +823,7 @@ impl GlRenderer {
+             }
+             let key = TextureKey { item: sig.key, part: 0 };
+             match op {
+-                DrawOp::Background { color, image } => {
++                DrawOp::Background { color, image, outputs } => {
+                     unsafe {
+                         let gl = &self.libs.gl;
+                         (gl.glClearColor)(f32::from(color[0]) / 255.0, f32::from(color[1]) / 255.0, f32::from(color[2]) / 255.0, 1.0);
+@@ -832,6 +832,11 @@ impl GlRenderer {
+                     if let Some(image) = image {
+                         self.draw_image(key, Point::new(0, 0), image, sig.generation, None, screen);
+                     }
++                    // the wallpaper fitted to each other output (DESK6)
++                    for (index, (rect, image)) in outputs.iter().enumerate() {
++                        let key = TextureKey { item: sig.key, part: index as u32 + 1 };
++                        self.draw_image(key, rect.pos, image, sig.generation, None, screen);
++                    }
+                 }
+                 DrawOp::External { pos, buffer } => self.draw_external(*pos, *buffer, screen),
+                 DrawOp::Image { pos, image } => {
+diff --git a/crates/wm-darwin/src/render.rs b/crates/wm-darwin/src/render.rs
+index 17c0092..a2dc779 100644
+--- a/crates/wm-darwin/src/render.rs
++++ b/crates/wm-darwin/src/render.rs
+@@ -535,11 +535,14 @@ fn draw_items(target: &mut tiny_skia::PixmapMut<'_>, list: &[(ItemSig, DrawOp<'_
+             continue;
+         }
+         match op {
+-            DrawOp::Background { color, image } => {
++            DrawOp::Background { color, image, outputs } => {
+                 target.fill(tiny_skia::Color::from_rgba8(color[0], color[1], color[2], 255));
+                 if let Some(image) = image {
+                     draw(target, Point::new(0, 0), image);
+                 }
++                for (rect, image) in outputs.iter() {
++                    draw(target, rect.pos, image);
++                }
+             }
+             DrawOp::Image { pos, image } => draw(target, *pos, image),
+             // GPU memory of a client: only a GPU renderer can show it, and
+@@ -812,7 +815,7 @@ mod tests {
+             vec![
+                 (
+                     ItemSig { key: crate::damage::ItemKey::Background, rect: DRect::from_xywh(0, 0, W, H), generation: 0 },
+-                    DrawOp::Background { color: [10, 20, 30], image: None },
++                    DrawOp::Background { color: [10, 20, 30], image: None, outputs: &[] },
+                 ),
+                 (
+                     ItemSig { key: crate::damage::ItemKey::Decoration(1), rect: DRect::from_xywh(-100, -100, 400, 400), generation: 0 },
+diff --git a/crates/wm-darwin/src/scene.rs b/crates/wm-darwin/src/scene.rs
+index b236d56..dc3907a 100644
+--- a/crates/wm-darwin/src/scene.rs
++++ b/crates/wm-darwin/src/scene.rs
+@@ -114,7 +114,9 @@ pub struct ExternalBuffer {
+ pub(crate) enum DrawOp<'a> {
+     /// A client dma-buf, drawn like an image at `pos`.
+     External { pos: Point, buffer: ExternalBuffer },
+-    Background { color: [u8; 3], image: Option<&'a DecorationBuffer> },
++    /// The desk's colour, its wallpaper at the panel's origin, and the wallpaper fitted to each
++    /// other output's rectangle (DESK6: before, an external display showed the colour alone).
++    Background { color: [u8; 3], image: Option<&'a DecorationBuffer>, outputs: &'a [(Rect, DecorationBuffer)] },
+     Image { pos: Point, image: &'a DecorationBuffer },
+     Decoration { pos: Point, surface: &'a DecorationSurface },
+ }
+@@ -147,6 +149,9 @@ pub struct CpuBackend {
+     next_id: u64,
+     background: [u8; 3],
+     background_image: Option<DecorationBuffer>,
++    /// The other outputs' rectangles in the scene and the wallpaper fitted to each (DESK6).
++    external_rects: Vec<Rect>,
++    output_backgrounds: Vec<(Rect, DecorationBuffer)>,
+     pub dirty: bool,
+     pub(crate) input_enabled: bool,
+     pub(crate) pointer: Point,
+@@ -198,6 +203,8 @@ impl CpuBackend {
+             next_id: 1,
+             background: [56, 72, 80],
+             background_image: None,
++            external_rects: Vec::new(),
++            output_backgrounds: Vec::new(),
+             dirty: true,
+             input_enabled: false, pointer: Point::new(0,0), cursor: None,
+             cursor_generation: 0, background_generation: 0, next_generation: 1,
+@@ -434,7 +441,7 @@ impl CpuBackend {
+                 rect: DRect::from_xywh(0, 0, size.w, size.h),
+                 generation: self.background_generation,
+             },
+-            DrawOp::Background { color: self.background, image: self.background_image.as_ref() },
++            DrawOp::Background { color: self.background, image: self.background_image.as_ref(), outputs: &self.output_backgrounds },
+         ));
+         let owned = |list: &mut Vec<(ItemSig, DrawOp<'a>)>, window: u64, shift: i32| {
+             for id in &self.shell_stack {
+@@ -850,6 +857,27 @@ impl CpuBackend {
+         let Some(index) = self.stack.iter().position(|id| *id == window) else { return true };
+         !self.stack[index + 1..].iter().any(|id| self.visible(*id) && self.window_frame_rect(*id).is_some_and(inside))
+     }
++    /// The other outputs (an external display), in scene coordinates: each gets the wallpaper
++    /// fitted to it (DESK6).
++    pub(crate) fn set_external_rects(&mut self, rects: Vec<Rect>) {
++        if rects != self.external_rects {
++            self.external_rects = rects;
++            self.fit_output_backgrounds();
++            self.background_generation = self.generation();
++            self.dirty = true;
++        }
++    }
++    /// The wallpaper (made for the panel) scaled to cover each other output, its middle kept and
++    /// the overhang cut (as a desktop picture fills a screen of another shape).
++    fn fit_output_backgrounds(&mut self) {
++        self.output_backgrounds.clear();
++        let Some(image) = self.background_image.as_ref() else { return };
++        for rect in &self.external_rects {
++            if let Some(fitted) = cover(image, rect.size.w, rect.size.h) {
++                self.output_backgrounds.push((*rect, fitted));
++            }
++        }
++    }
+     /// The desk's own surfaces (popups, layer surfaces, panels) bottom to top, one line each
+     /// (the inject module's `dump`).
+     #[cfg(feature = "test-inject")]
+@@ -1283,15 +1311,34 @@ impl Backend for CpuBackend {
+         self.background = [rgb.0, rgb.1, rgb.2];
+         self.background_image = None;
+         self.background_generation = self.generation();
++        self.fit_output_backgrounds();
+         self.dirty = true;
+     }
+     fn paint_root_image(&mut self, p: &DecorationBuffer) {
+         self.background_image = Some(p.clone());
+         self.background_generation = self.generation();
++        self.fit_output_backgrounds();
+         self.dirty = true;
+     }
+ }
+ 
++/// `image` scaled to cover `width` x `height`, centred, the overhang cut.
++pub(crate) fn cover(image: &DecorationBuffer, width: u32, height: u32) -> Option<DecorationBuffer> {
++    if image.width == 0 || image.height == 0 || width == 0 || height == 0 || image.pixels.len() != image.width as usize * image.height as usize * 4 {
++        return None;
++    }
++    // the part of the image with the target's shape
++    let (iw, ih) = (u64::from(image.width), u64::from(image.height));
++    let (cw, ch) = if iw * u64::from(height) > ih * u64::from(width) { ((ih * u64::from(width) / u64::from(height)).max(1), ih) } else { (iw, (iw * u64::from(height) / u64::from(width)).max(1)) };
++    let (x0, y0) = ((iw - cw) / 2, (ih - ch) / 2);
++    let mut pixels = Vec::with_capacity(cw as usize * ch as usize * 4);
++    for y in y0..y0 + ch {
++        let row = (y * iw + x0) as usize * 4;
++        pixels.extend_from_slice(&image.pixels[row..row + cw as usize * 4]);
++    }
++    crate::pixels::resample(&DecorationBuffer { width: cw as u32, height: ch as u32, pixels }, width, height).ok()
++}
++
+ impl wm_theme_api::PopupHost for CpuBackend {
+     type PopupId=u64;
+     fn create_popup(&mut self,geometry:Rect,background:(u8,u8,u8))->Option<u64>{
+@@ -1314,3 +1361,39 @@ impl wm_theme_api::PopupHost for CpuBackend {
+     fn grab_keyboard(&mut self){Backend::grab_keyboard(self);}
+     fn ungrab_keyboard(&mut self){Backend::ungrab_keyboard(self);}
+ }
++
++#[cfg(test)]
++mod output_background_tests {
++    use super::*;
++    /// DESK6 (second display): the wallpaper is fitted to an external output - scaled to cover
++    /// it, the middle kept - and drawn at the output's place in the scene; the colour alone there before.
++    #[test]
++    fn an_external_output_gets_the_wallpaper_fitted_to_its_shape() {
++        // a 16:10 picture: left half red, right half blue, a green stripe across the middle rows
++        let (w, h) = (160u32, 100u32);
++        let mut pixels = Vec::new();
++        for y in 0..h {
++            for x in 0..w {
++                pixels.extend_from_slice(&if (45..55).contains(&y) { [0, 255, 0, 255] } else if x < w / 2 { [255, 0, 0, 255] } else { [0, 0, 255, 255] });
++            }
++        }
++        let image = DecorationBuffer { width: w, height: h, pixels };
++        // 16:9 target: the picture's top and bottom rows are cut, it is scaled to the full width
++        let fitted = cover(&image, 320, 180).unwrap();
++        assert_eq!((fitted.width, fitted.height), (320, 180));
++        let at = |x: u32, y: u32| { let i = (y * 320 + x) as usize * 4; [fitted.pixels[i], fitted.pixels[i + 1], fitted.pixels[i + 2]] };
++        assert_eq!(at(10, 10), [255, 0, 0]);
++        assert_eq!(at(310, 10), [0, 0, 255]);
++        assert_eq!(at(10, 90), [0, 255, 0], "the middle stays in the middle");
++        let mut scene = CpuBackend::new(Size::new(160, 100)).unwrap();
++        wm_core::Backend::paint_root_image(&mut scene, &image);
++        let external = Rect::new(Point::new(160, 0), Size::new(320, 180));
++        scene.set_external_rects(vec![external]);
++        let list = scene.display_list();
++        let outputs = list.iter().find_map(|(_, op)| match op { DrawOp::Background { outputs, .. } => Some(outputs.len()), _ => None });
++        assert_eq!(outputs, Some(1), "the wallpaper for the external output is in the display list");
++        assert_eq!(scene.output_backgrounds[0].0, external);
++        scene.set_external_rects(Vec::new());
++        assert!(scene.output_backgrounds.is_empty(), "unplugged: no picture kept for it");
++    }
++}
+diff --git a/crates/wm-darwin/src/server.rs b/crates/wm-darwin/src/server.rs
+index aeab0a9..a6a0a09 100644
+--- a/crates/wm-darwin/src/server.rs
++++ b/crates/wm-darwin/src/server.rs
+@@ -171,7 +171,8 @@ pub struct Server {
+     /// and the blank it aims at (DESK5).
+     commit_due: Option<(std::time::Instant, Option<std::time::Instant>)>,
+     /// The last moments before a commit are waited for in the real-time scheduling class (DESK6;
+-    /// `CHONKSTEP_DARWIN_PRECISE_WAIT=0` or inject `precise off` turns it off).
++    /// off by default: measured on the M1 it did not lower the missed blanks, see SF-Z;
++    /// `CHONKSTEP_DARWIN_PRECISE_WAIT=1` or inject `precise on` turns it on).
+     pub(crate) precise_wait: bool,
+     /// The pointer's plane may be used (the test instrument's `cursorplane on|off`).
+     pub(crate) cursor_plane_allowed: bool,
+@@ -359,7 +360,7 @@ impl Server {
+             pacer: crate::input_latency::FramePacer::new(false),
+             render_due: None,
+             commit_due: None,
+-            precise_wait: std::env::var("CHONKSTEP_DARWIN_PRECISE_WAIT").map_or(true, |v| v != "0"),
++            precise_wait: std::env::var("CHONKSTEP_DARWIN_PRECISE_WAIT").is_ok_and(|v| v == "1"),
+             cursor_plane_allowed: true,
+             staged_drag_pointer: None,
+             input_wake: None,
+diff --git a/dock/crates/chonk-dock/src/launchdock.rs b/dock/crates/chonk-dock/src/launchdock.rs
+index 9e6af5e..b9a2380 100644
+--- a/dock/crates/chonk-dock/src/launchdock.rs
++++ b/dock/crates/chonk-dock/src/launchdock.rs
+@@ -1035,6 +1035,7 @@ pub fn write_defaults_if_empty(path: &Path, defaults: &[String]) -> bool {
+ /// Writes the pins as one desktop-file id per line — the whole
+ /// persistence format, human-editable on purpose like the theme and
+ /// wallpaper files beside it.
++#[cfg_attr(not(test), allow(dead_code))]
+ fn save_pins(path: &Path, pins: &[AppEntry]) -> std::io::Result<()> {
+     save_ids(path, &pins.iter().map(|pin| pin.id.as_str()).collect::<Vec<_>>())
+ }
+diff --git a/dock/crates/chonk-dock/src/wayland.rs b/dock/crates/chonk-dock/src/wayland.rs
+index 1e19d7f..be8ef77 100644
+--- a/dock/crates/chonk-dock/src/wayland.rs
++++ b/dock/crates/chonk-dock/src/wayland.rs
+@@ -148,7 +148,30 @@ impl Wayland {
+             .and_then(|id| self.outputs.get(&id))
+             .map_or(1, |o| o.scale.max(1))
+     }
++    /// Panel pixels per logical unit: the output's mode over its logical size (1.5 or 1.8 on
++    /// SiliconForest at a fractional scale), else its whole scale.
++    fn factor(&self) -> f64 {
++        self.output
++            .and_then(|id| self.outputs.get(&id))
++            .map_or(1.0, |o| match o.logical {
++                Some(logical) if logical.w > 0 && o.width > 0 => {
++                    f64::from(if o.rotated { o.height } else { o.width }) / f64::from(logical.w)
++                }
++                _ => f64::from(o.scale.max(1)),
++            })
++    }
+     pub fn screen(&self) -> Rect {
++        // SiliconForest (DESK6): the dock's coordinates are the panel's pixels - where the
++        // compositor gives the pointer (surface units of the whole buffer scale) - so the screen is
++        // the mode's pixels, and margins are converted with the fractional factor (below). Before,
++        // logical x whole scale (3413 wide at 150 %) put everything placed by a margin (the name
++        // beside a tile, a tile dragged, its "Remove" label) at 3/4 of where the pointer was.
++        if cfg!(target_os = "macos") {
++            if let Some(o) = self.output.and_then(|id| self.outputs.get(&id)).filter(|o| o.logical.is_some() && o.width > 0) {
++                let size = if o.rotated { Size::new(o.height, o.width) } else { Size::new(o.width, o.height) };
++                return Rect { pos: Point::new(0, 0), size };
++            }
++        }
+         let size = self
+             .output
+             .and_then(|id| self.outputs.get(&id))
+@@ -224,7 +247,12 @@ impl Wayland {
+                 rect.size.h.div_ceil(scale as u32),
+             );
+             layer.set_exclusive_zone(-1);
+-            layer.set_margin(rect.pos.y / scale, 0, 0, rect.pos.x / scale);
++            if cfg!(target_os = "macos") {
++                let f = self.factor();
++                layer.set_margin((f64::from(rect.pos.y) / f).round() as i32, 0, 0, (f64::from(rect.pos.x) / f).round() as i32);
++            } else {
++                layer.set_margin(rect.pos.y / scale, 0, 0, rect.pos.x / scale);
++            }
+         }
+         layer.set_keyboard_interactivity(if surface.role == Role::Dock && self.keyboard_panels {
+             layer::KeyboardInteractivity::Exclusive

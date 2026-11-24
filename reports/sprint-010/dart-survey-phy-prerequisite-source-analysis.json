@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SOURCE_CHALLENGE_NO_HARDWARE_NO_CHANGE",
+  "question": "In dart-survey attempt 001 the four PMGR guards passed but the PHY guard failed (reset asserted / clocks not all set), so the survey refused (rc 77). Is PHY/port readiness a true prerequisite for reading the normal dart-apcie0 MMIO bank, or can a powered DART be read while the PCIe PHY and ports are held in reset?",
+  "answer": "Not established either way by the pinned primary sources. No local primary source shows the normal T8103 dart-apcie0 bank being read while the APCIE PHY is in reset or the ports are not running. The one apparent precedent (Linux reading DART PARAMS at probe) occurs on T8103 only after m1n1 has already run its own pcie_init, so it cannot be cited as proof. Other source facts point weakly both ways. Keep the current guard; do not relax it or claim safe access. The refusal in attempt 001 is the correct, fail-closed outcome for an uninitialized PCIe handoff.",
+  "evidence": {
+    "for_independence_weak": [
+      "Guest ADT: /arm-io/dart-apcie0 declares no power-gates or clock-gates of its own. The only gates in this area are /arm-io/apcie's power-gates/clock-gates [77, 97, 29] (APCIE, APCIE_GP, PCIE_REF), the domains the survey's four PMGR guards (with IMX parent 32) verified on.",
+      "Linux apple-dart.c (pinned 6a08a08e) apple_dart_probe: for a non-tunneled DART, after devm_clk_bulk_get_all/clk_bulk_prepare_enable and runtime-PM activation it reads DART_PARAMS1/2 directly (around :3086). Only tunneled PCIe-C DARTs are special-cased as unsafe to read at that point ('raises an asynchronous SError', around :3056-3083).",
+      "Linux pcie-apple.c (around :389-396): the extra completion barriers are for PCIe-C only; 'Keep conventional root ports on the existing fast path'.",
+      "The PHY is a separate register block (apcie reg2 0x680080000/0x90000, reg8 0x680084000) from the DART (0x681008000)."
+    ],
+    "against_or_unproven": [
+      "m1n1 kboot_boot (src/kboot.c around :6672-6690) calls usb_init() then pcie_init() for every chip, including T8103 /arm-io/apcie, before handing off to Linux. So Linux's T8103 DART probe and PARAMS reads happen with PHY/ports already brought up by m1n1. They are not evidence about a cold PHY.",
+      "m1n1 C never reads an APCIE DART: dart_init_adt is used for display, DCP and USB DARTs only, and src/pcie.c has zero DART references. So pinned m1n1 gives no ordering evidence. The only proxyclient use (hv/trace_wlan.py:748-749) traces dart-apcie0 page tables during a live, already-initialized macOS PCIe session.",
+      "Address layout from the guest ADT: port0 config 0x681000000/0x8000 (reg6), the DART 0x681008000/0x4000, then 0x68100c000/0x4000 (reg10) and 0x681010000/0x1000 (reg7); port1 starts at 0x682000000 (reg11). The DART is a per-port sub-block inside port0's address complex, consistent with possibly sharing port clocking (APPCLK) or reset. That is suggestive, not proven.",
+      "Linux pcie-apple.c (around :2498-2500), PCIe-C only: 'Port hardware and RID/SID forwarding must be ready before DART access resumes, so suspend DART first and resume PCIe-C first.' This is a source-documented DART-after-port dependency for the tunneled variant. It does not apply directly to T8103 normal ports, but it is a precedent in the stricter direction.",
+      "Guest ADT dart-apcie0 has 'manual-availability' = 1 (absent on dart-disp0). No pinned source defines it. One reading is that the PCIe stack, not the DART itself, controls when the DART becomes available; that is unverified.",
+      "The pinned Linux reference is partial: there is no arch/arm64/boot/dts (so the pcie DART power-domains/clocks properties cannot be checked) and no drivers/of/property.c (so fw_devlink's iommu-map supplier ordering cannot be checked). Linux's power model for these DARTs is therefore unverifiable locally.",
+      "Observed handoff in attempt 001: PMGR domains on, PHY reset asserted, clocks not all set. Nothing (no stock pcie_init) had brought PCIe up. This is exactly the state for which no source evidence exists."
+    ]
+  },
+  "options": [
+    {"option": "Keep the current guard (PMGR + PHY + RC/port RUN)", "pros": ["Safe by construction; matches every source-observed DART access context (PCIe already up)", "Fail-closed refusal with diagnostic, as in attempt 001"], "cons": ["Yields NOT_READY on this cold-PCIe handoff, so no DART register data"]},
+    {"option": "Relax to PMGR-only (power/clock domains)", "pros": ["Would sample on this handoff if the DART truly depends only on APCIE/APCIE_GP"], "cons": ["No primary source supports it. The per-port sub-block layout, the PCIe-C precedent and manual-availability all leave real risk of a synchronous external abort, an SError or a bus hang in the guest kernel. Reads during reset could also return non-meaningful data", "Not permitted without proof and review (do NOT do this)"]},
+    {"option": "Bring PCIe up first (stock m1n1 pcie_init, or PHY/port enable, PERST release)", "pros": ["Would satisfy the existing guard"], "cons": ["Shared mutation of PHY, ports and endpoint reset; releases the Wi-Fi/BT endpoints from reset while DART/RID2SID ownership is unconfigured (possible DMA)", "Explicitly out of scope ('avoid stock pcie_init shared mutation')"]}
+  ],
+  "future_precise_profile_only_after_proof": {
+    "hypotheses": [
+      "H1: dart-apcie0 needs only the APCIE/APCIE_GP (and PCIE_REF) PMGR power/clock.",
+      "H2: it also needs the port's APPCLK (port sub-block) but not the PHY.",
+      "H3: it needs PHY clocks or refclk (least likely architecturally; unproven)."
+    ],
+    "acceptable_proof_examples": [
+      "A pinned primary source that reads dart-apcie* registers before PHY/port bring-up on T8103 without a preceding m1n1 pcie_init (for example a pinned Asahi DTS showing the pcie DART power-domains, plus a driver/devlink path proving DART probe precedes port enable on a cold handoff).",
+      "A separately authorized, read-only HV trace of a stock macOS T8103 PCIe bring-up showing the first dart-apcie0 access relative to the PHY CTRL, PHYIF RUN, APPCLK and PERST writes. That would be a hardware task, not proposed here."
+    ],
+    "rule": "Any narrower guard needs its own source review and a bounded, abort-contained trial approved separately. Until then the PHY and RC/port RUN predicates stay in the survey guard and in the collector/decoder validation."
+  },
+  "gaps": [
+    "The pinned Linux tree lacks device-tree sources and drivers/of (power-domains/clocks, devlink ordering).",
+    "manual-availability semantics are undefined in pinned sources.",
+    "No pinned evidence of macOS's ordering of DART versus PHY/port on T8103.",
+    "No local source states the DART's clock or reset relationship to the port APPCLK."
+  ],
+  "not_claimed": ["safe DART access without PHY/port", "unsafe access proven", "any guard change", "PCIe initialization"],
+  "scope": "Read-only analysis of pinned m1n1 (121fcbf3), pinned linux-aurora (6a08a08e) and the saved attempt-001 guest ADT (property names, gate IDs and register windows only). No fetch, hardware, SSH, builds or edits."
+}

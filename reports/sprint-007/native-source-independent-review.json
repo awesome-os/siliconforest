@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "record": "native-source-independent-review",
+  "recorded_at": "2026-11-08T01:15:35Z",
+  "reviewer": "Claude (independent, read-only source review; no edits to candidate sources)",
+  "subject": "T8103 parked first-entry experiment, candidate revision 6",
+  "reviewed_patch_sha256": "573bc2eaddd10ecf4250b8751b7b7459229dba77ee0483a8259debc7bd1565c4",
+  "reviewed_manifest_sha256": "597649b6bd13184f3fccaf11dbfcb6838260c0a186d508e8a01cc6a177d3e28e",
+  "puredarwin_pin": "e7aa00a60f0b56ef35aa24252e81467787bf71ea",
+  "m1n1_pin": "121fcbf35d4501814b58ca5347926a4173b6a512",
+  "reviewed_after_sha256": {
+    "flake.nix": "fbff72c93f3fdb1f5580f593094f0f0a8832937d7632e9c5a589233dc744cb87",
+    "nix/m1-firstboot.nix": "ca6211023f59c13965a9d7e5c4e1669529522dbaf8708645f748834cdc566665",
+    "src/Kernel/xnu/CMakeLists.txt": "f0ccdae0e89bf7e54259bece49de2a1a61d150e4be3a596fda18f2fa83e263f1",
+    "src/Kernel/xnu/cmake/MakeInc.def.in": "839af8158e32d9665dda3b7a9f9211c4e0c21fcc936f373a1ca780855e757bc8",
+    "src/Kernel/xnu/config/MASTER.arm64.t8103": "695bf4429a8b3ef15f3f96e8a52faee4e19b6752129a35afcad999a9777069c6",
+    "src/Kernel/xnu/osfmk/arm64/m1_first_entry.inc": "c4ab0081ea453392bc168244f98e13ca857b7e6b544fa0fe6f4dd11b0e7bf9af",
+    "src/Kernel/xnu/osfmk/arm64/start.s": "1943bbb7b642f28b97f4200fa7744571c4a1ae7e60c9ce880aebf37f8e52990a",
+    "src/Kernel/xnu/pexpert/pexpert/arm64/board_config.h": "03aa2bfb12cfc6b591fac28ebf2858c405f3b45272a3ad42969cc66f16dd9dc5"
+  },
+  "verdict": "NO_SOURCE_BLOCKER_FOR_PARKED_ENTRY_EXPERIMENT",
+  "verdict_scope": "Only the pre-VM console-and-park experiment. This is not a review of, or claim about, a continuing kernel, normal boot, VM/IOKit initialization or app support.",
+  "findings": {
+    "entry_and_park": [
+      "Kernel links with -e __start; __start and start_first_cpu both branch to darwin_lab_m1_first_entry (start.s), so neither cold entry reaches normal VM initialization.",
+      "First instruction masks DAIF (0xd5034fdf), including the wrong-EL refusal path; then EL1 (CurrentEL==4), SCTLR_EL1.M==0 and MIDR Apple 0x61 part 0x022/0x023 checks.",
+      "x0 (boot_args) is never written; no stack or writable globals; PC-relative addressing only; VBAR_EL1 set to LowExceptionVectorBase, a 4 KiB-aligned table of b . spin vectors.",
+      "UART constants match pinned m1n1: base 0x235200000 (src/soc.h), UTRSTAT +0x10 TXBE bit1 / TXE bit2, UTXH +0x20, 32-bit accesses (src/uart_regs.h, src/uart.c); bounded polling; unconditional self-loop park with no WFI, return or fallthrough.",
+      "MACHINE_FLAGS_ARM64_T8103 always defines DARWIN_LAB_M1_FIRSTBOOT=1 and CMake refuses non-DEBUG T8103, so no T8103 build of this candidate omits the park."
+    ],
+    "unsupported_failstop_aliases": {
+      "symbols": [
+        "CleanPoC_DcacheRegion_Force_nopreempt",
+        "CleanPoC_DcacheRegion_Force_nopreempt_nohid",
+        "enable_dc_mva_ops",
+        "disable_dc_mva_ops"
+      ],
+      "shared_label": "darwin_lab_m1_unsupported_cache",
+      "instructions": ["0xd5034fdf msr DAIFSet,#0xf", "0xd2801df3 mov x19,#0xef", "0x14000000 b ."],
+      "assessment": "Explicit nonreturning fail-closed guards for public-source-absent Apple cache/HID helpers, not success stubs and not a cache implementation. Unreachable from the parked path: the entry routine contains no calls, and callers (caches_asm.s APPLE_ARM64_ARCH_FAMILY path, osfmk/arm/pmap/pmap.c around 11044-11076) run only after VM initialization. No duplicate definition: the portable _nohid exists only under !APPLE_ARM64_ARCH_FAMILY (caches_asm.s:368-369)."
+    },
+    "security_backend_omissions": {
+      "omitted_only_when_DARWIN_LAB_M1_FIRSTBOOT_in_T8103_block": ["PMAP_CS", "PMAP_CS_ENABLE", "XNU_MONITOR", "KERNEL_INTEGRITY_CTRR"],
+      "preserved": ["HAS_CTRR hardware fact", "other native H13/T8103 board macros"],
+      "reason": "Private CoreEntitlements V2 types and CTRR register definitions are absent from the public source; no placeholder types or layouts were invented.",
+      "note": "KERNEL_CTRR_VERSION remains defined while KERNEL_INTEGRITY_CTRR is undefined; harmless for the parked image, must be resolved by any continuing kernel."
+    },
+    "public_source_selection": "MASTER.arm64.t8103 (selected by doconf only for SoC t8103) equals the pinned MacOSX master except nos_arm_pmap nos_arm_asm in ARM_EXTRAS_BASE and removal of optional sched_hygiene_debug.",
+    "scheduler_preemption_check": "With sched_hygiene_debug removed (VIRT master precedent), osfmk/arm/pmap/pmap.h:776-780 selects the public inline _pmap_pending_preemption_real AST_URGENT check instead of the undefined external debug wrapper. Cost: DEBUG scheduler-hygiene timeout diagnostics are off.",
+    "assembler_register_aliases": {
+      "CPU_OVRD": "S3_5_C15_C5_0 (m1n1 CYC_OVRD_EL1, src/cpu_regs.h:530)",
+      "CPU_CFG": "S3_5_C15_C4_0 (m1n1 ACC_CFG_EL1, src/cpu_regs.h:524)",
+      "ACC_OVRD": "S3_5_C15_C6_0 (m1n1 ACC_OVRD_EL1, src/cpu_regs.h:541)",
+      "assessment": "Assembler-only, experiment-gated encodings inferred from identical XNU/m1n1 field layouts and operations; scratch assembly with pinned clang 21.1.8 produced the expected MRS/MSR encodings. The instructions are unreachable in the parked image."
+    },
+    "packet_binding": "tools/m1_firstboot.py binds the packet source patch to the reviewed patch hash, binds kernel and m1n1 build receipts, and verifies the __start symbol, the LC_UNIXTHREAD entry branch target and the diagnostic instruction prefix."
+  },
+  "non_blocking_notes": [
+    "Describe any successful link as a native T8103 link with four fail-stop cache placeholders, PMAP_CS/XNU_MONITOR/CTRR omitted and scheduler-hygiene diagnostics off, not as a complete kernel. Root reports its final inspector now validates the linked fail-stop bindings and three instructions.",
+    "Optional: a distinctive brk before the fail-stop self-loop would panic identifiably instead of hanging if ever reached after VM initialization."
+  ],
+  "limits": [
+    "Source-only review. The reviewer did not build, link, inspect a linked build-006 artifact, contact hardware, use SSH or run a guest.",
+    "Register aliases are inferences from m1n1 encodings plus matching fields and operations, not Apple headers.",
+    "m1n1 hypervisor caveats remain: VUART UTRSTAT always reports TXBE|TXE, so polling/timeout is untested in that route; VPIDR_EL2 and guest SCTLR_EL1 are not set by pinned m1n1; host break-in after the masked park is unverified; the installed stage2 is not the pinned m1n1.",
+    "No runtime evidence exists. Only a captured HVLOG line plus the expected parked state would support the entry checkpoint."
+  ],
+  "kernel_built_by_reviewer": false,
+  "hardware_accessed": false,
+  "runtime_proof": false,
+  "full_kernel_init_supported": false,
+  "cache_implementation_claimed": false,
+  "mapped_reclamation_enabled": false
+}

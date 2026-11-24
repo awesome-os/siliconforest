@@ -1,0 +1,19 @@
+# --- video player runs (integrations/siliconforest/m1-avd/tools/avd_desktop_boot.sh) -------------
+# In the background: once the compositor's socket is there, each line of the play list is run
+# (sfvideo or sfvideo-gl with its arguments); everything goes to the console.
+(
+    n=0
+    while [ ! -S "$runtime/wayland-0" ] && [ "$n" -lt 600 ]; do sleep 0.1; n=$((n + 1)); done
+    sleep 4
+    printf 'AVDPLAY_BEGIN socket=%s avd=%s sound=%s\n' "$([ -S "$runtime/wayland-0" ] && echo yes || echo no)" "$(get kern.sf_avd.state)" "$(get kern.sf_sound.state | cut -c1-60)"
+    cd /private/var/avd
+    while read -r program line; do
+        [ -n "$program" ] || continue
+        printf 'AVDPLAY_RUN %s %s\n' "$program" "$line"
+        # shellcheck disable=SC2086
+        /usr/local/bin/$program $line 2>&1 | grep -a -v '^$' | cut -c1-800 | sed 's/^/AVDPLAY_OUT /'
+        printf 'AVDPLAY_EXIT avd=%s\n' "$(get kern.sf_avd.stats | cut -c1-200)"
+    done < /private/var/avd/play.list
+    [ -r /var/log/coreaudiod.log ] && tail -4 /var/log/coreaudiod.log | cut -c1-300 | sed 's/^/AVDPLAY_COREAUDIOD_LOG /'
+    printf 'AVDPLAY_DONE avd=%s\n' "$(get kern.sf_avd.state | cut -c1-80)"
+) > /dev/console 2>&1 &

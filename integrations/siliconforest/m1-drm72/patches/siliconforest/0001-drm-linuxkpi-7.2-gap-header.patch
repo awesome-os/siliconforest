@@ -1,0 +1,74 @@
+--- a/src/Kernel/fbsdkpi/drm/include/linux/sf_lkpi72.h
++++ b/src/Kernel/fbsdkpi/drm/include/linux/sf_lkpi72.h
+@@ -0,0 +1,71 @@
++// SPDX-License-Identifier: MIT
++// Copyright (c) 2026 The PureDarwin Project
++//
++// Linux 7.2 kernel API that the 7.2-level DRM files (scheduler, GPUVM, GEM shmem helper)
++// call and FreeBSD's LinuxKPI in this tree does not have. Each entry says what it does
++// here and how that differs from Linux. Everything is guarded, so a real implementation
++// in LinuxKPI takes over as soon as one exists.
++#ifndef _SF_LKPI72_H_
++#define _SF_LKPI72_H_
++
++#include <linux/ktime.h>
++#include <linux/llist.h>
++#include <linux/module.h>
++#include <linux/refcount.h>
++#include <linux/workqueue.h>
++
++// us_to_ktime(): exact.
++#ifndef us_to_ktime
++static inline ktime_t
++sf_us_to_ktime(uint64_t us)
++{
++	return (ns_to_ktime(us * NSEC_PER_USEC));
++}
++#define us_to_ktime(us) sf_us_to_ktime(us)
++#endif
++
++// init_llist_node()/llist_on_list(): exact (an off-list node points at itself).
++#ifndef init_llist_node
++static inline void
++sf_init_llist_node(struct llist_node *node)
++{
++	node->next = node;
++}
++static inline bool
++sf_llist_on_list(const struct llist_node *node)
++{
++	return (node->next != node);
++}
++#define init_llist_node(node) sf_init_llist_node(node)
++#define llist_on_list(node) sf_llist_on_list(node)
++#endif
++
++// refcount_dec_not_one(): decrement unless the count is 1; true if it was decremented.
++// Exact, except that LinuxKPI's refcount_t (a plain atomic_t) does not saturate.
++#ifndef refcount_dec_not_one
++static inline bool
++sf_refcount_dec_not_one(refcount_t *ref)
++{
++	return (atomic_add_unless(ref, -1, 1));
++}
++#define refcount_dec_not_one(ref) sf_refcount_dec_not_one(ref)
++#endif
++
++// __module_get(): kexts are not unloaded from under running code and LinuxKPI's
++// module_get()/module_put() are empty, so this is empty as well.
++#ifndef __module_get
++#define __module_get(module) do { (void)(module); } while (0)
++#endif
++
++// disable_work_sync(): Linux cancels the work, waits for a running instance and makes
++// every later queue_work() on it a no-op. LinuxKPI's work state machine has no "disabled"
++// state, so this is only the first two thirds: cancel_work_sync(). A queue_work() racing
++// with or following it still queues. The one caller (drm_sched_fini(), an Omacom addition
++// to 7.2) relies on drm_sched_wqueue_stop() having set pause_submit first, as mainline 7.2
++// does; the window mainline has between the pause_submit check and queue_work() stays open.
++#ifndef disable_work_sync
++#define disable_work_sync(work) cancel_work_sync(work)
++#define SF_LKPI72_DISABLE_WORK_IS_CANCEL 1
++#endif
++
++#endif

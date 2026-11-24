@@ -1,0 +1,152 @@
+--- a/src/Kernel/Extensions/PDM1SPIHID/CMakeLists.txt
++++ b/src/Kernel/Extensions/PDM1SPIHID/CMakeLists.txt
+@@ -4,7 +4,7 @@
+ set_property(TARGET PDM1SPIHID.kext PROPERTY OUTPUT_NAME PDM1SPIHID)
+ target_sources(PDM1SPIHID.kext PRIVATE
+     PDM1SPIHID.cpp PDM1KeyboardHW.cpp m1kbd_board.c m1kbd_pio.c m1kbd_hid.c
+-    native_protocol/dl_spi_hid.c)
++    native_protocol/dl_spi_hid.c m1tp_enum.c)
+ target_include_directories(PDM1SPIHID.kext PRIVATE
+     ${CMAKE_CURRENT_SOURCE_DIR}
+     ${CMAKE_CURRENT_SOURCE_DIR}/../IOHIDFamily/IOHIDSystem
+--- a/src/Kernel/Extensions/PDM1SPIHID/PDM1SPIHID.h
++++ b/src/Kernel/Extensions/PDM1SPIHID/PDM1SPIHID.h
+@@ -4,6 +4,9 @@
+ #include "PDM1KeyboardHW.h"
+ #include "native_protocol/dl_spi_hid.h"
+ #include "m1kbd_hid.h"
++/* Layout first: it defines and undefines its own one-argument assert macro. */
++#include "observation_layout.h"
++#include "m1tp_enum.h"
+ #include <IOKit/IOCommandGate.h>
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/IOWorkLoop.h>
+@@ -35,6 +38,10 @@
+     uint8_t descriptor[DLSP_DESCRIPTOR_BYTES];
+     size_t descriptorLength;
+     struct m1kbd_identity identity;
++    /* T1 trackpad enumeration snapshot: heap member, zeroed in init, never a
++     * stack copy. Read-only diagnostic data; not a pointer device or input. */
++    struct m1tp_observation trackpadEnumeration;
++    struct m1tp_interface_info trackpadInterface;
+     uint8_t nextID, usedRequestKeys;
+     IOWorkLoop *transportLoop;
+     IOCommandGate *transportGate;
+@@ -50,6 +57,8 @@
+     static IOReturn stopGated(OSObject *, void *, void *, void *, void *);
+     bool startHardware();
+     bool enumerate();
++    bool enumerateTrackpad();
++    bool preserveTrackpadEnumeration(IOService *provider);
+     int receive(struct dlsp_message *);
+     bool waitResponse(uint8_t report, uint8_t subdevice, uint16_t responseLength, struct dlsp_message *);
+     void fail(int error, const char *phase);
+--- a/src/Kernel/Extensions/PDM1SPIHID/PDM1SPIHID.cpp
++++ b/src/Kernel/Extensions/PDM1SPIHID/PDM1SPIHID.cpp
+@@ -69,12 +69,21 @@
+     countersDirty=false; requestPending=false;
+     pendingReport=0; pendingSubdevice=0; requestID=0;
+     bzero(packet,sizeof(packet)); bzero(descriptor,sizeof(descriptor)); dlsp_init(&wire);
++    bzero(&trackpadEnumeration,sizeof(trackpadEnumeration));
++    bzero(&trackpadInterface,sizeof(trackpadInterface));
++    trackpadEnumeration.version=M1TP_OBSERVATION_VERSION;
++    trackpadEnumeration.result=M1TP_OBS_NOT_ATTEMPTED;
++    trackpadEnumeration.stage=M1TP_OBS_BEFORE_IO;
+     return super::init(properties);
+ }
+ IOService *PDM1SPIHID::probe(IOService *provider, SInt32 *score)
+ {
+-    int enabled=0;
++    int enabled=0, trackpadOptIn=0;
+     if (!PE_parse_boot_argn("pdm1kbd",&enabled,sizeof(enabled)) || enabled!=1) return nullptr;
++    /* Experimental T1 bundle: both explicit opt-ins precede the one-shot
++     * claim, so neither default nor keyboard-only boots reach this probe. */
++    if (!PE_parse_boot_argn("pdm1trackpadenum",&trackpadOptIn,sizeof(trackpadOptIn)) ||
++        trackpadOptIn!=1) return nullptr;
+     if (!OSCompareAndSwap(0,1,&gPDM1KeyboardProbeClaimed)) {
+         IOLog("PDM1SPIHID: probe refused; one attempt already claimed this boot, registry_id=%llu\n",
+               (unsigned long long)getRegistryEntryID());
+@@ -115,8 +124,13 @@
+ }
+ bool PDM1SPIHID::handleStart(IOService *provider)
+ {
+-    if (!super::handleStart(provider)) return false;
+-    return transportGate && transportGate->runAction(startGated)==kIOReturnSuccess;
++    bool gated=super::handleStart(provider) &&
++        transportGate && transportGate->runAction(startGated)==kIOReturnSuccess;
++    /* The gate has returned: preserve the enumeration snapshot on success or
++     * failure, before IOHIDDevice publishes interfaces or start() arms the
++     * timer. A failed copy fails start; it never changes the raw result. */
++    bool preserved=preserveTrackpadEnumeration(provider);
++    return gated && preserved;
+ }
+ IOReturn PDM1SPIHID::startGated(OSObject *owner, void *, void *, void *, void *)
+ {
+@@ -166,7 +180,7 @@
+     /* One synchronous request at a time, each semantic key once per instance.
+      * Never release a claim, even if encoding, transport or response fails.
+      * Firmware response IDs need not echo our outbound global counter. */
+-    if (!m1kbd_claim_request(&usedRequestKeys,report,subdevice)) {
++    if (!m1tp_claim_request(&usedRequestKeys,report,subdevice)) {
+         fail(M1KBD_STATE,"request-key"); return false;
+     }
+     uint8_t id=nextID++;
+@@ -229,8 +243,58 @@
+     }
+     memcpy(descriptor,message.payload,message.payload_length);
+     descriptorLength=message.payload_length;
++    return enumerateTrackpad();
++}
++bool PDM1SPIHID::enumerateTrackpad()
++{
++    /* T1 enumeration only: two read queries to the info target (0xd0, command
++     * 0x20). No feature, SET, output or actuator request, no mode switch and
++     * no child device. A failure here fails the whole experimental start. */
++    struct dlsp_message message;
++    struct m1tp_observation *o=&trackpadEnumeration;
++    o->stage=M1TP_OBS_INFO_REQUEST;
++    if (!waitResponse(2,2,512,&message)) { o->result=M1TP_OBS_INFO_REQUEST_FAILED; return false; }
++    o->stage=M1TP_OBS_INFO_RECEIVED;
++    o->metadata_payload_bytes=(uint32_t)message.payload_length;
++    if (message.payload && message.payload_length)  /* fixed raw header only, never strings */
++        memcpy(o->metadata_header,message.payload,
++               message.payload_length<sizeof(o->metadata_header)?message.payload_length:sizeof(o->metadata_header));
++    if (m1tp_interface_info(message.payload,message.payload_length,&trackpadInterface)!=M1TP_OK) {
++        o->result=M1TP_OBS_INFO_INVALID;
++        fail(M1KBD_INVALID,"trackpad-interface-metadata"); return false;
++    }
++    IOLog("PDM1SPIHID: trackpad interface metadata bytes=%u interface=%u country=%u input=%u output=%u control=%u (no string bytes)\n",
++          (unsigned)message.payload_length,(unsigned)trackpadInterface.interface,(unsigned)trackpadInterface.country,
++          (unsigned)trackpadInterface.max_input,(unsigned)trackpadInterface.max_output,(unsigned)trackpadInterface.max_control);
++    o->stage=M1TP_OBS_DESC_REQUEST;
++    if (!waitResponse(0x10,2,512,&message)) { o->result=M1TP_OBS_DESC_REQUEST_FAILED; return false; }
++    o->stage=M1TP_OBS_DESC_RECEIVED;
++    o->descriptor_payload_bytes=(uint32_t)message.payload_length;
++    if (m1tp_copy_descriptor(o->descriptor,sizeof(o->descriptor),&o->descriptor_bytes,
++                             message.payload,message.payload_length)!=M1TP_OK) {
++        o->result=M1TP_OBS_DESC_INVALID;
++        fail(M1KBD_INVALID,"trackpad-descriptor-length"); return false;
++    }
++    o->stage=M1TP_OBS_COMPLETE; o->result=M1TP_OBS_ENUM_OK;
++    IOLog("PDM1SPIHID: CRC-checked J293 trackpad descriptor acquired (%u bytes); enumeration only, no mode write or pointer input\n",
++          (unsigned)o->descriptor_bytes);
+     return true;
+ }
++bool PDM1SPIHID::preserveTrackpadEnumeration(IOService *provider)
++{
++    trackpadEnumeration.request_mask=usedRequestKeys;
++    OSData *data=OSData::withBytes(&trackpadEnumeration,sizeof(trackpadEnumeration));
++    /* Plain property copies only: no publishResource, registerService or
++     * notifier. IOResources keeps its reference after a failed start detaches. */
++    bool providerRecorded=data && provider && provider->setProperty(M1TP_OBSERVATION_KEY,data);
++    bool instanceRecorded=data && setProperty(M1TP_OBSERVATION_KEY,data);
++    IOLog("PDM1SPIHID: trackpad enumeration result=%d stage=%u request_mask=%u metadata_bytes=%u descriptor_payload_bytes=%u descriptor_bytes=%u diagnostic_copy=%u provider_preserved=%u instance_recorded=%u (enumeration only, not pointer input)\n",
++          (int)trackpadEnumeration.result,(unsigned)trackpadEnumeration.stage,(unsigned)trackpadEnumeration.request_mask,
++          (unsigned)trackpadEnumeration.metadata_payload_bytes,(unsigned)trackpadEnumeration.descriptor_payload_bytes,
++          (unsigned)trackpadEnumeration.descriptor_bytes,data?1u:0u,providerRecorded?1u:0u,instanceRecorded?1u:0u);
++    if (data) data->release();
++    return providerRecorded && instanceRecorded;
++}
+ void PDM1SPIHID::poll(OSObject *owner, IOTimerEventSource *)
+ {
+     PDM1SPIHID *self=OSDynamicCast(PDM1SPIHID,owner);

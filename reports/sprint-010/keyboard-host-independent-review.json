@@ -1,0 +1,102 @@
+{
+  "status": "APPROVE_SOURCE_ONLY_HOST_KEYBOARD_EXPERIMENT_NO_SOURCE_BLOCKER",
+  "reviewer": "Astra",
+  "scope": "Independent read-only code review and host-only tests; no SSH, device, hardware, build or frozen-source edits",
+  "reviewed_sha256": {
+    "integrations/puredarwin/m1-keyboard/inventory/keyboard_inventory.c": "2a57ecfcdc301ca687c541f27d5a79b9fa85a62c627529426aba98ec289e08db",
+    "integrations/puredarwin/m1-keyboard/inventory/darwin-keyboard-test": "b9529aae24446ac8b21f5ecc5966508332e708cac5eaef1212920d1382700224",
+    "integrations/puredarwin/m1-keyboard/inventory/build.nix": "290aa1045a3cee09b6a5103fa50387002a17d8463cbefe655db7b8bb1dcd4841",
+    "integrations/puredarwin/m1-bringup/host_progress.py": "45ac5cc40f8891ebdcf33805019f71a48db03c8a9bd1da704024452c278af43d",
+    "integrations/puredarwin/m1-bringup/normal_image.py": "ea36952b5d68118583f03bdf756683a4a83b534fd4d1a96a62a23e2e54a8b062",
+    "tools/m1_bringup_cycle.py": "68ce01f6f37978c73a2e79cb80af22ea498d314f01585e9e43821d9ecdb4288d",
+    "integrations/puredarwin/m1-bringup/test_host_progress.py": "e304bddb0ba4ea9a3e187c7425b6cc0159381fe8b5bbc4381ab6a60dd294ed59",
+    "tests/test_m1_bringup_cycle.py": "fd8fe446497881b2db79db77c243991e3005032a2dc60c5d6e8e9413eeb1bf67"
+  },
+  "findings": [
+    {
+      "id": "KHOST1",
+      "verdict": "PASS",
+      "finding": "No device access is needed for keyboard opt-in validation, and production callers validate it before orderly reboot and before serial open. It requires exact fixed command/version, a verified RAM-root artifact, no desktop experiment, a native fileset, and exactly one SPI HID member.",
+      "evidence": [
+        "host_progress.py:110-119",
+        "host_progress.py:288-310",
+        "host_progress.py:603-608",
+        "tools/m1_bringup_cycle.py:34-42,203-204"
+      ]
+    },
+    {
+      "id": "KHOST2",
+      "verdict": "PASS",
+      "finding": "normal_image verifies every artifact size/SHA256 and the completed build record, then structurally inspects the KC. The keyboard helper adds only pdm1kbd=1; all original board/proxy/MMIO/recovery checks remain in the existing path. Actual final kext source fidelity and 51-member KC inspection are root-owned pending evidence.",
+      "evidence": [
+        "normal_image.py:191-229",
+        "host_progress.py:603-648"
+      ]
+    },
+    {
+      "id": "KHOST3",
+      "verdict": "PASS",
+      "finding": "Inventory uses the matching minimal PDIOKitLib string-based ABI and its static library; matching calls are sequential so the static XML buffer is not reused concurrently. The source contains no IOServiceOpen, HID queue open, ioctl or input injection; device checks are stat only.",
+      "evidence": [
+        "inventory/keyboard_inventory.c:18-73",
+        "inventory/build.nix:9-28",
+        "sources/puredarwin-m1-desktop/src/Libraries/IOKit/IOKitLib.c:39-86,231-263"
+      ]
+    },
+    {
+      "id": "KHOST4",
+      "verdict": "PASS",
+      "finding": "Guest launcher validates a 48-hex nonce, runs inventory, then blocks reading the literal human line m1keyboard. It emits DLK_TYPED only after an exact read match. No host code supplies this line or SOH virtual-HID input; the host sends only the fixed launcher after an independently verified Darwin shell challenge.",
+      "evidence": [
+        "inventory/darwin-keyboard-test:1-20",
+        "host_progress.py:223-243,283-285"
+      ]
+    },
+    {
+      "id": "KHOST5",
+      "verdict": "LIMIT_NOT_BLOCKER",
+      "finding": "Controller status/exit success means Darwin CLI plus Linux recovery, not keyboard success. Inventory presence and an initial native report can include idle/release reports and are insufficient to prove human typing. Preserve this distinction in the hardware receipt.",
+      "action": "Require the raw DLK_READY then DLK_TYPED nonce sequence, the real driver input-delivery observation, artifact/launch binding, and human confirmation of built-in-keyboard typing and visible response before claiming native input.",
+      "evidence": [
+        "host_progress.py:255-263",
+        "tools/m1_bringup_cycle.py:138-139,176-182,205-207",
+        "inventory/darwin-keyboard-test:17-20"
+      ]
+    },
+    {
+      "id": "KHOST6",
+      "verdict": "LIMIT_NOT_BLOCKER",
+      "finding": "PDIOKitLib IOIteratorNext collapses iterator RPC errors to IO_OBJECT_NULL, the same sentinel as exhaustion. Therefore query_errors:false is not proof that every service enumeration completed without an RPC error; counts are a bounded observation, not exhaustive absence proof. No native-keyboard success claim is made by the tool.",
+      "evidence": [
+        "sources/puredarwin-m1-desktop/src/Libraries/IOKit/IOKitLib.c:255-263",
+        "inventory/keyboard_inventory.c:40-56"
+      ]
+    }
+  ],
+  "tests": [
+    {
+      "command": "python3 integrations/puredarwin/m1-bringup/test_host_progress.py -v",
+      "passed": 23,
+      "execution": "independently rerun in this pane",
+      "scope": "fake host transport/metadata; no device"
+    },
+    {
+      "command": "python3 -m unittest tests.test_m1_bringup_cycle -v",
+      "passed": 8,
+      "execution": "independently rerun in this pane",
+      "scope": "fake controller operations; no target reboot"
+    }
+  ],
+  "sdk_build_context": {
+    "reported_by_root": "runs/m1-display-010/keyboard-kext-build-002.json",
+    "output": "/nix/store/khhqyxc2a9hky1f3w78fysa2zb4nizq8-puredarwin-m1-spi-keyboard-0.1",
+    "scope": "Root reports actual SDK kext build success; this review did not rebuild or independently certify linked KPI/startpath"
+  },
+  "remaining_before_hardware": [
+    "Root final source/artifact/KPI and KC-member binding checks",
+    "Claude final native lifecycle review",
+    "Root explicit candidate execution with qualified recovery; no agent hardware action"
+  ],
+  "native_keyboard_runtime_proven": false,
+  "hardware_accessed": false
+}

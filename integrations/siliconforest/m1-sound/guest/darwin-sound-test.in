@@ -1,0 +1,121 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Headphone-jack playback check for SFAppleSound, one boot:
+#   bringup   wait for the driver; codec identification, jack state, transport registers
+#   jack      the codec's interrupt counters; one plug type detection on the jack as it is
+#   tone48    the kernel test tone at 48 kHz, monitored once a second
+#   tone44    the same at 44.1 kHz
+#   sfplay    /dev/sfaudio from userspace: tones left, right, both; a WAVE file; raw zeros
+#   smp       a tone while one reader per processor polls the driver's sysctls
+# Everything is quiet: codec attenuation @VOLUME@ dB, tones @TONEDB@ dB below full scale.
+# tools/sd_summary.sh reads the result. (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nSD_BEGIN_%s\n' "$nonce"
+ncpu=$(sysctl -n hw.ncpu 2>/dev/null); ncpu=${ncpu:-1}
+t0=$(date +%s)
+now() { echo $(( $(date +%s) - t0 )); }
+phase() { printf 'SD_PHASE %s t=%s\n' "$1" "$(now)"; }
+get() { sysctl -n "$1" 2>/dev/null; }
+mon() {
+    printf 'SD_MON %s t=%s playing=%s periods=%s rate_mhz=%s lock_ms=%s late=%s ring_errors=%s dart_faults=%s i2c_errors=%s jack=%s\n' \
+        "$1" "$(now)" "$(get kern.sf_sound.playing)" "$(get kern.sf_sound.periods)" "$(get kern.sf_sound.rate_mhz)" \
+        "$(get kern.sf_sound.lock_ms)" "$(get kern.sf_sound.late)" "$(get kern.sf_sound.ring_errors)" \
+        "$(get kern.sf_sound.dart_faults)" "$(get kern.sf_sound.i2c_errors)" "$(get kern.sf_sound.jack)"
+}
+regs() {
+    printf 'SD_CODEC %s %s\n' "$1" "$(get kern.sf_sound.codec)"
+    printf 'SD_TRANSPORT %s %s\n' "$1" "$(get kern.sf_sound.transport)"
+}
+# waits until nothing plays, at most $1 seconds
+idle() {
+    n=0
+    while [ "$(get kern.sf_sound.playing)" = 1 ] && [ "$n" -lt "$1" ]; do sleep 1; n=$((n+1)); done
+    [ "$(get kern.sf_sound.playing)" = 1 ] && printf 'SD_FAIL still playing after %s s\n' "$1"
+}
+tone() {        # tag seconds
+    sysctl -w kern.sf_sound.tone="$2" 2>&1
+    n=0
+    while [ "$n" -lt "$2" ]; do
+        sleep 1; n=$((n+1)); mon "$1"
+        [ "$n" = 2 ] && regs "$1"
+    done
+    idle 10
+    mon "$1-end"
+}
+
+phase bringup
+n=0
+while [ "$n" -lt 40 ]; do
+    case "$(get kern.sf_sound.state)" in idle*|failed*|codec-only*) break;; esac
+    sleep 1; n=$((n+1))
+done
+printf 'SD_STATE %s\n' "$(get kern.sf_sound.state)"
+regs bringup
+ls -l /dev/sfaudio 2>&1
+case "$(get kern.sf_sound.state)" in
+idle*) ;;
+*)  printf 'SD_FAIL the driver is not ready for playback\n'
+    sysctl kern.sf_sound 2>&1
+    printf 'SD_END_%s\n' "$nonce"; printf '\nPD_BENCH_DONE\n'; exit 0;;
+esac
+sysctl -w kern.sf_sound.volume_db=@VOLUME@ kern.sf_sound.tone_db=@TONEDB@ 2>&1
+
+phase jack
+jackmon() {
+    printf 'SD_JACK %s jack=%s irqs=%s services=%s polled=%s plugs=%s unplugs=%s detects=%s type=%s buttons=%s button_events=%s\n' \
+        "$1" "$(get kern.sf_sound.jack)" "$(get kern.sf_sound.jack_irqs)" "$(get kern.sf_sound.jack_services)" \
+        "$(get kern.sf_sound.jack_polled)" "$(get kern.sf_sound.jack_plugs)" "$(get kern.sf_sound.jack_unplugs)" \
+        "$(get kern.sf_sound.jack_detects)" "$(get kern.sf_sound.jack_selftest)" "$(get kern.sf_sound.jack_buttons)" \
+        "$(get kern.sf_sound.jack_button_events)"
+}
+jackmon start
+# the plug type detection, run once on the jack as it is (refused when something is plugged)
+sysctl -w kern.sf_sound.jack_selftest=1 2>&1
+jackmon after-detection
+
+phase tone48
+sysctl -w kern.sf_sound.rate=48000 2>&1
+tone tone48 @SECONDS@
+
+phase tone44
+sysctl -w kern.sf_sound.rate=44100 2>&1
+tone tone44 @SECONDS@
+
+phase sfplay
+if [ -x /usr/bin/sfplay ]; then
+    sfplay -t 1000 -s 2 -d @TONEDB@ -r 48000 -c l 2>&1; idle 10; mon sfplay-left
+    sfplay -t 1000 -s 2 -d @TONEDB@ -r 48000 -c r 2>&1; idle 10; mon sfplay-right
+    sfplay -t 440 -s 2 -d @TONEDB@ -r 44100 2>&1; idle 10; mon sfplay-440
+    if [ -f /usr/share/sfsound-test.wav ]; then
+        sfplay /usr/share/sfsound-test.wav 2>&1; idle 10; mon sfplay-wav
+    fi
+else
+    printf 'SD_SKIP no /usr/bin/sfplay\n'
+fi
+# raw frames from the shell: one second of digital silence at the current rate
+dd if=/dev/zero of=/dev/sfaudio bs=4096 count=44 2>&1 | tail -1
+idle 10; mon raw
+
+phase smp
+sysctl -w kern.sf_sound.rate=48000 2>&1
+reader() {
+    end=$(( $(date +%s) + @SECONDS@ )); i=0
+    while [ "$(date +%s)" -lt "$end" ]; do
+        sysctl -n kern.sf_sound.codec kern.sf_sound.transport kern.sf_sound.state > /dev/null 2>&1
+        i=$((i+1))
+    done
+    printf 'SD_READER id=%s reads=%s\n' "$1" "$i"
+}
+w=0; while [ "$w" -lt "$ncpu" ]; do reader "$w" & w=$((w+1)); done
+tone smp @SECONDS@
+wait
+mon smp-readers-done
+
+phase end
+jackmon end
+regs end
+sysctl kern.sf_sound 2>&1
+printf 'SD_END_%s\n' "$nonce"
+# ends the capture at once (tools/pcie_iterate.sh PCIE_DONE)
+printf '\nPD_BENCH_DONE\n'

@@ -1,0 +1,57 @@
+fbsdkpi: of: a node can say which of its properties are text (pd,string-props)
+
+m1-gpu-dt's kernel/sf_linux_of.patch, change 1, re-made against the file because that patch
+does not apply as written (hunk line counts). to_fdt() guesses text from the bytes; one value
+of the M1's GPU table (opp01 opp-microwatt = 0x003a4148, stored 48 41 3a 00) passes for a
+string and would reach the driver unswapped. SFGpuDT lists its text properties.
+One addition to that patch, found on hardware (boot rp01: opp1 still read 1212234240):
+SFGpuDT sets the list only on nodes that have text, and the opp nodes have none. A node
+without the list below a node with one is taken to have no text at all.
+UPSTREAM: yes.
+
+--- a/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_of.c
++++ b/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_of.c
+@@ -133,6 +133,34 @@
+ 	return (true);
+ }
+ 
++// text or cells: a node that lists its text properties in "pd,string-props" is believed, any
++// other node is judged by the loader's rule
++static bool
++is_text(void *entry, const char *name, const uint8_t *in, uint32_t len)
++{
++	const void *list;
++	uint32_t n;
++
++	if (sfos_dt_prop(entry, "pd,string-props", &list, &n) != 0) {
++		// A publisher that lists text properties leaves the list off a node that has
++		// none (SFGpuDT's opp nodes: only numbers). Such a node sits below one that
++		// has the list, and then nothing on it is text; guessing is for trees nobody
++		// declared, i.e. Apple's own.
++		for (void *up = sfos_dt_parent(entry); up != NULL; up = sfos_dt_parent(up)) {
++			if (sfos_dt_prop(up, "pd,string-props", &list, &n) == 0)
++				return (false);
++		}
++		return (looks_like_strings(in, len) || ends(name, "-names"));
++	}
++	if (n == 0 || ((const char *)list)[n - 1] != 0)
++		return (false);
++	for (const char *p = list; p < (const char *)list + n; p += strlen(p) + 1) {
++		if (strcmp(p, name) == 0)
++			return (true);
++	}
++	return (false);
++}
++
+ // the inverse of the loader's import, so drivers see the property exactly as the fdt had it
+ static void
+ to_fdt(void *entry, const char *name, const uint8_t *in, uint32_t len, uint8_t *out)
+@@ -144,7 +172,7 @@
+ 	    name[0] == '#';
+ 	void *parent = sfos_dt_parent(entry);
+ 
+-	if ((!numeric && (looks_like_strings(in, len) || ends(name, "-names"))) || len % 4 != 0) {
++	if ((!numeric && is_text(entry, name, in, len)) || len % 4 != 0) {
+ 		memcpy(out, in, len);
+ 		return;
+ 	}

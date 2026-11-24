@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_GAP_ANALYSIS_NO_CODE_NO_HARDWARE",
+  "question": "What concretely separates the qualified startup-only native observer from an ordinary native interactive Wayland terminal/session, and what is the smallest bounded next test that advances desktop function without raw-HID tokens, multitouch, GPU, Wi-Fi or latency work?",
+  "sources": "Deployed Chonkstep source runs/m1-desktop-010/keyboard-only-compositor-build-001/source (717da106); native observer client-terminal-native-startup (set ae9bd975, binary bea5f11d) and its parent client-terminal (79c6c89f); client-ssd; darwin-native-live-test c06a481f; passive-child RAM record (310 files).",
+  "facts": [
+    "The observer is the qualified interactive terminal with only labels and its success condition changed (readiness instead of a host-typed response). Both are finite, nonce-bound test clients run with --seconds.",
+    "The observer's loop ends only on the deadline, a signal or window close (main.rs:644-646). Shell exit (PTY EOF) breaks the loop (main.rs:701-703), and the frozen criteria treat pty_eof as a failure. Cleanup always TERMs then KILLs the shell.",
+    "The shell gets a fixed environment: TERM=dumb, LC_ALL=C, PATH, HOME=/private/tmp, ENV=/dev/null, HISTFILE, PS1/PS2 (pty.rs:261-271). There is no WAYLAND_DISPLAY or XDG_RUNTIME_DIR, so nothing typed in the terminal can open a Wayland window.",
+    "The compositor cannot launch programs: the wm-core Backend trait has no spawn or exec hook, and the Darwin CpuBackend has none. Grabbed keys dispatch window-management actions only.",
+    "Every Wayland client in the RAM (darwin-wayland-terminal-native-startup, darwin-wayland-client, darwin-wayland-client-ssd) requires explicit '--socket PATH --nonce HEX48 --seconds N' (≤120 s) and ignores WAYLAND_DISPLAY. The PDSerialHID-qualified interactive terminal is not in the native RAM.",
+    "Every qualified desktop run so far has shown exactly one client window: desktop001 demo client, desktop002 SSD client, terminal008/009, native001/live001, T1, and passive-child (observer only)."
+  ],
+  "gaps": [
+    {"id": "D1", "gap": "No run has composited two clients at once, so stacking, placement, focus with a second toplevel, SSD chrome on multiple windows, and two-client cleanup are all unexercised."},
+    {"id": "D2", "gap": "No in-session app launch: no compositor spawn, no Wayland environment in the terminal shell, and no client that reads WAYLAND_DISPLAY."},
+    {"id": "D3", "gap": "Session end is deadline-only. There is no user-driven end (shell exit leading to a normal client exit, compositor teardown and console return), and EOF is currently a failure condition."},
+    {"id": "D4", "gap": "TERM=dumb with unsupported sequences counted (9 in passive-child, e.g. bracketed-paste toggles). Line editing and full-screen programs are out of scope until the terminal handles a basic VT subset."}
+  ],
+  "recommended_next_test": {
+    "name": "native two-window live composition (proposal only)",
+    "addresses": "D1. It is the only gap that needs no new kernel, SDK, client source or input.",
+    "artifact": "A RAM-only change on an already-qualified native base: a variant of darwin-native-live-test (c06a481f) that, after the server socket appears, starts the existing darwin-wayland-terminal-native-startup and the existing darwin-wayland-client-ssd (77dc33d5, frame-qualified in desktop-attempt002), each with a bounded --seconds, both kept mapped through the live framebuffer capture, then TERM/wait each with raw statuses. Recommend the keyboard-only native-live001 base (no pointer cursor to exclude) and the existing sealed native host mode; no T1/T2 experiment needed.",
+    "evidence": "One live frame showing both windows. The terminal body must equal the PTY RX replay pixel-for-pixel (the live001 method), and the SSD client body and chrome must equal its deterministic nonce paint and geometry (the desktop002 method). Also: recorded stacking/placement, which surface holds keyboard focus, both clients' frame-callback counts advancing, both exit statuses, compositor exit 0, sealed TX, verified Linux. Human interaction is optional; if any occurs, report it in a separate addendum as this run did.",
+    "out_of_scope": ["raw HID tokens", "multitouch", "GPU, Wi-Fi", "latency", "app launch from the shell (D2)"]
+  },
+  "follow_on_artifact_source_only": "For D2 later: an interactive-terminal revision that passes WAYLAND_DISPLAY and XDG_RUNTIME_DIR to its shell, plus a WAYLAND_DISPLAY fallback in the demo client. That is host-testable without hardware. Its runtime proof needs either human typing or a reviewed shell-start mechanism, so it should not be the next unattended test.",
+  "unknowns": ["the compositor's placement and focus policy for a second toplevel on this backend", "whether two clients fit the 80/120 s finite windows inside the 180 s host bound with margin (to measure from the live001 timeline)"],
+  "not_claimed": ["any runtime result", "pointer or keyboard input proof", "latency"]
+}

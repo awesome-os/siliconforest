@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_CAPTURE_REVIEW_NO_HARDWARE",
+  "capture": "runs/m1-keyboard-010/attempt-002/guest (private)",
+  "independent_checks": {
+    "guest_adt_guard": "guest-adt.bin is 340908 bytes, sha256 5746343cec92c13212d2de2fdcc3e9bb4a13a8c41b507e530ce6fffca62e56ef, and parses completely. m1kbd_validate_board, compiled from the frozen m1kbd_board.c d02e4a86, returns 0 (pass). This agrees with root's keyboard-guest-adt-guard.json and closes K4 on the real guest blob.",
+    "host_tx": "console-result error null, keyboard_command_sent true, desktop not sent. console-tx.bin (338 bytes, sha 433b8fbe...) matches the receipt, ends with exactly the keyboard command, and contains no 'm1keyboard'.",
+    "guest_script": "DLK_BEGIN, then DLK_INVENTORY_FAILED (caused by the inventory null-iterator bug, fixed separately as inventory 48cad701), then DLK_READY. The K3b non-fatal path worked. No DLK_TYPED or DLK_MISMATCH, so nobody typed.",
+    "driver": "Three complete PDM1SPIHID runs (console lines 281-284, 285-288, 330-333). Each logs device metadata bytes=89; last packet flags 40, device d0, offset 0, remain 0, length 99, parser_error 0; last message flags 40, device d0, command 20, report 01, subdevice d0, id 0, rsplen 0, payload 89; then 'stopped at device-metadata, error -2'. There are no 'expected response' lines because the response identity matched (responseExpected is cleared on a match), so the stop happened in m1kbd_device_info parsing.",
+    "inventory": "IOHIDDevice 1 (PDSerialHID), IOHIDKeyboard 1, AppleEmbeddedKeyboard 0, PDM1SPIHID 0 (failed instances detach), IOGOPFramebuffer 1; /dev/usb_hid_kbd and /dev/usb_hid_mouse absent; query_errors true (the known inventory bug)."
+  },
+  "conclusions": [
+    "The cause is confirmed by root's Linux excerpt ('limiting the number of devices to 4', with keyboard (1), trackpad (2) and actuator (3) at 001C:05AC:0341): num_devices > 4 fails our 2..4 check.",
+    "Three instances, not two: each IOResources publishResource re-match creates a new PDM1SPIHID after a failed start, which repeats the full power, reset and enumeration sequence. The once-only atomic probe latch is required.",
+    "No keyboard input, IOHID publication or typing claim. Enumeration stopped before the interface and descriptor requests."
+  ]
+}

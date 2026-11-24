@@ -1,0 +1,47 @@
+--- a/src/Frameworks/Onyx2D/O2Context_builtin.m
++++ b/src/Frameworks/Onyx2D/O2Context_builtin.m
+@@ -567,6 +567,44 @@
+ #endif
+ }
+ 
++// What -[NSView scrollRect:by:] asks for (NSCopyBits): the pixels of RECT moved so that the
++// rectangle's origin lies at POINT, both in user space. The move is by whole device pixels and
++// stays inside RECT (what leaves it is dropped; the strip it uncovers is the caller's to draw).
++// It was only defined for the abstract class: a view that scrolls its content this way raised.
++-(void)copyBitsInRect:(O2Rect)rect toPoint:(O2Point)point gState:(int)gState {
++   O2AffineTransform transform=O2ContextGetUserSpaceToDeviceSpaceTransform(self);
++   // the rectangle's device box from two opposite corners (the transform flips the y axis)
++   O2Point  corner=O2PointApplyAffineTransform(O2PointMake(O2RectGetMaxX(rect),O2RectGetMaxY(rect)),transform);
++   O2Point  from=O2PointApplyAffineTransform(rect.origin,transform);
++   O2Point  to=O2PointApplyAffineTransform(point,transform);
++   long     dx=lround(to.x-from.x),dy=lround(to.y-from.y);
++   long     width=O2ImageGetWidth(_surface),height=O2ImageGetHeight(_surface);
++   size_t   bytesPerRow=O2ImageGetBytesPerRow(_surface);
++   size_t   bytesPerPixel=O2ImageGetBitsPerPixel(_surface)/8;
++   uint8_t *pixels=[_surface pixelBytes];
++   long     x0=lround(fmin(from.x,corner.x)),y0=lround(fmin(from.y,corner.y));
++   long     x1=lround(fmax(from.x,corner.x)),y1=lround(fmax(from.y,corner.y));
++
++   if(pixels==NULL || bytesPerPixel==0 || (dx==0 && dy==0))
++    return;
++   if(x0<0) x0=0;
++   if(y0<0) y0=0;
++   if(x1>width) x1=width;
++   if(y1>height) y1=height;
++   // the destination rows and columns that stay inside the rectangle
++   long dx0=x0+(dx>0 ? dx : 0),dx1=x1+(dx<0 ? dx : 0);
++   long dy0=y0+(dy>0 ? dy : 0),dy1=y1+(dy<0 ? dy : 0);
++
++   if(dx0>=dx1 || dy0>=dy1)
++    return;
++   for(long i=0;i<dy1-dy0;i++){
++    // rows in the order that never reads a row already written
++    long y=dy>0 ? dy1-1-i : dy0+i;
++
++    memmove(pixels+y*bytesPerRow+dx0*bytesPerPixel,pixels+(y-dy)*bytesPerRow+(dx0-dx)*bytesPerPixel,(dx1-dx0)*bytesPerPixel);
++   }
++}
++
+ -(void)drawShading:(O2Shading *)shading {
+    O2GState    *gState=O2ContextCurrentGState(self);
+    O2ClipState *clipState=O2GStateClipState(gState);

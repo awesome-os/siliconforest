@@ -1,0 +1,22 @@
+#!/bin/sh
+# sf-net-up [interface] - bring the interface onto the network once in a root without configd:
+# radio on, join a remembered network if it is not joined, DHCP lease (address, default route,
+# /etc/resolv.conf via netsetup), then the resolver daemon that libc name lookups talk to.
+# This is "sf-netd --once"; run sf-netd without --once to keep the network up.
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+ifname=${1:-en0}
+if [ -x /usr/sbin/sf-netd ]; then
+    sf-netd --once "$ifname" || { echo "sf-net-up: network did not come up"; exit 1; }
+    echo "sf-net-up: resolver ready"
+    exit 0
+fi
+# a root without sf-netd: the interface must be joined already
+sf-dhcp "$ifname" || exit 1
+if [ ! -S /var/run/mDNSResponder ]; then
+    mkdir -p /var/run /var/log
+    # -debug keeps mdnsd in the foreground; it reads /etc/resolv.conf itself
+    mdnsd -debug > /var/log/mdnsd.log 2>&1 &
+    i=0
+    while [ ! -S /var/run/mDNSResponder ] && [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done
+fi
+[ -S /var/run/mDNSResponder ] && echo "sf-net-up: resolver ready" || { echo "sf-net-up: resolver did not start"; exit 1; }

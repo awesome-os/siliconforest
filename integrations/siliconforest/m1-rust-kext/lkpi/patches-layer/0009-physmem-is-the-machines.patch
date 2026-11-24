@@ -1,0 +1,30 @@
+fbsdkpi: si_meminfo() reports the machine's memory, not a constant 4 GiB
+
+sf_lkpi_physmem() was a constant. It now asks the xnu seam (sfos_physmem(): hw.memsize; that
+function is in patch 0002's files). Found by m1-lkpi-extras: the Asahi driver sizes its GPU
+memory limits from totalram.
+UPSTREAM: yes.
+
+--- a/src/Kernel/fbsdkpi/sf/lkpi/sf_lkpi_kern.c
++++ b/src/Kernel/fbsdkpi/sf/lkpi/sf_lkpi_kern.c
+@@ -72,11 +72,18 @@
+ 	sfos_sleep_us(1);
+ }
+ 
++uint64_t sfos_physmem(void);
++
+ unsigned long
+ sf_lkpi_physmem(void)
+ {
+-	// in pages, linuxkpi only sizes caches from it
+-	return (unsigned long)(4ULL << 30) / PAGE_SIZE;
++	// in pages: si_meminfo() totalram, which drivers size their limits from (the Asahi
++	// driver: 67 % of it device-wide, 50 % per client). 4 GiB when xnu does not say.
++	uint64_t bytes = sfos_physmem();
++
++	if (bytes == 0)
++		bytes = 4ULL << 30;
++	return (unsigned long)(bytes / PAGE_SIZE);
+ }
+ 
+ char *

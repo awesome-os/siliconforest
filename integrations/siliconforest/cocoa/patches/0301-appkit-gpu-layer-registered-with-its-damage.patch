@@ -1,0 +1,39 @@
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -103,6 +103,7 @@
+ 
+ @interface NSObject(SFFXGPUFrame)
+ -(CFTypeRef)copySFFXRenderedSurface;
++-(BOOL)_sffxExportDamage:(int *)box;
+ @end
+ // (TERM9) the whole-window GPU presenter is asked for only with SFFX_GPU_PRESENT=1 (Firefox's launcher sets it);
+ // the answer and WindowServer's entry are looked up once: every other application never calls it
+@@ -123,6 +124,17 @@
+  return set&&window?set((int)[window windowNumber],(uintptr_t)view,(void *)surface,sx,sy,sw,sh,dx,dy,dw,dh):0;
+ }
+ static void sfSFFXClearGPULayer(NSView *view,NSWindow *window){sfSFFXSetGPULayer(view,window,NULL,0,0,0,0,0,0,0,0);}
++// (FXPERF2) with the rectangle of the surface that differs from the one registered before (x0,y0,x1,y1, surface pixels,
++// rows top-down), so the window server composes and commits only that; the plain call when it does not know it
++typedef int (*sfSFFXSetGPULayerDamagedFn)(int,uintptr_t,void *,double,double,double,double,double,double,double,double,const int *);
++static int sfSFFXSetGPULayerDamaged(NSView *view,NSWindow *window,CFTypeRef surface,const int *damage,
++ double sx,double sy,double sw,double sh,double dx,double dy,double dw,double dh){
++ static sfSFFXSetGPULayerDamagedFn set;
++ static BOOL looked;
++ if(!looked){set=(sfSFFXSetGPULayerDamagedFn)dlsym(RTLD_DEFAULT,"_windowServerSFFXSetGPULayerDamaged");looked=YES;}
++ if(set==NULL||sfSFFXGPUPresenter()==NULL||window==nil)return sfSFFXSetGPULayer(view,window,surface,sx,sy,sw,sh,dx,dy,dw,dh);
++ return set((int)[window windowNumber],(uintptr_t)view,(void *)surface,sx,sy,sw,sh,dx,dy,dw,dh,damage);
++}
+ // (TERM10, FX-022) a window the window server shows as a popup or layer surface takes no GPU layers: its layers are
+ // read back without copying a frame first (a frame copied and then refused left the read-back empty: Firefox's menu
+ // panel showed as a transparent window)
+@@ -1965,7 +1977,9 @@
+       NSRect bounds=[self bounds],visible=[self visibleRect],target=[self convertRect:visible toView:nil];
+       CGFloat scale=[_window backingScaleFactor];
+       CGFloat sy=[self isFlipped]?NSMinY(visible)-NSMinY(bounds):NSMaxY(bounds)-NSMaxY(visible);
+-      BOOL registered=sfSFFXSetGPULayer(self,_window,surface,
++      int damage[4];
++      BOOL partial=[_layerContext respondsToSelector:@selector(_sffxExportDamage:)] && [(id)_layerContext _sffxExportDamage:damage];
++      BOOL registered=sfSFFXSetGPULayerDamaged(self,_window,surface,partial?damage:NULL,
+        (NSMinX(visible)-NSMinX(bounds))*scale,sy*scale,NSWidth(visible)*scale,NSHeight(visible)*scale,
+        NSMinX(target)*scale,(NSHeight([_window frame])-NSMaxY(target))*scale,NSWidth(target)*scale,NSHeight(target)*scale);
+       CFRelease(surface);

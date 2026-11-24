@@ -1,0 +1,22 @@
+#!/bin/sh
+# Flip-completion timing, for comparing a boot with high-priority work queues (the default,
+# layer patch 0025) against one with sflkpi_wq_highpri=0. 20 s of flips per run (about 1200):
+# dumb buffers with the event taken by read and by poll, then GPU buffers.
+# Read the "timing:" lines: kernel event timestamps min/max apart, and the counts of late
+# (> 25 ms) and early (< 8.3 ms) completions. A completion processed late shows as one late
+# and one early (the two intervals add up to two frames); a missed refresh as late only.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin; export PATH
+printf '\nDL51_TIMING_BEGIN_%s\n' "$nonce"
+sysctl -n kern.bootargs 2>&1 | cut -c1-200 | sed 's/^/DL51 bootargs: /'
+run() { # label, test arguments...
+    label=$1; shift
+    out=$(dcp-flip-test "$@" 2>&1); rc=$?
+    printf '%s\n' "$out" | grep -e 'flips in' -e 'timing:' -e FAIL -e 'failed' | cut -c1-240 | sed "s/^/DL51 $label: /"
+    printf 'DL51_TIMING_%s_RC=%s\n' "$label" "$rc"
+}
+run dumb_read --seconds ${DL51_SECONDS:-12} --wait read
+run dumb_poll --seconds ${DL51_SECONDS:-12} --wait poll
+run gpubuf_read --seconds ${DL51_SECONDS:-12} --prime-from auto
+printf 'DL51_TIMING_END_%s\n' "$nonce"

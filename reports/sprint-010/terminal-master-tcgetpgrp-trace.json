@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SOURCE_TRACE_NO_HARDWARE",
+  "question": "Does tcgetpgrp(master), which the terminal's pty.rs write() calls before every input, work on the pinned XNU, given that ttioctl TIOCGPGRP (tty.c:1266) requires isctty(p, tp) and the terminal app is not in the PTY's session?",
+  "answer": "YES, no defect and no hold needed. The master never reaches ttioctl's isctty check for TIOCGPGRP.",
+  "trace": [
+    "libc (puredarwin-baseline libc/gen/FreeBSD/termios.c:106): tcgetpgrp() checks isatty(fd), which works on the master because TIOCGETA has no ctty requirement, then calls _ioctl(fd, TIOCGPGRP, &s). Note: on ENOTTY/EINVAL/ENOSYS it falls back to getpgrp(), the caller's own pgrp. libSystem 8ff49e0c exports _tcgetpgrp.",
+    "Kernel dispatch: tty_ptmx.c ptmx_cdev (the /dev/ptmx primary) has .d_open = ptcopen and .d_ioctl = ptyioctl. The common ptyioctl lives in tty_dev.c:967 (the replica cdev also uses ptyioctl but has d_open = ptsopen).",
+    "tty_dev.c:1023-1031: 'else if (cdevsw[major(dev)].d_open == ptcopen) { switch (cmd) { case TIOCGPGRP: /* We aviod calling ttioctl on the controller since, in that case, tp must be the controlling terminal. */ *(int *)data = tp->t_pgrp ? tp->t_pgrp->pg_id : 0; goto out;'. This is the 4.4BSD controller special case: it returns the foreground pgrp without isctty and before any allow_ext_ioctl gating.",
+    "Value: the terminal child does setsid and then TIOCSCTTY on the slave, which makes the shell the session leader and sets tp->t_pgrp to its pgrp (its pid). +m keeps foreground jobs in that group, so tcgetpgrp(master) returns the shell pid, which is what Pty::write compares against. If t_pgrp were unset (0) or different, write() refuses, which fails closed."
+  ],
+  "residual": "Attempt-007 exercised the slave-side tcgetpgrp in the child, not this master path. The master path gets its first runtime exercise in the terminal run; a wrong value there can only refuse input (fail-closed), never inject it.",
+  "not_claimed": ["terminal runtime"],
+  "scope": "Read-only source trace of pinned XNU and libc plus a libSystem export check. No source change and no hardware."
+}

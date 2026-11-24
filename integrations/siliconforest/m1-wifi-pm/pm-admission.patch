@@ -1,0 +1,36 @@
+--- a/src/Kernel/Extensions/SFBwfm/SFBwfm.cpp
++++ b/src/Kernel/Extensions/SFBwfm/SFBwfm.cpp
+@@ -688,7 +688,8 @@
+ 		struct sf80211_powersave_data *ps = (struct sf80211_powersave_data *)data;
+ 
+ 		if (set) {
+-			if (*len < 3 * sizeof(uint32_t))
++			if (*len < 3 * sizeof(uint32_t) || ps->version != APPLE80211_VERSION ||
++			    ps->mode > 2 || ps->pm2_ret_ms > 60000)
+ 				return EINVAL;
+ 			if ((fChipDown || fPortDown) && chipUp(false, "power save") != kIOReturnSuccess)
+ 				return EIO;
+--- a/src/Kernel/Extensions/SFBwfm/bwfm.c
++++ b/src/Kernel/Extensions/SFBwfm/bwfm.c
+@@ -279,6 +279,8 @@
+ 	if (mode < BWFM_PM_CAM || mode > BWFM_PM_FAST_PS || ret_ms < 0 || ret_ms > 60000)
+ 		return EINVAL;
+ 	bwfm_lifecycle_enter(sc);
++	if (!sc->sc_pm_known)
++		sc->sc_pm2_ret_ms = sf_bwfm_want_pm2_ret();
+ 	sc->sc_pm_known = 1;
+ 	sc->sc_pm_mode = mode;
+ 	if (ret_ms > 0)
+@@ -286,9 +288,11 @@
+ 	if (sc->sc_initialized && !sc->sc_bus_gone &&
+ 	    (sc->sc_ic.ic_if.if_flags & IFF_RUNNING)) {
+ 		if (mode == BWFM_PM_FAST_PS && sc->sc_pm2_ret_ms > 0 &&
+-		    bwfm_fwvar_var_set_int(sc, "pm2_sleep_ret", sc->sc_pm2_ret_ms))
++		    bwfm_fwvar_var_set_int(sc, "pm2_sleep_ret", sc->sc_pm2_ret_ms)) {
+ 			printf("%s: pm2_sleep_ret %d ms not taken: %s\n", DEVNAME(sc),
+ 			    sc->sc_pm2_ret_ms, BWFM_CTLWHY(sc));
++			error = EIO;
++		}
+ 		if (bwfm_fwvar_cmd_set_int(sc, BWFM_C_SET_PM, mode))
+ 			error = EIO;
+ 		printf("%s: power save mode %d, pm2_sleep_ret %d ms: %s\n", DEVNAME(sc),

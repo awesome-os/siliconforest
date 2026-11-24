@@ -1,0 +1,40 @@
+#!/bin/sh
+# Guest side of the dma-buf descriptor mmap test (SFAgx + SFDcp, sfagx=1 sfdcp=2, kernel of
+# ../kernel.nix with patch 0003).
+# DL49_MMAP_dcp: a dumb buffer of the display driver, exported from the card node, its
+#   descriptor mapped in the same process, pattern read back through the dumb mapping.
+# DL49_MMAP_agx: GPU buffers made by a child process, descriptors sent over SCM_RIGHTS, mapped
+#   and written in the parent, read back in the child through the render node's mapping;
+#   then imported and flipped as in DL47.
+# Pass: both RC=0; per buffer "a mapping longer than the buffer is refused", "0 pixels read
+# through the descriptor's mapping differ", "pattern of buffer k read back ...: 0 pixels
+# differ"; about 60 flips per second; PASS.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin; export PATH
+run() { # label, test arguments...
+    label=$1; shift
+    out=$(dcp-flip-test "$@" 2>&1); rc=$?
+    printf '%s\n' "$out" | grep -e 'dma-buf' -e 'pattern' -e 'readback' -e 'received' -e 'child' \
+        -e 'exporting process' -e 'flips' -e 'timing:' -e FAIL -e 'failed' -e PASS | cut -c1-240 | sed 's/^/DL49 /'
+    printf 'DL49_MMAP_%s_RC=%s\n' "$label" "$rc"
+}
+uname -v | cut -c1-120 | sed 's/^/DL49 kernel: /'
+printf '\nDL49_MMAP_BEGIN_%s\n' "$nonce"
+# DL49_MMAP_ioctls: SYNC, EXPORT_SYNC_FILE and IMPORT_SYNC_FILE on a GPU buffer's descriptor in
+#   the process that created it (Mesa's case); the agx run repeats them across processes.
+#   Pass: two "... in the process that created the buffer: SYNC, EXPORT_SYNC_FILE and
+#   IMPORT_SYNC_FILE succeeded" lines (agx: plus two "in the process that received it").
+run ioctls --seconds 1 --prime-from auto --dmabuf-ioctls
+run dcp --seconds 1 --dmabuf-mmap
+run agx --seconds 1 --prime-from auto --scm-rights --dmabuf-mmap
+printf 'DL49_MMAP_END_%s\n' "$nonce"
+# DL50: every flip gives the display driver a sync_file made by the GPU driver (exported from
+# the GPU buffer's dma-buf) as IN_FENCE_FD. Pass: DL50_INFENCE_RC=0 and "N commits took a
+# sync_file of the GPU driver as IN_FENCE_FD" with N about 60. The fences are already
+# signalled (nothing renders in this test).
+printf '\nDL50_INFENCE_BEGIN_%s\n' "$nonce"
+out=$(dcp-flip-test --seconds 1 --prime-from auto --in-fence 2>&1); rc=$?
+printf '%s\n' "$out" | grep -e 'in-fence' -e 'flips' -e 'timing:' -e FAIL -e 'failed' -e PASS | cut -c1-240 | sed 's/^/DL50 /'
+printf 'DL50_INFENCE_RC=%s\n' "$rc"
+printf 'DL50_INFENCE_END_%s\n' "$nonce"

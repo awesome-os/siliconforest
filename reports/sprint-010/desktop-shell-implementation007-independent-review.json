@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "reviewer": "Grok (independent read-only source review; did not author 007)",
+  "status": "READ_ONLY_SOURCE_DELTA_REVIEW_NO_NATIVE_BUILD_NO_ADMISSION",
+  "prepared_utc": "2026-11-08T20:04:29Z",
+  "target": "integrations/puredarwin/chonkstep-darwin/desktop-shell/implementation-revisions/007",
+  "verdict": "NO_CONCRETE_DEFECT. The frozen delta is the D4 kernel-message record after a signal reap. Pre-spawn control flow is unchanged. The journal lines fit the 1024-byte bound, and a one- or two-attempt session result stays under the 16384-byte exporter cap. The record is not an input to wait status, signals, completion, or has_failures. Source acceptance only. Host tests are not a Darwin run, and this review does not admit a native build or a boot.",
+  "pins": {
+    "source_validation_sha256": "a5b63ea9d761e223917fcd3aa796623d691889f55e80c14f9506cce828b9da55",
+    "source_set_sha256": "248016c7428304cd07930bf2ddafe6fe23e8de1695559e74aaf4bdaed7d57452",
+    "incremental_source_set_sha256": "50ab4ab5c11ce6c00949f76983be1dee7bee41ac7c6c259d87f3fd4cf116ffc5",
+    "full_source_tree_sha256": "b979e28876299808902f90f33187a3455a39304b12a87aa8357131a9a52c59f9",
+    "full_source_tree_logical_file_count": 3966,
+    "from_006_patch_sha256": "ec2eb83d0d94770d3b2c3e2b360d349075d4e4035038344acbf60d6061b75f75",
+    "previous_006_source_validation_sha256": "cbe279232cad3fd74de1df897391eb3dfbf1a57e2a0689ee91af72288a8e1d7d",
+    "previous_006_full_tree_sha256": "82f4ccbd6e88ee330765d8661058914fd2839f78e0ce1c2eb46f54c2fe064cea"
+  },
+  "binding": {
+    "replay": "verify_checkpoint.py with assertions enabled printed: Verified007 cumulative 23 and incremental 2 files, full tree and dependencies; source only. It wrote only a temp scratch directory. Exit 0.",
+    "tree_delta": "Independent logical-byte compare of 006/source and 007/source, skipping target/.git/__pycache__, is 3966 files each. Exactly two paths differ: crates/wm-darwin/src/applications.rs 59922339 to 6908ae34, and crates/wm-darwin/src/launch_audit.rs 559606e4 to 22283894. Those are the incremental_changed_files. The cumulative changed_files list of 23 is the history versus the keyboard-only baseline."
+  },
+  "defects": [],
+  "d4": {
+    "placement": "spawn_using calls the shim, then OwnedChild::new only if child_created is 1. The new kernel_messages field is set to None in that constructor, after the shim returns. poll_using calls query_kernel_messages only after WaitState::Reaped and only when WIFSIGNALED, and only once. Application::service journals that value after exit_reason and cs_at_exit and before observe. A normal exit and a still-running child do not read.",
+    "pre_spawn": "from-006.patch does not change launch_at before spawn_using, the spawn request, or the C shim call. begin() pushes the Attempt, which now carries Option<KernelMessages>, before the shim. That value is None, so it does not allocate the line vector. The audit vector is a Vec of Attempt. gates_ms alone is 160 bytes, so the record is far above the 256-byte malloc class of the 248-byte spawn attributes. I did not measure sizeof(Attempt) and I did not re-run cargo. The 256 KiB proc_kmsgbuf buffer is allocated only on the signal-reap path, which is after the first spawn and before any later spawn.",
+    "bounds": "append still refuses a line longer than 1024 bytes or a journal past 2 MiB. The largest KernelMessages journal summary I formatted with attempt 127, ms u64::MAX, and u32/u64::MAX counters is 171 bytes. The largest KernelMessage text line is 300 bytes. Both are under 1024. The snapshot adds at most 2280 bytes per signal-reaped attempt (one summary plus eight 240-byte lines). Attempt 003's session-result.txt was 1747 bytes. One or two attempts of that shape stay under the exporter cap of 16384 in desktop-records.c. The writer itself does not enforce 16384.",
+    "outcome": "has_failures reads the audit error, attempt failure strings, launch_failure, status error, and Incomplete completion. It does not read kernel_messages. The host test kernel_messages_are_read_once_and_only_after_a_signal_reap keeps the SIGKILL as a failure. The record is not an admission.",
+    "proc_kmsgbuf": "The Apple declaration matches libproc.h: int proc_kmsgbuf(void *, uint32_t). libproc.c returns 0 when __proc_info fails. proc_kernmsgbuf requires suser and otherwise returns EPERM, after an optional MAC check. log_dmesg copies the newest bytes when the caller buffer is smaller. Canonical libSystem 8ff49e0c defines _proc_kmsgbuf and _geteuid. Host builds return Unsupported and do not call it."
+  },
+  "residuals": [
+    "The larger Attempt is allocated before the first spawn. It is not in the 248-byte size class. It can still change other heap traffic. The same kind of audit-field growth in 005 and 006 did not stop the first app from dying. This review does not prove the uninitialized spawn-attribute bytes are unchanged.",
+    "The 256 KiB read runs before a second spawn when the first child was signal-reaped. It does not run before the first spawn.",
+    "A successful log_dmesg copies at least the trailing NUL, so a zero return is a failure and the stored errno is the one proc_kmsgbuf left. An empty success is not how this kernel wrapper reports a log.",
+    "The Apple proc_kmsgbuf path is compiled by the Darwin type-check only. It has not run."
+  ],
+  "host_evidence": {
+    "tests_log_sha256": "8f899df7e40d2d5b9331e00328c3b1c0387d3cb1494a2ba8bb2b015278a601c5",
+    "tests": "Pinned validation/host-tests-007.log shows wm-darwin library tests 66 passed, 0 failed, and wayland_shm 5 passed, 0 failed, then exit=0. I did not re-run cargo.",
+    "clippy_log_sha256": "ce9c78de8cb2fddd1682cbd92a093374f6ec01de8ad48a5049f3d2bda7de12b4",
+    "clippy": "Pinned validation/clippy-007.log finishes the dev profile and exit=0. I did not re-run clippy.",
+    "darwin_typecheck_log_sha256": "92991f280529ca546422d8c96eeb2f2a147d89432301541c91b43695e57483d9",
+    "darwin_typecheck": "Pinned validation/darwin-typecheck-007.log checks wm-darwin for aarch64-apple-darwin, prints the UnavailableShim dead_code warning, finishes, and exit=0. The receipt's scope line says this is a type-check, not a link or run. I did not re-run it."
+  },
+  "not_claimed": [
+    "a fix for the first-app SIGKILL",
+    "the kernel subsystem that raised it",
+    "native 007 build, link, or execution",
+    "a runtime or boot result",
+    "physical input",
+    "that the diagnostic changes the outcome"
+  ],
+  "scope": "Read-only. verify_checkpoint.py, from-006.patch, the two Rust sources, pinned proc_kmsgbuf, proc_kernmsgbuf, and log_dmesg, and the three validation logs. No edits to 007, no cargo, no SSH, no hardware."
+}

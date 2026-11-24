@@ -1,0 +1,105 @@
+{
+ "report": "M1 framebuffer path review: why the panel held an old frame while the serial shell ran, and the minimal truthful display fix",
+ "author_role": "independent reviewer/implementer (Claude), read-only except the m1-display source patch",
+ "date": "2026-11-07",
+ "claim_class": "source_binary_and_saved_bootargs_review",
+ "verdict": "Source review identifies the gate that blocks normal console output to the panel: m1n1 sets boot-video display=0 under -v, so PE_create_console never switches to the video console, and with serial=3 normal console output stays on the UART. This review does not derive the exact provenance of the frame the panel retained (the user's photo shows a live current-boot 'Initializing serial KDP' frame); buffered or early boot text can still be painted despite the UART route. A truthful minimal path is: (1) host-only guest boot-video display=2 plus boot-arg serial_video_mirror=1 (already supported by kernel002), and (2) the IOGOPFramebuffer 30-bit description fix, so the console survives the IOKit framebuffer handoff at the correct depth. The framebuffer span is outside guest XNU RAM and all MCC carveouts. This file is a source-only review; compiled/boot claims belong to root's build records.",
+ "inputs_sha256": {
+  "bringup IOGOPFramebuffer.cpp (== pinned e7aa00a)": "72bdea3925213de85ed7caeeba52ca38bac18dd6acc9807d4dde0571d0344773",
+  "IOGOPFramebuffer Info.plist": "c6e38ce870ecc3d24320b7956fcf388954c92b5f9534104e2e081c36da8b6886",
+  "IOGraphicsFamily/IOFramebuffer.cpp": "1bb98e66478d5c414de6bf4234a0c3286be6ea6b1cdfb4ce9057e43bbda87fdd",
+  "IOGraphicsTypes.h": "ff5723d145e08e244c42a0421056c2e50ea17675f50a3a5c91b6d27fa467a2e3",
+  "xnu osfmk/console/video_console.c": "36fc5fa57dd3cebe2161242d476b97c0c49b760110cabc861537431391be3ea7",
+  "xnu osfmk/console/serial_general.c": "c19a8f601a0151807a3a80a072ec185244ed5ecf193f3982501df9092f7c5ce5",
+  "xnu osfmk/console/serial_console.c": "594f854529f5e45be0668e5ea09a4007888daf525bf051c393a942e3cdfe8c02",
+  "xnu pexpert/arm/pe_init.c": "24d3d56443a5eab79642e9ffd9e3f83296c4016bd6c1580e9ba8d50c0f5f5695",
+  "m1n1 src/fb.c (121fcbf)": "22dec340ab72b40076856b708b3495c3a70f7a1afa68d8fb8221f6fb5c5da117",
+  "captured proxyclient hv/__init__.py (attempt-009)": "18da80e496122233cbd3d69a287e5737ca78da083e8e36c8a33b01b35744c4a6",
+  "attempt-009 original-bootargs.bin (private)": "aedc8ad1d6463e4ce0966b830dfa2216444ddc24e28fbd6fe8ccede872dd1578",
+  "attempt-009 mcc-carveouts.bin (private)": "68e85adc1853aec128971d18379fa7e9bd1a1f016edc6f2a42274bb06981a559",
+  "booted KC (attempt-009)": "518d90c935ecf6c1fafc6c6cd975063e1dc08e077878461671b2975a2a2e5c9d"
+ },
+ "findings": [
+  {
+   "id": "D1",
+   "title": "display code zeroed by m1n1 under -v",
+   "fact": "captured proxyclient HV.set_bootargs: '-v' in boot args sets tba.video.display = 0 (else 1). pe_init.c PE_init_platform copies Video.v_display into PE_state.video.v_display."
+  },
+  {
+   "id": "D2",
+   "title": "video console never activated",
+   "fact": "pe_init.c PE_create_console: only if v_display != 0 does it call PE_initialize_console(1 => kPEGraphicsMode, otherwise kPETextMode) and, given serial_video_mirror=1 or gopconsole=1, switch_to_video_console(). With v_display=0 it only initializes text mode, and serial=3 keeps cons_ops on SERIAL_CONS_OPS."
+  },
+  {
+   "id": "D3",
+   "title": "normal console output does not reach the panel once the UART is selected",
+   "fact": "After serial=3 selects SERIAL_CONS_OPS, normal console output goes to serial_putc_options; the VC_CONS_OPS putc (vcputc_options) is the normal-output path that paints the framebuffer, and it is not dispatched while the console is serial. gc_enable(TRUE) at kPEAcquireScreen (startup.c:834) allocates character buffers and does not itself clear or paint. Other paths (buffered/early boot text replay, debugger/panic drawing) can still paint the framebuffer, so this is a gate on normal output, not a claim that nothing writes the buffer. The exact provenance of the retained panel frame is not derived here. User-reported (photo, not reviewed by Claude): the panel showed a live current-boot 'Initializing serial KDP' frame, which indicates current-boot writes to this buffer reach the panel."
+  },
+  {
+   "id": "D4",
+   "title": "the IOKit handoff keeps the screen released while the console is serial",
+   "fact": "IOGOPFramebuffer matches the PE's 'framebuffer' nub (Platform Display personality, IOPlatformDevice). IOFramebuffer findConsole calls setPlatformConsole(kPEReleaseScreen) then kPEEnableScreen with v_display=1. initialize_screen(kPEEnableScreen) re-takes the text console only when gc_text_boot && !console_is_serial(); gc_text_boot needs the first init in kPETextMode (pdtextboot defaults to 1). With a serial console the screen stays released; with video active it is re-taken on the new mapping."
+  },
+  {
+   "id": "D5",
+   "title": "IOGOPFramebuffer misdescribes 30-bpp firmware buffers (driver bug)",
+   "fact": "boot-args depth 0x1001e = 30 bpp, 2x scale, stride 0x2800 (4 bytes/px). IOGOP getPixelFormats/getPixelInformation have no case 30, so the default reports IO8BitIndexedPixels / kIOCLUTPixels / bitsPerPixel 8. IOFramebuffer consoleDepth (= componentCount*bitsPerComponent if bpc > 8, else bitsPerPixel) becomes 8 and is passed to the kernel console at the handoff; the post-IOKit console (where the shell appears) would paint 8-bit glyphs into 32-bit pixels. XNU itself supports depth 30 (case 30 -> vc_paint_char_32; vc_color_index_table[30] = 3 with 10-bit colours)."
+  },
+  {
+   "id": "D6",
+   "title": "framebuffer span is safe",
+   "fact": "Saved iBoot boot args: framebuffer 0xbd5d5c000-0xbd6cfc000 (15.6 MiB). Guest and iBoot XNU RAM end at 0xbd2d5c000 (phys_base 0x802078000 + mem_size 0x3d0ce4000), so the buffer is not allocatable RAM; XNU maps it with ml_io_map_unmappable(VM_WIMG_WCOMB) (HAS_UCNORMAL_MEM). Saved MCC carveouts 0xbd2d5c000+0x8000, 0xbd2d64000+0x1cf8000 and 0xbda620000+0x25800000 do not overlap it. It lies inside the m1n1 RAM-HIGH passthrough range [guest phys_base, 0xc00000000), and the host's bounded carveout unmap does not touch it. m1n1 copies iBoot's video struct into the guest boot args (tba = u.ba.copy()) and changes only display. MCC values re-verified from the raw attempt-009 bytes (mcc-carveouts.bin, little-endian u64 pairs): third entry address 0xbda620000 (offset 0x20) and length bytes '00 00 80 25 00 00 00 00' at offset 0x28 = 0x25800000 (end 0xbffe20000, below DRAM end 0xc00000000). Either 0x25800000 or 0x2580000 leaves the framebuffer clear, since the carveout starts above it at 0xbda620000."
+  },
+  {
+   "id": "D7",
+   "title": "no competing writer",
+   "fact": "Root's capture path calls stock HV.start() (host_console.py:405), which runs p.fb_shutdown(True) before P_HV_START: m1n1's own framebuffer console is off while the guest runs."
+  }
+ ],
+ "minimal_truthful_fix": {
+  "host_only": {
+   "change": "after set_bootargs, set guest-only tba.video.display = 2 and add boot-arg serial_video_mirror=1 (gopconsole=1 is an equivalent alias); log both as a declared policy, like kernel-ctrr-to-be-enabled",
+   "why_2_not_1": "1 = kPEGraphicsMode (splash): gc_graphics_boot suppresses text, and gc_text_boot stays FALSE, so the post-handoff re-take fails. 2 = kPETextMode in PD's PE_create_console.",
+   "serial_proof_preserved": "vcputc_options mirrors every character to the UART when serialmode & SERIALMODE_OUTPUT (serial=3), adding CR before LF as the serial path does; _vcgetc reads input via PE_stub_poll_input -> uart_getc; the serial keyboard poll thread is unchanged",
+   "truthfulness": "framebuffer geometry stays iBoot's; only the requested console mode changes; nothing claims a display the hardware did not provide"
+  },
+  "driver_patch": {
+   "path": "integrations/puredarwin/m1-display/framebuffer-30bit.patch",
+   "sha256": "91086c74d740991f6f98a117f9fa957b211fe071255e77a0d2abab26fbd90654",
+   "change": "IOGOPFramebuffer.cpp only, two added 'case 30:' blocks: getPixelFormats -> kIO30BitDirectPixels; getPixelInformation -> kIO30BitDirectPixels, kIORGBDirectPixels, masks R 0x3ff00000 G 0x000ffc00 B 0x000003ff, bitsPerPixel 32, componentCount 3, bitsPerComponent 10",
+   "result_sha256": "3690a93a06a38cb708858df9756636c2c14bcb45e2d811b9274eda12fb974f99",
+   "layout_proof": "m1n1 fb.c rgb2pixel_30 = (b<<2)|(g<<12)|(r<<22) (R[29:20] G[19:10] B[9:0], native little-endian 32-bit word); IOGraphicsTypes kIO30BitDirectPixels decodes to the same masks; XNU vc_colors column 3 matches",
+   "tests": "test_framebuffer_30bit.py (sha256 858e16e5...): 11/11 OK, 6 mutants caught",
+   "not_merged": "no platform reboot rev2 and no other source changes; root rebuilds the IOGOP bundle only, with kernel002 and platform rev1"
+  },
+  "expected_sequence_if_both_applied": "early PE_create_console: text console on the boot buffer at depth 30, video active, UART mirrored => verbose boot log on the panel; IOKit IOGOP start -> findConsole Release/Enable with consoleDepth 30 => kPEEnableScreen re-takes text on the IOGOP mapping (video console active) => single-user shell output drawn on the panel and mirrored to the UART. Requires hardware confirmation."
+ },
+ "risks": [
+  "Performance: vc_scroll_up -> video_scroll_up copies framebuffer to framebuffer, reading the write-combining 15.6 MiB mapping on every scroll. A verbose (-v) boot may slow noticeably against the bounded runtime and watchdogs. Measure with serial timestamps on the first display boot.",
+  "Compile: the patch is uncompiled until root's target-SDK Nix build; the console path does not exercise IOFramebuffer 10-bit gamma/cursor paths (WindowServer/Wayland later).",
+  "v_display=2 is PD's verbose-text code (comment in PE_create_console); after handoff PE_state.video is replaced by IOFramebuffer's console info (v_display 1) without affecting the re-take logic.",
+  "Any later window-server connection (kIOFBServerConnectType) releases the screen by design (Wayland/Chonkstep stage).",
+  "Panel reachability rests on the user-reported current-boot photo, not on observation in this review; the first display boot must show a fresh nonce on the panel, cross-checked on serial."
+ ],
+ "verification_plan_for_root": "One bounded display boot: identical KC except the IOGOP bundle; host sets display=2 + serial_video_mirror=1. Proof: the same fresh split-nonce challenge must appear on serial (strict pattern) AND be visible on the panel. A camera photo is only supporting evidence; the serial proof stays authoritative. Bound any framebuffer readback to the 0xbd5d5c000+0xfa0000 span (healthy RAM, outside the MCC carveouts).",
+ "not_claimed": [
+  "compile",
+  "boot",
+  "visible panel output",
+  "desktop/Wayland"
+ ],
+ "hardware_or_build_actions": "none",
+ "files_written": [
+  "integrations/puredarwin/m1-display/framebuffer-30bit.patch",
+  "integrations/puredarwin/m1-display/test_framebuffer_30bit.py",
+  "integrations/puredarwin/m1-display/FRAMEBUFFER_30BIT.md",
+  "reports/sprint-010/framebuffer-path-review.json"
+ ],
+ "revision": 2,
+ "corrections": [
+  "rev2: removed the D3 inference that the retained frame was attempt-006 panic UI; it contradicted the user's photo of a live current-boot 'Initializing serial KDP' frame",
+  "rev2: replaced 'nothing ever writes the framebuffer' and the 'fully explained' wording with a source gate on normal console output; buffered/early text can still paint (noted by Astra); provenance of the retained frame not derived",
+  "rev2: the MCC third length stays 0x25800000 (629145600). It was never changed; root's offline pinned-parser decode of the saved 80 bytes confirms it, the earlier 0x2580000 request came from a manual hex misreading, and runtime guards always used the decoded bytes."
+ ],
+ "scope_note": "source-only review; root's new patch/SDK/KC build records own all compiled claims"
+}

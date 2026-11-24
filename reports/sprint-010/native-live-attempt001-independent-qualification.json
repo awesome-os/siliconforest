@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "INDEPENDENT_READ_ONLY_QUALIFICATION_NO_HARDWARE",
+  "capture": "runs/m1-desktop-010/native-live-attempt-001 (private), saved files only",
+  "verdict": "QUALIFIED: native-only live window observed. At capture time the native observer's window was live on the keyboard-only seat. Its full server-side frame carries the title 'Chonkstep — native keyboard startup (input unverified)'. Its 896x544 body equals, on every pixel, the frozen renderer fed only the 93 PTY bytes from the strict live export. Everything outside the window is desktop background. The native driver, keyboard-only endpoint and sealed host match the qualified startup001. Live mode makes no app/child cleanup claim (closed001 holds that evidence) and no input or panel claim.",
+  "method": "My scratch qualify_native_live.py: 46 required checks, 46 pass. It is the native startup qualifier with live markers, strict '--phase live' prefix records, the body replay compare and chrome comparison against the qualified 008 frame. One rule was refined after inspecting the first run (see chrome below); the refinement explains the extra pixels exactly and does not relax the check.",
+  "binding": "verified-inputs = native-live-candidate-001: kernel eedf248b, source.patch b138dc6c, build record b3cb10f1, ramdisk 92b26ce5. Launcher 09cd5735 (and the attempt snapshot), controller cce9803f. Boot args end 'pdtextboot=1 pdm1kbd=1'.",
+  "host": "console-result: error null, native_keyboard_desktop_enabled true, native_mode_host_write_phase 'sealed', terminal/keyboard off, desktop sent, command line observed. console-tx.bin is 337 bytes (sha 86eff217), exactly ConsoleProof(nonce).command() + desktop_command(nonce) for nonce 598e5a0e..., with no SOH and no host input result files.",
+  "kernel_console": {
+    "sha256": "37fe65717cc1c01f (29865 bytes, matching console-result)",
+    "driver": "Same lines as startup001: L451 one 'sole probe attempt claimed', L473 device metadata 89 bytes 05ac:0341, L477 interface metadata 31 bytes, L479 'CRC-checked J293 keyboard descriptor acquired (90 bytes)'. There are no failure diagnostics, no first-input-report line and no PDSerialHID: line.",
+    "endpoint": "'BSD wait error=3 uptime_ms=55162'; 'BSD ready seen=1 uptime_ms=115138 elapsed_ms=59976'; 'published /dev/usb_hid_kbd'; 'ready kind=1 attempts=1 early_drops=0'. There is no mouse, PS/2 or kind=2 line, no deferred, refused or panic line. The inventory reports PDM1SPIHID only and the mouse node absent.",
+    "markers": "DL12_NATIVE_LIVE_BEGIN 668 < SERVER_SOCKET 702 < DL12_NATIVE_STARTUP_READY 708 (origin=native_input_unverified pty=ready keymap=xkb_v1 focus=own_surface frame=ready physical_input_proven=false) < 'DL12_NATIVE_LIVE_RECORDS_<n> phase=live rc=0' 744 (exactly once). Nothing follows the capture point: no STARTUP_DONE, LIVE_STATUS, footer, RETURN, END, FB close or IOGOP acquire. There is no NOT_READY, no REPLY_OBSERVED, and no observer, compositor, inventory or records error line (review note L1 satisfied)."
+  },
+  "live_records": "The strict decoder in live phase gives exactly four prefix records, each with file_bytes_after equal to its bytes: pty-rx 93 (4a1ac01b, byte-identical to startup001's prompt output), pty-tx 0, child.json 115 (04047436), child-ready.json 171 (1246686a: child_pid = sid = pgid = 15, session and controlling terminal checked in the child, exec status pipe closed, shell /bin/sh). It also gives 'DL11_RECORD_MISSING <n> grid-final.txt errno=2' and 'result.json errno=2', as the live phase allows. These equal root's decoded-terminal-records and root-live-record-check.json.",
+  "pixels": {
+    "framebuffer": "framebuffer.bin sha ec5171ed00dd8b46 matches framebuffer.json (16384000 bytes, physical_panel_observed false); the capture is this attempt's own step.",
+    "body": "My scratch termrender (frozen grid.rs 1fd4c8ec, render.rs 9a145a72, IBMPlexMono 6a3412f0 = the observer's), fed only the exported 93-byte pty-rx, renders an 80x24 grid ('$' plus the cursor). It equals the captured window body at origin (1,24) on all 487,424 pixels: 0 mismatched, 105 ink pixels. This agrees with root's native-live001-pixel-comparison.json (max channel difference 0).",
+    "chrome": "Compared with the qualified 008 frame (same 898x577 geometry at (0,0)): 0 differing pixels outside the frame, so desktop background only. Inside the chrome, the first run flagged differences reaching x=1. I traced them to the 008 pointer seat's cursor: 008's top-left 16x24 area equals this capture with wm-darwin's arrow() sprite (12x18) composited at (0,0), with 0 mismatches (53 cursor pixels). The keyboard-only seat advertises no pointer and draws no cursor, as expected (scene.rs: 'no advertised pointer capability'). Every other chrome difference (2200 pixels) lies in the title-text box x 269-628, y 6-18, centred between the unchanged miniaturize and close buttons. Border, title-bar fill, buttons and the 9-row resize bar are pixel-identical to 008. Reading the cropped title-bar pixels gives 'Chonkstep — native keyboard startup (input unverified)' (main.rs:476). I did not render title glyphs exactly (a vector font in wm-theme); root's comparison also records that title.",
+    "cursor_source_verification": "Root's explanation is confirmed from source, not by relaxing geometry. The 008 compositor d42795c8 (built from the unchanged sources/chonkstep-darwin) enables the pointer seat in enable_pdhid_seat (input.rs:44-52): seat.add_pointer() and backend cursor = Some((Point::new(0,0), arrow())). The scene starts the pointer at Point::new(0,0) (scene.rs:64) and, after all windows and decorations, draws the cursor at pointer - hotspot = (0,0) (scene.rs:225-226), so it sits over the title bar's left control. arrow() (input.rs:21-25) is a 12x18 RGBA buffer: rows 0-15, columns 0..min(y*2/3,10), shade 0 on edges and 255 inside, alpha 0 elsewhere. The keyboard-only compositor 717da106 (isolated source = approved patch 15fe9556) replaces this with enable_pdhid_seat_caps (input.rs:50-61): pointer only 'if caps.pointer', and 'if caps.pointer{b.cursor=Some((Point::new(0,0),arrow()));}'. With --input pdhid-keyboard, caps.pointer is false, so cursor stays at its initial None (scene.rs:64) and the draw at scene.rs:225 never runs. A client cannot set a cursor either, because set_cursor needs a wl_pointer and the seat advertises none. Pixel proof: composing exactly that arrow() at (0,0) over this capture reproduces 008's top-left 16x24 area with 0 mismatches. That accounts for 53 changed pixels at x 1-8, y 2-18 (008 white 255/black edges vs this capture's button 80/black), the same 53 root counted. The right button cells and everything else outside the title text are identical to 008."
+  },
+  "timing": "File mtimes (1 s): before-start 03:18:35; challenge and launcher 03:19:53 (+78 s); last console write 03:21:19 (+164 s, the live export line); core 03:21:35 (+180 s); framebuffer 03:21:37 (+182 s). The export finished about 16 s before the host stop, and the observer's 120 s deadline (about +200 s) had not been reached, consistent with the absence of DONE.",
+  "recovery": "DARWIN_COMMAND_LINE_OBSERVED_LINUX_VERIFIED, linux_verified true, reset_attempts 1, diagnostics_complete true, 14 diagnostic steps. returned-linux boot_id differs from baseline. capture-core console finalized with no close error.",
+  "notes": [
+    {
+      "id": "N1",
+      "severity": "scope",
+      "text": "Live capture: no result.json, cleanup, reap, closed export or text return is established here. That evidence is native-startup-attempt001-independent-qualification.json."
+    },
+    {
+      "id": "N2",
+      "severity": "scope",
+      "text": "No input occurred: PTY TX 0, no REPLY line, no driver first-input line, early_drops 0. The window shows only the shell prompt. Native key delivery and physical typing remain unproven."
+    },
+    {
+      "id": "N3",
+      "severity": "method",
+      "text": "The chrome rule was refined from 'differences may not touch x=1' to an exact, source-verified explanation: the 008 default cursor arrow() at (0,0), present only with a pointer seat, matched pixel for pixel (53 pixels), plus differences confined to the title text between the unchanged button cells. Frame geometry (898x577 at (0,0)), border, bar fill, buttons, resize bar and all outside pixels are held exactly. No criterion was relaxed."
+    }
+  ],
+  "not_claimed": [
+    "app or child cleanup from the live capture",
+    "native key delivery",
+    "physical typing",
+    "fresh physical-panel witness",
+    "trackpad",
+    "GPU",
+    "Wi-Fi"
+  ],
+  "scope": "Read-only: saved capture, my scratch qualifier, renderer and decoder, the qualified 008 framebuffer as a chrome reference, and the live host module used only for byte formats (09cd). No hardware, SSH, builds or edits."
+}

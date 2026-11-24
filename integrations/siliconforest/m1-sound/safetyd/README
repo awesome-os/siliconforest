@@ -1,0 +1,113 @@
+speakersafetyd for the SiliconForest guest (J293, 13" M1 MacBook Pro)
+================================================================================
+
+A port of the Asahi Linux speaker safety daemon, speakersafetyd 2.0.1 (git 4175df66,
+https://github.com/AsahiLinux/speakersafetyd, MIT, see LICENSE). The thermal model
+and the main loop are upstream's; only the platform layer is new: instead of ALSA the
+daemon talks to the kernel device /dev/sfspeaker-safety, whose contract is
+../include/sf_speaker_safety.h. The split is the one of Linux: the kernel holds the
+four speaker volumes at -100 dB unless this daemon owns the device and pings it at
+least every 250 ms while the speakers play; the daemon models the voice coil
+temperature from the current/voltage sense stream and lowers the volumes. Any error
+is a panic: the process exits (status 101), the device closes, the kernel locks.
+There is no option that bypasses the model or the lease.
+
+Build
+-----
+  ./build.sh            arm64 Mach-O for the guest -> build/speakersafetyd
+                        (host cargo --offline --locked, target aarch64-apple-darwin,
+                        linked by darwin-linker.py with the lab's pinned cross
+                        toolchain, SDK and libSystem; checks the header's ioctl
+                        numbers and that only libSystem is needed)
+  ./run-host-tests.sh   host tests on x86_64 Linux (needs alsa-lib's libasound.so.2)
+
+Crates (all from the local cargo registry, ~/.cargo/registry, no network):
+clap 4.6.7 (derive), log 0.4.34, signal-hook 0.4.4, libc 0.2.190 and what they pull
+in (Cargo.lock). Not available offline and replaced by small files here:
+configparser -> src/ini.rs, simple_logger and clap-verbosity-flag -> src/logger.rs.
+alsa is replaced by src/device.rs.
+
+Command line
+------------
+  speakersafetyd [-c DIR] [--machine NAME] [--runtime-dir DIR] [-m DB] [-v...] [-q...]
+
+  -c, --config-path DIR   config base directory; the file read is DIR/apple/j293.conf
+                          (default <PREFIX>/share/speakersafetyd; build.sh sets
+                          PREFIX=/usr). Install conf/apple/j293.conf there.
+      --machine NAME      "apple,j293" or "j293". Without it: sysctl hw.target, then
+                          hw.model ("J293AP" or "MacBookPro17,1" give apple,j293).
+      --runtime-dir DIR   directory of speakersafetyd.flag (default
+                          /var/run/speakersafetyd, created if missing). No flag file:
+                          cold start (coil assumed at 109 C). Flag file present, or
+                          not writable: warm start (coil assumed at 130 C, the gain
+                          starts reduced). The directory must be emptied at boot.
+  -m, --max-reduction DB  as upstream: panic if the gain goes below -DB (debugging)
+  -v / -q                 more / less logging (stdout; panics go to stderr)
+  SIGQUIT                 as upstream: panic at once ("SIGQUIT received")
+
+Must run as root, one instance (the device has one opener). Upstream is restarted by
+systemd (Restart=on-failure, RestartSec=1); something has to do that here too, the
+daemon ends on every error on purpose.
+
+Linux -> Darwin
+---------------
+  ALSA ctl device hw:AppleJ293        /dev/sfspeaker-safety (open, O_RDWR)
+  ELEM_LOCK of the controls           the open itself (one opener; close = lock)
+  write "Speaker Volume Unlock"       SFSPK_IOC_PING with 0xdec1be15; any error,
+    = 0xdec1be15                      ETIMEDOUT included, is a panic as on Linux
+  read "Speaker Sample Rate"          sfspk_info.sample_rate (SFSPK_IOC_INFO)
+  "<spk> Amp Gain Volume": set to     not set (the kernel fixes it); read:
+    max, read back                    sfspk_info.amp_gain, dBV = 11 + 0.5 * value
+  write "<spk> Speaker Playback       SFSPK_IOC_SET_VOLUME; the speaker is found by
+    Volume"                           name (Left Front, Right Front, Left Rear, Right
+                                      Rear = 0..3), the other three values are passed
+                                      back as SFSPK_IOC_INFO reports them
+  dB -> control value (alsa-lib,      same arithmetic, in helpers.rs: dB = -100.5 +
+    snd_ctl_convert_from_dB, range    0.5 * value, range 0..sfspk_info.volume_max,
+    read from the control each time)  NEAREST step, ties up (see below)
+  "<spk> VSENSE/ISENSE Switch" = on   nothing (always on in the kernel)
+  sense PCM hw:AppleJ293,2, readi()   read() on the device until `period` frames
+    of `period` frames, S16LE, 8 ch   (4096) of 8 S16LE samples are there
+  ESTRPIPE (suspend) -> reopen PCM    dropped (no such state, no such errno)
+  (none)                              sfspk_info.tripped != 0 or version != 1: panic
+  /proc/device-tree/compatible        --machine, or sysctl hw.target / hw.model
+  /run/speakersafetyd/...flag         /var/run/speakersafetyd/speakersafetyd.flag
+    (systemd RuntimeDirectory)        (--runtime-dir; the daemon makes the directory)
+  uclamp_max = 64 (sched_setattr)     ignored with a log line: XNU has no utilization
+                                      clamp, and no QoS class is set in its place
+  SIGQUIT flag, no SA_RESTART         the same (signal-hook + sigaction)
+
+Rounding: upstream passes alsa::Round::Floor, but alsa-lib only rounds down for a
+negative direction; for 0 it rounds to the nearest step. Measured with the host's
+alsa-lib 1.2.16: 0 dB -> 201, -12.03 dB -> 177 (-12.0 dB, not 176), -100 dB -> 1.
+The port does the same.
+
+Files
+-----
+  src/main.rs types.rs helpers.rs uclamp.rs   upstream's files, ported; each says in
+                                              its header what was changed
+  src/device.rs ini.rs logger.rs              new (device, config parser, logger)
+  conf/apple/j293.conf                        upstream's, unchanged
+  tests/model.rs, tests/process.rs            host tests; tests/common: fake device,
+                                              synthetic sense data
+  tests/upstream-ref/                         reference for the tests: upstream's
+                                              types.rs and helpers.rs UNMODIFIED,
+                                              built against a stand-in alsa crate
+                                              whose dB conversions call the real
+                                              alsa-lib
+
+Not verified (needs the guest, the kernel side and hardware)
+------------------------------------------------------------
+- Anything against the real device: the open, the three ioctls, the read, the lease
+  timing. One period is 85 ms at 48 kHz against a 250 ms lease, as on Linux, but the
+  scheduling of the guest is untested (no uclamp, no priority is set).
+- That the kernel's sense stream has the scale and channel order the Linux PCM has
+  (is_scale/vs_scale of j293.conf); the model is only as good as that.
+- What hw.target / hw.model say in the guest (use --machine j293 until known), and
+  that /var/run is empty after a boot (if not, every start is a warm start: safe,
+  but the gain starts at about -12 dB and recovers over a few minutes of playback).
+- The binary has not been run: it is linked against the lab's libSystem only
+  (unwinding, sigaction, sysctlbyname and the rest resolve at link time).
+- alsa::Round::Floor = 0 is from memory of the alsa crate (its source is not in the
+  offline registry). If it were negative, upstream would round down and be up to
+  one step (0.5 dB) lower than this port.

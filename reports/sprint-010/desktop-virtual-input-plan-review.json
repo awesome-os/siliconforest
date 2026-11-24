@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_PLAN_REVIEW_NO_HARDWARE",
+  "plan": "reports/sprint-010/desktop-virtual-input-plan.json (sha256 2b7b6ed81bb8dbdc)",
+  "verdict": "APPROVE AS A SOURCE PLAN. Every source claim checked holds. The attempt-002 capture confirms the plan's geometry preconditions. P1-P3 refine the observer and host contracts; none blocks implementation.",
+  "source_hashes_verified": "serial_general.c c19a8f60, PDSerialHID.cpp 39f718cf, PDHIDEventQueue.cpp c7a2f35b, wm-darwin hid.rs eace5888, input.rs 26bbb863, main.rs 99ffbeaa and wm-core manager.rs c05afe07 match the plan's pins.",
+  "claims_confirmed": [
+    "Framing (serial_general.c:59-76): 0x01 opens a line; the first CR or LF closes it and calls the handler. Bytes beyond 127 are silently dropped, and an embedded 0x01 does not resynchronise. With CRLF, the CR closes the line and the LF reaches cons_cinput, i.e. the tty. One LF per line is therefore required.",
+    "Parser (PDSerialHID.cpp:57-83): decimal strtoul, up to 8 values, zero-filled. 'k' gives a 9-byte report id 1 [mods,0,k1..k6]. 'm' gives a 6-byte report id 2, with X/Y clamped to 0x7fff and buttons masked with 7. The descriptor is a boot keyboard plus a 3-button absolute X/Y with logical and physical 0..32767. sendReport ignores allocation failure and the handleReport return, so a TX line is never delivery evidence.",
+    "Grab (PDHIDEventQueue.cpp:103-125, 388-407): any open of /dev/usb_hid_kbd sets gKbdGrabbed until the last close. While it is set, printable console forwarding stops, but modifier state is still tracked and Caps/Num/Scroll still toggle the LEDs. So 'always release Shift' and 'never send lock keys' are both required, as the plan says.",
+    "Compositor (main.rs): it accepts exactly '--run --socket PATH --input pdhid'. NativeHid::open (both character devices, nonblocking, draining up to 128 rounds to idle) runs before Pdgop::open, and the input loop sleeps 8 ms.",
+    "Absolute mapping (input.rs:84-87): x = q16*(w-1)/65535 and y likewise. The hit test uses floor(); Smithay receives the unfloored f64.",
+    "Double-click (manager.rs:3029-3061, 3184-3190): only an earlier press on the same window's titlebar drag region, within 400 ms and 4 px (scaled), triggers shade; a drag is never the first click. The single titlebar press that follows the content click therefore cannot shade.",
+    "Geometry (desktop-attempt002-ssd-frame-qualification.json): the measured frame is at (0,0), 802x513, with the client origin at (1,24) on a 2560x1600 output, exactly the plan's coordinate preconditions. The left miniaturize and right close buttons occupy about 23 px at each end of the title bar, so drag x=200, y=12 is a safe interior point."
+  ],
+  "findings": [
+    {"id": "P1", "kind": "observer contract", "text": "NativeHid::drain reads one keyboard record and one mouse record per round and pushes the keyboard event first (hid.rs:94-103). Order is preserved within each queue but not across devices within a round. The client-input observer must not assert keyboard-versus-pointer order. The plan's 100 ms or longer spacing, against the 8 ms loop, keeps the phases separate."},
+    {"id": "P2", "kind": "coordinate expectation", "text": "Pointer positions reach the client as fractional wl_fixed values. With q = round((p+0.5)*32767/(extent-1)) and linear kernel scaling, the expected client-local position is (p+0.5) minus the content origin (1,24): screen p=(201,124) gives about (200.5,100.5). Define the one-pixel acceptance window against that value, and report any kernel calibration offset as a measured value, not a correction."},
+    {"id": "P3", "kind": "host failure semantics", "text": "The SOH line buffer is one kernel static for all serial input. An unterminated SOH line swallows every later console byte, including shell commands, until a CR or LF arrives. After a short or failed VUART write, the guest console must therefore be treated as unusable as well: no typed cleanup or diagnostic commands, only the existing script-owned teardown and single-reset recovery. Never interleave a shell command with an open SOH line; the same-owner writer makes this structural."}
+  ],
+  "not_claimed": ["any input delivery", "physical keyboard or trackpad", "runtime"],
+  "scope": "Read-only. No hardware, builds or fetches."
+}

@@ -1,0 +1,50 @@
+# bindgen parameters on top of Linux's rust/bindgen_parameters, needed only because the C side
+# is FreeBSD LinuxKPI over Haiku's FreeBSD compatibility headers rather than Linux.
+# (The Haiku `seqlock` typedef that collides with LinuxKPI's `struct seqlock` is handled in
+# include/sf_bindgen_pre.h.)
+
+# LinuxKPI renames struct tags with macros; give the Linux names back as aliases.
+#   linux/page.h: #define page vm_page          linux/wait.h: #define wait_queue_entry wait_queue
+--raw-line 'pub type page = vm_page;'
+--raw-line 'pub type wait_queue_entry = wait_queue;'
+
+# KERN_* are "<N>" strings in LinuxKPI. rust/kernel/print.rs requires Linux's 3-byte form
+# (SOH, level, NUL) at compile time; lkpi/helpers/print.c parses it.
+--blocklist-item 'KERN_(EMERG|ALERT|CRIT|ERR|WARNING|NOTICE|INFO|DEBUG|CONT)'
+--raw-line 'pub const KERN_EMERG: &[u8; 3] = b"\x010\0";'
+--raw-line 'pub const KERN_ALERT: &[u8; 3] = b"\x011\0";'
+--raw-line 'pub const KERN_CRIT: &[u8; 3] = b"\x012\0";'
+--raw-line 'pub const KERN_ERR: &[u8; 3] = b"\x013\0";'
+--raw-line 'pub const KERN_WARNING: &[u8; 3] = b"\x014\0";'
+--raw-line 'pub const KERN_NOTICE: &[u8; 3] = b"\x015\0";'
+--raw-line 'pub const KERN_INFO: &[u8; 3] = b"\x016\0";'
+--raw-line 'pub const KERN_DEBUG: &[u8; 3] = b"\x017\0";'
+--raw-line 'pub const KERN_CONT: &[u8; 3] = b"\x01c\0";'
+
+
+# Real functions in LinuxKPI whose C type differs from Linux's; the helper of the same name
+# (Linux's signature) is used instead. is_vmalloc_addr returns int here, bool on Linux.
+--blocklist-function is_vmalloc_addr
+
+# linux/fs.h: #define file linux_file. Without this `bindings::file` is the FreeBSD
+# compatibility layer's own `struct file` (declared before that define), not the struct
+# LinuxKPI code means by `struct file`. Nothing uses the FreeBSD one by value.
+--blocklist-type file
+--raw-line 'pub type file = linux_file;'
+
+# linux/slab.h: #define kmem_cache linux_kmem_cache
+--raw-line 'pub type kmem_cache = linux_kmem_cache;'
+
+# dma_addr_t is u64 on Linux. Here it is vm_paddr_t, Haiku's `unsigned long`, which bindgen
+# gives Rust as usize: same size and layout, a different Rust type (rtkit.rs assigns a u64).
+--blocklist-type dma_addr_t
+--raw-line 'pub type dma_addr_t = u64;'
+# The same for the other two address-sized types Linux defines as u64 on arm64 and the
+# kernel crate and the driver use as such (`.into()` from u32, arithmetic with u64).
+--blocklist-type phys_addr_t
+--raw-line 'pub type phys_addr_t = u64;'
+--blocklist-type resource_size_t
+--raw-line 'pub type resource_size_t = u64;'
+
+# pd/fbsd-extra: #define acpi_device _device (FreeBSD's ACPI device is its newbus device)
+--raw-line 'pub type acpi_device = _device;'

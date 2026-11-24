@@ -1,0 +1,126 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Guest side of the multi-core stress boots (names la*), aimed at what
+# docs/roadmap/research/smp-lock-audit.md found. Needs the desktop collection (Wi-Fi + SFAgx +
+# SFDcp), cpus=8, sfagx=1 sfdcp=2. Stages are selected with @STAGES@ (default all) and scaled
+# with @SCALE@ (seconds of each timed stage, default 20; the soak passes thousands).
+#
+#   storm     drm-storm, 8 threads per case, on the render node while 8 CPU workers hash:
+#             open/close, ioctls, GEM create/mmap/verify, syncobj, PRIME export/import into a
+#             second file, sync-file and dma-buf poll, close-while-ioctl, mmap-while-close
+#             (D1, D2, D4, P5, P6, W5, W6, X1)
+#   gl        four agx-offscreen-test loops at once (exact pixel hash each run) and drm-storm
+#             gem,prime,syncfile beside them (P5 fence waits, W1/W4 on context teardown)
+#   wifi      radio off, on, rejoin, ping, three times, under the CPU load (H1: the interrupt's
+#             event source is removed and added again while interrupts arrive)
+#   session   the GL desktop session (compositor on the display node importing the GPU's
+#             buffers: X1, X3) with drm-storm gem,prime,syncfile,ioctl and the CPU load beside it
+#
+# Lines: LA_<STAGE>_RC=<n> per stage (0 passes), DRMSTORM lines, agx-offscreen-test PASS/FAIL
+# counts, the session's own WMGL3/WMSTAT lines, LA_RESULT stages=.. failed=.. at the end.
+# A stage that does not come back within its limit prints LA_<STAGE>_STALLED and counts as
+# failed. (@SSID@/@PSK@ are filled in by the assembler.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin; export PATH
+STAGES='@STAGES@'; SCALE=@SCALE@
+B=8fee6b41134a7b3eaa7e9b0f61aa6e907d21cafd4a2685a00a4699c3b32da274
+failed=0; ran=0
+printf '\nLA_BEGIN_%s stages=%s scale=%s\n' "$nonce" "$STAGES" "$SCALE"
+sysctl hw.ncpu hw.activecpu 2>&1
+ncpu=$(sysctl -n hw.ncpu 2>/dev/null); ncpu=${ncpu:-1}
+ls -l /dev/dri 2>&1 | head -6
+
+want() { case ",$STAGES," in *",$1,"*|*",all,"*) return 0;; esac; return 1; }
+
+# limit SECONDS LABEL COMMAND...: run with a deadline; the stage's verdict line
+limit() {
+    lim=$1; label=$2; shift 2
+    ran=$((ran+1))
+    ( "$@" ) 2>&1 &
+    pid=$!; t=0
+    while kill -0 $pid 2>/dev/null && [ $t -lt $lim ]; do sleep 1; t=$((t+1)); done
+    if kill -0 $pid 2>/dev/null; then
+        kill -9 $pid 2>/dev/null
+        printf 'LA_%s_STALLED after %ss\n' "$label" "$t"; failed=$((failed+1)); return 1
+    fi
+    wait $pid; rc=$?
+    printf 'LA_%s_RC=%s seconds=%s\n' "$label" "$rc" "$t"
+    [ "$rc" = 0 ] || failed=$((failed+1))
+    return $rc
+}
+
+worker() {      # id seconds
+    i=0; end=$(( $(date +%s) + $2 ))
+    while [ "$(date +%s)" -lt "$end" ]; do
+        dd if=/dev/zero bs=1048576 count=8 2>/dev/null | sha256sum > /dev/null; i=$((i+1))
+    done
+    printf 'LA_WORKER id=%s megabytes=%s\n' "$1" "$((i*8))"
+}
+load() {        # seconds: one hashing worker per processor, in the background
+    w=0; while [ "$w" -lt "$ncpu" ]; do worker "$w" "$1" & w=$((w+1)); done
+}
+
+wifi_up() {
+    sf-dhcp --up en0 2>&1; sleep 2
+    wifiutil on 2>&1; sleep 8
+    wifiutil join '@SSID@' '@PSK@' 2>&1; sleep 4
+    sf-net-up en0 2>&1
+    ping -c 3 10.1.1.1 2>&1 | tail -2
+}
+
+gl_loop() {     # id runs
+    p=0; f=0; i=0
+    while [ $i -lt "$2" ]; do
+        if agx-offscreen-test --require-renderer "Apple M1" --expect-b $B >/tmp/la-gl.$1 2>&1; then p=$((p+1)); else f=$((f+1)); grep -v '^agx-offscreen-test:   ' /tmp/la-gl.$1 | tail -3 | cut -c1-160; fi
+        i=$((i+1))
+    done
+    printf 'LA_GL_LOOP id=%s pass=%s fail=%s\n' "$1" "$p" "$f"
+    [ "$f" = 0 ]
+}
+
+stage_storm() {
+    load $(( SCALE * 8 + 10 ))
+    drm-storm --threads 8 --seconds "$SCALE"; rc=$?
+    wait; return $rc
+}
+stage_gl() {
+    load $(( SCALE * 2 ))
+    rc=0
+    for n in 1 2 3 4; do gl_loop $n $(( SCALE / 2 + 1 )) & eval "g$n=$!"; done
+    drm-storm --threads 4 --seconds "$SCALE" --cases gem,prime,syncfile || rc=1
+    for n in 1 2 3 4; do eval "wait \$g$n" || rc=1; done
+    wait; return $rc
+}
+stage_wifi() {
+    load $(( SCALE * 3 ))
+    rc=0
+    for round in 1 2 3; do
+        wifiutil off 2>&1 | tail -1; sleep 2
+        wifiutil on 2>&1 | tail -1; sleep 6
+        wifiutil join '@SSID@' '@PSK@' 2>&1 | tail -1; sleep 3
+        sf-net-up en0 2>&1 | tail -1
+        if ping -c 3 10.1.1.1 >/tmp/la-ping 2>&1; then printf 'LA_WIFI_ROUND %s ping ok\n' "$round"; else printf 'LA_WIFI_ROUND %s ping FAILED\n' "$round"; tail -2 /tmp/la-ping; rc=1; fi
+    done
+    wait; return $rc
+}
+stage_session() {
+    load $(( SCALE * 3 ))
+    ( sleep 15; drm-storm --threads 4 --seconds "$SCALE" --cases gem,prime,syncfile,ioctl ) & sp=$!
+    /usr/local/bin/wm-gl-session "$nonce"; rc=$?
+    wait $sp || rc=1
+    wait; return $rc
+}
+
+sleep 4
+want wifi || want session || want storm || want gl
+limit 60 WIFIUP wifi_up
+want storm   && limit $(( SCALE * 8 + 60 ))  STORM   stage_storm
+want gl      && limit $(( SCALE * 4 + 90 ))  GL      stage_gl
+want wifi    && limit $(( SCALE * 3 + 150 )) WIFI    stage_wifi
+want session && limit $(( SCALE * 3 + 330 )) SESSION stage_session
+ping -c 3 10.1.1.1 2>&1 | tail -2
+sysctl hw.ncpu hw.activecpu 2>&1
+printf 'LA_RESULT stages=%s failed=%s status=%s\n' "$ran" "$failed" "$([ "$failed" = 0 ] && echo PASS || echo FAIL)"
+printf 'LA_END_%s\n' "$nonce"
+# the bench stops capturing a second after this line (AGENTS.md, bench queue)
+printf '\nPD_BENCH_DONE\n'

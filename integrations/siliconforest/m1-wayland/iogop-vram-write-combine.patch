@@ -1,0 +1,87 @@
+diff --git a/src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.cpp b/src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.cpp
+index 859278c..c307b55 100644
+--- a/src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.cpp
++++ b/src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.cpp
+@@ -1,6 +1,7 @@
+ #include "IOGOPFramebuffer.h"
+ 
+ #include <IOKit/pci/IOPCIDevice.h>
++#include <IOKit/IODeviceTreeSupport.h>
+ 
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/thread_call.h>
+@@ -29,6 +30,7 @@ static int gFb0Major = -1;
+ static uint8_t *gFb0Base;
+ static IODeviceMemory *gFb0Memory;
+ static IOMemoryMap *gFb0Map;
++static IOOptionBits gFb0CacheMode = kIOGOPFBMapCacheMode;
+ static size_t gFb0Size;
+ static thread_call_t gFb0RetryCall;
+ static IONotifier *gFb0BSDNotifier;
+@@ -153,7 +155,7 @@ fb0_publish(uint8_t *physicalBase, size_t size)
+             return;
+         }
+ 
+-        gFb0Map = gFb0Memory->map(kIOMapAnywhere | kIOGOPFBMapCacheMode);
++        gFb0Map = gFb0Memory->map(kIOMapAnywhere | gFb0CacheMode);
+         if (!gFb0Map) {
+             DEBUG("failed to map /dev/fb0 physical range %p size=%lu\n",
+                   physicalBase, (unsigned long)size);
+@@ -465,6 +467,43 @@ IOGOPFramebuffer::drmTimedOut(thread_call_param_t param, thread_call_param_t)
+     self->release();
+ }
+ 
++/*
++ * True for the firmware boot framebuffer on an Apple SoC: published as a
++ * platform nub (not a PCI BAR) under a device tree whose root is "AppleARM".
++ * That buffer is DRAM (inside /chosen dram-base/dram-size, outside XNU-managed
++ * memory) which the display controller scans out without snooping CPU caches.
++ * XNU's boot console already maps it VM_WIMG_WCOMB (Normal non-cacheable).
++ * IOKit's default mode and kIOMapInhibitCache both give VM_WIMG_IO instead,
++ * which pmap turns into Device-GRE for DRAM, and Device memory faults on the
++ * unaligned stores and DC ZVA that memcpy/memset/pixman routinely emit.
++ */
++static bool
++gop_apple_soc_firmware_fb(IOService *provider)
++{
++    IORegistryEntry *root;
++    OSData *compat;
++    bool apple = false;
++
++    if (OSDynamicCast(IOPCIDevice, provider) != NULL)
++        return false;
++    root = IORegistryEntry::fromPath("/", gIODTPlane);
++    if (root == NULL)
++        return false;
++    compat = OSDynamicCast(OSData, root->getProperty("compatible"));
++    if (compat != NULL) {
++        const char *s = (const char *)compat->getBytesNoCopy();
++        unsigned int len = compat->getLength();
++        for (unsigned int o = 0; s != NULL && o < len; o += (unsigned int)strnlen(s + o, len - o) + 1) {
++            if (strncmp(s + o, "AppleARM", len - o) == 0) {
++                apple = true;
++                break;
++            }
++        }
++    }
++    root->release();
++    return apple;
++}
++
+ bool
+ IOGOPFramebuffer::start(IOService *provider)
+ {
+@@ -497,6 +536,13 @@ IOGOPFramebuffer::start(IOService *provider)
+     height = bootDisplay.v_height;
+     pitch  = bootDisplay.v_rowBytes;
+     bpp    = 32;
++    if (gop_apple_soc_firmware_fb(provider)) {
++        /* Give the user VRAM mapping (IOFramebufferUserClient honours this
++         * property) and /dev/fb0 the boot console's Normal non-cacheable
++         * attribute instead of the Device default. */
++        setProperty("sf-vram-write-combine", kOSBooleanTrue);
++        gFb0CacheMode = kIOMapWriteCombineCache;
++    }
+     fb0_publish((uint8_t *)fbBase, (size_t)pitch * height);
+ 
+     DEBUG("framebuffer: %dx%d @ %p\n", width, height, fbBase);

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SOURCE_REVIEW_NO_HARDWARE_NOT_APPLIED",
+  "reviewed": {
+    "patch": "integrations/puredarwin/m1-native-input/host-revision-001/native-host.patch, sha256 b5828a07e4aac411 (manifest 7486b825)",
+    "files": "host_progress.py b260bff9 -> 09cd5735 (the before copy equals the live active host); new test_native_desktop_progress.py 23420d50. The controller m1_bringup_cycle.py is unchanged (cce9803f). My scratch overlay replay reproduces both after hashes. The active host was not modified."
+  },
+  "verdict": "APPROVE the isolated native host revision for later application, after candidate-010 qualifies and with its own concrete native packet. The opt-in is exact and exclusive, PDSerialHID and every host-HID experiment are forbidden, there is no HID scheduler, the real SPI member, boot argument and geometry are enforced before the guest runs, and the VUART writer is sealed before the fixed launcher.",
+  "verified": [
+    "Opt-in: native_keyboard_desktop_enabled parses the build record with object_pairs_hook=image.unique (duplicate keys refused). The experiment must equal {version 1, driver 'PDM1SPIHID', input 'pdhid-keyboard', host_hid_injection false} with exact types. The presence (even null) of keyboard_experiment, virtual_input_experiment or terminal_input_experiment refuses, as does a missing desktop opt-in or bound RAM. KC members must include org.puredarwin.driver.PDM1SPIHID, com.apple.iokit.IOHIDFamily and com.ravynos.iokit.IOGOPFramebuffer and must not include org.puredarwin.driver.PDSerialHID. verify_spi_keyboard_member (factored out of keyboard_enabled, body unchanged and still returning True) requires a native fileset with exactly one PDM1SPIHID entry.",
+    "No HID injection: ConsoleSession requires native mode to be desktop-only with no keyboard, virtual or terminal flag. self.virtual stays None, so advance_virtual returns immediately and no SOH or HID report can be scheduled.",
+    "Writer state machine (native mode only, enforced inside send() before the ledger write): in 'initial', '/bin/sh\\r' is allowed once (the shell-path prompt) and the exact ConsoleProof challenge moves to 'await_launcher'; any other byte string refuses. In 'await_launcher', only desktop_command(nonce) is allowed, and only when the proof is complete and desktop_sent is set; the phase becomes 'sealed' BEFORE the ledger write and dev.write, so a short or failed launcher write is still followed by refusal. In 'sealed', every send refuses. A refusal raises, which follows the existing transport-failure path (sets error, ends the reader); that is fail-closed and only reachable by a bug, since no other send path is active in this mode. console-result records native_keyboard_desktop_enabled and native_mode_host_write_phase.",
+    "Boot and capture: bootargs add pdm1kbd=1 for native mode (the PDM1SPIHID opt-in). validate_input_geometry requires exclusive boolean flags and enforces 2560/1600/10240/30 for native mode before the guest runs. capture_framebuffer stays on (not keyboard).",
+    "Tests re-run on the patched overlay: test_native_desktop_progress 7/7, test_host_progress 41/41, test_terminal_input_progress 11/11, test_virtual_input_progress 18/18, test_progress_source_fidelity 2/2, tests.test_m1_bringup_cycle 20/20."
+  ],
+  "qualification_rules": [
+    "The TX ledger after a native run must equal exactly [optional '/bin/sh\\r'] + challenge + desktop launcher, with native_mode_host_write_phase 'sealed' and console-result error null. Any SOH byte or HID report is a failure.",
+    "The host does not verify which IOHIDFamily build is in the KC; the concrete native packet review must bind the publication-patched IOHIDFamily (820d75b1 line) and a PDSerialHID-free member list."
+  ],
+  "not_claimed": ["application", "runtime", "native keyboard input", "physical typing"],
+  "scope": "Read-only source review plus host tests on a scratch overlay. No live host change and no hardware."
+}

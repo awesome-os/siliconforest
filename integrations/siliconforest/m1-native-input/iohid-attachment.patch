@@ -1,0 +1,45 @@
+diff --git a/src/Kernel/Extensions/IOHIDFamily/IOHIDFamily/IOHIDEventService.cpp b/src/Kernel/Extensions/IOHIDFamily/IOHIDFamily/IOHIDEventService.cpp
+--- a/src/Kernel/Extensions/IOHIDFamily/IOHIDFamily/IOHIDEventService.cpp
++++ b/src/Kernel/Extensions/IOHIDFamily/IOHIDFamily/IOHIDEventService.cpp
+@@ -260,6 +260,33 @@
+ 
+     return true;
+ }
++/* The parsed collection capabilities of a successfully started event service
++ * authorize only matching real queue endpoints. No report is manufactured.
++ * Native SPI keyboard: keyboard only. PDSerialHID: keyboard + virtual mouse. */
++static void
++pdHIDPublishSupportedQueues(bool ready, OSArray *pairs)
++{
++    if (!ready || !pairs) return;
++    for (unsigned i = 0; i < pairs->getCount(); i++) {
++        OSDictionary *pair = OSDynamicCast(OSDictionary, pairs->getObject(i));
++        if (!pair) continue;
++        OSNumber *page = OSDynamicCast(OSNumber, pair->getObject(kIOHIDDeviceUsagePageKey));
++        OSNumber *usage = OSDynamicCast(OSNumber, pair->getObject(kIOHIDDeviceUsageKey));
++        if (!page || !usage || page->unsigned32BitValue() != kHIDPage_GenericDesktop) continue;
++        switch (usage->unsigned32BitValue()) {
++            case kHIDUsage_GD_Keyboard:
++            case kHIDUsage_GD_Keypad:
++                PDHIDPublishKeyboardDevice();
++                break;
++            case kHIDUsage_GD_Mouse:
++                PDHIDPublishMouseDevice();
++                break;
++            default:
++                break;
++        }
++    }
++}
++
+ //====================================================================================================
+ // IOHIDEventService::start
+ //====================================================================================================
+@@ -371,6 +398,7 @@
+     }
+ 
+     _readyForInputReports = true;
++    pdHIDPublishSupportedQueues(_readyForInputReports, _deviceUsagePairs);
+     
+     obj = getProperty(kIOHIDRegisterServiceKey);
+     if (obj != kOSBooleanFalse) {

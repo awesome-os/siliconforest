@@ -1,0 +1,162 @@
+diff -ru a/integrations/puredarwin/m1-bringup/host_progress.py b/integrations/puredarwin/m1-bringup/host_progress.py
+--- a/integrations/puredarwin/m1-bringup/host_progress.py	2026-11-12 08:14:45.540822787 -0800
++++ b/integrations/puredarwin/m1-bringup/host_progress.py	2026-11-12 08:14:45.541750509 -0800
+@@ -67,6 +67,10 @@
+ # A guest script that prints this at the start of a line ends the capture about a second
+ # later instead of waiting out --runtime (which stays the upper bound).
+ DONE_MARKER = b'PD_BENCH_DONE'
++# Printed by a guest script just before it restarts the machine itself; honoured only when
++# self_reboot_mode.txt lies next to this file (integrations/puredarwin/m1-native-boot/reboot).
++REBOOT_MARKER = b'PD_BENCH_REBOOT'
++REBOOT_LINGER = 10      # seconds of UART console kept after it (a native boot's capture)
+ # Seconds of console silence after a prompt before the challenge is typed.
+ SETTLE = 1.0
+ 
+@@ -479,6 +483,13 @@
+         self.finish = threading.Event()
+         self.error = None
+         self.done_mode, self.done_seen, self.done_scan = done_mode(), False, 0
++        # A guest that restarts the M1 itself: under the hypervisor this console's USB device
++        # disappears with m1n1, which then ends the capture and is not an error of it. On
++        # the real UART (a native boot) nothing shows the reset: the capture ends
++        # REBOOT_LINGER seconds after the announcement, as if the end marker had come.
++        self.self_reboot = (HERE/'self_reboot_mode.txt').exists()
++        self.usb_console = native_boot is None or port != native_boot.UART_DEVICE
++        self.reboot_seen, self.reboot_at, self.gone = False, None, None
+         self.times = None
+         try:
+             self.times = open(directory / 'console-times.txt', 'x')
+@@ -505,6 +516,9 @@
+                 # lines follow the prompt. The proof itself is unchanged.
+                 prompt_seen, last_rx = False, time.monotonic()
+                 while not self.finish.is_set():
++                    if (self.reboot_at is not None and not self.usb_console and
++                            time.monotonic() - self.reboot_at >= REBOOT_LINGER):
++                        self.done_seen = True
+                     data = self.dev.read(4096)
+                     if data:
+                         log.write(data)
+@@ -548,6 +562,10 @@
+                     self.check_done(tail)
+                     self.advance_virtual(data)
+         except BaseException as error:
++            if self.reboot_seen and self.usb_console and isinstance(error, OSError):
++                self.gone = f'{type(error).__name__}: {error}'
++                bq_mark('console_gone_after_reboot')
++                return
+             self.error = f'{type(error).__name__}: {error}'
+             if self.virtual:
+                 self.virtual.fail(self.error)
+@@ -571,6 +589,15 @@
+                 self.done_scan = len(self.proof.output)  # Only output after the command was sent.
+                 return
+             recent = console_prompt_text(bytes(self.proof.output[max(self.done_scan, len(self.proof.output) - 4096):]))
++            if self.self_reboot and not self.reboot_seen and re.search(
++                    rb'(?:^|\n)' + REBOOT_MARKER + rb'(?:\n|$)', recent) is not None:
++                self.reboot_seen, self.reboot_at = True, time.monotonic()
++                bq_mark('guest_reboot_announced')
++            if self.reboot_seen:
++                # Under the hypervisor, stopping the capture would stop the guest before it
++                # restarts: the capture ends when the M1 resets (or at the upper bound, if
++                # it does not). On the UART it ends REBOOT_LINGER seconds from here.
++                return
+             marker = re.search(rb'(?:^|\n)' + DONE_MARKER + rb'(?:\n|$)', recent) is not None
+             prompt = (self.done_mode == 'prompt' and len(self.proof.output) > self.done_scan + 80 and
+                       re.search(rb'\n[^\n]{0,100}[#$] ?$', tail) is not None)
+@@ -645,7 +672,11 @@
+             self.virtual.cancel()
+             name = 'terminal-input-result.json' if self.terminal_input else 'virtual-input-result.json'
+             old.write_private(self.directory, name, self.virtual.report())
+-        self.dev.close()
++        try:
++            self.dev.close()
++        except Exception:
++            if self.gone is None:
++                raise
+         try:
+             if self.times is not None:
+                 self.times.close()
+@@ -658,6 +689,7 @@
+             'nonce': self.proof.nonce, 'challenge_sent': self.proof.sent_at is not None,
+             'console_sha256': image.sha(raw), 'console_bytes': len(raw), 'error': self.error,
+             'desktop_command_sent': self.desktop_sent,
++            'reboot_announced': self.reboot_seen, 'console_gone_after_reboot': self.gone,
+             'keyboard_command_sent': self.keyboard_sent,
+             'terminal_input_enabled': self.terminal_input,
+             'native_keyboard_desktop_enabled': self.native_keyboard_desktop,
+diff -ru a/tools/m1_bringup_cycle.py b/tools/m1_bringup_cycle.py
+--- a/tools/m1_bringup_cycle.py	2026-11-12 08:14:45.540610032 -0800
++++ b/tools/m1_bringup_cycle.py	2026-11-12 08:14:45.541531038 -0800
+@@ -118,6 +118,53 @@
+         return False
+ 
+ 
++def self_reboot_announced(ops):
++    """A guest that restarts the M1 itself (integrations/puredarwin/m1-native-boot/reboot; this
++    boot's launcher tree carries self_reboot_mode.txt): its script printed PD_BENCH_REBOOT on
++    the console just before it asked the kernel to restart."""
++    try:
++        asked = (LAB/'integrations/puredarwin/m1-bringup/self_reboot_mode.txt').exists()
++        raw = base.read_file(ops.cycle/'guest'/'console.bin', 32 << 20).replace(b'\r', b'')
++        return asked and b'\nPD_BENCH_REBOOT\n' in raw
++    except (OSError, ValueError, AttributeError):
++        return False
++
++
++def guest_proxy_still_there(ops, cdc):
++    """The USB device the guest worker used is still enumerated: the hypervisor is alive, so
++    the M1 did not restart."""
++    try:
++        port = base.read_json(ops.cycle/'guest-port.json')
++        return cdc is not None and (cdc['IORegistryEntryID'], cdc['sessionID']) == (
++            port['IORegistryEntryID'], port['sessionID'])
++    except (OSError, ValueError, KeyError, TypeError):
++        return cdc is not None
++
++
++def wait_for_own_linux(ops, old_boot, seconds):
++    """A new, checked Linux boot within `seconds`, or None. Never a reset. One neighbour
++    refresh after 25 s without an answer, as base.recover_linux does (in boots bs01..bs05
++    Linux answered 32 to 34 s after a reset, each time just after that refresh); its record
++    has a name of its own, because base.recover_linux may still write its own later."""
++    started, refreshed = ops.clock(), False
++    while ops.clock() - started < seconds:
++        try:
++            value = ops.observe()
++        except (ConnectionError, TimeoutError):
++            value = None
++        if value is not None:
++            base.check_linux(value)
++            if value['boot_id'] != old_boot:
++                return value
++        if value is None and not refreshed and ops.clock() - started >= 25:
++            refreshed = True
++            ops.save('self-reboot-neighbor-refresh-intent.json',
++                     {'target_only': base.HOST, 'attempt': 1, 'cause_unproven': True})
++            ops.refresh_neighbor()
++        ops.sleep(1)
++    return None
++
++
+ def worker_timeout(runtime):
+     return 240 if runtime <= 180 else runtime + 60
+ 
+@@ -334,7 +381,17 @@
+                 else:
+                     cdc = ops.discover()
+                     ops.save('recovery-cdc.json', dict(primary_cdc=cdc, linux_probe_failed=True))
+-                    native = cdc is None and native_return_requested(ops)
++                    if self_reboot_announced(ops) and not guest_proxy_still_there(ops, cdc):
++                        # The guest restarted the M1 itself. Its Linux is coming up; the
++                        # installed m1n1's short proxy window on the way is not ours to
++                        # reset. 90 s: that boot took 32 to 34 s in bs01..bs05. Only a
++                        # machine still silent after it falls through to the rules below.
++                        returned = wait_for_own_linux(ops, baseline['boot_id'], 90)
++                        if returned is None:
++                            cdc = ops.discover()
++                        ops.save('self-reboot-return.json', dict(
++                            linux_returned_by_itself=returned is not None, primary_cdc=cdc))
++                    native = returned is None and cdc is None and native_return_requested(ops)
+                     if native:
+                         # A Linux that is already booting (the M1 reset by itself) is waited
+                         # for, never reset: 45 s is longer than its boot takes.

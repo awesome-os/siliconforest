@@ -1,0 +1,1624 @@
+diff --git a/crates/chonk-shell/src/miniwindows.rs b/crates/chonk-shell/src/miniwindows.rs
+index 3304cf0..a828bdc 100644
+--- a/crates/chonk-shell/src/miniwindows.rs
++++ b/crates/chonk-shell/src/miniwindows.rs
+@@ -82,16 +82,12 @@ impl<B: Backend> Miniwindows<B> {
+             if repaint || fresh || tile.missing_preview || tile.rect.size != rect.size || tile.title != title {
+                 let preview = wm.client_preview(id);
+                 tile.missing_preview = preview.is_none();
+-                let mut buffer = chrome.icon(theme, &mut fonts.system(), &mut fonts.swash(), size, &title, preview.as_ref());
+-                // The application's icon in the corner, as macOS badges a minimised window.
+-                let badge = (size as f32 * 0.4).round() as u32;
+-                if let Some(icon) = wm_theme::app_icon::for_app_id(&class, badge) {
+-                    if let Some(mut p) = tiny_skia::IntSize::from_wh(buffer.width, buffer.height).and_then(|s| tiny_skia::Pixmap::from_vec(std::mem::take(&mut buffer.pixels), s)) {
+-                        let at = size.saturating_sub(badge + size / 16) as i32;
+-                        wm_theme::app_icon::draw(&mut p, &icon, at, at, badge);
+-                        buffer.pixels = p.take();
+-                    }
+-                }
++                let buffer = chrome.icon(theme, &mut fonts.system(), &mut fonts.swash(), size, &title, preview.as_ref());
++                // DESK6: no application badge in the corner. The owner saw the minimised window
++                // as two icons, the preview and "that other icon that's smaller and overlapping"
++                // (this 40 % badge, and the dock's own tile of the window): one tile, the
++                // window's picture, is what he wants. (`class` stays for the tile's identity.)
++                let _ = &class;
+                 wm.backend_mut().paint_shell_surface(tile.surface, &buffer);
+                 tile.title = title;
+             }
+diff --git a/crates/wm-darwin/src/capture.rs b/crates/wm-darwin/src/capture.rs
+index 5c13563..a8036f2 100644
+--- a/crates/wm-darwin/src/capture.rs
++++ b/crates/wm-darwin/src/capture.rs
+@@ -542,6 +542,24 @@ impl Server {
+                     }
+                     continue;
+                 }
++                // The dock tile's Quit (DESK6): the application quits as its own menu's Quit does.
++                if let Some(id) = text.trim().strip_prefix("quit ") {
++                    #[cfg(feature = "desktop-shell")]
++                    {
++                        let id = id.trim().to_string();
++                        let answer = if !id.is_empty() && id.len() < 256 && id.chars().all(|c| c.is_ascii_alphanumeric() || ".-_".contains(c)) {
++                            self.quit_application_request(&id)
++                        } else {
++                            "error bad application id\n".to_string()
++                        };
++                        let _ = client.stream.write_all(answer.as_bytes());
++                    }
++                    #[cfg(not(feature = "desktop-shell"))]
++                    {
++                        let _ = (id, client.stream.write_all(b"error no desktop\n"));
++                    }
++                    continue;
++                }
+                 if text.starts_with("record ") {
+                     #[cfg(feature = "desktop-shell")]
+                     match parse_record(&text) {
+@@ -895,8 +913,9 @@ pub fn request_cli(args: &[String]) -> i32 {
+     let line = match args {
+         [t] if t == "terminal" => "terminal\n".to_string(),
+         [a, id] if a == "application" => format!("application {id}\n"),
++        [q, id] if q == "quit" => format!("quit {id}\n"),
+         _ => {
+-            eprintln!("usage: chonkstep-darwin-desktop --desktop-request terminal | application <bundle identifier>");
++            eprintln!("usage: chonkstep-darwin-desktop --desktop-request terminal | application <bundle identifier> | quit <application id>");
+             return 2;
+         }
+     };
+diff --git a/crates/wm-darwin/src/desktop.rs b/crates/wm-darwin/src/desktop.rs
+index 9cec7b6..5ef0d57 100644
+--- a/crates/wm-darwin/src/desktop.rs
++++ b/crates/wm-darwin/src/desktop.rs
+@@ -415,6 +415,8 @@ impl crate::server::Server {
+         if self.desktop.is_none() {
+             return Ok(());
+         }
++        // before the shell draws a minimised window's tile: its picture, also for a dma-buf window
++        self.preview_minimised_dmabufs();
+         // A window menu is about to open: a Mac application's own menu goes in it (appmenu.rs).
+         if let Some(id) = self.wm.pending_window_menu() {
+             let rows = self.app_menu_rows(id);
+diff --git a/crates/wm-darwin/src/inject.rs b/crates/wm-darwin/src/inject.rs
+index d066883..8ee4772 100644
+--- a/crates/wm-darwin/src/inject.rs
++++ b/crates/wm-darwin/src/inject.rs
+@@ -35,6 +35,8 @@
+ //!                                  key events delivered, the motion-to-screen latency so far
+ //! capture <name>                   the frame as it was last rendered, to <name>.ppm in the directory
+ //!                                  (an error after 2 s without one: the display sleeps until a key)
++//! list <name>                      <name>.txt of `dump` alone (windows with their state and title-bar
++//!                                  buttons' centres, the desk's surfaces), no pictures (DESK6)
+ //! dump <name>                      every window's own picture as the client gave it (no frame, nothing
+ //!                                  over it) to <name>-<window>.ppm, and <name>.txt listing windows
+ //!                                  (app id, content and frame rectangles, picture size) and the
+@@ -70,6 +72,8 @@ enum Step {
+     Wait(Duration),
+     Capture(String),
+     Dump(String),
++    /// `list <name>`: the text of `dump` only, no pictures (DESK6: cheap, for finding tiles and buttons).
++    List(String),
+ }
+ 
+ pub struct Inject {
+@@ -152,6 +156,7 @@ impl Inject {
+                 ["wait", ms] => ms.parse::<u64>().ok().filter(|ms| *ms <= 10_000).map(|ms| Step::Wait(Duration::from_millis(ms))),
+                 ["capture", name] if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => Some(Step::Capture((*name).to_string())),
+                 ["dump", name] if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => Some(Step::Dump((*name).to_string())),
++                ["list", name] if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => Some(Step::List((*name).to_string())),
+                 _ => None,
+             };
+             match step {
+@@ -280,9 +285,10 @@ impl Inject {
+             }
+             // a capture is of a rendered frame: after the repaint
+             Some(Step::Capture(_)) => {}
+-            Some(Step::Dump(name)) => {
++            Some(Step::Dump(name)) | Some(Step::List(name)) => {
++                let pictures = matches!(self.queue.front(), Some(Step::Dump(_)));
+                 let name = name.clone();
+-                if let Err(error) = self.dump(server, &name) {
++                if let Err(error) = self.dump(server, &name, pictures) {
+                     self.errors.push(format!("dump {name}: {error}"));
+                 }
+                 self.queue.pop_front();
+@@ -335,7 +341,7 @@ impl Inject {
+         Ok(())
+     }
+     /// The windows' own pictures and the scene's surfaces (`dump <name>`).
+-    fn dump(&mut self, server: &Server, name: &str) -> Result<(), String> {
++    fn dump(&mut self, server: &Server, name: &str, pictures: bool) -> Result<(), String> {
+         let backend = server.wm.backend();
+         let mut text = String::new();
+         let mut ids: Vec<u64> = backend.windows.keys().copied().collect();
+@@ -349,11 +355,22 @@ impl Inject {
+                 let origin = wm_core::Point::new(w.content.pos.x - c.layout.client_offset.x, w.content.pos.y - c.layout.client_offset.y);
+                 c.layout.resize_hitboxes.iter().find(|(k, _)| *k == wm_theme_api::ResizeEdge::SouthEast).map(|(_, r)| (origin.x + r.pos.x + r.size.w as i32 / 2, origin.y + r.pos.y + r.size.h as i32 / 2))
+             });
++            // the title bar's buttons (their centres on the screen) and the window's state (DESK6)
++            let client = server.wm.client_for_window(id).and_then(|c| server.wm.client(c));
++            let buttons: Vec<(String, i32, i32)> = client.map(|c| {
++                let origin = wm_core::Point::new(w.content.pos.x - c.layout.client_offset.x, w.content.pos.y - c.layout.client_offset.y);
++                c.layout.button_hitboxes.iter().map(|(k, r)| (format!("{k:?}"), origin.x + r.pos.x + r.size.w as i32 / 2, origin.y + r.pos.y + r.size.h as i32 / 2)).collect()
++            }).unwrap_or_default();
++            let lifecycle = client.map(|c| format!("{:?}", c.lifecycle)).unwrap_or_else(|| "untracked".into());
++            let focused = server.wm.client_for_window(id).is_some_and(|c| server.wm.focused_client() == Some(c));
+             text.push_str(&format!(
+-                "window {id} app_id={:?} title={:?} mapped={} content={:?} frame={:?} picture={:?} external={} resize_se={resize_se:?}\n",
+-                w.app_id.as_deref().or(w.last_app_id.as_deref()).unwrap_or(""), w.title.as_deref().unwrap_or(""), w.mapped, w.content, frame,
++                "window {id} app_id={:?} title={:?} mapped={} committed={} lifecycle={lifecycle} focused={focused} content={:?} frame={:?} picture={:?} external={} resize_se={resize_se:?} buttons={buttons:?}\n",
++                w.app_id.as_deref().or(w.last_app_id.as_deref()).unwrap_or(""), w.title.as_deref().unwrap_or(""), w.mapped, w.committed, w.content, frame,
+                 image.map(|i| (i.width, i.height)), w.external.is_some()
+             ));
++            if !pictures {
++                continue;
++            }
+             let Some(image) = image.filter(|i| i.pixels.len() == i.width as usize * i.height as usize * 4) else { continue };
+             // how opaque the client's picture is (premultiplied RGBA): a translucent window shows
+             // what is under it
+diff --git a/crates/wm-darwin/src/input.rs b/crates/wm-darwin/src/input.rs
+index 96c6c13..af0b90e 100644
+--- a/crates/wm-darwin/src/input.rs
++++ b/crates/wm-darwin/src/input.rs
+@@ -34,12 +34,15 @@ pub(crate) const UNHIDE_DISTANCE:f64=6.0;
+ #[derive(Default)]
+ struct CursorImageCache(std::sync::Mutex<Option<(wm_theme_api::DecorationBuffer,i32)>>);
+ impl Server {
+-    /// The focused toplevel belongs to a Mac application: its app id is the bundle identifier of an
+-    /// application bundle in /Applications.
++    /// The focused toplevel belongs to a Mac application (`macdesk::is_mac_client`: its app id is
++    /// a bundle's in the application folders, or its process runs from inside an application
++    /// bundle, or it serves an application-menu socket).
+     fn focused_is_mac_application(&self) -> bool {
+         let Some(client) = self.wm.focused_client().and_then(|id| self.wm.client(id)) else { return false };
+-        let Some(app_id) = self.wm.backend().windows.get(&client.window).and_then(|w| w.app_id.clone().filter(|a| !a.is_empty()).or_else(|| w.last_app_id.clone())) else { return false };
+-        wm_theme::app_icon::bundle_for_identifier(&app_id).is_some()
++        let Some(w) = self.wm.backend().windows.get(&client.window) else { return false };
++        let Some(app_id) = w.app_id.clone().filter(|a| !a.is_empty()).or_else(|| w.last_app_id.clone()) else { return false };
++        let pid = crate::server::peer_of(w.surface.wl_surface()).and_then(|p| p.pid);
++        crate::macdesk::is_mac_client(&app_id, pid)
+     }
+ }
+ 
+diff --git a/crates/wm-darwin/src/macdesk.rs b/crates/wm-darwin/src/macdesk.rs
+index 0d4b907..38c80d8 100644
+--- a/crates/wm-darwin/src/macdesk.rs
++++ b/crates/wm-darwin/src/macdesk.rs
+@@ -125,6 +125,21 @@ pub fn pid_path(pid: i32) -> Option<PathBuf> {
+     std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+ }
+ 
++/// A Mac (AppKit) application's window, whose Command chords are its own: its app id is the
++/// bundle identifier of a bundle in the application folders, or its process runs from inside an
++/// application bundle, or it serves an application-menu socket (AppKit's). DESK6: the Firefox
++/// agent found Command-W closing Firefox's whole window - a bundle outside the four folders (a
++/// private test copy) was not recognised by its app id alone, so the desk took the chord.
++pub(crate) fn is_mac_client(app_id: &str, pid: Option<i32>) -> bool {
++    if !app_id.is_empty() && wm_theme::app_icon::bundle_for_identifier(app_id).is_some() {
++        return true;
++    }
++    let Some(pid) = pid.filter(|p| *p > 0) else { return false };
++    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/private/var/run/gpu-desktop"));
++    crate::appmenu::socket_path(&runtime, pid).exists()
++        || pid_path(pid).is_some_and(|p| p.components().any(|c| c.as_os_str().to_string_lossy().ends_with(".app")))
++}
++
+ fn rounded(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<tiny_skia::Path> {
+     let r = r.min(w / 2.0).min(h / 2.0);
+     let k = 0.552_284_8 * r;
+@@ -784,6 +799,27 @@ impl Server {
+             }
+         }
+     }
++    /// The dock tile's Quit (`--desktop-request quit <app id>`, DESK6), as the switcher's Q does:
++    /// a Mac application quits as its own menu's Quit does (its questions, saving; SIGTERM only
++    /// without a menu socket), the desk's own windows of the application are asked to close.
++    pub fn quit_application_request(&mut self, id: &str) -> String {
++        let Some(app) = self.running_apps().into_iter().find(|a| a.app_id.eq_ignore_ascii_case(id)) else {
++            eprintln!("WMMAC quit request app={id}: not running");
++            return format!("error {id} is not running\n");
++        };
++        let mac = app.mac || app.pids.iter().any(|pid| is_mac_client(&app.app_id, Some(*pid)));
++        eprintln!("WMMAC quit request app={id} mac={mac} windows={} pids={:?}", app.clients.len(), app.pids);
++        if mac {
++            for pid in &app.pids {
++                quit_mac_app(*pid);
++            }
++        } else {
++            for client in &app.clients {
++                self.wm.close_client(*client);
++            }
++        }
++        "ok\n".into()
++    }
+     /// An application by bundle identifier: brought forward when it runs, else opened.
+     pub fn open_application(&mut self, id: &str, path: Option<&Path>) {
+         let running = self.running_apps().into_iter().find(|a| a.app_id.eq_ignore_ascii_case(id));
+diff --git a/crates/wm-darwin/src/scene.rs b/crates/wm-darwin/src/scene.rs
+index 526765a..b236d56 100644
+--- a/crates/wm-darwin/src/scene.rs
++++ b/crates/wm-darwin/src/scene.rs
+@@ -24,6 +24,9 @@ pub struct Window {
+     /// The window shows a client dma-buf (GPU memory, never copied). `image`
+     /// then carries only the size, with no pixels.
+     pub(crate) external: Option<ExternalBuffer>,
++    /// A dma-buf window's picture, small, taken from its buffer when it was minimised (DESK6):
++    /// its minimised tile shows it (a dma-buf window has no CPU pixels of its own).
++    pub(crate) preview: Option<DecorationBuffer>,
+     pub mapped: bool,
+     pub committed: bool,
+     pub chrome: ClientChrome,
+@@ -132,6 +135,8 @@ pub enum DesktopHit {
+ 
+ pub struct CpuBackend {
+     pub windows: HashMap<u64, Window>,
++    /// Advances when a dma-buf window's preview is taken (`Window::preview`, DESK6).
++    pub(crate) previews_generation: u64,
+     frames: HashMap<u64, Frame>,
+     shells: HashMap<u64, Shell>,
+     stack: Vec<u64>, // window IDs; each is drawn with its owning frame
+@@ -185,6 +190,7 @@ impl CpuBackend {
+         crate::pixels::image_len(size.w, size.h)?;
+         Ok(Self {
+             windows: HashMap::new(),
++            previews_generation: 0,
+             frames: HashMap::new(),
+             shells: HashMap::new(),
+             stack: Vec::new(),
+@@ -617,6 +623,7 @@ impl CpuBackend {
+                 generation: 0,
+                 partial: None,
+                 external: None,
++                preview: None,
+                 mapped: false,
+                 committed: false,
+                 chrome: ClientChrome::Edges,
+@@ -924,12 +931,16 @@ impl Backend for CpuBackend {
+     }
+     fn capture_window_image(&self, id: u64, _: Size) -> Option<DecorationBuffer> {
+         let w = self.windows.get(&id)?;
+-        // A dma-buf window has no CPU-side pixels to hand out.
++        // A dma-buf window has no CPU-side pixels to hand out: its preview, taken from its
++        // buffer when it was minimised, if any.
+         if w.external.is_some() {
+-            return None;
++            return w.preview.clone().filter(|p| p.width > 0 && p.height > 0);
+         }
+         w.image.clone()
+     }
++    fn preview_generation(&self) -> u64 {
++        self.previews_generation
++    }
+     fn create_decoration(&mut self, id: u64, l: &DecorationLayout) -> u64 {
+         let frame = self.alloc();
+         let generation = self.generation();
+@@ -1116,6 +1127,11 @@ impl Backend for CpuBackend {
+             w.state_changed = Some((std::time::Instant::now(), now));
+         }
+         let w = &self.windows[&id];
++        let was_hidden = w.surface.with_pending_state(|s| s.states.contains(xdg_toplevel::State::Suspended));
++        if was_hidden != state.hidden {
++            eprintln!("WMMINI window={id} app_id={:?} {}", w.app_id.as_deref().or(w.last_app_id.as_deref()).unwrap_or(""),
++                if state.hidden { "minimised: put away (suspended told), its tile shows" } else { "restored: shown again (suspended cleared)" });
++        }
+         w.surface.with_pending_state(|s| {
+             for (flag, on) in [
+                 (xdg_toplevel::State::Maximized, state.maximized_horizontally && state.maximized_vertically),
+diff --git a/crates/wm-darwin/src/server.rs b/crates/wm-darwin/src/server.rs
+index db93847..599ac3d 100644
+--- a/crates/wm-darwin/src/server.rs
++++ b/crates/wm-darwin/src/server.rs
+@@ -65,6 +65,37 @@ pub(crate) fn kill_pid(pid: i32, signal: i32) -> bool {
+     ok
+ }
+ /// The Peer of a surface's client.
++/// A dma-buf's picture, small (DESK6, a minimised window's tile): read through a CPU mapping
++/// (XRGB/ARGB8888, linear: what the renderer imports), one sample per output pixel, at most
++/// `edge` pixels on its longer side, opaque. `None` when the buffer cannot be mapped.
++pub(crate) fn dmabuf_preview(dmabuf: &Dmabuf, width: u32, height: u32, edge: u32) -> Option<wm_theme_api::DecorationBuffer> {
++    let (fd, offset, stride) = (dmabuf.handles().next()?, dmabuf.offsets().next()?, dmabuf.strides().next()?);
++    if width == 0 || height == 0 || (stride as u64) < u64::from(width) * 4 {
++        return None;
++    }
++    let length = offset as usize + stride as usize * height as usize;
++    let map = unsafe { libc::mmap(std::ptr::null_mut(), length, libc::PROT_READ, libc::MAP_SHARED, std::os::fd::AsRawFd::as_raw_fd(&fd), 0) };
++    if map == libc::MAP_FAILED {
++        return None;
++    }
++    let source = unsafe { std::slice::from_raw_parts(map as *const u8, length) };
++    let fit = (f64::from(edge) / f64::from(width.max(height))).min(1.0);
++    let (w, h) = (((f64::from(width) * fit).round() as u32).max(1), ((f64::from(height) * fit).round() as u32).max(1));
++    let mut pixels = Vec::with_capacity(w as usize * h as usize * 4);
++    for y in 0..h {
++        let sy = (u64::from(y) * u64::from(height) / u64::from(h)) as usize;
++        let row = offset as usize + sy * stride as usize;
++        for x in 0..w {
++            let sx = (u64::from(x) * u64::from(width) / u64::from(w)) as usize;
++            let p = &source[row + sx * 4..row + sx * 4 + 4];
++            // little-endian B, G, R, x -> R, G, B, opaque
++            pixels.extend_from_slice(&[p[2], p[1], p[0], 255]);
++        }
++    }
++    unsafe { libc::munmap(map, length) };
++    Some(wm_theme_api::DecorationBuffer { width: w, height: h, pixels })
++}
++
+ pub(crate) fn peer_of(surface: &WlSurface) -> Option<Arc<Peer>> {
+     let client = surface.client()?;
+     let id = client.id();
+@@ -1151,6 +1182,38 @@ impl Server {
+             .and_then(|d| d.handles().next().map(|h| std::os::fd::AsRawFd::as_raw_fd(&h)))
+             .is_none_or(|fd| crate::kms::poll_readable(fd, Some(std::time::Duration::ZERO)).unwrap_or(true))
+     }
++    /// A minimised dma-buf window's picture for its tile (DESK6: Firefox's minimised tile had
++    /// no picture, a dma-buf window has no CPU pixels): its buffer read through a CPU mapping,
++    /// sampled down to fit 320 pixels, once per minimise; dropped when it is shown again.
++    pub(crate) fn preview_minimised_dmabufs(&mut self) {
++        let mut take = Vec::new();
++        let mut clear = Vec::new();
++        for (&id, w) in &self.wm.backend().windows {
++            let Some(external) = w.external else { continue };
++            let minimised = self.wm.client_for_window(id).and_then(|c| self.wm.client(c)).is_some_and(|c| c.lifecycle == wm_core::Lifecycle::Miniaturized);
++            match (minimised, w.preview.is_some()) {
++                (true, false) => take.push((id, external)),
++                (false, true) => clear.push(id),
++                _ => {}
++            }
++        }
++        for id in clear {
++            if let Some(w) = self.wm.backend_mut().windows.get_mut(&id) {
++                w.preview = None;
++            }
++        }
++        for (id, external) in take {
++            let started = std::time::Instant::now();
++            let preview = self.external_dmabufs.get(&external.id).and_then(|d| dmabuf_preview(d, external.width, external.height, 320));
++            let ok = preview.is_some();
++            if let Some(w) = self.wm.backend_mut().windows.get_mut(&id) {
++                // an empty picture stands for "tried": not read again on every turn
++                w.preview = Some(preview.unwrap_or(wm_theme_api::DecorationBuffer { width: 0, height: 0, pixels: Vec::new() }));
++            }
++            self.wm.backend_mut().previews_generation += 1;
++            eprintln!("WMMINI preview window={id} dmabuf {}x{} {} in {} us", external.width, external.height, if ok { "taken" } else { "not mappable" }, started.elapsed().as_micros());
++        }
++    }
+     /// (commit number, differing pixels, largest channel difference) of the
+     /// latest check that could map the client's buffer.
+     pub fn last_dmabuf_check(&self) -> Option<(u64, u64, u8)> {
+@@ -1306,6 +1369,9 @@ impl Server {
+     }
+     fn remove(&mut self, surface: &WlSurface) {
+         if let Some(id) = self.wm.backend().window_for_surface(surface) {
++            if self.minimised(id) {
++                eprintln!("WMMINI window={id} destroyed by its client while minimised: its tile goes");
++            }
+             self.drop_held(id, None, true);
+             self.external_commits.remove(&id);
+             self.wm.dispatch(BackendEvent::Destroyed(id));
+@@ -1708,8 +1774,27 @@ impl CompositorHandler for Server {
+                         w.content.pos = wm_core::Point::new(0, 0);
+                     }
+                     w.content.size = size;
+-                    self.wm.dispatch(BackendEvent::MapRequest(id));
+-                    self.place_clear_of_launchers(id);
++                    // a window kept while minimised (above) maps again: the desk still has it, at
++                    // its place; still put away, its client brought it back itself (AppKit's
++                    // deminiaturize): it is shown
++                    let kept = self.wm.client_for_window(id).is_some();
++                    if kept {
++                        // its frame is the desk's still: the picture goes in it again
++                        if let Some(w) = self.wm.backend_mut().windows.get_mut(&id) {
++                            w.mapped = true;
++                        }
++                        let minimised = self.minimised(id);
++                        eprintln!("WMMINI window={id} mapped again by its client{}", if minimised { " while minimised: shown (deminiaturised)" } else { ": shown at its place" });
++                        if minimised {
++                            if let Some(client) = self.wm.client_for_window(id) {
++                                self.wm.deminiaturize(client);
++                            }
++                            self.wm.dispatch(BackendEvent::ActivateRequested(id));
++                        }
++                    } else {
++                        self.wm.dispatch(BackendEvent::MapRequest(id));
++                        self.place_clear_of_launchers(id);
++                    }
+                     self.output.enter(surface);
+                     self.apply_early_states(id);
+                 } else {
+@@ -1729,9 +1814,24 @@ impl CompositorHandler for Server {
+             }
+             Some(BufferAssignment::Removed) => {
+                 let was_mapped = self.wm.backend().windows[&id].committed;
+-                self.wm.dispatch(BackendEvent::Unmapped(id));
++                // DESK6: a window the desk has put away (minimised) whose client then takes its
++                // picture away (an AppKit window ordered out as it miniaturises) stays minimised:
++                // its tile, its picture and its place are kept, and the client's next buffer shows
++                // it again. Before, the desk forgot such a window at once: its tile went and the
++                // window looked closed while its application lived on (the owner's "minimizing
++                // windows closes or kills them").
++                let minimised = self.minimised(id);
++                if minimised {
++                    let w = &self.wm.backend().windows[&id];
++                    eprintln!("WMMINI window={id} app_id={:?} unmapped by its client while minimised: kept minimised (its tile, picture and place stay)",
++                        w.app_id.as_deref().or(w.last_app_id.as_deref()).unwrap_or(""));
++                } else {
++                    self.wm.dispatch(BackendEvent::Unmapped(id));
++                }
+                 self.drop_held(id, None, false);
+-                self.wm.backend_mut().set_window_image(id, None);
++                if !minimised {
++                    self.wm.backend_mut().set_window_image(id, None);
++                }
+                 let w = self.wm.backend_mut().windows.get_mut(&id).unwrap();
+                 w.committed = false;
+                 w.mapped = false;
+@@ -1848,6 +1948,7 @@ impl XdgShellHandler for Server {
+     fn minimize_request(&mut self, s: ToplevelSurface) {
+         if let Some(id) = self.wm.backend().window_for_surface(s.wl_surface()) {
+             if self.wm.backend().windows[&id].committed {
++                eprintln!("WMMINI window={id} the client asks to be minimised (xdg_toplevel.set_minimized)");
+                 self.wm.dispatch(BackendEvent::MinimizeRequest(id));
+             }
+         }
+@@ -1855,6 +1956,10 @@ impl XdgShellHandler for Server {
+ }
+ 
+ impl Server {
++    /// The desk has this window put away (minimised, its tile shown).
++    pub(crate) fn minimised(&self, id: u64) -> bool {
++        self.wm.client_for_window(id).and_then(|c| self.wm.client(c)).is_some_and(|c| c.lifecycle == wm_core::Lifecycle::Miniaturized)
++    }
+     /// A client's set/unset_maximized or set/unset_fullscreen. Before the window maps the request
+     /// is kept and carried out when it maps; after, the policy decides and every window it
+     /// touched gets one configure, the requester one in any case (a refusal is an answer too).
+diff --git a/crates/wm-darwin/tests/wayland_shm.rs b/crates/wm-darwin/tests/wayland_shm.rs
+index e736dff..52ec1ce 100644
+--- a/crates/wm-darwin/tests/wayland_shm.rs
++++ b/crates/wm-darwin/tests/wayland_shm.rs
+@@ -1323,6 +1323,57 @@ fn a_minimised_windows_tile_goes_when_the_window_is_closed_and_the_application_s
+     assert_eq!(after.managed, 1);
+ }
+ 
++/// DESK6, the owner: "Minimizing windows closes or kills them ... then it closes altogether".
++/// An AppKit window ordered out as it miniaturises takes its picture away (a null buffer) while
++/// the desk has it put away: the desk must keep it minimised - its tile stays, the window is not
++/// forgotten - and when the client shows it again it comes back at its place. (Fails on the old
++/// source: the unmap made the desk forget the window and its tile.)
++#[test]
++#[cfg(feature = "desktop-shell")]
++fn a_minimised_window_whose_client_unmaps_it_stays_minimised_and_comes_back_at_its_place() {
++    let (h, a) = Harness::sized(true, 640, 480, 15);
++    let (tx, rx) = mpsc::channel();
++    h.tx.send(Request::Desktop(tx)).unwrap();
++    rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
++    let settle = || { for _ in 0..10 { h.snapshot(); thread::sleep(Duration::from_millis(10)); } };
++    settle();
++    let (mut q, mut c, s, _x, t) = map_client(&a, "ordered out while minimised");
++    settle();
++    let mapped = h.snapshot();
++    let (before, place) = (mapped.shells, mapped.content.expect("the window is shown"));
++    assert_eq!((mapped.managed, mapped.visible), (1, 1));
++    t.set_minimized();
++    q.roundtrip(&mut c).unwrap();
++    settle();
++    let minimised = h.snapshot();
++    assert!(minimised.shells > before, "a tile for the minimised window");
++    assert_eq!(minimised.visible, 0);
++    // the client takes its picture away (AppKit orders the miniaturised window out)
++    s.attach(None, 0, 0);
++    s.commit();
++    q.roundtrip(&mut c).unwrap();
++    settle();
++    let unmapped = h.snapshot();
++    assert_eq!(unmapped.managed, 1, "the desk still has the window");
++    assert_eq!(unmapped.shells, minimised.shells, "its tile stays");
++    // the client shows it again (AppKit's deminiaturize): an initial commit, the configure, a buffer
++    s.commit();
++    q.roundtrip(&mut c).unwrap();
++    let qh = q.handle();
++    let mut file = tempfile::tempfile().unwrap();
++    file.write_all(&[10, 20, 240, 255].repeat(100 * 60)).unwrap();
++    let pool = c.shm.as_ref().unwrap().create_pool(file.as_fd(), 100 * 60 * 4, &qh, ());
++    let buffer = pool.create_buffer(0, 100, 60, 400, wl_shm::Format::Argb8888, &qh, ());
++    s.attach(Some(&buffer), 0, 0);
++    s.commit();
++    for _ in 0..3 { q.roundtrip(&mut c).unwrap(); }
++    settle();
++    let back = h.snapshot();
++    assert_eq!((back.managed, back.visible), (1, 1), "shown again: {back:?}");
++    assert_eq!(back.shells, before, "its tile went");
++    assert_eq!(back.content.map(|r| r.pos), Some(place.pos), "at its place");
++}
++
+ /// Command-Tab: the switcher takes the keyboard while Command is held, and Command's release
+ /// switches. Command went down while the client had the keyboard, so the client must not be
+ /// told Command is still down when it gets the keyboard back (the desk's terminal ends on a
+diff --git a/dock/crates/chonk-dock/src/apps.rs b/dock/crates/chonk-dock/src/apps.rs
+index bb2bedf..3551863 100644
+--- a/dock/crates/chonk-dock/src/apps.rs
++++ b/dock/crates/chonk-dock/src/apps.rs
+@@ -161,6 +161,21 @@ pub fn match_window_class(entries: &[AppEntry], wm_class: &str) -> Option<usize>
+ /// `$XDG_DATA_HOME` (default `~/.local/share`), then each entry of
+ /// `$XDG_DATA_DIRS` (default `/usr/local/share:/usr/share`) in order.
+ /// Empty environment values count as unset, per the XDG basedir spec.
++/// What the application directories hold right now, cheaply: each directory's modification time
++/// and entry count. An item installed or removed while the dock runs (Firefox's installer wrote
++/// its `.desktop` item and its pin into a running session) changes it; the dock then scans again
++/// (DESK6: before, the catalog was read once at start, and a pin of a later item did not resolve).
++pub fn catalog_signature() -> Vec<(PathBuf, Option<std::time::SystemTime>, usize)> {
++    xdg_application_dirs()
++        .into_iter()
++        .map(|dir| {
++            let modified = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
++            let count = std::fs::read_dir(&dir).map(|d| d.count()).unwrap_or(0);
++            (dir, modified, count)
++        })
++        .collect()
++}
++
+ fn xdg_application_dirs() -> Vec<PathBuf> {
+     let mut dirs = Vec::new();
+     let data_home = env::var("XDG_DATA_HOME")
+diff --git a/dock/crates/chonk-dock/src/client.rs b/dock/crates/chonk-dock/src/client.rs
+index f66ec78..bf6453e 100644
+--- a/dock/crates/chonk-dock/src/client.rs
++++ b/dock/crates/chonk-dock/src/client.rs
+@@ -136,6 +136,10 @@ impl Client {
+     pub fn activate(&self, id: u32) {
+         state!(self, s => s.activate(id))
+     }
++    /// Asks a window to close (a tile's Quit off SiliconForest).
++    pub fn close(&self, id: u32) {
++        state!(self, s => s.close(id))
++    }
+     pub fn is_backdrop(&self, id: u32) -> bool {
+         state!(self, s => s.is_backdrop(id))
+     }
+diff --git a/dock/crates/chonk-dock/src/launchdock.rs b/dock/crates/chonk-dock/src/launchdock.rs
+index eb73312..9e6af5e 100644
+--- a/dock/crates/chonk-dock/src/launchdock.rs
++++ b/dock/crates/chonk-dock/src/launchdock.rs
+@@ -3,8 +3,18 @@
+ //! below the Clip. Pin by dragging a miniaturized window's icon tile
+ //! onto the strip (the shell resolves the window back to its
+ //! application through the `.desktop` index), click to launch — or to
+-//! focus the running window when one exists — and drag a tile off the
+-//! strip to unpin. Pins persist across sessions in the state directory.
++//! focus the running window when one exists. Pins persist across
++//! sessions in the state directory.
++//!
++//! Moving and removing (DESK6, the owner: "the dock launchers disappeared when I clicked on them
++//! and tried to move them"; before, a tile dropped half a tile away from the strip was unpinned
++//! at once and for good, and a reorder showed nothing but a darkened tile): as macOS's Dock does,
++//! a tile picked up follows the pointer and the strip makes room where it would land (the order
++//! is written on the drop); dropped away from the strip it goes back to its place; it is removed
++//! only when held away from the strip until a "Remove from Dock" label shows (`REMOVE_HOLD`), or
++//! from its context menu (secondary click: Open/Show, Options > Keep in Dock / Remove from Dock,
++//! Quit). A click whose pointer wobbles less than the drag threshold is a click, wherever it is
++//! released. A dock that finds no pins at all starts with the default set (`default_pins`).
+ //!
+ //! The strip is one shell surface (like the Dock and the Clip in
+ //! `desktop.rs`), exactly one tile wide, starting at `y = tile`
+@@ -62,8 +72,26 @@ struct StripDrag {
+     /// click — the same press-never-moved rule the icon tiles use.
+     moved: bool,
+     grab: DragHandle,
++    /// Where the press was inside its tile: the tile that follows the pointer keeps it there.
++    offset: Point,
++    /// The pointer's last position.
++    root: Point,
++    /// Since when the pointer has been away from the strip (`None`: near it).
++    away_since: Option<std::time::Instant>,
++    /// Held away long enough: the "Remove from Dock" label shows and a release removes the tile.
++    removing: bool,
+ }
+ 
++/// How long a tile must be held away from the strip before a release removes it: the "Remove
++/// from Dock" label shows then. Released sooner (or near the strip) it is not removed.
++pub const REMOVE_HOLD: std::time::Duration = std::time::Duration::from_millis(800);
++
++/// The actions of a tile's context menu (see `LaunchDock::context_menu`).
++pub const MENU_OPEN: u32 = 1;
++pub const MENU_KEEP: u32 = 2;
++pub const MENU_REMOVE: u32 = 3;
++pub const MENU_QUIT: u32 = 4;
++
+ pub struct LaunchDock<B: Backend> {
+     /// The strip's one shell surface — `None` until the first pin ever
+     /// needs it, and kept (unmapped) across empty spells rather than
+@@ -114,17 +142,31 @@ pub struct LaunchDock<B: Backend> {
+     /// dismiss backdrop took it, so the tip flickered), beside the strip, never under the
+     /// pointer while it is on the strip.
+     tip: Option<(usize, B::ShellId)>,
++    /// Ids in the state file that resolve to no `.desktop` item this session (an application not
++    /// installed yet, an item being rewritten): kept in the file, not shown (DESK6: before, the
++    /// next move or removal rewrote the file without them, so they were lost for good).
++    stale: Vec<String>,
++    /// The picked-up tile following the pointer, and the "Remove from Dock" label above it.
++    float: Option<B::ShellId>,
++    remove_label: Option<(B::ShellId, Size)>,
++    /// The UI scale last given (labels).
++    scale: f32,
+ }
+ /// How long the pointer rests on a tile before its name shows.
+ const TIP_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+ 
+ impl<B: Backend> LaunchDock<B> {
+     pub fn reload(&mut self, backend: &mut B, theme: &Theme, apps: &[AppEntry]) {
++        if let Some(drag) = self.drag.take() {
++            backend.ungrab_pointer(drag.grab);
++            self.drop_float(backend);
++        }
+         self.pins = self
+             .state_path
+             .as_deref()
+             .map(|path| load_pins(path, apps))
+             .unwrap_or_default();
++        self.stale = self.state_path.as_deref().map(|path| stale_ids(path, apps)).unwrap_or_default();
+         self.lit = vec![false; self.pins.len()];
+         self.running_dirty = true;
+         self.sync_window(backend, theme);
+@@ -143,10 +185,14 @@ impl<B: Backend> LaunchDock<B> {
+     ) -> Self {
+         let tile = tile.max(1);
+         let state_path = state_path();
++        if let Some(path) = state_path.as_deref() {
++            write_defaults_if_empty(path, &default_pins());
++        }
+         let pins = state_path
+             .as_deref()
+             .map(|path| load_pins(path, apps))
+             .unwrap_or_default();
++        let stale = state_path.as_deref().map(|path| stale_ids(path, apps)).unwrap_or_default();
+         let lit = vec![false; pins.len()];
+         let mut dock = Self {
+             window: None,
+@@ -164,6 +210,10 @@ impl<B: Backend> LaunchDock<B> {
+             fonts,
+             hover: None,
+             tip: None,
++            stale,
++            float: None,
++            remove_label: None,
++            scale: tile as f32 / 56.0,
+         };
+         dock.sync_window(backend, theme);
+         dock
+@@ -200,19 +250,86 @@ impl<B: Backend> LaunchDock<B> {
+             // must give its grab back before the new one takes over.
+             if let Some(stale) = self.drag.take() {
+                 backend.ungrab_pointer(stale.grab);
++                self.drop_float(backend);
+             }
+             let grab = backend.grab_pointer_for_drag();
++            let offset = Point::new(root.x - origin.x, root.y - origin.y - (slot as u32 * self.tile) as i32);
+             self.drag = Some(StripDrag {
+                 index: slot,
+                 press_root: root,
+                 moved: false,
+                 grab,
++                offset,
++                root,
++                away_since: None,
++                removing: false,
+             });
+             return None;
+         }
+         self.finish_drag(backend, theme, root, running)
+     }
+ 
++    /// Which tile a point of the strip's own surface is on.
++    pub fn slot_at_local(&self, local: Point) -> Option<usize> {
++        let origin = strip_origin(self.primary, self.tile);
++        slot_at(origin, self.tile, self.pins.len(), Point::new(local.x + origin.x, local.y + origin.y))
++    }
++
++    /// The pinned entry of a slot.
++    pub fn pin(&self, slot: usize) -> Option<&AppEntry> {
++        self.pins.get(slot)
++    }
++
++    /// A tile's context menu (secondary click), as macOS's Dock has it: Open (Show when it
++    /// runs), Options > Keep in Dock (checked; unchecking removes it) / Remove from Dock, and
++    /// Quit for a running application.
++    pub fn context_menu(&self, slot: usize, running: &[(String, B::WindowId)]) -> Option<Vec<wm_theme::menu::MenuItem>> {
++        use wm_theme::menu::MenuItem;
++        let pin = self.pins.get(slot)?;
++        let runs = matches!(resolve_click(pin, running), LaunchDockAction::Focus(_));
++        let mut items = vec![
++            MenuItem::Action { label: if runs { "Show".into() } else { "Open".into() }, action: MENU_OPEN },
++            MenuItem::Submenu {
++                label: "Options".into(),
++                items: vec![
++                    MenuItem::Action { label: "\u{2713} Keep in Dock".into(), action: MENU_KEEP },
++                    MenuItem::Action { label: "Remove from Dock".into(), action: MENU_REMOVE },
++                ],
++            },
++        ];
++        if runs {
++            items.push(MenuItem::Action { label: "Quit".into(), action: MENU_QUIT });
++        }
++        Some(items)
++    }
++
++    /// Removes the pin with this desktop-file id (the context menu's Remove from Dock); written
++    /// at once. `false` when it is not pinned.
++    pub fn remove_pin(&mut self, backend: &mut B, theme: &Theme, id: &str) -> bool {
++        let Some(index) = self.pins.iter().position(|pin| pin.id == id) else { return false };
++        self.pins.remove(index);
++        self.lit.remove(index);
++        self.running_dirty = true;
++        self.persist();
++        self.sync_window(backend, theme);
++        eprintln!("chonk-dock: {id} removed from the dock (its menu)");
++        true
++    }
++
++    /// What a plain click on a pin does now (the context menu's Open/Show).
++    pub fn open_action(&mut self, backend: &mut B, theme: &Theme, id: &str, running: &[(String, B::WindowId)]) -> Option<LaunchDockAction<B::WindowId>> {
++        let pin = self.pins.iter().find(|pin| pin.id == id)?.clone();
++        let action = resolve_click(&pin, running);
++        if let LaunchDockAction::Launch(_) = &action {
++            if self.launching.get(&pin.id).is_some_and(|since| since.elapsed() < LAUNCH_WAIT) {
++                return None;
++            }
++            self.launching.insert(pin.id.clone(), std::time::Instant::now());
++            self.repaint(backend, theme);
++        }
++        Some(action)
++    }
++
+     /// Root-relative pointer motion while a strip drag may be in
+     /// progress — call on every motion event, like the icon drags.
+     /// The strip's drop feedback is deliberately light: crossing the
+@@ -220,43 +337,143 @@ impl<B: Backend> LaunchDock<B> {
+     /// is always a strip slot or "off", so a tile chasing the pointer
+     /// would add motion without adding information).
+     pub fn handle_motion(&mut self, backend: &mut B, theme: &Theme, root: Point) {
+-        {
++        let near = self.near_strip(root);
++        let before = self.shown_order();
++        let (picked_up, was_removing) = {
+             let Some(drag) = self.drag.as_mut() else {
+                 return;
+             };
+-            if drag.moved || !crossed_threshold(drag.press_root, root, self.drag_threshold) {
++            drag.root = root;
++            let picked_up = !drag.moved && crossed_threshold(drag.press_root, root, self.drag_threshold);
++            if !drag.moved && !picked_up {
+                 return;
+             }
+             drag.moved = true;
++            let was_removing = drag.removing;
++            if near {
++                drag.away_since = None;
++                drag.removing = false;
++            } else if drag.away_since.is_none() {
++                drag.away_since = Some(std::time::Instant::now());
++            }
++            (picked_up, was_removing)
++        };
++        if picked_up {
++            self.hide_tip(backend);
++            self.hover = None;
++            self.lift_float(backend, theme);
++        }
++        self.place_float(backend);
++        if was_removing && near {
++            if let Some((label, _)) = self.remove_label.take() {
++                backend.destroy_shell_surface(label);
++            }
++        }
++        if picked_up || self.shown_order() != before {
++            self.repaint(backend, theme);
+         }
+-        self.repaint(backend, theme);
+     }
+ 
+-    /// Ends an in-progress strip drag, if any: a drop back on the
+-    /// strip reorders the dragged tile to the slot under `root`, a
+-    /// drop off the strip unpins it — either way persisted. Returns
+-    /// whether the release was consumed. A press that never crossed
+-    /// the threshold is *not* consumed while the pointer is still over
+-    /// the strip: that release is a click, and it arrives (with the
+-    /// running-window pairs a click needs) through `handle_click`.
+-    pub fn handle_release(&mut self, backend: &mut B, theme: &Theme, root: Point) -> bool {
++    /// From the loop, while a tile is dragged: held away from the strip for `REMOVE_HOLD`, the
++    /// "Remove from Dock" label shows above it, and only then does a release remove it.
++    pub fn tick_drag(&mut self, backend: &mut B, theme: &Theme, scale: f32) {
++        self.scale = scale;
++        let Some(drag) = self.drag.as_mut() else { return };
++        if !drag.moved || drag.removing || drag.away_since.is_none_or(|since| since.elapsed() < REMOVE_HOLD) {
++            return;
++        }
++        drag.removing = true;
++        let chrome = wm_theme::UiChrome::new(theme, self.fonts.clone(), wm_theme_api::DecorationStyle::Auto, scale);
++        let font = theme.titlebar.font.size.max(10.0 * scale);
++        let height = (font * 1.9).round().max(16.0) as u32;
++        let image = chrome.label(theme, &mut self.fonts.system(), &mut self.fonts.swash(), "Remove from Dock", 1600, height, false);
++        let rect = Rect::new(Point::new(0, 0), Size::new(image.width, image.height));
++        if let Some(label) = backend.create_shell_surface(rect, (0, 0, 0), false) {
++            backend.set_role(label, crate::surface::Role::Icon);
++            backend.paint_shell_surface(label, &image);
++            backend.map_shell_surface(label);
++            self.remove_label = Some((label, rect.size));
++        }
++        self.place_float(backend);
++        eprintln!("chonk-dock: a tile held away from the dock: 'Remove from Dock' shows (a release now removes it)");
++    }
++
++    /// Ends an armed press, wherever the release lands (the compositor keeps the pointer on the
++    /// strip while the button is held): a press that never crossed the threshold is a click on
++    /// its tile (`Some(Some(action))`), a drag is a move, a snap back or (held away until its
++    /// label showed) a removal. `None`: no press was armed.
++    pub fn handle_release(&mut self, backend: &mut B, theme: &Theme, root: Point, running: &[(String, B::WindowId)]) -> Option<Option<LaunchDockAction<B::WindowId>>> {
++        self.drag.as_ref()?;
++        Some(self.finish_drag(backend, theme, root, running))
++    }
++
++    /// Whether a drop at `root` places the tile on the strip: up to a tile to its right (half a
++    /// tile to its left) and from a tile above its top to a tile below its last tile.
++    fn near_strip(&self, root: Point) -> bool {
+         let origin = strip_origin(self.primary, self.tile);
+-        let Some(drag) = self.drag.as_ref() else {
+-            return false;
+-        };
+-        if !drag.moved {
+-            if slot_at(origin, self.tile, self.pins.len(), root).is_some() {
+-                return false;
+-            }
+-            // A sub-threshold press released off the strip (possible
+-            // only right at the strip's edge): a cancelled click.
+-            if let Some(drag) = self.drag.take() {
+-                backend.ungrab_pointer(drag.grab);
++        let t = self.tile as i32;
++        let bottom = origin.y + self.pins.len() as i32 * t;
++        root.x >= origin.x - t / 2 && root.x < origin.x + 2 * t && root.y >= origin.y - t && root.y < bottom + t
++    }
++
++    /// The slot a drop near the strip at `root` puts the dragged tile in.
++    fn drop_slot(&self, root: Point) -> usize {
++        let origin = strip_origin(self.primary, self.tile);
++        let slot = ((root.y - origin.y).max(0) / self.tile.max(1) as i32) as usize;
++        slot.min(self.pins.len().saturating_sub(1))
++    }
++
++    /// The pins' indices in the order the strip shows them: while a tile is dragged near the
++    /// strip, it is shown where a drop would put it (the others make room).
++    fn shown_order(&self) -> Vec<usize> {
++        let mut order: Vec<usize> = (0..self.pins.len()).collect();
++        if let Some(drag) = self.drag.as_ref().filter(|d| d.moved) {
++            if self.near_strip(drag.root) && drag.index < order.len() {
++                let to = self.drop_slot(drag.root);
++                move_pin(&mut order, drag.index, to);
+             }
+-            return true;
++        }
++        order
++    }
++
++    /// The picked-up tile: a copy of it that follows the pointer.
++    fn lift_float(&mut self, backend: &mut B, theme: &Theme) {
++        let Some(index) = self.drag.as_ref().map(|d| d.index) else { return };
++        let Some(pin) = self.pins.get(index) else { return };
++        let icon = crate::apps::entry_icon(pin, self.tile);
++        let lit = self.lit.get(index).copied().unwrap_or(false);
++        let image = wm_theme::launcher::render_launcher_tile(theme, &mut self.fonts.system(), &mut self.fonts.swash(), self.tile, &pin.name, lit, icon.as_deref());
++        let rect = Rect::new(Point::new(0, 0), Size::new(self.tile, self.tile));
++        if let Some(float) = backend.create_shell_surface(rect, (0, 0, 0), false) {
++            backend.set_role(float, crate::surface::Role::Icon);
++            backend.paint_shell_surface(float, &image);
++            backend.map_shell_surface(float);
++            self.float = Some(float);
++        }
++    }
++
++    /// The floating tile (and its label) where the pointer holds it.
++    fn place_float(&mut self, backend: &mut B) {
++        let Some(drag) = self.drag.as_ref() else { return };
++        let at = Point::new(drag.root.x - drag.offset.x, drag.root.y - drag.offset.y);
++        if let Some(float) = self.float {
++            backend.configure_shell_surface(float, Rect::new(at, Size::new(self.tile, self.tile)));
++            backend.raise_shell_surface(float);
++        }
++        if let Some((label, size)) = self.remove_label {
++            let pos = Point::new(at.x + self.tile as i32 / 2 - size.w as i32 / 2, at.y - size.h as i32 - 4);
++            backend.configure_shell_surface(label, Rect::new(Point::new(pos.x.max(0), pos.y.max(0)), size));
++            backend.raise_shell_surface(label);
++        }
++    }
++
++    fn drop_float(&mut self, backend: &mut B) {
++        if let Some(float) = self.float.take() {
++            backend.destroy_shell_surface(float);
++        }
++        if let Some((label, _)) = self.remove_label.take() {
++            backend.destroy_shell_surface(label);
+         }
+-        self.finish_drag(backend, theme, root, &[]);
+-        true
+     }
+ 
+     /// Repaints running-app indicators from the current set of managed
+@@ -304,10 +521,8 @@ impl<B: Backend> LaunchDock<B> {
+     pub fn next_deadline(&self) -> Option<std::time::Instant> {
+         let pulse = (!self.launching.is_empty()).then(|| std::time::Instant::now() + std::time::Duration::from_millis(100));
+         let tip = self.hover.filter(|_| self.tip.is_none()).map(|(_, since)| since + TIP_DELAY);
+-        match (pulse, tip) {
+-            (Some(a), Some(b)) => Some(a.min(b)),
+-            (a, b) => a.or(b),
+-        }
++        let remove = self.drag.as_ref().filter(|d| d.moved && !d.removing).and_then(|d| d.away_since).map(|since| since + REMOVE_HOLD);
++        [pulse, tip, remove].into_iter().flatten().min()
+     }
+     /// The pointer is at `root` (or off the dock's surfaces: `None`): which tile it rests on.
+     /// Leaving the tile takes its name away at once; a press or a drag too.
+@@ -405,9 +620,9 @@ impl<B: Backend> LaunchDock<B> {
+         root: Point,
+         running: &[(String, B::WindowId)],
+     ) -> Option<LaunchDockAction<B::WindowId>> {
+-        let origin = strip_origin(self.primary, self.tile);
+         let drag = self.drag.take()?;
+         backend.ungrab_pointer(drag.grab);
++        self.drop_float(backend);
+ 
+         if !drag.moved {
+             let pin = self.pins.get(drag.index)?.clone();
+@@ -422,39 +637,30 @@ impl<B: Backend> LaunchDock<B> {
+             }
+             return Some(action);
+         }
+-        // A tile is unpinned only when it is dropped clearly away from the strip (half a tile
+-        // or more off it): a click whose pointer drifted a few pixels past the strip's edge (a
+-        // trackpad click at the bottom tile's edge) is a cancelled click, not an unpin.
+-        let near = |v: i32, lo: i32, hi: i32| v >= lo - self.tile as i32 / 2 && v < hi + self.tile as i32 / 2;
+-        let strip_bottom = origin.y + (self.pins.len() as i32) * self.tile as i32;
+-        if slot_at(origin, self.tile, self.pins.len(), root).is_none()
+-            && near(root.x, origin.x, origin.x + self.tile as i32)
+-            && near(root.y, origin.y, strip_bottom)
+-        {
+-            self.repaint(backend, theme);
+-            return None;
+-        }
+-        match slot_at(origin, self.tile, self.pins.len(), root) {
+-            Some(slot) if slot == drag.index => {
+-                // dropped where it was: nothing changes, nothing is written
+-                self.repaint(backend, theme);
+-            }
+-            Some(slot) => {
++        let id = self.pins.get(drag.index).map(|pin| pin.id.clone()).unwrap_or_default();
++        if self.near_strip(root) {
++            // a move along the strip: the order the drag showed is the one kept
++            let slot = self.drop_slot(root);
++            if slot != drag.index && drag.index < self.pins.len() {
+                 move_pin(&mut self.pins, drag.index, slot);
+                 move_pin(&mut self.lit, drag.index, slot);
+                 self.running_dirty = true;
+                 self.persist();
+-                self.repaint(backend, theme);
+-            }
+-            None => {
+-                if drag.index < self.pins.len() {
+-                    self.pins.remove(drag.index);
+-                    self.lit.remove(drag.index);
+-                    self.running_dirty = true;
+-                    self.persist();
+-                    self.sync_window(backend, theme);
+-                }
++                eprintln!("chonk-dock: {id} moved from place {} to {} (written)", drag.index + 1, slot + 1);
+             }
++            self.repaint(backend, theme);
++        } else if drag.removing && drag.index < self.pins.len() {
++            // held away until "Remove from Dock" showed: removed, as macOS's Dock does
++            self.pins.remove(drag.index);
++            self.lit.remove(drag.index);
++            self.running_dirty = true;
++            self.persist();
++            eprintln!("chonk-dock: {id} removed from the dock (held away until 'Remove from Dock' showed)");
++            self.sync_window(backend, theme);
++        } else {
++            // dropped away without the label: back where it was, nothing written
++            eprintln!("chonk-dock: {id} dropped away from the dock: back in its place, not removed");
++            self.repaint(backend, theme);
+         }
+         None
+     }
+@@ -464,7 +670,7 @@ impl<B: Backend> LaunchDock<B> {
+     /// rewrites away any stale ids `load_pins` dropped.
+     fn persist(&self) {
+         let Some(path) = &self.state_path else { return };
+-        if let Err(error) = save_pins(path, &self.pins) {
++        if let Err(error) = save_pins_keeping(path, &self.pins, &self.stale) {
+             tracing::warn!(?error, "failed to persist launcher pins");
+         }
+     }
+@@ -582,7 +788,9 @@ impl<B: Backend> LaunchDock<B> {
+         }
+         let slot_bytes = (self.tile * self.tile * 4) as usize;
+         let mut pixels = Vec::with_capacity(slot_bytes * self.pins.len());
+-        for (index, pin) in self.pins.iter().enumerate() {
++        let order = self.shown_order();
++        for &index in &order {
++            let pin = &self.pins[index];
+             let lit = self.lit.get(index).copied().unwrap_or(false);
+             let icon = crate::apps::entry_icon(pin, self.tile);
+             let launching = self.launching.get(&pin.id).map(|since| since.elapsed().as_secs_f32());
+@@ -604,8 +812,11 @@ impl<B: Backend> LaunchDock<B> {
+                 pixels.resize(pixels.len() + slot_bytes, 0);
+             }
+         }
++        // the place the dragged tile would land (or comes back to) is shown dimmed
+         if let Some(drag) = self.drag.as_ref().filter(|drag| drag.moved) {
+-            ghost_slot(&mut pixels, self.tile, drag.index);
++            if let Some(shown) = order.iter().position(|&i| i == drag.index) {
++                ghost_slot(&mut pixels, self.tile, shown);
++            }
+         }
+         backend.paint_shell_surface(
+             window,
+@@ -625,7 +836,9 @@ impl<B: Backend> LaunchDock<B> {
+ /// tile size — see `crate::desktop::drag_threshold_px`, the same
+ /// gesture measured from the other end.
+ fn drag_threshold_for_tile(tile: u32) -> i32 {
+-    ((4.0 * tile as f32 / 56.0).round() as i32).max(2)
++    // DESK6: 8 of a 56-unit tile (4 before): a trackpad click wobbles a few units, and a click
++    // that became a drag did not launch (the owner's "clicked on them").
++    ((8.0 * tile as f32 / 56.0).round() as i32).max(4)
+ }
+ 
+ /// Root position of the strip's top-left corner: the primary monitor's
+@@ -750,19 +963,95 @@ fn load_pins(path: &Path, apps: &[AppEntry]) -> Vec<AppEntry> {
+     pins
+ }
+ 
++/// The ids of the state file that resolve to no item in `apps`, in the file's order.
++fn stale_ids(path: &Path, apps: &[AppEntry]) -> Vec<String> {
++    let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
++    text.lines()
++        .map(str::trim)
++        .filter(|id| !id.is_empty() && !apps.iter().any(|app| app.id == *id))
++        .map(str::to_owned)
++        .collect()
++}
++
++/// The pins written: the shown ones in their order, then the ids that resolve to nothing this
++/// session (kept, so an item that comes back later keeps its pin).
++fn save_pins_keeping(path: &Path, pins: &[AppEntry], stale: &[String]) -> std::io::Result<()> {
++    let ids: Vec<&str> = pins.iter().map(|pin| pin.id.as_str())
++        .chain(stale.iter().map(String::as_str).filter(|id| !pins.iter().any(|pin| pin.id == *id)))
++        .collect();
++    save_ids(path, &ids)
++}
++
++/// SiliconForest's default pins (DESK6): the desk's terminal, Terminal, Activity Monitor and
++/// Firefox. A pin of an item not installed is kept in the file and not shown.
++pub const SILICONFOREST_DEFAULT_PINS: [&str; 4] = ["org.siliconforest.terminal", "com.apple.Terminal", "com.apple.ActivityMonitor", "org.mozilla.firefox"];
++
++/// The pins a dock with none starts with: `chonkstep/dock-pins` in the first data directory
++/// (`$XDG_DATA_DIRS`, default `/usr/local/share:/usr/share`) that has one (one desktop-file id a
++/// line), else on Darwin (SiliconForest) [`SILICONFOREST_DEFAULT_PINS`]. Elsewhere none: the
++/// Linux dock has no default pins.
++pub fn default_pins() -> Vec<String> {
++    let dirs = std::env::var("XDG_DATA_DIRS").ok().filter(|v| !v.is_empty()).unwrap_or_else(|| "/usr/local/share:/usr/share".into());
++    for dir in dirs.split(':').filter(|d| !d.is_empty()) {
++        if let Ok(text) = std::fs::read_to_string(Path::new(dir).join("chonkstep/dock-pins")) {
++            let ids: Vec<String> = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).map(str::to_owned).collect();
++            if !ids.is_empty() {
++                return ids;
++            }
++        }
++    }
++    if cfg!(target_os = "macos") {
++        SILICONFOREST_DEFAULT_PINS.iter().map(|s| s.to_string()).collect()
++    } else {
++        Vec::new()
++    }
++}
++
++/// A pins file that is missing or holds no id (every tile removed, or a file emptied by hand)
++/// gets `defaults` written into it, so a session never starts with an empty dock. `true` when
++/// it wrote them.
++pub fn write_defaults_if_empty(path: &Path, defaults: &[String]) -> bool {
++    if defaults.is_empty() {
++        return false;
++    }
++    let empty = std::fs::read_to_string(path).map_or(true, |text| text.lines().all(|l| l.trim().is_empty()));
++    if !empty {
++        return false;
++    }
++    let written = path.parent().map_or(Ok(()), std::fs::create_dir_all)
++        .and_then(|_| std::fs::write(path, defaults.iter().map(|id| format!("{id}\n")).collect::<String>()));
++    match written {
++        Ok(()) => {
++            eprintln!("chonk-dock: no pins in {}: the default set written ({})", path.display(), defaults.join(", "));
++            true
++        }
++        Err(error) => {
++            tracing::warn!(?error, "failed to write the default pins");
++            false
++        }
++    }
++}
++
+ /// Writes the pins as one desktop-file id per line — the whole
+ /// persistence format, human-editable on purpose like the theme and
+ /// wallpaper files beside it.
+ fn save_pins(path: &Path, pins: &[AppEntry]) -> std::io::Result<()> {
++    save_ids(path, &pins.iter().map(|pin| pin.id.as_str()).collect::<Vec<_>>())
++}
++
++fn save_ids(path: &Path, ids: &[&str]) -> std::io::Result<()> {
+     if let Some(parent) = path.parent() {
+         std::fs::create_dir_all(parent)?;
+     }
+     let mut text = String::new();
+-    for pin in pins {
+-        text.push_str(&pin.id);
++    for id in ids {
++        text.push_str(id);
+         text.push('\n');
+     }
+-    std::fs::write(path, text)
++    // written beside it and renamed over it: a dock ended mid-write never leaves a cut file
++    let next = path.with_extension("next");
++    std::fs::write(&next, text)?;
++    std::fs::rename(&next, path)
+ }
+ 
+ #[cfg(test)]
+@@ -1232,32 +1521,186 @@ mod tests {
+         dock.hover(&mut backend, None);
+         assert!(dock.hover.is_none());
+     }
+-    #[test]
+-    fn a_click_that_drifts_off_the_strips_edge_does_not_unpin() {
+-        use crate::surface::FakeBackend;
++    /// A strip of the three default tiles with its own state file.
++    fn three_tiles(backend: &mut crate::surface::FakeBackend, tag: &str) -> (LaunchDock<crate::surface::FakeBackend>, PathBuf, wm_theme::Theme) {
+         let theme = wm_theme::default_theme::nextstep_classic();
+-        let mut backend = FakeBackend::new();
+         let primary = Rect { pos: Point::new(0, 0), size: Size::new(640, 480) };
+-        let mut dock: LaunchDock<FakeBackend> = LaunchDock::new(&mut backend, &theme, primary, 56, &[], wm_theme::FontState::new());
+-        dock.state_path = None;
++        let mut dock: LaunchDock<crate::surface::FakeBackend> = LaunchDock::new(backend, &theme, primary, 56, &[], wm_theme::FontState::new());
++        let path = temp_state_file(tag);
++        dock.state_path = Some(path.clone());
+         dock.pins = vec![entry("org.siliconforest.terminal"), entry("com.apple.Terminal"), entry("com.apple.ActivityMonitor")];
+         dock.lit = vec![false; 3];
+-        dock.sync_window(&mut backend, &theme);
+-        // press near the bottom of the last tile, drift 6 px down (past the threshold and the strip's end)
++        dock.sync_window(backend, &theme);
++        (dock, path, theme)
++    }
++
++    /// DESK3's case, kept: a click whose pointer drifted a little past the strip's edge before
++    /// its release. DESK6: such a click (and one that wobbles less than the threshold anywhere)
++    /// launches its tile; nothing is unpinned and nothing written.
++    #[test]
++    fn a_click_that_wobbles_or_drifts_off_the_strips_edge_launches_and_never_unpins() {
++        let mut backend = crate::surface::FakeBackend::new();
++        let (mut dock, path, theme) = three_tiles(&mut backend, "wobble");
++        // press near the bottom of the last tile, drift 6 px down (under the threshold of 8, past the strip's end)
+         dock.handle_click(&mut backend, &theme, Point::new(28, 165), true, &[]);
+         dock.handle_motion(&mut backend, &theme, Point::new(28, 171));
+-        assert!(dock.handle_release(&mut backend, &theme, Point::new(28, 171)));
+-        assert_eq!(ids(&dock.pins), ["org.siliconforest.terminal", "com.apple.Terminal", "com.apple.ActivityMonitor"]);
++        let released = dock.handle_release(&mut backend, &theme, Point::new(28, 171), &[]);
++        assert!(matches!(released, Some(Some(LaunchDockAction::Launch(ref app))) if app.id == "com.apple.ActivityMonitor"), "a wobbling click launches its tile");
+         // the same off the right edge
++        dock.launching.clear();
+         dock.handle_click(&mut backend, &theme, Point::new(50, 20), true, &[]);
+-        dock.handle_motion(&mut backend, &theme, Point::new(60, 20));
+-        assert!(dock.handle_release(&mut backend, &theme, Point::new(60, 20)));
++        dock.handle_motion(&mut backend, &theme, Point::new(57, 22));
++        assert!(matches!(dock.handle_release(&mut backend, &theme, Point::new(57, 22), &[]), Some(Some(LaunchDockAction::Launch(_)))));
+         assert_eq!(dock.pins.len(), 3);
+-        // a deliberate drag well away unpins
++        assert!(!path.exists(), "a click writes nothing");
++        assert!(dock.float.is_none(), "a click lifts no tile");
++        cleanup(&path);
++    }
++
++    /// The owner: "the dock launchers disappeared when I clicked on them and tried to move
++    /// them". Dragging along the strip moves the tile: it follows the pointer, the strip shows
++    /// where it would land while it is dragged, and the drop writes the new order.
++    #[test]
++    fn dragging_a_tile_along_the_strip_reorders_it_live_and_the_order_persists() {
++        let mut backend = crate::surface::FakeBackend::new();
++        let (mut dock, path, theme) = three_tiles(&mut backend, "reorder");
++        dock.handle_click(&mut backend, &theme, Point::new(28, 20), true, &[]);
++        dock.handle_motion(&mut backend, &theme, Point::new(30, 60));
++        let float = dock.float.expect("the picked-up tile follows the pointer");
++        assert_eq!(backend.shell_geometries[&float].pos, Point::new(2, 40), "under the pointer where it was pressed");
++        assert_eq!(dock.shown_order(), [1, 0, 2], "the strip makes room: the tile shown in the second place");
++        dock.handle_motion(&mut backend, &theme, Point::new(34, 150));
++        assert_eq!(dock.shown_order(), [1, 2, 0], "live: now at the bottom");
++        assert_eq!(ids(&dock.pins), ["org.siliconforest.terminal", "com.apple.Terminal", "com.apple.ActivityMonitor"], "nothing changes before the drop");
++        assert!(matches!(dock.handle_release(&mut backend, &theme, Point::new(34, 150), &[]), Some(None)));
++        assert_eq!(ids(&dock.pins), ["com.apple.Terminal", "com.apple.ActivityMonitor", "org.siliconforest.terminal"]);
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "com.apple.Terminal\ncom.apple.ActivityMonitor\norg.siliconforest.terminal\n", "the order is written");
++        assert!(dock.float.is_none() && !backend.shell_geometries.contains_key(&float), "the floating tile is gone");
++        // a little to the right of the strip still counts as the strip
++        dock.handle_click(&mut backend, &theme, Point::new(28, 150), true, &[]);
++        dock.handle_motion(&mut backend, &theme, Point::new(90, 10));
++        dock.handle_release(&mut backend, &theme, Point::new(90, 10), &[]);
++        assert_eq!(ids(&dock.pins), ["org.siliconforest.terminal", "com.apple.Terminal", "com.apple.ActivityMonitor"]);
++        cleanup(&path);
++    }
++
++    /// Dropped well away from the dock without waiting for the label: it goes back to its place
++    /// (before DESK6 this removed it at once and wrote the file).
++    #[test]
++    fn a_tile_dropped_away_from_the_dock_snaps_back_and_nothing_is_written() {
++        let mut backend = crate::surface::FakeBackend::new();
++        let (mut dock, path, theme) = three_tiles(&mut backend, "snapback");
+         dock.handle_click(&mut backend, &theme, Point::new(28, 80), true, &[]);
+-        dock.handle_motion(&mut backend, &theme, Point::new(200, 80));
+-        assert!(dock.handle_release(&mut backend, &theme, Point::new(200, 80)));
++        dock.handle_motion(&mut backend, &theme, Point::new(300, 200));
++        assert_eq!(dock.shown_order(), [0, 1, 2], "away from the strip: its place is kept for it");
++        assert!(dock.next_deadline().is_some(), "the loop wakes to show the label in time");
++        assert!(matches!(dock.handle_release(&mut backend, &theme, Point::new(300, 200), &[]), Some(None)));
++        assert_eq!(dock.pins.len(), 3, "not removed");
++        assert!(!path.exists(), "nothing written");
++        cleanup(&path);
++    }
++
++    /// Removal needs a clear affordance: held away from the strip until "Remove from Dock" shows
++    /// (`REMOVE_HOLD`), a release removes the tile; brought back near the strip first, it does not.
++    #[test]
++    fn a_tile_held_away_shows_remove_and_only_then_a_release_removes_it() {
++        let mut backend = crate::surface::FakeBackend::new();
++        let (mut dock, path, theme) = three_tiles(&mut backend, "remove");
++        let shells = |b: &crate::surface::FakeBackend| b.shell_mapped.values().filter(|m| **m).count();
++        dock.handle_click(&mut backend, &theme, Point::new(28, 80), true, &[]);
++        dock.handle_motion(&mut backend, &theme, Point::new(300, 200));
++        dock.tick_drag(&mut backend, &theme, 1.0);
++        assert!(dock.remove_label.is_none(), "not at once");
++        let back_dated = |dock: &mut LaunchDock<crate::surface::FakeBackend>| {
++            let drag = dock.drag.as_mut().unwrap();
++            drag.away_since = drag.away_since.map(|t| t - REMOVE_HOLD);
++        };
++        back_dated(&mut dock);
++        let before = shells(&backend);
++        dock.tick_drag(&mut backend, &theme, 1.0);
++        let (label, _) = dock.remove_label.expect("held away: the label shows");
++        assert_eq!(shells(&backend), before + 1);
++        let at = backend.shell_geometries[&label];
++        assert!(at.pos.y < 200 && at.pos.y + at.size.h as i32 <= 200 - 28 + 1, "above the floating tile: {at:?}");
++        // back near the strip: the label goes, a drop there is a move
++        dock.handle_motion(&mut backend, &theme, Point::new(28, 80));
++        assert!(dock.remove_label.is_none());
++        // away again and held: removed on release, the file written
++        dock.handle_motion(&mut backend, &theme, Point::new(300, 200));
++        back_dated(&mut dock);
++        dock.tick_drag(&mut backend, &theme, 1.0);
++        assert!(dock.remove_label.is_some());
++        assert!(matches!(dock.handle_release(&mut backend, &theme, Point::new(300, 200), &[]), Some(None)));
+         assert_eq!(ids(&dock.pins), ["org.siliconforest.terminal", "com.apple.ActivityMonitor"]);
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "org.siliconforest.terminal\ncom.apple.ActivityMonitor\n");
++        assert!(dock.remove_label.is_none() && dock.float.is_none());
++        cleanup(&path);
++    }
++
++    /// The tile's context menu (secondary click), as macOS's Dock: Open (Show when it runs),
++    /// Options > Keep in Dock / Remove from Dock, Quit for a running application.
++    #[test]
++    fn a_tiles_context_menu_has_open_options_and_quit_and_removes_it() {
++        use wm_theme::menu::MenuItem;
++        let mut backend = crate::surface::FakeBackend::new();
++        let (mut dock, path, theme) = three_tiles(&mut backend, "menu");
++        let labels = |items: &[MenuItem]| items.iter().map(|i| i.label().to_string()).collect::<Vec<_>>();
++        assert_eq!(dock.slot_at_local(Point::new(10, 70)), Some(1));
++        let items = dock.context_menu(1, &[]).unwrap();
++        assert_eq!(labels(&items), ["Open", "Options"]);
++        let MenuItem::Submenu { items: options, .. } = &items[1] else { panic!("Options is a submenu") };
++        assert_eq!(labels(options), ["\u{2713} Keep in Dock", "Remove from Dock"]);
++        let window = backend.create_window();
++        let running = [("com.apple.Terminal".to_string(), window)];
++        assert_eq!(labels(&dock.context_menu(1, &running).unwrap()), ["Show", "Options", "Quit"]);
++        assert!(matches!(dock.open_action(&mut backend, &theme, "com.apple.Terminal", &running), Some(LaunchDockAction::Focus(_))));
++        assert!(dock.remove_pin(&mut backend, &theme, "com.apple.Terminal"));
++        assert_eq!(ids(&dock.pins), ["org.siliconforest.terminal", "com.apple.ActivityMonitor"]);
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "org.siliconforest.terminal\ncom.apple.ActivityMonitor\n");
++        cleanup(&path);
++    }
++
++    /// The Firefox installer found the owner's pins file empty: a dock that finds no pins
++    /// (missing file, or one with no id) starts with the default set and writes it; a file with
++    /// pins is left alone.
++    #[test]
++    fn a_missing_or_empty_pins_file_gets_the_default_set() {
++        let defaults: Vec<String> = SILICONFOREST_DEFAULT_PINS.iter().map(|s| s.to_string()).collect();
++        let path = temp_state_file("defaults");
++        assert!(write_defaults_if_empty(&path, &defaults), "missing: written");
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "org.siliconforest.terminal\ncom.apple.Terminal\ncom.apple.ActivityMonitor\norg.mozilla.firefox\n");
++        std::fs::write(&path, "\n  \n").unwrap();
++        assert!(write_defaults_if_empty(&path, &defaults), "blank: written");
++        std::fs::write(&path, "com.apple.Terminal\n").unwrap();
++        assert!(!write_defaults_if_empty(&path, &defaults), "pins of the owner's own: left alone");
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "com.apple.Terminal\n");
++        assert!(!write_defaults_if_empty(&path, &[]), "no defaults (Linux): nothing");
++        cleanup(&path);
++    }
++
++    /// A pin whose item is not installed this session (Firefox's pin before its item existed, an
++    /// item being rewritten) is kept in the file when the others move, not erased.
++    #[test]
++    fn a_pin_that_resolves_to_nothing_survives_a_move_in_the_file() {
++        let mut backend = crate::surface::FakeBackend::new();
++        let theme = wm_theme::default_theme::nextstep_classic();
++        let apps = [entry("app.a"), entry("app.b")];
++        let path = temp_state_file("stale-kept");
++        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
++        std::fs::write(&path, "app.a\norg.mozilla.firefox\napp.b\n").unwrap();
++        let primary = Rect { pos: Point::new(0, 0), size: Size::new(640, 480) };
++        let mut dock: LaunchDock<crate::surface::FakeBackend> = LaunchDock::new(&mut backend, &theme, primary, 56, &[], wm_theme::FontState::new());
++        dock.state_path = Some(path.clone());
++        dock.reload(&mut backend, &theme, &apps);
++        assert_eq!(ids(&dock.pins), ["app.a", "app.b"]);
++        dock.handle_click(&mut backend, &theme, Point::new(28, 20), true, &[]);
++        dock.handle_motion(&mut backend, &theme, Point::new(28, 80));
++        dock.handle_release(&mut backend, &theme, Point::new(28, 80), &[]);
++        assert_eq!(std::fs::read_to_string(&path).unwrap(), "app.b\napp.a\norg.mozilla.firefox\n");
++        // installed later: the reload (the dock scans again when the items change) shows it
++        dock.reload(&mut backend, &theme, &[entry("app.a"), entry("app.b"), entry("org.mozilla.firefox")]);
++        assert_eq!(ids(&dock.pins), ["app.b", "app.a", "org.mozilla.firefox"]);
++        cleanup(&path);
+     }
+ 
+     #[test]
+diff --git a/dock/crates/chonk-dock/src/main.rs b/dock/crates/chonk-dock/src/main.rs
+index 145f5fa..851dfa1 100644
+--- a/dock/crates/chonk-dock/src/main.rs
++++ b/dock/crates/chonk-dock/src/main.rs
+@@ -19,7 +19,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
+     while let Some(arg) = args.next() {
+         match arg.as_str() {
+             "--help" | "-h" => {
+-                println!("Chonk Dock — standalone NeXTSTEP dock\n\nchonk-dock [--x11 | --wayland] [--output NAME] [--theme ID] [--scale FACTOR]\nchonk-dock --stop | --toggle | --status\nchonk-dock --list-apps | --pin DESKTOP-ID\n\nRight-click instruments for panels; middle-drag to reorder.\nClick the identity tile for applications, pins, and Quit.\nThe dock is opt-in and is never started by the Omarchy preset.");
++                println!("Chonk Dock — standalone NeXTSTEP dock\n\nchonk-dock [--x11 | --wayland] [--output NAME] [--theme ID] [--scale FACTOR]\nchonk-dock --stop | --toggle | --status\nchonk-dock --list-apps | --pin DESKTOP-ID | --defaults\n\nRight-click instruments for panels; middle-drag to reorder.\nClick the identity tile for applications, pins, and Quit.\nThe dock is opt-in and is never started by the Omarchy preset.");
+                 return Ok(());
+             }
+             "--version" => {
+@@ -46,6 +46,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
+                 return Ok(());
+             }
+             "--pin" => pin = Some(args.next().ok_or("--pin needs a desktop id")?),
++            "--defaults" => operation = "defaults",
+             _ => return Err(format!("unknown option {arg}; use --help").into()),
+         }
+     }
+@@ -55,6 +56,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
+         }
+     }
+     let path = runtime::socket_path(options.platform)?;
++    if operation == "defaults" {
++        // the default pins (SiliconForest: chonkstep/dock-pins in the data directories), the
++        // file of before kept as dock.before-defaults; a running dock reloads them
++        let defaults = chonk_dock::launchdock::default_pins();
++        if defaults.is_empty() {
++            return Err("no default pins here (no chonkstep/dock-pins in the data directories)".into());
++        }
++        let state = startup::state_file("dock").ok_or("no state directory")?;
++        std::fs::create_dir_all(state.parent().unwrap())?;
++        if state.exists() {
++            std::fs::copy(&state, state.with_file_name("dock.before-defaults"))?;
++        }
++        std::fs::write(&state, defaults.iter().map(|id| format!("{id}\n")).collect::<String>())?;
++        println!("{}: {}", state.display(), defaults.join(" "));
++        let _ = request(&path, "reload");
++        return Ok(());
++    }
+     if let Some(pin) = pin {
+         let apps = apps::scan_applications();
+         if !apps.iter().any(|app| app.id == pin) {
+diff --git a/dock/crates/chonk-dock/src/runtime.rs b/dock/crates/chonk-dock/src/runtime.rs
+index 97535d6..96fb6a4 100644
+--- a/dock/crates/chonk-dock/src/runtime.rs
++++ b/dock/crates/chonk-dock/src/runtime.rs
+@@ -101,7 +101,8 @@ pub fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
+     let fonts = wm_theme::FontState::new();
+     // The themes' own faces, whatever the system has installed (the labels' figures).
+     fonts.load_resident_faces();
+-    let applications = apps::scan_applications();
++    let mut applications = apps::scan_applications();
++    let mut catalog = apps::catalog_signature();
+     let mut dock = Desktop::new(&mut display, screen, scale, &theme, fonts.clone());
+     let mut launcher = LaunchDock::new(
+         &mut display,
+@@ -113,6 +114,8 @@ pub fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
+     );
+     let mut menu = CascadeMenu::<u32>::new("Chonk Dock", (128, 129, 159));
+     let mut remote_menu: Option<String> = None;
++    // the launcher tile whose context menu is open (its desktop-file id)
++    let mut launcher_menu: Option<String> = None;
+     let mut icons = BTreeMap::<u32, (u32, String)>::new();
+     let mut icon_drag: Option<(u32, Point, bool)> = None;
+     let mut clients: Vec<(chonk_ipc::Stream, Vec<u8>, Instant)> = Vec::new();
+@@ -129,8 +132,21 @@ pub fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
+         // built-ins restyle solely in response to control events.
+         let due = Instant::now() >= theme_refresh;
+         let refresh_palette = due && (theme.id == "omarchy" || cfg!(target_os = "macos"));
++        let mut catalog_changed = false;
+         if due {
+             theme_refresh = Instant::now() + Duration::from_secs(2);
++            // an item installed or removed while the dock runs: scan again and resolve the pins
++            // again (DESK6: Firefox's item and pin, written into a running session)
++            let now = apps::catalog_signature();
++            if now != catalog {
++                catalog = now;
++                applications = apps::scan_applications();
++                catalog_changed = true;
++            }
++        }
++        if catalog_changed {
++            launcher.reload(&mut display, &theme, &applications);
++            windows_changed = true;
+         }
+         if display.take_changed() || last_theme != control.theme || refresh_palette {
+             last_theme = control.theme.clone();
+@@ -158,7 +174,13 @@ pub fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
+         if windows_changed || first || launcher.running_refresh_needed() {
+             first = false;
+             launcher.update_running(&mut display, &theme, &running);
+-            sync_icons(&mut display, &mut icons, &theme, &fonts, screen, tile, &applications);
++            // SiliconForest's desk draws each minimised window itself, a tile with its picture
++            // (chonk-shell's miniwindows): the dock's icon tile of the same window was a second,
++            // smaller icon over it (DESK6, the owner: "two icons ... not that other icon that's
++            // smaller and overlapping")
++            if !cfg!(target_os = "macos") {
++                sync_icons(&mut display, &mut icons, &theme, &fonts, screen, tile, &applications);
++            }
+         }
+         let (current, count) = if control.connected() {
+             (control.current, control.count)
+@@ -220,7 +242,24 @@ pub fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
+                             menu.click(&mut display, &theme, &mut fonts.system(), surface, local)
+                         {
+                             if let MenuClick::Action(action) = result {
+-                                if let Some(id) = remote_menu.take() {
++                                if let Some(id) = launcher_menu.take() {
++                                    match action {
++                                        crate::launchdock::MENU_OPEN => match launcher.open_action(&mut display, &theme, &id, &running) {
++                                            Some(LaunchDockAction::Focus(window)) => display.activate(window),
++                                            Some(LaunchDockAction::Launch(app)) => launch(&app, &theme, options.scale, options.platform),
++                                            None => {}
++                                        },
++                                        crate::launchdock::MENU_KEEP | crate::launchdock::MENU_REMOVE => {
++                                            launcher.remove_pin(&mut display, &theme, &id);
++                                        }
++                                        crate::launchdock::MENU_QUIT => {
++                                            if let Some(app) = applications.iter().find(|app| app.id == id) {
++                                                quit_application(&display, app, &running);
++                                            }
++                                        }
++                                        _ => {}
++                                    }
++                                } else if let Some(id) = remote_menu.take() {
+                                     dock.remote_action(&mut display, &theme, &id, action);
+                                 } else if action == u32::MAX {
+                                     QUIT.store(true, Ordering::Relaxed);
+@@ -260,7 +299,12 @@ pub fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
+                                 }
+                                 continue;
+                             }
+-                            if launcher.handle_release(&mut display, &theme, root) {
++                            if let Some(action) = launcher.handle_release(&mut display, &theme, root, &running) {
++                                match action {
++                                    Some(LaunchDockAction::Focus(window)) => display.activate(window),
++                                    Some(LaunchDockAction::Launch(app)) => launch(&app, &theme, options.scale, options.platform),
++                                    None => {}
++                                }
+                                 continue;
+                             }
+                         }
+@@ -317,6 +361,17 @@ pub fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
+                         dock.click_clip(local);
+                     } else if dock.instrument_panel_owns(surface) && button == 0x110 {
+                         dock.instrument_panel_click(&theme, local, MouseButton::Left, pressed);
++                    } else if launcher.owns_window(surface) && button == 0x111 && pressed {
++                        // a tile's context menu: Open/Show, Options > Keep in Dock / Remove
++                        // from Dock, Quit
++                        dock.dismiss_instrument_panel(&mut display, PanelCloseReason::Dismissed);
++                        if let Some(slot) = launcher.slot_at_local(local) {
++                            if let (Some(items), Some(pin)) = (launcher.context_menu(slot, &running), launcher.pin(slot)) {
++                                remote_menu = None;
++                                launcher_menu = Some(pin.id.clone());
++                                menu.open(&mut display, &theme, &mut fonts.system(), items, root, screen.size, true);
++                            }
++                        }
+                     } else if launcher.owns_window(surface) && button == 0x110 {
+                         if let Some(action) =
+                             launcher.handle_click(&mut display, &theme, local, pressed, &running)
+@@ -356,6 +411,7 @@ pub fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
+         dock.tick_items(&mut display, &theme);
+         launcher.tick_launching(&mut display, &theme);
+         launcher.tick_tip(&mut display, &theme, options.scale);
++        launcher.tick_drag(&mut display, &theme, options.scale);
+         display.sync_backdrop();
+         display.present()?;
+         for _ in 0..8 {
+@@ -394,6 +450,8 @@ pub fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
+             input.len() <= 64 && since.elapsed() < Duration::from_secs(2)
+         });
+         if reload {
++            applications = apps::scan_applications();
++            catalog = apps::catalog_signature();
+             launcher.reload(&mut display, &theme, &applications);
+         }
+         if QUIT.load(Ordering::Relaxed) {
+@@ -477,6 +535,34 @@ fn launch(app: &apps::AppEntry, theme: &wm_theme::Theme, scale: f32, platform: P
+     );
+ }
+ 
++/// A tile's Quit: on SiliconForest the desktop quits the application as its own menu's Quit does
++/// (a Mac application with its questions; the desk's terminal: every window of it closed), the
++/// way the Command-Tab switcher's Q does; elsewhere every matching window is asked to close.
++fn quit_application(display: &Client, app: &apps::AppEntry, running: &[(String, u32)]) {
++    let classes: Vec<&str> = running
++        .iter()
++        .filter(|(class, _)| apps::match_window_class(std::slice::from_ref(app), class).is_some())
++        .map(|(class, _)| class.as_str())
++        .collect();
++    if cfg!(target_os = "macos") {
++        let mut asked = Vec::new();
++        for class in classes {
++            if asked.contains(&class) {
++                continue;
++            }
++            asked.push(class);
++            eprintln!("chonk-dock: Quit {} (app id {class})", app.id);
++            crate::spawn::spawn_detached_with_env("/usr/bin/chonkstep-darwin-desktop", &["--desktop-request", "quit", class], &[], &[]);
++        }
++    } else {
++        for (class, window) in running {
++            if apps::match_window_class(std::slice::from_ref(app), class).is_some() {
++                display.close(*window);
++            }
++        }
++    }
++}
++
+ fn application_menu(apps: &[apps::AppEntry]) -> Vec<MenuItem> {
+     let mut groups = BTreeMap::new();
+     let mut pins = Vec::new();
+diff --git a/dock/crates/chonk-dock/src/wayland.rs b/dock/crates/chonk-dock/src/wayland.rs
+index 9a1b687..1e19d7f 100644
+--- a/dock/crates/chonk-dock/src/wayland.rs
++++ b/dock/crates/chonk-dock/src/wayland.rs
+@@ -177,6 +177,11 @@ impl Wayland {
+             .map(|(id, w)| (w.app_id.clone(), *id))
+             .collect()
+     }
++    pub fn close(&self, id: u32) {
++        if let Some(window) = self.windows.get(&id) {
++            window.handle.close();
++        }
++    }
+     pub fn activate(&self, id: u32) {
+         if let (Some(window), Some(seat)) = (self.windows.get(&id), self.seat.as_ref()) {
+             window.handle.unset_minimized();
+diff --git a/dock/crates/chonk-dock/src/x11.rs b/dock/crates/chonk-dock/src/x11.rs
+index 47daced..7dee3a7 100644
+--- a/dock/crates/chonk-dock/src/x11.rs
++++ b/dock/crates/chonk-dock/src/x11.rs
+@@ -26,7 +26,7 @@ x11rb::atom_manager! {
+         _NET_WM_WINDOW_TYPE_POPUP_MENU, _NET_WM_STATE, _NET_WM_STATE_ABOVE,
+         _NET_WM_STATE_STICKY, _NET_WM_STATE_SKIP_TASKBAR, _NET_WM_STATE_SKIP_PAGER,
+         _NET_WM_STATE_HIDDEN, _NET_WM_STRUT, _NET_WM_STRUT_PARTIAL, _NET_WM_DESKTOP,
+-        _NET_CLIENT_LIST, _NET_ACTIVE_WINDOW, _NET_CURRENT_DESKTOP, _NET_NUMBER_OF_DESKTOPS,
++        _NET_CLIENT_LIST, _NET_ACTIVE_WINDOW, _NET_CLOSE_WINDOW, _NET_CURRENT_DESKTOP, _NET_NUMBER_OF_DESKTOPS,
+         _NET_FRAME_EXTENTS, RESOURCE_MANAGER,
+     }
+ }
+@@ -199,6 +199,10 @@ impl X11 {
+         );
+         let _ = self.conn.flush();
+     }
++    pub fn close(&self, id: u32) {
++        // _NET_CLOSE_WINDOW: the window manager closes it as its own close button would
++        self.send_root(id, self.atoms._NET_CLOSE_WINDOW, [self.last_time, 2, 0, 0, 0]);
++    }
+     pub fn activate(&self, id: u32) {
+         if self.windows.get(&id).is_some_and(|w| w.minimized) {
+             let _ = self.conn.map_window(id);

@@ -1,0 +1,81 @@
+--- a/src/Frameworks/OpenGL/CGL.c
++++ b/src/Frameworks/OpenGL/CGL.c
+@@ -464,6 +464,7 @@
+ #ifdef SF_CGL_USE_EGL
+ static void sf_cgl_stop_presenting(CGLContextObj ctx);
+ static void sf_cgl_clear_export_cache(CGLContextObj ctx);
++static void sf_cgl_forget_context_fbos(CGLContextObj ctx);
+ #endif
+ 
+ CGLError
+@@ -667,6 +668,7 @@
+ #ifdef SF_CGL_USE_EGL
+ 	EGLDisplay dpy = sf_cgl_get_display();
+     sf_cgl_clear_export_cache(ctx);
++    sf_cgl_forget_context_fbos(ctx);
+ 
+ 	if (sf_cgl_current == ctx) {
+ 		if (dpy != EGL_NO_DISPLAY) {
+@@ -1055,7 +1057,8 @@
+ };
+ 
+ struct sf_cgl_fbo {
+-	void   *group;
++	// FBO names are context-local even when their textures are shared.
++	CGLContextObj context;
+ 	GLuint  fbo;
+ 	int     surftex;
+ };
+@@ -1065,6 +1068,16 @@
+ static int sf_cgl_surftex_count, sf_cgl_surftex_cap;
+ static struct sf_cgl_fbo *sf_cgl_fbos;
+ static int sf_cgl_fbo_count, sf_cgl_fbo_cap;
++static void sf_cgl_forget_context_fbos(CGLContextObj ctx) {
++    pthread_mutex_lock(&sf_cgl_track_lock);
++    for (int i=0;i<sf_cgl_fbo_count;) {
++        if (sf_cgl_fbos[i].context==ctx)
++            sf_cgl_fbos[i]=sf_cgl_fbos[--sf_cgl_fbo_count];
++        else ++i;
++    }
++    pthread_mutex_unlock(&sf_cgl_track_lock);
++}
++
+ // SF_CGL_TRACE: write-back totals, printed every two seconds
+ static struct {
+ 	double since, busy;
+@@ -1582,7 +1595,7 @@
+ 		return;
+ 	pthread_mutex_lock(&sf_cgl_track_lock);
+ 	for (i = 0; i < sf_cgl_fbo_count; i++) {
+-		if (sf_cgl_fbos[i].group == group && sf_cgl_fbos[i].fbo == (GLuint)fbo) {
++		if (sf_cgl_fbos[i].context == sf_cgl_current && sf_cgl_fbos[i].fbo == (GLuint)fbo) {
+ 			if (sf_cgl_fbos[i].surftex >= 0)
+ 				sf_cgl_surftexs[sf_cgl_fbos[i].surftex].dirty = 1;
+ 			break;
+@@ -1771,7 +1784,7 @@
+ 	pthread_mutex_lock(&sf_cgl_track_lock);
+ 	surftex = texture != 0 ? sf_cgl_find_surftex(group, texture) : -1;
+ 	for (i = 0; i < sf_cgl_fbo_count; i++) {
+-		if (sf_cgl_fbos[i].group == group && sf_cgl_fbos[i].fbo == (GLuint)fbo)
++		if (sf_cgl_fbos[i].context == sf_cgl_current && sf_cgl_fbos[i].fbo == (GLuint)fbo)
+ 			break;
+ 	}
+ 	if (i == sf_cgl_fbo_count) {
+@@ -1792,7 +1805,7 @@
+ 		}
+ 		sf_cgl_fbo_count++;
+ 	}
+-	sf_cgl_fbos[i] = (struct sf_cgl_fbo){ group, (GLuint)fbo, surftex };
++	sf_cgl_fbos[i] = (struct sf_cgl_fbo){ sf_cgl_current, (GLuint)fbo, surftex };
+ 	pthread_mutex_unlock(&sf_cgl_track_lock);
+ }
+ 
+@@ -1841,7 +1854,7 @@
+ 		pthread_mutex_lock(&sf_cgl_track_lock);
+ 		for (i = 0; i < n; i++) {
+ 			for (j = 0; j < sf_cgl_fbo_count; j++) {
+-				if (sf_cgl_fbos[j].group == group && sf_cgl_fbos[j].fbo == framebuffers[i]) {
++				if (sf_cgl_fbos[j].context == sf_cgl_current && sf_cgl_fbos[j].fbo == framebuffers[i]) {
+ 					sf_cgl_fbos[j] = sf_cgl_fbos[--sf_cgl_fbo_count];
+ 					break;
+ 				}

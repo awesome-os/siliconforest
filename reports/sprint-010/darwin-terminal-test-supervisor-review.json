@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SCRIPT_REVIEW_NO_HARDWARE",
+  "reviewed": "integrations/puredarwin/chonkstep-darwin/darwin-terminal-test, sha256 0347556f3f777902",
+  "verdict": "APPROVED, including timing for a host runtime of 180 s. Revision 1's S1 is RETRACTED: it inferred the desktop-command time from the kernel/IOFB uptime clock, which includes about 42 s of bootstrap before HV_START. desktop-attempt002-ssd-frame-qualification.json N1 had already said that clock cannot be compared with the host runtime.",
+  "verified": [
+    "Flow: nonce check (48 lowercase hex), then DL10_BEGIN, a 0700 runtime dir, exported XDG/WAYLAND/XKB/TMPDIR, and an EXIT/HUP/INT/TERM cleanup trap (TERM+wait client, then compositor). Then 'DL11_TERMINAL_PRIME_<nonce>', exactly the line TerminalInput expects. A stat-only wait (at most 5 s) for both HID character nodes, 0.5 s pacing, compositor '--run --socket PATH --input pdhid', a bounded socket wait with compositor liveness, DL10_SERVER_SOCKET, and the reviewed terminal binary with --seconds 120.",
+    "Evidence step: after 85 s, '/usr/bin/darwin-terminal-records --directory $runtime/terminal-$nonce --nonce $nonce --phase live' with its rc captured. The directory equals the terminal's private dir (<socket parent>/terminal-<nonce>, created 0700 by the same uid with 0600 files), so the collector's owner/mode/link checks are satisfied. The live phase tolerates only the optional final grid/result being absent, and export is read-only (no PTY injection).",
+    "Teardown: wait for the client (its own 120 s deadline ends the session; the app's cleanup TERM/KILLs its shell and the app exits 0 only with a response and a complete cleanup). Then 'kill -TERM compositor || :', wait, and 'DL11_TERMINAL_STATUS ... client= compositor= records=', with END only if all three are 0. The status line is printed even when one fails (R1 idiom)."
+  ],
+  "findings": [
+    {
+      "id": "S1",
+      "severity": "RETRACTED (revision 2), replaced by a margin note",
+      "text": "Host-timestamp evidence (original host mtimes preserved in the private copies; runtime 150): attempt-002/005/006 each show before-start.json at t=0, desktop-input.bin (written when the desktop command is sent) at +78 s, and capture-core.json (runtime stop) at +150 s. The stop is exactly +150 s in all three, so the timer anchors at before-start, and the command is sent at +78 s, not about 120 s (kernel uptime is about 42 s ahead of HV_START). For darwin-terminal-test: terminal launch is about +81-82 s (PRIME priming about 1 s, node wait, 0.5 s, socket), the live export about +166-167 s (launch + 85), and worst-case readiness plus typing is complete by about +132 s (launch + 20 + about 30). With a 180 s runtime the export finishes with about 12-14 s of margin; the live export is small (a few KB raw). Keep 180 s, or 200-240 s if more margin is wanted. This is consistent with root's 007 observation of PTY_PASS/end at console birth + 96.5 s."
+    },
+    {
+      "id": "S2",
+      "severity": "note",
+      "text": "If the runtime is raised past about 245 s (terminal launch + 120 s), the capture will also include the client's timed exit, compositor teardown and the console-return path. That is useful, but a live capture still cannot claim cleanup; the separate bounded close cycle stays the cleanup evidence."
+    },
+    {
+      "id": "S3",
+      "severity": "note",
+      "text": "A live export is a prefix snapshot. The digest covers exactly the exported bytes, but the response must already be inside pty-rx.bin at export time, which is another reason the export must come after worst-case typing completes."
+    }
+  ],
+  "not_claimed": [
+    "terminal runtime",
+    "typing",
+    "cleanup"
+  ],
+  "scope": "Read-only script review using earlier captures for timing. No hardware or edits.",
+  "revision": 3,
+  "timing_evidence": {
+    "attempt-002": {
+      "before_start_mtime": 1794125354,
+      "desktop_input_mtime": 1794125432,
+      "capture_core_mtime": 1794125504,
+      "command_s": 78,
+      "stop_s": 150
+    },
+    "attempt-005": {
+      "before_start_mtime": 1794127647,
+      "desktop_input_mtime": 1794127725,
+      "capture_core_mtime": 1794127797,
+      "command_s": 78,
+      "stop_s": 150
+    },
+    "attempt-006": {
+      "before_start_mtime": 1794128090,
+      "desktop_input_mtime": 1794128168,
+      "capture_core_mtime": 1794128240,
+      "command_s": 78,
+      "stop_s": 150
+    },
+    "method": "stat mtime of host-written files in the private run copies (second resolution); local birth times are copy times and are not used."
+  },
+  "revision_note": "Revision 2: S1 retracted (wrong clock). Revision 3: root host birth-time data for 003/005/006/007 added and the plan validated in host time.",
+  "root_host_timing_corroboration": {
+    "source": "runs/m1-desktop-010/PTY-and-terminal-host-timing.json (M5 host birth times, private)",
+    "desktop_command_after_console_birth_s": {
+      "003": 78.025,
+      "005": 78.175,
+      "006": 78.192,
+      "007": 78.106
+    },
+    "console_result_after_console_birth_s": "150.137-150.172",
+    "framebuffer_after_console_birth_s": "152.05-152.10",
+    "agreement": "Matches my second-resolution mtimes (+78 s command, +150 s stop for 002/005/006), now including 007. Kernel/IOFB uptime of about 122 s at compositor start therefore includes about 44 s from before console birth."
+  },
+  "plan_validation_host_time": "Using host time from console birth: command 78.0-78.2 s; PRIME, host priming (about 1 s at at least 150 ms per report), node wait, 0.5 s and socket put the terminal launch at about 79-81 s. Worst-case READY (20 s) plus typing (242 reports at about 100 ms, about 25-30 s) completes by about 130 s. The live export starts at launch + 85, about 164-166 s, and is a few KB raw (well under 1 s even at a conservative console rate). The 180 s runtime stop leaves about 14-16 s of margin. The plan is valid with the existing 180 s limit; no expansion needed."
+}

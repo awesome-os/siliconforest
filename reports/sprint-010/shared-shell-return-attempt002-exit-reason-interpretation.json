@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "author": "Grok, independent read of the attempt-002 exit-reason payload and the pinned desktop XNU tree",
+  "prepared_utc": "2026-11-08T18:47:28Z",
+  "status": "SENDER_IS_PID_14_CAUSE_NOT_ESTABLISHED",
+  "capture": "runs/m1-desktop-010/shared-shell-return-attempt-002",
+  "compared_with": "reports/sprint-010/shared-shell-return-attempt002-sigkill-exit-reason-analysis.json is the author analysis. This receipt does not adopt it.",
+  "source_tree": "sources/puredarwin-m1-desktop/src/Kernel/xnu",
+  "source_limit": "This is the pinned desktop tree. It is not a disassembly of kernelcache 02fe2d4106ca3091b95a3e9235e3f9a7226c0f030eb24fb609f6817506c0f883.",
+  "source_sha256": {
+    "bsd/kern/kern_sig.c": "8ce8c8d74345256e8598fc36b79976406fb165ae88d90721f3d918a3dd317495",
+    "bsd/kern/kern_cs.c": "3a75f217f695b911b997aaf995827f0a9fd22cecea1fa0b7124a85a48fe9382a",
+    "bsd/kern/kern_exec.c": "9097f68c0e18dfb3b6ded66b08617f26c7380e914463db2b879a473272de73f9",
+    "osfmk/vm/vm_fault.c": "4c515d8c8ab7c0e002ae81392c1c56603800c6ad317def6458106980920c8fdd",
+    "bsd/kern/kern_proc.c": "45e3a0e51629c0fb93b8fe6c169950f5f1d81dfe91b40b0d68c90217b2fdda7b",
+    "bsd/kern/kern_guarded.c": "4bdfcb6f23bd47358d0ce80f5f85eb4eb87dfda731d60a4265b3b0ce5d1092b6",
+    "bsd/kern/kern_memorystatus.c": "1ff7c0bece16f400e65da81aa84e39d731fc1b6b663f39f7569513beec7a25f0",
+    "bsd/sys/reason.h": "8dc6b5266fe2c21b6ddb6cc97ac2ef0f972bc400038f409a3a70ebf42ba157ce",
+    "libkdd/kcdata.h": "5d0b57dad21635f8447ac407a71f8c9af6289d964e65fe7cda6f7b6c3643d715"
+  },
+  "recorded_payload": {
+    "attempt": 0,
+    "pid_reaped": 14,
+    "raw_wait": 9,
+    "spawn_returned_ms": 249,
+    "exit_reason_ms": 258,
+    "reaped_ms": 258,
+    "namespace": 2,
+    "namespace_name": "OS_REASON_SIGNAL",
+    "code": 9,
+    "flags": 0,
+    "payload_bytes": 128,
+    "payload_hex": "0009a25300000000800000000000000036000000100000008c000000000000000e00000000000000000000000000000037000000300000008f0000000000000063686f6e6b2d7465726d696e616c2d64617277696e006f70000000000000000000000000000000000000000000000000ed5891f1000000000000000000000000",
+    "kcdata": [
+      "BEGIN type 0x53a20900 size 0 flags 0x80",
+      "PID type 0x36 size 16 flags 0x8c logical 4 bytes, int32 value 14",
+      "PROCNAME type 0x37 size 48 flags 0x8f logical 33 bytes, C string chonk-terminal-darwin, following nonzero bytes 6f70",
+      "BUFFER_END type 0xf19158ed size 0 flags 0"
+    ]
+  },
+  "what_matches_pinned_xnu": [
+    "kill() calls psignal with no reason (kern_sig.c kill). psignal calls psignal_internal with a NULL reason. For SIGKILL, if the target thread's uu_exit_reason is still null and no reason was passed, psignal_internal calls build_signal_reason(signum, NULL) and set_thread_exit_reason.",
+    "build_signal_reason(signum, NULL) sets namespace OS_REASON_SIGNAL and code to the signal number. The PID item is proc_getpid(current_proc()). The PROCNAME item is requested at sizeof(p_name), which is proc_name_t, 2*MAXCOMLEN+1 = 33, and the NULL-procname branch copies the whole p_name. An explicit procname is copied with strlen only into a zeroed buffer.",
+    "The 128-byte payload matches that layout: OS reason begin, one PID 14, one 33-byte name whose C string is chonk-terminal-darwin, and two nonzero bytes after the NUL. Those tail bytes match a whole-p_name copy. They do not match a strlen copy of an explicit name.",
+    "The sender recorded in the payload is therefore the process that was current when build_signal_reason ran. That process is pid 14, the reaped application. A kill syscall whose current process was the desktop (console DL23_DESKTOP_PID pid=13) would record pid 13. The attempt 0 journal has TermAttempt and KillAttempt absent."
+  ],
+  "where_the_author_analysis_does_not_match_this_tree": [
+    "cs_invalid_page calls threadsignal(current_thread(), SIGKILL, EXC_BAD_ACCESS, FALSE) only when CS_KILL is set (kern_cs.c). threadsignal builds a reason only when set_exitreason is true, and the name it passes is the literal exc handler. The CS_KILL call does not build that reason.",
+    "vm_fault_enter, when cs_killed is true, creates OS_REASON_CODESIGNING with code CODESIGNING_EXIT_REASON_INVALID_PAGE (2) and set_thread_exit_reason installs it only while uu_exit_reason is still null (vm_fault.c). The captured namespace is OS_REASON_SIGNAL and the code is 9. The CS_KILL page path in this tree installs a codesigning reason, so it is not the path that installed this record. CS_EXEC_SET_KILL in kern_exec.c ORs CS_KILL into the image flags; if that later took the page-kill path, the installed reason would still be the codesigning reason.",
+    "The console has two cs_invalid_page lines, both the non-kill text allowing (remove VALID): pid 1 launchd and pid 2 launchctl, final status 0x20020000. Neither line is pid 14. A silent CS_KILL or already-invalid call would not print when cs_debug is 0, so the missing line is not itself proof. The namespace in the exit reason is the contradicting fact.",
+    "kern_memorystatus.c calls psignal(p, SIGKILL) with no jetsam reason at three sites. Those calls also go through build_signal_reason(NULL) and record current_proc, so a jetsam namespace is not what those sites write. They match this payload only when current_proc at the call is pid 14. This receipt does not show that those sites ran.",
+    "The CodeDirectory flag value 0x20002 was not re-parsed from the application binary here."
+  ],
+  "paths_that_do_not_produce_this_payload": [
+    "process_signature failure uses psignal_vfork_with_reason with an EXEC, CODESIGNING, or SECURITY reason (kern_exec.c). That reason's namespace is not OS_REASON_SIGNAL. Spawn for pid 14 returned 0 at stage 10 before the reap.",
+    "The default vnguard flags in kern_guarded.c are LOGMSG, EXC_CORPSE, and UPRINTMSG. kVNG_POLICY_SIGKILL is a separate bit and is not in that default. The saved guest original-bootargs.bin contains no vnguard text. The SIGKILL policy branch would be psignal(current_proc(), SIGKILL), which would match this shape only if that branch ran on pid 14.",
+    "CS_OPS_MARKINVALID and CS_OPS_MARKKILL in kern_proc.c call psignal(target, SIGKILL) with no reason, so the recorded sender is the caller. A caller other than pid 14 would record that caller's pid. No CS_OPS_MARKKILL or CS_OPS_MARKINVALID call site was found under integrations/puredarwin."
+  ],
+  "attempt_1": "Attempt 1, pid 15, was reaped with application wait 0. Its exit_reason line is query_failed errno=2. Pinned proc_pidinfo returns ENOENT when the kernel has no exit reason. That is a recorded query result for a different process. It does not identify the signal that killed pid 14.",
+  "conclusion": "The captured reason was built as OS_REASON_SIGNAL code 9 while current_proc was pid 14 and that process's p_name began with chonk-terminal-darwin. The pinned sources make that the sender identity for a NULL-reason SIGKILL path. They do not identify which of those call sites ran. The CS_KILL page path described in the author analysis does not install this namespace or this procname in this tree. The subsystem that raised the SIGKILL is not established.",
+  "not_claimed": [
+    "the exact kernel subsystem that raised the SIGKILL",
+    "a fix",
+    "a runtime pass",
+    "a retry of candidate 002"
+  ]
+}

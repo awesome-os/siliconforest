@@ -1,0 +1,197 @@
+System audio on the SiliconForest M1 guest: coreaudiod over the SFAppleSound device nodes
+=====================================================================================
+
+What is here
+------------
+coreaudiod-dev-backend-tip.patch  the tree's coreaudiod with a second kind of engine: a character
+                               device that takes 16-bit frames (applies to upstream's tip
+                               c713d8fb, -p1; what build-sysaudio.nix builds by default)
+coreaudiod-dev-backend.patch   the same change for the pinned tree e7aa00a6 (SF_PD=pin). The tip's
+                               is this one merged over upstream's capture and device-interest
+                               additions (no conflict), plus: a stand-in node is paced by the
+                               host clock even when the real driver's fifo_frames sysctl exists
+build-sysaudio.nix             coreaudiod (patched), CoreAudio/AudioToolbox/AudioUnit and pcmplay
+                               (unchanged), sftone and sfvolume, arm64
+user/sftone.c                  a tone through an AudioQueue (default output) or, with -u <UID>,
+                               through an IOProc on one device; -l lists the devices
+user/sfvolume.c                get | set <0..100> | up | down | mute | unmute | toggle-mute
+tools/sa_boot.sh               one boot with all of it staged; tools/sa_summary.sh reads a console
+tools/sa_qemu.sh               the names check in QEMU, no M1 (guest/qemu-sysaudio-names.sh): the server
+                               starts, takes stand-in nodes at /dev/sfspeaker and /dev/sfaudio and not at
+                               the old names, clients play to it. Not sound: the machine has none
+guest/darwin-sysaudio-speakers.in  unattended proof on both real devices (no safety daemon)
+guest/darwin-sysaudio-test.in  unattended proof of the headphones alone (jack hook says plugged)
+guest/darwin-sysaudio-jack.in  the switch with /dev/null standing in for the speakers
+guest/darwin-sysaudio-listen.in  the script for a person
+wm-darwin-volume-keys.commit   the commit message for the compositor's volume keys (see the end)
+
+The path of a sample
+--------------------
+client (AudioQueue / AudioUnit / IOProc)
+  -> AudioConverter in the client: its format to interleaved float at the device's rate
+  -> the client's shared ring (sf_audio_ring, 4 periods of 512 frames, float)
+  -> coreaudiod, one thread per device: sums one period of every running client, applies
+     the software level when the device has no hardware volume, clips, rounds to S16LE
+  -> write() to /dev/sfaudio -> the driver's FIFO -> DMA ring -> CS42L83
+
+Nothing of this needs IOAudioFamily. An engine of the new kind is made for every node of
+sDevTable that exists, by a poll thread (every 200 ms, so a node published after coreaudiod
+started is found), and only while no IOAudioEngine is there; the IOAudioFamily code is as it
+was (three places ask "is this a device engine": applyVolume, hostTimeOfFrame, startIOThread,
+and the software gain now looks at the device's flags, which say the same for the family's
+engines).
+
+Rates: the device runs at 48000 Hz (DEV_RATE; coreaudiod sets kern.sf_sound.rate when the
+driver is idle and keeps whatever the driver has if it cannot). A client at 44100 Hz is
+converted in the client: the ring a client gets is at the device's rate, and AudioQueue and
+the output units put an AudioConverter (linear interpolation) in front of it. coreaudiod's
+own converter (mixClient, also linear) runs only for a ring whose rate differs from the
+device it lands on, which happens when the default output moves to a device at another rate
+under a client that follows the default. Both are linear interpolation without a low-pass:
+good enough for system sounds, audibly rough on dense high-frequency material; a better
+resampler belongs in AudioConverter.c and mixClient, not here.
+
+Pacing and timestamps
+---------------------
+The drivers' FIFOs take 16384 frames (341 ms) before a write blocks. Filling them would make
+every sound a third of a second late, so the server keeps DEV_QUEUE_FRAMES (3072, 64 ms)
+queued instead: <prefix>.fifo_frames says how many written frames the driver has not taken
+yet; the thread reads it (one sysctl by MIB) and writes a period of 512 whenever the queue
+has room for one, else sleeps 2 ms. The device's clock is therefore the only clock: no
+drift between host time and the codec, and AudioQueue callbacks run at the device's rate
+because the rings empty at it (measured from a client: 48006 and 44112 frames/s).
+
+  start: the headphones' driver begins a session with about 1.1 s of silence while the
+    codec's converter locks and does not read its FIFO meanwhile: the queue stays full,
+    the server waits, the clients are held and their first frames are not lost. The
+    speakers start with the first frames. Nothing has to be inferred about either.
+  underrun: an empty queue found while clients play (after the first frames of a run) is
+    counted and logged ("ran out of frames"); nothing is made up for.
+  stall: a queue that stays full for 3 s closes the node; it is tried again 5 s later.
+  errors: a write the driver refuses (ENXIO once the kernel has shut the speakers'
+    amplifiers down for good) closes the node for 5 s; a driver whose state sysctl says
+    off, failed, disabled or codec-only is no device: the poll thread takes the device
+    out of the table within 200 ms (clients on the default move to what is left) and puts
+    it back when the state allows.
+  idle: with no client playing nothing is written (the drivers play silence while the node
+    is open); DEV_LINGER_SECONDS (5) after the last client the node is closed, so a new
+    sound within that time starts at once and a later one pays the driver's start.
+  timestamps: readHostTime of a client's ring is now + (queued + 512 + DEV_OUTPUT_FRAMES)
+    frames, DEV_OUTPUT_FRAMES (5120) being the periods the drivers fill ahead of the DMA.
+    The device's latency is reported as 8192 frames (171 ms).
+
+A device without fifo_frames (the /dev/null stand-in, an older collection) is paced by the
+host clock: one period per period time, write() blocking when the device's queue is full.
+
+Volume
+------
+Headphones: kSFAudioDeviceHardwareVolume | HardwareMute. Level 0..1 maps linearly to the
+codec's attenuation, kern.sf_sound.volume_db = round((1 - level) * 62): 0 dB at 1.0, 62 dB
+at 0.0; mute writes 63 (the driver's mute) and keeps the level. At the first start the level
+is read back from the driver (30 dB -> 0.516), so starting the server changes nothing that
+can be heard; later starts use /Library/Preferences/org.siliconforest.audio.plist.
+A device without hardware volume (speakers) is scaled in the mix, level squared, and starts
+at 0.5 (DEV_SOFT_VOLUME: -12 dB) until a level is set.
+
+The speakers
+------------
+    { "Speakers", "SFAudio:speakers", "/dev/sfspeaker", ..., "kern.sf_speaker", false, kDevJackEmpty }
+A second engine of the same kind, with the software level. The server never touches the
+amplifiers' volume and never opens /dev/sfspeaker-safety: whether the speakers can be heard
+at all is the kernel's and the safety daemon's business (without the daemon: -100 dB), and
+the server's level is not a protection.
+
+The default output follows the jack (devPollThread/devRouteLocked): every 200 ms
+kern.sf_sound.jack is read; when it changes, or a device comes or goes, the default output
+and the default system output become the kDevJackPlugged device (Headphones) while
+something is plugged (1 headphones, 2 headset) and the kDevJackEmpty device (Speakers)
+otherwise, each only when that device exists. A default set by hand
+(kSFAudioSetDefaultOutput) holds until the next jack event.
+
+What happens to running clients at a switch: a client on the default device (every
+AudioQueue and default output unit: the alias device 0x40) keeps its ring and its rate; at
+its next period the other device's thread mixes it. The device left is closed 5 s later;
+the device taken is opened at once (for the headphones: 1.1 s of start during which the
+client is held, nothing is dropped; what was already written to the device left is played
+there, up to 64 ms plus the driver's periods). A client that connected to a device by its
+id (an IOProc on that device: sftone -u) stays on it. Listeners get
+kAudioHardwarePropertyDefaultOutputDevice and the alias device's volume and mute change
+notifications, as for any default change.
+
+Test hooks, environment of coreaudiod: COREAUDIOD_JACK_FILE=<file> reads the jack's number
+from a file instead of the sysctl (the jack is empty in every unattended boot);
+COREAUDIOD_SPEAKER_DEVICE=<node> names a stand-in for /dev/sfspeaker (/dev/null works).
+
+Adding capture
+--------------
+(Written at the pin. At the tip upstream's coreaudiod, CoreAudio and AudioToolbox have the input
+side for IOAudioFamily engines: input rings, deliverInput(), kSFAudioDeviceHasInput, the connect
+message's input word. What is left for the /dev backend is the driver node and a reading thread
+that calls deliverInput(); the framework work listed below is what upstream added (not exercised here).)
+
+Driver: a read-only node, say /dev/sfmic: S16LE at kern.sf_mic.rate, channels fixed and
+told by a sysctl (kern.sf_mic.channels), read() blocking until frames are there, capture
+running only while the node is open; kern.sf_mic.frames (captured) and .overruns. The
+headset microphone (kern.sf_sound.jack == 2) would be a second node.
+
+coreaudiod (small): a direction in dev_desc; an engine with kSFAudioDeviceHasInput and
+inputChannels; a thread that reads periods, converts to float and writes them into the ring
+of every client connected for input, signalling its semaphore. The ring is the one that
+exists with the roles turned round (the server moves writeFrame, the client readFrame; a
+client that does not read loses the oldest frames). The connect message has a spare word
+(pad) for the direction; kSFAudioFollowDefaultInput next to kSFAudioFollowDefaultOutput.
+Default input, kSFAudioSetDefaultInput and inputChannels are already in the protocol. The
+node is opened while an input client runs, as for output.
+
+Frameworks (the larger part; today there is no input anywhere):
+  CoreAudio   AudioHardware.c answers input-scope properties with "no property"
+              (streams, stream configuration, stream format, latency): they need the
+              input side of the device info. AudioDeviceIO.c calls IOProcs with a NULL
+              input list: it needs an input session per device and to hand each cycle's
+              captured frames to the procs.
+  AudioToolbox AudioQueueNewInput returns kAudioQueueErr_InvalidDevice. It needs the
+              mirror of the output queue: an IOProc on the default input device, an
+              AudioConverter from the device's float to the queue's format, filling the
+              enqueued buffers and calling the input callback with the packet count.
+              The output unit (AUHAL) needs kAudioOutputUnitProperty_EnableIO on element 1
+              and an input callback with AudioUnitRender from the captured frames.
+
+Known limits
+------------
+  - One writer: /dev/sfaudio opens once. While coreaudiod holds it sfplay gets EBUSY, and
+    while something else holds it coreaudiod retries every 5 s.
+  - An AudioQueue always plays on the default output (the tree's AudioQueue accepts
+    kAudioQueueProperty_CurrentDevice and ignores it); a client that wants one device
+    uses an IOProc on it.
+  - kern.sf_sound.tone and a second user of the driver's rate are outside the server's
+    knowledge: the driver's test tone is not heard while the server writes (the driver
+    plays its FIFO first), and a rate changed while the node is closed is set back at the
+    next open.
+  - The output is clipped, not limited, when clients sum above full scale.
+
+The desktop
+-----------
+What a desktop session must have for sound (all from `nix-build build-sysaudio.nix -A all`,
+staged as tools/sa_boot.sh does):
+    usr/sbin/coreaudiod                                         -> /usr/sbin/coreaudiod
+    System/Library/Frameworks/CoreAudio.framework/Versions/A/CoreAudio      -> same path
+    System/Library/Frameworks/AudioToolbox.framework/Versions/A/AudioToolbox -> same path
+    System/Library/Frameworks/AudioUnit.framework/Versions/A/AudioUnit      -> same path
+    usr/bin/sfvolume, usr/bin/sftone                            -> /usr/bin (optional tools)
+and one process, started once before or after the compositor, as root, no arguments, no
+environment (never COREAUDIOD_JACK_FILE or COREAUDIOD_SPEAKER_DEVICE outside a test):
+    mkdir -p /var/log /Library/Preferences
+    /usr/sbin/coreaudiod > /var/log/coreaudiod.log 2>&1 &
+It needs the SFAppleSound collection (kern.sf_sound, /dev/sfaudio; with the speakers
+kern.sf_speaker, /dev/sfspeaker) and finds the nodes whenever they appear. For the speakers
+to be heard the safety daemon must run as well; that is not part of this.
+
+Volume keys (sources/chonkstep-darwin, crates/wm-darwin/src/volume.rs): F10 mute, F11
+quieter, F12 louder by a sixteenth, without modifiers, on the default output; the notice
+says "Volume 56%" or "Sound off". The compositor sends coreaudiod's own Mach messages
+(get state, set volume, set mute) itself. Starting /usr/bin/sfvolume instead was the
+alternative: the compositor starts programs only through its managed-spawn shim, which is
+an admission path for applications, and a process per key press costs a dyld start in the
+input path; a lookup and two messages cost well under a millisecond, need nothing staged
+and fail at once when coreaudiod is not there (the keys are then ordinary F-keys). The
+price is that volume.rs repeats the layout of SFAudioServer.h's state and set messages.

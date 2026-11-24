@@ -1,0 +1,76 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Unattended proof, one boot: the root filesystem is the SiliconForest partition, read-only
+# (rd=uuid boot-uuid=<partition GUID>, launchdsuffix=sfro, sfnvme=3 with sfnvme_part* and
+# sfnvme_readfence=1). This script is in the RAM root image, which is the memory disk on
+# /private/ram; the disk root's /usr/bin/darwin-desktop-test starts it. Programs run from
+# the disk; sfnvme-test (not on the disk) from /private/ram.
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/private/ram/usr/bin; export PATH
+printf '\nNV_BEGIN_%s\n' "$nonce"
+get() { sysctl -n "$1" 2>/dev/null; }
+t0=$(date +%s)
+phase() { printf 'NV_PHASE %s t=%s\n' "$1" "$(( $(date +%s) - t0 ))"; }
+phase root
+printf 'NV_UPTIME %s\n' "$(get kern.boottime)"
+printf 'NV_STATE %s\n' "$(get kern.sf_nvme.state)"
+printf 'NV_NCPU %s\n' "$(get hw.ncpu)"
+printf 'NV_GATE_SELFTEST %s\n' "$(get kern.sf_nvme.gate_selftest)"
+printf 'NV_BOOTARGS %s\n' "$(get kern.bootargs | sed 's/[0-9A-Fa-f]\{8\}-[0-9A-Fa-f-]\{27\}/GUID/g')"
+mount 2>&1 | sed 's/^/NV_MOUNT /'
+printf 'NV_PART %s\n' "$(get kern.sf_nvme.part)"
+printf 'NV_MEDIA %s\n' "$(get kern.sf_nvme.media)"
+printf 'NV_FENCE %s\n' "$(get kern.sf_nvme.fence)"
+ls -ld / /var /tmp /private/var /private/tmp /private/ram /etc/resolv.conf 2>&1 | sed 's/^/NV_LS /'
+whole=$(ls /dev/rdisk* 2>/dev/null | grep -v 's[0-9]' | head -1)
+gpt -r show "$whole" 2>&1 | awk '{print "NV_GPT", $1, $2, $3, $4, $5, $6, $7, $8}'
+index=$(gpt -r show "$whole" 2>/dev/null | awk '$1 == @PART_LBA@ && $2 == @PART_BLOCKS@ { print $3 }')
+printf 'NV_OURS index=%s\n' "$index"
+rootdev=$(dmesg 2>/dev/null | sed -n 's/.*BSD root: \(disk[0-9]*s[0-9]*\).*/\1/p' | head -1)
+printf 'NV_ROOTDEV %s\n' "$rootdev"
+if mount | grep -q '^root_device on / (ext4.*read-only' && [ "$rootdev" = "$(echo "$whole" | sed 's/.*rdisk/disk/')s$index" ]; then
+    printf 'NV_ROOT disk read-only: %s on %s\n' "$(mount | grep ' on / ')" "$rootdev"
+else
+    printf 'NV_FAIL the root is not our partition read-only: %s (%s)\n' "$(mount | grep ' on / ')" "$rootdev"
+fi
+
+phase identify
+printf 'NV_IDCTRL %s\n' "$(get kern.sf_nvme.idctrl)"
+printf 'NV_IDNS %s\n' "$(get kern.sf_nvme.idns)"
+printf 'NV_SMART start %s\n' "$(get kern.sf_nvme.smart)"
+printf 'NV_SMARTRAW start %s\n' "$(get kern.sf_nvme.smart_raw)"
+
+phase state
+for f in /var/run/dr-x /tmp/dr-x /private/var/tmp/dr-x /etc/resolv.conf; do
+    sh -c "echo hello >> $f" 2>/tmp/dr-err; printf 'NV_STATEWRITE %s rc=%s %s\n' "$f" "$?" "$(head -1 /tmp/dr-err 2>/dev/null)"
+done
+for f in /etc/dr-x /usr/dr-x /dr-x /private/dr-x; do
+    touch $f 2>/private/ram/dr-err; printf 'NV_FSWRITE %s rc=%s %s\n' "$f" "$?" "$(head -1 /private/ram/dr-err)"
+done
+mount -t ext4 -o update,rw "/dev/$rootdev" / > /private/ram/dr-err 2>&1; printf 'NV_FSWRITE remount-rw rc=%s %s\n' "$?" "$(head -1 /private/ram/dr-err)"
+mount 2>&1 | grep ' on / ' | sed 's/^/NV_MOUNT_AFTER_UPGRADE /'
+
+phase tree
+# the libSystem in use does not read back as its blocks are (see user/sfnvme-test.c): its content
+# is left out of the digest and compared with the same file in the memory disk, which nothing has loaded
+sfnvme-test treex / -e usr/lib/libSystem.B.dylib etc/passwd bin/sh usr/lib/libSystem.B.dylib 2>&1 | grep -v NVT_TREE_TOP
+printf 'NV_LIBSYSTEM bytes differing from the copy in the memory disk: %s; first: %s\n' "$(cmp -l /usr/lib/libSystem.B.dylib /private/ram/usr/lib/libSystem.B.dylib 2>/dev/null | wc -l | tr -d ' ')" "$(cmp -l /usr/lib/libSystem.B.dylib /private/ram/usr/lib/libSystem.B.dylib 2>/dev/null | head -4 | tr '\n' ';')"
+printf 'NV_LIBSYSTEM memory-disk copy %s\n' "$(sha256sum /private/ram/usr/lib/libSystem.B.dylib | cut -c1-64)"
+
+phase hash
+sfnvme-test hash /dev/sfnvme0 /private/ram/etc/sfnvme-ranges 2>&1
+sfnvme-test seq /dev/sfnvme0 262144 256 8192 2>&1 | grep NVT_SEQ' '
+# a read of an owner's partition through the block layer must be refused by the read fence
+sfnvme-test head "$whole" 128006 2>&1 | cut -c1-80 | sed 's/^/NV_FENCETEST /'
+printf 'NV_FENCE %s\n' "$(get kern.sf_nvme.fence)"
+dmesg 2>/dev/null | grep -i 'ext4\|sf-roinit\|privilege\|Waiting on\|BSD root\|Got boot' | sed 's/[0-9A-Fa-f]\{8\}-[0-9A-Fa-f-]\{27\}/GUID/g' | tail -30 | sed 's/^/NV_DMESG /'
+printf 'NV_MEDIA %s\n' "$(get kern.sf_nvme.media)"
+
+phase stop
+sysctl -w kern.sf_nvme.smart=1 > /dev/null 2>&1
+printf 'NV_SMART end %s\n' "$(get kern.sf_nvme.smart)"
+printf 'NV_SMARTRAW end %s\n' "$(get kern.sf_nvme.smart_raw)"
+sync
+# from here on nothing is read from the root: one process, already in memory, stops the
+# controller, reports and prints the bench's end marker
+exec sfnvme-test stopreport "$nonce"

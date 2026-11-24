@@ -1,0 +1,69 @@
+{
+ "report": "platform patch revision 2: Apple PE leaves PE_halt_restart NULL (fixes the attempt-006 nested panic)",
+ "author_role": "independent reviewer/implementer (Claude)",
+ "date": "2026-11-07",
+ "status": "SOURCE_PATCH_READY_NOT_STAGED_NOT_COMPILED_NOT_BOOTED",
+ "location": "integrations/puredarwin/m1-bringup-platform/revisions/002/",
+ "frozen_rev1": {
+  "path": "integrations/puredarwin/m1-bringup-platform/platform.patch",
+  "sha256": "c4a4e83a202177c7e91e5a0d9b187d657fa0f11fa8f0b554827fb8a2501a8c12",
+  "modified": false
+ },
+ "evidence": {
+  "nested_chain": "MACH Reboot -> PEHaltRestart+0x1c -> PEHaltRestartInternal+0x3b8 -> IODTPlatformExpert::haltRestart+0x2c -> IOPlatformExpert::haltRestart+0x7c -> pdArmHaltRestart+0x74 -> PDArmCPU::systemReset+0x14 -> pd_psci_available+0x78 -> PDSun50i_isPlatform+0x5c -> IORegistryEntry::getProperty -> IORecursiveLockLock -> lck_mtx_lock -> lck_mtx_check_preemption -> nested panic",
+  "symbolication": "kext frames mapped against the PDArmPlatformExpert binary in /nix/store/7s13ygyk7av9b5ryydvqzx13x82sbiph-puredarwin-m1-bringup-platform-0.1, using the KC z981hgxk fileset entry vmaddr 0xfffffe0006118000 plus slide 0xc0e8000",
+  "apple_has_no_psci": "no /psci node in the Apple ADT; m1n1 HV does not implement PSCI"
+ },
+ "change": {
+  "incremental": "rev1-to-rev2.patch: PDArmPlatformExpert.cpp only; adds virtual usesPSCIHaltRestart() (generic default true); start() installs pdArmHaltRestart only when it returns true; the PDAppleARMPlatformExpert override returns false. The only removed line is the unconditional 'PE_halt_restart = pdArmHaltRestart;'.",
+  "generic_path": "unchanged: the default returns true, so QEMU, Pi, Sun50i, SG2002 and A733 still install the PSCI handler",
+  "no_invented_reset": "no WDT, MMIO, HVC/SMC or reset success path added (test-enforced)"
+ },
+ "resulting_apple_behaviour": "PE_halt_restart stays NULL (IOPlatformExpert.cpp:336) => IOPlatformExpert::haltRestart returns -1 with no registry or PSCI work => halt_all_cpus calls pd_psci_halt (SecureDT lookup, lock-free; returns because the ADT has no /psci) => while(1). reboot(2) and post-panic reboot park the CPU; the reset is external (M5 recovery).",
+ "artifacts_sha256": {
+  "platform-rev2.patch": "94aa3211a858e8b22a4d1b92e5cb3a247d367ee2a17a3285f366435209cf7c1c",
+  "rev1-to-rev2.patch": "c36e2b41c83bb607aa19f17fda62bb2e5605d724621c5dcc9e753ecf002bd0b6",
+  "test_platform_rev2.py": "b7dfb6cf7a9c8b0307c3efac0aae31454f0b26121e3629b54fffd2835f9ef41f"
+ },
+ "resulting_sources_sha256": {
+  "PDArmPlatformExpert.cpp": "a2d03ba91310de6c5d70f862d5dfe057faffd053905e5d53cd320262d7d70015",
+  "PDAppleAIC.cpp (= rev1)": "83f205f75bd5659639b982a412c9bdae58401c27d8226e1db0d9458215826296",
+  "PDAppleBootCPUPMGR.cpp (= rev1)": "2ee996cf8acf27edf7551842e3bf9f7f5bee2a6d2c66d3dd48937741caf96eb8",
+  "PDAppleBootCPUPMGR.h (= rev1)": "46594c5be4e08f7ed4eeb000490c2c76d0a994ca578d198a335c65119b99442e",
+  "CMakeLists.txt (= rev1)": "0d75ed8f2c84caf7b865f102a5fcac4135e564afdffda4e1bb15ba6f76866df9"
+ },
+ "tests": {
+  "command": "python3 integrations/puredarwin/m1-bringup-platform/revisions/002/test_platform_rev2.py -v",
+  "result": "10/10 OK",
+  "covers": [
+   "frozen rev1 hash intact",
+   "cumulative == rev1 + incremental",
+   "incremental scope (one file, one removal)",
+   "Apple installs no handler; generic default and gate present",
+   "all rev1 checks still pass (imported read-only)",
+   "incremental applies to a copy of the isolated tree (its kext files are byte-identical to rev1)"
+  ],
+  "mutants_caught": [
+   "Apple keeps PSCI",
+   "unconditional install",
+   "generic default flipped",
+   "Apple fake reset handler",
+   "override undeclared",
+   "invented WDT reset",
+   "extra removal"
+  ],
+  "rev1_tests_rerun": "test_platform_patch.py OK (unchanged)"
+ },
+ "not_claimed": [
+  "compile",
+  "KC inclusion",
+  "boot",
+  "any reset on Apple"
+ ],
+ "owner_actions": "Root decides whether to stage rev2 (apply rev1-to-rev2.patch to the isolated tree, or platform-rev2.patch to pinned sources) and to rebuild the kext and KC after the current attempt.",
+ "hardware_or_build_actions": "none",
+ "files_written": [
+  "integrations/puredarwin/m1-bringup-platform/revisions/002/{platform-rev2.patch, rev1-to-rev2.patch, test_platform_rev2.py, README.md}",
+  "reports/sprint-009/platform-reboot-fix.json"
+ ]
+}

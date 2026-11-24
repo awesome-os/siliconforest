@@ -1,0 +1,383 @@
+diff --git c/flake.nix i/flake.nix
+index c9a99817..1fac83d2 100644
+--- c/flake.nix
++++ i/flake.nix
+@@ -5174,6 +5174,10 @@
+             ;
+           # Investigative builds, not image contents.
+           probePackages = {
++            # Native T8103 first-entry UART checkpoint; never enters VM/IOKit.
++            kernel-arm64-t8103-firstboot = import ./nix/m1-firstboot.nix {
++              inherit mkPureDarwinBuild kernelSource arm64CrossToolchain;
++            };
+             # Cross toolchain, exposed so out-of-tree flakes (e.g. checkm8-tools'
+             # PongoOS build) can link Mach-O with the real cctools ld64.
+             arm64-cross-toolchain = arm64CrossToolchain;
+diff --git c/nix/m1-firstboot.nix i/nix/m1-firstboot.nix
+new file mode 100644
+index 00000000..d4afb3df
+--- /dev/null
++++ i/nix/m1-firstboot.nix
+@@ -0,0 +1,15 @@
++# A native T8103 XNU Mach-O with a mandatory pre-VM console-and-park entry.
++# This does not produce a KC, filesystem, installer or hardware runner.
++{ mkPureDarwinBuild, kernelSource, arm64CrossToolchain }:
++mkPureDarwinBuild {
++  pname = "puredarwin-kernel-arm64-t8103-firstboot";
++  src = kernelSource;
++  buildTargets = [ "xnu" ];
++  enableUserspace = false;
++  installUserland = false;
++  installKernel = true;
++  xnuKernelConfig = "DEBUG";
++  puredarwinArch = "arm64";
++  inherit arm64CrossToolchain;
++  extraCmakeFlags = [ "-DPUREDARWIN_ARM64_MACHINE_CONFIG=T8103" ];
++}
+diff --git c/src/Kernel/xnu/CMakeLists.txt i/src/Kernel/xnu/CMakeLists.txt
+index 04961d66..074c06b2 100644
+--- c/src/Kernel/xnu/CMakeLists.txt
++++ i/src/Kernel/xnu/CMakeLists.txt
+@@ -147,6 +147,12 @@ if(NOT PUREDARWIN_XNU_KERNEL_CONFIG MATCHES "^(RELEASE|DEVELOPMENT|DEBUG|KASAN)$
+         "Unsupported PUREDARWIN_XNU_KERNEL_CONFIG='${PUREDARWIN_XNU_KERNEL_CONFIG}'")
+ endif()
+ 
++# This build is deliberately unable to continue into kernel initialization.
++if(PUREDARWIN_ARM64_MACHINE_CONFIG STREQUAL "T8103" AND
++   NOT PUREDARWIN_XNU_KERNEL_CONFIG STREQUAL "DEBUG")
++    message(FATAL_ERROR "T8103 first-entry experiment requires DEBUG")
++endif()
++
+ file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/xnu_header_install)
+ # a prebuilt header install goes where the in-tree one would, so kexts see the same paths
+ set(PUREDARWIN_PREBUILT_XNU_HEADERS "" CACHE PATH "Prebuilt xnu header install to use instead of building it")
+diff --git c/src/Kernel/xnu/cmake/MakeInc.def.in i/src/Kernel/xnu/cmake/MakeInc.def.in
+index cf2bdc4c..e7b322b2 100644
+--- c/src/Kernel/xnu/cmake/MakeInc.def.in
++++ i/src/Kernel/xnu/cmake/MakeInc.def.in
+@@ -34,7 +34,7 @@ SUPPORTED_ARM_MACHINE_CONFIGS = NONE
+ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else
+ SUPPORTED_ARM_MACHINE_CONFIGS = T8002 T8004 BCM2835
+-SUPPORTED_ARM64_MACHINE_CONFIGS = T7000 T7001 S8000 S8001 T8010 T8011 BCM2837 VIRT VIRT4K VIRTAMP SUN50I SC8280XP
++SUPPORTED_ARM64_MACHINE_CONFIGS = T7000 T7001 S8000 S8001 T8010 T8011 T8103 BCM2837 VIRT VIRT4K VIRTAMP SUN50I SC8280XP
+ 
+ endif
+ 
+@@ -71,6 +71,9 @@ MACHINE_FLAGS_ARM_T8004 = -DARM_BOARD_CONFIG_T8004
+ # Open-source LLVM spells the same core apple-a10.
+ MACHINE_FLAGS_ARM64_T8010 = -DARM64_BOARD_CONFIG_T8010 -mcpu=apple-a10 -DPUREDARWIN_NO_KERNEL_INTEGRITY -DPUREDARWIN_NO_APPLE_PMU -DPUREDARWIN_EARLY_FB_MARK -DPUREDARWIN_MASK_AIC_SOURCES
+ MACHINE_FLAGS_ARM64_T8011 = -DARM64_BOARD_CONFIG_T8011 -mcpu=apple-a10
++# Bounded M1 first-entry candidate; native H13 definitions, mandatory park.
++# __ARM_ARCH_8_2__ selects the LSE paths upstream clang does not advertise.
++MACHINE_FLAGS_ARM64_T8103 = -DARM64_BOARD_CONFIG_T8103 -DCURRENT_MACHINE_CONFIG_LC=$(CURRENT_MACHINE_CONFIG_LC) -mcpu=apple-m1 -D__ARM_ARCH_8_2__=1 -DDARWIN_LAB_M1_FIRSTBOOT=1
+ # Raspberry Pi Zero / Zero W: BCM2835, ARM1176JZF-S, ARMv6Z, single core.
+ # The peripheral block is the same IP as the BCM2837 the arm64 side already
+ # supports, at a different base (0x20000000 rather than 0x3F000000).
+@@ -413,7 +416,7 @@ ARM64_KC_BASE      =0xfffffff006000000
+ # is a separate KC-layout bug (kc-tools emits two __TEXT_EXEC segments), not a
+ # consequence of this.
+ # VIRTAMP is VIRT with an E and a P cluster: the same geometry
+-ifneq ($(filter VIRT VIRTAMP SC8280XP,$(CURRENT_MACHINE_CONFIG)),)
++ifneq ($(filter VIRT VIRTAMP SC8280XP T8103,$(CURRENT_MACHINE_CONFIG)),)
+ LARGE_MEMORY_DEFINE=-DARM_LARGE_MEMORY=1
+ ARM64_PLKSEG_ADDR  =0xfffffe0004004000
+ ARM64_LINK_ADDR    =0xfffffe0007004000
+diff --git c/src/Kernel/xnu/config/MASTER.arm64.t8103 i/src/Kernel/xnu/config/MASTER.arm64.t8103
+new file mode 100644
+index 00000000..32d6a020
+--- /dev/null
++++ i/src/Kernel/xnu/config/MASTER.arm64.t8103
+@@ -0,0 +1,134 @@
++# T8103 first-entry experiment: public source backends, no normal-boot claim.
++# Derived from pinned MASTER.arm64.MacOSX; other platform options preserved.
++#
++# Mach Operating System
++# Copyright (c) 1986 Carnegie-Mellon University
++# Copyright 2001-2024 Apple Inc.
++#
++# All rights reserved.  The CMU software License Agreement
++# specifies the terms and conditions for use and redistribution.
++######################################################################
++#
++#  Master Apple configuration file (see the master machine independent
++#  configuration file for a description of the file format).
++#
++######################################################################
++#  Standard Apple OS Configurations:
++#  -------- ----- -- ---------------
++#
++#if MASTER_CONFIG_ENABLE_EXCLAVES
++#  ARM_EXTRAS_BASE = [ config_sptm config_sptm_iommu config_exclaves ]
++#elif MASTER_CONFIG_ENABLE_SPTM
++#  ARM_EXTRAS_BASE = [ config_sptm config_sptm_iommu ]
++#else
++#  ARM_EXTRAS_BASE = [ nos_arm_pmap nos_arm_asm config_pmap_ppl ]
++#endif
++#  KERNEL_BASE =    [ arm64 medium msgb_large config_requires_u32_munging config_delay_idle_sleep config_proc_udata_storage config_uexc config_darkboot ARM_EXTRAS_BASE ]
++#  KERNEL_RELEASE = [ KERNEL_BASE release ]
++#  KERNEL_DEV =     [ KERNEL_BASE development mach_assert config_xnupost proc_ref_debug config_proc_resource_limits config_ext_paniclog ]
++#  KERNEL_DEBUG =   [ KERNEL_BASE debug mach_assert config_xnupost config_waitq_stats config_workloop_debug config_proc_resource_limits config_ext_paniclog ]
++#  BSD_BASE =       [ mach_bsd config_vfork sysv_sem sysv_msg sysv_shm config_netboot config_imageboot psynch config_proc_uuid_policy config_coredump config_ucoredump pgo config_personas ]
++#  BSD_RELEASE =    [ BSD_BASE ]
++#  BSD_DEV =        [ BSD_BASE config_vnguard ]
++#  BSD_DEBUG =      [ BSD_BASE config_vnguard ]
++#  FILESYS_BASE =   [ devfs fdesc fifo fs_compression config_protect config_mnt_rootsnap config_rosv_startup config_mount_vm config_mount_prebootrecovery config_basesystemroot config_fse quota namedstreams config_imgsrc_access config_triggers config_ext_resolver config_searchfs config_volfs config_appledouble nullfs config_mnt_suid config_firmlinks config_dataless_files config_union_mounts config_file_leases ]
++#  FILESYS_RELEASE= [ FILESYS_BASE ]
++#  FILESYS_DEV =    [ FILESYS_BASE config_iocount_trace ]
++#  FILESYS_DEBUG =  [ FILESYS_BASE config_iocount_trace ]
++#  NFS =            [ nfsserver ]
++#  SKYWALK_BASE =   [ skywalk config_nexus_user_pipe config_nexus_kernel_pipe config_nexus_flowswitch config_nexus_netif ]
++#  SKYWALK_RELEASE = [ SKYWALK_BASE ]
++#  SKYWALK_DEV =    [ SKYWALK_BASE ]
++#  SKYWALK_DEBUG =  [ SKYWALK_BASE ]
++#  NETWORKING =     [ inet bpfilter dummynet traffic_mgt sendfile ah_all_crypto bond vlan gif stf ifnet_input_chk if_bridge MULTIPATH if_fake if_redirect remote_vif ]
++#  NETWORKING_RELEASE = [ NETWORKING ]
++#  NETWORKING_DEV = [ NETWORKING_RELEASE packet_mangler if_headless kctl_test ]
++#  NETWORKING_DEBUG = [ NETWORKING_DEV ]
++#  VPN =            [ ipsec flow_divert necp content_filter ]
++#  PF =             [ pf pflog ]
++#  MULTIPATH =      [ multipath mptcp ]
++#if SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED
++#  HIBERNATION =    [ ]
++#else /*!(SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED)*/
++#  HIBERNATION =    [ ]
++#endif /*SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED*/
++#  IOKIT_BASE =     [ iokit iokitcpp no_kernel_hid config_sleep iokitstats HIBERNATION ]
++#  IOKIT_RELEASE =  [ IOKIT_BASE ]
++#  IOKIT_DEV =      [ IOKIT_BASE iotracking ]
++#  IOKIT_DEBUG =    [ IOKIT_BASE iotracking ]
++#  LIBKERN_BASE =   [ libkerncpp config_blocks config_kec_fips crypto_sha2 config_img4 ]
++#  LIBKERN_RELEASE =[ LIBKERN_BASE zlib ]
++#  LIBKERN_DEV =    [ LIBKERN_BASE zlib iotracking ]
++#  LIBKERN_DEBUG =  [ LIBKERN_BASE zlib iotracking ]
++#if SOC_IS_VIRTUALIZED
++#  CPU_COUNTERS_BASE = [ ]
++#else /*!SOC_IS_VIRTUALIZED*/
++#  CPU_COUNTERS_BASE = [ config_cpu_counters config_pervasive_cpi config_pervasive_energy ]
++#endif /*SOC_IS_VIRTUALIZED*/
++#  PERF_DBG_BASE =  [ config_dtrace mach_kdp config_serial_kdp kdp_interactive_debugging config_kdp_coredump_encryption CPU_COUNTERS_BASE kperf ]
++#  PERF_DBG_RELEASE=[ PERF_DBG_BASE ist_kdebug ]
++#  PERF_DBG_DEV =   [ PERF_DBG_BASE lock_stats zleaks alternate_debugger sched_hygiene_debug config_debug_syscall_rejection config_iotrace config_memory_microstackshot ]
++#  PERF_DBG_DEBUG = [ PERF_DBG_BASE lock_stats zleaks alternate_debugger sched_hygiene_debug config_debug_syscall_rejection config_iotrace config_memory_microstackshot ]
++#  PERF_DBG_KASAN = [ PERF_DBG_BASE lock_stats zleaks alternate_debugger config_debug_syscall_rejection config_iotrace config_memory_microstackshot ]
++#if SOC_IS_VIRTUALIZED
++#  PARAVIRT_BASE =  [ config_pv_ticket ]
++#else
++#  PARAVIRT_BASE =  [ ]
++#endif /*SOC_IS_VIRTUALIZED*/
++#  MACH_BASE =      [ mach config_ecc_logging vc_progress_white importance_inheritance config_atm config_coalitions config_iosched config_sysdiagnose config_telemetry config_mach_bridge_recv_time config_quiesce_counter config_arm_pfz config_user_notification phys_write_acct config_service_port_info config_voucher_deprecated PARAVIRT_BASE ]
++#  MACH_RELEASE =   [ MACH_BASE ]
++#  MACH_DEV =       [ MACH_BASE config_io_accounting importance_trace config_task_suspend_stats ]
++#  MACH_DEBUG =     [ MACH_BASE config_io_accounting importance_trace importance_debug config_task_suspend_stats ]
++#  SCHED_BASE =     [ config_sched_timeshare_core config_sched_deferred_ast config_clutch config_sched_sfi config_sched_auto_join config_preadopt_tg ]
++#  SCHED_RELEASE =  [ SCHED_BASE ]
++#  SCHED_DEV =      [ SCHED_BASE ]
++#  SCHED_DEBUG =    [ SCHED_BASE ]
++#if MASTER_CONFIG_ENABLE_KERNEL_TAG && MASTER_CONFIG_ENABLE_SPTM
++#  VM_EXTRA =       [ kernel_tagging ]
++#  VM_EXTRA_DEV =   [ ]
++#elif MASTER_CONFIG_ENABLE_SPTM
++#  VM_EXTRA =       [ ]
++#  VM_EXTRA_DEV =   [ ]
++#else
++#  VM_EXTRA =       [ ]
++#  VM_EXTRA_DEV =   [ ]
++#endif /* MASTER_CONFIG_ENABLE_KERNEL_TAG && MASTER_CONFIG_ENABLE_SPTM */
++#  VM_BASE =        [ vm_pressure_events memorystatus config_code_decryption encrypted_swap config_deferred_reclaim VM_EXTRA ]
++#  VM_RELEASE =     [ VM_BASE ]
++#  VM_DEV =         [ VM_BASE dynamic_codesigning VM_EXTRA_DEV ]
++#  VM_DEBUG =       [ VM_BASE dynamic_codesigning VM_EXTRA_DEV ]
++#  VM_KASAN =       [ VM_BASE dynamic_codesigning config_kasan config_ubsan config_kcov config_ksancov kernel_tagging kernel_tbi ]
++#  SECURITY_BASE  =   [ config_macf config_audit kernel_integrity config_csr config_csr_from_dt config_setuid config_kas_info config_secure_bsd_root config_arcade config_supplemental_signatures second_static_trust_cache reslide_shared_cache ]
++#  SECURITY_RELEASE = [ SECURITY_BASE ]
++#  SECURITY_DEV   =   [ SECURITY_BASE ]
++#  SECURITY_DEBUG =   [ SECURITY_BASE ]
++#  BASE =           [ PF VPN NFS ]
++#  RELEASE =        [ BASE KERNEL_RELEASE BSD_RELEASE FILESYS_RELEASE SKYWALK_RELEASE NETWORKING_RELEASE IOKIT_RELEASE LIBKERN_RELEASE    PERF_DBG_RELEASE MACH_RELEASE SCHED_RELEASE VM_RELEASE SECURITY_RELEASE ]
++#  DEVELOPMENT =    [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_DEV     SECURITY_DEV     ]
++#  DEBUG =          [ BASE KERNEL_DEBUG   BSD_DEBUG   FILESYS_DEBUG   SKYWALK_DEBUG   NETWORKING_DEBUG   IOKIT_DEBUG   LIBKERN_DEBUG      PERF_DBG_DEBUG   MACH_DEBUG   SCHED_DEBUG   VM_DEBUG   SECURITY_DEBUG   ]
++#  KASAN =          [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_KASAN   MACH_DEV     SCHED_DEV     VM_KASAN   SECURITY_DEV     ]
++#  SPTM =           [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_DEV     SECURITY_DEV     ]
++#
++######################################################################
++#
++machine		"arm64"						# <arm64>
++
++makeoptions	OSFMK_MACHINE = "arm64"				# <mach>
++
++options		COUNT_SYSCALLS		# count bsd system calls 	# <countcalls>
++options     TRASH_VFP_ON_SAVE   # <debug,trash_vfp>
++options		ALTERNATE_DEBUGGER	# <alternate_debugger>
++
++options   CONFIG_VNODES=1024		# <xsmall>
++
++options   CONFIG_FREEZE_SUSPENDED_MIN=4		# <xsmall>
++
++options	  CONFIG_MACH_APPROXIMATE_TIME
++
++options   CONFIG_KERNEL_INTEGRITY		# <kernel_integrity>
++
++options CONFIG_MACF_LAZY_VNODE_LABELS   # Turn on labels, don't preallocate
++
++options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
++options   CONFIG_KERNEL_TBI		# <kernel_tbi>
++options   CONFIG_KERNEL_TAGGING		# <kernel_tagging>
+diff --git c/src/Kernel/xnu/osfmk/arm64/m1_first_entry.inc i/src/Kernel/xnu/osfmk/arm64/m1_first_entry.inc
+new file mode 100644
+index 00000000..8a7ae6b9
+--- /dev/null
++++ i/src/Kernel/xnu/osfmk/arm64/m1_first_entry.inc
+@@ -0,0 +1,88 @@
++/*
++ * Darwin Lab T8103 first-entry experiment. Included only by start.s in the
++ * explicitly selected DEBUG candidate. This is not the XNU VM/IOKit console.
++ * Entry ABI: __start, EL1, stage-1 MMU off, x0 = normal XNU boot_args pointer.
++ * x0 is preserved and is not dereferenced. No stack or writable globals used.
++ * The loader must validate T8103 and ADT uart0 reg0 == 0x235200000 and provide
++ * a working, already configured Samsung UART (m1n1 VUART for the first route).
++ * UART constants: pinned m1n1 src/soc.h and src/uart_regs.h; see CONTRACT.md.
++ */
++#if !defined(ARM64_BOARD_CONFIG_T8103) || !DEBUG
++#error "M1 first entry requires the native T8103 DEBUG configuration"
++#endif
++
++	.align 2
++	.globl EXT(darwin_lab_m1_first_entry)
++LEXT(darwin_lab_m1_first_entry)
++	/* Mask exceptions before validation, including the wrong-EL park path. */
++	msr DAIFSet, #0xf
++	/* x19 is a diagnostic state, not an authorization or success token. */
++	mov x19, #0
++	mrs x9, CurrentEL
++	cmp x9, #4
++	b.ne Ldl_m1_bad_el
++	mrs x9, SCTLR_EL1
++	tbnz x9, #0, Ldl_m1_bad_mmu
++	/* Preserve exception state at a local spin vector on a synchronous fault. */
++	adrp x9, EXT(LowExceptionVectorBase)@page
++	add x9, x9, EXT(LowExceptionVectorBase)@pageoff
++	msr VBAR_EL1, x9
++	isb
++	/* Tonga/M1 Icestorm or Firestorm. This cannot identify a Mac model. */
++	mrs x9, MIDR_EL1
++	ubfx x10, x9, #24, #8
++	cmp x10, #0x61
++	b.ne Ldl_m1_bad_cpu
++	ubfx x10, x9, #4, #12
++	cmp x10, #0x22
++	b.eq Ldl_m1_cpu_ok
++	cmp x10, #0x23
++	b.ne Ldl_m1_bad_cpu
++Ldl_m1_cpu_ok:
++	mov x19, #1
++	movz x1, #0x3520, lsl #16
++	movk x1, #2, lsl #32 /* x1 = 0x235200000 */
++	adr x2, Ldl_m1_message
++Ldl_m1_next:
++	ldrb w3, [x2], #1
++	cbz w3, Ldl_m1_drain
++	mov x4, #0x100000 /* bounded polling, no timer/IRQ dependencies */
++Ldl_m1_tx_wait:
++	ldr w5, [x1, #0x10] /* UTRSTAT: TXBE */
++	tbnz w5, #1, Ldl_m1_tx
++	subs x4, x4, #1
++	b.ne Ldl_m1_tx_wait
++	b Ldl_m1_uart_timeout
++Ldl_m1_tx:
++	str w3, [x1, #0x20] /* UTXH, same access width as pinned m1n1 */
++	dsb sy
++	mov x19, #2
++	b Ldl_m1_next
++Ldl_m1_drain:
++	mov x4, #0x100000
++Ldl_m1_drain_wait:
++	ldr w5, [x1, #0x10] /* UTRSTAT: transmitter empty */
++	tbnz w5, #2, Ldl_m1_drained
++	subs x4, x4, #1
++	b.ne Ldl_m1_drain_wait
++	b Ldl_m1_uart_timeout
++Ldl_m1_drained:
++	mov x19, #3
++	b Ldl_m1_park
++Ldl_m1_bad_el:
++	mov x19, #0xe1
++	b Ldl_m1_park
++Ldl_m1_bad_mmu:
++	mov x19, #0xe2
++	b Ldl_m1_park
++Ldl_m1_bad_cpu:
++	mov x19, #0xe3
++	b Ldl_m1_park
++Ldl_m1_uart_timeout:
++	mov x19, #0xe4
++Ldl_m1_park:
++	/* No fallthrough, return, WFI, secondary CPU startup or interrupt enable. */
++	b Ldl_m1_park
++Ldl_m1_message:
++	.asciz "HVLOG: DARWIN_LAB_M1_EARLY_CONSOLE checkpoint=entry-before-vm next=park kernel_init=not_started\r\n"
++	.align 2
+diff --git c/src/Kernel/xnu/osfmk/arm64/start.s i/src/Kernel/xnu/osfmk/arm64/start.s
+index 7669ce74..f353db56 100644
+--- c/src/Kernel/xnu/osfmk/arm64/start.s
++++ i/src/Kernel/xnu/osfmk/arm64/start.s
+@@ -229,8 +229,16 @@ LEXT(ResetHandlerData)
+ 	.align	3
+ 	.globl EXT(_start)
+ LEXT(_start)
++#if DARWIN_LAB_M1_FIRSTBOOT
++	b	EXT(darwin_lab_m1_first_entry)
++#else
+ 	ARM64_PROLOG
+ 	b	EXT(start_first_cpu)
++#endif
++
++#if DARWIN_LAB_M1_FIRSTBOOT
++#include "m1_first_entry.inc"
++#endif
+ 
+ 
+ /*
+@@ -474,6 +482,10 @@ start_cpu:
+ 	.align 2
+ 	.globl EXT(start_first_cpu)
+ LEXT(start_first_cpu)
++#if DARWIN_LAB_M1_FIRSTBOOT
++	// The experiment-only feature selection must never enter normal VM boot.
++	b	EXT(darwin_lab_m1_first_entry)
++#endif
+ 
+ 	// Unlock the core for debugging
+ 	msr		OSLAR_EL1, xzr
+diff --git c/src/Kernel/xnu/pexpert/pexpert/arm64/board_config.h i/src/Kernel/xnu/pexpert/pexpert/arm64/board_config.h
+index 7cc9846e..81587ba9 100644
+--- c/src/Kernel/xnu/pexpert/pexpert/arm64/board_config.h
++++ i/src/Kernel/xnu/pexpert/pexpert/arm64/board_config.h
+@@ -138,11 +138,26 @@
+ #ifdef ARM64_BOARD_CONFIG_T8103
+ #include <pexpert/arm64/H13.h>
+ 
++#if DARWIN_LAB_M1_FIRSTBOOT
++/* The pre-VM parked experiment cannot initialize the private CTRR backend.
++ * Keep HAS_CTRR as a hardware fact; omit only this kernel implementation. */
++#undef KERNEL_INTEGRITY_CTRR
++#if defined(__ASSEMBLER__)
++/* CPU_OVRD is inferred to be CYC_OVRD from the identical field definitions.
++ * Encoding source: pinned m1n1 src/cpu_regs.h, sys_reg(3, 5, 15, 5, 0).
++ * These normal-start/idle instructions are unreachable in this experiment. */
++#define CPU_OVRD S3_5_C15_C5_0
++#endif
++#endif
++
+ #define MAX_L2_CLINE                   7
+ #define MAX_CPUS                       8
+ #define MAX_CPU_CLUSTERS               2
+ 
+-#ifndef CONFIG_SPTM
++/* The parked first-entry experiment cannot initialize a PPL or use the
++ * private CoreEntitlements V2 ABI absent from this source distribution.
++ * Do not turn this selection into a bootable configuration. */
++#if !defined(CONFIG_SPTM) && !DARWIN_LAB_M1_FIRSTBOOT
+ #define PMAP_CS                        1
+ #define PMAP_CS_ENABLE                 1
+ #define XNU_MONITOR                    1 /* Secure pmap runtime */

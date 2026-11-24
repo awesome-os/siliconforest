@@ -1,0 +1,49 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Everything at once on all processors: join Wi-Fi, then run the unattended GPU desktop
+# session (../../chonkstep-darwin/darwin-wm-gl-session.in, staged as
+# /usr/local/bin/wm-gl-session by tools/smp_desktop_boot.sh) while every processor hashes
+# and the gateway is pinged once a second. Needs sfagx=1 sfdcp=2 and the Wi-Fi collection.
+# Lines: SMPD_* from this script, DL34_*-style Wi-Fi output, the session's own WMGL3/WMSTAT/
+# WMAUTO lines, SMP_WORKER per load worker.
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin; export PATH
+printf '\nSMPD_BEGIN_%s\n' "$nonce"
+sysctl hw.ncpu hw.activecpu 2>&1
+ncpu=$(sysctl -n hw.ncpu 2>/dev/null); ncpu=${ncpu:-1}
+
+sleep 4
+sf-dhcp --up en0 2>&1
+sleep 2
+wifiutil on 2>&1
+printf 'SMPD_WIFI_ON_RC=%s\n' "$?"
+sleep 8
+wifiutil join '@SSID@' '@PSK@' 2>&1
+printf 'SMPD_JOIN_RC=%s\n' "$?"
+sleep 4
+sf-net-up en0 2>&1
+printf 'SMPD_NET_UP_RC=%s\n' "$?"
+ping -c 3 10.1.1.1 2>&1
+printf 'SMPD_PING_BEFORE_RC=%s\n' "$?"
+
+load=@LOAD@
+worker() {      # id seconds
+    i=0; start=$(date +%s); end=$(( start + $2 ))
+    while [ "$(date +%s)" -lt "$end" ]; do
+        dd if=/dev/zero bs=1048576 count=8 2>/dev/null | sha256sum > /dev/null
+        i=$((i+1))
+    done
+    printf 'SMP_WORKER tag=desktopload id=%s megabytes=%s seconds=%s elapsed=%s\n' "$1" "$((i*8))" "$2" "$(( $(date +%s) - start ))"
+}
+w=0; while [ "$w" -lt "$ncpu" ]; do worker "$w" "$load" & w=$((w+1)); done
+( ping -c "$load" 10.1.1.1 2>&1 | tail -3 | sed 's/^/SMPD_PING_DURING /' ) &
+printf 'SMPD_LOAD_STARTED workers=%s seconds=%s\n' "$ncpu" "$load"
+
+/usr/local/bin/wm-gl-session "$nonce"
+printf 'SMPD_SESSION_RC=%s\n' "$?"
+wait
+ping -c 3 10.1.1.1 2>&1
+printf 'SMPD_PING_AFTER_RC=%s\n' "$?"
+wifiutil info 2>&1 | head -12
+sysctl hw.ncpu hw.activecpu 2>&1
+printf 'SMPD_END_%s\n' "$nonce"

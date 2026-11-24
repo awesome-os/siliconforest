@@ -1,0 +1,179 @@
+xnu: the boot no longer waits 62 s for a daemon and a clock that do not exist
+
+Three timeouts ran in full on every boot of the M1 (boots ht01, df01, tb11, ds06, ds07:
+root mounted 60.4 s after the kernel banner, shell prompt 66.4 s):
+
+  30 s  IOKitInitializeTime() waits for an IORTC resource; this machine has no RTC driver.
+  27 s  the waitQuiet(30 s) on the registry root that SiliconForest added after it. It could
+        never succeed: StartIOKitMatching() adds a busy count to the root "until the IOKit
+        daemon has completely finished launching", released only by
+        IOService::iokitDaemonLaunched() on kernelmanagerd's Daemon Ready request, which
+        nothing in SiliconForest sends.
+   5 s  launchctl's IOKitWaitQuiet(5 s) before the single-user shell (launchctl.c
+        do_single_user_mode2; a multi-user boot has the same wait after loading the
+        LaunchDaemons), for the same reason.
+
+While the daemon's count is outstanding, waitQuiet() on the root now returns when that count
+is the only one left, that is when every driver has finished matching and starting. The
+count itself is not released, so what a really quiet root triggers (publishHiddenMedia,
+OSKext::considerUnloads) stays exactly as before: it never ran on this system and still
+does not. IOKitInitializeTime() waits for the registry first and skips the clock wait once
+it is quiet (a driver with a clock publishes IORTC while it starts); if the registry does
+not settle in time it names the busy services and falls back to the upstream RTC wait.
+
+Boot-args: sf_quiet_wait=<s> (registry wait, default 30, 0 none), sf_rtc_wait=<s> (RTC wait,
+0 none; default 0 after a quiet registry and 30 otherwise), sf_daemon_hold_quiet=0 (the
+root stays busy for waiters until the daemon reports ready, as upstream).
+UPSTREAM: the IOKitInitializeTime order yes; the daemon count needs a SiliconForest decision
+(a daemon that reports ready, or NO_KEXTD).
+
+--- a/src/Kernel/xnu/iokit/Kernel/IOService.cpp
++++ b/src/Kernel/xnu/iokit/Kernel/IOService.cpp
+@@ -255,6 +255,11 @@
+ static IOLock *                 gIOServiceBusyLock;
+ bool                            gCPUsRunning;
+ bool                            gIOKitWillTerminate;
++// PD: the registry root's busy count that StartIOKitMatching() adds for the IOKit daemon is
++// outstanding, and (sf_daemon_hold_quiet, default 1) waitQuiet() on the root does not wait
++// for it. See waitQuietWithOptions().
++bool                            gSFIOKitDaemonBusyHold;
++bool                            gSFQuietIgnoresDaemonHold = true;
+ atomic_bool                     gInUserspaceReboot;
+ 
+ #define kIOServiceRootMediaParentInvalid ((IOService *) -1UL)
+@@ -1234,7 +1239,10 @@
+ 	}
+ 	IOServiceTrace(IOSERVICE_KEXTD_READY, 0, 0, 0, 0);
+ 	startDeferredMatches();
+-	getServiceRoot()->adjustBusy(-1);
++	if (gSFIOKitDaemonBusyHold) {
++		gSFIOKitDaemonBusyHold = false;
++		getServiceRoot()->adjustBusy(-1);
++	}
+ 	IOService::publishUserResource(gIOResourceIOKitKey);
+ #endif /* !NO_KEXTD */
+ }
+@@ -5852,7 +5860,23 @@
+ 	time = mach_absolute_time();
+ 	pendingRequests = false;
+ 	for (loops = 0; loops < timeoutExtensions; loops++) {
+-		ret = waitForState( kIOServiceBusyStateMask, 0, timeout );
++		// PD: the registry root carries one busy count from StartIOKitMatching() until the
++		// IOKit daemon reports ready. SiliconForest has no such daemon, so the root was never
++		// quiet and every wait on it ran to its timeout (30 s in IOKitInitializeTime, 5 s in
++		// launchctl before the single-user shell and again in a multi-user boot). While that
++		// count is outstanding the root is quiet for a waiter when it is the only one left:
++		// every driver has finished matching and starting. The count itself stays, so
++		// nothing that happens when the root really goes quiet (hidden media, kext
++		// autounload) changes.
++		UInt32 quietValue = 0;
++		if (gSFQuietIgnoresDaemonHold && gSFIOKitDaemonBusyHold && (this == gIOServiceRoot)) {
++			quietValue = 1;
++		}
++		ret = waitForState( kIOServiceBusyStateMask, quietValue, timeout );
++		if ((kIOReturnTimeout == ret) && quietValue && (0 == getBusyState())) {
++			// the daemon reported ready during the wait
++			ret = kIOReturnSuccess;
++		}
+ 
+ 		if (loops && (kIOReturnSuccess == ret)) {
+ 			time = mach_absolute_time() - time;
+--- a/src/Kernel/xnu/iokit/Kernel/IOStartIOKit.cpp
++++ b/src/Kernel/xnu/iokit/Kernel/IOStartIOKit.cpp
+@@ -69,22 +69,72 @@
+ #include <kern/clock.h>
+ #include <sys/time.h>
+ 
++extern bool gSFIOKitDaemonBusyHold;
++extern bool gSFQuietIgnoresDaemonHold;
++
++// PD: the services still busy after the registry wait timed out, providers before clients:
++// the ones with no busy client are the drivers that have not finished starting
++static void
++SFLogBusyServices( uint32_t seconds )
++{
++	IORegistryIterator * iter;
++	IORegistryEntry *    entry;
++	IOService *          service;
++	uint32_t             count = 0;
++
++	IOLog("IOKitInitializeTime: registry not quiet after %u s (root busy %u, daemon hold %d)\n",
++	    seconds, (uint32_t) IOService::getServiceRoot()->getBusyState(), gSFIOKitDaemonBusyHold);
++	iter = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
++	if (!iter) {
++		return;
++	}
++	while ((entry = iter->getNextObject())) {
++		service = OSDynamicCast(IOService, entry);
++		if (service && service->getBusyState() && (count++ < 32)) {
++			IOLog("IOKitInitializeTime: busy %u: %s (%s) depth %d\n",
++			    (uint32_t) service->getBusyState(), service->getName(),
++			    service->getMetaClass()->getClassName(), (int) service->getDepth(gIOServicePlane));
++		}
++	}
++	iter->release();
++}
++
+ void
+ IOKitInitializeTime( void )
+ {
+ 	mach_timespec_t         t;
++	uint32_t                quietWait = 30;
++	uint32_t                rtcWait = 30;
++	bool                    quiet = false;
++
++	// PD: first wait for the registry to settle (every matched driver started), then for the
++	// clock. Upstream waits 30 s for an IORTC resource and nothing else; this machine has no
++	// RTC driver, so that was 30 s of every boot, and the registry wait that followed could
++	// not succeed (see IOService::waitQuietWithOptions). A driver with a clock publishes
++	// IORTC while it starts, so once the registry is quiet the resource is there or will
++	// not come, and the clock is not waited for. If the registry does not settle, the busy
++	// services are named and the upstream RTC wait applies.
++	//   sf_quiet_wait=<seconds>  registry wait (default 30; 0: none)
++	//   sf_rtc_wait=<seconds>    RTC wait, also after a quiet registry (0: none)
++	PE_parse_boot_argn("sf_quiet_wait", &quietWait, sizeof(quietWait));
++	if (quietWait) {
++		mach_timespec_t q = { quietWait, 0 };
++
++		quiet = (kIOReturnSuccess == IOService::getServiceRoot()->waitQuiet(&q));
++		if (!quiet) {
++			SFLogBusyServices(quietWait);
++		}
++	}
++	if (quiet) {
++		rtcWait = 0;
++	}
++	PE_parse_boot_argn("sf_rtc_wait", &rtcWait, sizeof(rtcWait));
++	if (rtcWait) {
++		t.tv_sec = rtcWait;
++		t.tv_nsec = 0;
+ 
+-	t.tv_sec = 30;
+-	t.tv_nsec = 0;
+-
+-	IOService::waitForService(
+-		IOService::resourceMatching("IORTC"), &t );
+-	// Without an RTC the wait above ran its full 30 s, and root mount came to rely on storage
+-	// matching being done by then: with one, wait for the registry to settle instead
+-	{
+-		mach_timespec_t q = { 30, 0 };
+-
+-		IOService::getServiceRoot()->waitQuiet(&q);
++		IOService::waitForService(
++			IOService::resourceMatching("IORTC"), &t );
+ 	}
+ #if defined(__i386__) || defined(__x86_64__)
+ 	IOService::waitForService(
+@@ -199,6 +249,12 @@
+ 		 * removed and personalities have been sent.
+ 		 */
+ 		IOService::getServiceRoot()->adjustBusy(1);
++		// PD: waitQuiet() on the root does not wait for this count (sf_daemon_hold_quiet=0
++		// restores the upstream behaviour: the root is busy until the daemon reports ready)
++		uint32_t ignore = 1;
++		PE_parse_boot_argn("sf_daemon_hold_quiet", &ignore, sizeof(ignore));
++		gSFQuietIgnoresDaemonHold = (ignore != 0);
++		gSFIOKitDaemonBusyHold = true;
+ 	}
+ #endif
+ }

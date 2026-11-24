@@ -1,0 +1,1861 @@
+diff --git a/crates/wm-darwin/src/capture.rs b/crates/wm-darwin/src/capture.rs
+index a4c8aa8..db313db 100644
+--- a/crates/wm-darwin/src/capture.rs
++++ b/crates/wm-darwin/src/capture.rs
+@@ -63,10 +63,14 @@ pub struct Options {
+     /// Seconds before a toolbar capture or recording (0, 5, 10).
+     pub timer: u32,
+     pub pointer: bool,
++    /// DESK11: a recording at half size (`Some(true)`) or full size; `None`: the policy's `record_scale`.
++    pub record_half: Option<bool>,
++    /// DESK11: a recording's frame rate (30 or 60); `None`: the policy's `record_fps`.
++    pub record_fps: Option<u8>,
+ }
+ impl Default for Options {
+     fn default() -> Self {
+-        Self { location: Location::Screenshots, timer: 0, pointer: false }
++        Self { location: Location::Screenshots, timer: 0, pointer: false, record_half: None, record_fps: None }
+     }
+ }
+ const OPTIONS_FILE: &str = "/private/var/db/desktop-state/screencapture";
+@@ -85,6 +89,9 @@ impl Options {
+                 }
+                 Some(("timer", v)) => o.timer = v.parse::<u32>().unwrap_or(0).min(10),
+                 Some(("pointer", v)) => o.pointer = v == "1",
++                Some(("record_scale", "half")) => o.record_half = Some(true),
++                Some(("record_scale", "full")) => o.record_half = Some(false),
++                Some(("record_fps", v)) => o.record_fps = v.parse::<u8>().ok().filter(|n| (1..=60).contains(n)),
+                 _ => {}
+             }
+         }
+@@ -97,7 +104,14 @@ impl Options {
+             Location::Screenshots => "screenshots",
+             Location::Clipboard => "clipboard",
+         };
+-        format!("location={l}\ntimer={}\npointer={}\n", self.timer, u8::from(self.pointer))
++        let mut text = format!("location={l}\ntimer={}\npointer={}\n", self.timer, u8::from(self.pointer));
++        if let Some(half) = self.record_half {
++            text.push_str(if half { "record_scale=half\n" } else { "record_scale=full\n" });
++        }
++        if let Some(fps) = self.record_fps {
++            text.push_str(&format!("record_fps={fps}\n"));
++        }
++        text
+     }
+     pub fn load() -> Self {
+         std::fs::read_to_string(OPTIONS_FILE).map(|t| Self::parse(&t)).unwrap_or_default()
+@@ -141,6 +155,9 @@ enum Button {
+     Location(Location),
+     Timer(u32),
+     Pointer,
++    /// DESK11: recordings at half size (true) or full size
++    RecordHalf(bool),
++    RecordFps(u8),
+ }
+ 
+ pub struct Toolbar {
+@@ -215,10 +232,18 @@ fn parse_request(line: &str) -> Option<Target> {
+ /// A recording request: `record screen <full|points> <seconds> <path|->` or
+ /// `record rect <x> <y> <w> <h> <full|points> <seconds> <path|->` (the path is the rest of the
+ /// line and must be absolute).
++/// DESK11: a recording's size as asked: the toolbar's Options (else the policy's `record_scale`), or one of
++/// the two sizes (`--screencapture -F` / `-H`).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum RecordSize {
++    Default,
++    Full,
++    Half,
++}
+ #[derive(Debug, PartialEq)]
+ pub struct RecordRequest {
+     pub target: Option<Rect>,
+-    pub full: bool,
++    pub full: RecordSize,
+     pub seconds: u32,
+     pub path: Option<PathBuf>,
+ }
+@@ -237,8 +262,9 @@ pub fn parse_record(line: &str) -> Option<RecordRequest> {
+     };
+     let mut it = rest.splitn(3, ' ');
+     let full = match it.next()? {
+-        "full" => true,
+-        "points" => false,
++        "full" => RecordSize::Full,
++        "points" | "half" => RecordSize::Half,
++        "default" => RecordSize::Default,
+         _ => return None,
+     };
+     let seconds = it.next()?.parse::<u32>().ok()?.min(24 * 3600);
+@@ -464,7 +490,7 @@ impl Server {
+                     #[cfg(feature = "desktop-shell")]
+                     {
+                         let timer = self.captures.options().timer;
+-                        self.record_request(r, None, None, None, false, timer);
++                        self.record_request(r, None, None, None, RecordSize::Default, timer);
+                     }
+                 } else if r.size.w >= 4 && r.size.h >= 4 && !record {
+                     self.captures.pending.push_back(Request { target: Target::Area(r), file, clipboard, reply: None });
+@@ -801,6 +827,18 @@ impl Server {
+                 (check(options.timer == 10, "Timer: 10 Seconds"), Button::Timer(10)),
+                 (check(options.pointer, "Show Mouse Pointer"), Button::Pointer),
+             ];
++            // DESK11: what a recording is made at (shown as in effect: the toolbar's choice, else the policy's)
++            #[cfg(feature = "desktop-shell")]
++            let rows = {
++                let mut rows = rows;
++                let half = options.record_half.unwrap_or(self.policy.now.record.half);
++                let fps = options.record_fps.unwrap_or(self.policy.now.record.fps);
++                rows.push((check(!half, "Record at Full Size"), Button::RecordHalf(false)));
++                rows.push((check(half, "Record at Half Size"), Button::RecordHalf(true)));
++                rows.push((check(fps == 60, "Record 60 Frames a Second"), Button::RecordFps(60)));
++                rows.push((check(fps == 30, "Record 30 Frames a Second"), Button::RecordFps(30)));
++                rows
++            };
+             let row_w = (300.0 * s) as u32;
+             let list_h = rows.len() as u32 * (h + gap) + 2 * pad;
+             let list_at = Point::new(options_x.min(screen.w as i32 - row_w as i32 - 2 * pad as i32), at.y - list_h as i32 - gap as i32);
+@@ -857,7 +895,7 @@ impl Server {
+                 #[cfg(feature = "desktop-shell")]
+                 {
+                     let screen = self.wm.backend().screen_size();
+-                    self.record_request(Rect::new(Point::new(0, 0), screen), None, None, None, false, options.timer);
++                    self.record_request(Rect::new(Point::new(0, 0), screen), None, None, None, RecordSize::Default, options.timer);
+                 }
+             }
+             Mode::RecordArea => self.capture_select(false, false, false, true),
+@@ -895,6 +933,8 @@ impl Server {
+             Button::Location(l) => options.location = l,
+             Button::Timer(n) => options.timer = n,
+             Button::Pointer => options.pointer = !options.pointer,
++            Button::RecordHalf(half) => options.record_half = Some(half),
++            Button::RecordFps(fps) => options.record_fps = Some(fps),
+         }
+         if self.captures.options != Some(options) {
+             self.captures.options = Some(options);
+@@ -940,10 +980,11 @@ extern "C" fn on_interrupt(_: libc::c_int) {
+     INTERRUPTED.store(true, std::sync::atomic::Ordering::Release);
+ }
+ 
+-/// `--screencapture -v|-V <seconds> [-F] [-R x,y,w,h] [file.mov]`: a recording from the running
++/// `--screencapture -v|-V <seconds> [-F | -H] [-R x,y,w,h] [file.mov]`: a recording from the running
+ /// desktop. It stops at Return or Control-C here, the desktop's Command-Control-Escape or its
+-/// indicator, or after the seconds of -V. -F: the panel's pixels (default: the display's points).
+-fn record_cli(rect: Option<String>, seconds: u32, full: bool, file: Option<PathBuf>) -> i32 {
++/// indicator, or after the seconds of -V. -F: the panel's pixels, -H: half each way (DESK11: default the
++/// toolbar's Options, else the policy's `record_scale`, full).
++fn record_cli(rect: Option<String>, seconds: u32, full: RecordSize, file: Option<PathBuf>) -> i32 {
+     let target = match rect {
+         Some(r) => format!("rect {r}"),
+         None => "screen".into(),
+@@ -960,7 +1001,12 @@ fn record_cli(rect: Option<String>, seconds: u32, full: bool, file: Option<PathB
+         Ok(s) => s,
+         Err(e) => { eprintln!("screencapture: no desktop answers at {}: {e}", runtime.join("capture").display()); return 1; }
+     };
+-    let request = format!("record {target} {} {seconds} {path}\n", if full { "full" } else { "points" });
++    let size = match full {
++        RecordSize::Full => "full",
++        RecordSize::Half => "points",
++        RecordSize::Default => "default",
++    };
++    let request = format!("record {target} {size} {seconds} {path}\n");
+     if stream.write_all(request.as_bytes()).is_err() {
+         eprintln!("screencapture: the desktop closed the connection");
+         return 1;
+@@ -1021,14 +1067,15 @@ pub fn cli(args: &[String]) -> i32 {
+     let mut clipboard = false;
+     let mut file: Option<PathBuf> = None;
+     let mut record: Option<u32> = None;
+-    let mut full = false;
++    let mut full = RecordSize::Default;
+     let mut i = 0;
+     while i < args.len() {
+         match args[i].as_str() {
+             "-c" => clipboard = true,
+             "-w" => target = "window".into(),
+             "-v" => record = Some(record.unwrap_or(0)),
+-            "-F" => full = true,
++            "-F" => full = RecordSize::Full,
++            "-H" => full = RecordSize::Half,
+             "-V" => {
+                 i += 1;
+                 let Some(n) = args.get(i).and_then(|s| s.parse::<u32>().ok()).filter(|n| *n > 0) else { eprintln!("screencapture: -V needs seconds"); return 2 };
+@@ -1041,7 +1088,7 @@ pub fn cli(args: &[String]) -> i32 {
+                 rect = Some(spec.replace(',', " "));
+             }
+             "-h" | "--help" => {
+-                eprintln!("usage: screencapture [-c] [-w | -R x,y,w,h] [file.png]\n       screencapture -v | -V <seconds> [-F] [-R x,y,w,h] [file.mov]\n  a picture of the running desktop's screen (panel pixels, without the pointer);\n  -c: to the clipboard; -w: the focused window; no file: the toolbar's \"Save to\" place (~/Pictures/Screenshots);\n  -v: record until Return or Control-C (or Command-Control-Escape on the desktop); -V: for that many seconds;\n  -F: record the panel's pixels (default: the display's points)");
++                eprintln!("usage: screencapture [-c] [-w | -R x,y,w,h] [file.png]\n       screencapture -v | -V <seconds> [-F | -H] [-R x,y,w,h] [file.mov]\n  a picture of the running desktop's screen (panel pixels, without the pointer);\n  -c: to the clipboard; -w: the focused window; no file: the toolbar's \"Save to\" place (~/Pictures/Screenshots);\n  -v: record until Return or Control-C (or Command-Control-Escape on the desktop); -V: for that many seconds;\n  -F: record the panel's pixels, -H: half of them each way (default: the toolbar's Options, else record_scale of the policy: full)");
+                 return 0;
+             }
+             other if other.starts_with('-') => { eprintln!("screencapture: unknown option {other}"); return 2; }
+@@ -1103,10 +1150,12 @@ mod tests {
+     use super::*;
+     #[test]
+     fn recording_requests_are_read_strictly() {
+-        assert_eq!(parse_record("record screen points 0 -"), Some(RecordRequest { target: None, full: false, seconds: 0, path: None }));
++        assert_eq!(parse_record("record screen points 0 -"), Some(RecordRequest { target: None, full: RecordSize::Half, seconds: 0, path: None }));
++        // DESK11: the toolbar's (or the policy's) size
++        assert_eq!(parse_record("record screen default 3 -").map(|r| r.full), Some(RecordSize::Default));
+         let r = parse_record("record rect 10 20 300 200 full 5 /tmp/a b.mov").unwrap();
+         assert_eq!(r.target, Some(Rect::new(Point::new(10, 20), Size::new(300, 200))));
+-        assert_eq!((r.full, r.seconds), (true, 5));
++        assert_eq!((r.full, r.seconds), (RecordSize::Full, 5));
+         assert_eq!(r.path, Some(PathBuf::from("/tmp/a b.mov")));
+         assert_eq!(parse_record("record screen points 0 relative.mov"), None);
+         assert_eq!(parse_record("record screen points 0 /tmp/../etc/x"), None);
+@@ -1115,7 +1164,7 @@ mod tests {
+     }
+     #[test]
+     fn options_are_kept_as_text() {
+-        let o = Options { location: Location::Desktop, timer: 5, pointer: true };
++        let o = Options { location: Location::Desktop, timer: 5, pointer: true, record_half: Some(true), record_fps: Some(30) };
+         assert_eq!(Options::parse(&o.text()), o);
+         assert_eq!(Options::parse("garbage"), Options::default());
+         assert_eq!(location_dir(Location::Clipboard), location_dir(Location::Screenshots));
+diff --git a/crates/wm-darwin/src/encoder.rs b/crates/wm-darwin/src/encoder.rs
+new file mode 100644
+index 0000000..7df89e4
+--- /dev/null
++++ b/crates/wm-darwin/src/encoder.rs
+@@ -0,0 +1,389 @@
++//! DESK11: the screen recorder's video encoders. The compositor converts each recorded frame to NV12 on the
++//! GPU, into one of a small ring of shareable buffers (linear dma-bufs, CPU-mapped cached: `glrender.rs`
++//! `record_capture`); a writer thread (`record.rs`) hands each frame with its time to an `Encoder`:
++//!
++//! - **software** (`Software`): `/usr/local/bin/ffmpeg` with libx264, a separate program (GPL; never linked
++//!   into this one). The frames go to its standard input as a Matroska stream of raw NV12 frames, each with its
++//!   time in microseconds (a variable frame rate: a frame only when the screen changed), and ffmpeg writes a
++//!   QuickTime movie of H.264 (`+faststart`). ffmpeg is also the muxer.
++//! - **hardware** (`hardware`): the Apple Video Encoder through our VideoToolbox (`VTCompressionSession`),
++//!   when the AVE driver (SF-AD, paused) works. A seam only: `hardware::probe` says it is not available. What
++//!   it gets is the same `NvFrame`: the dma-buf of the frame (NV12, linear, Y at 0 and U/V at
++//!   `width * height`, pitch `width`) and its time, so it can take the buffer without a copy; it would give
++//!   back an H.264/HEVC elementary stream, muxed by ffmpeg (`-c copy`) or by our own movie writer.
++use std::io::Write;
++use std::os::fd::{FromRawFd, OwnedFd};
++use std::path::{Path, PathBuf};
++use std::process::{Child, Command, Stdio};
++use std::time::{Duration, Instant};
++
++pub const FFMPEG: &str = "/usr/local/bin/ffmpeg";
++
++/// One frame for an encoder: NV12, the Y plane (`width` x `height`, pitch `width`) then the interleaved U/V
++/// plane (`height / 2` rows of `width` bytes) in `data`; `dmabuf` the same memory as a dma-buf (or -1).
++pub struct NvFrame<'a> {
++    pub data: &'a [u8],
++    pub width: u32,
++    pub height: u32,
++    pub dmabuf: i32,
++    /// microseconds since the recording started
++    pub at_us: u64,
++}
++
++pub struct EncoderSummary {
++    pub frames: u64,
++    /// CPU seconds the encoder used (its own process, for the software one)
++    pub cpu_s: f64,
++    /// time spent handing frames over (writing them to ffmpeg), total
++    pub push_s: f64,
++    pub push_max_ms: f64,
++    pub detail: String,
++}
++
++/// What every encoder back end does: frames in order with their times, then the end, which completes the file.
++pub trait Encoder: Send {
++    fn name(&self) -> &'static str;
++    fn push(&mut self, frame: &NvFrame<'_>) -> Result<(), String>;
++    /// The last frame went; the file is complete (its index written) when this returns `Ok`.
++    fn finish(self: Box<Self>) -> Result<EncoderSummary, String>;
++}
++
++#[derive(Clone, Debug)]
++pub struct Settings {
++    pub width: u32,
++    pub height: u32,
++    pub fps: u32,
++    pub preset: &'static str,
++    pub crf: u32,
++    pub threads: u32,
++    pub nice: u32,
++    pub path: PathBuf,
++    pub ffmpeg: PathBuf,
++}
++
++/// The back end a recording uses, from `record_encoder`: probed when it starts.
++pub fn open(choice: crate::policy::RecordEncoder, settings: &Settings) -> Result<Box<dyn Encoder>, String> {
++    use crate::policy::RecordEncoder;
++    match choice {
++        RecordEncoder::Hardware => hardware::open(settings),
++        RecordEncoder::Auto => hardware::open(settings).or_else(|_| Ok(Box::new(Software::spawn(settings)?) as Box<dyn Encoder>)),
++        RecordEncoder::Software => Ok(Box::new(Software::spawn(settings)?)),
++    }
++}
++
++/// The software encoder can run (its program is there).
++pub fn software_available(ffmpeg: &Path) -> bool {
++    use std::os::unix::fs::PermissionsExt;
++    std::fs::metadata(ffmpeg).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
++}
++
++pub mod hardware {
++    /// The Apple Video Encoder (SF-AD) through VideoToolbox's `VTCompressionSession`. Not available: the
++    /// driver work is paused and our VideoToolbox has no encoder. When it comes, `probe` opens a session for
++    /// NV12 frames of the recording's size and `open` returns an `Encoder` whose `push` passes the frame's
++    /// dma-buf (as an IOSurface-compatible `CVPixelBuffer`) with its time, without a copy.
++    pub fn probe() -> Result<(), String> {
++        Err("no hardware video encoder: the Apple Video Encoder driver (SF-AD) is not finished and VideoToolbox here has no encoder".into())
++    }
++    pub fn open(_: &super::Settings) -> Result<Box<dyn super::Encoder>, String> {
++        probe()?;
++        Err("not available".into())
++    }
++}
++
++// --- Matroska, as much as a stream of raw frames with times needs -----------------------------------
++
++fn ebml_id(out: &mut Vec<u8>, id: u32) {
++    let bytes = id.to_be_bytes();
++    let skip = bytes.iter().position(|b| *b != 0).unwrap_or(3);
++    out.extend_from_slice(&bytes[skip..]);
++}
++/// Sizes are written in 8 bytes (any size, the same length every time).
++fn ebml_size(out: &mut Vec<u8>, size: u64) {
++    out.push(0x01);
++    out.extend_from_slice(&size.to_be_bytes()[1..]);
++}
++fn el_uint(out: &mut Vec<u8>, id: u32, v: u64) {
++    ebml_id(out, id);
++    ebml_size(out, 8);
++    out.extend_from_slice(&v.to_be_bytes());
++}
++fn el_bytes(out: &mut Vec<u8>, id: u32, b: &[u8]) {
++    ebml_id(out, id);
++    ebml_size(out, b.len() as u64);
++    out.extend_from_slice(b);
++}
++fn el_master(out: &mut Vec<u8>, id: u32, body: &[u8]) {
++    el_bytes(out, id, body);
++}
++
++/// The stream's head: EBML header, a Segment of unknown size, its Info (times in microseconds) and one
++/// video track of raw NV12 (`V_UNCOMPRESSED`, ColourSpace `NV12`).
++pub fn mkv_head(width: u32, height: u32) -> Vec<u8> {
++    let mut ebml = Vec::new();
++    el_uint(&mut ebml, 0x4286, 1);
++    el_uint(&mut ebml, 0x42F7, 1);
++    el_uint(&mut ebml, 0x42F2, 4);
++    el_uint(&mut ebml, 0x42F3, 8);
++    el_bytes(&mut ebml, 0x4282, b"matroska");
++    el_uint(&mut ebml, 0x4287, 4);
++    el_uint(&mut ebml, 0x4285, 2);
++    let mut out = Vec::new();
++    el_master(&mut out, 0x1A45_DFA3, &ebml);
++    ebml_id(&mut out, 0x1853_8067);
++    out.extend_from_slice(&[0x01, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
++    let mut info = Vec::new();
++    el_uint(&mut info, 0x2A_D7B1, 1000); // TimestampScale: 1000 ns
++    el_bytes(&mut info, 0x4D80, b"chonkstep-darwin-desktop");
++    el_bytes(&mut info, 0x5741, b"chonkstep-darwin-desktop");
++    el_master(&mut out, 0x1549_A966, &info);
++    let mut video = Vec::new();
++    el_uint(&mut video, 0xB0, u64::from(width));
++    el_uint(&mut video, 0xBA, u64::from(height));
++    el_bytes(&mut video, 0x2E_B524, b"NV12");
++    // BT.709 matrix, transfer and primaries, limited range: what the GPU's conversion makes (the frames carry it
++    // into the encoder, which writes it into the stream's VUI)
++    let mut colour = Vec::new();
++    el_uint(&mut colour, 0x55B1, 1);
++    el_uint(&mut colour, 0x55B9, 1);
++    el_uint(&mut colour, 0x55BA, 1);
++    el_uint(&mut colour, 0x55BB, 1);
++    el_master(&mut video, 0x55B0, &colour);
++    let mut track = Vec::new();
++    el_uint(&mut track, 0xD7, 1);
++    el_uint(&mut track, 0x73C5, 1);
++    el_uint(&mut track, 0x83, 1);
++    el_uint(&mut track, 0x9C, 0);
++    el_bytes(&mut track, 0x86, b"V_UNCOMPRESSED");
++    el_master(&mut track, 0xE0, &video);
++    let mut tracks = Vec::new();
++    el_master(&mut tracks, 0xAE, &track);
++    el_master(&mut out, 0x1654_AE6B, &tracks);
++    out
++}
++/// A Cluster with one SimpleBlock (a key frame of track 1 at `at_us`): everything before the frame's bytes.
++pub fn mkv_frame_head(at_us: u64, frame_len: usize) -> Vec<u8> {
++    let mut timestamp = Vec::new();
++    el_uint(&mut timestamp, 0xE7, at_us);
++    let block_len = 4 + frame_len as u64;
++    let mut out = Vec::with_capacity(64);
++    ebml_id(&mut out, 0x1F43_B675);
++    ebml_size(&mut out, timestamp.len() as u64 + 1 + 8 + block_len);
++    out.extend_from_slice(&timestamp);
++    ebml_id(&mut out, 0xA3);
++    ebml_size(&mut out, block_len);
++    out.extend_from_slice(&[0x81, 0x00, 0x00, 0x80]);
++    out
++}
++
++// --- the software encoder ---------------------------------------------------------------------------
++
++pub struct Software {
++    child: Option<Child>,
++    sink: Option<std::fs::File>,
++    frames: u64,
++    width: u32,
++    height: u32,
++    push_s: f64,
++    push_max_ms: f64,
++    started: Instant,
++    path: PathBuf,
++}
++
++/// The arguments ffmpeg gets: Matroska in, H.264 (x264) in a QuickTime movie out.
++pub fn ffmpeg_args(s: &Settings) -> Vec<String> {
++    let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostats", "-f", "matroska", "-i", "pipe:0", "-map", "0:v:0", "-c:v", "libx264", "-preset", s.preset]
++        .iter().map(|x| x.to_string()).collect();
++    a.extend(["-crf".into(), s.crf.to_string()]);
++    if s.threads > 0 {
++        a.extend(["-threads".into(), s.threads.to_string()]);
++    }
++    // a key frame every 2 s of the recording's time, whatever the frame rate (a player can seek)
++    a.extend(["-force_key_frames".into(), "expr:gte(t,n_forced*2)".into()]);
++    // the frames' own times (a frame only when the screen changed), on a 60 Hz grid; H.264 level 5.1 (the
++    // panel's size at 60 a second: what x264 cannot work out from times in microseconds)
++    a.extend(["-fps_mode".into(), "passthrough".into(), "-video_track_timescale".into(), "60000".into(), "-level:v".into(), "5.1".into()]);
++    a.extend(["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"].iter().map(|x| x.to_string()));
++    a.extend(["-movflags", "+faststart", "-f", "mov", "-y"].iter().map(|x| x.to_string()));
++    a.push(format!("file:{}", s.path.display()));
++    a
++}
++
++fn socketpair() -> std::io::Result<(OwnedFd, OwnedFd)> {
++    let mut fds = [0; 2];
++    if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
++        return Err(std::io::Error::last_os_error());
++    }
++    let (a, b) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
++    for (fd, opt) in [(fds[0], libc::SO_SNDBUF), (fds[1], libc::SO_RCVBUF)] {
++        unsafe {
++            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
++            // 4 MiB each way: the bytes of most of a frame go in one wake-up of ffmpeg's reader
++            let size: libc::c_int = 4 << 20;
++            libc::setsockopt(fd, libc::SOL_SOCKET, opt, &size as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
++        }
++    }
++    #[cfg(target_vendor = "apple")]
++    unsafe {
++        // a writer whose reader went gets EPIPE, not SIGPIPE
++        let on: libc::c_int = 1;
++        libc::setsockopt(fds[0], libc::SOL_SOCKET, libc::SO_NOSIGPIPE, &on as *const _ as *const libc::c_void, std::mem::size_of::<libc::c_int>() as libc::socklen_t);
++    }
++    Ok((a, b))
++}
++
++impl Software {
++    pub fn spawn(s: &Settings) -> Result<Self, String> {
++        if !software_available(&s.ffmpeg) {
++            return Err(format!("{} is not there", s.ffmpeg.display()));
++        }
++        let (ours, theirs) = socketpair().map_err(|e| format!("socketpair: {e}"))?;
++        let child = Command::new(&s.ffmpeg)
++            .args(ffmpeg_args(s))
++            .stdin(Stdio::from(theirs))
++            .stdout(Stdio::null())
++            .stderr(Stdio::inherit())
++            .spawn()
++            .map_err(|e| format!("{}: {e}", s.ffmpeg.display()))?;
++        if s.nice > 0 {
++            unsafe { libc::setpriority(libc::PRIO_PROCESS, child.id() as _, s.nice as libc::c_int) };
++        }
++        let mut sink = std::fs::File::from(ours);
++        sink.write_all(&mkv_head(s.width, s.height)).map_err(|e| format!("ffmpeg: {e}"))?;
++        eprintln!("WMRECORD encoder software pid={} {} {}", child.id(), s.ffmpeg.display(), ffmpeg_args(s).join(" "));
++        Ok(Self { child: Some(child), sink: Some(sink), frames: 0, width: s.width, height: s.height, push_s: 0.0, push_max_ms: 0.0, started: Instant::now(), path: s.path.clone() })
++    }
++}
++
++impl Encoder for Software {
++    fn name(&self) -> &'static str {
++        "software"
++    }
++    fn push(&mut self, f: &NvFrame<'_>) -> Result<(), String> {
++        let len = self.width as usize * self.height as usize * 3 / 2;
++        if f.width != self.width || f.height != self.height || f.data.len() < len {
++            return Err(format!("a frame of {}x{} ({} bytes) for a recording of {}x{}", f.width, f.height, f.data.len(), self.width, self.height));
++        }
++        let t = Instant::now();
++        let sink = self.sink.as_mut().ok_or("the encoder was finished")?;
++        sink.write_all(&mkv_frame_head(f.at_us, len))
++            .and_then(|_| sink.write_all(&f.data[..len]))
++            .map_err(|e| format!("ffmpeg stopped taking frames: {e}"))?;
++        let took = t.elapsed().as_secs_f64();
++        self.push_s += took;
++        self.push_max_ms = self.push_max_ms.max(took * 1000.0);
++        self.frames += 1;
++        Ok(())
++    }
++    fn finish(mut self: Box<Self>) -> Result<EncoderSummary, String> {
++        drop(self.sink.take()); // the end of the stream: ffmpeg finishes the file
++        let mut child = self.child.take().ok_or("no ffmpeg")?;
++        let pid = child.id() as libc::pid_t;
++        // ffmpeg writes the movie's index and moves it to the front (+faststart): it may take a while for a
++        // long recording; this thread waits (the desk does not)
++        let deadline = Instant::now() + Duration::from_secs(600);
++        let mut status = 0;
++        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
++        loop {
++            let r = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut usage) };
++            if r == pid {
++                break;
++            }
++            if r < 0 {
++                return Err(format!("waiting for ffmpeg: {}", std::io::Error::last_os_error()));
++            }
++            if Instant::now() > deadline {
++                let _ = child.kill();
++                return Err("ffmpeg did not finish the file within 10 minutes (ended)".into());
++            }
++            std::thread::sleep(Duration::from_millis(20));
++        }
++        let t = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 / 1e6;
++        let cpu = t(usage.ru_utime) + t(usage.ru_stime);
++        let exited = status & 0x7f == 0;
++        let code = (status >> 8) & 0xff;
++        if !exited || code != 0 {
++            return Err(format!("ffmpeg ended with {} (the file {} may be incomplete)", if exited { format!("status {code}") } else { format!("signal {}", status & 0x7f) }, self.path.display()));
++        }
++        let wall = self.started.elapsed().as_secs_f64();
++        Ok(EncoderSummary {
++            frames: self.frames,
++            cpu_s: cpu,
++            push_s: self.push_s,
++            push_max_ms: self.push_max_ms,
++            detail: format!("ffmpeg_cpu_s={cpu:.2} ffmpeg_cpu_pct_of_one_core={:.0}", if wall > 0.0 { cpu / wall * 100.0 } else { 0.0 }),
++        })
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn the_matroska_head_and_a_frame_have_their_sizes() {
++        let head = mkv_head(64, 32);
++        assert_eq!(&head[..4], &[0x1A, 0x45, 0xDF, 0xA3]);
++        assert!(head.windows(4).any(|w| w == b"NV12"));
++        assert!(head.windows(14).any(|w| w == b"V_UNCOMPRESSED"));
++        let f = mkv_frame_head(16_667, 64 * 32 * 3 / 2);
++        assert_eq!(&f[..4], &[0x1F, 0x43, 0xB6, 0x75]);
++        let cluster = u64::from_be_bytes([0, f[5], f[6], f[7], f[8], f[9], f[10], f[11]]);
++        assert_eq!(cluster as usize, f.len() - 12 + 64 * 32 * 3 / 2);
++        assert_eq!(&f[f.len() - 4..], &[0x81, 0, 0, 0x80]);
++    }
++    /// The software encoder end to end with the host's ffmpeg (skipped without one): 60 frames at 60 a second,
++    /// moving bars, in a movie of H.264 whose frames, times and colours ffprobe and ffmpeg read back.
++    #[test]
++    fn software_encoder_makes_an_h264_movie_with_the_frames_times() {
++        let ffmpeg = std::env::var_os("RECORD_TEST_FFMPEG").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/usr/bin/ffmpeg"));
++        if !software_available(&ffmpeg) {
++            eprintln!("no ffmpeg at {}: skipped", ffmpeg.display());
++            return;
++        }
++        let dir = std::env::temp_dir().join(format!("encoder-test-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("Screen Recording test.mov");
++        let (w, h) = (320u32, 192u32);
++        let settings = Settings { width: w, height: h, fps: 60, preset: "ultrafast", crf: 20, threads: 0, nice: 0, path: path.clone(), ffmpeg: ffmpeg.clone() };
++        let mut enc: Box<dyn Encoder> = Box::new(Software::spawn(&settings).unwrap());
++        let mut frame = vec![0u8; (w * h * 3 / 2) as usize];
++        for n in 0..60u64 {
++            // Y: a bright bar moving right on a mid grey; U/V neutral except a red-ish block
++            for y in 0..h as usize {
++                for x in 0..w as usize {
++                    frame[y * w as usize + x] = if (x as u64 / 16) == n % 20 { 235 } else { 126 };
++                }
++            }
++            for p in frame[(w * h) as usize..].chunks_exact_mut(2) {
++                p.copy_from_slice(&[128, 128]);
++            }
++            enc.push(&NvFrame { data: &frame, width: w, height: h, dmabuf: -1, at_us: n * 16_667 }).unwrap();
++        }
++        let s = enc.finish().unwrap();
++        assert_eq!(s.frames, 60);
++        let probe = ffmpeg.with_file_name("ffprobe");
++        let out = Command::new(&probe)
++            .args(["-v", "error", "-select_streams", "v:0", "-count_frames", "-show_entries", "stream=codec_name,pix_fmt,width,height,nb_read_frames,color_space,color_transfer,color_primaries,level:format=duration", "-of", "default=nw=1"])
++            .arg(&path)
++            .output()
++            .unwrap();
++        let text = String::from_utf8_lossy(&out.stdout).to_string();
++        eprintln!("{text}");
++        assert!(text.contains("codec_name=h264"), "{text}");
++        assert!(text.contains("pix_fmt=yuv420p"), "{text}");
++        assert!(text.contains("nb_read_frames=60"), "{text}");
++        assert!(text.contains("color_space=bt709"), "{text}");
++        assert!(text.contains("color_transfer=bt709") && text.contains("color_primaries=bt709"), "{text}");
++        let duration: f64 = text.lines().find_map(|l| l.strip_prefix("duration=")).and_then(|d| d.parse().ok()).unwrap();
++        assert!((duration - 1.0).abs() < 0.05, "duration {duration}");
++        assert!(text.contains("level=51"), "{text}");
++        // the moov is at the front (+faststart)
++        let data = std::fs::read(&path).unwrap();
++        let moov = data.windows(4).position(|w| w == b"moov").unwrap();
++        let mdat = data.windows(4).position(|w| w == b"mdat").unwrap();
++        assert!(moov < mdat);
++        if std::env::var_os("RECORD_TEST_KEEP").is_none() {
++            let _ = std::fs::remove_dir_all(&dir);
++        }
++    }
++}
+diff --git a/crates/wm-darwin/src/glrender.rs b/crates/wm-darwin/src/glrender.rs
+index 650fa5c..55f528e 100644
+--- a/crates/wm-darwin/src/glrender.rs
++++ b/crates/wm-darwin/src/glrender.rs
+@@ -16,7 +16,7 @@ use crate::damage::{DRect, ItemKey};
+ use crate::gpu::*;
+ use crate::kms::{Committed, Flip, FlipQueue, FlipWait, Kms, OverlayPlacement, Scanout, ScanoutBuffer, Steps};
+ use crate::presenter::Presenter;
+-use crate::render::{drawn_image_rect, DmabufDesc, FrameStats, Presented, Renderer, RendererKind};
++use crate::render::{drawn_image_rect, DmabufDesc, FrameStats, Presented, RecordFrame, Renderer, RendererKind};
+ use crate::scene::{CpuBackend, DrawOp, ExternalBuffer};
+ use std::collections::HashMap;
+ use std::ffi::{c_char, c_void};
+@@ -108,6 +108,15 @@ pub trait GlTarget {
+     /// A descriptor that ends a wait for a flip when it becomes readable (DESK8: the clients' requests, so
+     /// a commit made while a frame is on its way is read when it comes).
+     fn set_client_wake(&mut self, _: Option<libc::c_int>) {}
++    /// DESK11: the texture of the framebuffer `last` gives (what a recording converts).
++    fn last_texture(&self) -> Option<GLuint> {
++        None
++    }
++    /// DESK11: a shareable buffer for the recorder (`Kms::create_record_buffer`); `Ok(None)`: this target makes
++    /// none (an off-screen target: its frames are read back when taken, for tests).
++    fn create_record_buffer(&mut self, _: &Libraries, _: &Context, _: (u32, u32), _: bool) -> Result<Option<crate::kms::RecordBuffer>, String> {
++        Ok(None)
++    }
+ }
+ 
+ /// An external display's CRTC with its buffers and its own flips (DESK5).
+@@ -176,6 +185,7 @@ const CURSOR_BUFFER: u32 = 128;
+ /// the off-screen benchmark and the pixel check use it.
+ pub struct OffscreenTarget {
+     fbo: GLuint,
++    texture: GLuint,
+     size: (u32, u32),
+     drawn: bool,
+ }
+@@ -197,7 +207,7 @@ impl OffscreenTarget {
+                 return Err(format!("off-screen framebuffer status {status:#x}"));
+             }
+         }
+-        Ok(Self { fbo, size: (width, height), drawn: false })
++        Ok(Self { fbo, texture, size: (width, height), drawn: false })
+     }
+ }
+ impl GlTarget for OffscreenTarget {
+@@ -226,6 +236,9 @@ impl GlTarget for OffscreenTarget {
+     fn drawing_index(&self) -> Option<usize> {
+         Some(0)
+     }
++    fn last_texture(&self) -> Option<GLuint> {
++        self.drawn.then_some(self.texture)
++    }
+ }
+ 
+ /// The display and what is in flight on it, shared by the desktop's loop and the cursor thread
+@@ -833,6 +846,13 @@ impl GlTarget for KmsTarget {
+         let c = self.core();
+         self.last.map(|i| c.buffers[i].fbo)
+     }
++    fn last_texture(&self) -> Option<GLuint> {
++        let c = self.core();
++        self.last.map(|i| c.buffers[i].texture)
++    }
++    fn create_record_buffer(&mut self, libs: &Libraries, context: &Context, size: (u32, u32), writeback: bool) -> Result<Option<crate::kms::RecordBuffer>, String> {
++        self.core().kms.create_record_buffer(libs, context, size, writeback).map(Some)
++    }
+     fn set_power(&mut self, libs: &Libraries, on: bool) -> Result<bool, String> {
+         // the cursor thread leaves the display alone until the loop wants the plane again
+         self.core().plane.wanted.enabled = false;
+@@ -970,6 +990,82 @@ void main() {
+ }
+ ";
+ 
++/// DESK11: the recorder's conversion of an area of the frame on the screen to NV12 (BT.709, limited range),
++/// scaled to the recording's size, written as four bytes a texel into a target of `(width / 4) x (height * 3
++/// / 2)` texels whose memory is the frame's bytes exactly: rows `0..height` the Y plane, then `height / 2` rows
++/// of interleaved U, V. A luma sample is the source at its centre (bilinear: one texel at full size, the 2x2
++/// box at half); a chroma sample the mean of its four luma samples.
++const NV12_VERTEX_SHADER: &str = "#version 300 es
++void main() {
++    vec2 corner = vec2(float(gl_VertexID & 1), float(gl_VertexID >> 1));
++    gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
++}
++";
++const NV12_FRAGMENT_SHADER: &str = "#version 300 es
++precision highp float;
++precision highp int;
++uniform sampler2D u_src;
++uniform vec2 u_tex;     // the source texture's size in texels
++uniform vec4 u_area;    // the recorded area of it: x, y, w, h (texels, row 0 the top)
++uniform vec2 u_out;     // the recording's size in pixels
++uniform int u_bgra;     // the target's bytes are B, G, R, A
++out vec4 color;
++vec3 at(float x, float y) {
++    return texture(u_src, (u_area.xy + vec2(x, y) * u_area.zw / u_out) / u_tex).rgb;
++}
++float luma(vec3 c) { return 16.0 + 219.0 * dot(c, vec3(0.2126, 0.7152, 0.0722)); }
++vec2 chroma(vec3 c) {
++    return vec2(128.0 + 224.0 * dot(c, vec3(-0.114572, -0.385428, 0.5)),
++                128.0 + 224.0 * dot(c, vec3(0.5, -0.454153, -0.045847)));
++}
++void main() {
++    ivec2 t = ivec2(gl_FragCoord.xy);
++    float x = float(t.x * 4);
++    vec4 b;
++    if (float(t.y) < u_out.y) {
++        float y = float(t.y) + 0.5;
++        b = vec4(luma(at(x + 0.5, y)), luma(at(x + 1.5, y)), luma(at(x + 2.5, y)), luma(at(x + 3.5, y)));
++    } else {
++        float y = (float(t.y) - u_out.y) * 2.0;
++        vec3 l = at(x + 0.5, y + 0.5) + at(x + 1.5, y + 0.5) + at(x + 0.5, y + 1.5) + at(x + 1.5, y + 1.5);
++        vec3 r = at(x + 2.5, y + 0.5) + at(x + 3.5, y + 0.5) + at(x + 2.5, y + 1.5) + at(x + 3.5, y + 1.5);
++        b = vec4(chroma(l * 0.25), chroma(r * 0.25));
++    }
++    b = clamp(b, 0.0, 255.0) / 255.0;
++    color = u_bgra != 0 ? b.zyxw : b;
++}
++";
++
++#[derive(Clone, Copy, PartialEq, Eq, Debug)]
++enum SlotState {
++    Free,
++    /// Converted (or being): its fence and its ticket (the order frames were taken in).
++    Gpu(*mut c_void, u64),
++    /// With the recorder's writer until it is released.
++    Handed,
++}
++struct RecordSlot {
++    /// The NV12 frame's size in pixels.
++    size: (u32, u32),
++    writeback: bool,
++    fbo: GLuint,
++    /// A shareable buffer: CPU mapping and dma-buf; `None` on a target without them (host tests), whose
++    /// frames are read back into `local` when they are taken.
++    shared: Option<(*mut u8, i32)>,
++    local: Vec<u8>,
++    bgra: bool,
++    state: SlotState,
++}
++pub(crate) struct RecordGpu {
++    program: GLuint,
++    u_tex: GLint,
++    u_area: GLint,
++    u_out: GLint,
++    u_bgra: GLint,
++    slots: Vec<RecordSlot>,
++    next_ticket: u64,
++}
++
+ /// DESK9: the screen's changes of the last frames and which frame each of the target's buffers holds. A
+ /// buffer drawn `age` frames ago needs the changes of those frames repainted, nothing else: the rest of it
+ /// already shows what the screen shows (before, every frame repainted the whole 2560x1600 screen for any
+@@ -1075,6 +1171,8 @@ pub struct GlRenderer {
+     /// The pointer's image with straight (not premultiplied) alpha, as the DCP blends an
+     /// ARGB8888 plane: texture, generation, size.
+     cursor_texture: Option<(GLuint, u64, u32, u32)>,
++    /// DESK11: the recorder's NV12 conversion and its buffers.
++    record: Option<RecordGpu>,
+ }
+ 
+ unsafe fn compile(gl: &Gl, kind: GLenum, source: &str) -> Result<GLuint, String> {
+@@ -1174,6 +1272,7 @@ impl GlRenderer {
+                 next_external: 1,
+                 scaled: None,
+                 cursor_texture: None,
++                record: None,
+             })
+         }
+     }
+@@ -1181,6 +1280,58 @@ impl GlRenderer {
+         self.target.size()
+     }
+ 
++    /// DESK11: the NV12 program, made at the first recording.
++    fn record_gpu(&mut self) -> Result<&mut RecordGpu, String> {
++        if self.record.is_none() {
++            let gl = &self.libs.gl;
++            unsafe {
++                let vertex = compile(gl, GL_VERTEX_SHADER, NV12_VERTEX_SHADER)?;
++                let fragment = compile(gl, GL_FRAGMENT_SHADER, NV12_FRAGMENT_SHADER)?;
++                let program = (gl.glCreateProgram)();
++                (gl.glAttachShader)(program, vertex);
++                (gl.glAttachShader)(program, fragment);
++                (gl.glLinkProgram)(program);
++                let mut ok = 0;
++                (gl.glGetProgramiv)(program, GL_LINK_STATUS, &mut ok);
++                if ok == 0 {
++                    let mut log = vec![0u8; 1024];
++                    let mut length = 0;
++                    (gl.glGetProgramInfoLog)(program, log.len() as GLsizei, &mut length, log.as_mut_ptr() as *mut c_char);
++                    return Err(format!("NV12 program link: {}", String::from_utf8_lossy(&log[..length.max(0) as usize])));
++                }
++                let uniform = |name: &std::ffi::CStr| (gl.glGetUniformLocation)(program, name.as_ptr());
++                (gl.glUseProgram)(program);
++                (gl.glUniform1i)(uniform(c"u_src"), 0);
++                let r = RecordGpu { program, u_tex: uniform(c"u_tex"), u_area: uniform(c"u_area"), u_out: uniform(c"u_out"), u_bgra: uniform(c"u_bgra"), slots: Vec::new(), next_ticket: 0 };
++                (gl.glUseProgram)(self.program);
++                self.record = Some(r);
++            }
++        }
++        Ok(self.record.as_mut().unwrap())
++    }
++    fn record_slot(&mut self, out: (u32, u32), writeback: bool, slots: usize) -> Result<Option<usize>, String> {
++        let r = self.record.as_ref().unwrap();
++        if let Some(i) = r.slots.iter().position(|s| s.state == SlotState::Free && s.size == out && s.writeback == writeback) {
++            return Ok(Some(i));
++        }
++        if r.slots.iter().filter(|s| s.size == out && s.writeback == writeback).count() >= slots {
++            return Ok(None);
++        }
++        let texels = (out.0 / 4, out.1 * 3 / 2);
++        // a failure is the recording's (never a fallback that reads frames on this thread)
++        let slot = match self.target.create_record_buffer(&self.libs, &self._context, texels, writeback)? {
++            Some(b) => RecordSlot { size: out, writeback, fbo: b.fbo, shared: Some((b.map, b.prime_fd)), local: Vec::new(), bgra: b.bgra, state: SlotState::Free },
++            None => {
++                // no shareable buffers (an off-screen target, tests): an ordinary texture, read back when taken
++                let t = OffscreenTarget::new(&self.libs, texels.0, texels.1)?;
++                RecordSlot { size: out, writeback, fbo: t.fbo, shared: None, local: Vec::new(), bgra: false, state: SlotState::Free }
++            }
++        };
++        let r = self.record.as_mut().unwrap();
++        r.slots.push(slot);
++        Ok(Some(r.slots.len() - 1))
++    }
++
+     /// Bring the texture for `image` up to date and bind it. `partial` holds
+     /// image-space rectangles when only those changed since the last upload.
+     fn texture(&mut self, key: TextureKey, image: &DecorationBuffer, generation: u64, partial: Option<&[DRect]>) -> bool {
+@@ -1664,6 +1815,109 @@ impl Renderer for GlRenderer {
+     /// An area of the last frame scaled to `out` by the GPU (linear filter), then read: what a
+     /// recording takes. Reading the whole panel costs ~100 ms on the M1 (the frame's memory is
+     /// slow to read from the CPU); a frame of a quarter of the pixels costs a quarter of that.
++    fn record_capture(&mut self, src: (i32, i32, u32, u32), out: (u32, u32), writeback: bool, slots: usize) -> Result<Option<u64>, String> {
++        // the buffer's pitch is the frame's width in bytes: the driver takes linear dma-bufs with 16-byte pitches
++        if out.0 % 16 != 0 || out.1 % 2 != 0 || out.0 == 0 || out.1 == 0 {
++            return Err(format!("an NV12 frame of {}x{} (the width a multiple of 16, the height of 2)", out.0, out.1));
++        }
++        let Some(texture) = self.target.last_texture() else { return Ok(None) };
++        let (tw, th) = self.target.size();
++        self.record_gpu()?;
++        let Some(index) = self.record_slot(out, writeback, slots)? else { return Ok(None) };
++        let (program, u_tex, u_area, u_out, u_bgra) = {
++            let r = self.record.as_ref().unwrap();
++            (r.program, r.u_tex, r.u_area, r.u_out, r.u_bgra)
++        };
++        let (fbo, bgra) = {
++            let s = &self.record.as_ref().unwrap().slots[index];
++            (s.fbo, s.bgra)
++        };
++        let gl = &self.libs.gl;
++        let (fence, error) = unsafe {
++            (gl.glBindFramebuffer)(GL_FRAMEBUFFER, fbo);
++            (gl.glViewport)(0, 0, (out.0 / 4) as GLsizei, (out.1 * 3 / 2) as GLsizei);
++            (gl.glDisable)(GL_BLEND);
++            (gl.glDisable)(GL_SCISSOR_TEST);
++            (gl.glUseProgram)(program);
++            (gl.glBindVertexArray)(self.vertex_array);
++            (gl.glActiveTexture)(GL_TEXTURE0);
++            (gl.glBindTexture)(GL_TEXTURE_2D, texture);
++            (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_FILTER as GLint);
++            (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR_FILTER as GLint);
++            (gl.glUniform2f)(u_tex, tw as f32, th as f32);
++            (gl.glUniform4f)(u_area, src.0 as f32, src.1 as f32, src.2 as f32, src.3 as f32);
++            (gl.glUniform2f)(u_out, out.0 as f32, out.1 as f32);
++            (gl.glUniform1i)(u_bgra, i32::from(bgra));
++            (gl.glDrawArrays)(GL_TRIANGLE_STRIP, 0, 4);
++            (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++            (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++            (gl.glUseProgram)(self.program);
++            (gl.glEnable)(GL_BLEND);
++            let fence = (gl.glFenceSync)(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++            (gl.glFlush)();
++            if fence.is_null() {
++                (gl.glFinish)();
++            }
++            (fence, (gl.glGetError)())
++        };
++        let r = self.record.as_mut().unwrap();
++        if error != GL_NO_ERROR {
++            if !fence.is_null() {
++                unsafe { (gl.glDeleteSync)(fence) };
++            }
++            return Err(format!("NV12 conversion: GL error {error:#x}"));
++        }
++        let ticket = r.next_ticket;
++        r.next_ticket += 1;
++        r.slots[index].state = SlotState::Gpu(fence, ticket);
++        Ok(Some(ticket))
++    }
++    fn record_ready(&mut self, wait: Duration) -> Vec<RecordFrame> {
++        let mut out = Vec::new();
++        let Some(r) = self.record.as_mut() else { return out };
++        let gl = &self.libs.gl;
++        let mut order: Vec<(u64, usize)> = r.slots.iter().enumerate().filter_map(|(i, s)| match s.state {
++            SlotState::Gpu(_, ticket) => Some((ticket, i)),
++            _ => None,
++        }).collect();
++        order.sort_unstable();
++        for (n, (ticket, i)) in order.into_iter().enumerate() {
++            let SlotState::Gpu(fence, _) = r.slots[i].state else { continue };
++            if !fence.is_null() {
++                let timeout = if n == 0 { wait.as_nanos() as u64 } else { 0 };
++                let status = unsafe { (gl.glClientWaitSync)(fence, GL_SYNC_FLUSH_COMMANDS_BIT, timeout) };
++                if status != GL_ALREADY_SIGNALED && status != GL_CONDITION_SATISFIED {
++                    break; // in order: the newer ones wait for this one
++                }
++                unsafe { (gl.glDeleteSync)(fence) };
++            }
++            let s = &mut r.slots[i];
++            let (w, h) = s.size;
++            let len = w as usize * h as usize * 3 / 2;
++            let (data, dmabuf) = match s.shared {
++                Some((map, fd)) => (map as *const u8, fd),
++                None => {
++                    s.local.resize(len, 0);
++                    unsafe {
++                        (gl.glBindFramebuffer)(GL_FRAMEBUFFER, s.fbo);
++                        (gl.glPixelStorei)(GL_PACK_ALIGNMENT, 4);
++                        (gl.glReadPixels)(0, 0, (w / 4) as GLsizei, (h * 3 / 2) as GLsizei, GL_RGBA, GL_UNSIGNED_BYTE, s.local.as_mut_ptr() as *mut c_void);
++                    }
++                    (s.local.as_ptr(), -1)
++                }
++            };
++            s.state = SlotState::Handed;
++            out.push(RecordFrame { slot: i, ticket, data, len, width: w, height: h, dmabuf });
++        }
++        out
++    }
++    fn record_release(&mut self, slot: usize) {
++        if let Some(s) = self.record.as_mut().and_then(|r| r.slots.get_mut(slot)) {
++            if s.state == SlotState::Handed {
++                s.state = SlotState::Free;
++            }
++        }
++    }
+     fn read_back_scaled(&mut self, src: (i32, i32, u32, u32), out: (u32, u32)) -> Result<Option<Vec<u8>>, String> {
+         let Some(fbo) = self.target.last() else {
+             return Ok(None);
+@@ -1893,6 +2147,97 @@ mod tests {
+         assert_eq!(compare_frames(&panel, &want), (0, 0));
+     }
+ 
++    /// DESK11: BT.709 limited range, as the recorder's shader converts (the reference for its test).
++    fn nv12_reference(rgba: &[u8], w: usize, h: usize, src: (usize, usize, usize, usize), out: (usize, usize)) -> Vec<u8> {
++        let (sx, sy, sw, sh) = src;
++        let (ow, oh) = out;
++        // the mean of the source pixels a luma sample covers (exact for 1:1 and 2:1)
++        let fx = sw / ow;
++        let fy = sh / oh;
++        let px = |x: usize, y: usize| -> [f64; 3] {
++            let mut c = [0.0; 3];
++            for dy in 0..fy {
++                for dx in 0..fx {
++                    let at = ((sy + y * fy + dy) * w + sx + x * fx + dx) * 4;
++                    for k in 0..3 {
++                        c[k] += f64::from(rgba[at + k]) / 255.0;
++                    }
++                }
++            }
++            c.map(|v| v / (fx * fy) as f64)
++        };
++        let _ = h;
++        let mut nv = vec![0u8; ow * oh * 3 / 2];
++        for y in 0..oh {
++            for x in 0..ow {
++                let c = px(x, y);
++                nv[y * ow + x] = (16.0 + 219.0 * (0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2])).round() as u8;
++            }
++        }
++        for y in 0..oh / 2 {
++            for x in 0..ow / 2 {
++                let mut c = [0.0; 3];
++                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
++                    let p = px(2 * x + dx, 2 * y + dy);
++                    for k in 0..3 {
++                        c[k] += p[k] / 4.0;
++                    }
++                }
++                let u = 128.0 + 224.0 * (-0.114572 * c[0] - 0.385428 * c[1] + 0.5 * c[2]);
++                let v = 128.0 + 224.0 * (0.5 * c[0] - 0.454153 * c[1] - 0.045847 * c[2]);
++                nv[ow * oh + y * ow + 2 * x] = u.round() as u8;
++                nv[ow * oh + y * ow + 2 * x + 1] = v.round() as u8;
++            }
++        }
++        nv
++    }
++
++    /// DESK11: the recorder's GPU conversion of a frame (and of an area of it, at half size) to NV12 equals the
++    /// CPU's conversion of the same pixels within one step, and the frames come back in the order taken.
++    #[test]
++    fn a_recorded_frame_is_converted_to_nv12_on_the_gpu() {
++        const W: u32 = 96;
++        const H: u32 = 64;
++        let mut renderer = match GlRenderer::offscreen(W, H) {
++            Ok(renderer) => renderer,
++            Err(error) => {
++                eprintln!("SKIPPED a_recorded_frame_is_converted_to_nv12_on_the_gpu: no GL on this host ({error})");
++                return;
++            }
++        };
++        let mut rng = Lcg(0x11);
++        let mut scene = CpuBackend::new(Size::new(W, H)).unwrap();
++        let image = rng.image(W, H, true);
++        scene.paint_root_image(&image);
++        renderer.render_frame(&mut scene, &mut Nothing).unwrap();
++        let rgba = renderer.read_back().unwrap().unwrap();
++        // the whole frame at its size, an area at half size
++        let full = renderer.record_capture((0, 0, W, H), (W, H), true, 2).unwrap().unwrap();
++        let half = renderer.record_capture((16, 8, 64, 48), (32, 24), true, 2).unwrap().unwrap();
++        assert!(half > full);
++        let mut got = Vec::new();
++        for _ in 0..20 {
++            got.extend(renderer.record_ready(Duration::from_millis(100)));
++            if got.len() == 2 {
++                break;
++            }
++        }
++        assert_eq!(got.iter().map(|f| f.ticket).collect::<Vec<_>>(), vec![full, half]);
++        for (f, src, out) in [(got[0], (0, 0, W as usize, H as usize), (W as usize, H as usize)), (got[1], (16, 8, 64, 48), (32, 24))] {
++            let data = unsafe { std::slice::from_raw_parts(f.data, f.len) };
++            let want = nv12_reference(&rgba, W as usize, H as usize, src, out);
++            assert_eq!(data.len(), want.len());
++            let worst = data.iter().zip(&want).map(|(a, b)| a.abs_diff(*b)).max().unwrap();
++            let off = data.iter().zip(&want).filter(|(a, b)| a.abs_diff(**b) > 1).count();
++            eprintln!("nv12 {}x{}: largest difference {worst}, {off} bytes off by more than 1", out.0, out.1);
++            assert!(worst <= 1, "largest difference {worst}");
++        }
++        // a slot is not reused until it is released
++        assert_eq!(renderer.record_capture((0, 0, W, H), (W, H), true, 1).unwrap(), None);
++        renderer.record_release(got[0].slot);
++        assert!(renderer.record_capture((0, 0, W, H), (W, H), true, 1).unwrap().is_some());
++    }
++
+     /// Needs a working EGL/GLES 3 on the machine running the tests; without
+     /// one the test says so and passes, since there is nothing to compare.
+     #[test]
+diff --git a/crates/wm-darwin/src/gpu.rs b/crates/wm-darwin/src/gpu.rs
+index 97880fc..61cb3ee 100644
+--- a/crates/wm-darwin/src/gpu.rs
++++ b/crates/wm-darwin/src/gpu.rs
+@@ -129,6 +129,11 @@ library! {
+         fn glUniform2i(location: GLint, a: GLint, b: GLint);
+         fn glUniform2f(location: GLint, a: f32, b: f32);
+         fn glUniform4f(location: GLint, a: f32, b: f32, c: f32, d: f32);
++        // DESK11: the recorder's frames are converted on the GPU and taken when their fence has passed
++        fn glFenceSync(condition: GLenum, flags: c_uint) -> *mut c_void;
++        fn glClientWaitSync(sync: *mut c_void, flags: c_uint, timeout: u64) -> GLenum;
++        fn glDeleteSync(sync: *mut c_void);
++        fn glFlush();
+     }
+ }
+ 
+@@ -314,6 +319,7 @@ pub const DRM_MODE_CONNECTED: c_int = 1;
+ pub const DRM_MODE_TYPE_PREFERRED: u32 = 1 << 3;
+ pub const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241; // "AR24"
+ pub const DRM_FORMAT_XRGB8888: u32 = 0x3432_5258; // "XR24"
++pub const DRM_FORMAT_ABGR8888: u32 = 0x3432_4241; // "AB24": bytes R, G, B, A
+ pub const DRM_EVENT_FLIP_COMPLETE: u32 = 2;
+ 
+ pub const EGL_NONE: EGLint = 0x3038;
+@@ -371,6 +377,11 @@ pub const GL_LINK_STATUS: GLenum = 0x8B82;
+ pub const GL_FRAMEBUFFER: GLenum = 0x8D40;
+ pub const GL_COLOR_ATTACHMENT0: GLenum = 0x8CE0;
+ pub const GL_FRAMEBUFFER_COMPLETE: GLenum = 0x8CD5;
++pub const GL_SYNC_GPU_COMMANDS_COMPLETE: GLenum = 0x9117;
++pub const GL_SYNC_FLUSH_COMMANDS_BIT: c_uint = 0x1;
++pub const GL_ALREADY_SIGNALED: GLenum = 0x911A;
++pub const GL_TIMEOUT_EXPIRED: GLenum = 0x911B;
++pub const GL_CONDITION_SATISFIED: GLenum = 0x911C;
+ 
+ type GetPlatformDisplay = unsafe extern "C" fn(c_uint, *mut c_void, *const EGLint) -> EGLDisplay;
+ pub type CreateImage =
+diff --git a/crates/wm-darwin/src/kms.rs b/crates/wm-darwin/src/kms.rs
+index 50fe159..6fb3062 100644
+--- a/crates/wm-darwin/src/kms.rs
++++ b/crates/wm-darwin/src/kms.rs
+@@ -344,6 +344,21 @@ pub struct ScanoutBuffer {
+     pub prime_fd: c_int,
+ }
+ 
++/// DESK11: one of the recorder's buffers (`Kms::create_record_buffer`), kept for the compositor's life (no
++/// GEM buffer is freed here).
++pub struct RecordBuffer {
++    pub fbo: GLuint,
++    pub texture: GLuint,
++    /// CPU mapping through the render node: what the software encoder reads.
++    pub map: *mut u8,
++    pub size: usize,
++    /// The dma-buf (what a hardware encoder would take).
++    pub prime_fd: c_int,
++    pub pitch: u32,
++    /// The texture's bytes are B, G, R, A (the context refused ABGR8888).
++    pub bgra: bool,
++}
++
+ #[repr(C)]
+ #[derive(Default)]
+ struct AsahiGemCreate {
+@@ -913,6 +928,77 @@ impl Kms {
+         }
+     }
+ 
++    /// DESK11: a buffer for the recorder: a GEM object on the render node (CPU-mapped as writeback when
++    /// `writeback`: the CPU reads it whole, every frame), exported as a dma-buf, as a GL texture and
++    /// framebuffer of `width` x `height` four-byte texels in the byte order R, G, B, A (`ABGR8888`; when the
++    /// context refuses that, `ARGB8888` and the bytes B, G, R, A: `bgra`). Not a framebuffer of the
++    /// display. The memory is linear with a pitch of `width * 4` bytes, so a frame of NV12 at
++    /// `(width * 4) x (height * 2 / 3)` is exactly its bytes (Y, then interleaved U/V): the same dma-buf
++    /// can go to a hardware encoder as it is.
++    pub fn create_record_buffer(&mut self, libs: &Libraries, context: &Context, (width, height): (u32, u32), writeback: bool) -> Result<RecordBuffer, String> {
++        let (drm, gl) = (&libs.drm, &libs.gl);
++        let (create_image, image_target) = context.image_functions(libs)?;
++        let pitch = width * 4;
++        let size = (pitch as usize * height as usize + 0x3fff) & !0x3fff;
++        unsafe {
++            let mut create = AsahiGemCreate { size: size as u64, flags: u32::from(writeback), ..Default::default() };
++            if (drm.drmIoctl)(self.render, DRM_IOCTL_ASAHI_GEM_CREATE, &mut create as *mut _ as *mut c_void) != 0 {
++                return Err(os_error("DRM_IOCTL_ASAHI_GEM_CREATE (recorder buffer)"));
++            }
++            let mut offset = AsahiGemMmapOffset { handle: create.handle, ..Default::default() };
++            if (drm.drmIoctl)(self.render, DRM_IOCTL_ASAHI_GEM_MMAP_OFFSET, &mut offset as *mut _ as *mut c_void) != 0 {
++                return Err(os_error("DRM_IOCTL_ASAHI_GEM_MMAP_OFFSET (recorder buffer)"));
++            }
++            let map = libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, self.render, offset.offset as libc::off_t);
++            if map == libc::MAP_FAILED {
++                return Err(os_error("mmap of the recorder buffer"));
++            }
++            let mut prime_fd = -1;
++            if (drm.drmPrimeHandleToFD)(self.render, create.handle, DRM_CLOEXEC | DRM_RDWR, &mut prime_fd) != 0 {
++                return Err(os_error("drmPrimeHandleToFD (recorder buffer)"));
++            }
++            let mut image = std::ptr::null_mut();
++            let mut bgra = false;
++            for fourcc in [DRM_FORMAT_ABGR8888, DRM_FORMAT_ARGB8888] {
++                let attribs = [
++                    EGL_WIDTH, width as EGLint, EGL_HEIGHT, height as EGLint,
++                    EGL_LINUX_DRM_FOURCC_EXT, fourcc as EGLint,
++                    EGL_DMA_BUF_PLANE0_FD_EXT, prime_fd,
++                    EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
++                    EGL_DMA_BUF_PLANE0_PITCH_EXT, pitch as EGLint,
++                    EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT, 0,
++                    EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT, 0,
++                    EGL_NONE,
++                ];
++                image = create_image(context.display, std::ptr::null_mut(), EGL_LINUX_DMA_BUF_EXT, std::ptr::null_mut(), attribs.as_ptr());
++                if !image.is_null() {
++                    bgra = fourcc == DRM_FORMAT_ARGB8888;
++                    break;
++                }
++            }
++            if image.is_null() {
++                libc::close(prime_fd);
++                return Err(format!("eglCreateImageKHR refused the recorder buffer: EGL error {:#x}", (libs.egl.eglGetError)()));
++            }
++            let (mut texture, mut fbo) = (0, 0);
++            (gl.glGenTextures)(1, &mut texture);
++            (gl.glBindTexture)(GL_TEXTURE_2D, texture);
++            image_target(GL_TEXTURE_2D, image);
++            (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++            (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++            let error = (gl.glGetError)();
++            (gl.glGenFramebuffers)(1, &mut fbo);
++            (gl.glBindFramebuffer)(GL_FRAMEBUFFER, fbo);
++            (gl.glFramebufferTexture2D)(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0);
++            let status = (gl.glCheckFramebufferStatus)(GL_FRAMEBUFFER);
++            if error != GL_NO_ERROR || status != GL_FRAMEBUFFER_COMPLETE {
++                return Err(format!("recorder buffer as framebuffer: GL error {error:#x}, framebuffer status {status:#x}"));
++            }
++            eprintln!("WMRECORD buffer {width}x{height} texels handle={} fd={prime_fd} writeback={writeback} order={}", create.handle, if bgra { "BGRA" } else { "RGBA" });
++            Ok(RecordBuffer { fbo, texture, map: map as *mut u8, size, prime_fd, pitch, bgra })
++        }
++    }
++
+     /// Show `buffer`. The first commit sets the mode (blocking); later ones
+     /// are non-blocking flips of `FB_ID` only. Either way exactly one
+     /// flip-complete event follows a queued commit; do not commit again
+diff --git a/crates/wm-darwin/src/lib.rs b/crates/wm-darwin/src/lib.rs
+index f5d1374..122af12 100644
+--- a/crates/wm-darwin/src/lib.rs
++++ b/crates/wm-darwin/src/lib.rs
+@@ -20,6 +20,8 @@ pub mod macdesk;
+ pub mod appmenu;
+ #[cfg(feature = "desktop-shell")]
+ pub mod record;
++#[cfg(feature = "desktop-shell")]
++pub mod encoder;
+ pub mod glrender;
+ mod foreign;
+ mod gesture;
+diff --git a/crates/wm-darwin/src/policy.rs b/crates/wm-darwin/src/policy.rs
+index 0b9790a..257a7fe 100644
+--- a/crates/wm-darwin/src/policy.rs
++++ b/crates/wm-darwin/src/policy.rs
+@@ -22,6 +22,15 @@
+ //! | `natural_scroll` | on | DESK10: the content follows the fingers (macOS's default); off: the other way |
+ //! | `window_position` | off | DESK10: `sf_window_position_v1` advertised: an AppKit window opens where its application put it (a modal panel centred, FX-027) and AppKit learns where the desk placed it; applications started after the switch see it |
+ //! | `scroll_trace` | off | DESK10: one `WMSCROLLRAW` line per trackpad scroll record (its steps, time, speed, what was sent): the owner's own scrolling as evidence |
++//! | `record_fps` | 60 | DESK11: the most frames a second a screen recording takes (1..60; a frame only when the screen changed, so a still screen costs nothing) |
++//! | `record_scale` | full | DESK11: a recording's size: `full` = the panel's pixels (2560x1600), `half` = half each way; the capture toolbar's Options override it |
++//! | `record_codec` | h264 | DESK11: `h264` (QuickTime H.264 through `/usr/local/bin/ffmpeg` and libx264; Photo-JPEG when ffmpeg is missing) or `mjpeg` (the Photo-JPEG movie of DESK2) |
++//! | `record_encoder` | auto | DESK11: `auto` (the hardware encoder when one works, else software), `software` (ffmpeg/x264), `hardware` (the Apple Video Encoder through VideoToolbox: not available yet, SF-AD) |
++//! | `record_preset` | ultrafast | DESK11: x264's preset for recordings (`ultrafast`, `superfast`, `veryfast`, `faster`, `fast`, `medium`) |
++//! | `record_crf` | 20 | DESK11: x264's constant quality (0..51, lower = better and bigger) |
++//! | `record_threads` | 0 | DESK11: x264's threads (0 = x264's own choice) |
++//! | `record_nice` | 0 | DESK11: the encoder's nice value (0..19: a higher number leaves the CPU to everything else first) |
++//! | `record_writeback` | on | DESK11: the recorder's GPU buffers are CPU-mapped cached (fast to read); off: write-combined (for a comparison) |
+ use std::path::PathBuf;
+ use std::time::{Duration, Instant, SystemTime};
+ 
+@@ -44,6 +53,78 @@ pub struct Switches {
+     pub window_position: bool,
+     /// percent, 25..400 (not a switch: `scroll_speed=<n>`)
+     pub scroll_speed: u16,
++    /// DESK11: the screen recorder's settings (`record_*`)
++    pub record: RecordPolicy,
++}
++
++/// DESK11: x264's presets a recording may use (`record_preset`).
++pub const RECORD_PRESETS: [&str; 6] = ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium"];
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum RecordEncoder {
++    Auto,
++    Software,
++    Hardware,
++}
++/// DESK11: the screen recorder's settings in the policy file (a test may pin them as any other key).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct RecordPolicy {
++    pub fps: u8,
++    pub half: bool,
++    pub mjpeg: bool,
++    pub encoder: RecordEncoder,
++    /// index into `RECORD_PRESETS`
++    pub preset: u8,
++    pub crf: u8,
++    pub threads: u8,
++    pub nice: u8,
++    pub writeback: bool,
++}
++impl Default for RecordPolicy {
++    fn default() -> Self {
++        Self { fps: 60, half: false, mjpeg: false, encoder: RecordEncoder::Auto, preset: 0, crf: 20, threads: 0, nice: 0, writeback: true }
++    }
++}
++impl RecordPolicy {
++    pub fn preset_name(&self) -> &'static str {
++        RECORD_PRESETS[usize::from(self.preset).min(RECORD_PRESETS.len() - 1)]
++    }
++    /// One `record_*` key; `None`: not such a key; `Some(false)`: its value was refused.
++    fn set(&mut self, key: &str, value: &str) -> Option<bool> {
++        let v = value.trim().to_ascii_lowercase();
++        let number = |lo: u8, hi: u8| v.parse::<u8>().ok().filter(|n| (lo..=hi).contains(n));
++        let ok = match key {
++            "record_fps" => number(1, 60).map(|n| self.fps = n).is_some(),
++            "record_scale" => match v.as_str() {
++                "full" => { self.half = false; true }
++                "half" => { self.half = true; true }
++                _ => false,
++            },
++            "record_codec" => match v.as_str() {
++                "h264" => { self.mjpeg = false; true }
++                "mjpeg" | "jpeg" => { self.mjpeg = true; true }
++                _ => false,
++            },
++            "record_encoder" => match v.as_str() {
++                "auto" => { self.encoder = RecordEncoder::Auto; true }
++                "software" => { self.encoder = RecordEncoder::Software; true }
++                "hardware" => { self.encoder = RecordEncoder::Hardware; true }
++                _ => false,
++            },
++            "record_preset" => RECORD_PRESETS.iter().position(|p| *p == v).map(|i| self.preset = i as u8).is_some(),
++            "record_crf" => number(0, 51).map(|n| self.crf = n).is_some(),
++            "record_threads" => number(0, 16).map(|n| self.threads = n).is_some(),
++            "record_nice" => number(0, 19).map(|n| self.nice = n).is_some(),
++            "record_writeback" => parse_bool(&v).map(|b| self.writeback = b).is_some(),
++            _ => return None,
++        };
++        Some(ok)
++    }
++    fn text(&self) -> String {
++        let encoder = match self.encoder { RecordEncoder::Auto => "auto", RecordEncoder::Software => "software", RecordEncoder::Hardware => "hardware" };
++        format!("record_fps={} record_scale={} record_codec={} record_encoder={encoder} record_preset={} record_crf={} record_threads={} record_nice={} record_writeback={}",
++            self.fps, if self.half { "half" } else { "full" }, if self.mjpeg { "mjpeg" } else { "h264" }, self.preset_name(), self.crf, self.threads, self.nice, if self.writeback { "on" } else { "off" })
++    }
+ }
+ 
+ impl Switches {
+@@ -67,6 +148,7 @@ impl Switches {
+             scroll_trace: env("scroll_trace").unwrap_or(false),
+             window_position: env("window_position").unwrap_or(false),
+             scroll_speed: std::env::var("CHONKSTEP_DARWIN_SCROLL_SPEED").ok().and_then(|v| parse_speed(&v)).unwrap_or(100),
++            record: RecordPolicy::default(),
+         }
+     }
+     fn slot(&mut self, key: &str) -> Option<&mut bool> {
+@@ -106,6 +188,12 @@ impl Switches {
+                 refused.push(line.to_string());
+                 continue;
+             };
++            if let Some(ok) = out.record.set(key.trim(), value) {
++                if !ok {
++                    refused.push(line.to_string());
++                }
++                continue;
++            }
+             if key.trim() == "scroll_speed" {
+                 match parse_speed(value) {
+                     Some(v) => out.scroll_speed = v,
+@@ -123,6 +211,8 @@ impl Switches {
+     pub fn text(&self) -> String {
+         let mut text = Self::KEYS.iter().map(|k| format!("{k}={}", if self.get(k) { "on" } else { "off" })).collect::<Vec<_>>().join(" ");
+         text.push_str(&format!(" scroll_speed={}", self.scroll_speed));
++        text.push(' ');
++        text.push_str(&self.record.text());
+         text
+     }
+ }
+@@ -197,7 +287,7 @@ impl Policy {
+     pub fn pin(&mut self, text: &str) -> Result<String, String> {
+         let (next, refused) = Switches::parse(text, self.pinned.unwrap_or(self.now));
+         if !refused.is_empty() {
+-            return Err(format!("not understood: {refused:?} (keys: {}, scroll_speed=25..400)", Switches::KEYS.join(", ")));
++            return Err(format!("not understood: {refused:?} (keys: {}, scroll_speed=25..400, record_*)", Switches::KEYS.join(", ")));
+         }
+         self.pinned = Some(next);
+         self.now = next;
+@@ -221,14 +311,18 @@ mod tests {
+     use super::*;
+     #[test]
+     fn the_policy_file_changes_switches_without_a_relaunch_and_a_test_pin_wins_until_released() {
+-        let base = Switches { fifo: true, fifo_shm: true, client_wake: true, flip_time_callbacks: true, flip_stamps: true, restore: true, skip_unchanged: true, partial_repaint: true, framehash: false, late_latch: true, restore_after_reboot: false, trackpad_scroll: true, natural_scroll: true, scroll_trace: false, window_position: false, scroll_speed: 100 };
++        let base = Switches { fifo: true, fifo_shm: true, client_wake: true, flip_time_callbacks: true, flip_stamps: true, restore: true, skip_unchanged: true, partial_repaint: true, framehash: false, late_latch: true, restore_after_reboot: false, trackpad_scroll: true, natural_scroll: true, scroll_trace: false, window_position: false, scroll_speed: 100, record: RecordPolicy::default() };
+         // DESK10: the trackpad's scrolling speed is a number, the rest switches
+         let (sp, refused) = Switches::parse("scroll_speed=140\nscroll_trace=on\ntrackpad_scroll=off\n", base);
+         assert!(refused.is_empty() && sp.scroll_speed == 140 && sp.scroll_trace && !sp.trackpad_scroll && sp.natural_scroll);
+         let (sp, refused) = Switches::parse("scroll_speed=1000\nscroll_speed=fast\n", base);
+         assert_eq!(sp.scroll_speed, 100);
+         assert_eq!(refused.len(), 2);
+-        assert!(sp.text().ends_with("scroll_trace=off window_position=off scroll_speed=100"));
++        assert!(sp.text().contains("scroll_trace=off window_position=off scroll_speed=100 record_fps=60 record_scale=full"));
++        // DESK11: the recorder's keys
++        let (r, refused) = Switches::parse("record_fps=30\nrecord_scale=half\nrecord_preset=superfast\nrecord_crf=99\nrecord_encoder=hardware\nrecord_codec=mjpeg\n", base);
++        assert_eq!(refused, vec!["record_crf=99".to_string()]);
++        assert!(r.record.fps == 30 && r.record.half && r.record.preset_name() == "superfast" && r.record.crf == 20 && r.record.encoder == RecordEncoder::Hardware && r.record.mjpeg);
+         let (s, refused) = Switches::parse("# comment\nfifo=off\nrestore = 0\nbogus=1\nclient_wake=maybe\n", base);
+         assert!(!s.fifo && !s.restore && s.client_wake && s.flip_time_callbacks);
+         assert_eq!(refused, vec!["bogus=1".to_string(), "client_wake=maybe".to_string()]);
+diff --git a/crates/wm-darwin/src/record.rs b/crates/wm-darwin/src/record.rs
+index 95bf499..51a0f2a 100644
+--- a/crates/wm-darwin/src/record.rs
++++ b/crates/wm-darwin/src/record.rs
+@@ -1,11 +1,20 @@
+-//! Screen recording: the screen or an area of it, into a QuickTime movie of Photo-JPEG frames
+-//! ("Screen Recording <date> at <time>.mov"), as macOS's Command-Shift-5 and `screencapture -v`
+-//! make one. There is no hardware video encoder here: each frame is compressed by the CPU
+-//! (the `image` crate's baseline JPEG encoder) on worker threads, at half the panel's pixels
+-//! each way by default (the GPU scales the frame before it is read: reading the whole panel
+-//! costs ~100 ms on the M1). Frames are taken only when the screen
+-//! changed, so a still screen costs nothing and the movie's frames have their own durations.
+-//! No sound is recorded.
++//! Screen recording: the screen or an area of it, into a QuickTime movie ("Screen Recording <date> at
++//! <time>.mov"), as macOS's Command-Shift-5 and `screencapture -v` make one. Frames are taken only when the
++//! screen changed (and twice a second while it does not), at most `record_fps` (60) a second, so a still
++//! screen costs little and the movie's frames have their own times. No sound is recorded.
++//!
++//! DESK11, H.264 (the default): right after a frame is shown, the GPU converts it (or the selected area),
++//! scaled to the recording's size (the panel's pixels by default), to NV12 into one of a few shareable
++//! buffers (`glrender.rs` `record_capture`: a shader pass, a fence, no wait); a later turn of the loop takes
++//! the frames whose fence passed and hands them to a writer thread, which gives them to the encoder
++//! (`encoder.rs`: ffmpeg with x264 as a separate program, reading them from a socket; a hardware encoder
++//! later) and gives the buffer back. The compositor's thread never reads a frame's pixels and never waits
++//! for the GPU or the encoder; when every buffer is still busy a frame is not taken (counted).
++//! Stop waits (on the writer thread) for ffmpeg to finish the file.
++//!
++//! Photo-JPEG (`record_codec=mjpeg`, or when `/usr/local/bin/ffmpeg` is missing): each frame is scaled by the
++//! GPU, read on the compositor's thread and compressed by the CPU (the `image` crate's baseline JPEG
++//! encoder) on worker threads, at half the panel's pixels each way (DESK2).
+ //!
+ //! What starts a recording is what starts a screenshot, nothing else (`capture.rs`): the
+ //! compositor's own keys and capture toolbar, or a request on the session's uid-checked
+@@ -26,8 +35,15 @@ use wm_core::{Point, Rect, Size};
+ /// Encoder threads; a frame is dropped when all of them have two frames waiting.
+ const WORKERS: usize = 3;
+ const QUALITY: u8 = 70;
+-/// The most frames a second that are taken.
++/// The most frames a second that are taken (Photo-JPEG).
+ pub const MAX_FPS: u32 = 30;
++/// DESK11: NV12 buffers a recording's frames go through (each a frame's size: 6 MB at 2560x1600).
++const H264_SLOTS: usize = 5;
++/// DESK11: a frame is taken again after this long without a change (the file keeps a steady pace).
++const H264_IDLE_MS: u64 = 500;
++/// DESK11: a frame's time in the movie is the 60 Hz slot it was taken in (the display's refresh), so the
++/// file's frames sit on a 60 Hz grid however late in its refresh the desk drew each one.
++const H264_SLOT_US: u64 = 16_667;
+ 
+ struct Job {
+     seq: u64,
+@@ -51,6 +67,35 @@ pub struct Summary {
+     pub duration_ms: u64,
+     pub bytes: u64,
+     pub encode_ms_avg: f64,
++    /// DESK11: more of what the encoder measured (for the log line)
++    pub extra: String,
++}
++
++/// DESK11: what the compositor's thread sends the H.264 writer.
++enum ToWriter {
++    Frame(crate::render::RecordFrame, u64),
++    End(u64),
++}
++
++/// DESK11: the H.264 pipeline of a recording, on the compositor's side.
++struct H264 {
++    tx: Option<mpsc::Sender<ToWriter>>,
++    /// tickets of the frames converting on the GPU, with their times
++    gpu: std::collections::VecDeque<(u64, u64)>,
++    /// set by the writer when the encoder failed
++    failed: Arc<std::sync::atomic::AtomicBool>,
++    fps: u32,
++    writeback: bool,
++    last_take: Option<Instant>,
++    last_at_us: u64,
++    /// frames not taken because no buffer was free
++    no_slot: u64,
++    submit_us: u64,
++    submit_max_us: u64,
++    harvest_us: u64,
++    taken: u64,
++    sent: u64,
++    encoder: &'static str,
+ }
+ 
+ struct Recording {
+@@ -72,6 +117,8 @@ struct Recording {
+     indicator: Option<(u64, Rect, u64)>,
+     cpu_start: (f64, f64),
+     scaled_by_gpu: bool,
++    /// DESK11: H.264 (else Photo-JPEG)
++    h264: Option<H264>,
+ }
+ 
+ /// A recording asked for and waiting for its timer.
+@@ -81,7 +128,7 @@ struct Pending {
+     path: Option<PathBuf>,
+     reply: Option<UnixStream>,
+     limit: Option<Duration>,
+-    full: bool,
++    full: crate::capture::RecordSize,
+     last_second: u64,
+ }
+ 
+@@ -91,6 +138,8 @@ pub struct Recorder {
+     pending: Option<Pending>,
+     finishing: Vec<(std::thread::JoinHandle<Result<Summary, String>>, Option<UnixStream>, u64, f64, (f64, f64), Instant)>,
+     pub recorded: u64,
++    /// DESK11: the writers give the NV12 buffers back through this (any recording's, also one finishing)
++    released: Option<(mpsc::Sender<usize>, mpsc::Receiver<usize>)>,
+ }
+ 
+ impl Recorder {
+@@ -380,11 +429,64 @@ fn pipeline(file: std::fs::File, path: PathBuf, target: Rect, out: Size, stop_at
+         }
+         let end = stop_at.lock().map(|g| g.unwrap_or(0)).unwrap_or(0);
+         let (duration_ms, bytes) = writer.finish(end).map_err(|err| format!("{}: {err}", path.display()))?;
+-        Ok(Summary { path, frames, duration_ms, bytes, encode_ms_avg: if frames > 0 { encode_us as f64 / frames as f64 / 1000.0 } else { 0.0 } })
++        Ok(Summary { path, frames, duration_ms, bytes, encode_ms_avg: if frames > 0 { encode_us as f64 / frames as f64 / 1000.0 } else { 0.0 }, extra: "codec=mjpeg".into() })
+     })?;
+     Ok((tx, handle))
+ }
+ 
++/// DESK11: the H.264 writer: frames to the encoder in order, each buffer given back after it, then the end.
++fn h264_writer(mut encoder: Box<dyn crate::encoder::Encoder>, rx: mpsc::Receiver<ToWriter>, released: mpsc::Sender<usize>, failed: Arc<std::sync::atomic::AtomicBool>, path: PathBuf)
++    -> std::io::Result<std::thread::JoinHandle<Result<Summary, String>>> {
++    std::thread::Builder::new().name("record-h264".into()).spawn(move || {
++        let mut error: Option<String> = None;
++        let mut end_us = 0;
++        for msg in rx {
++            match msg {
++                ToWriter::Frame(f, at_us) => {
++                    if error.is_none() {
++                        // SAFETY: the buffer stays mapped and unwritten until it is released below
++                        let data = unsafe { std::slice::from_raw_parts(f.data, f.len) };
++                        let frame = crate::encoder::NvFrame { data, width: f.width, height: f.height, dmabuf: f.dmabuf, at_us };
++                        if let Err(e) = encoder.push(&frame) {
++                            failed.store(true, Ordering::Release);
++                            error = Some(e);
++                        }
++                    }
++                    let _ = released.send(f.slot);
++                }
++                ToWriter::End(at) => {
++                    end_us = at;
++                    break;
++                }
++            }
++        }
++        let finished = encoder.finish();
++        if let Some(e) = error {
++            return Err(e);
++        }
++        let s = finished?;
++        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
++        let extra = format!("codec=h264 push_ms_avg={:.2} push_ms_max={:.1} {}", if s.frames > 0 { s.push_s * 1000.0 / s.frames as f64 } else { 0.0 }, s.push_max_ms, s.detail);
++        Ok(Summary { path, frames: s.frames, duration_ms: end_us / 1000, bytes, encode_ms_avg: if s.frames > 0 { s.push_s * 1000.0 / s.frames as f64 } else { 0.0 }, extra })
++    })
++}
++
++/// The area recorded and the movie's size. H.264 (DESK11): the frame's width a multiple of 16 (its rows are the
++/// shareable buffer's pitch in bytes, which the GPU driver takes only 16-byte aligned: a 1000 px wide selection
++/// was refused on the M1, EGL_BAD_ALLOC), its height of 2; at full size the area is cut to that, so its pixels
++/// stay the panel's one for one. Photo-JPEG: even sizes. At least 16 pixels either way.
++pub(crate) fn record_sizes(target: Rect, half: bool, h264: bool) -> (Rect, Size) {
++    let target = if h264 && !half { Rect::new(target.pos, Size::new((target.size.w & !15).max(16), (target.size.h & !1).max(16))) } else { target };
++    let factor = if half { 2.0 } else { 1.0 };
++    let even = |v: f64| ((v.round() as u32) & !1).max(16);
++    let out = if h264 {
++        Size::new(((f64::from(target.size.w) / factor) as u32 & !15).max(16), even(f64::from(target.size.h) / factor))
++    } else {
++        Size::new(even(f64::from(target.size.w) / factor), even(f64::from(target.size.h) / factor))
++    };
++    (target, out)
++}
++
+ fn movie_name(dir: &Path) -> Result<(PathBuf, std::fs::File), String> {
+     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+     let stamp = crate::capture::local_stamp();
+@@ -402,7 +504,7 @@ fn movie_name(dir: &Path) -> Result<(PathBuf, std::fs::File), String> {
+ 
+ impl Server {
+     /// A recording of `target` (panel pixels), after the toolbar's timer when there is one.
+-    pub(crate) fn record_request(&mut self, target: Rect, path: Option<PathBuf>, reply: Option<UnixStream>, limit: Option<Duration>, full: bool, timer: u32) {
++    pub(crate) fn record_request(&mut self, target: Rect, path: Option<PathBuf>, reply: Option<UnixStream>, limit: Option<Duration>, full: crate::capture::RecordSize, timer: u32) {
+         if self.recorder.recording() {
+             if let Some(mut r) = reply {
+                 let _ = r.write_all(b"error a recording is already running\n");
+@@ -415,17 +517,26 @@ impl Server {
+             self.recorder.pending = Some(Pending { due: Instant::now() + Duration::from_secs(u64::from(timer)), target, path, reply, limit, full, last_second: u64::MAX });
+         }
+     }
+-    fn record_start(&mut self, target: Rect, path: Option<PathBuf>, mut reply: Option<UnixStream>, limit: Option<Duration>, full: bool) {
++    fn record_start(&mut self, target: Rect, path: Option<PathBuf>, mut reply: Option<UnixStream>, limit: Option<Duration>, full: crate::capture::RecordSize) {
+         let screen = { use wm_core::Backend; self.wm.backend().screen_size() };
+         let Some(target) = crate::capture::clip(target, screen) else {
+             self.record_fail(reply, "the area is off the screen");
+             return;
+         };
+-        // half the panel's pixels each way by default (the CPU encodes every frame); -F: all
+-        let factor = if full { 1.0 } else { 2.0 };
+-        // even sizes (some players want them), at least 16 pixels
+-        let even = |v: f64| ((v.round() as u32) & !1).max(16);
+-        let out = Size::new(even(f64::from(target.size.w) / factor), even(f64::from(target.size.h) / factor));
++        // DESK11: H.264 through ffmpeg unless the policy asks for Photo-JPEG or there is no encoder
++        let policy = self.policy.now.record;
++        let options = self.captures.options();
++        let ffmpeg = PathBuf::from(crate::encoder::FFMPEG);
++        let h264 = !policy.mjpeg && (crate::encoder::software_available(&ffmpeg) || crate::encoder::hardware::probe().is_ok());
++        if !policy.mjpeg && !h264 {
++            eprintln!("WMRECORD no H.264 encoder ({} missing, no hardware encoder): Photo-JPEG", ffmpeg.display());
++        }
++        let half = match full {
++            crate::capture::RecordSize::Full => false,
++            crate::capture::RecordSize::Half => true,
++            crate::capture::RecordSize::Default => if h264 { options.record_half.unwrap_or(policy.half) } else { true },
++        };
++        let (target, out) = record_sizes(target, half, h264);
+         let opened = match &path {
+             Some(p) => std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(p).map(|f| (p.clone(), f)).map_err(|e| format!("{}: {e}", p.display())),
+             None => movie_name(&self.capture_dir_for_movies()),
+@@ -439,22 +550,57 @@ impl Server {
+         };
+         let in_flight = Arc::new(AtomicUsize::new(0));
+         let stop_at = Arc::new(Mutex::new(None));
+-        let (tx, writer) = match pipeline(file, path.clone(), target, out, stop_at.clone(), in_flight.clone()) {
+-            Ok(x) => x,
+-            Err(e) => {
+-                self.record_fail(reply, &e.to_string());
+-                return;
++        let mut h264_state = None;
++        let (tx, writer) = if h264 {
++            drop(file); // ffmpeg writes the file (kept: its name and mode 0600)
++            let fps = u32::from(options.record_fps.unwrap_or(policy.fps)).clamp(1, 60);
++            let settings = crate::encoder::Settings {
++                width: out.w, height: out.h, fps, preset: policy.preset_name(), crf: u32::from(policy.crf), threads: u32::from(policy.threads), nice: u32::from(policy.nice),
++                path: path.clone(), ffmpeg,
++            };
++            let encoder = match crate::encoder::open(policy.encoder, &settings) {
++                Ok(e) => e,
++                Err(e) => {
++                    let _ = std::fs::remove_file(&path);
++                    self.record_fail(reply, &format!("no encoder: {e}"));
++                    return;
++                }
++            };
++            let name = encoder.name();
++            let released = self.recorder.released.get_or_insert_with(mpsc::channel::<usize>).0.clone();
++            let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
++            let (wtx, wrx) = mpsc::channel();
++            let handle = match h264_writer(encoder, wrx, released, failed.clone(), path.clone()) {
++                Ok(h) => h,
++                Err(e) => {
++                    self.record_fail(reply, &e.to_string());
++                    return;
++                }
++            };
++            h264_state = Some(H264 {
++                tx: Some(wtx), gpu: Default::default(), failed, fps, writeback: policy.writeback, last_take: None, last_at_us: 0, no_slot: 0,
++                submit_us: 0, submit_max_us: 0, harvest_us: 0, taken: 0, sent: 0, encoder: name,
++            });
++            (None, handle)
++        } else {
++            match pipeline(file, path.clone(), target, out, stop_at.clone(), in_flight.clone()) {
++                Ok((tx, writer)) => (Some(tx), writer),
++                Err(e) => {
++                    self.record_fail(reply, &e.to_string());
++                    return;
++                }
+             }
+         };
+         if let Some(r) = reply.as_mut() {
+             let _ = r.write_all(format!("recording {} {}x{}\n", path.display(), out.w, out.h).as_bytes());
+             let _ = r.set_nonblocking(true);
+         }
+-        eprintln!("WMRECORD start target={},{} {}x{} out={}x{} file={}", target.pos.x, target.pos.y, target.size.w, target.size.h, out.w, out.h, path.display());
++        eprintln!("WMRECORD start target={},{} {}x{} out={}x{} file={} codec={} {}", target.pos.x, target.pos.y, target.size.w, target.size.h, out.w, out.h, path.display(),
++            if h264 { "h264" } else { "mjpeg" }, h264_state.as_ref().map_or(String::new(), |h| format!("encoder={} fps={} preset={} crf={} threads={} nice={} writeback={}", h.encoder, h.fps, policy.preset_name(), policy.crf, policy.threads, policy.nice, h.writeback)));
+         let now = Instant::now();
+         self.recorder.active = Some(Recording {
+             target, out, path, started: now, next_due: now, seq: 0, dropped: 0, grab_us: 0, last_frame_count: None,
+-            tx: Some(tx), in_flight, writer: Some(writer), stop_at, reply, limit, indicator: None, cpu_start: cpu_seconds(), scaled_by_gpu: false,
++            tx, in_flight, writer: Some(writer), stop_at, reply, limit, indicator: None, cpu_start: cpu_seconds(), scaled_by_gpu: false, h264: h264_state,
+         });
+         self.wm.backend_mut().dirty = true;
+         self.record_indicator();
+@@ -527,6 +673,32 @@ impl Server {
+             *g = Some(end);
+         }
+         rec.tx.take();
++        if let Some(h) = rec.h264.as_mut() {
++            // the screen as it is now ends the movie (its last frame lasts to the end), then every frame still
++            // on the GPU goes to the writer, then the end
++            let elapsed = rec.started.elapsed().as_micros() as u64;
++            let end_us = ((elapsed + H264_SLOT_US / 2) / H264_SLOT_US * H264_SLOT_US).max(h.last_at_us + H264_SLOT_US);
++            if let Ok(Some(ticket)) = self.renderer.record_capture((rec.target.pos.x, rec.target.pos.y, rec.target.size.w, rec.target.size.h), (rec.out.w, rec.out.h), h.writeback, H264_SLOTS) {
++                h.gpu.push_back((ticket, end_us));
++                h.last_at_us = end_us;
++            }
++            for _ in 0..20 {
++                if h.gpu.is_empty() {
++                    break;
++                }
++                for f in self.renderer.record_ready(Duration::from_millis(50)) {
++                    Self::h264_send(h, f, &mut *self.renderer);
++                }
++            }
++            if let Some(tx) = h.tx.take() {
++                let _ = tx.send(ToWriter::End(h.last_at_us.max(end_us)));
++            }
++            eprintln!("WMRECORD h264 taken={} sent={} no_buffer={} lost_on_gpu={} submit_ms_avg={:.3} submit_ms_max={:.2} harvest_ms_avg={:.3} encoder={}",
++                h.taken, h.sent, h.no_slot, h.gpu.len(), if h.taken > 0 { h.submit_us as f64 / h.taken as f64 / 1000.0 } else { 0.0 }, h.submit_max_us as f64 / 1000.0,
++                if h.sent > 0 { h.harvest_us as f64 / h.sent as f64 / 1000.0 } else { 0.0 }, h.encoder);
++            rec.dropped += h.no_slot;
++            rec.seq = h.taken;
++        }
+         if let Some((id, _, _)) = rec.indicator.take() {
+             use wm_core::Backend;
+             self.wm.backend_mut().destroy_shell_surface(id);
+@@ -539,6 +711,75 @@ impl Server {
+         }
+         self.wm.backend_mut().dirty = true;
+     }
++    /// DESK11: a converted frame to the writer with its time (frames come in the order they were taken).
++    fn h264_send(h: &mut H264, f: crate::render::RecordFrame, renderer: &mut dyn crate::render::Renderer) {
++        while let Some(&(ticket, at_us)) = h.gpu.front() {
++            if ticket < f.ticket {
++                h.gpu.pop_front();
++                continue;
++            }
++            if ticket == f.ticket {
++                h.gpu.pop_front();
++                if let Some(tx) = h.tx.as_ref() {
++                    if tx.send(ToWriter::Frame(f, at_us)).is_ok() {
++                        h.sent += 1;
++                        return;
++                    }
++                }
++            }
++            break;
++        }
++        renderer.record_release(f.slot);
++    }
++    /// DESK11: each turn of the loop while recording H.264: the frames the GPU finished go to the writer; a new
++    /// frame is taken when the screen changed and one is due (at most `record_fps` a second), or after
++    /// `H264_IDLE_MS` without a change.
++    fn record_h264_tick(&mut self, frames_now: u64) {
++        let Some(rec) = self.recorder.active.as_mut() else { return };
++        let Some(h) = rec.h264.as_mut() else { return };
++        let t = Instant::now();
++        let ready = self.renderer.record_ready(Duration::ZERO);
++        if !ready.is_empty() {
++            for f in ready {
++                Self::h264_send(h, f, &mut *self.renderer);
++            }
++            h.harvest_us += t.elapsed().as_micros() as u64;
++        }
++        let now = Instant::now();
++        let interval = Duration::from_micros(1_000_000 / u64::from(h.fps.max(1)));
++        let fresh = rec.last_frame_count != Some(frames_now);
++        // at 60 a second every frame the desk drew (it draws at most one a refresh); fewer: one when a
++        // fourth of the interval is left, so that a frame drawn early in its refresh is not skipped
++        let due = match h.last_take {
++            None => true,
++            Some(last) => (fresh && (h.fps >= 60 || now >= last + interval * 3 / 4)) || now >= last + Duration::from_millis(H264_IDLE_MS),
++        };
++        if !due {
++            return;
++        }
++        let elapsed = rec.started.elapsed().as_micros() as u64;
++        let slot = (elapsed + H264_SLOT_US / 2) / H264_SLOT_US;
++        let at_us = (slot * H264_SLOT_US).max(if h.taken > 0 { h.last_at_us + H264_SLOT_US } else { 0 });
++        let t = Instant::now();
++        let result = self.renderer.record_capture((rec.target.pos.x, rec.target.pos.y, rec.target.size.w, rec.target.size.h), (rec.out.w, rec.out.h), h.writeback, H264_SLOTS);
++        let us = t.elapsed().as_micros() as u64;
++        h.submit_us += us;
++        h.submit_max_us = h.submit_max_us.max(us);
++        h.last_take = Some(now);
++        rec.last_frame_count = Some(frames_now);
++        match result {
++            Ok(Some(ticket)) => {
++                h.gpu.push_back((ticket, at_us));
++                h.taken += 1;
++                h.last_at_us = at_us;
++            }
++            Ok(None) => h.no_slot += 1,
++            Err(e) => {
++                eprintln!("WMRECORD the GPU conversion failed: {e}");
++                h.failed.store(true, Ordering::Release);
++            }
++        }
++    }
+     /// After each repaint: the timer, a frame when one is due and the screen changed, the
+     /// indicator, the requesting connection, recordings that finished writing.
+     pub fn record_after_repaint(&mut self) {
+@@ -569,10 +810,23 @@ impl Server {
+                 stop = Some("limit");
+             }
+         }
++        if self.recorder.active.as_ref().and_then(|r| r.h264.as_ref()).is_some_and(|h| h.failed.load(Ordering::Acquire)) {
++            stop = Some("encoder failed");
++        }
+         if let Some(why) = stop {
+             self.record_stop(why);
+         }
++        // DESK11: buffers the writers are done with
++        if let Some((_, rx)) = self.recorder.released.as_ref() {
++            for slot in rx.try_iter() {
++                self.renderer.record_release(slot);
++            }
++        }
++        if self.recorder.active.as_ref().is_some_and(|r| r.h264.is_some()) {
++            self.record_h264_tick(frames_now);
++        }
+         let due = self.recorder.active.as_ref().is_some_and(|rec| {
++            rec.h264.is_none() &&
+             Instant::now() >= rec.next_due && rec.last_frame_count != Some(frames_now)
+         });
+         if due {
+@@ -629,8 +883,8 @@ impl Server {
+                 Ok(s) => {
+                     self.recorder.recorded += 1;
+                     let fps = if seconds > 0.0 { s.frames as f64 / seconds } else { 0.0 };
+-                    eprintln!("WMRECORD saved file={} frames={} dropped={dropped} seconds={seconds:.2} fps={fps:.1} bytes={} encode_ms_avg={:.1} cpu_s={cpu:.2} cpu_pct_of_one_core={:.0} finish_ms={}",
+-                        s.path.display(), s.frames, s.bytes, s.encode_ms_avg, if seconds > 0.0 { cpu / seconds * 100.0 } else { 0.0 }, stopped.elapsed().as_millis());
++                    eprintln!("WMRECORD saved file={} frames={} dropped={dropped} seconds={seconds:.2} fps={fps:.1} bytes={} encode_ms_avg={:.1} cpu_s={cpu:.2} cpu_pct_of_one_core={:.0} finish_ms={} {}",
++                        s.path.display(), s.frames, s.bytes, s.encode_ms_avg, if seconds > 0.0 { cpu / seconds * 100.0 } else { 0.0 }, stopped.elapsed().as_millis(), s.extra);
+                     if let Some(mut r) = reply {
+                         let _ = r.set_nonblocking(false);
+                         let _ = r.write_all(format!("ok {} {} {:.2}\n", s.path.display(), s.frames, seconds).as_bytes());
+@@ -661,6 +915,19 @@ mod tests {
+         assert_eq!(odd.len(), 27);
+     }
+     #[test]
++    fn an_h264_recording_has_a_width_the_gpu_buffer_takes() {
++        let r = |x, y, w, h| Rect::new(Point::new(x, y), Size::new(w, h));
++        // the panel: as it is, both sizes
++        assert_eq!(record_sizes(r(0, 0, 2560, 1600), false, true), (r(0, 0, 2560, 1600), Size::new(2560, 1600)));
++        assert_eq!(record_sizes(r(0, 0, 2560, 1600), true, true).1, Size::new(1280, 800));
++        // DESK11 on the M1: a 1001x601 selection (1000 px rows were refused): cut to 992x600 at full size
++        assert_eq!(record_sizes(r(301, 201, 1001, 601), false, true), (r(301, 201, 992, 600), Size::new(992, 600)));
++        let (_, half) = record_sizes(r(301, 201, 1001, 601), true, true);
++        assert!(half.w % 16 == 0 && half.h % 2 == 0 && half.w <= 500, "{half:?}");
++        // Photo-JPEG as before
++        assert_eq!(record_sizes(r(0, 0, 1001, 601), true, false).1, Size::new(500, 300));
++    }
++    #[test]
+     fn a_movie_of_three_frames_has_its_samples_and_durations() {
+         let dir = std::env::temp_dir().join(format!("record-test-{}", std::process::id()));
+         std::fs::create_dir_all(&dir).unwrap();
+diff --git a/crates/wm-darwin/src/render.rs b/crates/wm-darwin/src/render.rs
+index 910f184..4f2ca3b 100644
+--- a/crates/wm-darwin/src/render.rs
++++ b/crates/wm-darwin/src/render.rs
+@@ -294,6 +294,23 @@ pub trait Renderer {
+         let _ = (src, out);
+         Ok(None)
+     }
++    /// DESK11: convert the area `src` of the frame on the screen to an NV12 frame of `out` pixels on the GPU,
++    /// into a free one of at most `slots` shareable buffers of that size (`writeback`: CPU-mapped cached).
++    /// Nothing waits for the GPU here. `Ok(None)`: no buffer is free (the frame is not taken) or nothing is
++    /// on the screen yet; `Err`: this renderer cannot (the recorder takes another way).
++    fn record_capture(&mut self, src: (i32, i32, u32, u32), out: (u32, u32), writeback: bool, slots: usize) -> Result<Option<u64>, String> {
++        let _ = (src, out, writeback, slots);
++        Err("this renderer converts no frames for a recording".into())
++    }
++    /// DESK11: the converted frames whose GPU work has finished, in the order they were taken (waiting up to
++    /// `wait` for the oldest). Each stays the caller's until `record_release`.
++    fn record_ready(&mut self, wait: Duration) -> Vec<RecordFrame> {
++        let _ = wait;
++        Vec::new()
++    }
++    fn record_release(&mut self, slot: usize) {
++        let _ = slot;
++    }
+     /// Short name of where frames go, for log lines.
+     fn output_name(&self) -> &'static str {
+         "presenter"
+@@ -328,6 +345,24 @@ pub struct DmabufDesc {
+     pub stride: u32,
+ }
+ 
++/// DESK11: one NV12 frame of a recording in one of the renderer's shareable buffers: the Y plane (`width` x
++/// `height` bytes, pitch `width`) at `data`, the interleaved U/V plane (`height / 2` rows of `width` bytes)
++/// right after it. `dmabuf`: the same memory as a dma-buf (linear; plane offsets 0 and `width * height`),
++/// -1 when there is none. Valid until the slot is released.
++#[derive(Clone, Copy, Debug)]
++pub struct RecordFrame {
++    pub slot: usize,
++    pub ticket: u64,
++    pub data: *const u8,
++    pub len: usize,
++    pub width: u32,
++    pub height: u32,
++    pub dmabuf: i32,
++}
++// SAFETY: the memory a frame points to stays mapped for the compositor's life and is not written by the GPU
++// until its slot is released (only the writer thread reads it meanwhile).
++unsafe impl Send for RecordFrame {}
++
+ /// A frame reached the screen.
+ #[derive(Clone, Copy, Debug)]
+ pub struct Presented {

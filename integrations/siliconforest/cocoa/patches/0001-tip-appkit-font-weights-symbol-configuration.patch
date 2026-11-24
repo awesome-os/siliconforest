@@ -1,0 +1,199 @@
+--- a/src/Frameworks/AppKit/NSFontDescriptor.h
++++ b/src/Frameworks/AppKit/NSFontDescriptor.h
+@@ -25,6 +25,19 @@
+ 
+ APPKIT_EXPORT NSString *const NSFontSymbolicTrait;
+ APPKIT_EXPORT NSString *const NSFontWeightTrait;
++
++typedef CGFloat NSFontWeight;
++APPKIT_EXPORT const NSFontWeight NSFontWeightUltraLight;
++APPKIT_EXPORT const NSFontWeight NSFontWeightThin;
++APPKIT_EXPORT const NSFontWeight NSFontWeightLight;
++APPKIT_EXPORT const NSFontWeight NSFontWeightRegular;
++APPKIT_EXPORT const NSFontWeight NSFontWeightMedium;
++APPKIT_EXPORT const NSFontWeight NSFontWeightSemibold;
++APPKIT_EXPORT const NSFontWeight NSFontWeightBold;
++APPKIT_EXPORT const NSFontWeight NSFontWeightHeavy;
++APPKIT_EXPORT const NSFontWeight NSFontWeightBlack;
++
++APPKIT_EXPORT NSString *const NSFontSetChangedNotification;
+ APPKIT_EXPORT NSString *const NSFontWidthTrait;
+ APPKIT_EXPORT NSString *const NSFontSlantTrait;
+ 
+--- a/src/Frameworks/AppKit/NSFontDescriptor.m
++++ b/src/Frameworks/AppKit/NSFontDescriptor.m
+@@ -23,6 +23,18 @@
+ 
+ NSString * const NSFontSymbolicTrait = @"NSFontSymbolicTrait";
+ NSString * const NSFontWeightTrait = @"NSFontWeightTrait";
++
++const NSFontWeight NSFontWeightUltraLight = -0.8;
++const NSFontWeight NSFontWeightThin = -0.6;
++const NSFontWeight NSFontWeightLight = -0.4;
++const NSFontWeight NSFontWeightRegular = 0.0;
++const NSFontWeight NSFontWeightMedium = 0.23;
++const NSFontWeight NSFontWeightSemibold = 0.3;
++const NSFontWeight NSFontWeightBold = 0.4;
++const NSFontWeight NSFontWeightHeavy = 0.56;
++const NSFontWeight NSFontWeightBlack = 0.62;
++
++NSString * const NSFontSetChangedNotification = @"NSFontSetChangedNotification";
+ NSString * const NSFontWidthTrait = @"NSFontWidthTrait";
+ NSString * const NSFontSlantTrait = @"NSFontSlantTrait";
+ 
+--- a/src/Frameworks/AppKit/NSImageSymbolConfiguration.h
++++ b/src/Frameworks/AppKit/NSImageSymbolConfiguration.h
+@@ -0,0 +1,30 @@
++// NSImageSymbolConfiguration.h - how a symbol image is drawn: size, weight, scale and colors
++// Copyright (c) 2026 The PureDarwin Project, SPDX-License-Identifier: MPL-2.0 OR BSD-2-Clause
++
++#import <Foundation/NSObject.h>
++#import <AppKit/AppKitExport.h>
++#import <AppKit/NSFontDescriptor.h>
++
++@class NSArray, NSColor, NSString;
++
++typedef NSInteger NSImageSymbolScale;
++enum {
++    NSImageSymbolScaleSmall = 1,
++    NSImageSymbolScaleMedium = 2,
++    NSImageSymbolScaleLarge = 3,
++};
++
++// how a symbol image is drawn: size, weight, scale and colors
++@interface NSImageSymbolConfiguration : NSObject <NSCopying, NSSecureCoding>
+++ (instancetype)configurationWithPointSize:(CGFloat)pointSize weight:(NSFontWeight)weight;
+++ (instancetype)configurationWithPointSize:(CGFloat)pointSize weight:(NSFontWeight)weight scale:(NSImageSymbolScale)scale;
+++ (instancetype)configurationWithTextStyle:(NSString *)style;
+++ (instancetype)configurationWithTextStyle:(NSString *)style scale:(NSImageSymbolScale)scale;
+++ (instancetype)configurationWithScale:(NSImageSymbolScale)scale;
+++ (instancetype)configurationWithHierarchicalColor:(NSColor *)hierarchicalColor;
+++ (instancetype)configurationWithPaletteColors:(NSArray *)paletteColors;
+++ (instancetype)configurationPreferringMulticolor;
+++ (instancetype)configurationPreferringMonochrome;
+++ (instancetype)configurationPreferringHierarchical;
++- (NSImageSymbolConfiguration *)configurationByApplyingConfiguration:(NSImageSymbolConfiguration *)configuration;
++@end
+--- a/src/Frameworks/AppKit/NSImageSymbolConfiguration.m
++++ b/src/Frameworks/AppKit/NSImageSymbolConfiguration.m
+@@ -0,0 +1,110 @@
++// NSImageSymbolConfiguration.m - how a symbol image is drawn: size, weight, scale and colors
++// Copyright (c) 2026 The PureDarwin Project, SPDX-License-Identifier: MPL-2.0 OR BSD-2-Clause
++
++#import <AppKit/NSImageSymbolConfiguration.h>
++#import <AppKit/NSColor.h>
++#import <Foundation/NSArray.h>
++#import <Foundation/NSCoder.h>
++#import <Foundation/NSString.h>
++
++// symbol images need the SF Symbols catalog this system lacks, the configuration is still kept and combined
++@implementation NSImageSymbolConfiguration {
++    CGFloat _pointSize;
++    NSFontWeight _weight;
++    NSImageSymbolScale _scale;
++    NSString *_textStyle;
++    NSArray *_colors;
++    BOOL _hasWeight;
++}
++
+++ (instancetype)configurationWithPointSize:(CGFloat)pointSize weight:(NSFontWeight)weight {
++    return [self configurationWithPointSize:pointSize weight:weight scale:0];
++}
++
+++ (instancetype)configurationWithPointSize:(CGFloat)pointSize weight:(NSFontWeight)weight scale:(NSImageSymbolScale)scale {
++    NSImageSymbolConfiguration *config = [[self new] autorelease];
++
++    config->_pointSize = pointSize;
++    config->_weight = weight;
++    config->_hasWeight = YES;
++    config->_scale = scale;
++    return config;
++}
++
+++ (instancetype)configurationWithTextStyle:(NSString *)style {
++    return [self configurationWithTextStyle:style scale:0];
++}
++
+++ (instancetype)configurationWithTextStyle:(NSString *)style scale:(NSImageSymbolScale)scale {
++    NSImageSymbolConfiguration *config = [[self new] autorelease];
++
++    config->_textStyle = [style copy];
++    config->_scale = scale;
++    return config;
++}
++
+++ (instancetype)configurationWithScale:(NSImageSymbolScale)scale {
++    NSImageSymbolConfiguration *config = [[self new] autorelease];
++
++    config->_scale = scale;
++    return config;
++}
++
+++ (instancetype)configurationWithHierarchicalColor:(NSColor *)hierarchicalColor {
++    return [self configurationWithPaletteColors:hierarchicalColor ? [NSArray arrayWithObject:hierarchicalColor] : nil];
++}
++
+++ (instancetype)configurationWithPaletteColors:(NSArray *)paletteColors {
++    NSImageSymbolConfiguration *config = [[self new] autorelease];
++
++    config->_colors = [paletteColors copy];
++    return config;
++}
++
+++ (instancetype)configurationPreferringMulticolor {
++    return [[self new] autorelease];
++}
++
+++ (instancetype)configurationPreferringMonochrome {
++    return [[self new] autorelease];
++}
++
+++ (instancetype)configurationPreferringHierarchical {
++    return [[self new] autorelease];
++}
++
+++ (BOOL)supportsSecureCoding {
++    return YES;
++}
++
++- (void)dealloc {
++    [_textStyle release];
++    [_colors release];
++    [super dealloc];
++}
++
++- (id)copyWithZone:(NSZone *)zone {
++    return [self retain];
++}
++
++- (void)encodeWithCoder:(NSCoder *)coder {
++}
++
++- (id)initWithCoder:(NSCoder *)coder {
++    return [self init];
++}
++
++// values set in the argument win over this one's
++- (NSImageSymbolConfiguration *)configurationByApplyingConfiguration:(NSImageSymbolConfiguration *)other {
++    NSImageSymbolConfiguration *config = [[NSImageSymbolConfiguration new] autorelease];
++
++    config->_pointSize = other && other->_pointSize ? other->_pointSize : _pointSize;
++    config->_hasWeight = (other && other->_hasWeight) || _hasWeight;
++    config->_weight = other && other->_hasWeight ? other->_weight : _weight;
++    config->_scale = other && other->_scale ? other->_scale : _scale;
++    config->_textStyle = [(other && other->_textStyle ? other->_textStyle : _textStyle) copy];
++    config->_colors = [(other && other->_colors ? other->_colors : _colors) copy];
++    return config;
++}
++
++@end
+--- a/src/Frameworks/AppKit/AppKit.h
++++ b/src/Frameworks/AppKit/AppKit.h
+@@ -67,6 +67,7 @@
+ #import <AppKit/NSGraphicsContext.h>
+ #import <AppKit/NSHelpManager.h>
+ #import <AppKit/NSImage.h>
++#import <AppKit/NSImageSymbolConfiguration.h>
+ #import <AppKit/NSImageCell.h>
+ #import <AppKit/NSImageRep.h>
+ #import <AppKit/NSImageView.h>

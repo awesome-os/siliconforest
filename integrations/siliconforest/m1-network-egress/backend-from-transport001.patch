@@ -1,0 +1,353 @@
+--- transport001/host/backend.py
++++ egress001/host/backend.py
+@@ -1,8 +1,8 @@
+ #!/usr/bin/env python3
+-"""Original opt-in Linux DLNET001 <-> Ethernet/QEMU/slirp bounded backend.
+-
+-No SSH, host routes, firewall, TAP, guest control, shell or public listener.
+-This version permits only the two nonce echo endpoints on slirp host alias.
++"""Separate opt-in example-http-v1 egress backend, Linux only.
++
++Adapted original transport001 backend0ec32b3e; that frozen file is unchanged.
++No echo listener, arbitrary destination, SSH, host route, firewall, TAP or target.
+ """
+ import argparse
+ from collections import deque
+@@ -22,21 +22,13 @@
+ import time
+ sys.dont_write_bytecode = True
+ sys.path.insert(0, str(Path(__file__).resolve().parent))
+-from codec import Codec
++from bindings import Codec
++from policy import Policy, DNS
+ 
+ GUEST_IP, HOST_IP = socket.inet_aton("10.0.2.15"), socket.inet_aton("10.0.2.2")
+ GUEST_MAC = bytes.fromhex("525400123456")
+ MAX_QUEUE, MAX_FRAMES, MAX_BYTES = 8, 4096, 4 * 1024 * 1024
+ STOP_REQUESTED = 0
+-
+-
+-def checksum(data):
+-    if len(data) & 1:
+-        data += b"\0"
+-    n = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+-    while n >> 16:
+-        n = (n & 65535) + (n >> 16)
+-    return (~n) & 65535
+ 
+ 
+ def checked_socket(sock):
+@@ -95,11 +87,13 @@
+ 
+ 
+ class Backend:
+-    def __init__(self, library, nonce, records, ports=(0, 0, 0), seconds=60, accept_seconds=300):
++    def __init__(self, library, library_sha256, nonce, records, port=0, seconds=60, accept_seconds=300):
+         if (not re.fullmatch(r"[0-9a-f]{48}", nonce) or not 1 <= seconds <= 120 or
+                 not 1 <= accept_seconds <= 300):
+             raise ValueError("nonce/lifetime")
+         self.nonce, self.seconds, self.library = nonce, seconds, Path(library).resolve()
++        if hashlib.sha256(self.library.read_bytes()).hexdigest() != library_sha256:
++            raise ValueError("explicit codec library digest mismatch")
+         self.accept_seconds, self.active_started = accept_seconds, None
+         self.records = Path(records)
+         self.records.mkdir(mode=0o700)  # new private directory, never reuse
+@@ -109,12 +103,9 @@
+         self.closed = False
+         self.first_error, self.cleanup = None, {}
+         self.qwire, self.client = None, None
+-        self.echo = None
+-        self.tcp_payload_complete = False
+-        self.server_in, self.server_out = bytearray(), Queue()
+         self.client_out, self.qemu_out = Queue(), Queue()
+         self.qemu_buffer = bytearray()
+-        self.flows = set()
++        self.policy = Policy(nonce)
+         self.opened = self.peer_close = self.sent_close = self.client_eof = False
+         self.frame_counts, self.byte_counts = [0, 0], [0, 0]
+         self.accepted = self.forwarded = 0
+@@ -122,16 +113,12 @@
+         self.last_activity = self.started
+         self.partial_since = self.eof_since = None
+         self.client_frame_buffer = bytearray()
+-        self.expected = {"tcp": b"DL26-TCP " + nonce.encode(), "udp": b"DL26-UDP " + nonce.encode()}
+-        self.echoes = {"tcp": False, "udp": False}
+         try:
+             self.codec = Codec(self.library, nonce, 2)
+             for name in ("relay-rx.bin", "relay-tx.bin", "ethernet-rx.bin", "ethernet-tx.bin"):
+                 self.logs[name] = self.open_record(name)
+-            self.control = self.own(listener(socket.SOCK_STREAM, ports[0]))
+-            self.tcp = self.own(listener(socket.SOCK_STREAM, ports[1]))
+-            self.udp = self.own(listener(socket.SOCK_DGRAM, ports[2]))
+-            self.ports = (self.control.getsockname()[1], self.tcp.getsockname()[1], self.udp.getsockname()[1])
++            self.control = self.own(listener(socket.SOCK_STREAM, port))
++            self.port = self.control.getsockname()[1]
+             self.qwire, child = socket.socketpair()
+             self.own(self.qwire); self.own(child)
+             qemu = shutil.which("qemu-system-aarch64")
+@@ -158,8 +145,10 @@
+                 raise RuntimeError("QEMU diagnostics pipe flags")
+             checked_socket(self.qwire)
+             self.gateway_mac = None
+-            arp = b"\0\1\x08\0\6\4\0\1" + GUEST_MAC + GUEST_IP + b"\0"*6 + HOST_IP
+-            self.qemu_out.append(self.ether_frame(b"\xff"*6 + GUEST_MAC + b"\x08\x06" + arp))
++            self.peers = {HOST_IP:None, DNS:None}
++            for peer in self.peers:
++                arp = b"\0\1\x08\0\6\4\0\1" + GUEST_MAC + GUEST_IP + b"\0"*6 + peer
++                self.qemu_out.append(self.ether_frame(b"\xff"*6 + GUEST_MAC + b"\x08\x06" + arp))
+         except BaseException as error:
+             self.first_error = repr(error)
+             self.close()
+@@ -229,39 +218,6 @@
+             if self.diagnostics.write(data) != len(data):
+                 raise RuntimeError("QEMU diagnostics short write")
+ 
+-    def packet_flow(self, packet, incoming):
+-        if not 20 <= len(packet) <= 1500 or packet[0] >> 4 != 4:
+-            raise RuntimeError("IPv4 length/version")
+-        ihl = (packet[0] & 15) * 4
+-        if ihl != 20 or struct.unpack_from("!H", packet, 2)[0] != len(packet):
+-            raise RuntimeError("IPv4 exact total length/IHL")
+-        if checksum(packet[:ihl]) or struct.unpack_from("!H", packet, 6)[0] & 0xbfff:
+-            raise RuntimeError("IPv4 checksum/fragment policy")
+-        src, dst, proto = packet[12:16], packet[16:20], packet[9]
+-        if (src, dst) != ((HOST_IP, GUEST_IP) if incoming else (GUEST_IP, HOST_IP)):
+-            raise RuntimeError("controlled host-alias address policy")
+-        body = packet[ihl:]
+-        if proto not in (6, 17) or len(body) < (20 if proto == 6 else 8):
+-            raise RuntimeError("TCP/UDP policy")
+-        sport, dport = struct.unpack_from("!HH", body)
+-        if proto == 6 and not 20 <= (body[12] >> 4)*4 <= len(body):
+-            raise RuntimeError("TCP header")
+-        if proto == 17 and struct.unpack_from("!H", body, 4)[0] != len(body):
+-            raise RuntimeError("UDP length")
+-        pseudo = src + dst + struct.pack("!BBH", 0, proto, len(body))
+-        if (proto == 6 or body[6:8] != b"\0\0") and checksum(pseudo + body):
+-            raise RuntimeError("transport checksum")
+-        if incoming:
+-            if (proto, dport, sport) not in self.flows:
+-                raise RuntimeError("unsolicited reverse flow")
+-        else:
+-            expected = self.ports[1] if proto == 6 else self.ports[2]
+-            if dport != expected or not sport:
+-                raise RuntimeError("controlled port policy")
+-            self.flows.add((proto, sport, dport))
+-            if len(self.flows) > 64:
+-                raise RuntimeError("flow budget")
+-
+     def receive(self, kind, sequence, packet):
+         self.frame_counts[0] += 1; self.byte_counts[0] += len(packet); self.check_budget()
+         if kind == 1:
+@@ -271,9 +227,10 @@
+         elif kind == 2:
+             if self.peer_close:
+                 raise RuntimeError("packet after CLOSE")
+-            self.packet_flow(packet, False)
++            self.policy.outgoing(packet)
+             self.accepted += 1
+-            self.qemu_out.append(self.ether_frame(self.gateway_mac + GUEST_MAC + b"\x08\x00" + packet))
++            mac = self.peers[DNS] if packet[16:20] == DNS else self.gateway_mac
++            self.qemu_out.append(self.ether_frame(mac + GUEST_MAC + b"\x08\x00" + packet))
+         elif kind == 3:
+             self.peer_close = True
+         else:
+@@ -286,22 +243,24 @@
+             a = frame[14:42]
+             if a[:6] != b"\0\1\x08\0\6\4":
+                 raise RuntimeError("ARP shape")
+-            if a[6:8] == b"\0\2" and a[14:18] == HOST_IP and a[24:28] == GUEST_IP:
++            if a[6:8] == b"\0\2" and a[14:18] in self.peers and a[24:28] == GUEST_IP:
+                 if frame[:6] != GUEST_MAC or a[18:24] != GUEST_MAC or frame[6:12] != a[8:14]:
+                     raise RuntimeError("ARP reply identities")
+-                if self.gateway_mac is not None and self.gateway_mac != a[8:14]:
+-                    raise RuntimeError("gateway MAC changed")
+-                self.gateway_mac = a[8:14]
+-            elif a[6:8] == b"\0\1" and a[24:28] == GUEST_IP and a[14:18] == HOST_IP:
+-                if (frame[6:12] != a[8:14] or a[8:14] != self.gateway_mac or
++                peer = a[14:18]
++                if self.peers[peer] is not None and self.peers[peer] != a[8:14]:
++                    raise RuntimeError("peer MAC changed")
++                self.peers[peer] = a[8:14]
++                self.gateway_mac = self.peers[HOST_IP]
++            elif a[6:8] == b"\0\1" and a[24:28] == GUEST_IP and a[14:18] in self.peers:
++                if (frame[6:12] != a[8:14] or a[8:14] != self.peers[a[14:18]] or
+                         frame[:6] not in (GUEST_MAC, b"\xff"*6)):
+                     raise RuntimeError("ARP request identities")
+-                reply = b"\0\1\x08\0\6\4\0\2" + GUEST_MAC + GUEST_IP + a[8:14] + HOST_IP
++                reply = b"\0\1\x08\0\6\4\0\2" + GUEST_MAC + GUEST_IP + a[8:14] + a[14:18]
+                 self.qemu_out.append(self.ether_frame(a[8:14] + GUEST_MAC + b"\x08\x06" + reply))
+             else:
+                 raise RuntimeError("unexpected ARP")
+             return
+-        if frame[12:14] != b"\x08\x00" or frame[:6] != GUEST_MAC or frame[6:12] != self.gateway_mac:
++        if frame[12:14] != b"\x08\x00" or frame[:6] != GUEST_MAC or frame[6:12] not in self.peers.values():
+             raise RuntimeError("Ethernet type/MAC policy")
+         packet = frame[14:]
+         if len(packet) < 20:
+@@ -310,7 +269,7 @@
+         if size > len(packet) or any(packet[size:]):
+             raise RuntimeError("IPv4 padding/size")
+         packet = packet[:size]
+-        self.packet_flow(packet, True)
++        self.policy.incoming(packet)
+         if self.sent_close:
+             raise RuntimeError("packet after local CLOSE")
+         self.forwarded += 1
+@@ -379,12 +338,12 @@
+                     raise TimeoutError("gateway readiness")
+                 if self.active_started is not None and now - self.last_activity > 10:
+                     raise TimeoutError("idle channel")
+-                for queue in (self.client_out, self.qemu_out, self.server_out):
++                for queue in (self.client_out, self.qemu_out):
+                     if queue.since is not None and now - queue.since > 2:
+                         raise TimeoutError("nonempty write queue")
+                 if self.partial_since is not None and now - self.partial_since > 2:
+                     raise TimeoutError("partial frame")
+-                if self.gateway_mac is not None and not ready:
++                if all(self.peers.values()) and not ready:
+                     maps = Path(f"/proc/{self.proc.pid}/maps").read_text().splitlines()
+                     slirp = {row.split(maxsplit=5)[5] for row in maps
+                              if len(row.split(maxsplit=5)) == 6 and "/libslirp.so" in row.split(maxsplit=5)[5]}
+@@ -392,8 +351,9 @@
+                         raise RuntimeError("actual child libslirp binding missing/ambiguous")
+                     self.slirp_binding = {path:hashlib.sha256(Path(path).read_bytes()).hexdigest() for path in slirp}
+                     self.write_json("ready.json", {"schema":1,"nonce":self.nonce,
+-                        "listen_host":"127.0.0.1","listen_port":self.ports[0],
+-                        "tcp_port":self.ports[1],"udp_port":self.ports[2],
++                        "profile":"example-http-v1","listen_host":"127.0.0.1","listen_port":self.port,
++                        "dns_server":"10.0.2.3","dns_port":53,"dns_question":"example.com A IN",
++                        "tcp_endpoint":"unresolved_until_correlated_dns_reply","tcp_port":80,
+                         "guest_ipv4":"10.0.2.15","host_alias":"10.0.2.2","mtu":1500,
+                         "codec_library_sha256":hashlib.sha256(self.library.read_bytes()).hexdigest(),
+                         "qemu_sha256":self.qemu_hash,"seconds":self.seconds,
+@@ -405,8 +365,8 @@
+                 if self.peer_close and not self.qemu_out and not self.sent_close:
+                     self.encode(3); self.sent_close = True; self.eof_since = now
+                 if self.sent_close and not self.client_out and self.client_eof:
+-                    if not all(self.echoes.values()):
+-                        raise RuntimeError("closed without both controlled echoes")
++                    if not self.policy.complete():
++                        raise RuntimeError("closed without correlated DNS/exact HTTP200/server FIN")
+                     normal = True; break
+                 if self.eof_since is not None and now - self.eof_since > 2:
+                     raise TimeoutError("closed peer EOF")
+@@ -415,16 +375,11 @@
+                         if events and sock.fileno() >= 0:
+                             sel.register(sock, events, name)
+                     reg(self.control, selectors.EVENT_READ if ready and self.client is None else 0, "accept")
+-                    reg(self.tcp, selectors.EVENT_READ if self.echo is None else 0, "tcp_accept")
+-                    reg(self.udp, selectors.EVENT_READ, "udp")
+                     reg(self.qwire, (selectors.EVENT_READ if not self.sent_close and len(self.client_out.parts) < MAX_QUEUE else 0) |
+                         (selectors.EVENT_WRITE if self.qemu_out else 0), "qemu")
+                     if self.client is not None:
+                         reg(self.client, (selectors.EVENT_READ if not self.client_eof and len(self.qemu_out.parts) < MAX_QUEUE else 0) |
+                             (selectors.EVENT_WRITE if self.client_out else 0), "client")
+-                    if self.echo is not None:
+-                        reg(self.echo, (selectors.EVENT_READ if not self.tcp_payload_complete else 0) |
+-                            (selectors.EVENT_WRITE if self.server_out else 0), "echo")
+                     events = sel.select(0.05)
+                 for key, mask in events:
+                     self.last_activity = time.monotonic()
+@@ -435,18 +390,6 @@
+                             sock.close(); raise RuntimeError("non-loopback peer")
+                         self.client = self.own(checked_socket(sock)); self.control.close()
+                         self.active_started = self.last_activity = time.monotonic()
+-                    elif tag == "tcp_accept":
+-                        sock, addr = self.tcp.accept()
+-                        if addr[0] != "127.0.0.1":
+-                            sock.close(); raise RuntimeError("non-loopback echo")
+-                        self.echo = self.own(checked_socket(sock)); self.tcp.close()
+-                    elif tag == "udp":
+-                        data, addr = self.udp.recvfrom(2048)
+-                        if addr[0] != "127.0.0.1" or data != self.expected["udp"] or self.echoes["udp"]:
+-                            raise RuntimeError("controlled UDP payload/peer/once")
+-                        if self.udp.sendto(data, addr) != len(data):
+-                            raise RuntimeError("UDP reply short write")
+-                        self.echoes["udp"] = True
+                     elif tag == "qemu":
+                         if mask & selectors.EVENT_WRITE:
+                             self.qemu_out.write(self.qwire)
+@@ -457,40 +400,36 @@
+                             self.client_out.write(self.client)
+                         if mask & selectors.EVENT_READ:
+                             self.client_read()
+-                    elif tag == "echo":
+-                        if mask & selectors.EVENT_READ:
+-                            data = self.echo.recv(512)
+-                            if not data:
+-                                raise RuntimeError("TCP echo premature EOF")
+-                            self.server_in.extend(data)
+-                            if not self.expected["tcp"].startswith(self.server_in):
+-                                raise RuntimeError("controlled TCP exact payload")
+-                            if self.server_in == self.expected["tcp"]:
+-                                self.tcp_payload_complete = True; self.server_out.append(bytes(self.server_in))
+-                        if mask & selectors.EVENT_WRITE:
+-                            self.server_out.write(self.echo)
+-                            if self.tcp_payload_complete and not self.server_out:
+-                                self.echoes["tcp"] = True
+         except BaseException as error:
+             self.first_error = repr(error)
+         finally:
+             self.close()
+             complete = normal and self.first_error is None and not self.cleanup.get("errors")
++            request_prefix = self.policy.summary()["request_observed_contiguous_bytes"]
++            for name, data in (("dns-query.bin", self.policy.query or b""),
++                    ("dns-reply.bin", self.policy.reply or b""),
++                    ("http-request-expected.bin", self.policy.request),
++                    ("http-request-observed.bin", bytes(self.policy.observed_request[:request_prefix])),
++                    ("http-response.bin", bytes(self.policy.response[:self.policy.contiguous]))):
++                with self.open_record(name) as f:
++                    if f.write(data) != len(data):
++                        raise RuntimeError("policy transcript short write")
++                    os.fsync(f.fileno())
+             record_hashes = {name: {"bytes":(self.records/name).stat().st_size,
+                 "sha256":hashlib.sha256((self.records/name).read_bytes()).hexdigest()}
+-                for name in list(self.logs) + ["qemu.log", "ready.json"]
++                for name in list(self.logs) + ["qemu.log", "ready.json", "dns-query.bin", "dns-reply.bin", "http-request-expected.bin", "http-request-observed.bin", "http-response.bin"]
+                 if (self.records/name).is_file()}
+             self.write_json("result.json", {"schema":1,"nonce":self.nonce,
+                 "complete":complete,"closed_records":record_hashes,
+-                "first_error":self.first_error,"cleanup":self.cleanup,"echoes":self.echoes,
+-                "controlled_tcp_hex":bytes(self.server_in).hex(),"controlled_udp_hex":self.expected["udp"].hex() if self.echoes["udp"] else None,
++                "profile":"example-http-v1","first_error":self.first_error,"cleanup":self.cleanup,
++                "egress":self.policy.summary(),
+                 "frame_counts_guest_host":self.frame_counts,"packet_bytes_guest_host":self.byte_counts,
+                 "guest_packets_accepted":self.accepted,"host_packets_forwarded":self.forwarded,
+-                "queued_bytes_client_qemu_echo":[sum(map(len,q.parts)) for q in (self.client_out,self.qemu_out,self.server_out)],
+-                "stream_bytes_written_client_qemu_echo":[q.written for q in (self.client_out,self.qemu_out,self.server_out)],
++                "queued_bytes_client_qemu":[sum(map(len,q.parts)) for q in (self.client_out,self.qemu_out)],
++                "stream_bytes_written_client_qemu":[q.written for q in (self.client_out,self.qemu_out)],
+                 "guest_close":self.peer_close,"host_close":self.sent_close,"peer_eof":self.client_eof,
+                 "qemu_sha256":self.qemu_hash,"actual_child_libslirp":getattr(self,"slirp_binding",None),"route_firewall_mutations":False,
+-                "scope":"Linux backend controlled host-alias TCP/UDP only; not Darwin or external connectivity"})
++                "scope":"Linux synthetic-guest slirp external DNS/HTTP only; no Darwin/M1 execution or TLS/DNSSEC identity proof"})
+         return 0 if complete else 1
+ 
+     def close(self):
+@@ -542,13 +481,13 @@
+ 
+ def main():
+     p = argparse.ArgumentParser(description=__doc__)
+-    for name in ("nonce", "codec-library", "records"):
++    for name in ("nonce", "codec-library", "codec-sha256", "records"):
+         p.add_argument("--" + name, required=True)
+-    for name in ("listen-port", "tcp-echo-port", "udp-echo-port", "seconds", "accept-seconds"):
++    p.add_argument("--profile", required=True, choices=["example-http-v1"])
++    for name in ("listen-port", "seconds", "accept-seconds"):
+         p.add_argument("--" + name, required=True, type=int)
+     a = p.parse_args()
+-    ports = (a.listen_port, a.tcp_echo_port, a.udp_echo_port)
+-    if any(not 0 <= n <= 65535 for n in ports):
++    if not 0 <= a.listen_port <= 65535:
+         p.error("ports0..65535 (0 selects an owned ephemeral port)")
+     if not Path(a.records).is_absolute() or not Path(a.codec_library).is_absolute():
+         p.error("absolute records and codec-library paths required")
+@@ -560,7 +499,7 @@
+     signal.signal(signal.SIGTERM, interrupted)
+     signal.signal(signal.SIGINT, interrupted)
+     signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+-    b = Backend(a.codec_library, a.nonce, a.records, ports, a.seconds, a.accept_seconds)
++    b = Backend(a.codec_library, a.codec_sha256, a.nonce, a.records, a.listen_port, a.seconds, a.accept_seconds)
+     raise SystemExit(b.run())
+ 
+ 

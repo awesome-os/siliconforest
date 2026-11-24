@@ -1,0 +1,30 @@
+callout: the drain's "still running" test is made under the callout lock
+
+Audit finding W4. del_timer_sync()/timer_delete_sync()/hrtimer_cancel() polled
+callout_active() without sLock; between two runs of a callback that re-arms itself the
+callout thread has no current callout for a moment, the poll took that for the end, and
+the caller went on to free a timer whose callback was running on another cpu.
+
+--- a/src/Kernel/fbsdkpi/haiku/freebsd_network/callout.cpp
++++ b/src/Kernel/fbsdkpi/haiku/freebsd_network/callout.cpp
+@@ -221,10 +221,16 @@
+ 			ret = 1;
+ 		}
+ 		if (drain) {
+-			locker.Unlock();
+-			while (callout_active(c))
++			// the "is it running" test is made with sLock held: the callout thread
++			// clears and sets the running callout under it, and a callback that re-arms
++			// itself is picked up again at once. tested without the lock, the gap
++			// between two runs looked like "finished" and del_timer_sync() returned
++			// with the callback running.
++			while (callout_active(c)) {
++				locker.Unlock();
+ 				snooze(100);
+-			locker.Lock();
++				locker.Lock();
++			}
+ 		}
+ 	}
+ 
+

@@ -1,0 +1,55 @@
+--- a/src/Kernel/Extensions/SFDRMDri/SFDRMDri.cpp
++++ b/src/Kernel/Extensions/SFDRMDri/SFDRMDri.cpp
+@@ -86,6 +86,12 @@
+ 	slot = SF_DRI_SLOT(dev);
+ 	if (slot > 0 && slot < SF_DRI_SLOTS) {
+ 		lck_mtx_lock(sLock);
++        /* Reclaim must never retire a still-live DRM file. Reservation is
++         * safer than reusing its select state/cookie if a caller misbehaves. */
++        if (sSlots[slot] != NULL) {
++            lck_mtx_unlock(sLock);
++            return EBUSY;
++        }
+ 		sSlotUsed[slot] = false;
+ 		sSlots[slot] = NULL;
+ 		lck_mtx_unlock(sLock);
+@@ -104,11 +110,8 @@
+ 		return ENXIO;
+ 	error = owner_ops(dev)->open(sOwner[SF_DRI_DRM_MINOR(dev)].minor, flags, &cookie);
+ 	if (error != 0) {
+-		// xnu frees a clone's minor only when it could not make the vnode: the slot of
+-		// an open that failed is ours to give back
+-		lck_mtx_lock(sLock);
+-		sSlotUsed[slot] = false;
+-		lck_mtx_unlock(sLock);
++        // The failed open still has a cloned vnode. Its reclaim callback
++        // releases the reservation; early reuse races that old vnode.
+ 		return error;
+ 	}
+ 	sSlots[slot] = cookie;
+@@ -130,12 +133,8 @@
+ 		selwakeup(&sSel[slot]);
+ 		selthreadclear(&sSel[slot]);
+ 		lck_mtx_unlock(sSelLock);
+-		// the last close of a clone is where its minor goes back (as xnu's own cloning
+-		// devices do it in d_close): without this every open since boot kept its slot,
+-		// and the 1024th open of a dri node failed. no fd operation is in flight here.
+-		lck_mtx_lock(sLock);
+-		sSlotUsed[slot] = false;
+-		lck_mtx_unlock(sLock);
++        // The vnode, not the descriptor, owns this reservation. Reclaim
++        // releases it after close/select cleanup, also for stat-only clones.
+ 	}
+ 	return 0;
+ }
+@@ -422,8 +421,8 @@
+ static int
+ dri_publish(int global)
+ {
+-	if (devfs_make_node_clone(makedev(sMajor, global & 0xff), DEVFS_CHAR, 0, 0, 0666,
+-	    dri_clone, "dri/%s", sNode[global]) == NULL)
++	if (devfs_make_node_clone_with_flags(makedev(sMajor, global & 0xff), DEVFS_CHAR, 0, 0, 0666,
++	    dri_clone, DEVFS_CLONE_FREE_ON_RECLAIM, "dri/%s", sNode[global]) == NULL)
+ 		return ENOMEM;
+ 	IOLog("sf_dri: /dev/dri/%s\n", sNode[global]);
+ 	sNode[global][0] = 0;

@@ -1,0 +1,46 @@
+--- transport001/host/backend.py
++++ 005/backend/backend.py
+@@ -27,6 +27,8 @@
+ GUEST_IP, HOST_IP = socket.inet_aton("10.0.2.15"), socket.inet_aton("10.0.2.2")
+ GUEST_MAC = bytes.fromhex("525400123456")
+ MAX_QUEUE, MAX_FRAMES, MAX_BYTES = 8, 4096, 4 * 1024 * 1024
++CLOSE_EOF_SECONDS = 15
++ACTIVE_IDLE_SECONDS = 10
+ STOP_REQUESTED = 0
+ 
+ 
+@@ -377,7 +379,7 @@
+                     raise TimeoutError("whole active backend lifetime")
+                 if not ready and now - self.started > 5:
+                     raise TimeoutError("gateway readiness")
+-                if self.active_started is not None and now - self.last_activity > 10:
++                if self.eof_since is None and self.active_started is not None and now - self.last_activity > ACTIVE_IDLE_SECONDS:
+                     raise TimeoutError("idle channel")
+                 for queue in (self.client_out, self.qemu_out, self.server_out):
+                     if queue.since is not None and now - queue.since > 2:
+@@ -397,6 +399,7 @@
+                         "guest_ipv4":"10.0.2.15","host_alias":"10.0.2.2","mtu":1500,
+                         "codec_library_sha256":hashlib.sha256(self.library.read_bytes()).hexdigest(),
+                         "qemu_sha256":self.qemu_hash,"seconds":self.seconds,
++                        "close_eof_seconds":CLOSE_EOF_SECONDS,"active_idle_seconds":ACTIVE_IDLE_SECONDS,
+                         "actual_child_libslirp":self.slirp_binding,
+                         "accept_seconds":self.accept_seconds,"backend_pid":os.getpid(),"qemu_pid":self.proc.pid})
+                     ready = True
+@@ -408,7 +411,7 @@
+                     if not all(self.echoes.values()):
+                         raise RuntimeError("closed without both controlled echoes")
+                     normal = True; break
+-                if self.eof_since is not None and now - self.eof_since > 2:
++                if self.eof_since is not None and now - self.eof_since > CLOSE_EOF_SECONDS:
+                     raise TimeoutError("closed peer EOF")
+                 with selectors.DefaultSelector() as sel:
+                     def reg(sock, events, name):
+@@ -482,6 +485,8 @@
+                 if (self.records/name).is_file()}
+             self.write_json("result.json", {"schema":1,"nonce":self.nonce,
+                 "complete":complete,"closed_records":record_hashes,
++                "close_eof_seconds":CLOSE_EOF_SECONDS,"active_idle_seconds":ACTIVE_IDLE_SECONDS,
++                "active_seconds":self.seconds,"accept_seconds":self.accept_seconds,
+                 "first_error":self.first_error,"cleanup":self.cleanup,"echoes":self.echoes,
+                 "controlled_tcp_hex":bytes(self.server_in).hex(),"controlled_udp_hex":self.expected["udp"].hex() if self.echoes["udp"] else None,
+                 "frame_counts_guest_host":self.frame_counts,"packet_bytes_guest_host":self.byte_counts,

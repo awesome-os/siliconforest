@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "INDEPENDENT_READ_ONLY_QUALIFICATION_NO_HARDWARE",
+  "capture": "runs/m1-desktop-010/attempt-001 (private); framebuffer.bin sha256 f483febfffdbe955964db1981df6abc1cfcac36a4fdc3bad77616023bf635b42",
+  "criteria_document": "reports/sprint-010/desktop-frame-qualification-criteria.json (fixed before the capture was seen)",
+  "verdict": "FIRST CPU DESKTOP FRAME QUALIFIED IN FRAMEBUFFER MEMORY. Chonkstep's Darwin CPU backend composited a real Wayland xdg/SHM client frame, carrying this run's fresh host nonce, with Chonkstep's own edges-mode chrome, into the M1 firmware framebuffer through PDGOP/IOGOP with correct 2101010 colours.",
+  "launch_and_linux": {
+    "binding": "desktop candidate-001: kernel 7335c418..., build record 904eae24..., ramdisk 2914fe69... (Chonkstep d42795c8..., reviewed earlier); launcher a8d61ebe...; controller 1464eced...",
+    "controller": "DARWIN_COMMAND_LINE_OBSERVED_LINUX_VERIFIED; guest_host_status HOST_WORKER_EXITED_WITHOUT_BOOT_VERDICT (normal, rc 1); diagnostics_complete true; reset 1; new Linux boot_id",
+    "host_tx": "console-result error null; TX matches its receipt and ends with exactly \"/usr/bin/darwin-desktop-test '2c13c79e...'\\r\"",
+    "core_and_diagnostics": "capture-core console_capture_finalized true; 14/14 diagnostic steps completed, including framebuffer-carveouts and framebuffer-pixels; no blocked step",
+    "hv": "0 'mapped page' aborts"
+  },
+  "guest_events": {
+    "markers": "DL10_BEGIN and DL10_SERVER_SOCKET with nonce 2c13c79e...; DL10_END and DL10_CLIENT_DONE absent, as expected at runtime 150 (the script is still in its sleep)",
+    "client": "DL10_CLIENT_FRAME 1..127, contiguous; no client or compositor error lines",
+    "first_iofb_open": "'PDGOP: selected framebuffer service IOGOPFramebuffer', 'kPEDisableScreen 1', 'IOFB: console disabled', 'enableController returned 0x0', then IOFramebuffer open. There was no kPEEnableScreen afterwards (no findConsole remap during open), so kernel text did not paint over the compositor. Console return when the compositor exits was NOT exercised; the compositor was still running at the deadline.",
+    "panic_grep": "Only 'EXT_PANICLOG: Initializing list' lines; no panic."
+  },
+  "criteria_results": {
+    "C1_fresh_capture": "PASS: owned paused capture with completed framebuffer step markers; sha f483febf... is new.",
+    "C2_compositor_owns_output": "PASS: 89.3% of a coarse grid decodes to the desktop colour [56,72,80].",
+    "C3_client_surface": "PASS: an 800x480 block of [34,47,56] at framebuffer (1,1).",
+    "C4_fresh_nonce_text": "PASS: pixel-for-pixel glyph-mask match 1.0 ink / 1.0 background for 'CHONKSTEP ON M1', 'DARWIN / ARM64 / WAYLAND', 'FRESH HOST NONCE:', '2c13c79e076a969382770b7e' and '3d3b0767cd90469c1c7b50e0'. The suspected mark beside the nonce was a viewer downscale artifact: at native resolution there are no stray pixels.",
+    "C5_frame_progress": "PASS: 'FRAME 126' exact, against 127 frame callbacks (the client paints after each callback).",
+    "C6_colour_path": "PASS: the bars decode exactly as red [230,60,50], green [40,220,70] and blue [45,100,245].",
+    "C7_compositor_chrome": "PASS AS EDGES CHROME; the criteria expectation is corrected. The pre-capture criteria expected a server-side title bar. The frozen source shows new windows default to ClientChrome::Edges (wm-darwin scene.rs:91) and switch to Full only when the client requests server-side decoration through xdg-decoration (server.rs:152-158); this client never binds xdg-decoration. create_decoration puts the frame at (0,0) and the content at client_offset (1,1) (scene.rs:281-287): a 1 px black border, the client, and a NeXTSTEP bevelled bottom resize bar (130/250/170 grey) with end segments; the frame is 802x490. render() draws client images first and the frame's solids/parts after (scene.rs:189-219), so the client cannot overwrite the chrome. The absent title bar is therefore by design for this client, not clipping or overwrite."
+  },
+  "honest_scope": {
+    "claimed": "A CPU-rendered Wayland desktop frame (Chonkstep compositor plus one real client) existed in the M1 firmware framebuffer at capture time, about 70 s into the session, with correct colours and a fresh nonce.",
+    "not_claimed": ["physical panel scanout (no observation recorded for this attempt)", "a server-side title bar or full window decoration", "input (keyboard or pointer)", "vblank or tear-free presentation", "GPU", "console return after the compositor exits", "a session longer than the bounded runtime"]
+  },
+  "suggestions": [
+    "To show Chonkstep's full NeXTSTEP chrome (title bar), have the test client request server-side decorations through zxdg_decoration_manager_v1. This is a client-only change.",
+    "A later run that lets the compositor exit before the deadline would exercise the console-resume path (IOFramebuffer close, then kPEAcquireScreen)."
+  ]
+}

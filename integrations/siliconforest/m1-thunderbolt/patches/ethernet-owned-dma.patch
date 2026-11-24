@@ -1,0 +1,231 @@
+--- a/src/Kernel/fbsdkpi/xnu/sf_fbsd_os.cpp
++++ b/src/Kernel/fbsdkpi/xnu/sf_fbsd_os.cpp
+@@ -29,6 +29,7 @@
+ #include <sys/uio.h>
+ 
+ #include "sf_fbsd_os.h"
++#include "sf_pci_dma_retire.h"
+ #include "sf_fbsd_xnu.h"
+ 
+ extern "C" {
+@@ -601,7 +602,7 @@
+ 			}
+ 			if (w->map == NULL) {
+ 				w->map = sBarDevs[d]->mapDeviceMemoryWithRegister(
+-					kIOPCIConfigBaseAddress0 + bar * 4, kIOMapInhibitCache);
++					kIOPCIConfigBaseAddress0 + bar * 4, kIOMapPostedWrite);
+ 				if (w->map == NULL)
+ 					return NULL;
+ 			}
+@@ -639,8 +640,8 @@
+ 		return NULL;
+ 	}
+ 	// 2 asks for write-combining, the way ioremap_wc maps a vram aperture
+-	IOOptionBits cacheMode = uncached == 2 ? kIOMapWriteCombineCache : uncached ? kIOMapInhibitCache : 0;
+-	void *bar_va = bar_window_va(phys, size, cacheMode == 0 ? kIOMapInhibitCache : cacheMode);
++	IOOptionBits cacheMode = uncached == 2 ? kIOMapWriteCombineCache : uncached ? kIOMapPostedWrite : 0;
++	void *bar_va = bar_window_va(phys, size, cacheMode == 0 ? kIOMapPostedWrite : cacheMode);
+ 	if (bar_va != NULL)
+ 		return bar_va;
+ 
+@@ -758,7 +759,7 @@
+ {
+ 	IOPCIDevice *pci = (IOPCIDevice *)dev;
+ 	IOMemoryMap *map = pci->mapDeviceMemoryWithRegister(
+-		kIOPCIConfigBaseAddress0 + bar * 4, kIOMapInhibitCache);
++		kIOPCIConfigBaseAddress0 + bar * 4, kIOMapPostedWrite);
+ 	if (map == NULL)
+ 		return 0;
+ 
+@@ -879,18 +880,79 @@
+ 	// set when the range was copied below the device's address limit
+ 	void				*bounce;
+ 	uint64_t			bounce_len;
++ IOBufferMemoryDescriptor *owned;
++ IOMemoryDescriptor *source;
++ IOService *device;
++ bool poisoned;
+ };
+ 
+ // without a mapper the bus address is the physical one and no state is kept
+ static sf_dma_cookie sIdentityCookie;
++
++/* Dedicated T8103 Ethernet bundle policy: every DMA request REQUIRES
++ * a mapper. This is not a claim that one exists; copyMapperForDevice must
++ * supply the actual object below. Even missing device association refuses
++ * identity/below-limit physical fallback. */
++int sfos_dma_requires_mapper(void *device){(void)device;return 1;}
++static void sf_owned_poison(sf_dma_cookie *c,const char *stage,uint32_t error)
++{
++ c->poisoned=true;c->device->setProperty("SFPCIDMAPoisoned",true);
++ IOLog("sfos Ethernet: owned DMA %s failed 0x%08x; command/backing retained until reboot\n",stage,error);
++}
++static uint32_t sf_owned_complete(void *p){return ((sf_dma_cookie *)p)->cmd->complete();}
++static uint32_t sf_owned_clear(void *p){return ((sf_dma_cookie *)p)->cmd->clearMemoryDescriptor(false);}
++static void sf_owned_release(void *p){
++ auto c=(sf_dma_cookie *)p;c->cmd->release();c->owned->release();
++ c->source->release();c->device->release();IOFree(c,sizeof(*c));
++}
++static void *sf_owned_map(IOService *device,IOMapper *mapper,uint64_t phys,uint64_t len,
++ int bits,uint64_t *busaddr)
++{
++ const uint64_t page=0x4000;
++ if(device->getProperty("SFPCIDMAPoisoned")==kOSBooleanTrue || len>UINT64_MAX-(page-1)){mapper->release();return NULL;}
++ auto c=(sf_dma_cookie *)IOMallocZero(sizeof(sf_dma_cookie));
++ if(!c){mapper->release();return NULL;}
++ c->source=IOMemoryDescriptor::withPhysicalAddress(phys,len,kIODirectionInOut);
++ c->owned=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++  kIODirectionInOut|kIOMemoryPhysicallyContiguous,(len+page-1)&~(page-1),page);
++ c->cmd=IODMACommand::withSpecification(kIODMACommandOutputHost64,bits,0,
++  IODMACommand::kMapped,0,1,mapper,NULL);mapper->release();
++ if(!c->source || !c->owned || !c->cmd){
++  OSSafeReleaseNULL(c->source);OSSafeReleaseNULL(c->owned);OSSafeReleaseNULL(c->cmd);IOFree(c,sizeof(*c));return NULL;
++ }
++ device->retain();c->device=device;c->bounce_len=len;
++ bzero(c->owned->getBytesNoCopy(),c->owned->getLength());
++ if(c->source->readBytes(0,c->owned->getBytesNoCopy(),len)!=len){
++  c->cmd->release();c->owned->release();c->source->release();device->release();IOFree(c,sizeof(*c));return NULL;
++ }
++ // Any failed prepare may have installed translations. Do not free its
++ // distinct page-owned backing, even if the command reports inactive.
++ IOReturn ret=c->cmd->setMemoryDescriptor(c->owned,true);
++ if(ret!=kIOReturnSuccess){sf_owned_poison(c,"prepare",ret);return NULL;}
++ UInt64 offset=0;UInt32 count=1;IODMACommand::Segment64 segment;
++ ret=c->cmd->gen64IOVMSegments(&offset,&segment,&count);
++ if(ret!=kIOReturnSuccess || count!=1 || segment.fLength<c->owned->getLength() ||
++  !segment.fIOVMAddr || segment.fIOVMAddr>UINT32_MAX ||
++  c->owned->getLength()-1>UINT32_MAX-segment.fIOVMAddr){
++  sf_owned_poison(c,"segments",ret?ret:kIOReturnUnderrun);return NULL;
++ }
++ *busaddr=segment.fIOVMAddr;return c;
++}
+ 
+ void *
+ sfos_dma_map_phys(void *pcidev, uint64_t phys, uint64_t len, int addrbits,
+ 	uint64_t *busaddr)
+ {
++ if(!busaddr || !phys || !len || addrbits<1 || addrbits>64 || phys>UINT64_MAX-(len-1))return NULL;
+ 	IOService *device = (IOService *)pcidev;
+ 	IOMapper *mapper = device != NULL ? IOMapper::copyMapperForDevice(device) : NULL;
+-	bool reachable = addrbits >= 64 || phys + len <= (1ULL << addrbits);
++ if(sfos_dma_requires_mapper(pcidev)){
++  if(!mapper)return NULL;
++  if(!mapper->metaCast("SFCIOPCIDartMapper")){mapper->release();return NULL;}
++  return sf_owned_map(device,mapper,phys,len,addrbits,busaddr);
++ }
++
++	bool reachable = addrbits == 64 || (phys < (1ULL << addrbits) && len <= (1ULL << addrbits)-phys);
+ 	if (mapper == NULL && reachable) {
+ 		*busaddr = phys;
+ 		return &sIdentityCookie;
+@@ -972,6 +1034,14 @@
+ 	if (cookie == NULL || cookie == &sIdentityCookie)
+ 		return;
+ 
++ if(cookie->owned){
++  if(cookie->poisoned)return;
++  if(to_device && cookie->source->readBytes(0,cookie->owned->getBytesNoCopy(),cookie->bounce_len)!=cookie->bounce_len){sf_owned_poison(cookie,"copy-out",kIOReturnUnderrun);return;}
++  IOReturn ret=cookie->cmd->synchronize(to_device?kIODirectionOut:kIODirectionIn);
++  if(ret!=kIOReturnSuccess){sf_owned_poison(cookie,"synchronize",ret);return;}
++  if(!to_device && cookie->source->writeBytes(0,cookie->owned->getBytesNoCopy(),cookie->bounce_len)!=cookie->bounce_len)sf_owned_poison(cookie,"copy-in",kIOReturnUnderrun);
++  return;
++ }
+ 	if (cookie->bounce != NULL) {
+ 		if (to_device)
+ 			cookie->md->readBytes(0, cookie->bounce, cookie->bounce_len);
+@@ -988,8 +1058,8 @@
+ 	IOMapper *mapper = pcidev != NULL ? IOMapper::copyMapperForDevice((IOService *)pcidev) : NULL;
+ 	if (mapper == NULL)
+ 		return 0;
+-	mapper->release();
+-	return 1;
++ bool valid=!sfos_dma_requires_mapper(pcidev) || mapper->metaCast("SFCIOPCIDartMapper");
++ mapper->release();return valid;
+ }
+ 
+ void
+@@ -999,6 +1069,13 @@
+ 	if (cookie == NULL || cookie == &sIdentityCookie)
+ 		return;
+ 
++ if(cookie->owned){
++  if(cookie->poisoned)return;
++  sf_pci_dma_retire_ops ops={cookie,sf_owned_complete,sf_owned_clear,sf_owned_release};
++  uint32_t ret=sf_pci_dma_retire(&ops);
++  if(ret)sf_owned_poison(cookie,"retire",ret);
++  return;
++ }
+ 	if (cookie->bounce != NULL) {
+ 		sfos_free_contig(cookie->bounce, cookie->bounce_len);
+ 		cookie->md->release();
+--- a/src/Kernel/fbsdkpi/haiku/freebsd_network/bus_dma.cpp
++++ b/src/Kernel/fbsdkpi/haiku/freebsd_network/bus_dma.cpp
+@@ -48,6 +48,7 @@
+ 	// the IOPCIDevice, and whether an iommu remaps its dma
+ 	void*			sf_device;
+ 	bool			sf_has_mapper;
++ bool sf_requires_mapper;
+ };
+ 
+ struct bus_dmamap {
+@@ -131,6 +132,7 @@
+ 	newtag->flags = flags;
+ 	newtag->ref_count = 1;
+ 	newtag->map_count = 0;
++ newtag->sf_requires_mapper = true; // This private Ethernet variant has no identity DMA.
+ 
+ 	// lockfunc is only needed if callbacks will be invoked asynchronously.
+ 
+@@ -139,6 +141,7 @@
+ 		atomic_add(&parent->ref_count, 1);
+ 		newtag->sf_device = parent->sf_device;
+ 		newtag->sf_has_mapper = parent->sf_has_mapper;
++  newtag->sf_requires_mapper = parent->sf_requires_mapper;
+ 
+ 		newtag->lowaddr = MIN(parent->lowaddr, newtag->lowaddr);
+ 		newtag->highaddr = MAX(parent->highaddr, newtag->highaddr);
+@@ -436,6 +439,7 @@
+ {
+ 	tag->sf_device = pcidev;
+ 	tag->sf_has_mapper = sfos_dma_has_mapper(pcidev) != 0;
++ tag->sf_requires_mapper = sfos_dma_requires_mapper(pcidev) != 0;
+ }
+ 
+ 
+@@ -453,6 +457,8 @@
+ _sf_map_segments(bus_dma_tag_t dmat, bus_dmamap_t map, bus_dma_segment_t* segs,
+ 	int nsegs)
+ {
++ if(dmat->sf_requires_mapper && (!dmat->sf_has_mapper || !map || !map->sf_cookies))return ENXIO;
++ if(nsegs<0 || (unsigned)nsegs>dmat->maxsegments)return EFBIG;
+ 	// haiku's own bounce buffers already respect the address limits
+ 	if (!dmat->sf_has_mapper || map == NULL)
+ 		return 0;
+@@ -492,7 +498,8 @@
+ {
+ 	if (dmat == NULL)
+ 		return true;
+-	return !dmat->sf_has_mapper && buf + buflen - 1 <= dmat->lowaddr;
++	return !dmat->sf_requires_mapper && !dmat->sf_has_mapper && buflen &&
++  buf<=UINT64_MAX-(buflen-1) && buf+buflen-1<=dmat->lowaddr;
+ }
+ 
+ 
+@@ -504,6 +511,7 @@
+ 	// sf_device is NULL for a device-tree platform device (bus_get_dma_tag() only knows pci):
+ 	// no IOMapper can be in front of it, and sfos_dma_map_phys(NULL, ..) is the identity
+ 	// mapping when the device can address the range
++ if(dmat->sf_requires_mapper && !dmat->sf_has_mapper)return ENXIO;
+ 	if (map->sf_cookies == NULL)
+ 		return EINVAL;
+ 
+--- a/src/Kernel/fbsdkpi/sf_fbsd_os.h
++++ b/src/Kernel/fbsdkpi/sf_fbsd_os.h
+@@ -67,6 +67,7 @@
+ int sfos_load_firmware(const char *name, void **data, size_t *size);
+ void sfos_free_firmware(void *data, size_t size);
+ int sfos_dma_has_mapper(void *pcidev);
++int sfos_dma_requires_mapper(void *pcidev);
+ 
+ // sleepable mutexes, kernel thread context only
+ // sfos_mtx_setup and sfos_rw_setup make an unlocked xnu lock in two words of caller storage

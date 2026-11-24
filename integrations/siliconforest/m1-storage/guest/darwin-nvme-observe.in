@@ -1,0 +1,20 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# sfnvme=1: the driver only reads power states and (where already powered) registers and
+# logs them; this prints its state and ends the boot. Nothing is started.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nNV_BEGIN_%s\n' "$nonce"
+n=0
+while [ "$n" -lt 30 ]; do
+    case "$(sysctl -n kern.sf_nvme.state 2>/dev/null)" in observed*|failed*) break;; esac
+    sleep 1; n=$((n+1))
+done
+printf 'NV_STATE %s\n' "$(sysctl -n kern.sf_nvme.state 2>&1)"
+printf 'NV_GATE_SELFTEST %s\n' "$(sysctl -n kern.sf_nvme.gate_selftest 2>&1)"
+printf 'NV_GATE_REJECTED %s\n' "$(sysctl -n kern.sf_nvme.gate_rejected 2>&1)"
+printf 'NV_NCPU %s\n' "$(sysctl -n hw.ncpu 2>&1)"
+ls /dev/sfnvme0 /dev/disk* 2>&1 | sed 's/^/NV_DEV /'
+printf 'NV_END_%s\n' "$nonce"
+printf '\nPD_BENCH_DONE\n'

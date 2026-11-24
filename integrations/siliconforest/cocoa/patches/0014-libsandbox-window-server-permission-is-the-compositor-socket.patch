@@ -1,0 +1,165 @@
+--- a/src/Libraries/libsandbox/sbpl.c
++++ b/src/Libraries/libsandbox/sbpl.c
+@@ -945,11 +945,44 @@
+ 	return false;
+ }
+ 
++/*
++ * The window server. On macOS a process reaches it through the Mach service
++ * com.apple.windowserver.active, and a profile that lets its process have windows says
++ * (allow mach-lookup (global-name "com.apple.windowserver.active")). Here the window server is
++ * the Wayland compositor, reached through a Unix socket, and Mach lookups are not something
++ * this policy checks at all - so that permission, and only it, is also written as what it
++ * means on this system: an outbound connection to the compositor's socket, the one path
++ * $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY names in the process that is sandboxing itself. A profile
++ * without the permission gets nothing (a browser's content process is headless here as it
++ * is on macOS), and nothing else about the socket's directory is opened up.
++ */
++static void
++emit_window_server_rules(struct compiler *c, int line)
++{
++	const char *display = getenv("WAYLAND_DISPLAY");
++	const char *runtime = getenv("XDG_RUNTIME_DIR");
++	char path[PATH_MAX], resolved[PATH_MAX];
++
++	if (display == NULL || display[0] == '\0') {
++		display = "wayland-0";
++	}
++	if (display[0] == '/') {
++		snprintf(path, sizeof(path), "%s", display);
++	} else if (runtime != NULL && runtime[0] == '/') {
++		snprintf(path, sizeof(path), "%s/%s", runtime, display);
++	} else {
++		return;
++	}
++	/* the kernel checks the path the socket really has (/var is /private/var) */
++	emit_rule(c, line, SB_OP_NETWORK_OUTBOUND, SB_ACTION_ALLOW, SB_FILTER_UNIX_LITERAL,
++	    realpath(path, resolved) != NULL ? resolved : path);
++}
++
+ static void
+ compile_rule(struct compiler *c, const struct node *form, uint8_t action)
+ {
+ 	uint32_t ops = 0;
+-	bool had_operation = false, had_filter = false;
++	bool had_operation = false, had_filter = false, mach_lookup = false;
+ 	size_t i = 1;
+ 
+ 	for (; i < form->count && form->items[i]->type == NODE_SYMBOL; i++) {
+@@ -972,6 +1005,9 @@
+ 		}
+ 		ops |= bits;
+ 		had_operation = true;
++		if (strcmp(operation, "mach-lookup") == 0) {
++			mach_lookup = true;
++		}
+ 	}
+ 	if (!had_operation) {
+ 		fail(c, form->line, "%s needs an operation", form->items[0]->text);
+@@ -992,6 +1028,18 @@
+ 		}
+ 		had_filter = true;
+ 		compile_filter(c, f, ops, action, 0);
++		if (mach_lookup && action == SB_ACTION_ALLOW && !c->failed && f->type == NODE_LIST &&
++		    f->count >= 2 && f->items[0]->type == NODE_SYMBOL &&
++		    strcmp(f->items[0]->text, "global-name") == 0) {
++			for (size_t n = 1; n < f->count && !c->failed; n++) {
++				struct value v = eval(c, f->items[n]);
++
++				if (!c->failed && v.kind == VALUE_STRING &&
++				    strcmp(v.string, "com.apple.windowserver.active") == 0) {
++					emit_window_server_rules(c, f->line);
++				}
++			}
++		}
+ 	}
+ 	if (!had_filter) {
+ 		emit_rule(c, form->line, ops, action, SB_FILTER_ANY, NULL);
+--- a/src/Libraries/libsandbox/sandbox.c
++++ b/src/Libraries/libsandbox/sandbox.c
+@@ -12,6 +12,7 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <unistd.h>
+ 
+ #include <sandbox.h>
+ 
+@@ -76,8 +77,8 @@
+ 	return source;
+ }
+ 
+-int
+-sandbox_init_with_parameters(const char *profile, uint64_t flags,
++static int
++sandbox_init_with_parameters_untraced(const char *profile, uint64_t flags,
+     const char *const parameters[], char **errorbuf)
+ {
+ 	const char *source = profile;
+@@ -148,6 +149,31 @@
+ 	return -1;
+ }
+ 
++/* With SF_SANDBOX_TRACE in the environment every attempt says on stderr which process it was
++ * and how it ended: what a run needs to tell the processes that really are sandboxed from those
++ * that never asked or were refused. */
++int
++sandbox_init_with_parameters(const char *profile, uint64_t flags,
++    const char *const parameters[], char **errorbuf)
++{
++	char *error = NULL;
++	int result = sandbox_init_with_parameters_untraced(profile, flags, parameters, &error);
++
++	if (getenv("SF_SANDBOX_TRACE") != NULL) {
++		int saved = errno;
++
++		fprintf(stderr, "sandbox_init: %s[%d] %s%s%s\n", getprogname(), (int)getpid(),
++		    result == 0 ? "sandboxed" : "FAILED", error ? ": " : "", error ? error : "");
++		errno = saved;
++	}
++	if (errorbuf != NULL) {
++		*errorbuf = error;
++	} else {
++		free(error);
++	}
++	return result;
++}
++
+ int
+ sandbox_init(const char *profile, unsigned long flags, char **errorbuf)
+ {
+--- a/src/Libraries/libSystem/stub/sf_dirhelper.c
++++ b/src/Libraries/libSystem/stub/sf_dirhelper.c
+@@ -6,6 +6,7 @@
+ #include <errno.h>
+ #include <stdbool.h>
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+@@ -45,8 +46,24 @@
+     return errno == EEXIST && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+ }
+ 
++static char *dirhelper(int which, char *path, size_t pathlen);
++
++// with SF_SANDBOX_TRACE set, a directory that cannot be handed out is said on stderr
+ char *_dirhelper(int which, char *path, size_t pathlen)
+ {
++    char *result = dirhelper(which, path, pathlen);
++
++    if (result == NULL && getenv("SF_SANDBOX_TRACE") != NULL) {
++        int saved = errno;
++
++        fprintf(stderr, "_dirhelper: %s[%d] no directory %d: %s\n", getprogname(), (int)getpid(), which, strerror(saved));
++        errno = saved;
++    }
++    return result;
++}
++
++static char *dirhelper(int which, char *path, size_t pathlen)
++{
+     static const char *const leaves[] = { "0", "T", "C" };
+     char user[64];
+     int length;

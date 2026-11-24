@@ -1,0 +1,38 @@
+--- a/integrations/siliconforest/firefox/daily-launch.py
++++ b/integrations/siliconforest/firefox/daily-launch.py
+@@ -243,6 +243,26 @@
+                 audio.parent == root / 'overrides'):
+             raise ValueError('Audio override must be a versioned complete family inside this runtime')
+         frames.insert(0, audio)
++    video = manifest.get('video_override')
++    if video is not None:
++        video = Path(video)
++        if (not manifest.get('system_layout') or not system_ui or not system_gpu or
++                '..' in video.parts or not video.is_relative_to(root / 'overrides') or
++                video.name != 'Frameworks' or video.parent == root / 'overrides'):
++            raise ValueError('Video override requires a versioned family and the qualified system graphics cohort')
++        frames.insert(0, video)
++    shared_video = manifest.get('video_zero_copy')
++    if shared_video is not None:
++        if type(shared_video) is not bool or (shared_video and video is None):
++            raise ValueError('Shared video requires an explicit complete video family')
++        if shared_video:
++            # Best effort for ordinary playback; strict tests can require it.
++            # Unsupported formats/devices retain the producer's copy fallback.
++            if env.get('SF_VT_ZERO_COPY', '1') not in ['0', '1', 'require']:
++                raise ValueError('Unknown video frame-allocation mode')
++            env.setdefault('SF_VT_ZERO_COPY', '1')
++        else:
++            env.pop('SF_VT_ZERO_COPY', None)
+     normalized_clock = manifest.get('audio_output_clock')
+     if normalized_clock is not None:
+         if not isinstance(normalized_clock, bool) or (normalized_clock and audio is None):
+@@ -304,7 +324,7 @@
+     command, env = plan(root, arguments[1:] if dry else arguments)
+     if dry:
+         print(json.dumps(dict(command=command, environment={k: v for k, v in env.items()
+-            if k.startswith(('DYLD_', 'SFFX_')) or k in {'MOZ_CRASHREPORTER_DISABLE', 'SF_AU_NORMALIZE_HAL_CLOCK'}}, sandbox_enabled=True), indent=2))
++            if k.startswith(('DYLD_', 'SFFX_')) or k in {'MOZ_CRASHREPORTER_DISABLE', 'SF_AU_NORMALIZE_HAL_CLOCK', 'SF_VT_ZERO_COPY'}}, sandbox_enabled=True), indent=2))
+         return
+     if os.uname().sysname != 'Darwin':
+         raise RuntimeError('Runtime requires SiliconForest')

@@ -1,0 +1,72 @@
+--- a/src/Frameworks/WindowServer/message.h
++++ b/src/Frameworks/WindowServer/message.h
+@@ -41,6 +41,9 @@
+     // shown; state: the window number of the tab shown now. The two records exchange what AppKit
+     // knows them by (number, backing store, title): the toplevel, its place and its frames stay
+     kWSWindowTakeToplevel = 14,
++    // wsRPCSimple: window, the window number of its parent (0: none). A sheet or a dialog: the
++    // compositor keeps it over its parent and centres it there (xdg_toplevel.set_parent)
++    kWSWindowSetParent = 15,
+     kCGGetLastMouseDelta = 100,
+     kCGGetMouseLocation = 101,
+     /* windowID 0 asks for the active application window. */
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -90,6 +90,8 @@
+     int popupParentID;
+     // set by AppKit before the popup is shown (kWSWindowSetPopupAnchor)
+     int popupKind, popupParentHint;
++    // the window number of the toplevel this one belongs to (a sheet's), 0 for none
++    int parentID;
+     double anchorX, anchorY, anchorW, anchorH;
+     // the frame origin AppKit asked for with the positioner last sent, and that request's token
+     double popupAskedX, popupAskedY;
+@@ -2213,6 +2215,17 @@
+     .position = windowPositionChanged,
+ };
+ 
++
++/* A sheet's toplevel names its parent's, so that the compositor keeps it over the parent and
++ * centres it there (AppKit's frame of the parent is not where the compositor put it). */
++static void windowApplyParent(struct wsWindow *window) {
++    struct wsWindow *parent = window->parentID != 0 ? windowForID(window->parentID) : NULL;
++
++    if (window->toplevel == NULL)
++        return;
++    xdg_toplevel_set_parent(window->toplevel, parent != NULL ? parent->toplevel : NULL);
++}
++
+ /* The compositor's answer to who draws the frame. AppKit assumed the compositor would for a
+  * standard window (it laid the window out without a title bar); it is told when that is not so. */
+ static void decorationConfigure(void *data, struct zxdg_toplevel_decoration_v1 *decoration, uint32_t mode) {
+@@ -2499,6 +2512,7 @@
+     xdg_surface_add_listener(window->xdgSurface, &xdgSurfaceListener, window);
+     window->toplevel = xdg_surface_get_toplevel(window->xdgSurface);
+     xdg_toplevel_add_listener(window->toplevel, &toplevelListener, window);
++    windowApplyParent(window);
+     /* Every toplevel says who should draw its frame: the compositor for a standard window, the
+      * application for the kinds that have no standard frame. Asked before the first commit, so
+      * the first configure already carries the answer. */
+@@ -3099,6 +3113,22 @@
+             return KERN_SUCCESS;
+         }
+ 
++        case kWSWindowSetParent: {
++            struct wsRPCSimple *msg = (struct wsRPCSimple *)data;
++            struct wsWindow *window = windowForID(msg->val1);
++
++            if (window == NULL) {
++                return KERN_FAILURE;
++            }
++            window->parentID = msg->val2;
++            if (window->toplevel != NULL) {
++                windowApplyParent(window);
++                wl_surface_commit(window->surface);
++                wl_display_flush(ws.display);
++            }
++            return KERN_SUCCESS;
++        }
++
+         case kWSWindowSetIgnoresMouse: {
+             struct wsRPCSimple *msg = (struct wsRPCSimple *)data;
+             struct wsWindow *window = windowForID(msg->val1);

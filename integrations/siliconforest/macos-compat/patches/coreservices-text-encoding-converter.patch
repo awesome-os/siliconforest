@@ -1,0 +1,432 @@
+diff -ruN a/src/Libraries/CoreServices/include/CoreServices/CoreServices.h b/src/Libraries/CoreServices/include/CoreServices/CoreServices.h
+--- a/src/Libraries/CoreServices/include/CoreServices/CoreServices.h	2026-11-13 09:07:36.202078737 -0800
++++ b/src/Libraries/CoreServices/include/CoreServices/CoreServices.h	2026-11-13 09:08:39.678142079 -0800
+@@ -14,6 +14,7 @@
+ #include <CoreServices/LaunchServices.h>
+ #include <CoreServices/SharedFileList.h>
+ #include <CoreServices/UnicodeUtilities.h>
++#include <CoreServices/TextEncodingConverter.h>
+ #include <CoreServices/AppleEvents.h>
+ 
+ #ifdef __cplusplus
+diff -ruN a/src/Libraries/CoreServices/include/CoreServices/TextEncodingConverter.h b/src/Libraries/CoreServices/include/CoreServices/TextEncodingConverter.h
+--- a/src/Libraries/CoreServices/include/CoreServices/TextEncodingConverter.h	1969-12-31 16:00:00.000000000 -0800
++++ b/src/Libraries/CoreServices/include/CoreServices/TextEncodingConverter.h	2026-11-13 09:08:39.676714065 -0800
+@@ -0,0 +1,93 @@
++// TextEncodingConverter.h - text encodings, the Text Encoding Converter and locale part strings
++// Copyright (c) 2026 The PureDarwin Project, SPDX-License-Identifier: MPL-2.0
++
++// the CarbonCore text encoding calls command-line programs built against the macOS SDK still
++// import (vim, neovim, gettext's locale probe): a TextEncoding is base | variant << 16 |
++// format << 26, the same packing as a CFStringEncoding
++#ifndef __CORESERVICES_TEXTENCODINGCONVERTER__
++#define __CORESERVICES_TEXTENCODINGCONVERTER__
++
++#include <CoreFoundation/CoreFoundation.h>
++#include <CoreServices/UnicodeUtilities.h>
++
++CF_EXTERN_C_BEGIN
++
++typedef UInt32 TextEncoding;
++typedef UInt32 TextEncodingBase;
++typedef UInt32 TextEncodingVariant;
++typedef UInt32 TextEncodingFormat;
++typedef UInt8 *TextPtr;
++typedef const UInt8 *ConstTextPtr;
++typedef struct OpaqueTECObjectRef *TECObjectRef;
++typedef UInt32 LocalePartMask;
++
++enum {
++    kTextEncodingMacRoman = 0,
++    kTextEncodingUnicodeDefault = 0x0100,
++    kTextEncodingDefaultVariant = 0,
++    kTextEncodingDefaultFormat = 0,
++};
++
++// formats of the Unicode base
++enum {
++    kUnicode16BitFormat = 0,
++    kUnicodeUTF7Format = 1,
++    kUnicodeUTF8Format = 2,
++    kUnicode32BitFormat = 3,
++    kUnicodeUTF16BEFormat = 4,
++    kUnicodeUTF16LEFormat = 5,
++    kUnicodeUTF32BEFormat = 6,
++    kUnicodeUTF32LEFormat = 7,
++};
++
++// variants of the Unicode base: which normal form the text is in
++enum {
++    kUnicodeNoSubset = 0,
++    kUnicodeCanonicalDecompVariant = 2,
++    kUnicodeCanonicalCompVariant = 3,
++    kUnicodeHFSPlusDecompVariant = 8,
++    kUnicodeHFSPlusCompVariant = 9,
++};
++
++enum {
++    kTextUnsupportedEncodingErr = -8738,
++    kTextMalformedInputErr = -8739,
++    kTextUndefinedElementErr = -8740,
++    kTECNoConversionPathErr = -8749,
++    kTECPartialCharErr = -8753,
++    kTECOutputBufferFullStatus = -8785,
++    kLocalesBufferTooSmallErr = -30001,
++};
++
++enum {
++    kLocaleLanguageMask = 1UL << 0,
++    kLocaleLanguageVariantMask = 1UL << 1,
++    kLocaleScriptMask = 1UL << 2,
++    kLocaleScriptVariantMask = 1UL << 3,
++    kLocaleRegionMask = 1UL << 4,
++    kLocaleRegionVariantMask = 1UL << 5,
++    kLocaleAllPartsMask = 0x0000003F,
++};
++
++CF_EXPORT TextEncoding CreateTextEncoding(TextEncodingBase encodingBase, TextEncodingVariant encodingVariant,
++                                          TextEncodingFormat encodingFormat);
++CF_EXPORT TextEncodingBase GetTextEncodingBase(TextEncoding encoding);
++CF_EXPORT TextEncodingVariant GetTextEncodingVariant(TextEncoding encoding);
++CF_EXPORT TextEncodingFormat GetTextEncodingFormat(TextEncoding encoding);
++
++CF_EXPORT OSStatus TECCreateConverter(TECObjectRef *newEncodingConverter, TextEncoding inputEncoding,
++                                      TextEncoding outputEncoding);
++CF_EXPORT OSStatus TECDisposeConverter(TECObjectRef newEncodingConverter);
++CF_EXPORT OSStatus TECClearConverterContextInfo(TECObjectRef encodingConverter);
++CF_EXPORT OSStatus TECConvertText(TECObjectRef encodingConverter, ConstTextPtr inputBuffer, ByteCount inputBufferLength,
++                                  ByteCount *actualInputLength, TextPtr outputBuffer, ByteCount outputBufferLength,
++                                  ByteCount *actualOutputLength);
++CF_EXPORT OSStatus TECFlushText(TECObjectRef encodingConverter, TextPtr outputBuffer, ByteCount outputBufferLength,
++                                ByteCount *actualOutputLength);
++
++CF_EXPORT OSStatus LocaleRefGetPartString(LocaleRef locale, LocalePartMask partMask, ByteCount maxStringLen,
++                                          char partString[]);
++
++CF_EXTERN_C_END
++
++#endif
+diff -ruN a/src/Libraries/CoreServices/TextEncodingConverter.c b/src/Libraries/CoreServices/TextEncodingConverter.c
+--- a/src/Libraries/CoreServices/TextEncodingConverter.c	1969-12-31 16:00:00.000000000 -0800
++++ b/src/Libraries/CoreServices/TextEncodingConverter.c	2026-11-13 09:08:55.770409264 -0800
+@@ -0,0 +1,320 @@
++// TextEncodingConverter.c - text encodings, the Text Encoding Converter and locale part strings
++// Copyright (c) 2026 The PureDarwin Project, SPDX-License-Identifier: MPL-2.0
++
++// The CarbonCore text encoding calls over CoreFoundation's string converters and normaliser.
++//
++// A converter turns a byte stream in one encoding into another. Between Unicode encodings the
++// variant of the output encoding says which normal form the result has: canonical or HFS+
++// decomposition (form D), canonical or HFS+ composition (form C); the HFS+ variants leave
++// U+2000..U+2FFF, U+F900..U+FAFF and U+2F800..U+2FAFF as they are, as the HFS+ volume format
++// specifies. Every other pair goes through whatever CFString can read and write.
++//
++// What does not fit the caller's output buffer is kept in the converter and handed out by the
++// next TECConvertText or TECFlushText (kTECOutputBufferFullStatus says there is more).
++#include <CoreServices/FileManager.h>
++#include <CoreServices/TextEncodingConverter.h>
++#include <stdlib.h>
++#include <string.h>
++
++TextEncoding CreateTextEncoding(TextEncodingBase encodingBase, TextEncodingVariant encodingVariant,
++                                TextEncodingFormat encodingFormat)
++{
++    return (encodingBase & 0xFFFF) | ((encodingVariant & 0x3FF) << 16) | ((encodingFormat & 0x3F) << 26);
++}
++
++TextEncodingBase GetTextEncodingBase(TextEncoding encoding) { return encoding & 0xFFFF; }
++TextEncodingVariant GetTextEncodingVariant(TextEncoding encoding) { return (encoding >> 16) & 0x3FF; }
++TextEncodingFormat GetTextEncodingFormat(TextEncoding encoding) { return (encoding >> 26) & 0x3F; }
++
++struct OpaqueTECObjectRef {
++    CFStringEncoding in, out;      // what CFString reads and writes
++    Boolean unicodeIn, unicodeOut;
++    TextEncodingFormat inFormat;
++    TextEncodingVariant outVariant;
++    UInt8 *pending;                // converted text the caller had no room for
++    ByteCount pendingLength;
++};
++
++// the CFStringEncoding of a TextEncoding, or kCFStringEncodingInvalidId when it cannot be converted here
++static CFStringEncoding cfEncoding(TextEncoding e, Boolean *unicode)
++{
++    TextEncodingBase base = GetTextEncodingBase(e);
++    TextEncodingVariant variant = GetTextEncodingVariant(e);
++    TextEncodingFormat format = GetTextEncodingFormat(e);
++
++    *unicode = false;
++    if (base >= 0x0100 && base <= 0x0108) {       // Unicode default and the versioned Unicode bases: one repertoire
++        if (format == kUnicodeUTF7Format || format > kUnicodeUTF32LEFormat) return kCFStringEncodingInvalidId;
++        if (variant != kUnicodeNoSubset && variant != kUnicodeCanonicalDecompVariant &&
++            variant != kUnicodeCanonicalCompVariant && variant != kUnicodeHFSPlusDecompVariant &&
++            variant != kUnicodeHFSPlusCompVariant)
++            return kCFStringEncodingInvalidId;
++        *unicode = true;
++        return 0x0100 | (format << 26);
++    }
++    CFStringEncoding enc = base | (format << 26);
++    return CFStringIsEncodingAvailable(enc) ? enc : kCFStringEncodingInvalidId;
++}
++
++OSStatus TECCreateConverter(TECObjectRef *newEncodingConverter, TextEncoding inputEncoding, TextEncoding outputEncoding)
++{
++    if (!newEncodingConverter) return paramErr;
++    *newEncodingConverter = NULL;
++
++    Boolean uin, uout;
++    CFStringEncoding in = cfEncoding(inputEncoding, &uin), out = cfEncoding(outputEncoding, &uout);
++    if (in == kCFStringEncodingInvalidId || out == kCFStringEncodingInvalidId) return kTextUnsupportedEncodingErr;
++
++    struct OpaqueTECObjectRef *c = calloc(1, sizeof(*c));
++    if (!c) return memFullErr;
++    c->in = in;
++    c->out = out;
++    c->unicodeIn = uin;
++    c->unicodeOut = uout;
++    c->inFormat = GetTextEncodingFormat(inputEncoding);
++    c->outVariant = uout ? GetTextEncodingVariant(outputEncoding) : kUnicodeNoSubset;
++    *newEncodingConverter = c;
++    return noErr;
++}
++
++OSStatus TECClearConverterContextInfo(TECObjectRef c)
++{
++    if (!c) return paramErr;
++    free(c->pending);
++    c->pending = NULL;
++    c->pendingLength = 0;
++    return noErr;
++}
++
++OSStatus TECDisposeConverter(TECObjectRef c)
++{
++    if (!c) return paramErr;
++    free(c->pending);
++    free(c);
++    return noErr;
++}
++
++// how many bytes at the end of a Unicode input buffer are the start of a character that is not complete
++static ByteCount partialTail(const struct OpaqueTECObjectRef *c, const UInt8 *p, ByteCount n)
++{
++    switch (c->inFormat) {
++    case kUnicodeUTF8Format: {
++        ByteCount back = 0;
++        while (back < n && back < 4) {
++            UInt8 b = p[n - 1 - back];
++            back++;
++            if ((b & 0xC0) == 0x80) continue;                   // a continuation byte: look further back
++            ByteCount need = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
++            return need > back ? back : 0;
++        }
++        return 0;
++    }
++    case kUnicode16BitFormat:
++    case kUnicodeUTF16BEFormat:
++    case kUnicodeUTF16LEFormat: {
++        ByteCount odd = n & 1, whole = n - odd;
++        if (whole >= 2) {
++            Boolean big = c->inFormat == kUnicodeUTF16BEFormat
++#if __BIG_ENDIAN__
++                          || c->inFormat == kUnicode16BitFormat
++#endif
++                ;
++            UInt16 u = big ? (UInt16)(p[whole - 2] << 8 | p[whole - 1]) : (UInt16)(p[whole - 1] << 8 | p[whole - 2]);
++            if (u >= 0xD800 && u <= 0xDBFF) return odd + 2;      // a high surrogate waits for its low half
++        }
++        return odd;
++    }
++    case kUnicode32BitFormat:
++    case kUnicodeUTF32BEFormat:
++    case kUnicodeUTF32LEFormat:
++        return n & 3;
++    }
++    return 0;
++}
++
++static Boolean hfsExempt(UTF32Char ch)
++{
++    return (ch >= 0x2000 && ch <= 0x2FFF) || (ch >= 0xF900 && ch <= 0xFAFF) || (ch >= 0x2F800 && ch <= 0x2FAFF);
++}
++
++// the string in the normal form the output variant asks for; consumes nothing, returns a new string
++static CFStringRef normalized(CFStringRef s, TextEncodingVariant variant)
++{
++    CFStringNormalizationForm form;
++    Boolean hfs = variant == kUnicodeHFSPlusDecompVariant || variant == kUnicodeHFSPlusCompVariant;
++
++    if (variant == kUnicodeCanonicalDecompVariant || variant == kUnicodeHFSPlusDecompVariant) form = kCFStringNormalizationFormD;
++    else if (variant == kUnicodeCanonicalCompVariant || variant == kUnicodeHFSPlusCompVariant) form = kCFStringNormalizationFormC;
++    else return CFRetain(s);
++
++    CFIndex len = CFStringGetLength(s);
++    CFMutableStringRef out = CFStringCreateMutable(kCFAllocatorDefault, 0);
++    if (!out) return NULL;
++    UniChar *chars = malloc((len ? len : 1) * sizeof(UniChar));
++    if (!chars) {
++        CFRelease(out);
++        return NULL;
++    }
++    CFStringGetCharacters(s, CFRangeMake(0, len), chars);
++
++    // runs of characters the variant normalises, separated by the characters HFS+ leaves alone
++    CFIndex i = 0;
++    while (i < len) {
++        CFIndex start = i;
++        Boolean exempt = false;
++        while (i < len) {
++            UTF32Char ch = chars[i];
++            CFIndex width = 1;
++            if (ch >= 0xD800 && ch <= 0xDBFF && i + 1 < len && chars[i + 1] >= 0xDC00 && chars[i + 1] <= 0xDFFF) {
++                ch = 0x10000 + ((ch - 0xD800) << 10) + (chars[i + 1] - 0xDC00);
++                width = 2;
++            }
++            Boolean e = hfs && hfsExempt(ch);
++            if (i == start) exempt = e;
++            else if (e != exempt) break;
++            i += width;
++        }
++        if (exempt) {
++            CFStringAppendCharacters(out, chars + start, i - start);
++        } else {
++            CFMutableStringRef run = CFStringCreateMutable(kCFAllocatorDefault, 0);
++            if (!run) {
++                free(chars);
++                CFRelease(out);
++                return NULL;
++            }
++            CFStringAppendCharacters(run, chars + start, i - start);
++            CFStringNormalize(run, form);
++            CFStringAppend(out, run);
++            CFRelease(run);
++        }
++    }
++    free(chars);
++    return out;
++}
++
++// hands pending text to the caller; kTECOutputBufferFullStatus while some is left
++static OSStatus drain(TECObjectRef c, TextPtr outputBuffer, ByteCount outputBufferLength, ByteCount *actualOutputLength)
++{
++    ByteCount n = c->pendingLength < outputBufferLength ? c->pendingLength : outputBufferLength;
++
++    if (n && outputBuffer) memcpy(outputBuffer, c->pending, n);
++    else n = 0;
++    if (actualOutputLength) *actualOutputLength = n;
++    if (n == c->pendingLength) {
++        free(c->pending);
++        c->pending = NULL;
++        c->pendingLength = 0;
++        return noErr;
++    }
++    memmove(c->pending, c->pending + n, c->pendingLength - n);
++    c->pendingLength -= n;
++    return kTECOutputBufferFullStatus;
++}
++
++OSStatus TECConvertText(TECObjectRef c, ConstTextPtr inputBuffer, ByteCount inputBufferLength,
++                        ByteCount *actualInputLength, TextPtr outputBuffer, ByteCount outputBufferLength,
++                        ByteCount *actualOutputLength)
++{
++    if (actualInputLength) *actualInputLength = 0;
++    if (actualOutputLength) *actualOutputLength = 0;
++    if (!c || (!inputBuffer && inputBufferLength) || (!outputBuffer && outputBufferLength)) return paramErr;
++
++    // text of an earlier call goes out first, in order; no new input is taken until it is gone
++    if (c->pendingLength) {
++        OSStatus s = drain(c, outputBuffer, outputBufferLength, actualOutputLength);
++        if (s != noErr || !inputBufferLength) return s;
++        ByteCount took = actualOutputLength ? *actualOutputLength : 0, more = 0;
++        s = TECConvertText(c, inputBuffer, inputBufferLength, actualInputLength, outputBuffer + took,
++                           outputBufferLength - took, &more);
++        if (actualOutputLength) *actualOutputLength = took + more;
++        return s;
++    }
++    if (!inputBufferLength) return noErr;
++
++    ByteCount tail = c->unicodeIn ? partialTail(c, inputBuffer, inputBufferLength) : 0;
++    ByteCount take = inputBufferLength - tail;
++    if (!take) return kTECPartialCharErr;
++
++    CFStringRef s = CFStringCreateWithBytes(kCFAllocatorDefault, inputBuffer, (CFIndex)take, c->in, false);
++    if (!s) return kTextMalformedInputErr;
++    CFStringRef n = normalized(s, c->outVariant);
++    CFRelease(s);
++    if (!n) return memFullErr;
++
++    CFIndex len = CFStringGetLength(n), need = 0;
++    CFIndex done = CFStringGetBytes(n, CFRangeMake(0, len), c->out, 0, false, NULL, 0, &need);
++    if (done != len) {                                         // a character the output encoding does not have
++        CFRelease(n);
++        return kTextUndefinedElementErr;
++    }
++    UInt8 *bytes = malloc(need ? (size_t)need : 1);
++    if (!bytes) {
++        CFRelease(n);
++        return memFullErr;
++    }
++    CFStringGetBytes(n, CFRangeMake(0, len), c->out, 0, false, bytes, need, &need);
++    CFRelease(n);
++
++    c->pending = bytes;
++    c->pendingLength = (ByteCount)need;
++    if (actualInputLength) *actualInputLength = take;
++    OSStatus status = drain(c, outputBuffer, outputBufferLength, actualOutputLength);
++    if (status == noErr && tail) status = kTECPartialCharErr;
++    return status;
++}
++
++OSStatus TECFlushText(TECObjectRef c, TextPtr outputBuffer, ByteCount outputBufferLength, ByteCount *actualOutputLength)
++{
++    if (actualOutputLength) *actualOutputLength = 0;
++    if (!c || (!outputBuffer && outputBufferLength)) return paramErr;
++    return drain(c, outputBuffer, outputBufferLength, actualOutputLength);
++}
++
++// LocaleRef as UnicodeUtilities.c makes it
++struct OpaqueLocaleRef {
++    CFLocaleRef locale;
++};
++
++// "ll[_Ssss][_RR][_variant]" pieces of a locale identifier (anything from '@' or '.' on is not a part)
++OSStatus LocaleRefGetPartString(LocaleRef locale, LocalePartMask partMask, ByteCount maxStringLen, char partString[])
++{
++    if (!partString || !maxStringLen) return paramErr;
++    partString[0] = 0;
++
++    char ident[128] = "";
++    CFLocaleRef l = locale && locale->locale ? (CFLocaleRef)CFRetain(locale->locale) : CFLocaleCopyCurrent();
++    if (l) {
++        CFStringRef id = CFLocaleGetIdentifier(l);
++        if (!id || !CFStringGetCString(id, ident, sizeof(ident), kCFStringEncodingUTF8)) ident[0] = 0;
++        CFRelease(l);
++    }
++    ident[strcspn(ident, "@.")] = 0;
++
++    char language[32] = "", script[8] = "", region[16] = "", variant[32] = "";
++    int field = 0;
++    for (char *p = ident, *next; p && *p; p = next, field++) {
++        size_t n = strcspn(p, "_-");
++        next = p[n] ? p + n + 1 : NULL;
++        p[n] = 0;
++        if (field == 0) strlcpy(language, p, sizeof(language));
++        else if (n == 4 && !script[0] && !region[0]) strlcpy(script, p, sizeof(script));
++        else if (!region[0] && (n == 2 || n == 3)) strlcpy(region, p, sizeof(region));
++        else if (!variant[0]) strlcpy(variant, p, sizeof(variant));
++    }
++
++    char out[128] = "";
++    const char *parts[4];
++    int count = 0;
++    if ((partMask & kLocaleLanguageMask) && language[0]) parts[count++] = language;
++    if ((partMask & kLocaleScriptMask) && script[0]) parts[count++] = script;
++    if ((partMask & kLocaleRegionMask) && region[0]) parts[count++] = region;
++    if ((partMask & kLocaleRegionVariantMask) && variant[0]) parts[count++] = variant;
++    for (int i = 0; i < count; i++) {
++        if (i) strlcat(out, "_", sizeof(out));
++        strlcat(out, parts[i], sizeof(out));
++    }
++    if (strlen(out) + 1 > maxStringLen) return kLocalesBufferTooSmallErr;
++    strcpy(partString, out);
++    return noErr;
++}

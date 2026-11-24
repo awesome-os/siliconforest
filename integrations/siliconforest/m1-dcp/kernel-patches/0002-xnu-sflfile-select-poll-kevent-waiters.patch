@@ -1,0 +1,233 @@
+xnu: select, poll and kevent wait on SiliconForest's linuxkpi file descriptors
+
+sf_lfile's select routine only asked the object whether it was ready and recorded nothing,
+so a select()/poll() on a sync_file or dma-buf descriptor that was not ready slept until its
+timeout, and kevent refused the descriptor (fo_no_kqfilter).
+
+- one selinfo for all linux files (the object belongs to the linuxkpi side and has no room
+  for one), under a mutex that is the selinfo's "primitive lock"; sf_lfile_select()
+  records on it before asking the object, so a wakeup between the two is not lost;
+- sf_lfile_wakeup(obj), exported with the other sf_lfile entry points: the linuxkpi side
+  calls it when an object's state changed (a fence signalled). Every waiter then asks its
+  own object again; the lock is not held across calls into the object's ops, so the
+  linuxkpi side may call it with its own locks held;
+- a kevent filter, EVFILTID_SFLFILE, for EVFILT_READ and EVFILT_WRITE: the selspec scheme
+  spec_filtops uses for select-only devices (run select with the record hook, selwakeup()
+  activates and detaches the knote, the process routine asks again and re-attaches).
+
+A wakeup is not per object: with many linux files open, each wakeup makes every waiter
+poll once. Precise wakeups need a selinfo per file, i.e. storage the kernel owns per
+fileglob; not done.
+UPSTREAM: yes.
+
+--- a/src/Kernel/xnu/bsd/kern/kern_event.c
++++ b/src/Kernel/xnu/bsd/kern/kern_event.c
+@@ -305,6 +305,7 @@
+ extern const struct filterops fsevent_filtops;
+ extern const struct filterops vnode_filtops;
+ extern const struct filterops tty_filtops;
++extern const struct filterops sf_lfile_filtops;
+ 
+ __security_const_early static struct filterops file_filtops;
+ __security_const_early static struct filterops kqread_filtops;
+@@ -394,6 +395,7 @@
+ 	[EVFILTID_PTMX]                 = &ptmx_kqops,
+ 	[EVFILTID_MACH_PORT]            = &mach_port_filtops,
+ 	[EVFILTID_MACH_PORT_SET]        = &mach_port_set_filtops,
++	[EVFILTID_SFLFILE]              = &sf_lfile_filtops,
+ 
+ 	/* fake filter for detached knotes, keep last */
+ 	[EVFILTID_DETACHED]             = &bad_filtops,
+--- a/src/Kernel/xnu/bsd/kern/sf_lfile.c
++++ b/src/Kernel/xnu/bsd/kern/sf_lfile.c
+@@ -8,8 +8,16 @@
+ #include <sys/ioctl.h>
+ #include <sys/kauth.h>
+ #include <sys/proc_internal.h>
++#include <sys/select.h>
++#include <sys/event.h>
+ #include <sys/uio_internal.h>
++#include <sys/user.h>
+ #include <sys/vnode.h>
++#include <kern/assert.h>
++#include <kern/locks.h>
++#include <kern/waitq.h>
++#include <os/atomic_private.h>
++#include <libkern/section_keywords.h>
+ 
+ #define f_flag fp_glob->fg_flag
+ #define f_ops fp_glob->fg_ops
+@@ -32,10 +40,20 @@
+ void sf_lfile_unreserve(int fd);
+ void sf_lfile_install(int fd, void *obj);
+ void *sf_lfile_get(int fd);
++void sf_lfile_wakeup(void *obj);
+ 
+ static const struct sf_lfile_ops *sf_lfile_ops;
+ static const struct fileops sf_lfileops;
+ 
++// One wait channel for every linux file. The object is the linuxkpi side's and has no room
++// for a selinfo, so a wakeup for any of them makes each waiter ask its own object again
++// (select scans again, a knote runs its process routine). The lock is the selinfo's
++// "primitive lock" (bsd/kern/sys_generic.c): selrecord and selwakeup run under it, and it
++// is never held across a call into the object's ops.
++static LCK_GRP_DECLARE(sf_lfile_lck_grp, "sf_lfile");
++static LCK_MTX_DECLARE(sf_lfile_sel_lock, &sf_lfile_lck_grp);
++static struct selinfo sf_lfile_sel;
++
+ // a descriptor still reserved by sf_lfile_reserve, with the proc fd lock held
+ static struct fileproc *
+ sf_lfile_reserved_locked(proc_t p, int fd)
+@@ -84,12 +102,117 @@
+ }
+ 
+ static int
+-sf_lfile_select(struct fileproc *fp, int which, __unused void *wql, __unused vfs_context_t ctx)
++sf_lfile_select(struct fileproc *fp, int which, void *wql, vfs_context_t ctx)
+ {
+-	if (sf_lfile_ops->poll == NULL) {
++	void *obj = fp_get_data(fp);
++
++	if (obj == NULL || sf_lfile_ops->poll == NULL) {
+ 		return 1;
+ 	}
+-	return sf_lfile_ops->poll(fp_get_data(fp), which);
++	// recorded before the object is asked: a wakeup between the two is then not lost
++	lck_mtx_lock(&sf_lfile_sel_lock);
++	selrecord(vfs_context_proc(ctx), &sf_lfile_sel, wql);
++	lck_mtx_unlock(&sf_lfile_sel_lock);
++	return sf_lfile_ops->poll(obj, which);
++}
++
++// the state of obj changed (a fence signalled): select and kevent waiters look again
++void
++sf_lfile_wakeup(__unused void *obj)
++{
++	lck_mtx_lock(&sf_lfile_sel_lock);
++	selwakeup(&sf_lfile_sel);
++	lck_mtx_unlock(&sf_lfile_sel_lock);
++}
++
++// kevent on a linux file, the way spec_filtops (bsd/miscfs/specfs/spec_vnops.c) does it for
++// devices that only have select: run the select routine with the hook that hands the
++// selinfo to selspec_attach(). selwakeup() then activates and detaches the knote, and its
++// process routine asks the object and attaches again while it is not ready.
++static int
++sf_lfile_filt_common(struct knote *kn, struct kevent_qos_s *kev)
++{
++	uthread_t uth = current_uthread();
++	struct select_set *old_wqs;
++	int ready;
++
++	if (kn->kn_flags & EV_EOF) {
++		knote_fill_kevent(kn, kev, 0);
++		return FILTER_ACTIVE;
++	}
++
++	selspec_record_hook_t cb = ^(struct selinfo *si) {
++		selspec_attach(kn, si);
++	};
++
++	old_wqs = uth->uu_selset;
++	uth->uu_selset = SELSPEC_RECORD_MARKER;
++	ready = sf_lfile_select(kn->kn_fp, knote_get_seltype(kn), cb, vfs_context_current());
++	uth->uu_selset = old_wqs;
++
++	if (ready) {
++		knote_fill_kevent(kn, kev, 1);
++		return FILTER_ACTIVE;
++	}
++	return 0;
++}
++
++static int
++sf_lfile_filt_attach(struct knote *kn, struct kevent_qos_s *kev)
++{
++	return sf_lfile_filt_common(kn, kev);
++}
++
++static void
++sf_lfile_filt_detach(struct knote *kn)
++{
++	selspec_detach(kn);
++}
++
++static int
++sf_lfile_filt_event(struct knote *kn, long hint)
++{
++	// called by selwakeup() with the selspec lock held; it has taken the knote off the list
++	assert(KNOTE_IS_AUTODETACHED(kn));
++	knote_kn_hook_set_raw(kn, NULL);
++	if (hint & NOTE_REVOKE) {
++		os_atomic_or(&kn->kn_flags, EV_EOF | EV_ONESHOT, relaxed);
++	}
++	return FILTER_ACTIVE;
++}
++
++static int
++sf_lfile_filt_touch(struct knote *kn, struct kevent_qos_s *kev)
++{
++	kn->kn_sdata = kev->data;
++	kn->kn_sfflags = kev->fflags;
++	return sf_lfile_filt_common(kn, kev);
++}
++
++static int
++sf_lfile_filt_process(struct knote *kn, struct kevent_qos_s *kev)
++{
++	return sf_lfile_filt_common(kn, kev);
++}
++
++SECURITY_READ_ONLY_EARLY(struct filterops) sf_lfile_filtops = {
++	.f_isfd    = 1,
++	.f_attach  = sf_lfile_filt_attach,
++	.f_detach  = sf_lfile_filt_detach,
++	.f_event   = sf_lfile_filt_event,
++	.f_touch   = sf_lfile_filt_touch,
++	.f_process = sf_lfile_filt_process,
++};
++
++static int
++sf_lfile_kqfilter(__unused struct fileproc *fp, struct knote *kn, struct kevent_qos_s *kev)
++{
++	if (kn->kn_filter != EVFILT_READ && kn->kn_filter != EVFILT_WRITE) {
++		knote_set_error(kn, EINVAL);
++		return 0;
++	}
++	kn->kn_filtid = EVFILTID_SFLFILE;
++	return sf_lfile_filt_attach(kn, kev);
+ }
+ 
+ static int
+@@ -112,7 +235,7 @@
+ 	.fo_select   = sf_lfile_select,
+ 	.fo_close    = sf_lfile_close,
+ 	.fo_drain    = fo_no_drain,
+-	.fo_kqfilter = fo_no_kqfilter,
++	.fo_kqfilter = sf_lfile_kqfilter,
+ };
+ 
+ int
+--- a/src/Kernel/xnu/bsd/sys/event_private.h
++++ b/src/Kernel/xnu/bsd/sys/event_private.h
+@@ -198,8 +198,11 @@
+ #define EVFILTID_MACH_PORT         (EVFILT_SYSCOUNT + 19)
+ #define EVFILTID_MACH_PORT_SET     (EVFILT_SYSCOUNT + 20)
+ 
+-#define EVFILTID_DETACHED          (EVFILT_SYSCOUNT + 21)
+-#define EVFILTID_MAX               (EVFILT_SYSCOUNT + 22)
++/* SiliconForest: linuxkpi files (dma-buf, sync_file), bsd/kern/sf_lfile.c */
++#define EVFILTID_SFLFILE           (EVFILT_SYSCOUNT + 21)
++
++#define EVFILTID_DETACHED          (EVFILT_SYSCOUNT + 22)
++#define EVFILTID_MAX               (EVFILT_SYSCOUNT + 23)
+ 
+ #endif /* defined(XNU_KERNEL_PRIVATE) */
+ 
+--- a/src/Kernel/xnu/config/BSDKernel.exports
++++ b/src/Kernel/xnu/config/BSDKernel.exports
+@@ -864,3 +864,4 @@
+ _sf_lfile_register
+ _sf_lfile_reserve
+ _sf_lfile_unreserve
++_sf_lfile_wakeup

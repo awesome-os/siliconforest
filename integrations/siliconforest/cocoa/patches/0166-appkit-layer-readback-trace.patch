@@ -1,0 +1,48 @@
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -1984,11 +1984,17 @@
+    CGImageRef image;
+ 
+ 
+-   if(_layerContext==nil || ![self canDraw])
++   if(_layerContext==nil || ![self canDraw]){
++    if(getenv("SF_WIN_TRACE")!=NULL && [_window level]>=3)
++     fprintf(stderr,"SFWIN layers of window %d: context %p canDraw %d\n",(int)[_window windowNumber],(void *)_layerContext,(int)[self canDraw]);
+     return;
++   }
+    // a bare backing layer has nothing of its own to show, so skip the readback
+-   if([[_layer sublayers] count]==0 && [_layer contents]==nil && [_layer backgroundColor]==NULL && [_layer borderWidth]==0)
++   if([[_layer sublayers] count]==0 && [_layer contents]==nil && [_layer backgroundColor]==NULL && [_layer borderWidth]==0){
++    if(getenv("SF_WIN_TRACE")!=NULL && [_window level]>=3)
++     fprintf(stderr,"SFWIN layers of window %d: bare backing layer, nothing read back\n",(int)[_window windowNumber]);
+     return;
++   }
+    if([_layerContext respondsToSelector:@selector(setBackingScale:)])
+     [_layerContext setBackingScale:[[self window] backingScaleFactor]];
+    [_layerContext render];
+@@ -2011,7 +2017,24 @@
+     }
+    }
+    sfSFFXClearGPULayer(self,_window);
+-   if((image=[_layerContext createImage])==NULL)
++   image=[_layerContext createImage];
++   if(getenv("SF_WIN_TRACE")!=NULL && [_window level]>=3){
++    size_t nonzero=0,count=0;
++
++    if(image!=NULL){
++     CFDataRef data=CGDataProviderCopyData(CGImageGetDataProvider(image));
++     const uint32_t *px=data?(const uint32_t *)CFDataGetBytePtr(data):NULL;
++
++     count=data?CFDataGetLength(data)/4:0;
++     for(size_t i=0;px!=NULL && i<count;i++)
++      if(px[i]!=0)nonzero++;
++     if(data)CFRelease(data);
++    }
++    fprintf(stderr,"SFWIN layers of window %d (%s): %lu sublayers, contents %p, image %p %zux%zu, %zu/%zu non-zero\n",(int)[_window windowNumber],
++            object_getClassName(_window),(unsigned long)[[_layer sublayers] count],[_layer contents],(void *)image,
++            image?CGImageGetWidth(image):0,image?CGImageGetHeight(image):0,nonzero,count);
++   }
++   if(image==NULL)
+     return;
+    // a view with a layer draws into a bitmap of its own, so this goes to the window's context directly
+    NSGraphicsContext *windowContext=[[self window] graphicsContext];

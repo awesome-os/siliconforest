@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SCRIPT_RAM_AND_PACKET_REVIEW_NO_HARDWARE",
+  "reviewed": {
+    "script": "integrations/puredarwin/chonkstep-darwin/darwin-native-live-test c06a481ff0edf7b6 (diff base: qualified darwin-native-startup-test dcba72de)",
+    "criteria": "reports/sprint-010/native-live-supervisor-source-and-criteria.json f2ba27f1 (PRE_CAPTURE)",
+    "ram": "artifacts/m1-desktop-010/native-live-candidate-001 (complete packet: manifest, kernel, source.patch, build record, RAM 92b26ce51d303332)"
+  },
+  "verdict": "APPROVE the live-only script, its timing and the live RAM. The change is minimal and mirrors the qualified 008 live pattern: observer 120 s, one read-only '--phase live' export after 'sleep 85', placed before the wait, replacing the closed export. Labels become DL12_NATIVE_LIVE_*. The input-free startup path (inventory gate, keyboard-node wait, mouse refusal, keyboard-only compositor, cleanup trap) is unchanged, and the live RAM differs from the qualified startup001 RAM only in this script. Live mode makes no cleanup, return or input claim, and the closed001 evidence and rules stay separate and unchanged.",
+  "script_diff": [
+    "Line 2: comment. Line 7: DL12_NATIVE_BEGIN -> DL12_NATIVE_LIVE_BEGIN.",
+    "Observer '--seconds 80' -> '--seconds 120' (same binary bea5f11d, same nonce and socket).",
+    "Inserted after the client launch: 'sleep 85; kill -0 \"$client\"; darwin-terminal-records --phase live; DL12_NATIVE_LIVE_RECORDS_<n> phase=live rc=<rc>; kill -0 \"$client\"'.",
+    "The closed export block after the wait is removed. The STATUS, RETURN and END labels gain LIVE_. The cleanup trap, the compositor TERM/wait, the all-zero gate before the footer and the footer text itself are unchanged, but are expected to be unreachable before the host stops."
+  ],
+  "timing": {
+    "assessment": "Consistent with the frozen plan and with measured runs. The host launcher lands about 78 s after guest start (78 s in every run since 003; native startup001 also 78 s). In startup001 the preamble before the client (inventory, node wait, compositor socket) took about 2 s: console closed at +160 s with an 80 s observer plus reap. So the live export starts at about 78-80 + 2 + 85 = 165-167 s, inside the planned 164-168. It is four small prefix records (startup001 RX was 93 bytes), giving at least about 12 s of margin before the 180 s host stop. The 008 live terminal used the same 120 s/85 s pattern and finished its export before capture. The observer's own deadline is about launch + 2 + 120 = 200-202 s, after the host stop, so the window is still live in the captured frame.",
+    "risk": "If the launch slipped by more than about 12 s, the export could be cut off by the host stop. The strict decoder then rejects it, which fails closed and is never accepted as partial."
+  },
+  "verified": [
+    "No input source: the script writes nothing to the PTY or any HID node and prints no SOH. The host is sealed after the launcher (09cd), as in startup001.",
+    "The guards are fail-closed: under 'set -eu' a failing 'kill -0' exits through the cleanup trap. No LIVE_RECORDS line is then printed, and the compositor is TERMed, so no live window remains to capture.",
+    "The live RAM record has 308 files, the same as startup001's except /usr/bin/darwin-desktop-test (dcba72de -> c06a481f, 2568 -> 2631 bytes). The image itself, checked with read-only debugfs (image hash unchanged), has all 308 record files hash- and size-matched. A full tree walk gives 10,017 entries each, differing only in that file's size.",
+    "Pixel replay applies unchanged: the observer's grid.rs 1fd4c8ec, render.rs 9a145a72 and IBMPlexMono 6a3412f0 equal the qualified rev2 terminal's and my scratch termrender sources. The window size is unchanged, so the expected 898x577 frame and 896x544 body at (1,24) carry over from 008. The window title is 'Chonkstep — native keyboard startup (input unverified)' (main.rs:476)."
+  ],
+  "notes": [
+    {
+      "id": "L1",
+      "severity": "qualification",
+      "text": "'kill -0' succeeds on a child that has exited but not yet been reaped, so it does not prove liveness. If the observer failed early (for example no readiness), the export could still print LIVE_RECORDS rc=0. The qualification must therefore require the nonce-bound DL12_NATIVE_STARTUP_READY, no 'darwin-wayland-terminal-native-startup:' error line, no DL12_NATIVE_STARTUP_DONE before capture, and the live window present in the pixels. The frozen criteria already list these."
+    },
+    {
+      "id": "L2",
+      "severity": "qualification",
+      "text": "Live mode has no result.json, so frames, ready and cleanup are not recorded. The evidence is READY plus the four prefix records (file_bytes_after == bytes), PTY TX 0, and an exact pixel replay of the exported RX over the whole 896x544 body. With about 93 bytes of shell prompt, the body is mostly background plus '$'. The replay is still exact over every pixel, including cursor and glyph ink."
+    },
+    {
+      "id": "L3",
+      "severity": "qualification",
+      "text": "Title text check: the compositor draws the title (wm-theme render_decoration, vector font). I will check the frame geometry, border, title-bar fill, buttons and resize bar against the 008 frame, then read the title text from the cropped pixels. An exact glyph match would need a separate renderer harness, so the report will say exactly what was compared."
+    }
+  ],
+  "packet": {
+    "verdict": "APPROVE the concrete native-live-candidate-001 bindings. Only the supervisor changes relative to the qualified native startup001 packet.",
+    "manifest": "The 4 sha256 values match: kernel eedf248b001fe2b6 (38932376), source.patch b138dc6cd2c1ba12 (339309), build record b3cb10f1e9045d17 (162723), ramdisk 92b26ce51d303332 (503316480). Pins and purpose are unchanged.",
+    "kernel_and_source": "kernel.macho and source.patch are byte-identical (cmp) to native-startup-candidate-001, so the KC review (native-startup-candidate001-packet-review.json) carries over unchanged.",
+    "build_record": "BUILT_NOT_BOOTED, exit 0, same kernel/source hashes. native_keyboard_desktop_experiment {1, PDM1SPIHID, pdhid-keyboard, false} and desktop_experiment are unchanged, and no terminal/virtual/keyboard experiment key is present. Every difference from startup001 is a live-mode field: capture_plan (app 120, export 85, launch 79-82, export 164-168, live true), desktop_test_mode, evidence_rule, hardware_gate, not_claimed, prior_native_closed_evidence, ramdisk (sha, guest script c06a481f, payload record 4f35d69a, scope), and the RAM member list, where only /usr/bin/darwin-desktop-test changes. components.native_supervisor.criteria equals the frozen criteria file. host_input_sources pin 09cd/cce9/689a/2b89.",
+    "host_gate": "The live host (now 09cd5735), run offline on this manifest, gives native_keyboard_desktop true, desktop true, and keyboard/virtual/terminal false."
+  },
+  "measured_timing": "Root's runs/m1-desktop-010/native-startup001-host-timing.json (from console birth): desktop launcher +78.219 s, core +180.250 s, framebuffer +182.129 s. The live export therefore starts at about 78.2 + 2 + 85 = 165.2 s, about 15 s before the host stop at 180.25 s. The observer deadline is about 200 s, so the window is live at capture.",
+  "not_claimed": [
+    "runtime",
+    "app or child cleanup from the live capture",
+    "native physical input",
+    "fresh panel witness",
+    "GPU",
+    "Wi-Fi"
+  ],
+  "scope": "Read-only script, criteria and RAM review (read-only debugfs). No hardware, SSH, builds or edits."
+}

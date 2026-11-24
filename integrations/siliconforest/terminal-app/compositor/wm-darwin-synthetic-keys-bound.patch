@@ -1,0 +1,79 @@
+diff --git a/crates/wm-darwin/src/input.rs b/crates/wm-darwin/src/input.rs
+index c4a95f5..b215f2a 100644
+--- a/crates/wm-darwin/src/input.rs
++++ b/crates/wm-darwin/src/input.rs
+@@ -842,7 +842,15 @@ impl Server {
+             // a swipe changes the Space the owner looks at
+             Event::Swipe{..} if active=>return Err("the owner is active: a synthetic swipe would change his Space; refused".into()),
+             Event::Key{evdev,down}=>{
+-                let target=self.input.as_ref().unwrap().key_target.clone().filter(|s|smithay::reexports::wayland_server::Resource::is_alive(s));
++                // DESK8: the window the request aimed at, still alive and mapped; never another one
++                let target=self.input.as_ref().unwrap().key_target.clone().filter(|s|smithay::reexports::wayland_server::Resource::is_alive(s)
++                    && self.wm.backend().window_for_surface(s).is_some_and(|id|self.wm.backend().windows.get(&id).is_some_and(|w|w.mapped)));
++                if target.is_none() && self.input.as_ref().unwrap().key_target.is_some() {
++                    // the window went in the middle of the request: the rest of its keys go nowhere
++                    let input=self.input.as_mut().unwrap();
++                    input.key_target=None;
++                    if input.kb_lent.take().is_some() {eprintln!("WMINJECT the synthetic keys' window went (destroyed, unmapped or its client gone): the rest of the request's keys are dropped");}
++                }
+                 // DESK8: never to whatever window has the focus (TERM8, 23:56Z: its target window had gone and its
+                 // keys went into the desk's terminal): without a live target the instrument's keys are dropped
+                 if target.is_none() {
+diff --git a/crates/wm-darwin/tests/wayland_shm.rs b/crates/wm-darwin/tests/wayland_shm.rs
+index 457c269..9b8a3f6 100644
+--- a/crates/wm-darwin/tests/wayland_shm.rs
++++ b/crates/wm-darwin/tests/wayland_shm.rs
+@@ -1872,3 +1872,53 @@ fn the_clipboard_is_kept_when_the_application_that_copied_quits(){
+     let mut text=String::new();read.read_to_string(&mut text).unwrap();
+     assert_eq!(text,"copied in A");
+ }
++
++/// DESK8 (the coordinator's safety item; FXQA's Return into the desk's terminal): the instrument's keys are
++/// bound to the window it pressed in. When that window's client goes in the middle of a request, the rest
++/// of the keys are refused and no other client gets any of them (before: they went to the focused window).
++#[test]
++#[cfg(feature="desktop-shell")]
++fn synthetic_keys_whose_window_went_reach_no_other_window(){
++    use wm_darwin::hid::{Event,Motion};
++    let(h,connection)=Harness::with_input(true);
++    let (server_end,client_end)=UnixStream::pair().unwrap();
++    h.tx.send(Request::AddClient(server_end)).unwrap();
++    let other=Connection::from_socket(client_end).unwrap();
++    let(mut qb,mut cb,_sb,_tb)=map_with_seat(&other);
++    let a_window;
++    {
++        let(mut qa,mut ca,_sa,_ta)=map_with_seat(&connection);
++        for _ in 0..3{h.snapshot();qa.roundtrip(&mut ca).unwrap();qb.roundtrip(&mut cb).unwrap();}
++        let shot=h.snapshot();
++        assert_eq!(shot.windows.len(),2,"{:?}",shot.windows);
++        a_window=shot.windows.iter().map(|w|w.0).find(|r|r.size.w>0).unwrap();
++        // the newest window is A here: press in it
++        let a=shot.windows[1].0;
++        let p=wm_core::Point::new(a.pos.x+a.size.w as i32/2,a.pos.y+a.size.h as i32/2);
++        let abs=Motion::Absolute(((f64::from(p.x)+0.25)/319.*65535.).round() as u16,((f64::from(p.y)+0.25)/239.*65535.).round() as u16);
++        let virt=|e:Event|{let(tx,rx)=mpsc::channel();h.tx.send(Request::Virtual(e,tx)).unwrap();rx.recv_timeout(Duration::from_secs(3)).unwrap()};
++        virt(Event::Pointer{motion:abs,buttons:0,wheel:0}).unwrap();
++        virt(Event::Pointer{motion:Motion::Relative(0,0),buttons:1,wheel:0}).unwrap();
++        virt(Event::Pointer{motion:Motion::Relative(0,0),buttons:0,wheel:0}).unwrap();
++        virt(Event::Key{evdev:30,down:true}).unwrap();
++        virt(Event::Key{evdev:30,down:false}).unwrap();
++        for _ in 0..3{h.snapshot();qa.roundtrip(&mut ca).unwrap();qb.roundtrip(&mut cb).unwrap();}
++        assert!(ca.keys.len()>=2,"A, pressed in, got the synthetic key");
++    }
++    // A's client quits in the middle of the request
++    drop(connection);
++    for _ in 0..5{h.snapshot();qb.roundtrip(&mut cb).unwrap();std::thread::sleep(Duration::from_millis(5));}
++    assert_eq!(h.snapshot().windows.len(),1,"A is gone");
++    let _=a_window;
++    let kb=cb.keys.len();
++    let virt=|e:Event|{let(tx,rx)=mpsc::channel();h.tx.send(Request::Virtual(e,tx)).unwrap();rx.recv_timeout(Duration::from_secs(3)).unwrap()};
++    // the rest of the request: a word and Return
++    let mut refused=0;
++    for code in [20u32,30,28] {
++        if virt(Event::Key{evdev:code,down:true}).is_err(){refused+=1;}
++        if virt(Event::Key{evdev:code,down:false}).is_err(){refused+=1;}
++    }
++    for _ in 0..3{h.snapshot();qb.roundtrip(&mut cb).unwrap();}
++    assert_eq!(cb.keys.len(),kb,"no key of the request reached B (the focused window now): {:?}",&cb.keys[kb..]);
++    assert_eq!(refused,6,"every remaining key is refused (reported to the instrument)");
++}

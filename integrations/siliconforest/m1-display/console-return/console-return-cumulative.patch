@@ -1,0 +1,201 @@
+diff --git a/src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.cpp b/src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.cpp
+--- a/src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.cpp
++++ b/src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.cpp
+@@ -1,6 +1,7 @@
+ #include "IOGOPFramebuffer.h"
+ 
+ #include <IOKit/pci/IOPCIDevice.h>
++#include <IOKit/IODeviceTreeSupport.h>
+ 
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/thread_call.h>
+@@ -29,6 +30,7 @@
+ static uint8_t *gFb0Base;
+ static IODeviceMemory *gFb0Memory;
+ static IOMemoryMap *gFb0Map;
++static IOOptionBits gFb0CacheMode = kIOGOPFBMapCacheMode;
+ static size_t gFb0Size;
+ static thread_call_t gFb0RetryCall;
+ static IONotifier *gFb0BSDNotifier;
+@@ -153,7 +155,7 @@
+             return;
+         }
+ 
+-        gFb0Map = gFb0Memory->map(kIOMapAnywhere | kIOGOPFBMapCacheMode);
++        gFb0Map = gFb0Memory->map(kIOMapAnywhere | gFb0CacheMode);
+         if (!gFb0Map) {
+             DEBUG("failed to map /dev/fb0 physical range %p size=%lu\n",
+                   physicalBase, (unsigned long)size);
+@@ -465,6 +467,43 @@
+     self->release();
+ }
+ 
++/*
++ * True for the firmware boot framebuffer on an Apple SoC: published as a
++ * platform nub (not a PCI BAR) under a device tree whose root is "AppleARM".
++ * That buffer is DRAM (inside /chosen dram-base/dram-size, outside XNU-managed
++ * memory) which the display controller scans out without snooping CPU caches.
++ * XNU's boot console already maps it VM_WIMG_WCOMB (Normal non-cacheable).
++ * IOKit's default mode and kIOMapInhibitCache both give VM_WIMG_IO instead,
++ * which pmap turns into Device-GRE for DRAM, and Device memory faults on the
++ * unaligned stores and DC ZVA that memcpy/memset/pixman routinely emit.
++ */
++static bool
++gop_apple_soc_firmware_fb(IOService *provider)
++{
++    IORegistryEntry *root;
++    OSData *compat;
++    bool apple = false;
++
++    if (OSDynamicCast(IOPCIDevice, provider) != NULL)
++        return false;
++    root = IORegistryEntry::fromPath("/", gIODTPlane);
++    if (root == NULL)
++        return false;
++    compat = OSDynamicCast(OSData, root->getProperty("compatible"));
++    if (compat != NULL) {
++        const char *s = (const char *)compat->getBytesNoCopy();
++        unsigned int len = compat->getLength();
++        for (unsigned int o = 0; s != NULL && o < len; o += (unsigned int)strnlen(s + o, len - o) + 1) {
++            if (strncmp(s + o, "AppleARM", len - o) == 0) {
++                apple = true;
++                break;
++            }
++        }
++    }
++    root->release();
++    return apple;
++}
++
+ bool
+ IOGOPFramebuffer::start(IOService *provider)
+ {
+@@ -497,6 +536,13 @@
+     height = bootDisplay.v_height;
+     pitch  = bootDisplay.v_rowBytes;
+     bpp    = 32;
++    if (gop_apple_soc_firmware_fb(provider)) {
++        /* Give the user VRAM mapping (IOFramebufferUserClient honours this
++         * property) and /dev/fb0 the boot console's Normal non-cacheable
++         * attribute instead of the Device default. */
++        setProperty("pd-vram-write-combine", kOSBooleanTrue);
++        gFb0CacheMode = kIOMapWriteCombineCache;
++    }
+     fb0_publish((uint8_t *)fbBase, (size_t)pitch * height);
+ 
+     DEBUG("framebuffer: %dx%d @ %p\n", width, height, fbBase);
+@@ -524,6 +570,72 @@
+     }
+     fb0_unpublish();
+     super::stop(provider);
++}
++
++/*
++ * closeWork calls this virtual method with both the system and framebuffer
++ * gates held. The parent drains server cleanup and clears fServerConnect last;
++ * a replacement server cannot open between that cleanup and this request.
++ * IOGOP has no PM power-state table: state zero is not a scanout-off operation.
++ */
++void
++IOGOPFramebuffer::close(void)
++{
++    const bool hadServer = (fServerConnect != NULL);
++    super::close();
++
++    IOService *provider = getProvider();
++    if (provider == NULL || OSDynamicCast(IOPlatformDevice, provider) == NULL ||
++        !gop_apple_soc_firmware_fb(provider))
++        return;
++
++    enum {
++        NoServer = 1, OwnerRemains = 2, Unavailable = 4, ManagedPower = 8,
++        NoConsole = 16, DifferentFramebuffer = 32, NotText = 64, OptedOut = 128
++    };
++    unsigned int blocked = 0;
++    if (!hadServer)
++        blocked |= NoServer;
++    if (fServerConnect != NULL || fSharedConnect != NULL || captured)
++        blocked |= OwnerRemains;
++    if (isInactive() || provider->isInactive() || dead || suspended)
++        blocked |= Unavailable;
++    if (getPowerState() != 0)
++        blocked |= ManagedPower;
++
++    IOPlatformExpert *platform = getPlatform();
++    PE_Video console;
++    bzero(&console, sizeof(console));
++    if (platform == NULL || platform->getConsoleInfo(&console) != kIOReturnSuccess) {
++        blocked |= NoConsole;
++    } else {
++        /* Keep the retained firmware mapping; never commandeer a new console. */
++        if (fbBase == NULL || width == 0 || height == 0 || pitch == 0 ||
++            (console.v_baseAddr & ~3UL) != (uintptr_t)fbBase ||
++            console.v_width != width || console.v_height != height ||
++            console.v_rowBytes != pitch ||
++            (console.v_depth != 30 && console.v_depth != 32))
++            blocked |= DifferentFramebuffer;
++        if (console.v_display != 2)
++            blocked |= NotText;
++    }
++
++    uint32_t textBoot = 1, mirror = 0, gopConsole = 0;
++    PE_parse_boot_argn("pdtextboot", &textBoot, sizeof(textBoot));
++    PE_parse_boot_argn("serial_video_mirror", &mirror, sizeof(mirror));
++    PE_parse_boot_argn("gopconsole", &gopConsole, sizeof(gopConsole));
++    if (textBoot == 0 || (mirror == 0 && gopConsole == 0))
++        blocked |= OptedOut;
++
++    if (blocked != 0) {
++        IOLog("IOGOP: console-return skip=0x%02x\n", blocked);
++        return;
++    }
++    /* Explicit ownership return uses kernel003's existing route restoration.
++     * Do not force mode, paint directly, or claim that a panel was observed. */
++    IOReturn result = platform->setConsoleInfo(NULL, kPEAcquireScreen);
++    IOLog("IOGOP: console-return acquire-request result=0x%08x\n",
++          (unsigned int)result);
+ }
+ 
+ void * IOGOPFramebuffer::getBaseAddress(void) { return fbBase; }
+@@ -559,6 +671,10 @@
+         case 24:
+         case 32:
+             ret = IO32BitDirectPixels;
++            break;
++        case 30:
++            // Apple firmware boot framebuffer: 10-bit RGB in a 32-bit word
++            ret = kIO30BitDirectPixels;
+             break;
+     }
+ 
+@@ -686,6 +802,19 @@
+             info->componentCount        = 3;
+             info->bitsPerComponent      = 8;
+             break;
++        case 30:
++            // Apple firmware boot framebuffer (boot-args depth 30): one
++            // native little-endian 32-bit word per pixel, R[29:20] G[19:10]
++            // B[9:0], bits 31:30 unused. 30-bit colour, 32-bit storage.
++            strlcpy(info->pixelFormat, kIO30BitDirectPixels, sizeof(info->pixelFormat));
++            info->pixelType     = kIORGBDirectPixels;
++            info->componentMasks[0] = 0x3ff00000;
++            info->componentMasks[1] = 0x000ffc00;
++            info->componentMasks[2] = 0x000003ff;
++            info->bitsPerPixel  = 32;
++            info->componentCount        = 3;
++            info->bitsPerComponent      = 10;
++            break;
+     }
+ 
+     return (kIOReturnSuccess);
+diff --git a/src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.h b/src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.h
+--- a/src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.h
++++ b/src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.h
+@@ -25,6 +25,7 @@
+     IOService * probe(IOService * provider, SInt32 * score) override;
+     virtual bool start(IOService * provider) override;
+     virtual void stop(IOService * provider) override;
++    virtual void close(void) override;
+     virtual void * getBaseAddress();
+     virtual uint32_t getWidth();
+     virtual uint32_t getHeight();

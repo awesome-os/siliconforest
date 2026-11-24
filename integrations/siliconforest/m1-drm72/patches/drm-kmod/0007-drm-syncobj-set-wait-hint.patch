@@ -1,0 +1,63 @@
+--- a/include/drm/drm_file.h
++++ b/include/drm/drm_file.h
+@@ -321,6 +321,10 @@
+ 	/** @syncobj_table_lock: Protects @syncobj_idr. */
+ 	spinlock_t syncobj_table_lock;
+ 
++	/* Driver-provided recent-feeder hint, protected by table_lock. */
++	unsigned int syncobj_wait_util_min;
++	unsigned long syncobj_wait_hint_until;
++
+ 	/** @filp: Pointer to the core file structure. */
+ 	struct file *filp;
+ 
+--- a/include/drm/drm_syncobj.h
++++ b/include/drm/drm_syncobj.h
+@@ -135,4 +135,7 @@
+ 			   struct drm_syncobj *syncobj, u32 *handle);
+ int drm_syncobj_get_fd(struct drm_syncobj *syncobj, int *p_fd);
+ 
++void drm_syncobj_set_wait_hint(struct drm_file *file, unsigned int util_min,
++			       unsigned int duration_ms);
++
+ #endif
+--- a/drivers/gpu/drm/drm_syncobj.c
++++ b/drivers/gpu/drm/drm_syncobj.c
+@@ -1043,6 +1043,37 @@
+ 	list_del_init(&wait->node);
+ }
+ 
++/**
++ * drm_syncobj_set_wait_hint - tag recent GPU-feeder work on an open DRM file
++ * @file: submitting client
++ * @util_min: scheduler capacity hint, bounded to 1024
++ * @duration_ms: validity for subsequent waits, bounded to one second
++ *
++ * This changes no scheduling attribute or affinity. A blocking syncobj wait
++ * may use the hint in a balanced kernel scope while this recent-work tag is
++ * valid. Sleeping tasks consume no CPU; the scope is removed before return.
++ */
++void drm_syncobj_set_wait_hint(struct drm_file *file, unsigned int util_min,
++			       unsigned int duration_ms)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&file->table_lock, flags);
++	file->syncobj_wait_util_min = min(util_min, 1024u);
++	file->syncobj_wait_hint_until = jiffies +
++		msecs_to_jiffies(min(duration_ms, 1000u));
++	spin_unlock_irqrestore(&file->table_lock, flags);
++}
++EXPORT_SYMBOL_GPL(drm_syncobj_set_wait_hint);
++
++/*
++ * SiliconForest: Linux consumes the hint in drm_syncobj_array_wait_timeout(),
++ * which raises the waiting task's utilisation clamp for the duration of the
++ * wait through sched_util_min_scope_enter(), a Linux scheduler interface.
++ * There is no equivalent on this platform, so the hint is recorded above and
++ * not acted on.
++ */
++
+ static signed long drm_syncobj_array_wait_timeout(struct drm_syncobj **syncobjs,
+ 						  void __user *user_points,
+ 						  uint32_t count,

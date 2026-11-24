@@ -1,0 +1,58 @@
+#!/bin/sh
+# Finite terminal-close experiment. Input comes only from the host HID path.
+set -eu
+nonce=${1-}
+case "$nonce" in ''|*[!0-9a-f]*) exit 2 ;; esac
+[ "${#nonce}" -eq 48 ] || exit 2
+printf '\nDL10_BEGIN_%s\n' "$nonce"
+runtime=/private/var/run/darwin-desktop
+mkdir -p "$runtime"
+chmod 0700 "$runtime"
+export XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=wayland-0
+export XKB_CONFIG_ROOT=/usr/share/X11/xkb TMPDIR=/private/tmp
+compositor=
+client=
+cleanup() {
+    trap - EXIT HUP INT TERM
+    if [ -n "$client" ]; then kill -TERM "$client" 2>/dev/null || :; wait "$client" 2>/dev/null || :; fi
+    if [ -n "$compositor" ]; then kill -TERM "$compositor" 2>/dev/null || :; wait "$compositor" 2>/dev/null || :; fi
+}
+trap cleanup EXIT HUP INT TERM
+printf 'DL11_TERMINAL_PRIME_%s\n' "$nonce"
+count=0
+while [ ! -c /dev/usb_hid_kbd ] || [ ! -c /dev/usb_hid_mouse ]; do
+    count=$((count + 1))
+    [ "$count" -le 50 ] || exit 1
+    sleep 0.1
+done
+sleep 0.5
+/usr/bin/chonkstep-darwin --run --socket "$runtime/wayland-0" --input sfhid &
+compositor=$!
+count=0
+while [ ! -S "$runtime/wayland-0" ]; do
+    kill -0 "$compositor"
+    count=$((count + 1))
+    [ "$count" -le 100 ] || exit 1
+    sleep 0.1
+done
+printf 'DL10_SERVER_SOCKET_%s\n' "$nonce"
+/usr/bin/darwin-wayland-terminal --socket "$runtime/wayland-0" --nonce "$nonce" --seconds 80 &
+client=$!
+client_rc=0
+if wait "$client"; then :; else client_rc=$?; fi
+client=
+records_rc=0
+if /usr/bin/darwin-terminal-records --directory "$runtime/terminal-$nonce" --nonce "$nonce" --phase closed; then :; else records_rc=$?; fi
+printf 'DL11_TERMINAL_RECORDS_%s phase=closed rc=%s\n' "$nonce" "$records_rc"
+kill -TERM "$compositor" 2>/dev/null || :
+compositor_rc=0
+if wait "$compositor"; then :; else compositor_rc=$?; fi
+compositor=
+printf 'DL11_TERMINAL_STATUS_%s client=%s compositor=%s records=%s\n' "$nonce" "$client_rc" "$compositor_rc" "$records_rc"
+[ "$client_rc" -eq 0 ] && [ "$compositor_rc" -eq 0 ] && [ "$records_rc" -eq 0 ]
+printf '\nCHONKSTEP TERMINAL CLOSED - DARWIN TEXT CONSOLE\n'
+printf 'DL11_TERMINAL_RETURN_%s\n' "$nonce"
+/bin/uname -s
+/bin/uname -m
+/bin/uname -r
+printf 'DL10_END_%s\n' "$nonce"

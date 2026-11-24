@@ -1,0 +1,127 @@
+{
+  "schema_version": 1,
+  "revision": 1,
+  "owner": "Astra",
+  "status": "FROZEN_SOURCE_HOST_SANITIZERS_PASS_NOT_SDK_BUILT_OR_RUNTIME_QUALIFIED",
+  "prepared_utc": "2026-11-08T21:31:02.863678+00:00",
+  "source_set_sha256": "2cfaa889327f7ebf9c4f22a28988b8206ca841b72b41ef8997ca10901ba95e42",
+  "source_set_format": "sha256 two spaces leaf-relative path LF sorted; only7 owned source/test files; receipt and root-owned contract/recipes excluded",
+  "files_sha256": {
+    "adapter/CMakeLists.txt": "d01a432df699f00c1cc4d095b708364f90c132ef6db1a5a8594fdaa8177e5e89",
+    "adapter/SFM1SPIHID.cpp": "15481a8e67e0a0d1b1e01665fc46304845c8e246e0883190c1e99ebb527e8995",
+    "adapter/SFM1SPIHID.h": "53523704a195ce00712345edb620d9aa0c57f9aa610a04299ad663628132b5ab",
+    "core/m1tp_trace.c": "c13aff0fb61a4086f5b21fa8e43e1e98818f29ccf903812fc1041bd492c7fbb0",
+    "core/m1tp_trace.h": "d206427dd3b9badf6dc46c9d47deeee636cc3eb7d9013de20d1f31082ce727b0",
+    "test_trace.c": "2e4c7acdfed56fe9022dc488383fc42cac2ee713042749e134aacaa439c04104",
+    "test_trace.py": "ab738ef0aac6a949006b56c0ce610c6bb5a2429c1d032265ecad613d7699c533"
+  },
+  "changed_existing_files": {
+    "adapter/SFM1SPIHID.cpp": {
+      "before_path": "integrations/siliconforest/m1-trackpad-child/adapter/SFM1SPIHID.cpp",
+      "before_sha256": "a67a038d057560b1fe83dd31266d62b805f5bddf35a723ead460e093689c3994",
+      "after_sha256": "15481a8e67e0a0d1b1e01665fc46304845c8e246e0883190c1e99ebb527e8995"
+    },
+    "adapter/SFM1SPIHID.h": {
+      "before_path": "integrations/siliconforest/m1-trackpad-child/adapter/SFM1SPIHID.h",
+      "before_sha256": "35f3bfd4ab1db558d580222ed19d08c0ef7579f2fbb33195deb3017e41056855",
+      "after_sha256": "53523704a195ce00712345edb620d9aa0c57f9aa610a04299ad663628132b5ab"
+    },
+    "adapter/CMakeLists.txt": {
+      "before_path": "integrations/siliconforest/m1-trackpad-child/adapter/CMakeLists.txt",
+      "before_sha256": "0128931ce905fa81e684553bb73b9d3444c7bc7e36735b3c93b0cf906f875ca7",
+      "after_sha256": "d01a432df699f00c1cc4d095b708364f90c132ef6db1a5a8594fdaa8177e5e89"
+    }
+  },
+  "adapter_unified_diff": "--- frozen-T2/SFM1SPIHID.cpp\n+++ trace/SFM1SPIHID.cpp\n@@ -84,6 +84,7 @@\n     childState.version=DL_M1_TP_CHILD_STATE_VERSION;\n     childState.byte_size=sizeof(childState);\n     t2Dispatches=0; childObserved=0; childRejected=0; childSubmitted=0;\n+    m1tp_trace_init(&trackpadTrace);\n     return super::init(properties);\n }\n IOService *SFM1SPIHID::probe(IOService *provider, SInt32 *score)\n@@ -322,6 +323,8 @@\n     SFM1SPIHID *self=OSDynamicCast(SFM1SPIHID,owner);\n     if (!self || self->stopping || !self->published) return;\n     if (self->t2Enabled && __atomic_load_n(&self->t2Phase,__ATOMIC_ACQUIRE)!=1) return;\n+    if (self->t2Enabled && m1tp_trace_announce(&self->trackpadTrace))\n+        IOLog(\"DL24_TP_TRACE version=1 passive=1 cap02=16 cap3f=2 cap44=1 motion_reserved=1\\n\");\n     struct dlsp_message message;\n     /* A bounded batch lets other workloop users run, even with ready held low.\n      * Partial messages remain in the bounded heap reassembly buffer. */\n@@ -351,6 +354,7 @@\n                 IOLog(\"SFM1SPIHID: first device-1 input report accepted by IOHID; physical typing not yet verified\\n\");\n             }\n         } else if (self->t2Enabled && message.device==2 && message.flags==0x20 && message.command==0x10) {\n+            self->traceTrackpad(&message);\n             self->routeTrackpad(&message);\n         } else {\n             /* Management/trackpad/aux reports are consumed but never relabeled\n@@ -361,6 +365,22 @@\n     self->publishCounters(false);\n     if (!self->stopping && self->pollTimer->setTimeoutMS(2)!=kIOReturnSuccess)\n         self->fail(M1KBD_IO,\"timer-rearm\");\n+}\n+void SFM1SPIHID::traceTrackpad(const struct dlsp_message *message)\n+{\n+    struct m1tp_trace_record r;\n+    if (!m1tp_trace_select(&trackpadTrace,message,&r)) return;\n+    IOLog(\"DL24_TP_BEGIN seq=%u id=%02x bytes=%u reason=%u seen02=%u seen3f=%u seen44=%u\\n\",\n+          (unsigned)r.sequence,(unsigned)r.report_id,(unsigned)r.bytes,(unsigned)r.reason,\n+          (unsigned)r.seen02,(unsigned)r.seen3f,(unsigned)r.seen44);\n+    char hex[129];\n+    for (size_t index=0;index<(r.bytes+63u)/64u;index++) {\n+        (void)m1tp_trace_hex(message->payload,r.bytes,index,hex);\n+        IOLog(\"DL24_TP_HEX seq=%u index=%u data=%s\\n\",\n+              (unsigned)r.sequence,(unsigned)index,hex);\n+    }\n+    IOLog(\"DL24_TP_END seq=%u bytes=%u crc16=%04x\\n\",\n+          (unsigned)r.sequence,(unsigned)r.bytes,(unsigned)r.crc16);\n }\n void SFM1SPIHID::publishCounters(bool force)\n {\n--- frozen-T2/SFM1SPIHID.h\n+++ trace/SFM1SPIHID.h\n@@ -4,6 +4,7 @@\n #include \"SFM1KeyboardHW.h\"\n #include \"native_protocol/dl_spi_hid.h\"\n #include \"m1kbd_hid.h\"\n+#include \"m1tp_trace.h\"\n /* Layout first: it defines and undefines its own one-argument assert macro. */\n #include \"observation_layout.h\"\n #include \"m1tp_enum.h\"\n@@ -79,6 +80,8 @@\n     bool publishChildState();\n     void removeChildState();\n     void childFault(int32_t);\n+    struct m1tp_trace_state trackpadTrace;\n+    void traceTrackpad(const struct dlsp_message *);\n     void routeTrackpad(const struct dlsp_message *);\n     static void poll(OSObject *, IOTimerEventSource *);\n     static IOReturn startGated(OSObject *, void *, void *, void *, void *);\n--- frozen-T2/CMakeLists.txt\n+++ trace/CMakeLists.txt\n@@ -4,7 +4,7 @@\n set_property(TARGET SFM1SPIHID.kext PROPERTY OUTPUT_NAME SFM1SPIHID)\n target_sources(SFM1SPIHID.kext PRIVATE\n     SFM1SPIHID.cpp SFM1KeyboardHW.cpp m1kbd_board.c m1kbd_pio.c m1kbd_hid.c\n-    native_protocol/dl_spi_hid.c m1tp_enum.c SFM1SPITrackpad.cpp m1tp_child_policy.c)\n+    native_protocol/dl_spi_hid.c m1tp_enum.c SFM1SPITrackpad.cpp m1tp_child_policy.c m1tp_trace.c)\n target_include_directories(SFM1SPIHID.kext PRIVATE\n     ${CMAKE_CURRENT_SOURCE_DIR}\n     ${CMAKE_CURRENT_SOURCE_DIR}/../IOHIDFamily/IOHIDSystem\n",
+  "dependency_files_sha256": {
+    "integrations/siliconforest/m1-trackpad-child/adapter/CMakeLists.txt": "0128931ce905fa81e684553bb73b9d3444c7bc7e36735b3c93b0cf906f875ca7",
+    "integrations/siliconforest/m1-keyboard/Info.plist": "fcf63029ecbbc8271f381f3e8f26656e41c73b3e22a488edb9069746d20de50f",
+    "integrations/siliconforest/m1-keyboard/SFM1KeyboardHW.cpp": "0483c13af2b72b74f3e550a1be38a4c6c26cccaabf177d0bc8a835a40d844990",
+    "integrations/siliconforest/m1-keyboard/SFM1KeyboardHW.h": "6d8c889eac0aaed41601de4b1d749b2e994968a2df289ef1aa92dcdb8873716c",
+    "integrations/siliconforest/m1-trackpad-child/adapter/SFM1SPIHID.cpp": "a67a038d057560b1fe83dd31266d62b805f5bddf35a723ead460e093689c3994",
+    "integrations/siliconforest/m1-trackpad-child/adapter/SFM1SPIHID.h": "35f3bfd4ab1db558d580222ed19d08c0ef7579f2fbb33195deb3017e41056855",
+    "integrations/siliconforest/m1-trackpad-child/adapter/SFM1SPIHIDChild.inc": "7e51fb0a6c755d28bcce4c8bd72582f81867c2f677eac73fcd31729b85822802",
+    "integrations/siliconforest/m1-trackpad-child/adapter/SFM1SPITrackpad.cpp": "5dd0bf4172151446b1fecddfd69c5ae91a5975c194d9238190fec4662de0373b",
+    "integrations/siliconforest/m1-trackpad-child/adapter/SFM1SPITrackpad.h": "1d2c224140b86b119042087d5d4d152ab5b9d4039d33139cdbd3986dcc348cde",
+    "integrations/siliconforest/m1-trackpad-child/child_state.h": "991922e8efb2cfa3bf9ace432079d0a97530093e1a9f4cc3858d9694f2bef99c",
+    "integrations/siliconforest/m1-keyboard/m1kbd_board.c": "d02e4a86f01a10a33eb75043a467bf0a191c16fb69e82134b8c5545b6d660a89",
+    "integrations/siliconforest/m1-keyboard/m1kbd_hid.c": "c4b9248c1b740d66bc6e39b2106ec3c67cb7e2d0e034d03386b6e920d34dddee",
+    "integrations/siliconforest/m1-keyboard/m1kbd_hid.h": "0badc44929aee8ed18949684bc17cc51f6e81ebc06650f06d2f64ccd0dc36c85",
+    "integrations/siliconforest/m1-keyboard/m1kbd_hw.h": "a6fecae107fa4d29c0ee3d62eb1287bcc148af8cb5628ae1404b51da95be1970",
+    "integrations/siliconforest/m1-keyboard/m1kbd_pio.c": "3af8a6bd82db427b9d3695634916bec57eea506c4a7768b686608f06f656bea3",
+    "integrations/siliconforest/m1-trackpad-child/adapter/m1tp_child_policy.c": "c4b68408ee1ef53dc3704005fef89650b26df17616cbede045d350d761c495cc",
+    "integrations/siliconforest/m1-trackpad-child/adapter/m1tp_child_policy.h": "1c892b8a9165dfdefddf5378daea2ae4224c4027fcf92f3e6364deedfdd9bd7a",
+    "integrations/siliconforest/m1-trackpad-enum/core/m1tp_enum.c": "1b6cff1b4f2071ffa916965be3e89e89f062728aff97454052587c75bb1288b5",
+    "integrations/siliconforest/m1-trackpad-enum/core/m1tp_enum.h": "8a90316d98ca5ad97cc2a147128145dbcac1ff75009d94c03fdedae50d4a4083",
+    "integrations/siliconforest/m1-keyboard/native_protocol/dl_spi_hid.c": "88f2ae23fc527affa440fe5ee7309ac9b566de6c842cdb3e0d03dd054bf53103",
+    "integrations/siliconforest/m1-keyboard/native_protocol/dl_spi_hid.h": "c58d84b1965812b65210d0f0c794b577a6dcfecef1a5dc449e2ae1fc6fe5d5ec",
+    "integrations/siliconforest/m1-trackpad-enum/observation_layout.h": "a6990ec48d99cfa02daef765b84c543cab19ee66ce50cc8723bf90e0dd859a96",
+    "runs/m1-desktop-010/trackpad-child-reference-001/trackpad_reference.h": "a66853f0ae967d79f3f1c4c34ad80d09e6df41ecdcdc05025e53b6f16a6d3eb7",
+    "integrations/siliconforest/m1-trackpad-child/source-manifest.json": "8e5413dad5de877ac256c6c3660a1189244cfac0a4f3fb91c6426a684568850c",
+    "integrations/siliconforest/m1-trackpad-child/test_child.py": "fd351e9dd134f540eb35130327e43293fa9309efb659b937764c35f1f3f581e3",
+    "integrations/siliconforest/m1-trackpad-child/tests/fake_iokit.h": "42a8bc2b1da552563e88f9fd557bff6a1cf7dacf3b358a913fb84c5b7d426374",
+    "integrations/siliconforest/m1-trackpad-child/tests/lifecycle_main.cpp": "d7d4ae51a0a3894eae5eae5bbcf1248fec52691eeb2ad9c39b3966132911bc3e",
+    "integrations/siliconforest/m1-trackpad-input-trace/TRACE_CONTRACT.json": "5490927e36603116d7f130ceed28765069bc7eb6ab400679e6998ec9a09a5ad9"
+  },
+  "production_inputs": {
+    "override_frozen_T2": [
+      "adapter/SFM1SPIHID.cpp",
+      "adapter/SFM1SPIHID.h",
+      "adapter/CMakeLists.txt"
+    ],
+    "add_to_module_root": {
+      "m1tp_trace.c": "core/m1tp_trace.c",
+      "m1tp_trace.h": "core/m1tp_trace.h"
+    },
+    "composition": "Root recipe layers these5 files over exact frozen T2 23-input composition to make25 SDK inputs. No other frozen production byte changes. Root owns recipe/composition/SDK/KC."
+  },
+  "scope": {
+    "passive_input_only": true,
+    "tap": "Only existing runtime t2Enabled && device2 && flags0x20 && command0x10 branch, synchronously immediately before unchanged routeTrackpad; no borrowed pointer retained.",
+    "init": "m1tp_trace_init silently zeros private member in init(). First active poll after nonstopping/published/phase1 guards announces once, even with zero reports. t2Enabled required; rematched constructors never announce.",
+    "selection": "First16 exact8-byte report02 including invalid -128 axis values; first2 exact17-byte3f; first1 exact1752-byte44. Reserve one extra02 only if no prior logged02 has both axes !=-128 and at least one nonzero axis. Maximum20. All exact8 report02 count toward seen02 even invalid-range/uncaptured values. Counters saturate UINT32_MAX. Unknown IDs, wrong lengths/identity and keyboard/otherdevice payloads never traced.",
+    "steering": "Root precision after initial contract: ordinary report02 cap includes out-of-descriptor-range -128 raw bytes; only reserved motion selection requires valid range. No invalid data is relabeled as motion.",
+    "wire": "Exactly root DL24 TRACE/BEGIN/HEX/END formats; sequence starts1 and each selected record increments once;64-byte chunks except final, lowercasehex, CRC16/ARC via unchanged original dlsp_crc16 over exact payload including ID.1752-byte report44 has28 chunks with final24 bytes.",
+    "stack": "Adapter uses char hex[129] and small scalar record; no new heap allocation, async path, callback owner, report copy, transport read/write or formatting allocation. One fixed-format IOLog call per whole line; hexadecimal buffer stores128chars+NUL.",
+    "limitations": "Source guarantees bounded attempted IOLog records. Host must detect dropped/truncated/interleaved records using full lines/sequence/chunk indexes/length/CRC; IOLog provides no serial delivery acknowledgement. This source/test result is not raw report/runtime/input/panel proof.",
+    "preserved": "Exact descriptor compare/copy, child gates/report route/open/stop/free, five one-use request keys, CRC/reassembly/transport/power/PIO and all other methods restored byte-identically by source guard. No Feature/mode/output/D9/device3 request or new retry."
+  },
+  "host_validation": {
+    "command": "python3 -B integrations/siliconforest/m1-trackpad-input-trace/test_trace.py",
+    "result": "PASS",
+    "groups": 5,
+    "elapsed_seconds": 9.529,
+    "sanitizers": [
+      "AddressSanitizer",
+      "UndefinedBehaviorSanitizer"
+    ],
+    "ASAN_OPTIONS": "detect_leaks=0 (known host LSan restriction; ASan/UBSan remain active)",
+    "checks": [
+      "Real core cap/reserved-motion/invalid-axis capture/saturatingcounter/refusal tests; CRC ARC known vector123456789=bb3d; exact reconstruct1752 from28chunks and129bytecanaries",
+      "Eight assertion-killed compiled policy mutants; explicit -DNDEBUG compilation refusal",
+      "Extracted actual adapter init/poll/traceTrackpad plus frozen parent/child lifetime bodies execute against existing fake IOKit. Existing lifecycle/failure harness remains passing.",
+      "Fake active poll emits initialline once with no input; constructor/notpublished/phase0/legacy path emits none. Real keyboard dispatch emits no raw trace. Actual device2 report44 emits all bytes andCRC before unchanged childhandleReport and preserves exact report copy.",
+      "Python independently parses actual IOLog-format output: exact initial/header/chunkindexes/lowercase/length/byteidentity/CRC; no fabricated firmware/target record.",
+      "Source guard reverses only declared trace additions and reproduces complete frozen parent CPP/header/CMake bytes. No expanded request/dispatch/lifetime behavior."
+    ],
+    "preserved_initial_test_failure": "First local mutation run had1 failure because total20 ceiling masked the raised44 cap. Added an independent vendor cap test; final5groups andall8mutants pass. Production bytes did not change for that test fix.",
+    "scope": "Host fakes and extracted bodies only, no native ABI/SDK/kernel stack/device execution evidence."
+  },
+  "provenance": {
+    "new_core_and_tests": "Original lab implementation authored from root TRACE_CONTRACT and frozen original dlsp API. No GPL implementation copied or relicensed.",
+    "adapter": "Exact inherited frozen T2 C++/header/CMake plus recorded minimal additions; original provenance/source-manifest retained as dependencies.",
+    "protocol": "Original lab native_protocol dl_spi_hid source reused unmodified; no Linux source text copied.",
+    "root_owned_files_not_edited": [
+      "TRACE_CONTRACT.json",
+      "build-input-trace.nix",
+      "build-kc.nix"
+    ]
+  },
+  "not_performed": [
+    "SDK/Nix build",
+    "hardware/SSH/MMIO",
+    "mode/Feature/output/D9/device3 command",
+    "old source/frozen tree/host/controller/packet edit",
+    "physical input or trace qualification"
+  ]
+}

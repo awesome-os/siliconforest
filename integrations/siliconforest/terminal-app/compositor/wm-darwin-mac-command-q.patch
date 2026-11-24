@@ -1,0 +1,60 @@
+--- a/crates/wm-darwin/src/input.rs
++++ b/crates/wm-darwin/src/input.rs
+@@ -20,6 +20,16 @@
+     #[cfg(feature = "desktop-shell")]
+     deferred_focus:bool,
+ }
++impl Server {
++    /// The focused toplevel belongs to a Mac application: its app id is the bundle identifier of an
++    /// application bundle in /Applications.
++    fn focused_is_mac_application(&self) -> bool {
++        let Some(client) = self.wm.focused_client().and_then(|id| self.wm.client(id)) else { return false };
++        let Some(app_id) = self.wm.backend().windows.get(&client.window).and_then(|w| w.app_id.clone()) else { return false };
++        crate::settings::mac_bundle_identifiers().iter().any(|id| *id == app_id)
++    }
++}
++
+ fn modifiers(m:&ModifiersState)->Modifiers {
+     let mut out=Modifiers::empty();out.set(Modifiers::SHIFT,m.shift);out.set(Modifiers::CONTROL,m.ctrl);
+     out.set(Modifiers::ALT,m.alt);out.set(Modifiers::SUPER,m.logo);out
+@@ -174,6 +184,13 @@
+                         if !down && s.input.as_mut().unwrap().suppressed_keys.remove(&evdev){return FilterResult::Intercept(());}
+                         let sym=key.raw_latin_sym_or_raw_current_sym().unwrap_or_else(||key.modified_sym());
+                         let combo=KeyCombo{keysym:sym.raw(),modifiers:mods};
++                        // Command-Q of a Mac application is the application's own (its Quit, which
++                        // asks about running processes and ends every window), as on macOS: the key
++                        // goes to it, not to the desktop's "quit application" (which asked each
++                        // window to close).
++                        if mods==Modifiers::SUPER && (combo.keysym==0x71 || combo.keysym==0x51) && s.focused_is_mac_application(){
++                            return FilterResult::Forward;
++                        }
+                         #[cfg(feature = "desktop-shell")]
+                         if s.desktop.is_some(){
+                             match s.desktop_key(combo,down){
+--- a/crates/wm-darwin/src/settings.rs
++++ b/crates/wm-darwin/src/settings.rs
+@@ -185,6 +185,24 @@
+     found
+ }
+ 
++/// The bundle identifiers (`CFBundleIdentifier` of an XML `Info.plist`) of the application bundles
++/// in [`APPLICATION_DIRS`]: the app ids of Mac applications (their WindowServer names each toplevel
++/// after the bundle identifier). Read when asked, so a bundle installed later is known.
++pub fn mac_bundle_identifiers() -> Vec<String> {
++    let mut ids = Vec::new();
++    for app in applications_in(&APPLICATION_DIRS) {
++        let Ok(text) = std::fs::read_to_string(app.join("Contents/Info.plist")) else { continue };
++        let Some(at) = text.find("<key>CFBundleIdentifier</key>") else { continue };
++        let rest = &text[at..];
++        if let (Some(open), Some(close)) = (rest.find("<string>"), rest.find("</string>")) {
++            if open < close {
++                ids.push(rest[open + 8..close].trim().to_string());
++            }
++        }
++    }
++    ids
++}
++
+ /// What the Applications submenu showed last: a row names its place in this list.
+ static APPLICATIONS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+ 

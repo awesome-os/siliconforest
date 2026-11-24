@@ -1,0 +1,64 @@
+{
+ "schema_version": 1,
+ "reviewer": "Claude (independent read-only design and safety review; not the adapter or decoder author)",
+ "status": "READ_PATH_SAFE_NO_ADAPTER_DESIGN_BLOCKER_CONSOLE_INTERLEAVE_ACCEPTED_BY_ROOT",
+ "subject": "integrations/puredarwin/m1-trackpad-input-trace/TRACE_CONTRACT.json (updated, sha256 5490927e36603116d7f130ceed28765069bc7eb6ab400679e6998ec9a09a5ad9; first read 06e63a08) against the frozen T2 path integrations/puredarwin/m1-trackpad-child/adapter",
+ "scope": "Read-only. Frozen adapter sources, the m1-keyboard native protocol, the private acquired descriptor (parsed locally, no bytes copied), and the frozen shared-shell export decoder. No SSH, hardware, Nix or build. No 005 or live-frame regrading.",
+ "answer": "Yes. Device-2 Input reports can be read and traced without any write. The runtime path contains no write, and a tap at the existing eligibility point inherits that.",
+ "findings": {
+  "R1_no_runtime_write": "PDM1SPIHID::poll (PDM1SPIHID.cpp 320-374) only calls receive(), which calls hardware.readPacket then dlsp_push. Device-2 messages with flags 0x20 and command 0x10 go to routeTrackpad (PDM1SPIHIDChild.inc 189-218), which calls m1tp_child_input and then the child's synchronous handleReport. Neither function writes to the device. The only writePacket in the adapter is inside waitResponse (PDM1SPIHID.cpp 199-232), the enumeration request path.",
+  "R2_five_get_keys": "waitResponse is called exactly five times, with the keys (1,0xd0), (2,1), (0x10,1), (2,2) and (0x10,2) (PDM1SPIHID.cpp 248, 256, 262, 278, 292). Each key is claimed once by m1tp_claim_request and never released. The runtime poll issues none. A tap must leave these five calls and the claim policy byte-identical.",
+  "R3_crc_already_validated": "dlsp_push rejects a packet whose CRC over bytes 0..253 fails (dl_spi_hid.c 43) and a message whose CRC fails (dl_spi_hid.c 26) before DLSP_MESSAGE is returned. Every message routeTrackpad sees has passed both checks. dlsp_crc16 (dl_spi_hid.c 7-15; declared in dl_spi_hid.h 39) is CRC-16/ARC: init 0, reflected polynomial 0xa001, no final XOR. The tap can call that exact function, as the contract requires.",
+  "R4_eligibility_and_lengths": "m1tp_child_input (m1tp_child_policy.c) accepts only device 2, flags 0x20, command 0x10, payload length at most 2038, and the exact lengths 02:8, 3f:17, 44:1752. Device 1 (keyboard) goes through m1kbd_keyboard_input earlier in poll and never reaches routeTrackpad, so a tap placed after eligibility == 1 cannot see keyboard or management payloads.",
+  "R5_descriptor_matches_classification": "The private 110-byte descriptor (sha256 4ae5bc26...) parses as follows. Report 02: three 1-bit buttons, 5 constant bits, then X and Y (usages 0x30 and 0x31), 8-bit, logical -127..127, flags 0x06 (data, variable, relative), then 4 constant bytes, for 8 bytes in total. Report 3f: 16 bytes on vendor page 0xff00, 17 in total. Report 44: 1751 bytes on vendor page 0xff00, 1752 in total. There are no Output or Feature items. The contract's 02 classification is correct: buttons are bits 0-2 of byte 1, signed X/Y are bytes 2 and 3, and -128 (0x80) is outside the logical range.",
+  "R6_payload_lifetime": "message.payload points into the stream's delivered buffer (dl_spi_hid.h 24), which is valid until the next dlsp_push completes a message. The tap must read and format the bytes synchronously inside routeTrackpad, before poll calls receive again. It must not keep the pointer.",
+  "R7_no_heap_bounds": "The existing dispatch already allocates an IOBufferMemoryDescriptor per report; that stays unchanged. The tap needs no allocation. The longest line is the hex line, 'DL24_TP_HEX seq=20 index=27 data=' plus 128 hex characters plus a newline, about 162 bytes, so a stack buffer of 192 bytes is enough. Format straight from message.payload, never copy 1752 bytes onto the stack, and print each line with one IOLog call. A 44 record is 30 lines (begin, 28 hex chunks of 64 bytes except the last 24-byte chunk, end). The worst case total is about 88 lines, roughly 10 KB.",
+  "R8_timing": "IOLog serial output is synchronous on the parent's workloop timer thread. A 44 record prints about 5 KB in one poll pass, which delays later polls and keyboard dispatch for that time. The existing comment at PDM1SPIHID.cpp 326-327 says the device holds ready low and partial messages stay buffered, so this delays but does not drop input. Report order and content stay the same; only timing changes. Record any visible lag as an observation, not as a trace failure."
+ },
+ "requirements_for_p5_adapter": [
+  "Tap only device-2 Input messages that pass the same eligibility as m1tp_child_input: device 2, flags 0x20, command 0x10, and exact lengths 02:8, 3f:17, 44:1752. Root clarification: a pure selector called in the existing poll branch immediately before routeTrackpad, rechecking that identity and those lengths, is an equivalent guard. The frozen PDM1SPIHIDChild.inc need not change. No tap on rejected payloads, device 1 or management messages.",
+  "The tap reads the const message only, must not return early from poll or skip routeTrackpad, must not change counters used by dispatch or the child fault path, and must not alter the report bytes. Every eligible report then reaches routeTrackpad exactly as before.",
+  "Add no writePacket, dlsp_request, waitResponse, m1tp_claim_request, setReport, getReport, Feature/Output/mode/D9/device-3 call or new timer. The five GET keys and their order stay byte-identical.",
+  "Add no new allocation (no IOMalloc, new, OSData, IOBufferMemoryDescriptor or OSString in the tap). Use a bounded stack line buffer (about 192 bytes) and snprintf, with one IOLog per whole line.",
+  "Keep all trace state per instance (header-printed flag, seq, per-id emitted and seen counters, motion-seen flag, reserve-used flag), changed only on the poll workloop. Print the DL24_TP_TRACE header once, from the sole admitted, active T2 poll path (root clarification: not at init), before the first record. Print nothing when T2 is not enabled, not committed or not active.",
+  "Caps (updated contract): reason 1 for the first 16 exact-length 02 records, including ones with X or Y = 0x80; the first 2 exact-length 3f records; and the first exact-length 44 record. Reason 2 is at most one 02 record, emitted only if no reason-1 02 record had valid motion, and only for a later 02 with X and Y both in -127..127 and at least one nonzero. Never more than 20 records. seq starts at 1 and has no gaps.",
+  "CRC with dlsp_crc16 over the exact report bytes including the report ID. Hex is lowercase in 64-byte chunks, the last chunk shorter. Printed bytes are message.payload exactly as dispatched.",
+  "The frozen m1-trackpad-child and m1-keyboard sources stay unchanged. The new adapter is a new leaf with its own manifest and patch, built by root."
+ ],
+ "requirements_for_p3_decoder": [
+  "Require exactly one DL24_TP_TRACE header with the contract caps, after the sole-probe line of the same capture and before any record.",
+  "Per record: seq starts at 1 and has no gaps across emitted records. The begin line's id and byte count must match the table (02:8, 3f:17, 44:1752). HEX index is contiguous from 0, chunks are 64 bytes except the last, the reassembled length equals bytes, and the end line repeats seq and bytes and carries the CRC-16/ARC of the reassembled bytes. Byte 0 equals the declared id.",
+  "Caps and reasons as in the contract. A reason-2 record must be a 02 with valid nonzero motion, and only when no reason-1 02 record had motion. seenNN values never decrease and are at least the emitted count for that id.",
+  "Whole unrelated lines may sit between one record's lines. A partial, duplicated, out-of-order, corrupted or truncated DL24 line fails that record and is never repaired. A record still open at the end of the capture fails.",
+  "Classification: only a 02 whose X and Y are both in -127..127 and not both zero counts as observed relative pointer motion. A 02 with X or Y = 0x80 is kept and reported with descriptor_value_valid=false, never hidden, and never motion. 3f and 44 stay vendor-defined. Never infer contacts, scroll, haptics or physical touch."
+ ],
+ "interpretation_notes": [
+  "Without a Feature or mode write, reports arrive only while someone or something drives the trackpad. Zero records means no reports were observed. It is not a pass, and it is not a passivity failure.",
+  "Records prove which reports the device sent. They do not prove who touched the trackpad; any physical-input claim still needs a separate witness.",
+  "A 44 record may never appear in passive mode, so do not make it a required observation."
+ ],
+ "not_claimed": [
+  "adapter source review (pending p5 freeze)",
+  "decoder review (pending p3)",
+  "any runtime result",
+  "that tracing is free of timing effects"
+ ],
+ "console_interleave": {
+  "observation": "The kernel keeps polling device 2 after the desktop exits. If the closed-export supervisor is reused, a DL24 line emitted while the supervisor prints its DL22/DL11/DL23 export blocks breaks the closed export. The frozen decode_exports.py (4e845eef) raises 'Noise in export block' for any line that is not DL22 or DL11 inside a block or between application blocks (lines 108-123), and tolerates foreign lines only before session_begin or after the footer. The kernel console and the supervisor's /dev/console writes are also not line-atomic with respect to each other, so a DL24 line can split a DL22 hex line. Records stay un-emitted until their caps fill (02 needs 16 reports, 3f needs 2, 44 needs 1, plus the one reserve 02), and 44 may never arrive without a mode change. So a late touch during export is a realistic way to fail the closed export. Root must fix the console-ownership rule before freezing the packet. Options: (a) a supervisor that runs no strict console export while DL24 can still emit; (b) a bounded kernel emission window that is reviewed against measured session and export timing; or (c) a new, separately reviewed DL24-aware export path. The frozen decoder and old sources must stay unchanged. This blocks the packet and supervisor design, not the adapter read path.",
+  "root_resolution": "Root clarification (2026-11-08): raw DL24 lines may interleave with the existing DL23 record exports. Neither decoder is relaxed and no old frame is regraded. The new target is only passive Input-report proof, graded by a separate DL24 decoder bound to record CRC, source, cycle, the same-boot descriptor and Linux recovery, apart from the LIVE prefix grading. The existing LIVE120 supervisor is reused unchanged to expose the cursor window; no new application or shell proof is needed.",
+  "status": "Accepted by root; not an adapter blocker. A LIVE export failure caused by DL24 interleaving stays a LIVE failure and is not relabeled by the DL24 result."
+ },
+ "source_check_focus": "Per root: adapter no-write, payload bounds and guarded ownership once p5 freezes.",
+ "wip_preview": {
+  "note": "Preview of p5 WIP (adapter/PDM1SPIHID.cpp and .h, core/m1tp_trace.c and .h, test_trace.c) as seen at 13:27-13:28. Not a freeze review.",
+  "observations": [
+   "Diff against the frozen child adapter adds 20 lines to PDM1SPIHID.cpp and 3 to PDM1SPIHID.h and removes none. The five GET keys and every waitResponse, writePacket, handleReport and routeTrackpad line are unchanged.",
+   "The new code calls only IOLog, m1tp_trace_*, memset and dlsp_crc16. There is no write, request, timer, sleep or allocation. The checker hit on the word new was inside a comment.",
+   "The header is printed from poll after the existing t2Enabled and t2Phase==1 early return, once per instance.",
+   "m1tp_trace_select rechecks device, flags, command and exact lengths, so its accepted set equals that of m1tp_child_input. Caps 16/2/1 plus one reserve fit the 20 ceiling exactly. motion is X!=0x80 && Y!=0x80 && (X||Y). Counters saturate. No payload pointer is retained.",
+   "The hex buffer is char[129] on the stack. m1tp_trace_hex writes at most 128 characters plus NUL, and the loop bound matches the function index bound."
+  ],
+  "hardening_suggestion": "traceTrackpad ignores the m1tp_trace_hex return value, and hex is uninitialized. The arguments make the invalid case unreachable today, but if it ever returned 0 the following %s would read an unterminated stack buffer. Initialize hex (for example char hex[129]={0}), or stop the record when the return is 0. Low severity, not a blocker.",
+  "host_test": "test_trace.c was read, not compiled or run (no build in this scope)."
+ }
+}

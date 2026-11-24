@@ -1,0 +1,32 @@
+#!/bin/sh
+# Guest side of the compositor benchmark on the GPU (SFAgx + SFDcp, sfagx=1 sfdcp=2).
+# chonkstep-darwin-desktop --bench with the GL renderer presenting by KMS page flip: a pixel
+# check (one frame from GL against the CPU full-frame render), the four scenarios of
+# reports/sprint-010/compositor-damage-bench-001.md (full repaint, pointer motion, 800x600 client
+# whole buffer, 20 damaged rows), 5 s of continuous animation (frames presented per second,
+# missed refreshes) and idle. Then, for comparison in the same boot: GL into an ordinary
+# framebuffer object (no display), and the CPU damage renderer off-screen and on the boot
+# framebuffer mapping (which the display no longer scans out after the KMS run).
+# Lines: WMBENCH; "chonkstep-gl: step:" before each first-time display call.
+# The new desktop binary is staged over the RAM root's own /usr/bin/chonkstep-darwin-desktop
+# (tools/wm_gl_boot.sh), which replaces the old one and reclaims its space.
+# (@SSID@/@PSK@ are unused; the placeholders exist because the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin; export PATH
+F="--font-regular /usr/share/darwin-desktop/DejaVuSans.ttf --font-bold /usr/share/darwin-desktop/DejaVuSans-Bold.ttf"
+XKB_CONFIG_ROOT=/usr/share/X11/xkb; export XKB_CONFIG_ROOT
+printf '\nWMGL2_BEGIN_%s\n' "$nonce"
+ls -l /dev/dri 2>&1 | head -6
+first=
+for mode in "gl" "gl --offscreen --quick" "damage --offscreen --quick" "damage --quick"; do
+    if [ -n "$first" ] && [ "$first" != 0 ] && [ "${mode#gl}" != "$mode" ]; then
+        printf 'WMGL2_SKIPPED %s: the first GL run failed\n' "$mode"
+        continue
+    fi
+    printf 'WMGL2_RUN %s start=%s\n' "$mode" "$(date +%s)"
+    chonkstep-darwin-desktop --bench $F --renderer $mode 2>&1
+    rc=$?
+    [ -z "$first" ] && first=$rc
+    printf 'WMGL2_RC=%s mode=%s end=%s\n' "$rc" "$mode" "$(date +%s)"
+done
+printf 'WMGL2_END_%s\n' "$nonce"

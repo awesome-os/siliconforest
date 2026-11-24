@@ -1,0 +1,93 @@
+{
+  "status": "REVISION002_SOURCE_PROPOSAL_HOST_TESTED_NOT_SDK_BUILT_OR_RUN",
+  "failure_evidence": {
+    "path": "runs/m1-desktop-010/attempt-010/guest/console.bin",
+    "sha256": "6412e15b8e09c2ea4677faf7c243a505bd76c9aab79dd54cf4f99acda4329055",
+    "bytes": 23345,
+    "lines": {
+      "476": "keyboard deferred attempt1 error3",
+      "480": "mouse deferred attempt1 error3",
+      "482": "keyboard refused attempts60 error3",
+      "484": "mouse refused attempts60 error3",
+      "547": "BSD root md0",
+      "578": "attempt load /sbin/launchd",
+      "585": "launchd started single-user",
+      "664": "terminal PRIME marker"
+    },
+    "no_publication_elapsed_timestamps": true,
+    "console_result_error": "TerminalInputError: Input schedule deadline expired",
+    "console_result_sha256": "a88f9094477654b07f24fd22af3c64778363ed78c93257ec9a6dda4427eb7ada",
+    "root_reported": "Controller returned NO_COMMAND_LINE_OBSERVED_LINUX_VERIFIED; one reset and verified Linux. Independent source owner did not access target."
+  },
+  "confirmed_mechanism": "Revision001 increments and permanently exhausts per-queue attempts even for pre-devfs error3. Subsequent real readiness or HID events cannot restart that terminal budget. Startup capability publication made this eager path run earlier than the previously qualified first-report path.",
+  "source_supported_timing_explanation": [
+    {
+      "path": "src/Kernel/xnu/iokit/Kernel/IOStartIOKit.cpp",
+      "lines": "73-94",
+      "fact": "IOKitInitializeTime waits for IORTC up to30 seconds, then root waitQuiet up to30 seconds; unchanged."
+    },
+    {
+      "path": "src/Kernel/xnu/bsd/kern/bsd_init.c",
+      "lines": "697-702,807-808,1123-1140",
+      "fact": "IOKitInitializeTime precedes vfsinit; bsd_autoconf later calls IOKitBSDInit."
+    },
+    {
+      "path": "src/Kernel/xnu/bsd/miscfs/devfs/devfs_vfsops.c",
+      "lines": "110-114",
+      "fact": "devfs_init calls devfs_sinit."
+    },
+    {
+      "path": "src/Kernel/xnu/bsd/miscfs/devfs/devfs_tree.c",
+      "lines": "163-172,186-224",
+      "fact": "devfs_ready starts0; devfs_sinit sets1 only after root construction."
+    },
+    {
+      "path": "src/Kernel/xnu/iokit/bsddev/IOKitBSDInit.cpp",
+      "lines": "117-119",
+      "fact": "IOBSD resource is published after that startup sequence."
+    },
+    {
+      "path": "src/Kernel/xnu/osfmk/kern/clock.c",
+      "lines": "1642-1654",
+      "fact": "clock_interval_to_deadline converts the interval and adds current mach_absolute_time."
+    },
+    {
+      "path": "src/Kernel/xnu/iokit/IOKit/IOTypes.h",
+      "lines": "239",
+      "fact": "kSecondScale is1000000000."
+    },
+    {
+      "path": "src/Kernel/xnu/osfmk/kern/thread_call.c",
+      "lines": "757-770,1588-1623",
+      "fact": "Delayed enter while ONCE/RUNNING stores its deadline and RESCHEDULE; finish reenqueues delayed unless deadline already expired."
+    },
+    {
+      "path": "src/Kernel/xnu/iokit/Kernel/IOService.cpp",
+      "lines": "6616-6655",
+      "fact": "addMatchingNotification invokes existing-service callbacks synchronously before returning the notifier."
+    }
+  ],
+  "inference_limit": "Legitimate up-to60-second startup waits can exhaust60 eager attempts (initial attempt plus59 intervals). This matches observed ordering, but existing logs do not measure the delay or rule out an independent clock defect. No immediate-spin mechanism was found in the reviewed source; revision002 records numeric monotonic times.",
+  "revision002_policy": {
+    "predevfs": "One successful IOBSD registration and a separate180-second monotonic watchdog. No major/node creation and zero publication-failure attempts while devfs is false. Already-ready devfs proceeds without notifier. Event is only a wake, never a substitute for devfs_is_ready.",
+    "registration_failure": "At most60 failed matching/notifier allocations, no faster than once per second; category5 terminal refusal. Duplicate requests cannot reset/accelerate this.",
+    "after_IOBSD_but_false_devfs": "Remove notifier from owner only; bounded1-second rechecks until original180-second watchdog; category6 terminal refusal, no fake nodes.",
+    "actual_publication_failure": "Existing60-attempt bound starts only after real devfs readiness, separately per queue with explicit earliest-next-attempt to prevent new capability wakes accelerating attempts.",
+    "watchdog_rationale": "180seconds is an explicit finite experiment readiness bound, not a claim that BSD is ready by a particular time. It is independent of the60 actual-operation failure attempts; its expiration remains failure.",
+    "lifetime": "Single CAS-installed ONCE worker owns notifier and publication state. Callback only atomic first-event flag + schedule; it never reads/removes returned notifier or publishes. Owner stores notifier only after synchronous callback returns, then removes it after readiness/event/terminal refusal. Globals are boot-lifetime; no unload support.",
+    "lost_wake": "Arm delayed deadline, then compare atomic event flag with entry observation; if changed, immediately schedule. An event after that comparison schedules itself. Duplicate callbacks do not accelerate retries."
+  },
+  "unchanged": [
+    "IORTC wait",
+    "waitQuiet",
+    "vfs/devfs implementation",
+    "kernel",
+    "native005 driver",
+    "board/PIO/power/protocol",
+    "real capability matching",
+    "no fabricated input",
+    "existing endpoint permissions",
+    "frozen da499 revision001 files"
+  ],
+  "runtime_required": "Independent source review, new SDK and KC, then root-owned host regression and verified Linux recovery before native progression. Host tests do not establish scheduler/devfs runtime or physical input."
+}

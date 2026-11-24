@@ -1,0 +1,57 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -2,7 +2,8 @@
+ add_kext_bundle(SFCpuPower.kext INFO_PLIST Info.plist KERNEL_PRIVATE
+     BUNDLE_IDENTIFIER org.siliconforest.driver.SFCpuPower BUNDLE_VERSION 0.1.0)
+ set_property(TARGET SFCpuPower.kext PROPERTY OUTPUT_NAME SFCpuPower)
+-target_sources(SFCpuPower.kext PRIVATE SFCpuPower.cpp SFSmcSession.cpp sf_cpufreq_policy.c sf_thermal_policy.c)
++target_sources(SFCpuPower.kext PRIVATE SFCpuPower.cpp SFSmcSession.cpp sf_cpufreq_policy.c sf_thermal_policy.c
++    SFAppleReboot.cpp sf_pmu_scratch.c)
+ target_include_directories(SFCpuPower.kext PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+ target_link_libraries(SFCpuPower.kext PRIVATE xnu_kernel_private_headers)
+ target_compile_options(SFCpuPower.kext PRIVATE -Wall -Wno-inconsistent-missing-override)
+--- a/SFCpuPower.cpp
++++ b/SFCpuPower.cpp
+@@ -69,6 +69,7 @@
+ #include <sys/sysctl.h>
+ #include <sys/systm.h>
+ 
++#include "SFAppleReboot.h"
+ #include "SFSmcSession.h"
+ #include "sf_cpufreq_policy.h"
+ #include "sf_thermal_policy.h"
+@@ -757,6 +758,8 @@
+ 			IOSleep(1000);
+ 			continue;
+ 		}
++		/* a restart or power-off takes the session from here (SFAppleReboot.cpp) */
++		SFAppleRebootSmcBegin(smc);
+ 		if (smc->failed() && now >= nextOpen) {
+ 			smc->close();
+ 			gSFSmcVerbose = gSmcOpens == 0 || gSmcKeepVerbose;
+@@ -835,6 +838,7 @@
+ 			if (!smc->failed() && enumerated)
+ 				thermalFan(smc, valid, hottest, status);
+ 			gShutdown = 2;
++			SFAppleRebootSmcEnd();
+ 			for (;;)
+ 				IOSleep(1000);
+ 		}
+@@ -859,6 +863,7 @@
+ 			thermalLog("minute");
+ 			lastLog = now;
+ 		}
++		SFAppleRebootSmcEnd();
+ 		IOSleep(gThermalPollMs < 100 ? 100 : gThermalPollMs);
+ 	}
+ }
+@@ -1314,6 +1319,9 @@
+ 	    gPeriodMs, gThermalEnabled ? "on" : "OFF (fallback states only)", gThermalCfg.limit_mc / 1000,
+ 	    gThermalCfg.critical_mc / 1000, gThermalPollMs);
+ 
++	/* restart and power-off through the SMC, the PMU's boot state (SFAppleReboot.cpp) */
++	SFAppleRebootStart();
++
+ 	gArmed = !gThermalEnabled;
+ 	if (gHaveClusters && kernel_thread_start(sf_governor_thread, NULL, &thread) == KERN_SUCCESS)
+ 		thread_deallocate(thread);

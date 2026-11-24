@@ -1,0 +1,59 @@
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -43,6 +43,10 @@
+ #import <AppKit/NSViewBackingLayer.h>
+ #import <CoreGraphics/CGWindow.h>
+ #import <QuartzCore/CALayerContext.h>
++#include <dlfcn.h>
++#include <stdlib.h>
++
++static BOOL sfLayerRenderingAvailable(void);
+ #import <QuartzCore/CATransaction.h>
+ #import <QuartzCore/CADisplayLink.h>
+ #import <QuartzCore/CAMetalLayer-Private.h>
+@@ -1684,7 +1688,33 @@
+    _layerContext=nil;
+ }
+ 
++// A layer tree renders through OpenGL (CALayerContext, CGL on EGL). Where the system has no EGL
++// (a root without Mesa) CGL calls a function it could not load: such a view is drawn as an ordinary
++// view instead (its -drawRect: into the window), without a layer context. SFLayerRendering=NO in the
++// environment or the defaults does the same. (First met with Activity Monitor's graphs, which ask for
++// a layer: docs/roadmap/issues/SF-AA-activity-monitor.md.)
++static BOOL sfLayerRenderingAvailable(void){
++   static int available=-1;
++
++   if(available<0){
++    const char *env=getenv("SFLayerRendering");
++
++    if(env!=NULL && (env[0]=='N' || env[0]=='n' || env[0]=='0'))
++     available=0;
++    else {
++     void *egl=dlopen("/usr/lib/libEGL.1.dylib",RTLD_LAZY|RTLD_LOCAL);
++
++     available=(egl!=NULL);
++     if(!available)
++      NSLog(@"no OpenGL (libEGL) on this system: layer-backed views are drawn as ordinary views");
++    }
++   }
++   return available;
++}
++
+ -(void)_createLayerContextIfNeeded {
++   if(!sfLayerRenderingAvailable())
++    return;
+    if([_superview layer]==nil){
+     _layerContext=[[CALayerContext alloc] initWithFrame:[self frame]];
+     [_layerContext setDelegate:self];
+@@ -1807,7 +1837,10 @@
+    else {
+     if(!_wantsLayer){
+      _wantsLayer=YES;
+-     [self _createLayersInTreeIfNeeded];
++     // without OpenGL there is nothing to render a layer tree with: the view keeps drawing into
++     // its window as an ordinary view (a layer it had no context for was never shown: black)
++     if(sfLayerRenderingAvailable())
++      [self _createLayersInTreeIfNeeded];
+     }
+    }
+ }

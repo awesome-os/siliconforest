@@ -1,0 +1,151 @@
+--- a/src/Frameworks/AuthenticationServices/AuthenticationServices.m
++++ b/src/Frameworks/AuthenticationServices/AuthenticationServices.m
+@@ -571,3 +571,148 @@
+ }
+ 
+ @end
++
++// ASWebAuthenticationSession, the browser side: on macOS the system hands a sign-in session that
++// another application started to the default browser, as a request object given to the handler
++// the browser registered with the session manager. No application can start such a session on
++// this system yet, so the manager never calls its handler and was never the reason for a launch.
++// The request object itself is complete: whoever creates one gets its delegate callbacks.
++
++NSString *const ASWebAuthenticationSessionErrorDomain = @"com.apple.AuthenticationServices.WebAuthenticationSession";
++
++enum {
++    ASWebAuthenticationSessionErrorCodeCanceledLogin = 1,
++    ASWebAuthenticationSessionErrorCodePresentationContextNotProvided = 2,
++    ASWebAuthenticationSessionErrorCodePresentationContextInvalid = 3,
++};
++
++@class ASWebAuthenticationSessionRequest;
++
++@interface NSObject (ASWebAuthenticationSessionRequestDelegate)
++- (void)authenticationSessionRequest:(ASWebAuthenticationSessionRequest *)request didCompleteWithCallbackURL:(NSURL *)callbackURL;
++- (void)authenticationSessionRequest:(ASWebAuthenticationSessionRequest *)request didCancelWithError:(NSError *)error;
++@end
++
++@interface ASWebAuthenticationSessionRequest : NSObject <NSCopying, NSSecureCoding> {
++    NSUUID *_UUID;
++    NSURL *_URL;
++    NSString *_callbackURLScheme;
++    BOOL _shouldUseEphemeralSession;
++    id _delegate;
++    BOOL _finished;
++}
++@end
++
++@implementation ASWebAuthenticationSessionRequest
++
+++ (BOOL)supportsSecureCoding { return YES; }
++
++- (instancetype)init
++{
++    if ((self = [super init]))
++        _UUID = [[NSUUID alloc] init];
++    return self;
++}
++
++- (instancetype)initWithCoder:(NSCoder *)coder
++{
++    if ((self = [super init])) {
++        _UUID = [[coder decodeObjectForKey:@"UUID"] retain] ?: [[NSUUID alloc] init];
++        _URL = [[coder decodeObjectForKey:@"URL"] retain];
++        _callbackURLScheme = [[coder decodeObjectForKey:@"callbackURLScheme"] copy];
++        _shouldUseEphemeralSession = [coder decodeBoolForKey:@"shouldUseEphemeralSession"];
++    }
++    return self;
++}
++
++- (void)encodeWithCoder:(NSCoder *)coder
++{
++    [coder encodeObject:_UUID forKey:@"UUID"];
++    [coder encodeObject:_URL forKey:@"URL"];
++    [coder encodeObject:_callbackURLScheme forKey:@"callbackURLScheme"];
++    [coder encodeBool:_shouldUseEphemeralSession forKey:@"shouldUseEphemeralSession"];
++}
++
++- (id)copyWithZone:(NSZone *)zone
++{
++    ASWebAuthenticationSessionRequest *copy = [[[self class] allocWithZone:zone] init];
++    [copy->_UUID release];
++    copy->_UUID = [_UUID retain];
++    copy->_URL = [_URL retain];
++    copy->_callbackURLScheme = [_callbackURLScheme copy];
++    copy->_shouldUseEphemeralSession = _shouldUseEphemeralSession;
++    return copy;
++}
++
++- (void)dealloc
++{
++    [_UUID release];
++    [_URL release];
++    [_callbackURLScheme release];
++    [super dealloc];
++}
++
++- (NSUUID *)UUID { return _UUID; }
++- (NSURL *)URL { return _URL; }
++- (NSString *)callbackURLScheme { return _callbackURLScheme; }
++- (BOOL)shouldUseEphemeralSession { return _shouldUseEphemeralSession; }
++- (id)delegate { return _delegate; }
++- (void)setDelegate:(id)delegate { _delegate = delegate; }
++
++// a request finishes once, either way
++- (void)cancelWithError:(NSError *)error
++{
++    if (_finished)
++        return;
++    _finished = YES;
++    if (error == nil)
++        error = [NSError errorWithDomain:ASWebAuthenticationSessionErrorDomain
++                                    code:ASWebAuthenticationSessionErrorCodeCanceledLogin
++                                userInfo:nil];
++    if ([_delegate respondsToSelector:@selector(authenticationSessionRequest:didCancelWithError:)])
++        [_delegate authenticationSessionRequest:self didCancelWithError:error];
++}
++
++- (void)completeWithCallbackURL:(NSURL *)url
++{
++    if (_finished)
++        return;
++    _finished = YES;
++    if ([_delegate respondsToSelector:@selector(authenticationSessionRequest:didCompleteWithCallbackURL:)])
++        [_delegate authenticationSessionRequest:self didCompleteWithCallbackURL:url];
++}
++
++@end
++
++@interface ASWebAuthenticationSessionWebBrowserSessionManager : NSObject {
++    id _sessionHandler;
++}
++@end
++
++@implementation ASWebAuthenticationSessionWebBrowserSessionManager
++
+++ (ASWebAuthenticationSessionWebBrowserSessionManager *)sharedManager
++{
++    static ASWebAuthenticationSessionWebBrowserSessionManager *shared;
++    static dispatch_once_t once;
++
++    dispatch_once(&once, ^{
++        shared = [[self alloc] init];
++    });
++    return shared;
++}
++
++// the browser's handler is kept for the day sessions can be started; nothing calls it today
++- (id)sessionHandler { return _sessionHandler; }
++- (void)setSessionHandler:(id)handler
++{
++    [_sessionHandler autorelease];
++    _sessionHandler = [handler retain];
++}
++
++// a session never launches the browser here
++- (BOOL)wasLaunchedByAuthenticationServices { return NO; }
++
+++ (void)registerDefaultsForASWASInSetupAssistantIfNeeded { }
++
++@end

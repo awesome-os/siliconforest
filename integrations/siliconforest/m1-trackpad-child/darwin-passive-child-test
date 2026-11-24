@@ -1,0 +1,72 @@
+#!/bin/sh
+# Passive native child/seat startup only. No input injection or human prompt.
+set -eu
+nonce=${1-}
+case "$nonce" in ''|*[!0-9a-f]*) exit 2 ;; esac
+[ "${#nonce}" -eq 48 ] || exit 2
+printf '\nDL15_CHILD_BEGIN_%s physical_input_proven=false\n' "$nonce"
+runtime=/private/var/run/darwin-desktop
+mkdir -p "$runtime"
+chmod 0700 "$runtime"
+export XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=wayland-0
+export XKB_CONFIG_ROOT=/usr/share/X11/xkb TMPDIR=/private/tmp
+compositor=
+client=
+cleanup() {
+    trap - EXIT HUP INT TERM
+    if [ -n "$client" ]; then kill -TERM "$client" 2>/dev/null || :; wait "$client" 2>/dev/null || :; fi
+    if [ -n "$compositor" ]; then kill -TERM "$compositor" 2>/dev/null || :; wait "$compositor" 2>/dev/null || :; fi
+}
+trap cleanup EXIT HUP INT TERM
+# Preserve the same-boot raw enumeration before the child identity decision.
+enum_rc=0
+if /usr/bin/darwin-trackpad-enum --nonce "$nonce"; then :; else enum_rc=$?; fi
+printf 'DL15_CHILD_ENUM_%s rc=%s physical_input_proven=false\n' "$nonce" "$enum_rc"
+case "$enum_rc" in 0) ;; 77) exit 77 ;; *) exit 1 ;; esac
+# The shared nodes publish asynchronously. Wait by stat only, then make one
+# identity/state observation even after a timeout, preserving its exact cause.
+count=0
+while [ ! -c /dev/usb_hid_kbd ] || [ ! -c /dev/usb_hid_mouse ]; do
+    count=$((count + 1))
+    [ "$count" -le 100 ] || break
+    sleep 0.1
+done
+printf 'DL15_CHILD_ENDPOINT_WAIT_%s missing_checks=%s max_sleeps=100 physical_input_proven=false\n' "$nonce" "$count"
+gate_rc=0
+if /usr/bin/darwin-native-input-inventory --nonce "$nonce"; then :; else gate_rc=$?; fi
+printf 'DL15_CHILD_IDENTITY_%s rc=%s physical_input_proven=false\n' "$nonce" "$gate_rc"
+case "$gate_rc" in
+    0) ;;
+    77) printf 'DL15_CHILD_NOT_READY_%s source=identity_gate physical_input_proven=false\n' "$nonce"; exit 77 ;;
+    *) printf 'DL15_CHILD_FAILED_%s source=identity_gate rc=%s physical_input_proven=false\n' "$nonce" "$gate_rc"; exit 1 ;;
+esac
+/usr/bin/chonkstep-darwin --run --socket "$runtime/wayland-0" --input sfhid &
+compositor=$!
+count=0
+while [ ! -S "$runtime/wayland-0" ]; do
+    kill -0 "$compositor"
+    count=$((count + 1))
+    [ "$count" -le 100 ] || exit 1
+    sleep 0.1
+done
+printf 'DL15_CHILD_SERVER_SOCKET_%s physical_input_proven=false\n' "$nonce"
+/usr/bin/darwin-wayland-terminal-native-startup --socket "$runtime/wayland-0" --nonce "$nonce" --seconds 80 &
+client=$!
+client_rc=0
+if wait "$client"; then :; else client_rc=$?; fi
+client=
+records_rc=0
+if /usr/bin/darwin-terminal-records --directory "$runtime/terminal-$nonce" --nonce "$nonce" --phase closed; then :; else records_rc=$?; fi
+printf 'DL15_CHILD_RECORDS_%s phase=closed rc=%s physical_input_proven=false\n' "$nonce" "$records_rc"
+kill -TERM "$compositor" 2>/dev/null || :
+compositor_rc=0
+if wait "$compositor"; then :; else compositor_rc=$?; fi
+compositor=
+printf 'DL15_CHILD_STATUS_%s client=%s compositor=%s records=%s physical_input_proven=false\n' "$nonce" "$client_rc" "$compositor_rc" "$records_rc"
+[ "$client_rc" -eq 0 ] && [ "$compositor_rc" -eq 0 ] && [ "$records_rc" -eq 0 ]
+printf '\nCHONKSTEP PASSIVE NATIVE CHILD STARTUP ONLY - INPUT UNVERIFIED\n'
+printf 'DL15_CHILD_RETURN_%s\n' "$nonce"
+/bin/uname -s
+/bin/uname -m
+/bin/uname -r
+printf 'DL15_CHILD_END_%s physical_input_proven=false\n' "$nonce"

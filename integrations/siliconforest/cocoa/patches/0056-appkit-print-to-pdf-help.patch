@@ -1,0 +1,114 @@
+--- a/src/Frameworks/AppKit/NSDisplay.m
++++ b/src/Frameworks/AppKit/NSDisplay.m
+@@ -20,6 +20,11 @@
+ SOFTWARE. */
+ 
+ #import <AppKit/NSDisplay.h>
++#import <CoreGraphics/CGDataConsumer.h>
++#import <CoreGraphics/CGPDFContext.h>
++#import <AppKit/NSPrintInfo.h>
++#import <AppKit/NSSavePanel.h>
++#import <AppKit/NSAlert.h>
+ #import <AppKit/NSPanel.h>
+ #import <AppKit/NSDraggingManager.h>
+ #import <AppKit/NSApplication.h>
+@@ -439,8 +444,42 @@
+    return NSCancelButton;
+ }
+ 
++/* The print panel. There is no printing system: what is printed can be saved as a PDF file, the
++ * way macOS's print panel offers it (PDF > Save as PDF). The operation draws its pages into the PDF
++ * context left in the dictionary (NSPrintOperation -createContext, "_KGContext") and closes it. */
+ -(int)runModalPrintPanelWithPrintInfoDictionary:(NSMutableDictionary *)attributes {
+-   return NSCancelButton;
++   NSString *title=[attributes objectForKey:@"_title"];
++   NSAlert  *alert=[[[NSAlert alloc] init] autorelease];
++
++   [alert setMessageText:NSLocalizedStringFromTableInBundle(@"There are no printers.", nil, [NSBundle bundleForClass:[NSDisplay class]], @"print panel")];
++   [alert setInformativeText:NSLocalizedStringFromTableInBundle(@"What you print can be saved as a PDF file.", nil, [NSBundle bundleForClass:[NSDisplay class]], @"print panel")];
++   [alert addButtonWithTitle:NSLocalizedStringFromTableInBundle(@"Save as PDF\u2026", nil, [NSBundle bundleForClass:[NSDisplay class]], @"print panel")];
++   [alert addButtonWithTitle:NSLocalizedStringFromTableInBundle(@"Cancel", nil, [NSBundle bundleForClass:[NSDisplay class]], @"print panel")];
++   if([alert runModal]!=NSAlertFirstButtonReturn)
++    return NSCancelButton;
++
++   NSSavePanel *save=[NSSavePanel savePanel];
++   NSString    *name=[[title length] ? title : @"Untitled" stringByReplacingOccurrencesOfString:@"/" withString:@"-"];
++
++   [save setAllowedFileTypes:[NSArray arrayWithObject:@"pdf"]];
++   [save setNameFieldStringValue:[name stringByAppendingPathExtension:@"pdf"]];
++   if([save runModal]!=NSOKButton)
++    return NSCancelButton;
++
++   NSSize            paper=[[attributes objectForKey:NSPrintPaperSize] sizeValue];
++   CGRect            media=CGRectMake(0,0,paper.width>0 ? paper.width : 612,paper.height>0 ? paper.height : 792);
++   CGDataConsumerRef consumer=CGDataConsumerCreateWithURL((CFURLRef)[save URL]);
++   CGContextRef      context=consumer ? CGPDFContextCreate(consumer,&media,NULL) : NULL;
++
++   if(consumer)
++    CGDataConsumerRelease(consumer);
++   if(context==NULL)
++    return NSCancelButton;
++   [attributes setObject:(id)context forKey:@"_KGContext"];
++   CGContextRelease(context);
++   [attributes setObject:NSPrintSaveJob forKey:NSPrintJobDisposition];
++   [attributes setObject:[[save URL] path] forKey:NSPrintSavePath];
++   return NSOKButton;
+ }
+ 
+ -(O2Context *)graphicsPortForPrintOperationWithView:(NSView *)view printInfo:(NSPrintInfo *)printInfo pageRange:(NSRange)pageRange {
+--- a/src/Frameworks/AppKit/NSPrintOperation.m
++++ b/src/Frameworks/AppKit/NSPrintOperation.m
+@@ -7,6 +7,7 @@
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+ 
+ #import <AppKit/NSPrintOperation.h>
++#include <objc/message.h>
+ #import <AppKit/NSPrintInfo.h>
+ #import <AppKit/NSPrintPanel.h>
+ #import <AppKit/NSView.h>
+@@ -285,6 +286,14 @@
+ 
+ // FIX, drawRect: should be changed to displayRect: and displayRect:/NSView should be print aware
+ 
++// the sheet's form: the operation runs (its panel is application-modal here), then the delegate hears how it went
++-(void)runOperationModalForWindow:(NSWindow *)window delegate:delegate didRunSelector:(SEL)selector contextInfo:(void *)info {
++   BOOL ok=[self runOperation];
++
++   if(delegate!=nil && selector!=NULL && [delegate respondsToSelector:selector])
++    ((void (*)(id,SEL,NSPrintOperation *,BOOL,void *))objc_msgSend)(delegate,selector,self,ok,info);
++}
++
+ -(BOOL)runOperation {
+    NSRange            pageRange=NSMakeRange(NSNotFound,NSNotFound);
+    BOOL               knowsPageRange;
+--- a/src/Frameworks/AppKit/NSHelpManager.m
++++ b/src/Frameworks/AppKit/NSHelpManager.m
+@@ -7,6 +7,7 @@
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+ 
+ #import <AppKit/NSHelpManager.h>
++#import <AppKit/NSApplication.h>
+ #import <Foundation/NSMapTable.h>
+ #import <AppKit/NSRaise.h>
+ 
+@@ -57,12 +58,18 @@
+    NSUnimplementedMethod();
+ }
+ 
++// there is no Help Viewer: the application's help is not available, which macOS says in an alert
++// too when an application has no help book (as -[NSApplication showHelp:] does here)
++-(void)_sfNoHelp {
++   [NSApp showHelp:nil];
++}
++
+ -(void)findString:(NSString *)string inBook:(NSString *)bookName {
+-   NSUnimplementedMethod();
++   [self _sfNoHelp];
+ }
+ 
+ -(void)openHelpAnchor:(NSString *)anchor inBook:(NSString *)bookName {
+-   NSUnimplementedMethod();
++   [self _sfNoHelp];
+ }
+ 
+ @end

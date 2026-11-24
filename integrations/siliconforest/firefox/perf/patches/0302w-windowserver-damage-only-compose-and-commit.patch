@@ -1,0 +1,392 @@
+--- a/src/Frameworks/WindowServer/sffx_gpu_present.h
++++ b/src/Frameworks/WindowServer/sffx_gpu_present.h
+@@ -7,6 +7,9 @@
+ #include <stdint.h>
+ #include <CoreFoundation/CoreFoundation.h>
+ #include <sys/time.h>
++#include <math.h>
++#include <string.h>
++#include <stdlib.h>
+ #ifdef __aarch64__
+ #include <arm_neon.h>
+ #endif
+@@ -51,7 +54,7 @@
+  const unsigned char *(*glGetString)(unsigned);
+  void (*glReadPixels)(int,int,int,int,unsigned,unsigned,void *);
+  void (*glViewport)(int,int,int,int),(*glClearColor)(float,float,float,float),(*glClear)(unsigned);
+- void (*glDisable)(unsigned),(*glEnable)(unsigned),(*glBlendFunc)(unsigned,unsigned);
++ void (*glDisable)(unsigned),(*glEnable)(unsigned),(*glBlendFunc)(unsigned,unsigned),(*glScissor)(int,int,int,int);
+  void (*glMatrixMode)(unsigned),(*glLoadIdentity)(void),(*glOrtho)(double,double,double,double,double,double);
+  void (*glBegin)(unsigned),(*glEnd)(void),(*glVertex2f)(float,float),(*glTexCoord2f)(float,float),(*glColor4f)(float,float,float,float),(*glFinish)(void);
+  void *(*IOSurfaceCreate)(CFDictionaryRef);
+@@ -73,7 +76,7 @@
+  SFLOAD(gl,glGenTextures);SFLOAD(gl,glBindTexture);SFLOAD(gl,glDeleteTextures);SFLOAD(gl,glTexImage2D);SFLOAD(gl,glTexSubImage2D);
+  SFLOAD(gl,glTexParameteri);SFLOAD(gl,glPixelStorei);SFLOAD(gl,glGenFramebuffers);SFLOAD(gl,glBindFramebuffer);SFLOAD(gl,glDeleteFramebuffers);
+  SFLOAD(gl,glFramebufferTexture2D);SFLOAD(gl,glCheckFramebufferStatus);SFLOAD(gl,glGetError);SFLOAD(gl,glGetString);
+- SFLOAD(gl,glReadPixels);SFLOAD(gl,glViewport);SFLOAD(gl,glClearColor);SFLOAD(gl,glClear);SFLOAD(gl,glDisable);SFLOAD(gl,glEnable);SFLOAD(gl,glBlendFunc);
++ SFLOAD(gl,glReadPixels);SFLOAD(gl,glViewport);SFLOAD(gl,glClearColor);SFLOAD(gl,glClear);SFLOAD(gl,glDisable);SFLOAD(gl,glEnable);SFLOAD(gl,glBlendFunc);SFLOAD(gl,glScissor);
+  SFLOAD(gl,glMatrixMode);SFLOAD(gl,glLoadIdentity);SFLOAD(gl,glOrtho);SFLOAD(gl,glBegin);SFLOAD(gl,glEnd);
+  SFLOAD(gl,glVertex2f);SFLOAD(gl,glTexCoord2f);SFLOAD(gl,glColor4f);SFLOAD(gl,glFinish);
+  SFLOAD(surface,IOSurfaceGetBaseAddress);SFLOAD(surface,IOSurfaceCreate);SFLOAD(surface,IOSurfaceSFGPUCopyFD);SFLOAD(surface,IOSurfaceSFGPUGetOffset);
+@@ -83,17 +86,47 @@
+ }
+ 
+ #define SF_GPU_LAYERS 16
+-struct sfGPULayer {uintptr_t key;void *surface;unsigned texture;double sx,sy,sw,sh,dx,dy,dw,dh;};
++// (FXPERF2) a layer alternates between the producer's frames: one texture per surface keeps each one's GPU import
++struct sfGPULayer {uintptr_t key;void *surface;unsigned texture;double sx,sy,sw,sh,dx,dy,dw,dh;unsigned textures[2];void *textureSurface[2];unsigned textureNext;};
+ struct sfGPUPresenter {
+  void *context,*format;unsigned baseTexture,fbo;void *baseCache;size_t baseBytes;int baseW,baseH,failed;
+  struct sfGPULayer layers[SF_GPU_LAYERS];int count;
+  uint64_t frames,baseUploadBytes,layerBytes,failures;
++ // (FXPERF2) damage (SFFX_GPU_DAMAGE=1): window pixels (x0,y0,x1,y1, rows top-down) changed since the last prepare,
++ // the damage of each prepared picture (serial n at [n%8]) and the serial last presented
++ int damage[4];uint64_t serial,presented;int history[8][4];uint64_t damageBytes,composedBytes;
+ };
+-struct sfGPUFrame {struct sfGPUPresenter *owner;void *surface;unsigned texture;int w,h;};
++struct sfGPUFrame {struct sfGPUPresenter *owner;void *surface;unsigned texture;int w,h;uint64_t serial;};
++
++static int sfGPUDamageEnabled(void){
++ static int on=-1;
++ if(on<0){const char *v=getenv("SFFX_GPU_DAMAGE");on=v&&!strcmp(v,"1");}
++ return on;
++}
++static void sfGPUBoxEmpty(int *b){b[0]=b[1]=INT32_MAX;b[2]=b[3]=INT32_MIN;}
++static int sfGPUBoxIsEmpty(const int *b){return b[2]<=b[0]||b[3]<=b[1];}
++static void sfGPUBoxUnion(int *a,const int *b){
++ if(sfGPUBoxIsEmpty(b))return;
++ if(sfGPUBoxIsEmpty(a)){memcpy(a,b,4*sizeof(int));return;}
++ if(b[0]<a[0])a[0]=b[0];if(b[1]<a[1])a[1]=b[1];if(b[2]>a[2])a[2]=b[2];if(b[3]>a[3])a[3]=b[3];
++}
++static void sfGPUDamageRect(struct sfGPUPresenter *p,double x,double y,double w,double h){
++ if(!(w>0)||!(h>0))return;
++ int b[4]={(int)floor(x)-1,(int)floor(y)-1,(int)ceil(x+w)+1,(int)ceil(y+h)+1};
++ sfGPUBoxUnion(p->damage,b);
++}
++// the union of the prepared pictures' damage over serials (after, upto]; 0 when not known (all of it)
++static int sfGPUDamageSince(const struct sfGPUPresenter *p,uint64_t after,int *box){
++ sfGPUBoxEmpty(box);
++ if(after==0||after>p->serial||p->serial-after>7)return 0;
++ for(uint64_t n=after+1;n<=p->serial;n++)sfGPUBoxUnion(box,p->history[n%8]);
++ return 1;
++}
+ 
+ static struct sfGPUPresenter *sfGPUCreate(void){
+  if(!sfGPULoad())return NULL;
+  struct sfGPUPresenter *p=calloc(1,sizeof(*p));if(!p)return NULL;
++ sfGPUBoxEmpty(p->damage);
+  int attributes[]={8,24,11,8,73,96,0},count=0;
+  void *previous=sfGPU.CGLGetCurrentContext();
+  int status=sfGPU.CGLChoosePixelFormat(attributes,&p->format,&count);
+@@ -130,26 +163,94 @@
+  return f;
+ }
+ 
+-static int sfGPUSetLayer(struct sfGPUPresenter *p,uintptr_t key,void *surface,
+- double sx,double sy,double sw,double sh,double dx,double dy,double dw,double dh){
++static void sfGPULayerTexturesDelete(struct sfGPULayer *l){
++ if(l->texture)sfGPU.glDeleteTextures(1,&l->texture);
++ for(int k=0;k<2;k++)if(l->textures[k])sfGPU.glDeleteTextures(1,&l->textures[k]);
++ l->texture=0;l->textures[0]=l->textures[1]=0;l->textureSurface[0]=l->textureSurface[1]=NULL;
++}
++// damage: where surface differs from the surface registered before (x0,y0,x1,y1 in its pixels, rows top-down);
++// NULL: all of the layer (FXPERF2)
++static int sfGPUSetLayerDamaged(struct sfGPUPresenter *p,uintptr_t key,void *surface,
++ double sx,double sy,double sw,double sh,double dx,double dy,double dw,double dh,const int *damage){
+  if(!p||p->failed||!key)return 0;
+  int i;for(i=0;i<p->count;i++)if(p->layers[i].key==key)break;
+  if(!surface){
+   if(i<p->count){
++   struct sfGPULayer *l=&p->layers[i];
++   sfGPUDamageRect(p,l->dx,l->dy,l->dw,l->dh);
+    void *previous=sfGPU.CGLGetCurrentContext();sfGPU.CGLSetCurrentContext(p->context);
+-   if(p->layers[i].texture)sfGPU.glDeleteTextures(1,&p->layers[i].texture);
+-   CFRelease(p->layers[i].surface);p->layers[i]=p->layers[--p->count];sfGPU.CGLSetCurrentContext(previous);
++   sfGPULayerTexturesDelete(l);
++   CFRelease(l->surface);p->layers[i]=p->layers[--p->count];sfGPU.CGLSetCurrentContext(previous);
+   }
+   return 1;
+  }
+  if(!sfGPU.IOSurfaceSFGPUGetOffset(surface)||sw<=0||sh<=0||dw<=0||dh<=0||i==SF_GPU_LAYERS)return 0;
+- if(i==p->count)p->count++;
++ int fresh=i==p->count;
++ if(fresh){p->count++;memset(&p->layers[i],0,sizeof(p->layers[i]));}
+  struct sfGPULayer *l=&p->layers[i];
++ int moved=fresh||l->sx!=sx||l->sy!=sy||l->sw!=sw||l->sh!=sh||l->dx!=dx||l->dy!=dy||l->dw!=dw||l->dh!=dh||
++  (l->surface&&(sfGPU.IOSurfaceGetWidth(l->surface)!=sfGPU.IOSurfaceGetWidth(surface)||sfGPU.IOSurfaceGetHeight(l->surface)!=sfGPU.IOSurfaceGetHeight(surface)));
++ if(moved||!damage){
++  if(!fresh)sfGPUDamageRect(p,l->dx,l->dy,l->dw,l->dh);
++  sfGPUDamageRect(p,dx,dy,dw,dh);
++ }else if(damage[2]>damage[0]&&damage[3]>damage[1]){
++  // the changed part of the shown source rectangle, in the window
++  double x0=fmax(damage[0],sx),y0=fmax(damage[1],sy),x1=fmin(damage[2],sx+sw),y1=fmin(damage[3],sy+sh);
++  if(x1>x0&&y1>y0)sfGPUDamageRect(p,dx+(x0-sx)*dw/sw,dy+(y0-sy)*dh/sh,(x1-x0)*dw/sw,(y1-y0)*dh/sh);
++ }
+  if(surface!=l->surface){CFRetain(surface);if(l->surface)CFRelease(l->surface);l->surface=surface;}
+  l->key=key;l->sx=sx;l->sy=sy;l->sw=sw;l->sh=sh;l->dx=dx;l->dy=dy;l->dw=dw;l->dh=dh;
+  return 1;
+ }
+ 
++static int sfGPUSetLayer(struct sfGPUPresenter *p,uintptr_t key,void *surface,
++ double sx,double sy,double sw,double sh,double dx,double dy,double dw,double dh){
++ return sfGPUSetLayerDamaged(p,key,surface,sx,sy,sw,sh,dx,dy,dw,dh,NULL);
++}
++
++// the texture that holds this layer's surface: one per surface it alternates between, so each keeps its import
++static unsigned sfGPULayerTexture(struct sfGPULayer *l){
++ if(!sfGPUDamageEnabled()){if(!l->texture)sfGPU.glGenTextures(1,&l->texture);return l->texture;}
++ for(int k=0;k<2;k++)if(l->textures[k]&&l->textureSurface[k]==l->surface)return l->textures[k];
++ int k=l->textureNext++%2;
++ if(!l->textures[k])sfGPU.glGenTextures(1,&l->textures[k]);
++ l->textureSurface[k]=l->surface;
++ return l->textures[k];
++}
++
++// (FXPERF2) before a damage present: the CPU-drawn base uploaded where its rows changed, and this picture's damage
++// (the layers' since the last prepare and the base's) recorded as serial p->serial. Called with nothing current
++// or another context; restores it.
++static void sfGPUPrepare(struct sfGPUPresenter *p,const void *base,int w,int h,int maybeChanged){
++ if(!p||p->failed||!base)return;
++ void *previous=sfGPU.CGLGetCurrentContext();
++ if(sfGPU.CGLSetCurrentContext(p->context)!=0)return;
++ size_t row=(size_t)w*4,bytes=row*h;
++ sfGPU.glBindTexture(0x0de1,p->baseTexture);sfGPU.glPixelStorei(0x0cf5,4);sfGPU.glPixelStorei(0x0cf2,0);
++ if(p->baseW!=w||p->baseH!=h){
++  void *cache=realloc(p->baseCache,bytes);
++  if(cache){p->baseCache=cache;p->baseBytes=bytes;p->baseW=w;p->baseH=h;
++   sfGPU.glTexImage2D(0x0de1,0,0x8058,w,h,0,0x80e1,0x1401,base);memcpy(cache,base,bytes);p->baseUploadBytes+=bytes;}
++  int all[4]={0,0,w,h};sfGPUBoxUnion(p->damage,all);
++ }else if(maybeChanged&&!sfGPUBaseEqual(p->baseCache,base,bytes)){
++  const unsigned char *a=p->baseCache,*b=base;int r0=0,r1=h;
++  while(r0<h&&!memcmp(a+r0*row,b+r0*row,row))r0++;
++  while(r1>r0&&!memcmp(a+(r1-1)*row,b+(r1-1)*row,row))r1--;
++  if(r1>r0){
++   sfGPU.glTexSubImage2D(0x0de1,0,0,r0,w,r1-r0,0x80e1,0x1401,b+r0*row);memcpy((unsigned char *)p->baseCache+r0*row,b+r0*row,(r1-r0)*row);
++   p->baseUploadBytes+=(r1-r0)*row;
++   int rows[4]={0,r0,w,r1};sfGPUBoxUnion(p->damage,rows);
++  }
++ }
++ sfGPU.CGLSetCurrentContext(previous);
++ int clamp[4]={0,0,w,h},d[4];memcpy(d,p->damage,sizeof(d));
++ if(!sfGPUBoxIsEmpty(d)){d[0]=d[0]<0?0:d[0];d[1]=d[1]<0?0:d[1];d[2]=d[2]>w?w:d[2];d[3]=d[3]>h?h:d[3];}
++ if(sfGPUBoxIsEmpty(d))sfGPUBoxEmpty(d);
++ (void)clamp;
++ p->serial++;memcpy(p->history[p->serial%8],d,sizeof(d));sfGPUBoxEmpty(p->damage);
++ if(!sfGPUBoxIsEmpty(d))p->damageBytes+=(uint64_t)(d[2]-d[0])*(d[3]-d[1])*4;
++}
++
+ static void sfGPUQuad(double x,double y,double w,double h,double sx,double sy,double sw,double sh){
+  sfGPU.glBegin(7); // GL_QUADS, in this private compatibility context
+  sfGPU.glTexCoord2f(sx,sy);sfGPU.glVertex2f(x,y);
+@@ -169,6 +270,15 @@
+ 
+ static int sfGPUCompose(struct sfGPUPresenter *p,struct sfGPUFrame *f,const void *base,int w,int h){
+  if(!p||p->failed||!f||!base||f->w!=w||f->h!=h)return 0;
++ // (FXPERF2) damage mode: only what this frame lacks, the damage since the picture it holds (none: it is current)
++ int damageMode=sfGPUDamageEnabled(),region[4]={0,0,w,h};
++ if(damageMode){
++  int since[4];
++  if(sfGPUDamageSince(p,f->serial,since)){
++   if(sfGPUBoxIsEmpty(since)){f->serial=p->serial;return 1;}
++   memcpy(region,since,sizeof(region));
++  }
++ }
+  int trace=getenv("SFFX_GPU_PHASE_TRACE")!=NULL;
+  double started=trace?sfGPUClockMs():0,imported=started,baseDone=started,drawDone=started,finished=started;
+  void *previous=sfGPU.CGLGetCurrentContext();int good=sfGPU.CGLSetCurrentContext(p->context)==0;
+@@ -182,7 +292,9 @@
+  if(good){
+   size_t bytes=(size_t)w*h*4;
+   sfGPU.glBindTexture(0x0de1,p->baseTexture);sfGPU.glPixelStorei(0x0cf5,4);sfGPU.glPixelStorei(0x0cf2,0);
+-  if(p->baseW!=w||p->baseH!=h){
++  if(damageMode){
++   // uploaded by sfGPUPrepare
++  }else if(p->baseW!=w||p->baseH!=h){
+    void *cache=realloc(p->baseCache,bytes);
+    if(!cache)good=0;
+    else{p->baseCache=cache;p->baseBytes=bytes;p->baseW=w;p->baseH=h;
+@@ -193,19 +305,25 @@
+   if(trace)baseDone=sfGPUClockMs();
+   sfGPUTextureParameters();
+   sfGPU.glViewport(0,0,w,h);sfGPU.glDisable(0x0b71);sfGPU.glDisable(0x0b90);sfGPU.glDisable(0x0c11);sfGPU.glDisable(0x0be2);
+-  sfGPU.glDisable(0x8db9);sfGPU.glClearColor(0,0,0,0);sfGPU.glClear(0x4000);
++  sfGPU.glDisable(0x8db9);
++  if(damageMode){sfGPU.glEnable(0x0c11);sfGPU.glScissor(region[0],region[1],region[2]-region[0],region[3]-region[1]);
++   p->composedBytes+=(uint64_t)(region[2]-region[0])*(region[3]-region[1])*4;}
++  sfGPU.glClearColor(0,0,0,0);sfGPU.glClear(0x4000);
+   sfGPU.glMatrixMode(0x1701);sfGPU.glLoadIdentity();sfGPU.glOrtho(0,w,0,h,-1,1);
+   sfGPU.glMatrixMode(0x1700);sfGPU.glLoadIdentity();sfGPU.glEnable(0x0de1);sfGPU.glColor4f(1,1,1,1);
+   sfGPUQuad(0,0,w,h,0,0,1,1);
+   sfGPU.glEnable(0x0be2);sfGPU.glBlendFunc(1,0x0303); // premultiplied source-over
+   for(int i=0;i<p->count&&good;i++){
+    struct sfGPULayer *l=&p->layers[i];int lw=(int)sfGPU.IOSurfaceGetWidth(l->surface),lh=(int)sfGPU.IOSurfaceGetHeight(l->surface);
+-   if(!l->texture)sfGPU.glGenTextures(1,&l->texture);sfGPU.glBindTexture(0x0de1,l->texture);
++   if(damageMode&&!(l->dx<region[2]&&region[0]<l->dx+l->dw&&l->dy<region[3]&&region[1]<l->dy+l->dh))continue;
++   sfGPU.glBindTexture(0x0de1,sfGPULayerTexture(l));
+    good=lw>0&&lh>0&&sfGPU.CGLTexImageIOSurface2D(p->context,0x0de1,0x1908,lw,lh,0x80e1,0x8367,l->surface,0)==0;
+    if(good){sfGPUTextureParameters();sfGPUQuad(l->dx,l->dy,l->dw,l->dh,l->sx/lw,l->sy/lh,l->sw/lw,l->sh/lh);p->layerBytes+=(uint64_t)lw*lh*4;}
+   }
+   if(trace)drawDone=sfGPUClockMs();
++  if(damageMode)sfGPU.glDisable(0x0c11);
+   sfGPU.glFinish();good=good&&sfGPU.glGetError()==0;
++  if(good&&damageMode)f->serial=p->serial;
+   if(trace)finished=sfGPUClockMs();
+   if(getenv("SFFX_GPU_VERIFY")){
+    unsigned char a[4]={0},b[4]={0};sfGPU.glReadPixels(w/4,h/2,1,1,0x1908,0x1401,a);sfGPU.glReadPixels(w*3/4,h/2,1,1,0x1908,0x1401,b);
+@@ -226,7 +344,7 @@
+ static void sfGPUDestroy(struct sfGPUPresenter *p){
+  if(!p)return;
+  void *previous=sfGPU.CGLGetCurrentContext();sfGPU.CGLSetCurrentContext(p->context);
+- for(int i=0;i<p->count;i++){if(p->layers[i].texture)sfGPU.glDeleteTextures(1,&p->layers[i].texture);if(p->layers[i].surface)CFRelease(p->layers[i].surface);}
++ for(int i=0;i<p->count;i++){sfGPULayerTexturesDelete(&p->layers[i]);if(p->layers[i].surface)CFRelease(p->layers[i].surface);}
+  if(p->baseTexture)sfGPU.glDeleteTextures(1,&p->baseTexture);if(p->fbo)sfGPU.glDeleteFramebuffers(1,&p->fbo);
+  sfGPU.CGLSetCurrentContext(previous);sfGPU.CGLDestroyContext(p->context);sfGPU.CGLDestroyPixelFormat(p->format);free(p->baseCache);free(p);
+ }
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -57,6 +57,8 @@
+     struct sfGPUFrame *gpuOutput;
+     int ownerID;           // the window the frame belongs to (0: a frame presenter's)
+     double usedAt;         // when a flush last took it (ms, wall clock): frames unused a while are let go
++    int damage[4];         // (FXPERF2) buffer pixels changed since the frame presented before (x0,y0,x1,y1)
++    int damageKnown;
+ };
+ 
+ #define WS_FRAMES 4
+@@ -114,6 +116,9 @@
+     int flushed;           // AppKit has flushed the backing store at its current size
+     int presentPending;    // a flush found every frame busy: the next release presents it
+     int frameOut;          // (TERM9) a commit whose frame callback has not come (SF_WS_PACE_PRESENTS)
++    int presentMaySkip;    // (FXPERF2) this present may be left out when the picture is the one shown
++    int baseClean;         // (FXPERF2) AppKit drew nothing into the backing store before the flush it precedes
++    int baseDirty;         // (FXPERF2) a flush since the last compare may have changed the backing store
+     double frameOutAt;
+     int staleConfigures;   // unmaps the compositor has not passed yet: configures from before them are void
+     char title[64];
+@@ -1302,6 +1307,7 @@
+         window->frameOut = 0;
+         if (window->presentPending && window->state != MINIMIZED && window->state != HIDDEN && window->surface != NULL) {
+             window->presentPending = 0;
++            window->presentMaySkip = 1;
+             if (windowPresent(window)) {
+                 windowPacedCommit(window);
+                 if (wsTiming())
+@@ -1333,6 +1339,7 @@
+     struct wsWindow *window = windowForID(frame->ownerID);
+     if (window != NULL && window->presentPending) {
+         window->presentPending = 0;
++        window->presentMaySkip = 1;
+         if (window->state != MINIMIZED && window->state != HIDDEN && window->surface != NULL &&
+             !(window->frameOut && wsNowMs() - window->frameOutAt < 100) && windowPresent(window)) {
+             windowPacedCommit(window);
+@@ -1578,8 +1585,16 @@
+     }
+     windowAskPresentation(window, frame);
+     wl_surface_attach(window->surface, frame->buffer, 0, 0);
++    // (FXPERF2) a damage present on a surface already showing the window: only what changed, in buffer pixels
++    int partial = frame->damageKnown && window->attached;
++    frame->damageKnown = 0;
+     window->attached = 1;
+-    if (window->viewport != NULL && frame->pointsW > 0 && frame->pointsH > 0) {
++    if (partial && window->viewport != NULL && frame->pointsW > 0 && frame->pointsH > 0) {
++        wp_viewport_set_destination(window->viewport, frame->pointsW, frame->pointsH);
++        if (frame->damage[2] > frame->damage[0] && frame->damage[3] > frame->damage[1])
++            wl_surface_damage_buffer(window->surface, frame->damage[0], frame->damage[1],
++                                     frame->damage[2] - frame->damage[0], frame->damage[3] - frame->damage[1]);
++    } else if (window->viewport != NULL && frame->pointsW > 0 && frame->pointsH > 0) {
+         wp_viewport_set_destination(window->viewport, frame->pointsW, frame->pointsH);
+         wl_surface_damage(window->surface, 0, 0, frame->pointsW, frame->pointsH);
+     } else {
+@@ -1614,6 +1629,25 @@
+ 
+     windowTrimFrames(window);
+     int gpu=window->gpuPresenter&&!window->gpuPresenter->failed&&window->gpuPresenter->count>0&&ws.dmabuf&&sfGPURoleTakesDmabuf(window);
++    int maySkip = window->presentMaySkip;
++    window->presentMaySkip = 0;
++    if (gpu && sfGPUDamageEnabled()) {
++        // (FXPERF2) the base uploaded where it changed, this picture's damage recorded; the same picture as the one
++        // shown is not presented again (no new buffer, no commit)
++        struct sfGPUPresenter *p = window->gpuPresenter;
++        int since[4];
++
++        sfGPUPrepare(p, window->pixels, window->pixelsW, window->pixelsH, window->baseDirty);
++        window->baseDirty = 0;
++        if (maySkip && window->attached && window->front != NULL && window->front->gpuOutput != NULL &&
++            window->front->w == window->pixelsW && window->front->h == window->pixelsH && p->presented > 0 &&
++            sfGPUDamageSince(p, p->presented, since) && sfGPUBoxIsEmpty(since)) {
++            if (getenv("SF_WS_TRACE") != NULL)
++                fprintf(stderr, "WindowServer: surface %d: picture unchanged, not presented\n", window->windowID);
++            pthread_mutex_unlock(&ws.pixelsLock);
++            return 0;
++        }
++    }
+     struct wsFrame *frame = windowFreeFrame(window, window->pixelsW, window->pixelsH, gpu);
+     if (frame == NULL) {
+         pthread_mutex_unlock(&ws.pixelsLock);
+@@ -1626,9 +1660,16 @@
+             pthread_mutex_unlock(&ws.pixelsLock);return 0;
+         }
+         struct sfGPUPresenter *p=window->gpuPresenter;
++        if(sfGPUDamageEnabled()){
++            // against the picture shown last, when that was one of these GPU frames of the same size
++            frame->damageKnown=window->front!=NULL&&window->front->gpuOutput!=NULL&&window->front->w==frame->w&&
++                window->front->h==frame->h&&sfGPUDamageSince(p,p->presented,frame->damage);
++            p->presented=p->serial;
++        }
+         if(p->frames<=3||p->frames%120==0)
+-            fprintf(stderr,"FXWSPRESENT window=%d frames=%llu base_upload_bytes=%llu layer_gpu_bytes=%llu failures=%llu transport=dmabuf\n",window->windowID,
+-                (unsigned long long)p->frames,(unsigned long long)p->baseUploadBytes,(unsigned long long)p->layerBytes,(unsigned long long)p->failures);
++            fprintf(stderr,"FXWSPRESENT window=%d frames=%llu base_upload_bytes=%llu layer_gpu_bytes=%llu failures=%llu transport=dmabuf damage_bytes=%llu composed_bytes=%llu\n",window->windowID,
++                (unsigned long long)p->frames,(unsigned long long)p->baseUploadBytes,(unsigned long long)p->layerBytes,(unsigned long long)p->failures,
++                (unsigned long long)p->damageBytes,(unsigned long long)p->composedBytes);
+     }else memcpy(frame->pixels, window->pixels, frame->size);
+     frame->pointsW = window->pointsW;
+     frame->pointsH = window->pointsH;
+@@ -3963,6 +4004,9 @@
+             double began = wsTiming() ? wsNowMs() : 0;
+             pthread_mutex_lock(&ws.pixelsLock);
+             window->presentPending = 0;
++            if (!window->baseClean)
++                window->baseDirty = 1;
++            window->baseClean = 0;
+             if (wsPacePresents() && window->frameOut && wsNowMs() - window->frameOutAt < 100 &&
+                 window->state != MINIMIZED && window->state != HIDDEN) {
+                 // the last commit is not drawn yet: its frame callback presents the newest backing store
+@@ -3970,6 +4014,7 @@
+                 pthread_mutex_unlock(&ws.pixelsLock);
+                 return KERN_SUCCESS;
+             }
++            window->presentMaySkip = 1;
+             if (window->state != MINIMIZED && window->state != HIDDEN && windowPresent(window)) {
+                 windowPacedCommit(window);
+                 if (wsTiming())
+@@ -4957,6 +5002,29 @@
+     }
+     pthread_mutex_unlock(&ws.pixelsLock);return good;
+ }
++// (FXPERF2) as _windowServerSFFXSetGPULayer, with where the surface differs from the one registered before
++// (x0,y0,x1,y1 in its pixels, rows top-down; NULL: all of it)
++int _windowServerSFFXSetGPULayerDamaged(int windowID,uintptr_t key,void *surface,
++    double sx,double sy,double sw,double sh,double dx,double dy,double dw,double dh,const int *damage){
++    const char *enabled=getenv("SFFX_GPU_PRESENT");
++    if(!enabled||strcmp(enabled,"1")||!ensureConnected()||!ws.dmabuf)return 0;
++    pthread_mutex_lock(&ws.pixelsLock);
++    struct wsWindow *window=windowForID(windowID);int good=0;
++    if(window&&!sfGPURoleTakesDmabuf(window)){pthread_mutex_unlock(&ws.pixelsLock);return 0;}
++    if(window){
++        if(!window->gpuPresenter&&surface)window->gpuPresenter=sfGPUCreate();
++        good=sfGPUSetLayerDamaged(window->gpuPresenter,key,surface,sx,sy,sw,sh,dx,dy,dw,dh,sfGPUDamageEnabled()?damage:NULL);
++    }
++    pthread_mutex_unlock(&ws.pixelsLock);return good;
++}
++// (FXPERF2) AppKit drew nothing into the window's backing store since its last flush: the next flush need not
++// compare it with what was uploaded (any flush without this note compares)
++void _windowServerSFFXBaseUnchanged(int windowID){
++    pthread_mutex_lock(&ws.pixelsLock);
++    struct wsWindow *window=windowForID(windowID);
++    if(window)window->baseClean=1;
++    pthread_mutex_unlock(&ws.pixelsLock);
++}
+ int _windowServerSFFXGPUStats(int windowID,uint64_t values[4]){
+     pthread_mutex_lock(&ws.pixelsLock);
+     struct wsWindow *window=windowForID(windowID);int good=window&&window->gpuPresenter;

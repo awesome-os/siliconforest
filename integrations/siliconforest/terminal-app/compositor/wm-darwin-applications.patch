@@ -1,0 +1,199 @@
+diff -ruN a/crates/wm-darwin/Cargo.toml b/crates/wm-darwin/Cargo.toml
+--- a/crates/wm-darwin/Cargo.toml
++++ b/crates/wm-darwin/Cargo.toml
+@@ -13,6 +13,10 @@
+ # establish Darwin FD-whitelist runtime admission. The separate desktop binary
+ # still requires its strict explicit CLI and independently admitted package.
+ native-managed-spawn = ["desktop-shell"]
++# Requested synthetic input and screen captures for tests (src/inject.rs). A test
++# instrument: the build that is installed as the desktop is made without it, and
++# then no environment variable or file can turn it on.
++test-inject = ["desktop-shell"]
+ 
+ [dependencies]
+ smithay = { version = "0.7", default-features = false, features = ["wayland_frontend"], optional = true }
+diff -ruN a/crates/wm-darwin/src/desktop.rs b/crates/wm-darwin/src/desktop.rs
+--- a/crates/wm-darwin/src/desktop.rs
++++ b/crates/wm-darwin/src/desktop.rs
+@@ -308,6 +308,7 @@
+                             Err(errno) => format!("sound request={action:?} error={errno}"),
+                         },
+                         crate::settings::Action::SessionEnd(off) => format!("session_end={} notice={notice:?}", if off { "poweroff" } else { "restart" }),
++                        crate::settings::Action::OpenApplication(n) => format!("open_application={n} notice={notice:?}"),
+                     };
+                     (line, notice)
+                 }
+@@ -916,7 +917,7 @@
+             server.desktop_pointer(at, 2, 0).unwrap();
+             server.desktop_pointer(at, 0, 2).unwrap();
+             let rows = server.desktop_menu_level(0, 0).unwrap().0;
+-            assert_eq!(rows, ["Terminal", "Theme", "Wallpaper", "Display", "Wi-Fi", "Sound", "End Session"]);
++            assert_eq!(rows, ["Terminal", "Theme", "Wallpaper", "Display", "Applications", "Wi-Fi", "Sound", "End Session"]);
+             // Every row is hit at its centre, and rows are the theme's row height at the scale.
+             let centres: Vec<Point> = (0..rows.len()).map(|i| server.desktop_menu_level(0, i).unwrap().1).collect();
+             let pitch = centres[1].y - centres[0].y;
+diff -ruN a/crates/wm-darwin/src/lib.rs b/crates/wm-darwin/src/lib.rs
+--- a/crates/wm-darwin/src/lib.rs
++++ b/crates/wm-darwin/src/lib.rs
+@@ -13,8 +13,25 @@
+ pub mod glrender;
+ pub mod gpu;
+ pub mod hid;
+-#[cfg(feature = "desktop-shell")]
++#[cfg(all(feature = "desktop-shell", feature = "test-inject"))]
+ pub mod inject;
++/// The build without the test instrument: nothing is read, nothing is injected, and a session
++/// that asks for it is told so once.
++#[cfg(all(feature = "desktop-shell", not(feature = "test-inject")))]
++pub mod inject {
++    pub const ENV: &str = "CHONKSTEP_DARWIN_INJECT_DIR";
++    pub struct Inject;
++    impl Inject {
++        pub fn from_env() -> Option<Self> {
++            if std::env::var_os(ENV).is_some() {
++                eprintln!("WMINJECT absent: this build has no inject module (feature test-inject); {ENV} is ignored");
++            }
++            None
++        }
++        pub fn step(&mut self, _: &mut crate::server::Server, _: u32) -> Result<(), String> { Ok(()) }
++        pub fn after_repaint(&mut self, _: &mut crate::server::Server) -> Result<(), String> { Ok(()) }
++    }
++}
+ mod input;
+ pub mod kms;
+ pub mod launch_audit;
+diff -ruN a/crates/wm-darwin/src/settings.rs b/crates/wm-darwin/src/settings.rs
+--- a/crates/wm-darwin/src/settings.rs
++++ b/crates/wm-darwin/src/settings.rs
+@@ -58,7 +58,12 @@
+     Mute(bool),
+     /// End the session and restart (`false`) or power off (`true`) the machine.
+     SessionEnd(bool),
++    /// Open the n-th application of the Applications submenu as it was last shown.
++    OpenApplication(u8),
+ }
++
++/// The most applications the submenu lists.
++pub const APPLICATION_ROWS: usize = 40;
+ impl Action {
+     /// The id the row fires, less `HOST_ACTION_BASE`.
+     pub fn id(self) -> u32 {
+@@ -67,6 +72,7 @@
+             Action::Mute(on) => 2 + u32::from(on),
+             Action::Volume(percent) => 100 + u32::from(percent.min(100)),
+             Action::SessionEnd(off) => 250 + u32::from(off),
++            Action::OpenApplication(n) => 252 + u32::from(n).min(APPLICATION_ROWS as u32 - 1),
+         }
+     }
+     pub fn from_id(id: u32) -> Option<Self> {
+@@ -75,6 +81,7 @@
+             2 | 3 => Some(Action::Mute(id == 3)),
+             100..=200 => Some(Action::Volume((id - 100) as u8)),
+             250 | 251 => Some(Action::SessionEnd(id == 251)),
++            252..=291 => Some(Action::OpenApplication((id - 252) as u8)),
+             _ => None,
+         }
+     }
+@@ -153,9 +160,73 @@
+     Ok(())
+ }
+ 
++/// The directories whose application bundles the Applications submenu lists.
++pub const APPLICATION_DIRS: [&str; 2] = ["/Applications", "/Applications/Utilities"];
++
++/// The pipe in the session's runtime directory on which the session's listener
++/// (`open --listen`) takes the path of a bundle to open.
++pub const OPEN_REQUESTS: &str = "open-requests";
++
++/// The application bundles (`*.app` directories) of `dirs`, by name; at most
++/// [`APPLICATION_ROWS`].
++pub fn applications_in(dirs: &[&str]) -> Vec<std::path::PathBuf> {
++    let mut found: Vec<std::path::PathBuf> = Vec::new();
++    for dir in dirs {
++        let Ok(entries) = std::fs::read_dir(dir) else { continue };
++        for entry in entries.flatten() {
++            let path = entry.path();
++            if path.extension().is_some_and(|e| e == "app") && path.is_dir() {
++                found.push(path);
++            }
++        }
++    }
++    found.sort_by_key(|p| p.file_stem().map(|s| s.to_string_lossy().to_lowercase()));
++    found.truncate(APPLICATION_ROWS);
++    found
++}
++
++/// What the Applications submenu showed last: a row names its place in this list.
++static APPLICATIONS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
++
++/// The Applications submenu: one row per bundle in the application directories.
++pub fn application_rows(apps: &[std::path::PathBuf]) -> Vec<MenuItem> {
++    if apps.is_empty() {
++        return vec![row("No applications in /Applications", None)];
++    }
++    apps.iter()
++        .enumerate()
++        .map(|(n, path)| row(path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(), Some(Action::OpenApplication(n as u8))))
++        .collect()
++}
++
++/// Ask the session to open a bundle: its path goes, as one line, into the
++/// session's pipe. The compositor starts no program for this; without a
++/// listener on the pipe (`ENXIO`, `ENOENT`) nothing is opened and the notice
++/// says so.
++pub fn request_open(path: &std::path::Path) -> Result<(), i32> {
++    use std::io::Write;
++    use std::os::unix::fs::OpenOptionsExt;
++    let dir = std::env::var_os("XDG_RUNTIME_DIR").ok_or(libc::ENOENT)?;
++    let pipe = std::path::Path::new(&dir).join(OPEN_REQUESTS);
++    let mut file = std::fs::OpenOptions::new()
++        .write(true)
++        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
++        .open(&pipe)
++        .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
++    let mut line = path.as_os_str().as_encoded_bytes().to_vec();
++    line.push(b'\n');
++    file.write_all(&line).map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))
++}
++
+ /// The host's part of the desktop menu.
+ pub fn host_menu(wifi: &WifiStatus, sound: Option<(Level, Option<String>)>) -> Vec<MenuItem> {
++    let apps = applications_in(&APPLICATION_DIRS);
++    let rows = application_rows(&apps);
++    if let Ok(mut shown) = APPLICATIONS.lock() {
++        *shown = apps;
++    }
+     vec![
++        MenuItem::Submenu { label: "Applications".into(), items: rows },
+         MenuItem::Submenu { label: "Wi-Fi".into(), items: wifi_rows(wifi) },
+         MenuItem::Submenu { label: "Sound".into(), items: sound_rows(sound) },
+         MenuItem::Submenu { label: "Session".into(), items: session_rows() },
+@@ -185,6 +256,19 @@
+             Ok(()) => if off { "Shutting down\u{2026}".into() } else { "Restarting\u{2026}".into() },
+             Err(errno) => format!("The session could not be ended: error {errno}"),
+         },
++        Action::OpenApplication(n) => {
++            let path = APPLICATIONS.lock().ok().and_then(|shown| shown.get(usize::from(n)).cloned());
++            match path {
++                None => "That application is no longer there".into(),
++                Some(path) => {
++                    let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
++                    match request_open(&path) {
++                        Ok(()) => format!("Opening {name}\u{2026}"),
++                        Err(errno) => format!("{name} could not be opened: this session takes no requests (error {errno})"),
++                    }
++                }
++            }
++        }
+         Action::Mute(on) => match mixer.set_muted(on) {
+             Ok(()) => if on { "Sound off".into() } else { "Sound on".into() },
+             Err(errno) => format!("Sound could not be {}: error {errno}", if on { "muted" } else { "unmuted" }),
+@@ -414,7 +498,7 @@
+         assert_eq!(apply(Action::WifiPower(true), &NativeWifi, &mixer), format!("Wi-Fi could not be turned on: error {}", libc::ENODEV));
+         assert_eq!(apply(Action::Volume(10), &wifi, &crate::volume::CoreaudiodMixer), format!("Volume could not be set: error {}", libc::ENOENT));
+         let menu = host_menu(&wifi.status(), sound_state(&mixer));
+-        assert_eq!(labels(&menu), ["Wi-Fi", "Sound"]);
++        assert_eq!(labels(&menu), ["Applications", "Wi-Fi", "Sound", "Session"]);
+         assert!(menu.iter().all(MenuItem::is_submenu));
+     }
+ }

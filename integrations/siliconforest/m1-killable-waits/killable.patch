@@ -1,0 +1,131 @@
+fbsdkpi: signal_pending() and current_exiting() answer for the calling XNU thread
+
+SPDX-License-Identifier: MIT (this header and the added lines; the patched files keep
+their FreeBSD/PureDarwin licences)
+
+The PD LinuxKPI stubbed linux_signal_pending()/linux_fatal_signal_pending() and
+linux_task_exiting() to false ("kernel threads on xnu take no signals"). Every Linux
+interruptible wait loop that ends on signal_pending() (drm_syncobj_array_wait_timeout,
+dma_fence_default_wait(intr), the Rust kernel crate's CondVar::wait_interruptible used
+by the Asahi driver) therefore never ended for a dying or signalled client: XNU's
+task_terminate aborts the thread, our THREAD_ABORTSAFE sleep returns at once, the loop
+asks signal_pending(), gets false, and sleeps again -> the thread spins in the kernel
+and the process stays in exit (SF-AC "a process that used Indium cannot exit", the
+stuck-in-exit GPU helpers). A posted SIGTERM was swallowed the same way.
+
+Now, for the calling thread only: true when its process is exiting (P_LEXIT, set by
+exit1() before task_terminate_internal(); lock-free) or, where blocking is allowed,
+when XNU has an unblocked, unignored signal posted to it (thread_issignal); fatal:
+SIGKILL posted or exiting. Kernel threads (kernproc) still take no signals.
+Uninterruptible waits stay uninterruptible: no GPU backing, mapping or job is freed
+to make exit pass. -ERESTARTSYS still reaches user space as EINTR (layer 0012),
+which libdrm's drmIoctl() retries.
+
+Applies unchanged (fuzz 0) to the frozen CIO29 agx tree 0n94n35s... and dcp tree
+gj14r67...; build-agx.nix / build-dcp.nix; host test test-waits.py.
+
+--- a/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/src/linux_schedule.c
++++ b/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/src/linux_schedule.c
+@@ -132,17 +132,27 @@
+ }
+ 
+ #ifdef SF_LINUXKPI
+-// kernel threads on xnu take no signals
++// a linux wait loop (drm_syncobj, dma_fence_default_wait, the Rust CondVar) ends on
++// signal_pending(). xnu interrupts our THREAD_ABORTSAFE sleeps for a signal and for task
++// termination, but a constant false sent the loop back to sleep: a SIGKILLed or exiting
++// client's waiting threads spun or slept for ever and the process never finished exit.
++// The answer is for the calling thread only; kernel threads still take no signals.
++int sfos_signal_pending(int fatal);
++
+ bool
+ linux_signal_pending(struct task_struct *task)
+ {
+-	return (false);
++	if (task != NULL && task->task_thread != curthread)
++		return (false);
++	return (sfos_signal_pending(0) != 0);
+ }
+ 
+ bool
+ linux_fatal_signal_pending(struct task_struct *task)
+ {
+-	return (false);
++	if (task != NULL && task->task_thread != curthread)
++		return (false);
++	return (sfos_signal_pending(1) != 0);
+ }
+ #else
+ bool
+--- a/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_current.c
++++ b/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_current.c
+@@ -116,10 +116,16 @@
+ 	return (NULL);
+ }
+ 
++int sfos_task_exiting(void);
++
++// current_exiting(): drm_sched_entity_flush() bounds its wait and drops a dying
++// client's queued jobs only when this says the process is in exit
+ bool
+ linux_task_exiting(struct task_struct *task)
+ {
+-	return (false);
++	if (task == NULL || task->task_thread != curthread)
++		return (false);
++	return (sfos_task_exiting() != 0);
+ }
+ 
+ static void
+--- a/src/Kernel/fbsdkpi/xnu/sf_fbsd_os.cpp
++++ b/src/Kernel/fbsdkpi/xnu/sf_fbsd_os.cpp
+@@ -37,6 +37,11 @@
+ extern boolean_t ml_get_interrupts_enabled(void);
+ extern boolean_t ml_at_interrupt_context(void);
+ extern boolean_t preemption_enabled(void);
++// BSD KPI (BSDKernel.exports); sigset_t is a 32-bit mask on xnu
++extern proc_t current_proc(void);
++extern proc_t kernproc;
++extern int proc_exiting(proc_t);
++extern int thread_issignal(proc_t, thread_t, unsigned int);
+ }
+ 
+ static lck_grp_t *sGroup;
+@@ -1226,6 +1231,37 @@
+ 	thread_wakeup_prim((event_t)event, all ? FALSE : TRUE, THREAD_AWAKENED);
+ }
+ 
++// linux's signal_pending()/fatal_signal_pending() for the calling thread. exit1() sets
++// P_LEXIT before task_terminate_internal() aborts the other threads, so an exiting
++// process (exit, SIGKILL, a crash) answers yes without a lock; that is what lets a
++// client's waiting threads leave the kernel. A signal xnu has posted to this thread
++// (and not blocked or ignored) answers yes too, but thread_issignal() takes the proc
++// mutex, so only where blocking is allowed: under a real spin lock the answer is
++// "exiting" alone. Kernel threads take no signals.
++#define SFOS_SIGKILL_MASK	(1u << (9 - 1))
++
++extern "C" int
++sfos_signal_pending(int fatal)
++{
++	proc_t p = current_proc();
++
++	if (p == NULL || p == kernproc)
++		return 0;
++	if (proc_exiting(p))
++		return 1;
++	if (ml_at_interrupt_context() || !ml_get_interrupts_enabled() || !preemption_enabled())
++		return 0;
++	return thread_issignal(p, current_thread(), fatal ? SFOS_SIGKILL_MASK : ~0u) != 0;
++}
++
++extern "C" int
++sfos_task_exiting(void)
++{
++	proc_t p = current_proc();
++
++	return p != NULL && p != kernproc && proc_exiting(p);
++}
++
+ // threads
+ 
+ struct sf_start {

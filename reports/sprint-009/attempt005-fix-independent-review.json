@@ -1,0 +1,87 @@
+{
+ "report": "attempt-005 fix: independent review of the ARM64 kc-tools producer fix and control KC (addendum to attempt005-independent-analysis.json)",
+ "author_role": "independent reviewer (Claude), read-only",
+ "date": "2026-11-07",
+ "claim_class": "artifact_byte_and_offline_model_review",
+ "verdict": "APPROVE: the fix is minimal and correct. The control KC differs from the failing KC only in the two __TEXT.vmsize fields (0x330000 -> 0x17c000), and no 2048-phase permission conflict remains. Not a boot claim.",
+ "artifacts": {
+  "fixed_tool": {
+   "out": "/nix/store/0laqdrjic713l4b3javvi1m4gv4fnv9h-kc-tools-arm64-text-fixed-0.1",
+   "drv": "/nix/store/1xv1a2vnmqyzi5mbkcp9d1czxszjrjqy-kc-tools-arm64-text-fixed-0.1.drv",
+   "source": "/nix/store/ms2dkzn692vj0y7r7pn0y2zgf4bw0hnf-smvq8016ginrmqa9qhdwnh8f25lq558l-source (same pinned kc-tools 05e5ed6a as the original)",
+   "patch_store": "/nix/store/idymyn3z1isssp2kc3831yfzgsi03ag3-kc-tools-arm64-text.patch"
+  },
+  "patch_sha256": {
+   "repo integrations/puredarwin/m1-bringup/kc-tools-arm64-text.patch": "4ea5eee1036c93d3b9efe40fb919407b5aff8c71b73a979e845df729597a9a55",
+   "store copy": "4ea5eee1036c93d3b9efe40fb919407b5aff8c71b73a979e845df729597a9a55"
+  },
+  "old_kc": {
+   "path": "/nix/store/vn510pz79zjfvac0sb062swvnpw0lp4y-puredarwin-kc-arm64-0.1/kernel",
+   "sha256": "496618b211db6ee3f4faf2cf2b0fd113f7db4ec7c088e38dd082c3e6e8aaf5a0",
+   "drv": "/nix/store/5s0px7kk41n8qryv430yk9svhpm8jv8r-puredarwin-kc-arm64-0.1.drv"
+  },
+  "control_kc": {
+   "path": "/nix/store/wcsg0qkj6fk7jzhhvi707sba40fm7nz2-puredarwin-kc-arm64-0.1/kernel",
+   "sha256": "3628eb8b9f655e982f31af5e6811fd8282f3ba9c005bec9dabe189458393f0f4",
+   "drv": "/nix/store/g59z8yr0fkjcdz8jp19ihfpcnywdqfz1-puredarwin-kc-arm64-0.1.drv"
+  },
+  "input_kernel_sha256": "ce5c7ee376174ba2424d9d044ddcbebf66fefbb40a15796d595a907d7d4e4537"
+ },
+ "checks": [
+  {
+   "id": "C1",
+   "check": "derivation inputs",
+   "result": "PASS",
+   "detail": "nix-store --references of the old vs new KC drv differ in exactly one entry: kc-tools-0.1.drv (2hgpc78h) replaced by kc-tools-arm64-text-fixed-0.1.drv (1xv1a2vn). Kernel, kexts, recipe and sources are unchanged."
+  },
+  {
+   "id": "C2",
+   "check": "patch content",
+   "result": "PASS",
+   "detail": "src/fileset.c:1008 adds 'omh->cputype != CPU_TYPE_ARM64 &&' to the embedded-kernel __TEXT inflation, so RISCV64 and other architectures keep their layout. The comment is accurate. The fileset.c:651-666 __DATA_CONST-over-__LASTDATA_CONST extension is untouched (control KC __DATA_CONST vmsize is still 0x1b4000), which is benign for permissions per the original analysis."
+  },
+  {
+   "id": "C3",
+   "check": "byte diff old vs control KC",
+   "result": "PASS",
+   "detail": "Same size (38883200 bytes). Exactly 4 differing bytes: top-level header __TEXT.vmsize (file offset 0x41..0x42) and com.apple.kernel member __TEXT.vmsize (0x4041..0x4042), both 0x330000 -> 0x17c000. No other load-command field, UUID, fixup or payload byte changed."
+  },
+  {
+   "id": "C4",
+   "check": "actual extent",
+   "result": "PASS",
+   "detail": "Control KC kernel __TEXT = 0xfffffe0007004000 + 0x17c000, ending at 0xfffffe0007180000 = __DATA_CONST start (no overlap). Equals the linker's __TEXT vmsize and filesize in kernel.debug.t8103."
+  },
+  {
+   "id": "C5",
+   "check": "full arm_vm_prot_init model, 2048 phases",
+   "result": "PASS_WITH_RESIDUAL_NOTE",
+   "detail": "Segment values parsed from each KC. Old: 1232 phases with PERMISSION conflicts (hinted RO __TEXT vs unhinted RW __DATA_CONST/__LASTDATA_CONST) plus 144 hint-only. Control: 0 permission conflicts; 004 slide 0xbe2c000 = 0 and 005 slide 0xc790000 = 0."
+  },
+  {
+   "id": "C6",
+   "check": "root host test rerun",
+   "result": "PASS",
+   "detail": "Reran test_kc_layout.py independently with the same three artifacts: 3/3 OK, HOST_LAYOUT_CHECKS_PASSED, hashes identical to runs/m1-bringup-009/kc-layout-check-001.log. Scope note: that test models only the __TEXT/__DATA_CONST pair; C5 covers all prot_init requests."
+  },
+  {
+   "id": "C7",
+   "check": "pre-device inspector",
+   "result": "PASS",
+   "detail": "normal_image.inspect rejects the old KC ('Embedded kernel TEXT overlaps writable startup DATA_CONST') and accepts the control KC."
+  }
+ ],
+ "residual_note": {
+  "severity": "low, permission-neutral, unchanged by the fix",
+  "finding": "In 144/2048 phases (7.0%), in BOTH KCs, the upstream RWNX+HINT mapping of the gap between __PRELINK_TEXT end and kernel __TEXT (0xfffffe0006b58000..0xfffffe0007004000 linked) contains __PRELINK_INFO (0xfffffe0006b58000+0x24000), which upstream then remaps RWNX without HINT. Permissions and attributes are identical, so this cannot cause a permission fault like attempt-005. It is still a mixed contiguous-bit group (CONSTRAINED UNPREDICTABLE: a TLB conflict abort is possible in principle). The code path is upstream XNU arm_vm_prot_init and its occurrence depends on the fileset layout. Kernel owner may consider it later; not a blocker for this fix."
+ },
+ "not_claimed": [
+  "boot of the control KC",
+  "hardware page-table dump",
+  "kernel002 (separate live build, not reviewed)"
+ ],
+ "hardware_or_build_actions": "none; read-only file, derivation-metadata and offline-model checks only",
+ "files_written": [
+  "reports/sprint-009/attempt005-fix-independent-review.json"
+ ]
+}

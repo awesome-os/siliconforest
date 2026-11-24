@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SCRIPT_REVIEW_NO_HARDWARE_COLLECTOR_PENDING",
+  "reviewed": {
+    "script": "integrations/puredarwin/m1-dart-survey/darwin-dart-survey-test 0f1c4ab9d1431eb2 (diff base: approved and qualified darwin-native-startup-test dcba72de)",
+    "record": "reports/sprint-010/dart-survey-supervisor-source.json"
+  },
+  "verdict": "APPROVE the supervisor structure. The binding is conditional on the final collector (/usr/bin/darwin-dart-survey) being reviewed against the requirements below before packet assembly. The only change is one block inserted after nonce validation and before the original DL12_NATIVE_BEGIN. The qualified native-only startup, GUI and closed-cleanup path follows unchanged.",
+  "diff": [
+    "Inserted after line 6 (the nonce length check): a comment; 'DL13_DART_BEGIN_<n> register_writes=0 device_initialization=false'; 'survey_rc=0; if /usr/bin/darwin-dart-survey --nonce \"$nonce\"; then :; else survey_rc=$?; fi'; 'DL13_DART_COLLECTED_<n> rc=<raw rc> initialization_proven=false'; 'case \"$survey_rc\" in 0|77) ;; *) exit 1 ;; esac'.",
+    "Everything from DL12_NATIVE_BEGIN onward is byte-identical to dcba72de (inventory gate, keyboard-node wait, mouse refusal, keyboard-only compositor, finite 80 s observer, closed 6-record export, compositor TERM/wait, STATUS, footer and return)."
+  ],
+  "verified": [
+    "set -eu safety: the collector runs inside if/else, so a non-zero rc does not trip errexit, and the raw rc is printed before any decision. One invocation; no loop or retry.",
+    "Fail-closed: any rc other than 0 or 77 (crash, usage error, missing or malformed diagnostic, if the collector maps those so) exits 1 before the runtime directory, the cleanup trap, the compositor or the client exist, so nothing needs cleanup. Root's controller still performs the mandatory reset and Linux recovery.",
+    "Refusal preserved: rc 77 continues to the desktop, so a kernel-recorded refusal (NOT_READY/UNSUPPORTED/...) is kept as an observation and the finite GUI/cleanup is still exercised. The DL13_DART_COLLECTED rc line is the survey verdict; the later STATUS/footer never imply a survey result.",
+    "No input or write paths are added. The host stays sealed after the launcher (09cd/25694c88 native mode), and the script writes nothing to registers, HID nodes or the PTY."
+  ],
+  "collector_requirements_before_packet": [
+    "Read-only IORegistry access only (an IOResources property read). No IOServiceOpen or user client, no MMIO, no device-tree writes, no retries beyond a single bounded read.",
+    "Exact validation: OSData length 764, version 1, sample_count <= 88, reads_attempted <= 1024, failure_region <= 5, result in {0,1,2,-1,-2,-3,-4}. For result 0 also require sample_count 88, reads 889, region 5 and offset 0. Read both the provider copy (PDDARTSurveyDiagnosticV1 on IOResources) and, if present, the instance copy; when both exist, require them byte-equal.",
+    "Exit-code mapping: 0 only for a well-formed result 0; 77 only for a well-formed kernel-recorded refusal (result != 0); any other code for a missing property, wrong length or version, inconsistent counts or a read error. A missing diagnostic must never become 0 or 77.",
+    "Evidence: print the full 764 raw bytes once, nonce-bound, as chunked hex with a SHA-256 (as the terminal records collector does), so the saved console preserves the diagnostic independently of the GUI run. Values include firmware table physical addresses and must stay private capture.",
+    "Bounded output and runtime well inside the existing 180 s host plan: launch at +78 s, collector about 1 s, then the unchanged 80 s observer and closed export, which finished at +160 s in native startup001."
+  ],
+  "qualification_notes": [
+    "Survey qualification rests on the decoded raw bytes in the console, together with the kernel IOLog 'PDDARTSurvey: result=... diagnostic_copy=1 provider_preserved=1 instance_recorded=...'. Neither the marker alone nor the GUI footer is enough.",
+    "Even result 0 is a noncoherent read sequence (README): no translation, ownership or initialization claim."
+  ],
+  "not_claimed": ["collector behaviour", "runtime", "survey result", "DART initialization"],
+  "scope": "Read-only script diff and record review. No hardware, builds or edits."
+}

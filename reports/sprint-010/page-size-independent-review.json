@@ -1,0 +1,219 @@
+{
+  "schema_version": 1,
+  "reviewer": "Astra",
+  "status": "APPROVE_MINIMAL_DELETION_PENDING_REBUILT_FORWARDING_AND_RUNTIME_CHECKS",
+  "scope": "Independent bounded source, current Mach-O symbol/export/disassembly, and saved runtime-image review. No source edits, build, fetch, target access, or hardware execution. This report is the only file written.",
+  "source_pin": "e7aa00a60f0b56ef35aa24252e81467787bf71ea",
+  "conclusion": {
+    "confirmed_defect": "The booted libSystem.B exports its own initialized 4096 vm_page_size, while its mach_init call resolves to libdyld, which initializes a different vm_page_size alongside the canonical masks and shifts. The exported size and the initialized size are different storage objects.",
+    "minimal_patch": "Delete exactly vm_size_t vm_page_size = 4096; at src/Libraries/libSystem/stub/pd_libSystem_compat.c:711. Preserve libSystem.exports:298 and the existing -reexport_library libdyld link at stub/CMakeLists.txt:324-327.",
+    "source_api": "Keep the public data ABI: extern vm_size_t vm_page_size in mach/vm_page_size.h:42. No new getter, local cache, initializer assignment, commpage reader, or hardcoded page size is needed. A declaration without an initializer that is still a definition is not a forwarding fix.",
+    "required_correction_to_grok_report": "The link_note/why_this_is_enough claim that -u,_vm_page_size should pull mach_init.o into libSystem is not the desired mechanism and is not established by this binary. Current libSystem has no defined mach_init; it imports that function from libdyld. The correct rebuilt result is canonical data forwarding to libdyld, matching the existing kernel-size/kernel-mask exports. Reject a new local uninitialized or initialized duplicate even if linking succeeds.",
+    "approval_limit": "The proposed one-line deletion is justified because the forwarding dependency and exported canonical target already exist. This review did not inspect a completed patched dylib or execute it. Root must establish the linked result before staging."
+  },
+  "runtime_binding": {
+    "private_console": "runs/m1-desktop-010/attempt-003/guest/console.bin",
+    "console_bytes": 33882,
+    "console_sha256": "6c73769ae9628a48a612124f131be0481096fceea3d45c98579be2625992d205",
+    "ramdisk": "artifacts/m1-desktop-010/candidate-003/ramdisk.img",
+    "ramdisk_sha256": "0707900627ffdbc0b0ad14474fe35a367c45b2d566a6189f5872ac9b22bdc704",
+    "method": "Independently hashed the full image and saved raw console. Used debugfs -R cat (read-only; no -w, mount, or extracted-file writes) to hash the three image members below; both dylibs equal the current jll store bytes. Parsed/compared the report values against the raw JSON console line.",
+    "members": {
+      "/usr/lib/libSystem.B.dylib": {
+        "bytes": 4202062,
+        "sha256": "432c7369de607b8c0af8f1313ac7a0055cb8f327ea12d1bb9239081eebd53b83",
+        "store": "/nix/store/jll17vb2bl849knd0b68n358c53wh1gl-puredarwin-libsystem-0.1/usr/lib/libSystem.B.dylib"
+      },
+      "/usr/lib/system/libdyld.dylib": {
+        "bytes": 1174330,
+        "sha256": "428e224ec2621bf3a2a7859402603a9a0fd6abe8b3e26c38edeb869e0ce58a0d",
+        "store": "/nix/store/jll17vb2bl849knd0b68n358c53wh1gl-puredarwin-libsystem-0.1/usr/lib/system/libdyld.dylib"
+      },
+      "/usr/bin/darwin-page-probe": {
+        "bytes": 34622,
+        "sha256": "856d742eac14d0adcbe33a290c1ded38e8104b8d8b9951d012029c9b4560f4a8"
+      }
+    },
+    "observed": {
+      "vm_page_size": 4096,
+      "vm_page_mask": 16383,
+      "vm_page_shift": 14,
+      "vm_kernel_page_size": 16384,
+      "vm_kernel_page_mask": 16383,
+      "vm_kernel_page_shift": 14,
+      "getpagesize": 16384,
+      "sysconf_SC_PAGESIZE": 16384,
+      "host_page_size": 16384,
+      "direct_commpage_read": false
+    },
+    "protection_results": "Saved probe succeeds for aligned mprotect, rejects +4096 and +8192 with EINVAL, and succeeds for all three vm_protect calls; this is real saved runtime evidence, not a current execution."
+  },
+  "binary_findings": [
+    {
+      "evidence": "arm64-apple-darwin20.4-nm -m; llvm-objdump --macho --exports-trie; independent LC_SEGMENT_64 file-offset decoding",
+      "libSystem": "_vm_page_size is external __DATA,__data at unslid 0x2b6800; file bytes decode as uint64 4096. _mach_init, _vm_page_mask and _vm_page_shift are undefined from libdyld. _vm_kernel_page_size and mask are explicit re-exports. No local mach_init definition is present."
+    },
+    {
+      "evidence": "llvm-objdump --macho --exports-trie plus nm",
+      "libdyld": {
+        "_vm_kernel_page_size": "0x993c0",
+        "_vm_kernel_page_mask": "0x993c8",
+        "_vm_kernel_page_shift": "0x993d0",
+        "_vm_page_size": "0x993d8",
+        "_vm_page_mask": "0x993e0",
+        "_vm_page_shift": "0x993e8",
+        "_mach_init": "0x5ecd0"
+      },
+      "meaning": "All six globals are external definitions in __DATA,__common and in the export trie. Their zero-fill on disk is intentional; mach_init initializes these same addresses."
+    },
+    {
+      "evidence": "Mach-O load commands, not otool -L alone",
+      "dependency": "libSystem has LC_REEXPORT_DYLIB (0x8000001f) /usr/lib/system/libdyld.dylib. libdyld has ordinary LC_LOAD_DYLIB /usr/lib/libSystem.B.dylib. The libSystem ID is not an extra dependency. The whole-library re-export also exposes mask/shift even though libSystem.exports omits their explicit names."
+    },
+    {
+      "evidence": "llvm-objdump --disassemble --disassemble-symbols=_mach_init,_mach_init_doit on libdyld",
+      "stores": "mach_init_doit 0x5ed90-0x5edcc reads USER_PAGE_SHIFT_64 at 0xfffff4025, stores shift to its own 0x993e8, stores 1<<shift at its own 0x993d8 (instruction 0x5edbc), then reloads that same size at 0x5edc0 and stores size-1 to 0x993e0. Kernel trio uses commpage 0xfffff4037 and addresses 0x993c0/0x993c8/0x993d0.",
+      "correction": "In this actual build the mask path reloads the libdyld-local size; no optimizer/register-retention hypothesis is needed to explain the mismatch."
+    },
+    {
+      "evidence": "llvm-objdump disassembly and --macho --indirect-symbols on libSystem",
+      "initialization_order": "pd_libSystem_initializer at 0x9cf7c calls its own __libkernel_init at 0x9d0c8. That wrapper calls import stub 0x26c6f4 for libdyld mach_init at 0xbadd4. Then initializer calls the explicit libdyld wrapper at 0x9d0dc via stub 0x26c7c0; __malloc_init follows at 0x9d160. libdyld pd_libdyld_libkernel_init 0x5d680 calls its own __libkernel_init 0x5f090. mach_init has an idempotence flag, not a late constructor that runs after malloc."
+    }
+  ],
+  "source_evidence": [
+    {
+      "file": "sources/puredarwin-baseline/src/Libraries/libSystem/stub/pd_libSystem_compat.c",
+      "lines": [
+        711
+      ],
+      "finding": "Strong initialized local compatibility definition is the incorrect exported size."
+    },
+    {
+      "file": "sources/puredarwin-baseline/src/Libraries/libSystem/stub/CMakeLists.txt",
+      "lines": [
+        139,
+        143,
+        307,
+        315,
+        324,
+        325,
+        327
+      ],
+      "finding": "Export names become -u roots and the export list; libdyld is linked and whole-library re-exported. Preserve these; -u is an unresolved-symbol requirement, not proof of which archive object will be selected."
+    },
+    {
+      "file": "sources/puredarwin-baseline/src/Libraries/libSystem/libdyld/CMakeLists.txt",
+      "lines": [
+        122,
+        127,
+        144,
+        145
+      ],
+      "finding": "libdyld links libsystem_kernel_static; its unexport list hides C++ internals, not the Mach page globals."
+    },
+    {
+      "file": "sources/puredarwin-baseline/src/Libraries/libSystem/stub/pd_libSystem_init.c",
+      "lines": [
+        250,
+        263,
+        270,
+        303
+      ],
+      "finding": "Both libkernel tables initialized before malloc. Their hidden table duplication does not require public page-global duplication."
+    },
+    {
+      "file": "sources/puredarwin-baseline/src/Libraries/libSystem/libdyld/pd_libdyld_exports.c",
+      "lines": [
+        7,
+        22,
+        25
+      ],
+      "finding": "Explicit wrapper enters libdyld-local kernel initializer."
+    },
+    {
+      "file": "sources/puredarwin-baseline/src/Libraries/libSystem/libsystem_kernel/wrappers/_libkernel_init.c",
+      "lines": [
+        75,
+        84
+      ],
+      "finding": "Calls mach_init before returning."
+    },
+    {
+      "file": "sources/puredarwin-baseline/src/Libraries/libSystem/libsystem_kernel/mach/mach_init.c",
+      "lines": [
+        78,
+        84,
+        105,
+        109,
+        144,
+        152,
+        158,
+        160,
+        170,
+        171
+      ],
+      "finding": "Canonical globals; commpage-derived shift/size/mask; idempotent call. No source change needed."
+    },
+    {
+      "file": "sources/puredarwin-baseline/src/Libraries/libSystem/libsystem_kernel/mach/mach/vm_page_size.h",
+      "lines": [
+        42,
+        49,
+        50,
+        55,
+        56
+      ],
+      "finding": "Public extern variable ABI; round_page uses size, mach_vm_round_page uses mask, so split storage matters."
+    },
+    {
+      "file": "sources/puredarwin-baseline/src/Libraries/libSystem/libmalloc/src/base.h",
+      "lines": [
+        99,
+        100,
+        110,
+        111,
+        112
+      ],
+      "finding": "User allocation quantum follows vm_page_size; guard quantum is max of kernel and user sizes."
+    },
+    {
+      "file": "sources/puredarwin-baseline/src/Libraries/libSystem/libmalloc/src/vm.c",
+      "lines": [
+        237,
+        249,
+        251
+      ],
+      "finding": "Postlude guard starts at user round_page_quanta and uses large_vm_page_quanta_size; observed 4K start/16K task alignment mismatch explains the warning mechanism. Do not change protections or suppress warnings."
+    }
+  ],
+  "ordered_validation_for_root": [
+    "Build the isolated one-line deletion using the existing pinned recipe. No extra local definition or initialization function; leave allocator/kernel/commpage code intact.",
+    "Inspect rebuilt libSystem nm plus export trie/chained imports: no N_SECT/N_ABS/common _vm_page_size definition, canonical re-export to libdyld, and no newly selected local mach_init. Inspect libdyld still exports all six globals and its mach_init stores into its own exported tuple. If linker selection differs, stop and fix forwarding rather than adding a local copy.",
+    "Bind the rebuilt dylib bytes in the staged RAM image; retain the unchanged page-probe binary. Check getpagesize, host_page_size, vm_page_size, mask=size-1 and 1<<shift=size agree on this actual 16K guest. Misaligned mprotect must still fail; no permission relaxation. Re-run the previously warning-producing program in a separately authorized cycle and preserve any remaining warning.",
+    "Treat compile/link/export success as artifact evidence only. A later target run must validate page values and allocator behavior; this review authorizes no hardware action."
+  ],
+  "limits": [
+    "No patched binary was available for this review; Grok one-line patch had not yet appeared in the fix directory when inspected.",
+    "Direct commpage memory was not read on hardware. Its initialization path is established by current disassembly/source and is consistent with saved values.",
+    "The split symbol is confirmed; disappearance of every malloc warning after correction is not yet runtime-proven.",
+    "No full-libSystem initialization, ABI, allocator, or desktop qualification is claimed."
+  ],
+  "reviewed_file_sha256": {
+    "reports/sprint-010/page-size-symbol-fix.json": "12ca240cb3e76a64a82339c20e06012626e4aba4a5cb0c94c20b24ba39e88a90",
+    "reports/sprint-010/page-size-runtime-observation-001.json": "ef0ae00fe5e5fd8d11926c05b2cc15b9adb255e3656ded6b0bff33c2e03ce6d1",
+    "artifacts/m1-desktop-010/candidate-003/manifest.json": "cb75e269773097d1875c8e7b980f9fc4a35a7f08841d538f774c6e9f93cdd71c",
+    "integrations/puredarwin/m1-userspace-diagnostics/page-probe.c": "ab66c18f15c5db0397643da62f3030900b63078422cef83cb21591ef781f97ea",
+    "sources/puredarwin-baseline/src/Libraries/libSystem/stub/pd_libSystem_compat.c": "0406a9f44ff0d6d77c42c75bb8cc14cf13ebbeb5dce2d92d2e16d42c6af8e23e",
+    "sources/puredarwin-baseline/src/Libraries/libSystem/stub/pd_libSystem_init.c": "e19354b19327738d56cc7a3dabeb9d9dfe48515b0f7871c0210bc80464979d76",
+    "sources/puredarwin-baseline/src/Libraries/libSystem/stub/CMakeLists.txt": "8a932ce697489307c323556e04f39f7a1f1c0f92d60439767de46314156231e7",
+    "sources/puredarwin-baseline/src/Libraries/libSystem/stub/libSystem.exports": "2d0e0d963b9db07b3c4a1148927bff088bc4d7f7813d6dc18e6dcb6c3bbd65fb",
+    "sources/puredarwin-baseline/src/Libraries/libSystem/libdyld/CMakeLists.txt": "6bf47f11e3d812c2ca42460c140b2caddc41af6dff14b484dc037264d677fdfa",
+    "sources/puredarwin-baseline/src/Libraries/libSystem/libdyld/libdyld.unexports": "afb361fb3bc02c948318fdbf887c8a8da56201bff9a04790a4de9c815be54ce8",
+    "sources/puredarwin-baseline/src/Libraries/libSystem/libdyld/pd_libdyld_exports.c": "7c76f9ac6a13fe4a0a2a136a7a4fb39e42ff31303d00654f0c1decc092132bc5",
+    "sources/puredarwin-baseline/src/Libraries/libSystem/libsystem_kernel/mach/mach_init.c": "954e81996c1d48f7e8596c46c7e14e4be680169bd2190944d76f0ea5b078eff8",
+    "sources/puredarwin-baseline/src/Libraries/libSystem/libsystem_kernel/wrappers/_libkernel_init.c": "d961af247d9f5640941b4579cd515c570a9f97c60824f1c65c6d034f46395597",
+    "sources/puredarwin-baseline/src/Libraries/libSystem/libsystem_kernel/mach/mach/vm_page_size.h": "b438a06335ed21e1c2e6f543250516628d436c1fefc9d4a44f37177c8c94f4a4",
+    "sources/puredarwin-baseline/src/Libraries/libSystem/libmalloc/src/base.h": "fd0c7cd42500b8b2a1a955c6f42331ec8d0c4e9a89f49cef8dd0123007ddc8aa",
+    "sources/puredarwin-baseline/src/Libraries/libSystem/libmalloc/src/vm.c": "ebb549762210d7aeb71045164edaca0ba010b7a54fcb9b47144a7bc64542d40b"
+  }
+}

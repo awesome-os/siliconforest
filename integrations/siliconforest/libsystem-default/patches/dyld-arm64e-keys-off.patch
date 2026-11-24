@@ -1,0 +1,62 @@
+--- a/src/Libraries/dyld/upstream/src/dyld2.cpp	2026-11-13 12:31:43.072373928 -0800
++++ b/src/Libraries/dyld/upstream/src/dyld2.cpp	2026-11-13 12:32:00.638335447 -0800
+@@ -2893,6 +2893,11 @@
+ 	#else
+ 		// arm64 main binary
+ 		static const cpu_subtype_t kARM64[] = { CPU_SUBTYPE_ARM64_V8, CPU_SUBTYPE_ARM64_ALL, CPU_SUBTYPE_END_OF_LIST };
++		// SiliconForest: pointer authentication is off in every process (the kernel has the
++		// keys off and lowers PAC instructions in every executable page), so arm64 and arm64e
++		// code may share a process. A program prefers slices of its own kind.
++		static const cpu_subtype_t kARM64KeysOff[]       = { CPU_SUBTYPE_ARM64_V8, CPU_SUBTYPE_ARM64_ALL, CPU_SUBTYPE_ARM64E, CPU_SUBTYPE_END_OF_LIST };
++		static const cpu_subtype_t kARM64eMainKeysOff[]  = { CPU_SUBTYPE_ARM64E, CPU_SUBTYPE_ARM64_V8, CPU_SUBTYPE_ARM64_ALL, CPU_SUBTYPE_END_OF_LIST };
+ 	#endif // __arm64e__
+ #endif
+ 
+@@ -2937,6 +2942,11 @@
+ 		#if __arm64e__
+ 			return ( sKeysDisabled ? kARM64eKeysOff : kARM64e);
+ 		#else
++			if ( sKeysDisabled ) {
++				if ( (sMainExecutableMachHeader != NULL) && ((sMainExecutableMachHeader->cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E) )
++					return kARM64eMainKeysOff;
++				return kARM64KeysOff;
++			}
+ 			return kARM64;
+ 		#endif
+ 			break;
+@@ -2977,7 +2987,7 @@
+ 			uint64_t      sliceLen        = OSSwapBigToHostInt32(archs[fatIndex].size);
+ 			if ( (sliceCpuType == cpu) && ((list[subTypeIndex] & ~CPU_SUBTYPE_MASK) == sliceCpuSubType) ) {
+ #if TARGET_OS_OSX && __has_feature(ptrauth_calls)
+-				if ( sOnlyPlatformArm64e && (sliceCpuType == CPU_TYPE_ARM64) && (sliceCpuSubType == CPU_SUBTYPE_ARM64E) ) {
++				if ( sOnlyPlatformArm64e && !sKeysDisabled && (sliceCpuType == CPU_TYPE_ARM64) && (sliceCpuSubType == CPU_SUBTYPE_ARM64E) ) {
+ 					// if we can only load arm64e slices that are platform binaries, skip over slices that are not
+ 					if ( !dyld3::MachOAnalyzer::sliceIsOSBinary(fd, sliceOffset, sliceLen) )
+ 						continue;
+@@ -3204,7 +3214,7 @@
+ 						if ( *p == mhCPUSubtype ) {
+ 	#if TARGET_OS_OSX && __has_feature(ptrauth_calls)
+ 							if ( mhCPUSubtype == CPU_SUBTYPE_ARM64E ) {
+-								if ( !sOnlyPlatformArm64e || dyld3::MachOAnalyzer::sliceIsOSBinary(fd, sliceOffset, sliceLen) )
++								if ( !sOnlyPlatformArm64e || sKeysDisabled || dyld3::MachOAnalyzer::sliceIsOSBinary(fd, sliceOffset, sliceLen) )
+ 									return true;
+ 							}
+ 							else
+@@ -6573,6 +6583,17 @@
+ 		if ( (mainExecutableMH->cpusubtype == CPU_SUBTYPE_ARM64_V8) || (mainExecutableMH->cpusubtype == CPU_SUBTYPE_ARM64_ALL) )
+ 			sKeysDisabled = true;
+ 	}
++	if ( !sKeysDisabled ) {
++		// SiliconForest: the kernel runs arm64e programs with pointer authentication off (keys
++		// disabled, PAC instructions lowered in every executable page) and does not say so in
++		// the apple strings. Measure it: where signing leaves a pointer as it was, nothing in
++		// this process can sign or authenticate, and arm64 and arm64e images may be mixed.
++		void* volatile probe = (void*)0x0000000100004000ULL;
++		volatile uint64_t discriminator = 0x5346;
++		void* signedProbe = __builtin_ptrauth_sign_unauthenticated(probe, 0, discriminator);
++		if ( signedProbe == probe )
++			sKeysDisabled = true;
++	}
+ #endif
+ 
+     // Grab the cdHash of the main executable from the environment

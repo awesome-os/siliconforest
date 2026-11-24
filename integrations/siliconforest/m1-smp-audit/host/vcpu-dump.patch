@@ -1,0 +1,93 @@
+diff -ru a/integrations/puredarwin/m1-bringup/host_progress.py b/integrations/puredarwin/m1-bringup/host_progress.py
+--- a/integrations/puredarwin/m1-bringup/host_progress.py	2026-11-12 08:14:45.453339543 -0800
++++ b/integrations/puredarwin/m1-bringup/host_progress.py	2026-11-12 08:14:45.454292329 -0800
+@@ -1096,6 +1096,7 @@
+             diagnostics = getattr(self, 'diagnostic_partial', {})
+             diagnostics['error'] = f'{type(error).__name__}: {error}'
+         self.event, self.raw, self.context_error = original_event, original_raw, original_error
++        self.dump_cpus()
+         self.closed = True
+         record = dict(status='CONTINUING_XNU_STOPPED_FOR_OBSERVATION', message=message,
+                       event=self.event, context_error=self.context_error,
+@@ -1117,7 +1118,63 @@
+         finally:
+             raise old.BoundedStop(message)
+ 
++    def dump_cpus(self):
++        # Where every guest processor is when the capture stops (a hang shows as the lock or
++        # loop each one sits in): one PD_VCPU line per processor in worker.log, with the
++        # frame-pointer chain. The guest is never continued: the hypervisor only moves this
++        # paused callback from one processor to the next (HV_SWITCH_CPU), after which the
++        # worker exits and the machine is reset as after every capture. Any failure ends
++        # the dump and nothing else.
++        hv = self.hv
++        if (not self.raw or not getattr(hv, '_in_handler', False) or self.dispatch_depth < 1 or
++                getattr(hv, 'ctx', None) is None or not hasattr(hv, '_switch_context')):
++            print('PD_VCPU_DUMP_SKIPPED raw=%s in_handler=%s depth=%s ctx=%s switch=%s' % (
++                self.raw is not None, getattr(hv, '_in_handler', None), self.dispatch_depth,
++                getattr(hv, 'ctx', None) is not None, hasattr(hv, '_switch_context')),
++                file=sys.stderr, flush=True)
++            return
++        def canonical(v):
++            return (v & 0x1ffffffffff) | 0xfffffe0000000000 if v & (1 << 55) else v
++        def record():
++            ctx, frames, seen = hv.ctx, [], set()
++            fp = int(ctx.regs[29])
++            while fp and fp not in seen and len(frames) < 200:
++                seen.add(fp)
++                fpp, lrp = hv.p.hv_translate(fp), hv.p.hv_translate(fp + 8)
++                if not fpp or not lrp:
++                    break
++                frames.append(canonical(hv.p.read64(lrp)))
++                fp = hv.p.read64(fpp)
++            line = dict(cpu=int(ctx.cpu_id), elr=canonical(int(ctx.elr)), spsr=int(ctx.spsr),
++                        esr=int(ctx.esr), far=int(ctx.far), lr=canonical(int(ctx.regs[30])),
++                        fp=int(ctx.regs[29]), x0=int(ctx.regs[0]), x1=int(ctx.regs[1]),
++                        frames=frames)
++            print('PD_VCPU ' + json.dumps({k: (hex(v) if isinstance(v, int) and k != 'cpu' else
++                                               [hex(x) for x in v] if isinstance(v, list) else v)
++                                           for k, v in line.items()}), file=sys.stderr, flush=True)
++        self.dumping = True
++        try:
++            first = int(hv.ctx.cpu_id)
++            record()
++            for cpu in range(8):
++                if cpu == first:
++                    continue
++                if not hv.p.hv_switch_cpu(cpu):
++                    continue
++                hv._switch_context()
++                record()
++            # leave the paused callback on the processor it arrived on (a chained boot
++            # takes the machine over from there)
++            if int(hv.ctx.cpu_id) != first and hv.p.hv_switch_cpu(first):
++                hv._switch_context()
++        except (Exception, old.BoundedStop) as error:
++            print(f'PD_VCPU_DUMP_ENDED {type(error).__name__}: {error}', file=sys.stderr, flush=True)
++        finally:
++            self.dumping = False
++
+     def load_context(self):
++        if getattr(self, 'dumping', False):
++            return self.original_load_context()
+         if not self.event or not self.event['info']:
+             self.stop('Callback lacks context pointer')
+         try:
+@@ -1133,6 +1190,8 @@
+         return ctx
+ 
+     def dispatch(self, original, boot, *args):
++        if getattr(self, 'dumping', False):
++            return original(*args)  # the processor switch of dump_cpus, nothing is continued
+         self.dispatch_depth += 1
+         outer = self.dispatch_depth == 1
+         began = time.monotonic()
+@@ -1162,6 +1221,8 @@
+                 self.event = self.raw = None
+ 
+     def cmd(self, command, payload=b''):
++        if getattr(self, 'dumping', False):
++            return self.original_cmd(command, payload)
+         self.cmd_depth += 1
+         try:
+             if self.closed:

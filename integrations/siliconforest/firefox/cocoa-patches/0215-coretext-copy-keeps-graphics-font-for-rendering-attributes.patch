@@ -1,0 +1,47 @@
+--- a/src/Frameworks/CoreText/CTFont.m
++++ b/src/Frameworks/CoreText/CTFont.m
+@@ -112,21 +112,30 @@
+    CTFontDescriptorRef base=CTFontCopyFontDescriptor(font);
+    CFDictionaryRef extra=attributes ? CTFontDescriptorCopyAttributes(attributes) : NULL;
+    CTFontDescriptorRef merged=extra ? CTFontDescriptorCreateCopyWithAttributes(base,extra) : (CTFontDescriptorRef)CFRetain(base);
++   CFDictionaryRef original=CTFontDescriptorCopyAttributes(base);
++   bool selectFace=false;
++   CFStringRef identity[]={kCTFontNameAttribute,kCTFontFamilyNameAttribute,kCTFontStyleNameAttribute,
++      kCTFontDisplayNameAttribute,kCTFontURLAttribute,kCTFontTraitsAttribute};
++   for(unsigned i=0;extra && i<sizeof(identity)/sizeof(identity[0]);i++){
++    CFTypeRef wanted=CFDictionaryGetValue(extra,identity[i]);
++    CFTypeRef previous=CFDictionaryGetValue(original,identity[i]);
++    if(wanted && (!previous || !CFEqual(wanted,previous)))selectFace=true;
++   }
++   CFRelease(original);
++   if(extra)CFRelease(extra);
++   if(size<=0)size=CTFontGetSize(font);
++   CGAffineTransform transform=matrix ? *matrix : CTFontGetMatrix(font);
+    CTFontRef copy;
+-
+-   if(extra) CFRelease(extra);
+-
+-   if(size<=0)
+-    size=CTFontGetSize(font);
+-   if(matrix==NULL){
+-    CGAffineTransform m=CTFontGetMatrix(font);
+-
+-    copy=CTFontCreateWithFontDescriptor(merged,size,&m);
+-   }
+-   else
+-    copy=CTFontCreateWithFontDescriptor(merged,size,matrix);
+-   CFRelease(merged);
+-   CFRelease(base);
++   if(!selectFace){
++    // Size, matrix and rendering attributes must preserve the actual face.
++    // A memory/data font need not exist in the installed-font registry.
++    KTFont *kept=(KTFont *)CTFontCreateWithGraphicsFont([font graphicsFont],size,&transform,merged);
++    kept->_ctFace=CTFaceRetain([font _ctFace]);
++    kept->_fromGraphicsFont=((KTFont *)font)->_fromGraphicsFont;
++    copy=kept;
++   }
++   else copy=CTFontCreateWithFontDescriptor(merged,size,&transform);
++   CFRelease(merged);CFRelease(base);
+    return copy;
+ }
+ 

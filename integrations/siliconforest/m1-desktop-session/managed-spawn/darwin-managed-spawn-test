@@ -1,0 +1,34 @@
+#!/bin/sh
+# Real Darwin exec descriptor prerequisite. No UI or input claim.
+set -eu
+nonce=${1-}
+case "$nonce" in ''|*[!0-9a-f]*) exit 2 ;; esac
+[ "${#nonce}" -eq 48 ] || exit 2
+printf '\nDL19_SPAWN_BEGIN_%s physical_input_proven=false\n' "$nonce"
+enum_rc=0
+if /usr/bin/darwin-trackpad-enum --nonce "$nonce"; then :; else enum_rc=$?; fi
+printf 'DL19_SPAWN_ENUM_%s rc=%s\n' "$nonce" "$enum_rc"
+case "$enum_rc" in 0) ;; 77) exit 77 ;; *) exit 1 ;; esac
+count=0
+while [ ! -c /dev/usb_hid_kbd ] || [ ! -c /dev/usb_hid_mouse ]; do
+    count=$((count + 1))
+    [ "$count" -le 100 ] || break
+    sleep 0.1
+done
+printf 'DL19_SPAWN_ENDPOINT_WAIT_%s missing_checks=%s max_sleeps=100\n' "$nonce" "$count"
+gate_rc=0
+if /usr/bin/darwin-native-input-inventory --nonce "$nonce"; then :; else gate_rc=$?; fi
+printf 'DL19_SPAWN_IDENTITY_%s rc=%s\n' "$nonce" "$gate_rc"
+case "$gate_rc" in 0) ;; 77) exit 77 ;; *) exit 1 ;; esac
+probe_rc=0
+if /usr/bin/darwin-spawn-whitelist-parent --nonce "$nonce"; then :; else probe_rc=$?; fi
+records_rc=0
+if /usr/bin/darwin-spawn-records --directory "/private/tmp/chonk-spawn-whitelist-$nonce" --nonce "$nonce" --phase closed; then :; else records_rc=$?; fi
+printf 'DL19_SPAWN_STATUS_%s probe=%s records=%s physical_input_proven=false\n' "$nonce" "$probe_rc" "$records_rc"
+[ "$probe_rc" -eq 0 ] && [ "$records_rc" -eq 0 ] || exit 1
+printf '\nMANAGED DARWIN SPAWN DESCRIPTOR TEST RETURNED\n'
+printf 'DL19_SPAWN_RETURN_%s\n' "$nonce"
+/bin/uname -s
+/bin/uname -m
+/bin/uname -r
+printf 'DL19_SPAWN_END_%s physical_input_proven=false\n' "$nonce"

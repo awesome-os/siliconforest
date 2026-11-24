@@ -1,0 +1,140 @@
+--- a/src/Frameworks/AppKit/NSTextField.h
++++ b/src/Frameworks/AppKit/NSTextField.h
+@@ -51,4 +51,8 @@
+ 
+ - (void)setTitleWithMnemonic:(NSString *)value;
+ 
+++ (instancetype)labelWithString:(NSString *)string;
+++ (instancetype)wrappingLabelWithString:(NSString *)string;
+++ (instancetype)labelWithAttributedString:(NSAttributedString *)attributedString;
+++ (instancetype)textFieldWithString:(NSString *)string;
+ @end
+--- a/src/Frameworks/AppKit/NSTextField.m
++++ b/src/Frameworks/AppKit/NSTextField.m
+@@ -7,6 +7,9 @@
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+ #import <AppKit/NSTextField.h>
+ #import <AppKit/NSTextFieldCell.h>
++#import <AppKit/NSFont.h>
++#import <AppKit/NSColor.h>
++#import <AppKit/NSAttributedString.h>
+ #import <AppKit/NSTextView.h>
+ #import <AppKit/NSTextStorage.h>
+ #import <AppKit/NSApplication.h>
+@@ -31,6 +34,55 @@
+ 
+ @implementation NSTextField
+ 
++/* (TERM8) the 10.12 convenience constructors (Firefox's crash reporter raised on +wrappingLabelWithString:, FX-004):
++ * a label is neither editable nor bezeled and draws no background, in the system font and label colour; a wrapping
++ * label wraps and can be selected; a text field is an editable, bezeled field. Each is sized to its text. */
+++(instancetype)_sfLabelWithString:(NSString *)string wraps:(BOOL)wraps {
++   NSTextField *field=[[[self alloc] initWithFrame:NSMakeRect(0,0,100,17)] autorelease];
++
++   [field setStringValue:string!=nil ? string : @""];
++   [field setEditable:NO];
++   [field setSelectable:wraps];
++   [field setBezeled:NO];
++   [field setBordered:NO];
++   [field setDrawsBackground:NO];
++   [field setFont:[NSFont systemFontOfSize:[NSFont systemFontSize]]];
++   [field setTextColor:[NSColor labelColor]];
++   [[field cell] setLineBreakMode:wraps ? NSLineBreakByWordWrapping : NSLineBreakByClipping];
++   [[field cell] setWraps:wraps];
++   [field sizeToFit];
++   return field;
++}
++
+++(instancetype)labelWithString:(NSString *)string {
++   return [self _sfLabelWithString:string wraps:NO];
++}
++
+++(instancetype)wrappingLabelWithString:(NSString *)string {
++   return [self _sfLabelWithString:string wraps:YES];
++}
++
+++(instancetype)labelWithAttributedString:(NSAttributedString *)attributedString {
++   NSTextField *field=[self _sfLabelWithString:[attributedString string] wraps:NO];
++
++   [field setAttributedStringValue:attributedString];
++   [field sizeToFit];
++   return field;
++}
++
+++(instancetype)textFieldWithString:(NSString *)string {
++   NSTextField *field=[[[self alloc] initWithFrame:NSMakeRect(0,0,100,22)] autorelease];
++
++   [field setStringValue:string!=nil ? string : @""];
++   [field setEditable:YES];
++   [field setSelectable:YES];
++   [field setBezeled:YES];
++   [field setDrawsBackground:YES];
++   [field setFont:[NSFont systemFontOfSize:[NSFont systemFontSize]]];
++   [field sizeToFit];
++   return field;
++}
++
+ +(Class)cellClass {
+    return [NSTextFieldCell class];
+ }
+--- a/src/Frameworks/AppKit/NSButton.h
++++ b/src/Frameworks/AppKit/NSButton.h
+@@ -57,4 +57,9 @@
+ 
+ @property BOOL hasDestructiveAction;
+ 
+++ (instancetype)buttonWithTitle:(NSString *)title target:(id)target action:(SEL)action;
+++ (instancetype)buttonWithTitle:(NSString *)title image:(NSImage *)image target:(id)target action:(SEL)action;
+++ (instancetype)buttonWithImage:(NSImage *)image target:(id)target action:(SEL)action;
+++ (instancetype)checkboxWithTitle:(NSString *)title target:(id)target action:(SEL)action;
+++ (instancetype)radioButtonWithTitle:(NSString *)title target:(id)target action:(SEL)action;
+ @end
+--- a/src/Frameworks/AppKit/NSButton.m
++++ b/src/Frameworks/AppKit/NSButton.m
+@@ -18,6 +18,46 @@
+ 
+ @implementation NSButton
+ 
++/* (TERM8) the 10.12 convenience constructors: a push button (rounded bezel), a check box, a radio button, each with
++ * its target and action, sized to its title */
+++(instancetype)_sfButtonWithTitle:(NSString *)title image:(NSImage *)image type:(NSButtonType)type target:(id)target action:(SEL)action {
++   NSButton *button=[[[self alloc] initWithFrame:NSMakeRect(0,0,100,24)] autorelease];
++
++   [button setButtonType:type];
++   if(type==NSMomentaryPushInButton)
++    [button setBezelStyle:NSRoundedBezelStyle];
++   [button setTitle:title!=nil ? title : @""];
++   if(image!=nil){
++    [button setImage:image];
++    if(title==nil)
++     [button setImagePosition:NSImageOnly];
++   }
++   [button setTarget:target];
++   [button setAction:action];
++   [button sizeToFit];
++   return button;
++}
++
+++(instancetype)buttonWithTitle:(NSString *)title target:(id)target action:(SEL)action {
++   return [self _sfButtonWithTitle:title image:nil type:NSMomentaryPushInButton target:target action:action];
++}
++
+++(instancetype)buttonWithTitle:(NSString *)title image:(NSImage *)image target:(id)target action:(SEL)action {
++   return [self _sfButtonWithTitle:title image:image type:NSMomentaryPushInButton target:target action:action];
++}
++
+++(instancetype)buttonWithImage:(NSImage *)image target:(id)target action:(SEL)action {
++   return [self _sfButtonWithTitle:nil image:image type:NSMomentaryPushInButton target:target action:action];
++}
++
+++(instancetype)checkboxWithTitle:(NSString *)title target:(id)target action:(SEL)action {
++   return [self _sfButtonWithTitle:title image:nil type:NSSwitchButton target:target action:action];
++}
++
+++(instancetype)radioButtonWithTitle:(NSString *)title target:(id)target action:(SEL)action {
++   return [self _sfButtonWithTitle:title image:nil type:NSRadioButton target:target action:action];
++}
++
+ // the red look macOS gives a destructive button, kept so callers read it back
+ static char hasDestructiveActionKey;
+ 

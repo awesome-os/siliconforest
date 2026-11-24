@@ -1,0 +1,78 @@
+SFM1SPIHID tells the Touch Bar driver about the Fn key and typing.
+
+Applied by ../build-spihid.nix to a copy of ../../m1-trackpad-child/multitouch (SFM1SPIHID.cpp,
+SFM1SPIHID.h, CMakeLists.txt); the new code is SFM1SPIHIDTouchBar.inc, sf_hid_fn.c and
+sf_touchbar_kbd.h of this directory. Nothing in the trackpad stream's directory is changed.
+
+diff -u a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt	2026-11-11 15:09:03.669555545 -0800
++++ b/CMakeLists.txt	2026-11-11 15:09:03.677985299 -0800
+@@ -5,7 +5,7 @@
+ target_sources(SFM1SPIHID.kext PRIVATE
+     SFM1SPIHID.cpp SFM1KeyboardHW.cpp m1kbd_board.c m1kbd_pio.c m1kbd_hid.c
+     native_protocol/dl_spi_hid.c m1tp_enum.c SFM1SPITrackpad.cpp m1tp_child_policy.c m1tp_trace.c
+-    m1tp_mt.c m1tp_mt_selftest.c)
++    m1tp_mt.c m1tp_mt_selftest.c sf_hid_fn.c)
+ target_include_directories(SFM1SPIHID.kext PRIVATE
+     ${CMAKE_CURRENT_SOURCE_DIR}
+     ${CMAKE_CURRENT_SOURCE_DIR}/../IOHIDFamily/IOHIDSystem
+diff -u a/SFM1SPIHID.cpp b/SFM1SPIHID.cpp
+--- a/SFM1SPIHID.cpp	2026-11-11 15:09:03.669500035 -0800
++++ b/SFM1SPIHID.cpp	2026-11-11 15:09:03.677943836 -0800
+@@ -94,6 +94,7 @@
+     mtSelftest=0; mtDebug=0; mtDebugHex=0; mtModeAttempts=0; mtResets=0; mtResponses=0;
+     mtWireDrops=0; mtLoggedEvents=0; mtInjectSubmitted=0; mtInjectOffered=0; bzero(mtKeys,sizeof(mtKeys));
+     mtModeDueUS=0; mtTouchReports=0; mtBasicReports=0; mtPointerReports=0;
++    tbFnBit=-1; tbFnBits=0; tbFnDown=0; tbNotes=0; tbLastNoteUS=0; tbService=nullptr;
+     bzero(&mtConfig,sizeof(mtConfig)); bzero(&mtFrame,sizeof(mtFrame)); bzero(mtBuffer,sizeof(mtBuffer));
+     m1tp_mt_init(&mtState,nullptr); m1tp_mt_init(&mtScratch,nullptr);
+     return super::init(properties);
+@@ -191,6 +192,7 @@
+     setProperty("Built-In",kOSBooleanTrue);
+     IOLog("SFM1SPIHID: CRC-checked J293 keyboard descriptor acquired (%u bytes); input not yet observed\n",
+           (unsigned)descriptorLength);
++    tbConfigure();
+     return true;
+ }
+ int SFM1SPIHID::receive(struct dlsp_message *message)
+@@ -401,6 +403,8 @@
+                           (unsigned)message.payload_length);
+                 }
+             }
++            if (message.payload_length>=9 && message.payload[0]==0x01)
++                self->tbKeyboardReport(message.payload,message.payload_length);
+             if (self->t2Enabled) { self->retain(); self->t2Dispatches++; }
+             IOReturn kr=self->handleReport(report,kIOHIDReportTypeInput);
+             if (self->t2Enabled) { self->t2Dispatches--; self->release(); }
+@@ -584,3 +588,4 @@
+ 
+ #include "SFM1SPIHIDChild.inc"
+ #include "SFM1SPIHIDMultitouch.inc"
++#include "SFM1SPIHIDTouchBar.inc"
+diff -u a/SFM1SPIHID.h b/SFM1SPIHID.h
+--- a/SFM1SPIHID.h	2026-11-11 15:09:03.669532025 -0800
++++ b/SFM1SPIHID.h	2026-11-11 15:09:03.677808761 -0800
+@@ -28,6 +28,7 @@
+     bool handleStart(IOService *) APPLE_KEXT_OVERRIDE;
+     void handleStop(IOService *) APPLE_KEXT_OVERRIDE;
+     bool terminate(IOOptionBits options=0) APPLE_KEXT_OVERRIDE;
++    IOReturn message(UInt32 type, IOService *provider, void *argument=nullptr) APPLE_KEXT_OVERRIDE;
+     bool handleOpen(IOService *, IOOptionBits, void *) APPLE_KEXT_OVERRIDE;
+     IOReturn newUserClient(task_t, void *, UInt32, OSDictionary *, IOUserClient **) APPLE_KEXT_OVERRIDE;
+     /* Recursive sink clear: no waiting or dispatch-drain sleep. */
+@@ -103,6 +104,15 @@
+     void mtRunSelftest(bool inject);
+     static void mtInjectSink(void *, const struct m1tp_mt_out *);
+     void routeTrackpad(const struct dlsp_message *);
++    /* The Touch Bar is told about Fn and typing (SFM1SPIHIDTouchBar.inc). */
++    int tbFnBit;
++    uint8_t tbFnDown, tbFnBits;
++    uint32_t tbNotes;
++    uint64_t tbLastNoteUS;
++    IOService *tbService;
++    void tbConfigure();
++    void tbKeyboardReport(const uint8_t *, size_t);
++    static IOReturn tbTestGated(OSObject *, void *, void *, void *, void *);
+     static void poll(OSObject *, IOTimerEventSource *);
+     static IOReturn startGated(OSObject *, void *, void *, void *, void *);
+     static IOReturn stopGated(OSObject *, void *, void *, void *, void *);

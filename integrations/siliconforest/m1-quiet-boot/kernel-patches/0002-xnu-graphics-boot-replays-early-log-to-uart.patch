@@ -1,0 +1,41 @@
+xnu: a graphics boot replays the early log to the UART
+
+vcattach() replays the message buffer (everything printed before the console came up)
+through vcputc() when the boot is a text boot; SiliconForest's vcputc() mirrors each
+character to the UART, and that replay is the only way those lines reach a serial
+console. A graphics boot (Video.v_display 1) skips the replay, so its serial log lacked
+them: boot qb01 on the M1 (graphics) against sm35 (text), same collection and boot-args,
+had none of the 73 early lines ("kprintf initialized", the interrupt controller mapping,
+the scheduler and IPC subsystem lines, ...). With serial output configured, a graphics
+boot now sends the same bytes to the UART and still paints nothing.
+UPSTREAM: yes.
+
+--- a/src/Kernel/xnu/osfmk/console/video_console.c
++++ b/src/Kernel/xnu/osfmk/console/video_console.c
+@@ -3159,6 +3159,26 @@
+ 				vcputc( '\r' );
+ 			}
+ 		}
++	} else if (serialmode & SERIALMODE_OUTPUT) {
++		long index;
++
++		// PD: a graphics boot paints no text, so the replay above (which vcputc also
++		// mirrors to the UART) does not run; the UART still gets the log from before
++		// the console came up, byte for byte as the text boot sends it
++		for (index = 0; index < msgbufp->msg_bufx; index++) {
++			char c = msgbufp->msg_bufc[index];
++
++			if (c == '\0') {
++				continue;
++			}
++			if (c == '\n') {
++				serial_putc('\r');
++			}
++			serial_putc(c);
++			if (c == '\n') {
++				serial_putc('\r');
++			}
++		}
+ 	}
+ }
+ 

@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "revision": 3,
+  "reviewer": "Astra",
+  "scope": "Read-only kernel console, boot metadata, IOGraphics console handoff and isolated IOGOP format-patch review. Only this report was changed in the workspace; source tests used disposable temporary copies. No build, fetch, SSH, device action, source edit or goal API call.",
+  "verdict": "HOST_AND_IOGOP_FORMAT_PATCH_SOURCE_APPROVED_BUILD_AND_PANEL_VERIFICATION_PENDING",
+  "summary": "Keep serial=3 and the current recovery path. Append serial_video_mirror=1 and explicitly retain pdtextboot=1. Set guest BootArgs.video.display=2 after pinned HV.set_bootargs and before load_raw serializes BootArgs. Kernel002 already implements VC painting plus UART mirroring; no kernel rebuild is required for this routing change. Root has held hardware for Claude's separate IOGOP depth-30 format fix and kext/KC build. This report does not establish physical display success. A conditional IOGraphics disable/release/enable ordering defect remains separately identified below.",
+  "required_stop": "A real userland shell response rendered on the laptop display. Serial shell proof, kernel boot text, framebuffer bytes and a working desktop/Wayland session are distinct claims.",
+  "candidate_binding": {
+    "kernel_path": "/nix/store/7fjh48gkqgrhy4q29ji9c2nk5hdnr8h6-puredarwin-kernel-arm64-t8103-bringup-0.1/System/Library/Kernels/kernel.debug.t8103",
+    "kernel_sha256_verified": "ae5ff9414abc68e3b155ed8807ab87b2454a64bc334ae59b9ffe2db8ce605bc2",
+    "kernel_source_snapshot": "/nix/store/skqrs5jy91w4w560qga94hnhmvaxp6g2-source",
+    "kernel_string_occurrences_verified": {"serial_video_mirror": 1, "gopconsole": 1, "pdtextboot": 1},
+    "string_limit": "Presence corroborates the built source binding, not execution of these branches or panel readiness.",
+    "reviewed_host_snapshot": {
+      "path": "integrations/puredarwin/m1-bringup/host_progress.py",
+      "sha256": "7de58272af90c349440a431e4fc9fdc379e9122019c883dda52dcfe6a1b85907",
+      "test_path": "integrations/puredarwin/m1-bringup/test_host_progress.py",
+      "test_sha256": "f0e7a5992a12ccf8cd1744a4510a5ef36b9d0f5be25ea4b2f1b342a99d8fde2a",
+      "assessment": "No blocking source finding in framebuffer_geometry/configure_display_console, its call placement, or the added paused pixel read. The helper preserves base/stride/width/height/raw depth, rejects invalid geometry and out-of-physical-DRAM or MCC-intersecting spans before setting display=2, and executes before load_raw writes the guest image/BootArgs. It correctly records physical_panel_observed=false. Root owns subsequent changes and staging."
+    },
+    "pinned_hv_source": "sources/m1n1-baseline/proxyclient/m1n1/hv/__init__.py",
+    "pinned_hv_source_sha256": "18da80e496122233cbd3d69a287e5737ca78da083e8e36c8a33b01b35744c4a6"
+  },
+  "kernel_files_compared_byte_for_byte_to_build_source": [
+    {"path": "src/Kernel/xnu/pexpert/arm/pe_init.c", "sha256": "24d3d56443a5eab79642e9ffd9e3f83296c4016bd6c1580e9ba8d50c0f5f5695", "equal": true},
+    {"path": "src/Kernel/xnu/pexpert/gen/pe_gen.c", "sha256": "647f11b0602e2bbce2bddf0f5e9249a9530d245833ab0a59884afbb1723efc89", "equal": true},
+    {"path": "src/Kernel/xnu/osfmk/console/video_console.c", "sha256": "36fc5fa57dd3cebe2161242d476b97c0c49b760110cabc861537431391be3ea7", "equal": true},
+    {"path": "src/Kernel/xnu/osfmk/console/serial_console.c", "sha256": "594f854529f5e45be0668e5ea09a4007888daf525bf051c393a942e3cdfe8c02", "equal": true},
+    {"path": "src/Kernel/xnu/osfmk/console/serial_general.c", "sha256": "c19a8f601a0151807a3a80a072ec185244ed5ecf193f3982501df9092f7c5ce5", "equal": true},
+    {"path": "src/Kernel/xnu/osfmk/arm/arm_init.c", "sha256": "782cc2d0f7ebf122010e69ddc9bcfc1806a9663f73c8bf63dac3d91c95cda2dc", "equal": true},
+    {"path": "src/Kernel/xnu/bsd/dev/arm/km.c", "sha256": "336ecfa5fca1ae98bb007800ab966a503b03b5ae2f9878485b4bf4856c92943c", "equal": true},
+    {"path": "src/Kernel/xnu/bsd/dev/arm/cons.c", "sha256": "9aa68a6defa10abf15807d7d91aeb2ce0c5366f06ac52bb974730ffa737099a4", "equal": true}
+  ],
+  "source_findings": [
+    {
+      "id": "VC1",
+      "finding": "The mirror boot argument alone does not fix the current -v handoff. Pinned HV.set_bootargs sets video.display=0 for -v. ARM PE_create_console checks v_display before parsing either mirror argument; zero takes text initialization without switching the serial-selected console to VC.",
+      "evidence": [
+        "sources/m1n1-baseline/proxyclient/m1n1/hv/__init__.py:1679-1685",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/osfmk/arm/arm_init.c:626-664",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/pexpert/arm/pe_init.c:554-586"
+      ],
+      "fix": "After set_bootargs, use display=2 with serial_video_mirror=1. It is a text-mode input to this exact kernel, not a fabricated framebuffer or hardware capability. Keep -v and serial=3."
+    },
+    {
+      "id": "VC2",
+      "finding": "ARM copies Boot_Video geometry and display verbatim, and decodes depth/rotation/scale from the raw depth word. display=2 changes mode selection only; it does not reinterpret the framebuffer address. PE_create_console runs before machine_startup -> kernel_bootstrap -> vm_mem_bootstrap creates kernel_map, so initialize_screen maps the original physical base even with its low tag bits clear. Later IOGraphics supplies a kernel virtual fFrameBuffer address; that is the separate post-VM interpretation.",
+      "evidence": [
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/pexpert/arm/pe_init.c:444-461",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/osfmk/arm/arm_init.c:664,727",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/osfmk/arm64/machine_routines.c:515-530",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/osfmk/kern/startup.c:533-550",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/osfmk/console/video_console.c:2833-2909",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/osfmk/arm/io_map.c:68-116",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/pexpert/pexpert/arm64/H13.h:42"
+      ],
+      "mapping": "H13 HAS_UCNORMAL_MEM selects VM_WIMG_WCOMB, then ml_io_map_unmappable/io_map maps round_page(height*stride). Preserve the firmware base and raw depth; do not invent a consoleBaseAddr alias or force a different pixel format."
+    },
+    {
+      "id": "VC3",
+      "finding": "Normal console writes dispatch through cons_ops. With VC selected, vcputc_options paints when initialized/enabled and separately mirrors every character to UART when serialmode OUTPUT is set. serial=3 keeps OUTPUT and INPUT. The keyboard polling thread directly calls _serial_getc and cons_cinput; it does not depend on cons_ops selecting serial. Thus a shell can accept the proven VUART input and paint its genuine output on the boot framebuffer while retaining serial capture.",
+      "evidence": [
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/osfmk/console/serial_protos.h:53-76",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/osfmk/console/serial_console.c:123-134,248-286",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/osfmk/console/video_console.c:1239-1267",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/osfmk/console/serial_general.c:87-147",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/bsd/dev/arm/km.c:397-408",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/osfmk/kern/startup.c:943"
+      ],
+      "limits": "This preserves the source path for polled shell input and UART output. It does not qualify a laptop keyboard or every debugger-input path. kprintf uses its independent PE_kputc UART callback; not every serial debug line is expected on the panel. debug=0x14e enables DB_PRT/DB_KPRT but is not an exclusive framebuffer-routing switch (pexpert/arm/pe_kprintf.c:38-73)."
+    },
+    {
+      "id": "VC4",
+      "finding": "The kernel's /dev/console is major 0 and delegates to the km tty (major 12, minor 0) unless TIOCCONS redirected it. kmwrite uses the tty line discipline; kmoutput drains bytes through console_write, hence the selected VC/UART route. /dev/tty is major 2 and resolves the process controlling tty; it is not a separate video device. No new Linux-style /dev/tty0 or VT switching is required for this shell stop. The VT100 parser is inside the single video-console renderer.",
+      "evidence": [
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/bsd/miscfs/devfs/devfs_vfsops.c:115-118",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/bsd/dev/arm64/conf.c:173-182,215-218",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/bsd/dev/arm/cons.c:74-87,128-141",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/bsd/dev/arm/km.c:52-56,167-174,249-258,338-365",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/bsd/kern/tty_tty.c:180-196",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/osfmk/console/video_console.c:478-508"
+      ],
+      "limit": "serial=3 makes kmopen report 80x24 even on the larger framebuffer (km.c:116-126), and TIOCSWINSZ is rejected (194-200). This is a terminal-size limitation, not a reason to lose serial recovery or introduce another terminal for the first display stop."
+    },
+    {
+      "id": "VC5",
+      "finding": "Text initialization latches gc_text_boot with pdtextboot defaulting to 1. PE_init_iokit -> PE_init_printf(TRUE) -> vcattach acquires text and replays buffered log text. IOFramebuffer::findConsole supplies v_display=1 but uses release/enable operations, not kPEGraphicsMode; an ordinary release/enable pair with VC selected reacquires text. Releasing/pausing the screen suppresses painting but does not globally mute UART mirroring when serial OUTPUT remains set.",
+      "evidence": [
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/pexpert/arm/pe_init.c:273-286",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/pexpert/gen/pe_gen.c:135-141",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/osfmk/console/video_console.c:351-363,2778-2786,2960-2976,3014-3028,3051-3066,3101-3147",
+        "sources/puredarwin-m1-bringup/src/Kernel/Extensions/IOGraphicsFamily/IOFramebuffer.cpp:10523-10534",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/iokit/Kernel/IOPlatformExpert.cpp:412-415"
+      ],
+      "qualification": "An early bootframebuffer text shell does not require a newly matched IOGOP driver. IOGOP attachment, apertures and mode ownership remain Claude's separate review. Source can also replay old boot text to VC even when subsequent output remains serial; the routing defect alone is not proof of why the observed panel retained precisely its old frame."
+    },
+    {
+      "id": "VC6",
+      "severity": "CONDITIONAL_HANDOFF_DEFECT",
+      "finding": "The stronger disable -> release -> enable sequence can fail to resume painting. PE_initialize_console(DISABLE) saves VC then selects serial; RELEASE clears gc_acquired; ENABLE calls initialize_screen while serial is still selected, so its gc_text_boot && !console_is_serial reacquire branch is skipped. Only afterwards does PE restore VC. Result: VC selected, gc_enabled false, UART mirror still alive. IOFramebuffer::open contains the disable operation, and findConsole contains release/enable.",
+      "evidence": [
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/pexpert/arm/pe_init.c:228-243",
+        "sources/puredarwin-m1-bringup/src/Kernel/xnu/osfmk/console/video_console.c:3014-3028,3051-3054",
+        "sources/puredarwin-m1-bringup/src/Kernel/Extensions/IOGraphicsFamily/IOFramebuffer.cpp:9090-9094,10523-10534"
+      ],
+      "current_relevance": "No IOFB console-disabled, kPEDisableScreen or kPEEnableScreen diagnostic occurs in archived attempt009 console bytes. Absence is not proof of no state transition. No framebuffer-user-client open is required for the proposed single-user bootframebuffer path. Therefore this is not a demonstrated blocker for the host-only candidate, but blanket approval of every IOGOP handoff would be incorrect.",
+      "recommended_followup_if_exercised": "Have Claude/root review the specific transition before a compositor opens the framebuffer. A narrow kernel fix would restore the saved console route before the enable-state test, or explicitly reacquire text after restoring it; test disable/enable, release/enable, disable/release/enable and graphics-owned release separately. Do not keep painting into a framebuffer owned by a compositor. No such patch was made here."
+    },
+    {
+      "id": "VC7",
+      "severity": "IOGOP_FORMAT_DEFECT_HARDWARE_HELD",
+      "finding": "Independently confirmed Claude's source finding: IOGOP getPixelFormats and getPixelInformation omit depth 30. The latter defaults to indexed pixels, bitsPerPixel=8, componentCount=1 and bitsPerComponent=8. IOFramebuffer derives consoleDepth from that result, then findConsole passes the resulting depth to PE. A successful IOGOP handoff can therefore replace the valid 30-bit bootframebuffer interpretation with depth 8.",
+      "evidence": [
+        "sources/puredarwin-m1-bringup/src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.cpp:542-565,635-688",
+        "sources/puredarwin-m1-bringup/src/Kernel/Extensions/IOGraphicsFamily/IOFramebuffer.cpp:2484-2499,10523-10534"
+      ],
+      "ownership_and_limit": "Claude owns the isolated IOGOP format patch. Root explicitly held hardware until that patch is reviewed and built. Revision 3 independently source-approves patch 91086c74d740991f6f98a117f9fa957b211fe071255e77a0d2abab26fbd90654 as detailed below. This confirms the source defect and its correction, not execution of the handoff on hardware. Keep the firmware raw depth and fix the reported pixel metadata rather than disguising the framebuffer as 32-bit color."
+    }
+  ],
+  "iogop_format_patch_independent_review": {
+    "verdict": "NO_SOURCE_BLOCKER",
+    "patch": "integrations/puredarwin/m1-display/framebuffer-30bit.patch",
+    "patch_sha256": "91086c74d740991f6f98a117f9fa957b211fe071255e77a0d2abab26fbd90654",
+    "test": "integrations/puredarwin/m1-display/test_framebuffer_30bit.py",
+    "test_sha256": "858e16e50a1b6b6e36808fb9e7aff5a1be20930f164c6a4eaff3c70f65a181fb",
+    "base_source_sha256": "72bdea3925213de85ed7caeeba52ca38bac18dd6acc9807d4dde0571d0344773",
+    "patched_source_sha256_independently_derived_in_memory": "3690a93a06a38cb708858df9756636c2c14bcb45e2d811b9274eda12fb974f99",
+    "scope_verified": "Two hunks, one IOGOPFramebuffer.cpp, 17 insertions and no deletions. The existing depths, mode/aperture rejection, stride, VRAM extent, matching and controller behavior are unchanged. git apply --check succeeded against the isolated bringup source; an independent in-memory exact-context application also succeeded. Source-only tests compare against git show at exact PureDarwin e7aa00a and confirm the isolated IOGOP source equals that pin.",
+    "format_and_byte_layout": {
+      "encoding": "kIO30BitDirectPixels, defined by IOGraphicsTypes.h:64 as --RRRRRRRRRRGGGGGGGGGGBBBBBBBBBB",
+      "storage_bits": 32,
+      "component_bits": 10,
+      "component_count": 3,
+      "masks_rgb": ["0x3ff00000", "0x000ffc00", "0x000003ff"],
+      "mask_check": "Three disjoint contiguous 10-bit fields; union 0x3fffffff; bits 31:30 unused. The component order agrees exactly with XNU video_console.c:1288-1297 red/green/blue table entries.",
+      "little_endian_primary_words": {"red": "00 00 f0 3f", "green": "00 fc 0f 00", "blue": "ff 03 00 00"},
+      "m1n1_source_check": "Pinned src/fb.c:153-160 places 8-bit R/G/B in bits 29:22/19:12/9:2, the upper eight bits of the same 10-bit fields. An independent 4096-case host arithmetic check matched that pack rule. This is source/model evidence, not captured scanout pixels.",
+      "consumer_check": "IOFramebuffer.cpp:2485-2499 computes four storage bytes per pixel, totalWidth=10240*8/32=2560 and consoleDepth=3*10=30. Its 2570-2576 branch already supports the 10-bit-component software cursor. The bootframebuffer remains 10240*1600=16384000 bytes; no packed-30-bit row arithmetic is introduced."
+    },
+    "tests_executed": {
+      "command": "python3 -B integrations/puredarwin/m1-display/test_framebuffer_30bit.py -v",
+      "exit_code": 0,
+      "passed": 11,
+      "skipped": 0,
+      "mutations_rejected": 6,
+      "coverage": "Exact pins and patch applicability, unchanged other depths, old fallback-to-8 bug, corrected field assignments, encoding masks, IOGraphics console-depth rule, XNU painting and pinned m1n1 channel layout. Mutation cases cover 8-bit components, 30-bit storage, swapped masks, wrong format, missing format case and CLUT pixel type.",
+      "limit": "These are source-aware lexical/model checks, not a compiler, ABI, linked-kext or runtime test. Root's SDK build and resulting KC inspection remain required."
+    },
+    "remaining_scope": "No blocker found in these two added cases. This patch does not fix VC6 disable/release/enable ordering, establish framebuffer driver matching, prove framebuffer coherence/scanout, or qualify a compositor. Nix files were not changed; root owns the in-progress build and artifact binding."
+  },
+  "saved_hardware_metadata_offline_check": {
+    "path": "runs/m1-bringup-009/attempt-009/guest/original-bootargs.bin",
+    "sha256": "aedc8ad1d6463e4ce0966b830dfa2216444ddc24e28fbd6fe8ccede872dd1578",
+    "length": 736,
+    "revision": 2,
+    "decoder": "Six little-endian uint64 fields at offset 40, per pinned proxyclient/m1n1/tgtypes.py:32-55 and XNU pexpert/arm64/boot.h:24-37.",
+    "original_video_display": 1,
+    "width": 2560,
+    "height": 1600,
+    "stride_bytes": 10240,
+    "raw_depth": "0x1001e",
+    "decoded_depth": 30,
+    "decoded_scale": 2,
+    "decoded_rotation": 0,
+    "span_bytes": 16384000,
+    "base_and_span_16k_aligned": true,
+    "span_within_physical_dram": true,
+    "span_intersects_saved_mcc_carveout": false,
+    "mcc_path": "runs/m1-bringup-009/attempt-009/guest/mcc-carveouts.bin",
+    "mcc_sha256": "68e85adc1853aec128971d18379fa7e9bd1a1f016edc6f2a42274bb06981a559",
+    "depth_support": "video_console.c:1426-1428 renders 30-bit glyph masks and 1653-1656 selects the 32-bit storage painter for depth 30. Do not replace raw depth with 32. Cursor inversion's switch at 1737-1752 has no case 30, a source-level cursor-visibility limitation rather than a missing glyph path.",
+    "limit": "These are previously captured firmware metadata bytes, checked offline; no framebuffer pixels were read here and no physical panel observation was obtained. Current live metadata and MCC guards must still be applied."
+  },
+  "m1n1_handoff": {
+    "bootargs_contract": "-v -s debug=0x14e keepsyms=1 serial=3 serial-device-name=uart0 disable-uart-irq=1 cpus=1 rd=md0 serial_video_mirror=1 pdtextboot=1",
+    "display_override_order": "hv.set_bootargs(BOOTARGS), configure_display_console(...), then hv.load_raw(...). load_raw serializes tba at lines 1791-1807; load_payloads later reserializes the same modified tba. Do not apply the override after the last BootArgs upload.",
+    "original_metadata": "The helper saves original raw BootArgs/ADT before HV init and any display mutation. HV.init uses u.ba.copy at line 1372; do not infer that all nested in-memory objects are independent. The preservation claim is about retained original raw bytes and unchanged guest geometry, not a deep-copy guarantee.",
+    "framebuffer_shutdown": "Pinned HV.start calls fb_shutdown(True) at line 1978. src/fb.c:546-560 disables the m1n1 software console, restores its saved logo and frees its software framebuffer storage; that function does not call display_shutdown. It is not source evidence that the panel scanout is shut off. Final scanout remains a hardware qualification.",
+    "framebuffer_source_sha256": "22dec340ab72b40076856b708b3495c3a70f7a1afa68d8fb8221f6fb5c5da117"
+  },
+  "validation": {
+    "performed_here": [
+      "Read the exact console/control sources and compared eight kernel files with the kernel002 Nix source snapshot.",
+      "Hash-checked kernel002 and counted the three expected NUL-terminated boot-argument strings.",
+      "Decoded saved attempt009 BootArgs video fields using the pinned structure offsets, and checked the whole framebuffer span against physical DRAM and the saved bounded MCC table.",
+      "Reviewed root's configure_display_console, paused framebuffer read and focused host-test source; did not run a build or hardware test.",
+      "Ran python3 -B integrations/puredarwin/m1-bringup/test_host_progress.py -v: 20 tests passed, exit 0.",
+      "Ran python3 -B -m unittest tests.test_m1_bringup_cycle -v: 6 tests passed, exit 0. These are fake-transport/host-only tests, not target execution."
+    ],
+    "focused_test_source": "test_host_progress.py:231-261 checks paused ownership, no pixel I/O outside the handler, exact fake bytes/hash and MCC refusal; 263-284 checks modes 0/1/2 become 2, raw geometry preservation, invalid-geometry and MCC refusal before display mutation, retained recovery boot arguments and physical_panel_observed=false.",
+    "recommended_checks_before_or_with_root_candidate": [
+      "Pinned Construct saved-metadata roundtrip: after set_bootargs and before/after configure_display_console, only the video.display uint64 at offset 48 changes; retain all five other raw video fields. Verify the finally uploaded BootArgs still encode 2 and the full intended command line.",
+      "Add focused physical-range boundary cases: framebuffer above usable mem_size but inside actual DRAM accepted; end beyond DRAM rejected; MCC adjacency accepted and one-byte overlap rejected. Current source uses the correct full-span predicate.",
+      "Retain the strict fresh serial challenge and Linux-recovery checks. Separately obtain a contemporaneous laptop-panel observation of a fresh shell command/response; old boot text is insufficient."
+    ]
+  },
+  "paused_pixel_capture_review": {
+    "assessment": "No blocking source finding in the added read for the current single-guest-CPU experiment.",
+    "ownership": "ProgressCapture.diagnostics at host_progress.py:260-267 requires nonempty original raw context, hv._in_handler and dispatch_depth>=1, then parses the context before target I/O. stop at 313-329 disarms the alarm and privately saves exception-context.bin before diagnostics. Original event/raw/error are restored after any optional diagnostic exception, including BoundedStop reentrancy.",
+    "range_and_transport": "Lines 297-310 use backend.ba.video parsed from the original firmware BootArgs, freshly query the bounded 80-byte MCC table, revalidate the full physical-DRAM framebuffer span and read at most 64 MiB (this saved mode is 16,384,000 bytes). Pinned proxy.py:428-464 chunks readmem into 16 KiB framed reads with checksum/sentinel validation. This uses the existing main-thread proxy reader, not a timer-thread write or second reader.",
+    "failure_behavior": "A short read fails before framebuffer artifacts are published. Optional read/parse/proxy errors remain diagnostics errors and do not erase the original exception bytes. A long or hung read remains subject to the parent worker timeout (host_progress.py:625,643-660); parent termination can leave partial evidence and target state unknown, so existing independent recovery still applies. No target resume/reset command was added by this capture.",
+    "claims": "framebuffer.bin/json are private and contain the exact original geometry, byte count and hash. physical_panel_observed remains false. A copy of the firmware framebuffer is not proof that the panel currently scans it out, nor proof of an arbitrary later framebuffer chosen by IOGraphics. Keep that distinction when classifying the display stop.",
+    "focused_test_limits": "Tests cover the handler-false and MCC-intersection refusal cases plus successful fake capture; raw-empty, dispatch_depth=0, short-read and physical-DRAM-boundary cases are useful small additional cases. The source checks are present; passing fakes do not establish real USB throughput or display coherence."
+  },
+  "ordered_next_steps": [
+    "Root retains the hardware hold while Claude's isolated IOGOP depth-30 fix is reviewed and built into a newly bound KC; keep kernel002/rootfs and serial recovery pinned. No hardware action was performed by this reviewer.",
+    "Root stages the reviewed host metadata/capture change after the saved-metadata wire check. Claude checks whether IOGOP opens/disables the screen before the shell; retain VC6 as a conditional handoff defect rather than silently assuming all transitions reacquire text.",
+    "On the next root-owned authorized test, prove a fresh shell response on the actual laptop display alongside serial challenge and verified Linux recovery. If the panel remains stale, diagnose framebuffer mapping/scanout and the recorded screen-state transitions before further routing changes.",
+    "Only after the display-shell stop is satisfied, proceed to the separate userland terminal/Wayland Chonkstep work."
+  ]
+}

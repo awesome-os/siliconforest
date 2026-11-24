@@ -1,0 +1,3151 @@
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/src/desktop_entry.rs desk5-003/crates/wm-darwin/src/desktop_entry.rs
+--- desk4-007/crates/wm-darwin/src/desktop_entry.rs	2026-11-14 19:47:15.000000000 -0800
++++ desk5-003/crates/wm-darwin/src/desktop_entry.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -183,6 +183,22 @@
+         if let Some(error) = self.wait_error.take() {
+             return Err(error);
+         }
++        // A frame waiting for its commit moment (the pointer on its plane, DESK5): the input that
++        // came meanwhile places the pointer, then the commit, before anything else of this turn.
++        if self.server.commit_due_now() {
++            let ms = self.elapsed().as_millis() as u32;
++            for stamped in self.input.take() {
++                if let crate::hid::Event::Pointer { motion, .. } = stamped.event {
++                    if motion != crate::hid::Motion::Relative(0, 0) {
++                        self.server.note_pointer_motion(stamped.at);
++                    }
++                }
++                if let Err(error) = self.server.deliver_hid(stamped.event, ms) {
++                    self.server.note_input_refused(&error);
++                }
++            }
++            self.server.commit_if_due(ms)?;
++        }
+         // Admission work per frame is finite so incoming clients cannot keep
+         // the loop from observing its wall-time/signal boundary forever.
+         for _ in 0..4 {
+@@ -331,6 +347,7 @@
+ // The signal scope outlives all device, UI and application owners below. Its
+ // checked restoration happens only after this function's cleanup/drop paths.
+ fn run_session(options: Options) -> Result<(), String> {
++    crate::input_latency::interactive_qos("main");
+     let records_path = options.records.clone();
+     let records = PrivateDirectory::open(&options.records).map_err(|e| e.to_string())?;
+     let mut result = records
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/src/displays.rs desk5-003/crates/wm-darwin/src/displays.rs
+--- desk4-007/crates/wm-darwin/src/displays.rs	1969-12-31 16:00:00.000000000 -0800
++++ desk5-003/crates/wm-darwin/src/displays.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -0,0 +1,230 @@
++//! More than one output (DESK5): what the desk does when the layout of outputs.rs changes.
++//!
++//! The scene is one space in the panel's density (outputs.rs `Layout::scene_outputs`): the
++//! panel at its origin, an external display beside it (the primary: the dock, the launcher
++//! strip, the desk's panels and new windows go there). Here the scene follows a new set of
++//! outputs at run time:
++//! - wm-core's monitors (and so its work areas, its placement of new windows, the output a
++//!   window is on), with Spaces per display (macOS's default, wm-core `reconcile_display_spaces`)
++//!   or, without separate Spaces, the windows of an output that went brought to the remaining
++//!   ones (`rescue_departed_output`);
++//! - a `wl_output` per output, with its own mode, scale and position, and `xdg_output` (smithay)
++//!   telling clients its logical size; a window's surface enters the output it lies on;
++//! - the layer surfaces (the dock) placed on the primary;
++//! - the pointer kept on an output (it crosses where outputs touch, stops elsewhere).
++//! The single-output path is the one the desk always had: nothing here runs until a second
++//! output is set.
++use crate::outputs::{OutputKind, SceneOutput};
++use crate::server::Server;
++use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
++use smithay::reexports::wayland_server::backend::GlobalId;
++use smithay::utils::Transform;
++use wm_core::{Backend, MonitorInfo, Point, Rect};
++
++/// The outputs besides the panel's (which is `Server::output`): name, wl_output, its global.
++#[derive(Default)]
++pub struct ExtraOutputs {
++    pub(crate) outputs: Vec<(SceneOutput, Output, GlobalId)>,
++    /// The output each mapped window's surface was last told it is on.
++    pub(crate) entered: std::collections::HashMap<u64, String>,
++}
++
++fn contains(r: Rect, p: Point) -> bool {
++    p.x >= r.pos.x && p.y >= r.pos.y && p.x < r.pos.x + r.size.w as i32 && p.y < r.pos.y + r.size.h as i32
++}
++
++/// Where the pointer ends when it moves from `from` to `to` among `outputs` (scene pixels): on an
++/// output, there; between them (a gap, below a shorter one), at the edge of the output it was on.
++pub fn keep_on_outputs(outputs: &[Rect], from: Point, to: Point) -> Point {
++    if outputs.is_empty() || outputs.iter().any(|r| contains(*r, to)) {
++        return to;
++    }
++    let home = outputs.iter().copied().find(|r| contains(*r, from)).unwrap_or(outputs[0]);
++    Point::new(to.x.clamp(home.pos.x, home.pos.x + home.size.w as i32 - 1), to.y.clamp(home.pos.y, home.pos.y + home.size.h as i32 - 1))
++}
++
++impl Server {
++    /// The outputs as the scene has them now (one: the panel).
++    pub fn scene_outputs(&self) -> Vec<SceneOutput> {
++        let backend = self.wm.backend();
++        let mut list: Vec<SceneOutput> = self.extra_outputs.outputs.iter().map(|(o, ..)| o.clone()).collect();
++        let panel = backend.monitors_ref().iter().find(|m| !list.iter().any(|o| o.name == m.name));
++        if let Some(m) = panel {
++            list.insert(0, SceneOutput { primary: m.primary, ..SceneOutput::panel(m.geometry.size, self.scale()) });
++            list[0].rect = m.geometry;
++        }
++        list
++    }
++    /// Make the scene's outputs `outputs` (the panel first or anywhere: it is the one of kind
++    /// Internal). Returns what changed, for the log.
++    pub fn set_scene_outputs(&mut self, outputs: &[SceneOutput]) -> Result<String, String> {
++        if outputs.is_empty() {
++            return Err("no outputs".into());
++        }
++        let before: Vec<MonitorInfo> = self.wm.backend().monitors();
++        // the panel keeps its wl_output (and its name in the scene: SFGOP-0)
++        let monitors: Vec<MonitorInfo> = outputs
++            .iter()
++            .map(|o| MonitorInfo {
++                geometry: o.rect,
++                name: if o.kind == OutputKind::Internal { "SFGOP-0".into() } else { o.name.clone() },
++                identity: Some(o.id.clone()),
++                primary: o.primary,
++            })
++            .collect();
++        let departed: Vec<MonitorInfo> = before.iter().filter(|m| !monitors.iter().any(|n| n.name == m.name)).cloned().collect();
++        let added: Vec<String> = monitors.iter().filter(|m| !before.iter().any(|b| b.name == m.name)).map(|m| m.name.clone()).collect();
++        self.wm.backend_mut().set_outputs(monitors.clone());
++        // wl_output per external; the panel's moves and keeps its scale
++        let dh = self.display_handle.clone();
++        let keep: Vec<String> = outputs.iter().filter(|o| o.kind == OutputKind::External).map(|o| o.name.clone()).collect();
++        let mut i = 0;
++        while i < self.extra_outputs.outputs.len() {
++            if keep.contains(&self.extra_outputs.outputs[i].0.name) {
++                i += 1;
++                continue;
++            }
++            let (gone, output, global) = self.extra_outputs.outputs.remove(i);
++            // its windows' surfaces leave it (before it goes) and are on the panel's until they
++            // are placed again
++            let on_it: Vec<u64> = self.extra_outputs.entered.iter().filter(|(_, n)| **n == gone.name).map(|(id, _)| *id).collect();
++            for id in on_it {
++                if let Some(w) = self.wm.backend().windows.get(&id) {
++                    let surface = w.surface.wl_surface().clone();
++                    output.leave(&surface);
++                    self.output.enter(&surface);
++                }
++                self.extra_outputs.entered.insert(id, "SFGOP-0".into());
++            }
++            dh.disable_global::<Server>(global.clone());
++            dh.remove_global::<Server>(global);
++            eprintln!("WMOUTPUT wl_output {} removed", gone.name);
++        }
++        for o in outputs {
++            let scale = Scale::Fractional(o.scale.factor());
++            let position = Some((o.rect.pos.x, o.rect.pos.y).into());
++            let mode = Mode { size: (o.pixels.0 as i32, o.pixels.1 as i32).into(), refresh: 60_000 };
++            if o.kind == OutputKind::Internal {
++                self.output.change_current_state(None, None, None, position);
++                continue;
++            }
++            match self.extra_outputs.outputs.iter_mut().find(|(e, ..)| e.name == o.name) {
++                Some((e, output, _)) => {
++                    output.change_current_state(Some(mode), None, Some(scale), position);
++                    *e = o.clone();
++                }
++                None => {
++                    let output = Output::new(o.name.clone(), PhysicalProperties { size: (0, 0).into(), subpixel: Subpixel::Unknown, make: "External".into(), model: o.id.clone() });
++                    let global = output.create_global::<Server>(&dh);
++                    output.change_current_state(Some(mode), Some(Transform::Normal), Some(scale), position);
++                    output.set_preferred(mode);
++                    eprintln!("WMOUTPUT wl_output {} added {}x{} {} at {},{}", o.name, o.pixels.0, o.pixels.1, o.scale.label(), o.rect.pos.x, o.rect.pos.y);
++                    self.extra_outputs.outputs.push((o.clone(), output, global));
++                }
++            }
++        }
++        // wm-core: Spaces per display, or the departed outputs' windows rescued
++        if self.wm.spaces_mode() && self.wm.interaction_config().separate_spaces {
++            self.wm.reconcile_display_spaces();
++        } else {
++            for d in &departed {
++                self.wm.rescue_departed_output(d.geometry, &d.name, d.identity.as_deref());
++            }
++            self.wm.restore_evacuated_clients();
++        }
++        self.layers_relayout();
++        // the pointer stays on an output
++        let rects: Vec<Rect> = monitors.iter().map(|m| m.geometry).collect();
++        let pointer = self.wm.backend().pointer;
++        if !rects.iter().any(|r| contains(*r, pointer)) {
++            let p = self.wm.backend().primary_rect();
++            let centre = Point::new(p.pos.x + p.size.w as i32 / 2, p.pos.y + p.size.h as i32 / 2);
++            self.move_pointer_to(centre);
++        }
++        self.sync_surface_outputs();
++        self.renderer.invalidate();
++        let line = format!(
++            "outputs={} added={added:?} departed={:?} screen={}x{} primary={:?}",
++            monitors.iter().map(|m| format!("{}{}@{},{} {}x{}", m.name, if m.primary { "*" } else { "" }, m.geometry.pos.x, m.geometry.pos.y, m.geometry.size.w, m.geometry.size.h)).collect::<Vec<_>>().join(";"),
++            departed.iter().map(|d| d.name.clone()).collect::<Vec<_>>(),
++            self.wm.backend().screen_size().w,
++            self.wm.backend().screen_size().h,
++            self.wm.backend().primary_rect()
++        );
++        eprintln!("WMOUTPUT scene {line}");
++        Ok(line)
++    }
++    /// The pointer to a place (an output came or went): moved as by a motion there.
++    fn move_pointer_to(&mut self, p: Point) {
++        if let Some(input) = self.input.as_mut() {
++            input.position = (f64::from(p.x), f64::from(p.y));
++        }
++        let backend = self.wm.backend_mut();
++        backend.pointer = p;
++        backend.cursor_changed();
++        self.refresh_pointer();
++    }
++    /// Each mapped window's surface told which output it is on (its centre's), when there is more
++    /// than one output; with one, every surface is on the panel's as before.
++    pub(crate) fn sync_surface_outputs(&mut self) {
++        if self.extra_outputs.outputs.is_empty() && self.extra_outputs.entered.is_empty() {
++            return;
++        }
++        let monitors = self.wm.backend().monitors();
++        let windows: Vec<(u64, Rect, smithay::reexports::wayland_server::protocol::wl_surface::WlSurface)> = self
++            .wm
++            .backend()
++            .windows
++            .iter()
++            .filter(|(_, w)| w.mapped)
++            .map(|(id, w)| (*id, w.content, w.surface.wl_surface().clone()))
++            .collect();
++        for (id, content, surface) in windows {
++            let centre = Point::new(content.pos.x + content.size.w as i32 / 2, content.pos.y + content.size.h as i32 / 2);
++            let Some(on) = monitors.iter().find(|m| contains(m.geometry, centre)).or(monitors.iter().find(|m| m.primary)) else { continue };
++            if self.extra_outputs.entered.get(&id) == Some(&on.name) {
++                continue;
++            }
++            let output_of = |name: &str| -> Option<Output> {
++                if name == "SFGOP-0" { Some(self.output.clone()) } else { self.extra_outputs.outputs.iter().find(|(o, ..)| o.name == name).map(|(_, out, _)| out.clone()) }
++            };
++            if let Some(old) = self.extra_outputs.entered.get(&id).and_then(|n| output_of(n)) {
++                old.leave(&surface);
++            } else {
++                self.output.leave(&surface);
++            }
++            if let Some(new) = output_of(&on.name) {
++                new.enter(&surface);
++            }
++            self.extra_outputs.entered.insert(id, on.name.clone());
++        }
++        self.extra_outputs.entered.retain(|id, _| self.wm.backend().windows.contains_key(id));
++    }
++    /// A pointer motion's end among several outputs (input.rs): kept on an output.
++    pub(crate) fn pointer_on_outputs(&self, from: Point, to: Point) -> Point {
++        let monitors = self.wm.backend().monitors_ref();
++        if monitors.len() < 2 {
++            return to;
++        }
++        keep_on_outputs(&monitors.iter().map(|m| m.geometry).collect::<Vec<_>>(), from, to)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn the_pointer_crosses_where_outputs_touch_and_stops_below_the_shorter_one() {
++        let panel = Rect::new(Point::new(0, 0), wm_core::Size::new(2560, 1600));
++        let external = Rect::new(Point::new(2560, 0), wm_core::Size::new(3840, 2160));
++        let outputs = [panel, external];
++        // across the shared edge
++        assert_eq!(keep_on_outputs(&outputs, Point::new(2550, 800), Point::new(2600, 800)), Point::new(2600, 800));
++        // down from the external's lower part to where the panel has nothing: stays on the external
++        assert_eq!(keep_on_outputs(&outputs, Point::new(3000, 2000), Point::new(2500, 2000)), Point::new(2560, 2000));
++        // below the panel from the panel: at its bottom edge
++        assert_eq!(keep_on_outputs(&outputs, Point::new(100, 1590), Point::new(100, 1700)), Point::new(100, 1599));
++        // one output: kept on it (the caller does not ask then: it clamps to the screen as before)
++        assert_eq!(keep_on_outputs(&[panel], Point::new(1, 1), Point::new(5000, 5000)), Point::new(2559, 1599));
++    }
++}
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/src/foreign.rs desk5-003/crates/wm-darwin/src/foreign.rs
+--- desk4-007/crates/wm-darwin/src/foreign.rs	2026-11-14 19:47:15.000000000 -0800
++++ desk5-003/crates/wm-darwin/src/foreign.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -34,8 +34,16 @@
+ pub struct ForeignToplevels {
+     listeners: Vec<Listener>,
+     global: Option<GlobalId>,
++    /// AppKit applications running without a window (pid, app id, name), read twice a second.
++    windowless: Vec<(i32, String, String)>,
++    windowless_at: Option<std::time::Instant>,
+ }
+ 
++/// A handle for an AppKit application that runs without a window (it closed its last one, or
++/// hid itself): the dock shows its running dot from it; activating it reopens the application,
++/// closing it quits it (its menu's Quit). Its key is this plus the pid (window ids are small).
++pub const WINDOWLESS_BASE: u64 = 1 << 40;
++
+ impl ForeignToplevels {
+     pub fn create_global(&mut self, dh: &DisplayHandle) {
+         self.global = Some(dh.create_global::<Server, ZwlrForeignToplevelManagerV1, ()>(3, ()));
+@@ -73,13 +81,41 @@
+                 }
+                 Some((c.window, Shown { title: w.title.clone().unwrap_or_default(), app_id: w.app_id.clone().unwrap_or_default(), states: states_bytes(&states) }))
+             })
++            .chain(self.foreign.windowless.iter().map(|(pid, app_id, name)| (WINDOWLESS_BASE + *pid as u64, Shown { title: name.clone(), app_id: app_id.clone(), states: Vec::new() })))
+             .collect()
+     }
++    /// The AppKit applications without a window now: a client still connected whose toplevels
++    /// gave an application id, with no managed window, that serves an application menu socket
++    /// (`$XDG_RUNTIME_DIR/app-menu/<pid>`: AppKit's). Cheap (no bundle scan): twice a second.
++    fn refresh_windowless(&mut self) {
++        let now = std::time::Instant::now();
++        if self.foreign.windowless_at.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(500)) {
++            return;
++        }
++        self.foreign.windowless_at = Some(now);
++        let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from("/private/var/run/gpu-desktop"));
++        let with_windows: Vec<i32> = self.wm.backend().windows.values().filter(|w| w.mapped || w.committed).filter_map(|w| crate::server::peer_of(w.surface.wl_surface()).and_then(|p| p.pid)).collect();
++        let mut windowless: Vec<(i32, String, String)> = Vec::new();
++        for peer in crate::server::live_peers() {
++            let (Some(pid), Some(app_id)) = (peer.pid, peer.app_id.lock().ok().and_then(|a| a.clone())) else { continue };
++            if with_windows.contains(&pid) || windowless.iter().any(|(p, ..)| *p == pid) || !crate::appmenu::socket_path(&runtime, pid).exists() {
++                continue;
++            }
++            let name = self.macdesk_app_name(&app_id);
++            windowless.push((pid, app_id, name));
++        }
++        windowless.sort();
++        if windowless != self.foreign.windowless {
++            eprintln!("WMFOREIGN windowless applications: {:?}", windowless.iter().map(|(pid, id, _)| format!("{id}({pid})")).collect::<Vec<_>>());
++            self.foreign.windowless = windowless;
++        }
++    }
+     /// Once a frame: new windows, changes, windows gone.
+     pub fn foreign_sync(&mut self) {
+         if self.foreign.listeners.is_empty() {
+             return;
+         }
++        self.refresh_windowless();
+         let now = self.foreign_now();
+         let dh = self.display_handle.clone();
+         for listener in &mut self.foreign.listeners {
+@@ -149,6 +185,23 @@
+ impl Dispatch<ZwlrForeignToplevelHandleV1, u64> for Server {
+     fn request(state: &mut Self, _: &Client, _: &ZwlrForeignToplevelHandleV1, request: handle::Request, window: &u64, _: &DisplayHandle, _: &mut DataInit<'_, Self>) {
+         let window = *window;
++        if window >= WINDOWLESS_BASE {
++            let pid = (window - WINDOWLESS_BASE) as i32;
++            if !state.foreign.windowless.iter().any(|(p, ..)| *p == pid) {
++                return;
++            }
++            match request {
++                handle::Request::Activate { .. } | handle::Request::UnsetMinimized => {
++                    eprintln!("WMFOREIGN reopen windowless application pid={pid}");
++                    crate::macdesk::reopen(pid);
++                }
++                handle::Request::Close => {
++                    crate::macdesk::quit_mac_app(pid);
++                }
++                _ => {}
++            }
++            return;
++        }
+         if !state.wm.backend().windows.contains_key(&window) {
+             return;
+         }
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/src/glrender.rs desk5-003/crates/wm-darwin/src/glrender.rs
+--- desk4-007/crates/wm-darwin/src/glrender.rs	2026-11-14 19:47:15.000000000 -0800
++++ desk5-003/crates/wm-darwin/src/glrender.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -14,7 +14,7 @@
+ //! translucent ones can differ by GPU rounding of the blend.
+ use crate::damage::{DRect, ItemKey};
+ use crate::gpu::*;
+-use crate::kms::{Committed, Flip, FlipQueue, FlipWait, Kms, Scanout, ScanoutBuffer, Steps};
++use crate::kms::{Committed, Flip, FlipQueue, FlipWait, Kms, OverlayPlacement, Scanout, ScanoutBuffer, Steps};
+ use crate::presenter::Presenter;
+ use crate::render::{drawn_image_rect, DmabufDesc, FrameStats, Presented, Renderer, RendererKind};
+ use crate::scene::{CpuBackend, DrawOp, ExternalBuffer};
+@@ -42,7 +42,67 @@
+     fn set_power(&mut self, _: &Libraries, _: bool) -> Result<bool, String> {
+         Ok(false)
+     }
++    /// Keep what was drawn since `begin` for a later `commit` instead of showing it now.
++    fn stage(&mut self) -> Result<(), String> {
++        Err("this target shows frames at once".into())
++    }
++    /// A frame is staged and not committed yet.
++    fn staged(&self) -> bool {
++        false
++    }
++    /// Show the staged frame, or the frame on the screen again (a change of the pointer's
++    /// plane only). `Ok(false)`: nothing was committed (nothing on the screen yet).
++    fn commit(&mut self, _: &Libraries) -> Result<bool, String> {
++        Ok(false)
++    }
++    /// The pointer's plane: the size of its square buffers, when this target has one.
++    fn cursor_plane(&self) -> Option<u32> {
++        None
++    }
++    /// A pointer buffer free to draw in (not on the screen): its index and framebuffer object.
++    fn cursor_begin(&mut self, _: (u64, Point)) -> Option<(usize, GLuint, bool)> {
++        None
++    }
++    /// What the next commit puts on the pointer's plane: a buffer at a place, or nothing.
++    fn set_cursor(&mut self, _: Option<(usize, Point)>) {}
++}
++
++/// Where the pointer's plane goes and where the image lies in its buffer: the plane always lies
++/// wholly on the screen (the DCP takes no plane that leaves the screen, nor one smaller than
++/// 32x32), so near an edge the image is drawn shifted inside the buffer instead.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum CursorPlace {
++    /// The plane at `plane`, the image at `offset` inside the buffer.
++    Plane { plane: Point, offset: Point },
++    /// Nothing of the image is on the screen: the plane off.
++    Hidden,
++    /// The image does not fit the buffer: drawn into the frame.
++    Software,
++}
++pub fn place_cursor(origin: Point, image: (u32, u32), buffer: u32, screen: (u32, u32)) -> CursorPlace {
++    let (w, h) = (image.0 as i32, image.1 as i32);
++    let (sw, sh, b) = (screen.0 as i32, screen.1 as i32, buffer as i32);
++    if w <= 0 || h <= 0 || w > b || h > b || b > sw || b > sh {
++        return CursorPlace::Software;
++    }
++    if origin.x >= sw || origin.y >= sh || origin.x + w <= 0 || origin.y + h <= 0 {
++        return CursorPlace::Hidden;
++    }
++    let plane = Point::new(origin.x.clamp(0, sw - b), origin.y.clamp(0, sh - b));
++    CursorPlace::Plane { plane, offset: Point::new(origin.x - plane.x, origin.y - plane.y) }
++}
++
++/// The pointer's buffers on the overlay plane (ARGB8888, square).
++struct CursorBuffers {
++    buffers: Vec<ScanoutBuffer>,
++    /// What each buffer holds: the image's generation and where it lies in the buffer.
++    holds: Vec<Option<(u64, Point)>>,
++    size: u32,
++    /// The buffer on the screen (as committed last) and the one the next commit shows.
++    shown: Option<usize>,
++    next: Option<(usize, Point)>,
+ }
++const CURSOR_BUFFER: u32 = 128;
+ 
+ /// An ordinary texture-backed framebuffer; nothing is displayed. Host tests,
+ /// the off-screen benchmark and the pixel check use it.
+@@ -106,8 +166,11 @@
+     /// What is on screen and which commit the display owes an event for.
+     queue: FlipQueue,
+     drawing: Option<usize>,
++    /// Drawn, kept for its commit (late latching with the pointer on its plane).
++    staged: Option<usize>,
+     last: Option<usize>,
+     steps: Steps,
++    cursor: Option<CursorBuffers>,
+ }
+ /// The real display behind the flip queue, for the length of one call.
+ struct Live<'a> {
+@@ -135,11 +198,49 @@
+         for index in 0..3 {
+             buffers.push(kms.create_buffer(libs, context, index, &mut steps)?);
+         }
+-        Ok(Self { kms, buffers, queue: FlipQueue::new(), drawing: None, last: None, steps })
++        // The pointer's plane needs buffers whose alpha GL writes (ARGB8888 for GL as well).
++        let mut cursor = None;
++        if kms.overlay().is_some() {
++            if kms.gl_fourcc() != DRM_FORMAT_ARGB8888 {
++                eprintln!("WMCURSOR plane not used: GL draws the buffers as {} (no alpha); the pointer is drawn into each frame", String::from_utf8_lossy(&kms.gl_fourcc().to_le_bytes()));
++                kms.set_overlay(None);
++            } else {
++                let mut made = Vec::new();
++                for index in 0..3 {
++                    match kms.create_buffer_sized(libs, context, 10 + index, (CURSOR_BUFFER, CURSOR_BUFFER), DRM_FORMAT_ARGB8888, &mut steps) {
++                        Ok(buffer) => made.push(buffer),
++                        Err(error) => {
++                            eprintln!("WMCURSOR plane not used: pointer buffer {index}: {error}; the pointer is drawn into each frame");
++                            break;
++                        }
++                    }
++                }
++                if made.len() == 3 {
++                    cursor = Some(CursorBuffers { holds: vec![None; made.len()], buffers: made, size: CURSOR_BUFFER, shown: None, next: None });
++                }
++            }
++        }
++        Ok(Self { kms, buffers, queue: FlipQueue::new(), drawing: None, staged: None, last: None, steps, cursor })
++    }
++    fn placement(&self) -> Option<OverlayPlacement> {
++        let c = self.cursor.as_ref()?;
++        let (index, at) = c.next?;
++        Some(OverlayPlacement { fb: c.buffers[index].fb, x: at.x, y: at.y, w: c.size, h: c.size })
+     }
+     pub fn kms(&self) -> &Kms {
+         &self.kms
+     }
++    /// After a commit: what it put on the plane is what is shown (once its flip completes; a
++    /// buffer is only drawn in when it is neither shown nor about to be).
++    fn cursor_committed(&mut self) {
++        let failed = self.kms.overlay().is_none();
++        if let Some(c) = self.cursor.as_mut() {
++            c.shown = if failed { None } else { c.next.map(|n| n.0) };
++        }
++        if failed {
++            self.cursor = None;
++        }
++    }
+ }
+ impl GlTarget for KmsTarget {
+     fn size(&self) -> (u32, u32) {
+@@ -155,6 +256,9 @@
+         if self.queue.busy() {
+             return Err("KMS target: a commit is still in flight".into());
+         }
++        if self.staged.is_some() {
++            return Err("KMS target: a staged frame has not been committed".into());
++        }
+         let index = (0..self.buffers.len())
+             .find(|i| Some(*i) != self.queue.front())
+             .ok_or("KMS target: no free buffer")?;
+@@ -167,8 +271,59 @@
+         if self.queue.front().is_none() {
+             self.steps.step("first commit (sets the mode)");
+         }
++        let placement = self.placement();
++        self.kms.set_overlay(placement);
++        let mut display = Live { kms: &mut self.kms, buffers: &self.buffers, libs, steps: &mut self.steps };
++        self.queue.submit(&mut display, index)?;
++        self.cursor_committed();
++        Ok(())
++    }
++    fn stage(&mut self) -> Result<(), String> {
++        let index = self.drawing.take().ok_or("KMS target: stage without begin")?;
++        self.last = Some(index);
++        self.staged = Some(index);
++        Ok(())
++    }
++    fn staged(&self) -> bool {
++        self.staged.is_some()
++    }
++    fn commit(&mut self, libs: &Libraries) -> Result<bool, String> {
++        if self.queue.busy() {
++            return Err("KMS target: commit while a commit is in flight".into());
++        }
++        let Some(index) = self.staged.take().or(self.queue.front()) else {
++            return Ok(false);
++        };
++        if self.queue.front().is_none() {
++            self.steps.step("first commit (sets the mode)");
++        }
++        let placement = self.placement();
++        self.kms.set_overlay(placement);
+         let mut display = Live { kms: &mut self.kms, buffers: &self.buffers, libs, steps: &mut self.steps };
+-        self.queue.submit(&mut display, index)
++        self.queue.submit(&mut display, index)?;
++        self.cursor_committed();
++        Ok(true)
++    }
++    fn cursor_plane(&self) -> Option<u32> {
++        self.kms.overlay()?;
++        self.cursor.as_ref().map(|c| c.size)
++    }
++    fn cursor_begin(&mut self, want: (u64, Point)) -> Option<(usize, GLuint, bool)> {
++        let c = self.cursor.as_mut()?;
++        if let Some(i) = c.holds.iter().position(|h| *h == Some(want)) {
++            return Some((i, c.buffers[i].fbo, false));
++        }
++        // a buffer that is not on the screen and not about to be (the frame in flight was
++        // committed with `shown`)
++        let busy = [c.shown, c.next.map(|n| n.0)];
++        let i = (0..c.buffers.len()).find(|i| !busy.contains(&Some(*i)))?;
++        c.holds[i] = Some(want);
++        Some((i, c.buffers[i].fbo, true))
++    }
++    fn set_cursor(&mut self, placement: Option<(usize, Point)>) {
++        if let Some(c) = self.cursor.as_mut() {
++            c.next = placement;
++        }
+     }
+     fn poll(&mut self, libs: &Libraries, timeout: Duration) -> Result<Option<Presented>, String> {
+         let first = self.queue.front().is_none();
+@@ -280,6 +435,9 @@
+     can_import: bool,
+     /// A small framebuffer a recording's frames are scaled into before they are read.
+     scaled: Option<OffscreenTarget>,
++    /// The pointer's image with straight (not premultiplied) alpha, as the DCP blends an
++    /// ARGB8888 plane: texture, generation, size.
++    cursor_texture: Option<(GLuint, u64, u32, u32)>,
+ }
+ 
+ unsafe fn compile(gl: &Gl, kind: GLenum, source: &str) -> Result<GLuint, String> {
+@@ -375,6 +533,7 @@
+                 external: HashMap::new(),
+                 next_external: 1,
+                 scaled: None,
++                cursor_texture: None,
+             })
+         }
+     }
+@@ -437,74 +596,8 @@
+         true
+     }
+ 
+-    /// One image as a quad over exactly the pixels the CPU renderer covers.
+-    fn draw_image(&mut self, key: TextureKey, pos: Point, image: &DecorationBuffer, generation: u64, partial: Option<&[DRect]>, screen: DRect) {
+-        let covered = drawn_image_rect(pos, image.width, image.height).intersect(screen);
+-        if !self.texture(key, image, generation, partial) || covered.is_empty() {
+-            return;
+-        }
+-        let gl = &self.libs.gl;
+-        unsafe {
+-            (gl.glUniform1i)(self.u_textured, 1);
+-            (gl.glUniform2f)(self.u_origin, pos.x as f32, pos.y as f32);
+-            (gl.glUniform2i)(self.u_last, image.width as GLint - 1, image.height as GLint - 1);
+-            (gl.glUniform4f)(self.u_rect, covered.x0 as f32, covered.y0 as f32, covered.x1 as f32, covered.y1 as f32);
+-            (gl.glDrawArrays)(GL_TRIANGLE_STRIP, 0, 4);
+-        }
+-    }
+-    /// A client dma-buf: the same quad as an image, sampling the client's memory.
+-    fn draw_external(&self, pos: Point, buffer: ExternalBuffer, screen: DRect) {
+-        let covered = drawn_image_rect(pos, buffer.width, buffer.height).intersect(screen);
+-        let Some((_, texture)) = self.external.get(&buffer.id) else {
+-            return;
+-        };
+-        if covered.is_empty() {
+-            return;
+-        }
+-        let gl = &self.libs.gl;
+-        unsafe {
+-            (gl.glBindTexture)(GL_TEXTURE_2D, *texture);
+-            (gl.glUniform1i)(self.u_textured, 1);
+-            (gl.glUniform2f)(self.u_origin, pos.x as f32, pos.y as f32);
+-            (gl.glUniform2i)(self.u_last, buffer.width as GLint - 1, buffer.height as GLint - 1);
+-            (gl.glUniform4f)(self.u_rect, covered.x0 as f32, covered.y0 as f32, covered.x1 as f32, covered.y1 as f32);
+-            (gl.glDrawArrays)(GL_TRIANGLE_STRIP, 0, 4);
+-        }
+-    }
+-    fn draw_solid(&self, rect: DRect, rgb: [u8; 3]) {
+-        if rect.is_empty() {
+-            return;
+-        }
+-        let gl = &self.libs.gl;
+-        unsafe {
+-            (gl.glUniform1i)(self.u_textured, 0);
+-            (gl.glUniform4f)(self.u_color, f32::from(rgb[0]) / 255.0, f32::from(rgb[1]) / 255.0, f32::from(rgb[2]) / 255.0, 1.0);
+-            (gl.glUniform4f)(self.u_rect, rect.x0 as f32, rect.y0 as f32, rect.x1 as f32, rect.y1 as f32);
+-            (gl.glDrawArrays)(GL_TRIANGLE_STRIP, 0, 4);
+-        }
+-    }
+-}
+-
+-impl Renderer for GlRenderer {
+-    fn kind(&self) -> RendererKind {
+-        RendererKind::Gl
+-    }
+-    fn output_name(&self) -> &'static str {
+-        self.target.name()
+-    }
+-    fn busy(&self) -> bool {
+-        self.target.busy()
+-    }
+-    fn poll_presented(&mut self, timeout: Duration) -> Result<Option<Presented>, String> {
+-        self.target.poll(&self.libs, timeout)
+-    }
+-    fn invalidate(&mut self) {
+-        // Every frame is a complete repaint; textures stay valid.
+-    }
+-    fn set_display_power(&mut self, on: bool) -> Result<bool, String> {
+-        self.target.set_power(&self.libs, on)
+-    }
+-    fn render_frame(&mut self, scene: &mut CpuBackend, _: &mut dyn Presenter) -> Result<FrameStats, String> {
++    /// The scene into the next buffer; then shown (`stage` false) or kept for `commit`.
++    fn draw_frame(&mut self, scene: &mut CpuBackend, stage: bool) -> Result<FrameStats, String> {
+         let start = Instant::now();
+         let (width, height) = self.target.size();
+         let size = scene.screen_size();
+@@ -528,7 +621,11 @@
+             (gl.glBlendFunc)(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+         }
+         let list = scene.display_list();
++        let cursor_on_plane = scene.cursor_on_plane;
+         for (sig, op) in &list {
++            if cursor_on_plane && sig.key == ItemKey::Cursor {
++                continue; // on its own plane (DESK5)
++            }
+             let key = TextureKey { item: sig.key, part: 0 };
+             match op {
+                 DrawOp::Background { color, image } => {
+@@ -579,7 +676,11 @@
+             return Err(format!("GL error {error:#x} while rendering"));
+         }
+         let rendered = Instant::now();
+-        self.target.present(&self.libs)?;
++        if stage {
++            self.target.stage()?;
++        } else {
++            self.target.present(&self.libs)?;
++        }
+         Ok(FrameStats {
+             composite_us: (rendered - start).as_micros() as u64,
+             convert_us: 0,
+@@ -590,6 +691,155 @@
+             large_alloc_bytes: 0,
+         })
+     }
++    /// The pointer's image into one of its plane's buffers at `offset`, straight alpha, nothing
++    /// blended (the plane's buffer is the image and transparency around it).
++    fn draw_cursor_buffer(&mut self, fbo: GLuint, size: u32, image: &DecorationBuffer, generation: u64, offset: Point) -> Result<(), String> {
++        if image.width == 0 || image.height == 0 || image.pixels.len() != image.width as usize * image.height as usize * 4 {
++            return Err("pointer image of the wrong size".into());
++        }
++        let gl = &self.libs.gl;
++        unsafe {
++            let fresh = !matches!(self.cursor_texture, Some((_, g, w, h)) if g == generation && w == image.width && h == image.height);
++            if fresh {
++                let straight = unpremultiply(&image.pixels);
++                let id = match self.cursor_texture {
++                    Some((id, ..)) => id,
++                    None => {
++                        let mut id = 0;
++                        (gl.glGenTextures)(1, &mut id);
++                        id
++                    }
++                };
++                (gl.glBindTexture)(GL_TEXTURE_2D, id);
++                (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++                (gl.glTexParameteri)(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++                (gl.glTexImage2D)(GL_TEXTURE_2D, 0, GL_RGBA8 as GLint, image.width as GLsizei, image.height as GLsizei, 0, GL_RGBA, GL_UNSIGNED_BYTE, straight.as_ptr() as *const c_void);
++                self.cursor_texture = Some((id, generation, image.width, image.height));
++            }
++            let (texture, ..) = self.cursor_texture.unwrap();
++            (gl.glBindFramebuffer)(GL_FRAMEBUFFER, fbo);
++            (gl.glViewport)(0, 0, size as GLsizei, size as GLsizei);
++            (gl.glUseProgram)(self.program);
++            (gl.glBindVertexArray)(self.vertex_array);
++            (gl.glActiveTexture)(GL_TEXTURE0);
++            (gl.glDisable)(GL_BLEND);
++            (gl.glClearColor)(0.0, 0.0, 0.0, 0.0);
++            (gl.glClear)(GL_COLOR_BUFFER_BIT);
++            let covered = drawn_image_rect(offset, image.width, image.height).intersect(DRect::from_xywh(0, 0, size, size));
++            if !covered.is_empty() {
++                (gl.glBindTexture)(GL_TEXTURE_2D, texture);
++                (gl.glUniform2f)(self.u_screen, size as f32, size as f32);
++                (gl.glUniform1i)(self.u_textured, 1);
++                (gl.glUniform2f)(self.u_origin, offset.x as f32, offset.y as f32);
++                (gl.glUniform2i)(self.u_last, image.width as GLint - 1, image.height as GLint - 1);
++                (gl.glUniform4f)(self.u_rect, covered.x0 as f32, covered.y0 as f32, covered.x1 as f32, covered.y1 as f32);
++                (gl.glDrawArrays)(GL_TRIANGLE_STRIP, 0, 4);
++            }
++            (gl.glEnable)(GL_BLEND);
++            (gl.glFinish)();
++            let error = (gl.glGetError)();
++            if error != GL_NO_ERROR {
++                return Err(format!("GL error {error:#x} while drawing the pointer's buffer"));
++            }
++        }
++        Ok(())
++    }
++    /// One image as a quad over exactly the pixels the CPU renderer covers.
++    fn draw_image(&mut self, key: TextureKey, pos: Point, image: &DecorationBuffer, generation: u64, partial: Option<&[DRect]>, screen: DRect) {
++        let covered = drawn_image_rect(pos, image.width, image.height).intersect(screen);
++        if !self.texture(key, image, generation, partial) || covered.is_empty() {
++            return;
++        }
++        let gl = &self.libs.gl;
++        unsafe {
++            (gl.glUniform1i)(self.u_textured, 1);
++            (gl.glUniform2f)(self.u_origin, pos.x as f32, pos.y as f32);
++            (gl.glUniform2i)(self.u_last, image.width as GLint - 1, image.height as GLint - 1);
++            (gl.glUniform4f)(self.u_rect, covered.x0 as f32, covered.y0 as f32, covered.x1 as f32, covered.y1 as f32);
++            (gl.glDrawArrays)(GL_TRIANGLE_STRIP, 0, 4);
++        }
++    }
++    /// A client dma-buf: the same quad as an image, sampling the client's memory.
++    fn draw_external(&self, pos: Point, buffer: ExternalBuffer, screen: DRect) {
++        let covered = drawn_image_rect(pos, buffer.width, buffer.height).intersect(screen);
++        let Some((_, texture)) = self.external.get(&buffer.id) else {
++            return;
++        };
++        if covered.is_empty() {
++            return;
++        }
++        let gl = &self.libs.gl;
++        unsafe {
++            (gl.glBindTexture)(GL_TEXTURE_2D, *texture);
++            (gl.glUniform1i)(self.u_textured, 1);
++            (gl.glUniform2f)(self.u_origin, pos.x as f32, pos.y as f32);
++            (gl.glUniform2i)(self.u_last, buffer.width as GLint - 1, buffer.height as GLint - 1);
++            (gl.glUniform4f)(self.u_rect, covered.x0 as f32, covered.y0 as f32, covered.x1 as f32, covered.y1 as f32);
++            (gl.glDrawArrays)(GL_TRIANGLE_STRIP, 0, 4);
++        }
++    }
++    fn draw_solid(&self, rect: DRect, rgb: [u8; 3]) {
++        if rect.is_empty() {
++            return;
++        }
++        let gl = &self.libs.gl;
++        unsafe {
++            (gl.glUniform1i)(self.u_textured, 0);
++            (gl.glUniform4f)(self.u_color, f32::from(rgb[0]) / 255.0, f32::from(rgb[1]) / 255.0, f32::from(rgb[2]) / 255.0, 1.0);
++            (gl.glUniform4f)(self.u_rect, rect.x0 as f32, rect.y0 as f32, rect.x1 as f32, rect.y1 as f32);
++            (gl.glDrawArrays)(GL_TRIANGLE_STRIP, 0, 4);
++        }
++    }
++}
++
++impl Renderer for GlRenderer {
++    fn kind(&self) -> RendererKind {
++        RendererKind::Gl
++    }
++    fn output_name(&self) -> &'static str {
++        self.target.name()
++    }
++    fn busy(&self) -> bool {
++        self.target.busy()
++    }
++    fn poll_presented(&mut self, timeout: Duration) -> Result<Option<Presented>, String> {
++        self.target.poll(&self.libs, timeout)
++    }
++    fn invalidate(&mut self) {
++        // Every frame is a complete repaint; textures stay valid.
++    }
++    fn set_display_power(&mut self, on: bool) -> Result<bool, String> {
++        self.target.set_power(&self.libs, on)
++    }
++    fn render_frame(&mut self, scene: &mut CpuBackend, _: &mut dyn Presenter) -> Result<FrameStats, String> {
++        self.draw_frame(scene, false)
++    }
++    fn stage_frame(&mut self, scene: &mut CpuBackend, _: &mut dyn Presenter) -> Result<FrameStats, String> {
++        self.draw_frame(scene, true)
++    }
++    fn staged(&self) -> bool {
++        self.target.staged()
++    }
++    fn cursor_plane_takes(&self, image: (u32, u32)) -> bool {
++        self.target.cursor_plane().is_some_and(|size| image.0 <= size && image.1 <= size && image.0 > 0 && image.1 > 0)
++    }
++    fn commit(&mut self, cursor: Option<(Point, &DecorationBuffer, u64)>) -> Result<bool, String> {
++        let placement = match (cursor, self.target.cursor_plane()) {
++            (Some((origin, image, generation)), Some(size)) => match place_cursor(origin, (image.width, image.height), size, self.target.size()) {
++                CursorPlace::Plane { plane, offset } => {
++                    let (index, fbo, draw) = self.target.cursor_begin((generation, offset)).ok_or("the pointer's plane has no free buffer")?;
++                    if draw {
++                        self.draw_cursor_buffer(fbo, size, image, generation, offset)?;
++                    }
++                    Some((index, plane))
++                }
++                CursorPlace::Hidden | CursorPlace::Software => None,
++            },
++            _ => None,
++        };
++        self.target.set_cursor(placement);
++        self.target.commit(&self.libs)
++    }
+     fn dmabuf_formats(&self) -> Vec<(u32, u64)> {
+         if !self.can_import {
+             return Vec::new();
+@@ -706,6 +956,24 @@
+     }
+ }
+ 
++/// Premultiplied RGBA (the scene's pictures) to straight alpha (what the DCP blends for an
++/// ARGB8888 plane: linux-aurora `apple_plane_atomic_update` marks only X formats premultiplied).
++pub fn unpremultiply(pixels: &[u8]) -> Vec<u8> {
++    let mut out = Vec::with_capacity(pixels.len());
++    for p in pixels.chunks_exact(4) {
++        let a = u32::from(p[3]);
++        match a {
++            0 => out.extend_from_slice(&[0, 0, 0, 0]),
++            255 => out.extend_from_slice(p),
++            _ => {
++                let c = |v: u8| ((u32::from(v) * 255 + a / 2) / a).min(255) as u8;
++                out.extend_from_slice(&[c(p[0]), c(p[1]), c(p[2]), p[3]]);
++            }
++        }
++    }
++    out
++}
++
+ /// Differences between two RGBA frames: (differing pixels, largest channel difference).
+ pub fn compare_frames(a: &[u8], b: &[u8]) -> (u64, u8) {
+     let (mut pixels, mut worst) = (0u64, 0u8);
+@@ -739,6 +1007,32 @@
+     use super::*;
+     use wm_core::{Rect, Size};
+ 
++    #[test]
++    fn the_pointers_plane_stays_on_the_screen_and_the_image_shifts_in_its_buffer_at_the_edges() {
++        let screen = (2560, 1600);
++        // in the middle: the plane at the image, the image at the buffer's corner
++        assert_eq!(place_cursor(Point::new(1000, 700), (18, 27), 128, screen), CursorPlace::Plane { plane: Point::new(1000, 700), offset: Point::new(0, 0) });
++        // at the right and bottom edges: the plane stops 128 px in, the image moves within it
++        assert_eq!(place_cursor(Point::new(2555, 1590), (18, 27), 128, screen), CursorPlace::Plane { plane: Point::new(2432, 1472), offset: Point::new(123, 118) });
++        // a hotspot left of the image's edge at the left edge: a negative offset (clipped)
++        assert_eq!(place_cursor(Point::new(-4, -6), (18, 27), 128, screen), CursorPlace::Plane { plane: Point::new(0, 0), offset: Point::new(-4, -6) });
++        // never smaller than 32x32 on the screen and never off it
++        for (x, y) in [(-17, 0), (2559, 1599), (0, 1599), (2540, -20)] {
++            if let CursorPlace::Plane { plane, .. } = place_cursor(Point::new(x, y), (18, 27), 128, screen) {
++                assert!(plane.x >= 0 && plane.y >= 0 && plane.x + 128 <= 2560 && plane.y + 128 <= 1600);
++            }
++        }
++        assert_eq!(place_cursor(Point::new(-18, 5), (18, 27), 128, screen), CursorPlace::Hidden);
++        assert_eq!(place_cursor(Point::new(10, 10), (200, 20), 128, screen), CursorPlace::Software, "larger than the buffer");
++        assert_eq!(place_cursor(Point::new(10, 10), (0, 0), 128, screen), CursorPlace::Software);
++    }
++    #[test]
++    fn the_pointers_plane_gets_straight_alpha() {
++        // opaque and transparent unchanged; half-covered white (premultiplied 128) is white at 128
++        let px = [255, 0, 0, 255, 0, 0, 0, 0, 128, 128, 128, 128, 10, 20, 30, 40];
++        assert_eq!(unpremultiply(&px), vec![255, 0, 0, 255, 0, 0, 0, 0, 255, 255, 255, 128, 64, 128, 191, 40]);
++    }
++
+     struct Lcg(u64);
+     impl Lcg {
+         fn next(&mut self, bound: u32) -> u32 {
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/src/gpu.rs desk5-003/crates/wm-darwin/src/gpu.rs
+--- desk4-007/crates/wm-darwin/src/gpu.rs	2026-11-14 19:47:15.000000000 -0800
++++ desk5-003/crates/wm-darwin/src/gpu.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -308,6 +308,7 @@
+ pub const DRM_MODE_OBJECT_CRTC: u32 = 0xcccc_cccc;
+ pub const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
+ pub const DRM_PLANE_TYPE_PRIMARY: u64 = 1;
++pub const DRM_PLANE_TYPE_OVERLAY: u64 = 0;
+ pub const DRM_MODE_CONNECTED: c_int = 1;
+ pub const DRM_MODE_TYPE_PREFERRED: u32 = 1 << 3;
+ pub const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241; // "AR24"
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/src/hid.rs desk5-003/crates/wm-darwin/src/hid.rs
+--- desk4-007/crates/wm-darwin/src/hid.rs	2026-11-14 19:47:15.000000000 -0800
++++ desk5-003/crates/wm-darwin/src/hid.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -669,8 +669,8 @@
+     }
+ }
+ 
+-/// The queues read on a thread of their own: every 1 ms while input arrives (4 ms after a
+-/// quarter of a second without, 8 ms after two seconds), whatever the desktop's frames are doing. The desktop takes
++/// The queues read on a thread of their own: every 1 ms while input arrives (2 ms after a
++/// quarter of a second without, 4 ms after two seconds), whatever the desktop's frames are doing. The desktop takes
+ /// what has accumulated once per loop turn (`take`), and its wait between frames ends when
+ /// something arrives (`wake_fd`).
+ pub struct InputThread {
+@@ -704,6 +704,7 @@
+         let handle = std::thread::Builder::new()
+             .name("sfhid-reader".into())
+             .spawn(move || {
++                crate::input_latency::interactive_qos("sfhid-reader");
+                 let mut out = Vec::new();
+                 let mut last_event = std::time::Instant::now() - std::time::Duration::from_secs(1);
+                 while !thread_shared.stop.load(std::sync::atomic::Ordering::Acquire) {
+@@ -716,11 +717,12 @@
+                         }
+                         thread_shared.push(out.drain(..).map(|event| Stamped { event, at: now }), Some(hid.health));
+                     }
+-                    // Every 1 ms while input arrives, 4 ms after a quarter of a second without,
+-                    // 8 ms (the old once-a-frame rate) after two seconds: a ring of 64 records
+-                    // lasts far longer than that, and an idle desktop costs little.
++                    // Every 1 ms while input arrives, 2 ms after a quarter of a second without,
++                    // 4 ms after two seconds: the first motion after a pause waits for the next
++                    // read (the device node has no select: SFHIDEventQueue `eno_select`), at most
++                    // 4 ms (DESK5; 8 ms before), and an idle desktop still costs little.
+                     let quiet = now.duration_since(last_event);
+-                    let pause = if quiet > std::time::Duration::from_secs(2) { 8 } else if quiet > std::time::Duration::from_millis(250) { 4 } else { 1 };
++                    let pause = if quiet > std::time::Duration::from_secs(2) { 4 } else if quiet > std::time::Duration::from_millis(250) { 2 } else { 1 };
+                     std::thread::sleep(std::time::Duration::from_millis(pause));
+                 }
+                 hid
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/src/inject.rs desk5-003/crates/wm-darwin/src/inject.rs
+--- desk4-007/crates/wm-darwin/src/inject.rs	2026-11-14 19:47:15.000000000 -0800
++++ desk5-003/crates/wm-darwin/src/inject.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -27,6 +27,10 @@
+ //!                                  frame that waits for the GPU; the input thread goes on reading
+ //! fail                             the compositor ends with an error (the session's relaunch test)
+ //! latch on|off                     late latching of frames on or off (before/after numbers)
++//! margin <us>|auto                 commit this long before the blank (500..10000), or learn it (DESK5)
++//! cursorplane on|off               the pointer on the display's overlay plane, or drawn into frames
++//! motions <n>                      the next <n> event steps (abs/rel/buttons/wheel/...) in one frame,
++//!                                  as a device that reports faster than the screen refreshes
+ //! stats                            one line: the input thread's counts (records, gaps, ...), the
+ //!                                  key events delivered, the motion-to-screen latency so far
+ //! capture <name>                   the frame as it was last rendered, to <name>.ppm in the directory
+@@ -60,6 +64,9 @@
+     Fail,
+     Stats,
+     Latch(bool),
++    Margin(Option<u32>),
++    CursorPlane(bool),
++    Motions(usize),
+     Wait(Duration),
+     Capture(String),
+     Dump(String),
+@@ -76,6 +83,8 @@
+     errors: Vec<String>,
+     active: bool,
+     injector: Option<crate::hid::Injector>,
++    /// Event steps still to deliver in this frame (`motions <n>`).
++    burst: usize,
+ }
+ 
+ impl Inject {
+@@ -86,7 +95,7 @@
+             return None;
+         }
+         eprintln!("WMINJECT armed dir={} input=synthetic-inject (requested events; not physical input)", dir.display());
+-        Some(Self { dir, queue: VecDeque::new(), poll_at: Instant::now(), wait_until: None, buttons: 0, capture_since: None, done: 0, errors: Vec::new(), active: false, injector: None })
++        Some(Self { dir, queue: VecDeque::new(), poll_at: Instant::now(), wait_until: None, buttons: 0, capture_since: None, done: 0, errors: Vec::new(), active: false, injector: None, burst: 0 })
+     }
+     /// The input thread's queue: injected events take the device events' path.
+     pub fn with_injector(mut self, injector: crate::hid::Injector) -> Self {
+@@ -136,6 +145,10 @@
+                 ["fail"] => Some(Step::Fail),
+                 ["stats"] => Some(Step::Stats),
+                 ["latch", on @ ("on" | "off")] => Some(Step::Latch(*on == "on")),
++                ["margin", "auto"] => Some(Step::Margin(None)),
++                ["margin", us] => us.parse::<u32>().ok().filter(|us| (500..=10_000).contains(us)).map(|us| Step::Margin(Some(us))),
++                ["cursorplane", on @ ("on" | "off")] => Some(Step::CursorPlane(*on == "on")),
++                ["motions", n] => n.parse::<usize>().ok().filter(|n| (1..=1000).contains(n)).map(Step::Motions),
+                 ["wait", ms] => ms.parse::<u64>().ok().filter(|ms| *ms <= 10_000).map(|ms| Step::Wait(Duration::from_millis(ms))),
+                 ["capture", name] if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => Some(Step::Capture((*name).to_string())),
+                 ["dump", name] if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => Some(Step::Dump((*name).to_string())),
+@@ -175,15 +188,37 @@
+         }
+         self.wait_until = None;
+         match self.queue.front() {
+-            Some(Step::Event(event)) => {
+-                match &self.injector {
+-                    Some(injector) => injector.push(*event),
+-                    None => {
+-                        if let Err(error) = server.deliver_hid(*event, ms) {
+-                            self.errors.push(format!("event not delivered: {error}"));
++            Some(Step::Event(_)) => {
++                // one event a frame, or `motions <n>` of them at once
++                let n = std::mem::take(&mut self.burst).max(1);
++                for _ in 0..n {
++                    let Some(Step::Event(event)) = self.queue.front() else { break };
++                    let event = *event;
++                    match &self.injector {
++                        Some(injector) => injector.push(event),
++                        None => {
++                            if let Err(error) = server.deliver_hid(event, ms) {
++                                self.errors.push(format!("event not delivered: {error}"));
++                            }
+                         }
+                     }
++                    self.queue.pop_front();
++                    self.done += 1;
+                 }
++            }
++            Some(Step::Motions(n)) => {
++                self.burst = *n;
++                self.queue.pop_front();
++                self.done += 1;
++            }
++            Some(Step::Margin(us)) => {
++                server.pacer.fixed_margin_us = *us;
++                eprintln!("WMINJECT margin {} ({})", us.map_or("auto".to_string(), |us| format!("{us}us")), server.pacer.describe());
++                self.queue.pop_front();
++                self.done += 1;
++            }
++            Some(Step::CursorPlane(on)) => {
++                server.cursor_plane_allowed = *on;
+                 self.queue.pop_front();
+                 self.done += 1;
+             }
+@@ -224,6 +259,7 @@
+                 let (keys, last) = server.hid_keys();
+                 eprintln!("WMINJECT stats hid: {hid} | key_events_delivered={keys} last_key={last:?} | {}", server.latency.final_line().unwrap_or_else(|| "no motion latency samples".into()));
+                 eprintln!("{}", server.latency.flush_line(&server.pacer));
++                eprintln!("WMPACE {} cursor_on_plane={}", server.pacer.take_leads(), server.wm.backend().cursor_on_plane);
+             }
+             Some(Step::Latch(on)) => {
+                 let on = *on;
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/src/input_latency.rs desk5-003/crates/wm-darwin/src/input_latency.rs
+--- desk4-007/crates/wm-darwin/src/input_latency.rs	2026-11-14 19:47:15.000000000 -0800
++++ desk5-003/crates/wm-darwin/src/input_latency.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -68,45 +68,134 @@
+     format!("{what} n={} p50_ms={:.1} p90_ms={:.1} p99_ms={:.1} max_ms={:.1}", sorted.len(), percentile(sorted, 0.5), percentile(sorted, 0.9), percentile(sorted, 0.99), sorted.last().map_or(0.0, |v| f64::from(*v) / 1000.0))
+ }
+ 
++/// The calling thread to the user-interactive QoS class (DESK5): its timed waits are woken with
++/// the least timer coalescing the kernel applies, so a commit planned for its moment is not made
++/// late by a sleep that overran. Looked up at run time (a libSystem without it: nothing happens).
++pub fn interactive_qos(what: &str) {
++    #[cfg(target_os = "macos")]
++    unsafe {
++        let f = libc::dlsym(libc::RTLD_DEFAULT, c"pthread_set_qos_class_self_np".as_ptr());
++        if f.is_null() {
++            eprintln!("WMPACE {what} thread: pthread_set_qos_class_self_np absent (QoS unchanged)");
++            return;
++        }
++        let set: extern "C" fn(u32, i32) -> i32 = std::mem::transmute(f);
++        let rc = set(0x21, 0); // QOS_CLASS_USER_INTERACTIVE
++        eprintln!("WMPACE {what} thread: QoS user-interactive rc={rc}");
++    }
++    #[cfg(not(target_os = "macos"))]
++    let _ = what;
++}
++
+ #[derive(Default)]
+ pub(crate) struct MotionLatency {
+-    /// The oldest and the newest motion not drawn yet.
++    /// The oldest and the newest motion not shown yet.
+     pending: Option<(Instant, Instant)>,
+-    /// The same for the frame on its way to the screen.
+-    in_flight: Option<(Instant, Instant)>,
++    /// The same for the frame on its way to the screen, and whether it was a frame of an
++    /// interactive move or resize (the window follows the pointer: a rendered frame).
++    in_flight: Option<(Instant, Instant, bool)>,
+     oldest: Series,
+     newest: Series,
++    /// Motions during an interactive move or resize: to the flip of the frame that shows the
++    /// window where the motion put it.
++    drag_oldest: Series,
++    drag_newest: Series,
++    /// An interactive resize: the client's time from the size asked to its buffer of that size
++    /// (the client's cost), and from that buffer to the flip showing it (the compositor's).
++    resize_client: Series,
++    resize_compositor: Series,
++    resize_pending: Option<Instant>,
++    resize_in_flight: Option<Instant>,
++    /// The motions a staged frame of an interactive move drew (its windows where they put
++    /// them); later ones wait for the next frame although the commit comes after them.
++    staged: Option<(Instant, Instant)>,
+     logged_at: Option<Instant>,
+ }
+ impl MotionLatency {
+     pub fn motion(&mut self, at: Instant) {
+         self.pending = Some(self.pending.map_or((at, at), |(o, n)| (o.min(at), n.max(at))));
+     }
+-    /// A frame was rendered; `in_flight`: it reaches the screen with a later flip.
+-    pub fn rendered(&mut self, in_flight: bool) {
++    /// A client committed the size an interactive resize asked of it at `asked`.
++    pub fn resize_answered(&mut self, asked: Instant) {
++        let now = Instant::now();
++        self.resize_client.sample(now.saturating_duration_since(asked));
++        self.resize_pending.get_or_insert(now);
++    }
++    /// A frame was committed (with the pointer drawn in it, or its plane placed); `in_flight`: it
++    /// reaches the screen with a later flip; `drag`: it shows a window an interactive move or
++    /// resize moved.
++    /// A frame of an interactive move or resize was rendered and waits for its commit: it shows
++    /// the motions up to now.
++    pub fn staged(&mut self) {
++        if let Some((o, n)) = self.pending.take() {
++            self.staged = Some(match self.staged {
++                Some((so, sn)) => (so.min(o), sn.max(n)),
++                None => (o, n),
++            });
++        }
++    }
++    pub fn rendered(&mut self, in_flight: bool, drag: bool) {
++        // a staged frame of a move shows what it drew; the motions since wait for the next one
++        if let Some(frame) = self.staged.take() {
++            if in_flight {
++                self.in_flight = Some(match self.in_flight {
++                    Some((po, pn, pd)) => (po.min(frame.0), pn.max(frame.1), pd || drag),
++                    None => (frame.0, frame.1, drag),
++                });
++            } else {
++                self.sample(frame.0, frame.1, drag);
++            }
++            return;
++        }
++        if let Some(at) = self.resize_pending.take() {
++            if in_flight {
++                self.resize_in_flight.get_or_insert(at);
++            } else {
++                self.resize_compositor.sample(at.elapsed());
++            }
++        }
+         let Some((o, n)) = self.pending.take() else { return };
+         if in_flight {
+-            self.in_flight = Some(self.in_flight.map_or((o, n), |(po, pn)| (po.min(o), pn.max(n))));
++            self.in_flight = Some(match self.in_flight {
++                Some((po, pn, pd)) => (po.min(o), pn.max(n), pd || drag),
++                None => (o, n, drag),
++            });
++        } else {
++            self.sample(o, n, drag);
++        }
++    }
++    fn sample(&mut self, o: Instant, n: Instant, drag: bool) {
++        if drag {
++            self.drag_oldest.sample(o.elapsed());
++            self.drag_newest.sample(n.elapsed());
+         } else {
+             self.oldest.sample(o.elapsed());
+             self.newest.sample(n.elapsed());
+         }
+     }
+     pub fn presented(&mut self) {
+-        if let Some((o, n)) = self.in_flight.take() {
+-            self.oldest.sample(o.elapsed());
+-            self.newest.sample(n.elapsed());
++        if let Some((o, n, drag)) = self.in_flight.take() {
++            self.sample(o, n, drag);
++        }
++        if let Some(at) = self.resize_in_flight.take() {
++            self.resize_compositor.sample(at.elapsed());
+         }
+     }
+     fn line(&mut self, what: &str) -> String {
+         let since = self.logged_at.map_or(0.0, |t| t.elapsed().as_secs_f64());
+         let (o, n) = (self.oldest.take_sorted(), self.newest.take_sorted());
++        let (dragged_o, dragged_n) = (self.drag_oldest.take_sorted(), self.drag_newest.take_sorted());
+         self.logged_at = Some(Instant::now());
+-        format!("WMLATENCY pointer motion->flip {what} {} | {} window_s={since:.1} (read from the queue or injected -> page flip showing the cursor; scan-out not included)", window_text(&o, "oldest"), window_text(&n, "newest"))
++        let mut drag = if dragged_o.is_empty() { String::new() } else { format!(" | drag/resize {} | {}", window_text(&dragged_o, "oldest"), window_text(&dragged_n, "newest")) };
++        let (client, compositor) = (self.resize_client.take_sorted(), self.resize_compositor.take_sorted());
++        if !client.is_empty() || !compositor.is_empty() {
++            drag.push_str(&format!(" | resize {} | {}", window_text(&client, "asked->client-buffer"), window_text(&compositor, "client-buffer->flip")));
++        }
++        format!("WMLATENCY pointer motion->flip {what} {} | {}{drag} window_s={since:.1} (read from the queue or injected -> page flip showing the cursor; scan-out not included)", window_text(&o, "oldest"), window_text(&n, "newest"))
+     }
+     /// A line every 10 s while the pointer moves.
+     pub fn maybe_log(&mut self, pacer: &FramePacer) {
+-        if self.oldest.window.is_empty() {
++        if self.oldest.window.is_empty() && self.drag_oldest.window.is_empty() && self.resize_compositor.window.is_empty() {
+             return;
+         }
+         let at = *self.logged_at.get_or_insert_with(Instant::now);
+@@ -122,10 +211,11 @@
+     }
+     /// The whole run (whole milliseconds).
+     pub fn final_line(&self) -> Option<String> {
+-        if self.oldest.samples == 0 {
++        if self.oldest.samples == 0 && self.drag_oldest.samples == 0 {
+             return None;
+         }
+-        Some(format!("WMLATENCY pointer motion->flip total {} | {}", self.oldest.total("oldest"), self.newest.total("newest")))
++        let drag = if self.drag_oldest.samples == 0 { String::new() } else { format!(" | drag/resize {} | {}", self.drag_oldest.total("oldest"), self.drag_newest.total("newest")) };
++        Some(format!("WMLATENCY pointer motion->flip total {} | {}{drag}", self.oldest.total("oldest"), self.newest.total("newest")))
+     }
+     #[cfg(test)]
+     pub fn samples(&self) -> u64 {
+@@ -133,42 +223,102 @@
+     }
+ }
+ 
+-/// When to render: late enough that the frame holds the newest input, early enough to make the
+-/// vertical blank it aims at. Learns the blank's phase from flip-complete events, the refresh
+-/// interval from their spacing, and the render time from the frames it times; a frame that
+-/// arrived a refresh late widens the margin, good frames narrow it again.
++/// When to render and when to commit: late enough that the frame holds the newest input, early
++/// enough to make the vertical blank it aims at. Learns the blank's phase from flip-complete
++/// events, the refresh interval from their spacing, and the render time from the frames it
++/// times.
++///
++/// A frame aims at a blank `b`; it is committed `margin` before it (`commit_at`) and, when the
++/// scene must be rendered, rendered `render_budget` before that (`render_at`). With the pointer on
++/// its plane (DESK5) a pointer-only frame is a commit alone, at the last safe moment, and a
++/// rendered frame waits for that moment too, so the pointer is placed by the newest input; with
++/// the pointer drawn into frames the commit follows the render at once (DESK4's late latching).
++/// A frame shown a refresh after its blank (a miss) raises the margin above the lead it had;
++/// frames on time lower it slowly.
+ pub(crate) struct FramePacer {
+     enabled: bool,
+     /// A vertical blank (from the earliest-read flip events: the closest to the real blank).
+     phase: Option<Instant>,
+     interval: Duration,
+-    /// Render times of the last frames (render start to commit returned), microseconds.
++    /// Render times of the last frames (render start to frame ready), microseconds.
+     renders: std::collections::VecDeque<u32>,
+-    margin_us: u32,
++    /// How long before the blank (as the flip events place it) the display must have a commit:
++    /// learned from misses (DESK5, measured on the M1: about 2 ms).
++    min_lead_us: u32,
++    /// How late commits came after their planned moment (the loop's wake-up), the last 120.
++    lateness: std::collections::VecDeque<u32>,
++    /// The test instrument's fixed margin (`margin <us>`); `None`: learned.
++    pub fixed_margin_us: Option<u32>,
+     last_flip: Option<Instant>,
+-    /// The blank the frame on its way is aimed at.
+-    aim: Option<Instant>,
++    /// The blank the commit on its way aims at, and how long before it it was made (us).
++    aim: Option<(Instant, i64)>,
++    /// Pointer-only commits that were made for a blank a rendered frame could not reach.
++    pub pointer_first: u64,
+     pub frames: u64,
++    pub commits: u64,
+     pub late: u64,
++    /// Commit leads (before the aimed blank) of frames on time and of misses, counted in 0.5 ms
++    /// buckets (the last is 10 ms or more; negative leads in the first).
++    pub on_time_leads: [u32; 21],
++    pub late_leads: [u32; 21],
+ }
+-// measured on the M1 (desk4-006): with 2.5 ms about 1 % of frames missed the blank they aimed at
+-const MARGIN_MIN_US: u32 = 3_500;
++// Measured on the M1 (DESK5, desk5-001, fixed margins, pointer-only commits): a commit made less
++// than about 2 ms before the blank (as the flip events place it) shows a refresh later; 2.0-2.5 ms
++// before it is on time in 97 % of frames, 2.5-3.0 ms in all. The margin is that lead plus how late
++// the loop has been waking for its commits.
++const MIN_LEAD_US: u32 = 2_200;
++const MIN_LEAD_FLOOR_US: u32 = 2_000;
++const MIN_LEAD_MAX_US: u32 = 6_000;
++const LATENESS_PAD_US: u32 = 200;
++const MARGIN_MIN_US: u32 = 2_200;
+ const MARGIN_MAX_US: u32 = 8_000;
+-const BUDGET_MIN_US: u32 = 4_000;
+-const BUDGET_MAX_US: u32 = 14_000;
++const RENDER_PAD_US: u32 = 500;
++const BUDGET_MIN_US: u32 = 1_000;
++const BUDGET_MAX_US: u32 = 12_000;
+ impl FramePacer {
+     pub fn new(enabled: bool) -> Self {
+-        Self { enabled, phase: None, interval: Duration::from_micros(16_667), renders: Default::default(), margin_us: MARGIN_MIN_US, last_flip: None, aim: None, frames: 0, late: 0 }
++        Self {
++            enabled,
++            phase: None,
++            interval: Duration::from_micros(16_667),
++            renders: Default::default(),
++            min_lead_us: MIN_LEAD_US,
++            lateness: Default::default(),
++            fixed_margin_us: None,
++            last_flip: None,
++            aim: None,
++            pointer_first: 0,
++            frames: 0,
++            commits: 0,
++            late: 0,
++            on_time_leads: [0; 21],
++            late_leads: [0; 21],
++        }
++    }
++    fn margin_us(&self) -> u32 {
++        // the latest wake-ups of the last 30 commits (half a second): a busy spell raises the
++        // margin at once, an idle desk lowers it again quickly
++        let late = self.lateness.iter().rev().take(30).copied().max().unwrap_or(500);
++        (self.min_lead_us + late.min(4_000) + LATENESS_PAD_US).clamp(MARGIN_MIN_US, MARGIN_MAX_US)
++    }
++    /// How long before its blank a frame is committed: the lead the display needs and how late
++    /// the loop wakes (the test instrument can fix it).
++    pub fn margin(&self) -> Duration {
++        Duration::from_micros(u64::from(self.fixed_margin_us.unwrap_or_else(|| self.margin_us())))
++    }
++    /// How long before its commit a frame is started: the longest of the last 60 render times
++    /// (with how late the loop started them) and a little.
++    pub fn render_budget(&self) -> Duration {
++        let longest = self.renders.iter().copied().max().unwrap_or(3_000);
++        Duration::from_micros(u64::from((longest + RENDER_PAD_US).clamp(BUDGET_MIN_US, BUDGET_MAX_US)))
+     }
+-    /// How long a frame is given before its blank: the longest of the last 60 render times
+-    /// plus the margin.
++    /// Render plus margin: how long before its blank a rendered frame starts (DESK4's budget).
+     pub fn budget(&self) -> Duration {
+-        let longest = self.renders.iter().copied().max().unwrap_or(BUDGET_MIN_US);
+-        Duration::from_micros(u64::from((longest + self.margin_us).clamp(BUDGET_MIN_US, BUDGET_MAX_US)))
++        self.render_budget() + self.margin()
+     }
+-    /// A frame took `render` from its start to the commit's return; `late`: how much after its
+-    /// planned moment it started (a busy loop, e.g. a client flooding the desk with commits).
+-    /// Both count against the budget, so a loop that wakes late plans earlier.
++    /// A frame took `render` from its start to being ready; `late`: how much after its planned
++    /// moment it started (a busy loop, e.g. a client flooding the desk with commits). Both count
++    /// against the budget, so a loop that wakes late plans earlier.
+     pub fn rendered(&mut self, render: Duration, late: Duration) {
+         let render = render + late;
+         if self.renders.len() == 60 {
+@@ -177,6 +327,59 @@
+         self.renders.push_back(render.as_micros().min(1_000_000) as u32);
+         self.frames += 1;
+     }
++    /// The blank's phase and the interval (us), when flips are recent enough to plan by.
++    fn reliable(&self, now: Instant) -> Option<(Instant, u64)> {
++        if !self.enabled || self.last_flip.is_none_or(|t| now.saturating_duration_since(t) > Duration::from_secs(1)) {
++            return None;
++        }
++        Some((self.phase?, self.interval.as_micros() as u64))
++    }
++    /// The first blank at or after `t`.
++    fn blank_after(phase: Instant, i: u64, t: Instant) -> Instant {
++        let since = t.saturating_duration_since(phase).as_micros() as u64;
++        phase + Duration::from_micros(since.div_ceil(i) * i)
++    }
++    /// When to commit a frame that is ready now (a pointer move, a staged frame), and the blank
++    /// it aims at; `None`: at once (no phase, latching off).
++    pub fn commit_at(&self, now: Instant) -> Option<(Instant, Instant)> {
++        let (phase, i) = self.reliable(now)?;
++        let blank = Self::blank_after(phase, i, now + self.margin());
++        Some((blank - self.margin(), blank))
++    }
++    /// When to start rendering a frame, and the blank it aims at; `None`: at once.
++    pub fn render_at(&self, now: Instant) -> Option<(Instant, Instant)> {
++        let (phase, i) = self.reliable(now)?;
++        let budget = self.budget();
++        let blank = Self::blank_after(phase, i, now + budget);
++        // the blank before it, if the typical render still fits: render now and aim at it
++        let earlier = blank - Duration::from_micros(i);
++        let typical = u64::from(self.renders.iter().copied().sum::<u32>()) / (self.renders.len().max(1) as u64);
++        if earlier > now && now + Duration::from_micros(typical + 1_000) + self.margin() <= earlier {
++            return Some((now, earlier));
++        }
++        Some((blank - budget, blank))
++    }
++    /// A frame was committed at `at`, aimed at `blank` (`None`: not planned; then the first blank
++    /// after the commit), planned for `planned` (how late the loop was counts in the margin).
++    pub fn committed(&mut self, at: Instant, blank: Option<Instant>, planned: Option<Instant>) {
++        self.commits += 1;
++        if let Some(planned) = planned {
++            if self.lateness.len() == 120 {
++                self.lateness.pop_front();
++            }
++            self.lateness.push_back(at.saturating_duration_since(planned).as_micros().min(100_000) as u32);
++        }
++        let Some((phase, i)) = self.reliable(at) else {
++            self.aim = None;
++            return;
++        };
++        let blank = blank.unwrap_or_else(|| Self::blank_after(phase, i, at));
++        let lead = blank.saturating_duration_since(at).as_micros() as i64 - at.saturating_duration_since(blank).as_micros() as i64;
++        self.aim = Some((blank, lead));
++    }
++    fn bucket(lead: i64) -> usize {
++        (lead.max(0) / 500).min(20) as usize
++    }
+     /// A flip completed (read) at `at`.
+     pub fn flipped(&mut self, at: Instant) {
+         // the spacing of consecutive flips, when it looks like one refresh, refines the interval
+@@ -204,60 +407,49 @@
+                 }
+             }
+         });
+-        // a frame shown a refresh (or more) after the blank it was aimed at: more margin;
+-        // otherwise slowly less
+-        if let Some(aim) = self.aim.take() {
++        // a frame shown a refresh (or more) after the blank it was aimed at: the margin above
++        // the lead it had; otherwise slowly less
++        if let Some((aim, lead)) = self.aim.take() {
+             if at > aim + self.interval / 2 {
+                 self.late += 1;
+-                self.margin_us = (self.margin_us + 1_500).min(MARGIN_MAX_US);
++                self.late_leads[Self::bucket(lead)] += 1;
++                // a commit with at least the lead thought enough missed: the display needs more
++                // (a commit that came late missed for its lateness, which the margin follows)
++                if lead >= i64::from(self.min_lead_us) {
++                    self.min_lead_us = (lead as u32 + 250).min(MIN_LEAD_MAX_US);
++                }
+             } else {
+-                // back by 1 ms over about 200 frames on time
+-                self.margin_us = self.margin_us.saturating_sub(5).max(MARGIN_MIN_US);
+-            }
+-        }
+-    }
+-    /// Decide now: `Some(moment)` to render then, `None` at once; either way the blank aimed at
+-    /// is remembered for the late count.
+-    pub fn plan(&mut self, now: Instant) -> Option<Instant> {
+-        let due = self.render_at(now);
+-        if self.enabled {
+-            if let Some(phase) = self.phase {
+-                let i = self.interval.as_micros() as u64;
+-                let start = due.unwrap_or(now) + self.budget();
+-                let since = start.saturating_duration_since(phase).as_micros() as u64;
+-                // the first blank at or after the frame's expected end
+-                self.aim = Some(phase + Duration::from_micros(since.div_ceil(i) * i));
++                self.on_time_leads[Self::bucket(lead)] += 1;
++                // back by 0.1 ms over about 100 frames on time, never under the floor
++                self.min_lead_us = self.min_lead_us.saturating_sub(1).max(MIN_LEAD_FLOOR_US);
+             }
+         }
+-        due
+     }
+-    /// The moment to start the next frame (`None`: now). Without a flip in the last second (the
+-    /// display woke, nothing moved for long) there is no reliable phase: render at once.
+-    pub fn render_at(&self, now: Instant) -> Option<Instant> {
+-        if !self.enabled || self.last_flip.is_none_or(|t| now.saturating_duration_since(t) > Duration::from_secs(1)) {
+-            return None;
+-        }
+-        let phase = self.phase?;
+-        let i = self.interval.as_micros() as u64;
+-        let budget = self.budget();
+-        // the first blank after now
+-        let since = now.saturating_duration_since(phase).as_micros() as u64;
+-        let next = phase + Duration::from_micros((since / i + 1) * i);
+-        let left = next.saturating_duration_since(now);
+-        if left >= budget {
+-            return Some(next - budget);
+-        }
+-        // too close to make it with the full budget: at once if the typical render still fits,
+-        // else aim at the blank after it
+-        let typical = u64::from(self.renders.iter().copied().sum::<u32>()) / (self.renders.len().max(1) as u64);
+-        if left >= Duration::from_micros(typical + 1_000) {
+-            None
+-        } else {
+-            Some(next + Duration::from_micros(i) - budget)
+-        }
++    /// The lead counts since the last call, as text, and cleared.
++    #[cfg_attr(not(feature = "test-inject"), allow(dead_code))]
++    pub fn take_leads(&mut self) -> String {
++        let text = |h: &[u32; 21]| h.iter().enumerate().filter(|(_, n)| **n > 0).map(|(b, n)| format!("{}:{n}", b as f64 / 2.0)).collect::<Vec<_>>().join(",");
++        let line = format!("commit_lead_ms(bucket:count) on_time=[{}] late=[{}]", text(&self.on_time_leads), text(&self.late_leads));
++        self.on_time_leads = [0; 21];
++        self.late_leads = [0; 21];
++        line
+     }
+     pub fn describe(&self) -> String {
+-        format!("pacer={} budget_ms={:.1} margin_ms={:.1} interval_ms={:.3} frames={} late={}", if self.enabled { "late-latch" } else { "off" }, self.budget().as_secs_f64() * 1000.0, f64::from(self.margin_us) / 1000.0, self.interval.as_secs_f64() * 1000.0, self.frames, self.late)
++        format!(
++            "pacer={} budget_ms={:.1} render_budget_ms={:.1} margin_ms={:.1}{} min_lead_ms={:.2} wake_late_max_ms={:.2} interval_ms={:.3} frames={} commits={} pointer_first={} late={}",
++            if self.enabled { "late-latch" } else { "off" },
++            self.budget().as_secs_f64() * 1000.0,
++            self.render_budget().as_secs_f64() * 1000.0,
++            self.margin().as_secs_f64() * 1000.0,
++            if self.fixed_margin_us.is_some() { "(fixed)" } else { "" },
++            f64::from(self.min_lead_us) / 1000.0,
++            f64::from(self.lateness.iter().copied().max().unwrap_or(0)) / 1000.0,
++            self.interval.as_secs_f64() * 1000.0,
++            self.frames,
++            self.commits,
++            self.pointer_first,
++            self.late
++        )
+     }
+ }
+ 
+@@ -271,58 +463,97 @@
+         l.motion(read);
+         l.motion(read + Duration::from_millis(1));
+         std::thread::sleep(Duration::from_millis(5));
+-        l.rendered(true);
++        l.rendered(true, false);
+         assert_eq!(l.samples(), 0, "nothing on the screen before the flip");
+         std::thread::sleep(Duration::from_millis(5));
+         l.presented();
+         assert_eq!(l.samples(), 1, "two motions in one frame: one sample each of the oldest and the newest");
+         assert!(l.oldest.max_us >= 10_000 && l.newest.max_us < l.oldest.max_us);
+         l.presented();
+-        l.rendered(false);
++        l.rendered(false, false);
+         assert_eq!(l.samples(), 1, "no motion, no sample");
+         assert!(l.final_line().unwrap().contains("oldest n=1"));
++        // a motion of a window drag is counted apart
++        l.motion(Instant::now());
++        l.rendered(true, true);
++        l.presented();
++        assert_eq!(l.samples(), 1);
++        assert!(l.final_line().unwrap().contains("drag/resize oldest n=1"), "{}", l.final_line().unwrap());
++    }
++    fn near(a: Instant, b: Instant, us: u64) -> bool {
++        a.max(b) - a.min(b) < Duration::from_micros(us)
+     }
+     #[test]
+-    fn the_pacer_renders_late_enough_for_the_newest_input_and_early_enough_for_the_blank() {
++    fn the_pacer_commits_at_the_last_safe_moment_and_renders_its_budget_before() {
+         let mut p = FramePacer::new(true);
+         let t0 = Instant::now();
+         assert_eq!(p.render_at(t0), None, "no flip seen yet: at once");
++        assert_eq!(p.commit_at(t0), None);
+         let i = Duration::from_micros(16_667);
+         for k in 0..10u32 {
+             p.rendered(Duration::from_micros(4_000), Duration::ZERO);
+             p.flipped(t0 + i * k);
+         }
+         let last = t0 + i * 9;
+-        // just after a flip: wait until the next blank minus 4 ms of render and 3.5 ms of margin
+-        let at = p.render_at(last + Duration::from_millis(1)).unwrap();
+-        let expect = last + i - Duration::from_micros(7_500);
+-        assert!(at.max(expect) - at.min(expect) < Duration::from_micros(300), "{:?}", at.max(expect) - at.min(expect));
+-        // 5 ms before the blank: not the whole budget, but a 4 ms render fits: at once
+-        assert_eq!(p.render_at(last + i - Duration::from_millis(5)), None);
+-        // 2 ms before it: aim at the one after
+-        let at = p.render_at(last + i - Duration::from_millis(2)).unwrap();
+-        assert!(at > last + i);
+-        // a frame planned for the next blank but shown a refresh later widens the margin
+-        let before = p.budget();
+-        assert!(p.plan(last + Duration::from_millis(1)).is_some());
++        let margin = p.margin();
++        // no commit timed yet: the lead the display needs and half a millisecond of wake-up
++        assert_eq!(margin, Duration::from_micros(u64::from(MIN_LEAD_US + 500 + LATENESS_PAD_US)));
++        // just after a flip: a pointer-only commit waits until the margin before the next blank
++        let (at, blank) = p.commit_at(last + Duration::from_millis(1)).unwrap();
++        assert!(near(at, last + i - margin, 300) && near(blank, last + i, 300));
++        // a rendered frame starts its render budget (4 ms + 0.5) before that
++        let (at, blank) = p.render_at(last + Duration::from_millis(1)).unwrap();
++        assert!(near(at, last + i - margin - Duration::from_micros(4_500), 300), "{:?}", at.duration_since(last));
++        assert!(near(blank, last + i, 300));
++        // 2 ms before the blank: too late for this one, the next
++        let (_, blank) = p.commit_at(last + i - Duration::from_millis(2)).unwrap();
++        assert!(near(blank, last + i * 2, 300));
++        // 9 ms before the blank: the budget (4.5 + 2.9 ms) still fits, render at its moment
++        let (at, blank) = p.render_at(last + i - Duration::from_millis(9)).unwrap();
++        assert!(near(at, last + i - p.budget(), 300) && near(blank, last + i, 300));
++        // one slow render (6 ms) makes the budget 10 ms: 9 ms before the blank the typical render
++        // still fits, so the frame is rendered now for it instead of a refresh later
++        p.rendered(Duration::from_micros(6_000), Duration::ZERO);
++        let (at, blank) = p.render_at(last + i - Duration::from_millis(9)).unwrap();
++        assert!(near(at, last + i - Duration::from_millis(9), 50) && near(blank, last + i, 300));
++        for _ in 0..60 {
++            p.rendered(Duration::from_micros(4_000), Duration::ZERO);
++        }
++        // a commit made on time, 2.9 ms before its blank, shown a refresh later: the display needs
++        // more lead than that
++        p.committed(last + i - margin, Some(last + i), Some(last + i - margin));
+         p.flipped(last + i * 2);
+-        assert!(p.budget() > before && p.late == 1);
+-        // one shown on time narrows it a little
+-        assert!(p.plan(last + i * 2 + Duration::from_millis(1)).is_some());
+-        p.flipped(last + i * 3);
+         assert_eq!(p.late, 1);
++        assert!(p.margin() >= Duration::from_micros(2_900 + 250 + LATENESS_PAD_US as u64), "{:?}", p.margin());
++        assert!(p.take_leads().contains("late=[2.5:1]"), "the lead was 2.9 ms");
++        // one that came 1.5 ms late (the loop woke late) and missed: the lead is not raised, the
++        // margin follows the lateness instead
++        let lead = p.min_lead_us;
++        let planned = last + i * 3 - p.margin();
++        p.committed(planned + Duration::from_micros(1_500), Some(last + i * 3), Some(planned));
++        p.flipped(last + i * 4);
++        assert_eq!((p.late, p.min_lead_us), (2, lead));
++        assert!(p.margin() >= Duration::from_micros(u64::from(lead) + 1_500));
++        // shown on time: the needed lead comes down a little
++        p.committed(last + i * 5 - p.margin(), Some(last + i * 5), None);
++        p.flipped(last + i * 5);
++        assert_eq!(p.late, 2);
++        assert!(p.min_lead_us < lead);
++        // a fixed margin (the test instrument) is not learned
++        p.fixed_margin_us = Some(1_500);
++        assert_eq!(p.margin(), Duration::from_micros(1_500));
+         // a render that started late counts its lateness against the budget
+         p.rendered(Duration::from_millis(3), Duration::from_millis(6));
+-        assert!(p.budget() >= Duration::from_micros(9_000 + 3_500));
+-        // a slow render raises the budget (to at most 14 ms)
++        assert!(p.render_budget() >= Duration::from_micros(9_500));
++        // a slow render raises the budget (to at most 12 ms)
+         p.rendered(Duration::from_millis(30), Duration::ZERO);
+-        assert_eq!(p.budget(), Duration::from_millis(14));
++        assert_eq!(p.render_budget(), Duration::from_millis(12));
+         // a flip read 3 ms late moves the phase by an eighth of that at most
+-        p.flipped(last + i * 4 + Duration::from_millis(3));
++        p.flipped(last + i * 6 + Duration::from_millis(3));
+         let off = (p.phase.unwrap().duration_since(t0).as_micros() as u64) % 16_667;
+         assert!(off < 600 || off > 16_000, "phase moved by an eighth at most: {off}");
+-        // stale: a second without flips renders at once; a pacer that is off always does
++        // stale: a second without flips commits at once; a pacer that is off always does
+         assert_eq!(p.render_at(last + Duration::from_secs(3)), None);
+-        assert_eq!(FramePacer::new(false).render_at(last + Duration::from_millis(1)), None);
++        assert_eq!(FramePacer::new(false).commit_at(last + Duration::from_millis(1)), None);
+     }
+ }
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/src/input.rs desk5-003/crates/wm-darwin/src/input.rs
+--- desk4-007/crates/wm-darwin/src/input.rs	2026-11-14 19:47:15.000000000 -0800
++++ desk5-003/crates/wm-darwin/src/input.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -10,7 +10,7 @@
+ 
+ pub(crate) struct InputState {
+     pub seat:Seat<Server>,keyboard:KeyboardHandle<Server>,pointer:Option<PointerHandle<Server>>,
+-    position:(f64,f64),buttons:u8,forwarded:u8,modifiers:Modifiers,last_time:u32,
++    pub(crate) position:(f64,f64),buttons:u8,forwarded:u8,modifiers:Modifiers,last_time:u32,
+     suppressed_keys:HashSet<u32>,pub cursor_surface:Option<WlSurface>,
+     /// Physical button mask of the last record, and whether the left button
+     /// went down with Control held: that press is a secondary click.
+@@ -286,12 +286,21 @@
+                 let input=self.input.as_mut().unwrap();
+                 let (x,y)=match motion {Motion::Absolute(x,y)=>(f64::from(x)*f64::from(size.w-1)/65535.,f64::from(y)*f64::from(size.h-1)/65535.),
+                     Motion::Relative(x,y)=>(input.position.0+f64::from(x),input.position.1+f64::from(y))};
++                let from=input.position;
+                 input.position=(x.clamp(0.,f64::from(size.w-1)),y.clamp(0.,f64::from(size.h-1)));
++                // several outputs: the pointer crosses where they touch and stops elsewhere (DESK5)
++                if self.extra_outputs.outputs.len()>0{
++                    let to=Point::new(input.position.0.floor() as i32,input.position.1.floor() as i32);
++                    let kept=self.pointer_on_outputs(Point::new(from.0.floor() as i32,from.1.floor() as i32),to);
++                    let input=self.input.as_mut().unwrap();
++                    if kept!=to{input.position=(f64::from(kept.x),f64::from(kept.y));}
++                }
++                let input=self.input.as_mut().unwrap();
+                 let root=Point::new(input.position.0.floor() as i32,input.position.1.floor() as i32);
+                 let previous=input.buttons;let mods=input.modifiers;
+                 let buttons=secondary_click(buttons,input.physical_buttons,mods==Modifiers::CONTROL,&mut input.control_click);
+                 input.physical_buttons=(input.physical_buttons&!7)|(buttons_physical(&event)&7);
+-                let b=self.wm.backend_mut();b.pointer=root;b.dirty=true;
++                let b=self.wm.backend_mut();let moved=b.pointer!=root;b.pointer=root;if !b.cursor_on_plane{b.dirty=true;}else if moved{b.cursor_moved=true;}
+                 self.unhide_cursor_on_motion();
+                 // Control-Command with a two-finger scroll: between Spaces (gesture.rs, the stand-in).
+                 if wheel!=0 && mods==Modifiers::CONTROL|Modifiers::SUPER && !self.wm.interactive_drag_active() {
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/src/kms.rs desk5-003/crates/wm-darwin/src/kms.rs
+--- desk4-007/crates/wm-darwin/src/kms.rs	2026-11-14 19:47:15.000000000 -0800
++++ desk5-003/crates/wm-darwin/src/kms.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -464,6 +464,33 @@
+     pub ebusy_retries: u32,
+     gl_fourcc: u32,
+     flips: Box<dyn FlipSource>,
++    /// The CRTC's overlay plane, when it takes ARGB8888: the pointer's plane (DESK5).
++    overlay: Option<OverlayPlane>,
++}
++
++/// An overlay plane the pointer can be shown on: a pointer-only frame is then a change of the
++/// plane's position in the next atomic commit, without rendering the scene (DESK5).
++#[derive(Clone, Copy, Debug)]
++pub struct OverlayPlane {
++    pub id: u32,
++    props: [u32; 10],
++    /// What the display shows now: `None` the plane off.
++    committed: Option<OverlayPlacement>,
++    /// What the next commit sets.
++    wanted: Option<OverlayPlacement>,
++    /// A commit with the plane was refused (not EBUSY): the plane is not used again.
++    pub failed: bool,
++}
++/// A framebuffer on the overlay plane, at a place on the CRTC, unscaled and wholly on the screen
++/// (the DCP takes no plane that leaves the screen and none smaller than 32x32: linux-aurora
++/// `apple_plane_atomic_check`).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct OverlayPlacement {
++    pub fb: u32,
++    pub x: i32,
++    pub y: i32,
++    pub w: u32,
++    pub h: u32,
+ }
+ 
+ const PLANE_PROPERTIES: [&str; 10] =
+@@ -479,6 +506,10 @@
+     pub fn refresh(&self) -> u32 {
+         self.mode.vrefresh
+     }
++    /// The format GL draws the scanout buffers in (ARGB8888 when it took it).
++    pub fn gl_fourcc(&self) -> u32 {
++        self.gl_fourcc
++    }
+     pub fn flip_source(&self) -> &'static str {
+         self.flips.name()
+     }
+@@ -590,7 +621,7 @@
+             if planes.is_null() {
+                 return Err(os_error("drmModeGetPlaneResources"));
+             }
+-            let mut plane_id = 0;
++            let (mut plane_id, mut overlay_id) = (0, 0);
+             for i in 0..(*planes).count_planes as usize {
+                 let plane = (drm.drmModeGetPlane)(card, *(*planes).planes.add(i));
+                 if plane.is_null() {
+@@ -598,12 +629,14 @@
+                 }
+                 let id = (*plane).plane_id;
+                 let kind = Self::property(drm, card, id, DRM_MODE_OBJECT_PLANE, "type").map(|p| p.1);
+-                if plane_id == 0
+-                    && kind == Some(DRM_PLANE_TYPE_PRIMARY)
+-                    && (*plane).possible_crtcs & (1 << crtc_index) != 0
+-                {
++                let ours = (*plane).possible_crtcs & (1 << crtc_index) != 0;
++                if plane_id == 0 && kind == Some(DRM_PLANE_TYPE_PRIMARY) && ours {
+                     plane_id = id;
+                 }
++                let argb = (0..(*plane).count_formats as usize).any(|f| *(*plane).formats.add(f) == DRM_FORMAT_ARGB8888);
++                if overlay_id == 0 && kind == Some(DRM_PLANE_TYPE_OVERLAY) && ours && argb {
++                    overlay_id = id;
++                }
+                 (drm.drmModeFreePlane)(plane);
+             }
+             (drm.drmModeFreePlaneResources)(planes);
+@@ -622,6 +655,31 @@
+             for (slot, name) in plane_props.iter_mut().zip(PLANE_PROPERTIES) {
+                 *slot = id(plane_id, DRM_MODE_OBJECT_PLANE, name)?;
+             }
++            // The pointer's plane: off with CHONKSTEP_DARWIN_CURSOR_PLANE=0 (the pointer is then
++            // drawn into every frame, as before DESK5).
++            let wanted = std::env::var("CHONKSTEP_DARWIN_CURSOR_PLANE").map_or(true, |v| v != "0");
++            let overlay = if overlay_id != 0 && wanted {
++                let mut props = [0u32; 10];
++                let mut complete = true;
++                for (slot, name) in props.iter_mut().zip(PLANE_PROPERTIES) {
++                    match Self::property(drm, card, overlay_id, DRM_MODE_OBJECT_PLANE, name) {
++                        Some((prop, _)) => *slot = prop,
++                        None => complete = false,
++                    }
++                }
++                complete.then_some(OverlayPlane { id: overlay_id, props, committed: None, wanted: None, failed: false })
++            } else {
++                None
++            };
++            eprintln!(
++                "WMCURSOR plane {}",
++                match (&overlay, overlay_id, wanted) {
++                    (Some(o), _, _) => format!("overlay id={} for the pointer (ARGB8888; a pointer-only frame is a plane move without a render)", o.id),
++                    (None, 0, _) => "none: no ARGB8888 overlay plane on this CRTC; the pointer is drawn into each frame".to_string(),
++                    (None, _, false) => "off (CHONKSTEP_DARWIN_CURSOR_PLANE=0): the pointer is drawn into each frame".to_string(),
++                    (None, id, true) => format!("overlay id={id} lacks a property; the pointer is drawn into each frame"),
++                }
++            );
+             let mut mode_blob = 0;
+             if (drm.drmModeCreatePropertyBlob)(
+                 card,
+@@ -658,6 +716,7 @@
+                 ebusy_retries: 0,
+                 gl_fourcc: 0,
+                 flips,
++                overlay,
+             })
+         }
+     }
+@@ -671,9 +730,22 @@
+         index: usize,
+         steps: &mut Steps,
+     ) -> Result<ScanoutBuffer, String> {
++        let (width, height) = (self.width(), self.height());
++        self.create_buffer_sized(libs, context, index, (width, height), DRM_FORMAT_XRGB8888, steps)
++    }
++    /// A buffer of any size; `scanout_fourcc` is how the display reads it (XRGB8888 for the
++    /// primary plane, ARGB8888 for the pointer's overlay plane: its alpha blends it).
++    pub fn create_buffer_sized(
++        &mut self,
++        libs: &Libraries,
++        context: &Context,
++        index: usize,
++        (width, height): (u32, u32),
++        scanout_fourcc: u32,
++        steps: &mut Steps,
++    ) -> Result<ScanoutBuffer, String> {
+         let (drm, gl) = (&libs.drm, &libs.gl);
+         let (create_image, image_target) = context.image_functions(libs)?;
+-        let (width, height) = (self.width(), self.height());
+         let pitch = width * 4;
+         let size = (pitch as usize * height as usize + 0x3fff) & !0x3fff;
+         unsafe {
+@@ -759,9 +831,10 @@
+             }
+             let (handles, pitches, offsets) = ([card_handle, 0, 0, 0], [pitch, 0, 0, 0], [0u32; 4]);
+             let mut fb = 0;
+-            steps.step(&format!("buffer {index}: ADDFB2 XRGB8888"));
+-            if (drm.drmModeAddFB2)(self.card, width, height, DRM_FORMAT_XRGB8888, handles.as_ptr(), pitches.as_ptr(), offsets.as_ptr(), &mut fb, 0) != 0 {
+-                return Err(os_error("drmModeAddFB2 (XRGB8888, card node)"));
++            let name = String::from_utf8_lossy(&scanout_fourcc.to_le_bytes()).into_owned();
++            steps.step(&format!("buffer {index}: ADDFB2 {name} {width}x{height}"));
++            if (drm.drmModeAddFB2)(self.card, width, height, scanout_fourcc, handles.as_ptr(), pitches.as_ptr(), offsets.as_ptr(), &mut fb, 0) != 0 {
++                return Err(os_error(&format!("drmModeAddFB2 ({name}, card node)")));
+             }
+             println!(
+                 "WMGL buffer index={index} render_handle={} card_handle={card_handle} fb={fb} gl_format={} texture={texture} fbo={fbo}",
+@@ -778,6 +851,52 @@
+     /// before taking it. `Busy`: the display has not finished its previous
+     /// commit (EBUSY); nothing was queued and no event will follow this call.
+     pub fn commit(&mut self, libs: &Libraries, buffer: &ScanoutBuffer, steps: &mut Steps) -> Result<Committed, String> {
++        match self.commit_with_overlay(libs, buffer, steps) {
++            Err(error) if self.overlay.as_ref().is_some_and(|o| !o.failed && (o.wanted.is_some() || o.committed.is_some())) => {
++                // Refused with the pointer's plane in it (not EBUSY): the plane is given up for
++                // good, the frame is committed without it and the pointer is drawn into frames.
++                let o = self.overlay.as_mut().unwrap();
++                eprintln!("WMCURSOR plane refused by the display ({error}; wanted {:?}): the pointer is drawn into each frame from now on", o.wanted);
++                // the retry turns the plane off if it was on, then leaves it alone
++                o.failed = true;
++                o.wanted = None;
++                self.commit_with_overlay(libs, buffer, steps)
++            }
++            other => other,
++        }
++    }
++    /// The pointer's overlay plane, when there is one that has not failed.
++    pub fn overlay(&self) -> Option<&OverlayPlane> {
++        self.overlay.as_ref().filter(|o| !o.failed)
++    }
++    /// What the next commit puts on the overlay plane (`None`: the plane off).
++    pub fn set_overlay(&mut self, placement: Option<OverlayPlacement>) {
++        if let Some(o) = self.overlay.as_mut().filter(|o| !o.failed) {
++            o.wanted = placement;
++        }
++    }
++    fn add_overlay(&self, drm: &crate::gpu::Drm, request: *mut c_void) -> bool {
++        let Some(o) = self.overlay.as_ref() else { return false };
++        // While the plane is on it is in every commit (each commit is one DCP swap of the
++        // surfaces it names); once off it is left out.
++        let values = match o.wanted {
++            Some(p) if !o.failed => [u64::from(p.fb), u64::from(self.crtc_id), 0, 0, u64::from(p.w) << 16, u64::from(p.h) << 16, i64::from(p.x) as u64, i64::from(p.y) as u64, u64::from(p.w), u64::from(p.h)],
++            _ if o.committed.is_some() => [0; 10],
++            _ => return false,
++        };
++        unsafe {
++            for (property, value) in o.props.iter().zip(values) {
++                (drm.drmModeAtomicAddProperty)(request, o.id, *property, value);
++            }
++        }
++        true
++    }
++    fn overlay_committed(&mut self) {
++        if let Some(o) = self.overlay.as_mut() {
++            o.committed = if o.failed { None } else { o.wanted };
++        }
++    }
++    fn commit_with_overlay(&mut self, libs: &Libraries, buffer: &ScanoutBuffer, steps: &mut Steps) -> Result<Committed, String> {
+         let drm = &libs.drm;
+         unsafe {
+             if !self.modeset_done {
+@@ -790,7 +909,8 @@
+                 for (property, value) in self.plane_props.iter().zip(values) {
+                     (drm.drmModeAtomicAddProperty)(request, self.plane_id, *property, value);
+                 }
+-                steps.step(&format!("atomic commit with ALLOW_MODESET, fb {}", buffer.fb));
++                let overlay = self.add_overlay(drm, request);
++                steps.step(&format!("atomic commit with ALLOW_MODESET, fb {}{}", buffer.fb, if overlay { " and the pointer's plane" } else { "" }));
+                 let result = (drm.drmModeAtomicCommit)(
+                     self.card,
+                     request,
+@@ -803,10 +923,12 @@
+                     return Err(error);
+                 }
+                 self.modeset_done = true;
++                self.overlay_committed();
+                 return Ok(Committed::Queued);
+             }
+             let request = (drm.drmModeAtomicAlloc)();
+             (drm.drmModeAtomicAddProperty)(request, self.plane_id, self.plane_props[0], u64::from(buffer.fb));
++            self.add_overlay(drm, request);
+             let result = (drm.drmModeAtomicCommit)(
+                 self.card,
+                 request,
+@@ -817,6 +939,7 @@
+             let error = os_error("drmModeAtomicCommit (PAGE_FLIP_EVENT | NONBLOCK)");
+             (drm.drmModeAtomicFree)(request);
+             if result == 0 {
++                self.overlay_committed();
+                 return Ok(Committed::Queued);
+             }
+             if errno == Some(libc::EBUSY) {
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/src/layers.rs desk5-003/crates/wm-darwin/src/layers.rs
+--- desk4-007/crates/wm-darwin/src/layers.rs	2026-11-14 19:47:15.000000000 -0800
++++ desk5-003/crates/wm-darwin/src/layers.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -48,8 +48,8 @@
+             .map(|l| l.rect.pos.x + l.rect.size.w as i32)
+             .max() else { return };
+         let dx = right - frame.pos.x;
+-        let screen = self.wm.backend().screen_size();
+-        let room = screen.w as i32 - (frame.pos.x + frame.size.w as i32 + dx);
++        let screen = self.wm.backend().primary_rect();
++        let room = screen.pos.x + screen.size.w as i32 - (frame.pos.x + frame.size.w as i32 + dx);
+         if dx <= 0 || room < -(frame.size.w as i32) / 2 {
+             return; // no room beside the strip: left where wm-core placed it
+         }
+@@ -64,7 +64,9 @@
+     /// Size and place from the cached state; returns (logical size to configure, panel rect).
+     fn layer_place(&self, state: &LayerSurfaceCachedState) -> (Size, Rect) {
+         let density = self.scale().factor();
+-        let screen = self.wm.backend().screen_size();
++        // the primary output's (the panel alone: the whole scene, as before DESK5)
++        let primary = self.wm.backend().primary_rect();
++        let (origin, screen) = (primary.pos, primary.size);
+         let (sw, sh) = ((f64::from(screen.w) / density).round() as i32, (f64::from(screen.h) / density).round() as i32);
+         let a = state.anchor;
+         let m = state.margin;
+@@ -99,9 +101,34 @@
+         let px = |v: i32| (f64::from(v) * density).round() as i32;
+         (
+             Size::new(w as u32, h as u32),
+-            Rect::new(Point::new(px(x), px(y)), Size::new(px(w).max(1) as u32, px(h).max(1) as u32)),
++            Rect::new(Point::new(origin.x + px(x), origin.y + px(y)), Size::new(px(w).max(1) as u32, px(h).max(1) as u32)),
+         )
+     }
++    /// The outputs changed (DESK5): every layer surface placed anew on the primary output, told
++    /// its new size when it changed, and the work areas again.
++    pub(crate) fn layers_relayout(&mut self) {
++        for index in 0..self.layers.len() {
++            let surface = self.layers[index].surface.wl_surface().clone();
++            let state = with_states(&surface, |s| *s.cached_state.get::<LayerSurfaceCachedState>().current());
++            let (size, rect) = self.layer_place(&state);
++            let layer = &self.layers[index];
++            let drawn = layer.shell.and_then(|shell| self.wm.backend().shell_size(shell));
++            let rect = match drawn {
++                Some(drawn) => Rect::new(self.layer_drawn_pos(&state, rect.pos, drawn), drawn),
++                None => rect,
++            };
++            if layer.rect.size != rect.size && drawn.is_none() {
++                layer.surface.with_pending_state(|p| p.size = Some((size.w as i32, size.h as i32).into()));
++                layer.surface.send_pending_configure();
++            }
++            if let Some(shell) = layer.shell {
++                self.wm.backend_mut().configure_shell_surface(shell, rect);
++            }
++            self.layers[index].rect = rect;
++        }
++        self.layer_workarea = None;
++        self.layers_workarea();
++    }
+     fn layer_exclusive(&self, state: &LayerSurfaceCachedState) -> Option<(Anchor, u32)> {
+         let ExclusiveZone::Exclusive(zone) = state.exclusive_zone else { return None };
+         if zone == 0 {
+@@ -132,7 +159,8 @@
+     }
+     /// The work area: the panel less every exclusive zone (and the margin beside it).
+     fn layers_workarea(&mut self) {
+-        let screen = self.wm.backend().screen_size();
++        let primary = self.wm.backend().primary_rect();
++        let screen = primary.size;
+         let (mut left, mut right, mut top, mut bottom) = (0u32, 0u32, 0u32, 0u32);
+         for layer in &self.layers {
+             if layer.shell.is_none() {
+@@ -147,12 +175,18 @@
+             }
+         }
+         let area = Rect::new(
+-            Point::new(left as i32, top as i32),
++            Point::new(primary.pos.x + left as i32, primary.pos.y + top as i32),
+             Size::new(screen.w.saturating_sub(left + right).max(1), screen.h.saturating_sub(top + bottom).max(1)),
+         );
+         if self.layer_workarea != Some(area) {
+             self.layer_workarea = Some(area);
+-            self.wm.set_workarea(area);
++            let monitors = self.wm.backend().monitors_ref().to_vec();
++            if monitors.len() > 1 {
++                // the dock is on the primary; every other output is all work area (DESK5)
++                self.wm.set_workareas(monitors.iter().map(|m| if m.geometry == primary { area } else { m.geometry }).collect());
++            } else {
++                self.wm.set_workarea(area);
++            }
+             eprintln!("WMLAYER workarea={},{} {}x{}", area.pos.x, area.pos.y, area.size.w, area.size.h);
+         }
+     }
+@@ -290,7 +324,8 @@
+     /// Where a surface of `drawn` panel pixels goes: its far side on the right or bottom edge it
+     /// is anchored to (a buffer larger than the size it asked for grows inwards, not off the panel).
+     fn layer_drawn_pos(&self, state: &LayerSurfaceCachedState, pos: Point, drawn: Size) -> Point {
+-        let screen = self.wm.backend().screen_size();
++        let primary = self.wm.backend().primary_rect();
++        let screen = Size::new((primary.pos.x + primary.size.w as i32) as u32, (primary.pos.y + primary.size.h as i32) as u32);
+         let density = self.scale().factor();
+         let px = |v: i32| (f64::from(v) * density).round() as i32;
+         let (a, m) = (state.anchor, state.margin);
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/src/lib.rs desk5-003/crates/wm-darwin/src/lib.rs
+--- desk4-007/crates/wm-darwin/src/lib.rs	2026-11-14 19:47:15.000000000 -0800
++++ desk5-003/crates/wm-darwin/src/lib.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -50,6 +50,7 @@
+ pub mod launch_audit;
+ pub mod output;
+ pub mod outputs;
++pub mod displays;
+ pub mod pixels;
+ mod popups;
+ pub mod power;
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/src/macdesk.rs desk5-003/crates/wm-darwin/src/macdesk.rs
+--- desk4-007/crates/wm-darwin/src/macdesk.rs	2026-11-14 19:47:15.000000000 -0800
++++ desk5-003/crates/wm-darwin/src/macdesk.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -264,6 +264,28 @@
+     ForwardTo(smithay::reexports::wayland_server::protocol::wl_surface::WlSurface),
+ }
+ 
++/// Ask an AppKit application to quit as its menu's Quit does (its own questions, saving): the
++/// item with Command-Q of its menu over its app-menu socket (`$XDG_RUNTIME_DIR/app-menu/<pid>`,
++/// appmenu.rs), which a windowless application still serves; SIGTERM only when it has no socket.
++pub fn quit_mac_app(pid: i32) -> String {
++    let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/private/var/run/gpu-desktop"));
++    let how = match crate::appmenu::fetch(&runtime, pid) {
++        Ok(menu) => match menu.items.iter().find(|i| i.key == "cmd+q" && !i.flags.contains('d')).or_else(|| menu.items.iter().find(|i| i.depth == 1 && i.title.starts_with("Quit"))) {
++            Some(item) => match crate::appmenu::request(&runtime, pid, &format!("invoke {}", item.id)) {
++                Ok(answer) => format!("menu item {:?} invoked: {answer}", item.title),
++                Err(e) => format!("menu item {:?} not invoked: {e}", item.title),
++            },
++            None => "its menu has no Quit item: nothing sent".to_string(),
++        },
++        Err(e) => {
++            crate::server::kill_pid(pid, libc::SIGTERM);
++            format!("no menu socket ({e}): SIGTERM")
++        }
++    };
++    eprintln!("WMMAC quit pid={pid}: {how}");
++    how
++}
++
+ /// Ask an AppKit application to come forward (unhide, or open its untitled window).
+ #[cfg(target_os = "macos")]
+ pub fn reopen(pid: i32) -> bool {
+@@ -390,6 +412,10 @@
+             }
+         }
+     }
++    /// An application's name as the catalog read last (no new scan: callers in the frame loop).
++    pub(crate) fn macdesk_app_name(&self, app_id: &str) -> String {
++        self.macdesk.catalog.name(app_id)
++    }
+     /// The running applications, the most recently used first.
+     pub fn running_apps(&mut self) -> Vec<App> {
+         self.macdesk.catalog.refresh();
+@@ -871,8 +897,9 @@
+                             let surface = self.wm.client(id).and_then(|c| self.wm.backend().windows.get(&c.window)).map(|w| w.surface.wl_surface().clone());
+                             return surface.map(MacKey::ForwardTo).unwrap_or(MacKey::Taken);
+                         }
++                        // windowless: its menu's Quit through its socket
+                         for pid in &app.pids {
+-                            crate::server::kill_pid(*pid, libc::SIGTERM);
++                            quit_mac_app(*pid);
+                         }
+                     } else {
+                         for id in &app.clients {
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/src/outputs.rs desk5-003/crates/wm-darwin/src/outputs.rs
+--- desk4-007/crates/wm-darwin/src/outputs.rs	2026-11-14 19:47:15.000000000 -0800
++++ desk5-003/crates/wm-darwin/src/outputs.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -77,6 +77,41 @@
+     }
+ }
+ 
++/// An output as the scene places it (`Layout::scene_outputs`).
++#[derive(Debug, Clone, PartialEq)]
++pub struct SceneOutput {
++    pub name: String,
++    pub id: String,
++    pub kind: OutputKind,
++    /// Its rectangle in scene pixels.
++    pub rect: wm_core::Rect,
++    /// Its mode in device pixels.
++    pub pixels: (u32, u32),
++    pub scale: Scale,
++    /// Its size in logical units at its own scale (what `xdg_output` tells clients).
++    pub logical: (i32, i32),
++    pub primary: bool,
++}
++impl SceneOutput {
++    /// The panel alone, as the desk has always had it (a scene of the panel's pixels).
++    pub fn panel(size: wm_core::Size, scale: Scale) -> Self {
++        Self {
++            name: "SFGOP-0".into(),
++            id: "panel".into(),
++            kind: OutputKind::Internal,
++            rect: wm_core::Rect::new(wm_core::Point::new(0, 0), size),
++            pixels: (size.w, size.h),
++            scale,
++            logical: (scale.to_logical(size.w as i32), scale.to_logical(size.h as i32)),
++            primary: true,
++        }
++    }
++    /// Scene pixels per device pixel of this output (1 when its scale is the scene's density).
++    pub fn view_scale(&self) -> f64 {
++        f64::from(self.pixels.0.max(1)) / f64::from(self.rect.size.w.max(1))
++    }
++}
++
+ /// What a change of the connected outputs did.
+ #[derive(Debug, Clone, PartialEq, Eq)]
+ pub enum Change {
+@@ -236,6 +271,52 @@
+         let y1 = self.outputs.iter().map(|o| o.origin.1 + o.logical.1).max().unwrap_or(0);
+         Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+     }
++    /// The outputs in the scene's pixels (DESK5): the scene is one space in the panel's density
++    /// (a logical unit is `density` scene pixels), the bounding box's top left at 0,0. An output
++    /// whose scale is the scene's density is drawn pixel for pixel; another one is scaled.
++    pub fn scene_outputs(&self, density: Scale) -> Vec<SceneOutput> {
++        // sizes from the device pixels (exact when an output's scale is the density: the panel
++        // keeps its 2560 px, not a rounded logical size times 1.5), placed as `arrange` places the
++        // logical rectangles: the primary, the others to its left, tops aligned (mirrored: all at
++        // the origin with the primary's size); then the leftmost at 0
++        let size = |o: &Placed| {
++            let k = density.factor() / o.scale.factor();
++            ((f64::from(o.info.pixels.0) * k).round().max(1.0) as i32, (f64::from(o.info.pixels.1) * k).round().max(1.0) as i32)
++        };
++        let primary = self.outputs.iter().position(|o| o.primary).unwrap_or(0);
++        let mut rects: Vec<(i32, i32, i32, i32)> = vec![(0, 0, 0, 0); self.outputs.len()];
++        let ps = size(&self.outputs[primary]);
++        rects[primary] = (0, 0, ps.0, ps.1);
++        let mut left = 0;
++        for (i, o) in self.outputs.iter().enumerate() {
++            if i == primary {
++                continue;
++            }
++            let (w, h) = size(o);
++            rects[i] = match self.arrangement {
++                Arrangement::Mirrored => (0, 0, ps.0, ps.1),
++                Arrangement::Extended => {
++                    left -= w;
++                    (left, 0, w, h)
++                }
++            };
++        }
++        let x0 = rects.iter().map(|r| r.0).min().unwrap_or(0);
++        self.outputs
++            .iter()
++            .zip(rects)
++            .map(|(o, r)| SceneOutput {
++                name: o.info.name.clone(),
++                id: o.info.id.clone(),
++                kind: o.info.kind,
++                rect: wm_core::Rect::new(wm_core::Point::new(r.0 - x0, r.1), wm_core::Size::new(r.2 as u32, r.3 as u32)),
++                pixels: o.info.pixels,
++                scale: o.scale,
++                logical: o.logical,
++                primary: o.primary,
++            })
++            .collect()
++    }
+     /// One line for the log.
+     pub fn describe(&self) -> String {
+         self.outputs.iter().map(|o| format!("{}{} {:?} {}x{}px {} at {},{} logical {}x{}", o.info.name, if o.primary { "*" } else { "" }, o.info.kind, o.info.pixels.0, o.info.pixels.1, o.scale.label(), o.origin.0, o.origin.1, o.logical.0, o.logical.1))
+@@ -430,6 +511,28 @@
+         assert!(old.said_absent && old.layout().is_none());
+     }
+     #[test]
++    fn the_scene_holds_both_outputs_in_the_panels_density_with_the_panel_where_it_was() {
++        let mut l = Layout::single(panel(), s(180));
++        let solo = l.scene_outputs(s(180));
++        assert_eq!(solo.len(), 1);
++        assert_eq!(solo[0].rect, wm_core::Rect::new(wm_core::Point::new(0, 0), wm_core::Size::new(2560, 1600)), "the panel alone: the scene of its pixels, as before");
++        l.sync(&[panel(), samsung()], |_| s(180));
++        let both = l.scene_outputs(s(180));
++        let p = both.iter().find(|o| o.kind == OutputKind::Internal).unwrap();
++        let e = both.iter().find(|o| o.kind == OutputKind::External).unwrap();
++        // the panel to the left (at the scene's origin), the external (primary) right of it, tops aligned
++        assert_eq!(p.rect, wm_core::Rect::new(wm_core::Point::new(0, 0), wm_core::Size::new(2560, 1600)));
++        assert_eq!(e.rect.pos, wm_core::Point::new(2560, 0));
++        assert_eq!(e.rect.size, wm_core::Size::new(3840, 2160), "a 4K at the panel's 150 %: pixel for pixel");
++        assert!(e.primary && !p.primary);
++        assert!((e.view_scale() - 1.0).abs() < 1e-9);
++        // at 100 % the external's logical size is its pixels; in the panel's density it is 1.5x larger
++        l.set_scale(&samsung().name, s(120));
++        let e = l.scene_outputs(s(180)).into_iter().find(|o| o.kind == OutputKind::External).unwrap();
++        assert_eq!(e.rect.size, wm_core::Size::new(5760, 3240));
++        assert!((e.view_scale() - 2.0 / 3.0).abs() < 1e-6);
++    }
++    #[test]
+     fn mirroring_shows_the_primary_picture_on_both() {
+         let mut layout = Layout::single(panel(), s(180));
+         layout.sync(&[panel(), samsung()], default_scale);
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/src/render.rs desk5-003/crates/wm-darwin/src/render.rs
+--- desk4-007/crates/wm-darwin/src/render.rs	2026-11-14 19:47:15.000000000 -0800
++++ desk5-003/crates/wm-darwin/src/render.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -209,6 +209,28 @@
+         scene: &mut CpuBackend,
+         presenter: &mut dyn Presenter,
+     ) -> Result<FrameStats, String>;
++    /// Like `render_frame`, but the frame is kept for `commit` instead of being shown now
++    /// (renderers that show frames at once show it now: `staged` stays false).
++    fn stage_frame(&mut self, scene: &mut CpuBackend, presenter: &mut dyn Presenter) -> Result<FrameStats, String> {
++        self.render_frame(scene, presenter)
++    }
++    /// A frame is staged and waits for `commit`.
++    fn staged(&self) -> bool {
++        false
++    }
++    /// The pointer can be shown on a plane of its own with an image of this size (DESK5): the
++    /// scene is then rendered without it and a pointer-only change is a `commit` alone.
++    fn cursor_plane_takes(&self, image: (u32, u32)) -> bool {
++        let _ = image;
++        false
++    }
++    /// Show the staged frame, or the frame on the screen again, with the pointer's plane showing
++    /// `cursor` (its image's top left on the screen, the image, its generation) or nothing.
++    /// `Ok(false)`: nothing to commit.
++    fn commit(&mut self, cursor: Option<(wm_core::Point, &wm_theme_api::DecorationBuffer, u64)>) -> Result<bool, String> {
++        let _ = cursor;
++        Ok(false)
++    }
+     /// Forget what is on screen: the next frame repaints and presents all of it.
+     fn invalidate(&mut self);
+     /// A frame has been handed to the display and its flip has not completed.
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/src/scene.rs desk5-003/crates/wm-darwin/src/scene.rs
+--- desk4-007/crates/wm-darwin/src/scene.rs	2026-11-14 19:47:15.000000000 -0800
++++ desk5-003/crates/wm-darwin/src/scene.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -137,6 +137,8 @@
+     stack: Vec<u64>, // window IDs; each is drawn with its owning frame
+     shell_stack: Vec<u64>,
+     monitors: Vec<MonitorInfo>,
++    /// The bounding box of the outputs (`screen_size`), from 0,0.
++    screen: Size,
+     next_id: u64,
+     background: [u8; 3],
+     background_image: Option<DecorationBuffer>,
+@@ -170,6 +172,13 @@
+     pub(crate) hold_configures: bool,
+     /// A swipe between Spaces in progress: windows drawn displaced (`gesture.rs`).
+     pub slide: Option<crate::gesture::Slide>,
++    /// The pointer is on the display's overlay plane (DESK5): GL frames are rendered without
++    /// it, and moving it or changing its image marks `cursor_moved`, not `dirty`.
++    pub(crate) cursor_on_plane: bool,
++    /// The pointer moved or changed while on its plane: the next commit places it.
++    pub(crate) cursor_moved: bool,
++    /// Sizes asked of clients by an interactive resize, and when (the resize latency).
++    pub(crate) resize_asked: HashMap<u64, (Size, std::time::Instant)>,
+ }
+ impl CpuBackend {
+     pub fn new(size: Size) -> Result<Self, String> {
+@@ -195,6 +204,10 @@
+             rescaling: false,
+             hold_configures: false,
+             slide: None,
++            cursor_on_plane: false,
++            cursor_moved: false,
++            resize_asked: HashMap::new(),
++            screen: size,
+             monitors: vec![MonitorInfo {
+                 geometry: Rect::new(Point::new(0, 0), size),
+                 name: "SFGOP-0".into(),
+@@ -203,6 +216,26 @@
+             }],
+         })
+     }
++    /// The outputs (DESK5, outputs.rs `SceneOutput`): their rectangles in scene pixels, the
++    /// primary first in wm-core's sense (`primary` set); the scene is their bounding box.
++    pub fn set_outputs(&mut self, monitors: Vec<MonitorInfo>) {
++        if monitors.is_empty() {
++            return;
++        }
++        let w = monitors.iter().map(|m| m.geometry.pos.x + m.geometry.size.w as i32).max().unwrap_or(1).max(1);
++        let h = monitors.iter().map(|m| m.geometry.pos.y + m.geometry.size.h as i32).max().unwrap_or(1).max(1);
++        self.screen = Size::new(w as u32, h as u32);
++        self.monitors = monitors;
++        self.dirty = true;
++    }
++    /// The primary output's rectangle (the dock, the launcher strip, the desk's panels).
++    pub fn primary_rect(&self) -> Rect {
++        self.monitors.iter().find(|m| m.primary).unwrap_or(&self.monitors[0]).geometry
++    }
++    /// The output under a point, if any.
++    pub fn output_rect_at(&self, p: Point) -> Option<Rect> {
++        self.monitors.iter().map(|m| m.geometry).find(|r| p.x >= r.pos.x && p.y >= r.pos.y && p.x < r.pos.x + r.size.w as i32 && p.y < r.pos.y + r.size.h as i32)
++    }
+     /// Panel pixels per logical unit of this window's surface.
+     pub fn density(&self, id: u64) -> f64 {
+         match self.windows.get(&id) {
+@@ -235,14 +268,27 @@
+     pub(crate) fn set_cursor(&mut self, cursor: Option<(Point, DecorationBuffer)>) {
+         self.cursor = cursor;
+         self.cursor_generation = self.generation();
+-        self.dirty = true;
++        self.cursor_changed();
++    }
++    /// The pointer moved or its image changed: a new frame, or only a new place of its plane.
++    pub(crate) fn cursor_changed(&mut self) {
++        if self.cursor_on_plane {
++            self.cursor_moved = true;
++        } else {
++            self.dirty = true;
++        }
++    }
++    /// Where the pointer's image lies on the screen (its top left), the image, its generation.
++    pub(crate) fn cursor_on_screen(&self) -> Option<(Point, &DecorationBuffer, u64)> {
++        let (hotspot, image) = self.cursor.as_ref()?;
++        Some((Point::new(self.pointer.x - hotspot.x, self.pointer.y - hotspot.y), image, self.cursor_generation))
+     }
+     #[cfg_attr(not(test), allow(dead_code))] // the render tests move a hotspot alone
+     pub(crate) fn set_cursor_hotspot(&mut self, hotspot: Point) {
+         if let Some((old, _)) = &mut self.cursor {
+             *old = hotspot;
+         }
+-        self.dirty = true;
++        self.cursor_changed();
+     }
+     /// Replace a window's pixels completely (or drop them).
+     pub fn set_window_image(&mut self, id: u64, image: Option<DecorationBuffer>) {
+@@ -838,7 +884,8 @@
+         &self.monitors
+     }
+     fn screen_size(&self) -> Size {
+-        self.monitors[0].geometry.size
++        // the bounding box of every output (one output: its size, as always; DESK5)
++        self.screen
+     }
+     // AppKit sizes windows from the display; it cannot know the dock or the frame added here
+     fn fits_new_windows_to_workarea(&self) -> bool {
+@@ -971,6 +1018,10 @@
+                 .with_pending_state(|s| s.size = Some((logical.w as i32, logical.h as i32).into()));
+             if !self.hold_configures {
+                 w.surface.send_pending_configure();
++                if interactive {
++                    // for the resize latency: when this size was asked of the client
++                    self.resize_asked.insert(id, (logical, std::time::Instant::now()));
++                }
+             }
+         }
+         self.dirty = true;
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/src/server.rs desk5-003/crates/wm-darwin/src/server.rs
+--- desk4-007/crates/wm-darwin/src/server.rs	2026-11-14 19:47:15.000000000 -0800
++++ desk5-003/crates/wm-darwin/src/server.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -19,7 +19,7 @@
+     viewporter::{ViewporterState,ViewportCachedState},
+ };
+ use crate::scale::Scale as DisplayScale;
+-use wm_core::{BackendEvent,ClientChrome,WindowManager,Size};
++use wm_core::{BackendEvent,ClientChrome,WindowManager,Size,Point};
+ use crate::{damage::DRect,pixels::ShmCopy,scene::ExternalBuffer,render::DmabufDesc};
+ use smithay::wayland::dmabuf::{DmabufState,DmabufGlobal,DmabufHandler,ImportNotifier};
+ use smithay::wayland::selection::{SelectionHandler,SelectionSource,SelectionTarget,
+@@ -102,7 +102,7 @@
+     shell: XdgShellState,
+     shm: ShmState,
+     _decoration: XdgDecorationState,
+-    output: Output,
++    pub(crate) output: Output,
+     pub(crate) seats: SeatState<Self>,
+     pub(crate) input: Option<crate::input::InputState>,
+     pub(crate) cursor_callbacks: Vec<wl_callback::WlCallback>,
+@@ -110,7 +110,7 @@
+     pub(crate) client_popups: Vec<crate::popups::ClientPopup>,
+     pub wm: WindowManager<CpuBackend>,
+     callbacks: HashMap<u64, Vec<wl_callback::WlCallback>>,
+-    renderer: Box<dyn Renderer>,
++    pub(crate) renderer: Box<dyn Renderer>,
+     frames: FrameTotals,
+     /// (print a WMSTAT line every N frames, totals at the last line)
+     frame_log: Option<(u64, FrameTotals, std::time::Instant)>,
+@@ -132,8 +132,16 @@
+     pub(crate) latency: crate::input_latency::MotionLatency,
+     /// Late latching: when to render (input_latency.rs `FramePacer`); on with the KMS output.
+     pub(crate) pacer: crate::input_latency::FramePacer,
+-    /// The moment the next frame is to be rendered, once decided.
+-    render_due: Option<std::time::Instant>,
++    /// The moment the next frame is to be rendered, once decided, and the blank it aims at.
++    render_due: Option<(std::time::Instant, Option<std::time::Instant>)>,
++    /// The moment a ready frame (staged, or a pointer move on its plane) is to be committed,
++    /// and the blank it aims at (DESK5).
++    commit_due: Option<(std::time::Instant, Option<std::time::Instant>)>,
++    /// The pointer's plane may be used (the test instrument's `cursorplane on|off`).
++    pub(crate) cursor_plane_allowed: bool,
++    /// The pointer as the staged frame drew the windows during an interactive move or resize:
++    /// the plane shows it there too, so the window does not slip under it.
++    staged_drag_pointer: Option<Point>,
+     /// Readable when the input thread has events (hid.rs `InputThread::wake_fd`): ends the
+     /// wait between frames at once.
+     input_wake: Option<i32>,
+@@ -180,6 +188,8 @@
+     _xdg_output: smithay::wayland::output::OutputManagerState,
+     /// The windows told to a dock (`foreign.rs`).
+     pub(crate) foreign: crate::foreign::ForeignToplevels,
++    /// Outputs besides the panel (displays.rs, DESK5).
++    pub(crate) extra_outputs: crate::displays::ExtraOutputs,
+     /// xdg_activation_v1 (`activation.rs`).
+     pub(crate) activation: smithay::wayland::xdg_activation::XdgActivationState,
+ }
+@@ -311,6 +321,9 @@
+             latency: Default::default(),
+             pacer: crate::input_latency::FramePacer::new(false),
+             render_due: None,
++            commit_due: None,
++            cursor_plane_allowed: true,
++            staged_drag_pointer: None,
+             input_wake: None,
+             input_refused: 0,
+             external_dmabufs: HashMap::new(),
+@@ -339,6 +352,7 @@
+             _xdg_output: smithay::wayland::output::OutputManagerState::new_with_xdg_output::<Self>(dh),
+             activation: smithay::wayland::xdg_activation::XdgActivationState::new::<Self>(dh),
+             foreign: { let mut f = crate::foreign::ForeignToplevels::default(); f.create_global(dh); f },
++            extra_outputs: Default::default(),
+         })
+     }
+     /// The display scale in force.
+@@ -554,9 +568,34 @@
+         // (without this the old bottom edge stayed where the resize began until it ended).
+         self.wm.flush_decorations();
+         self.hold_frames_for_resizing_clients();
++        // several outputs: each window's surface on the output it lies on (displays.rs)
++        if !self.extra_outputs.outputs.is_empty() {
++            self.sync_surface_outputs();
++        }
++        self.choose_cursor_plane();
+         // While a frame is in flight the scene stays dirty and is rendered
+         // once, with everything that accumulated, after the flip.
+-        if !self.wm.backend().dirty || self.renderer.busy() {
++        if self.renderer.busy() {
++            return Ok(());
++        }
++        let now = std::time::Instant::now();
++        // A frame that is ready (staged, or only the pointer's plane moved) is committed at the
++        // last safe moment before its blank, with the pointer where the newest input put it.
++        let backend = self.wm.backend();
++        let pointer_only = backend.cursor_on_plane && backend.cursor_moved && !backend.dirty;
++        let pointer_moved = backend.cursor_on_plane && backend.cursor_moved;
++        if self.renderer.staged() || pointer_only {
++            let (due, blank) = *self.commit_due.get_or_insert_with(|| match self.pacer.commit_at(now) {
++                Some((at, blank)) => (at, Some(blank)),
++                None => (now, None),
++            });
++            if now < due {
++                return Ok(());
++            }
++            return self.commit_ready(blank, Some(due), time_ms);
++        }
++        if !self.wm.backend().dirty {
++            self.commit_due = None;
+             return Ok(());
+         }
+         // Implicit sync: a client may commit before its GPU work is done. The
+@@ -566,24 +605,60 @@
+         }
+         // Late latching: the frame is made as late as it can be and still make its blank, so
+         // that it shows the newest pointer position and client buffers (input_latency.rs).
+-        let now = std::time::Instant::now();
+-        let late = match self.render_due {
+-            Some(due) if now < due => return Ok(()),
+-            Some(due) => now - due,
+-            None => {
+-                if let Some(at) = self.pacer.plan(now).filter(|at| now < *at) {
+-                    self.render_due = Some(at);
++        let plan = match self.render_due {
++            Some(plan) => Some(plan),
++            None => self.pacer.render_at(now).map(|(at, blank)| (at, Some(blank))),
++        };
++        // The pointer moved on its plane and the scene changed too late for the next blank (a
++        // client's buffer that came late in the refresh): the pointer goes on that blank alone,
++        // the scene on the one after (without this a terminal flooding the screen held the
++        // pointer to every other refresh).
++        if let (true, Some((_, Some(render_blank))), Some((at, pointer_blank))) = (pointer_moved, plan, self.pacer.commit_at(now)) {
++            let interval = std::time::Duration::from_micros(8_000);
++            if render_blank > pointer_blank + interval {
++                if now < at {
++                    self.render_due = plan;
++                    self.commit_due = Some((at, Some(pointer_blank)));
+                     return Ok(());
+                 }
+-                std::time::Duration::ZERO
++                self.render_due = None;
++                self.pacer.pointer_first += 1;
++                return self.commit_ready(Some(pointer_blank), Some(at), time_ms);
+             }
++        }
++        self.commit_due = None;
++        let (late, blank) = match plan {
++            Some((due, blank)) if now < due => {
++                self.render_due = Some((due, blank));
++                return Ok(());
++            }
++            Some((due, blank)) => (now - due, blank),
++            None => (std::time::Duration::ZERO, None),
+         };
+         self.render_due = None;
++        let on_plane = self.wm.backend().cursor_on_plane;
++        let drag = self.wm.interactive_drag_active();
+         let started = std::time::Instant::now();
+-        let stats = self.renderer.render_frame(self.wm.backend_mut(), presenter)?;
++        // With the pointer on its plane the frame is staged and committed at its moment (below);
++        // otherwise it is shown at once, the pointer drawn in it.
++        let stats = if on_plane { self.renderer.stage_frame(self.wm.backend_mut(), presenter)? } else { self.renderer.render_frame(self.wm.backend_mut(), presenter)? };
+         self.pacer.rendered(started.elapsed(), late);
+         self.wm.backend_mut().dirty = false;
+-        self.latency.rendered(self.renderer.busy());
++        if self.renderer.staged() {
++            self.staged_drag_pointer = drag.then(|| self.wm.backend().pointer);
++            if drag {
++                self.latency.staged();
++            }
++            let margin = self.pacer.margin();
++            self.commit_due = Some(match blank {
++                Some(blank) => (blank.checked_sub(margin).unwrap_or(now), Some(blank)),
++                None => (std::time::Instant::now(), None),
++            });
++        } else {
++            let planned = blank.and_then(|b| b.checked_sub(self.pacer.margin()));
++            self.pacer.committed(std::time::Instant::now(), blank, planned.filter(|p| *p <= std::time::Instant::now()));
++            self.latency.rendered(self.renderer.busy(), drag);
++        }
+         self.latency.maybe_log(&self.pacer);
+         // The frame just rendered no longer samples these client buffers.
+         for buffer in self.release_after_frame.drain(..) {
+@@ -609,15 +684,98 @@
+                 ready.extend(callbacks);
+             }
+         }
+-        if self.renderer.busy() {
++        if self.renderer.busy() || self.renderer.staged() {
+             self.awaiting_flip.extend(ready);
+         } else {
+             for callback in ready {
+                 callback.done(time_ms);
+             }
+         }
++        // the moment may have come already (a long render)
++        if self.renderer.staged() && self.commit_due.is_some_and(|(due, _)| std::time::Instant::now() >= due) {
++            let (due, blank) = self.commit_due.unwrap();
++            return self.commit_ready(blank, Some(due), time_ms);
++        }
++        Ok(())
++    }
++    /// A commit's moment has come (or is within 0.1 ms).
++    pub fn commit_due_now(&self) -> bool {
++        self.commit_due.is_some_and(|(due, _)| std::time::Instant::now() + std::time::Duration::from_micros(100) >= due)
++    }
++    /// A ready frame whose moment has come is committed now (the loop calls this as soon as it
++    /// wakes, before serving clients, so their requests do not make the commit late).
++    pub fn commit_if_due(&mut self, time_ms: u32) -> Result<(), String> {
++        let Some((due, blank)) = self.commit_due else { return Ok(()) };
++        let now = std::time::Instant::now();
++        if self.renderer.busy() || due.saturating_duration_since(now) > std::time::Duration::from_micros(100) {
++            return Ok(());
++        }
++        if now < due {
++            std::thread::sleep(due - now);
++        }
++        let backend = self.wm.backend();
++        if self.renderer.staged() || (backend.cursor_on_plane && backend.cursor_moved) {
++            if !self.renderer.staged() {
++                self.render_due = None;
++            }
++            return self.commit_ready(blank, Some(due), time_ms);
++        }
+         Ok(())
+     }
++    /// Commit the staged frame, or the frame on the screen again with the pointer's plane moved.
++    fn commit_ready(&mut self, blank: Option<std::time::Instant>, planned: Option<std::time::Instant>, time_ms: u32) -> Result<(), String> {
++        self.commit_due = None;
++        let drag_pointer = self.staged_drag_pointer.take();
++        let drag = drag_pointer.is_some() || self.wm.interactive_drag_active();
++        let backend = self.wm.backend();
++        let cursor = if backend.cursor_on_plane {
++            match (backend.cursor_on_screen(), drag_pointer) {
++                (Some((origin, image, generation)), Some(at)) => {
++                    let shift = Point::new(at.x - backend.pointer.x, at.y - backend.pointer.y);
++                    Some((Point::new(origin.x + shift.x, origin.y + shift.y), image, generation))
++                }
++                (cursor, _) => cursor,
++            }
++        } else {
++            None
++        };
++        let queued = self.renderer.commit(cursor)?;
++        self.wm.backend_mut().cursor_moved = false;
++        if !queued {
++            return Ok(());
++        }
++        self.pacer.committed(std::time::Instant::now(), blank, planned);
++        self.latency.rendered(self.renderer.busy(), drag);
++        // a client animating its pointer image draws its next one after this frame
++        if self.wm.backend().cursor().is_some() && !self.cursor_callbacks.is_empty() {
++            let callbacks = std::mem::take(&mut self.cursor_callbacks);
++            if self.renderer.busy() {
++                self.awaiting_flip.extend(callbacks);
++            } else {
++                for callback in callbacks {
++                    callback.done(time_ms);
++                }
++            }
++        }
++        Ok(())
++    }
++    /// The pointer on the display's overlay plane when the renderer has one that takes its
++    /// image, and nothing needs it drawn into frames (a recording takes the frames as rendered;
++    /// the pointer must be in them).
++    fn choose_cursor_plane(&mut self) {
++        let size = self.wm.backend().cursor().map_or((1, 1), |(_, image)| (image.width, image.height));
++        let recording = self.recorder.recording();
++        let want = self.cursor_plane_allowed && !recording && self.renderer.cursor_plane_takes(size);
++        let backend = self.wm.backend_mut();
++        if want == backend.cursor_on_plane {
++            return;
++        }
++        backend.cursor_on_plane = want;
++        backend.dirty = true;
++        backend.cursor_moved = want;
++        let why = if want { "on" } else if recording { "off: a recording takes the frames with the pointer in them" } else if !self.cursor_plane_allowed { "off (test instrument)" } else { "off: the plane does not take this pointer image (size or a refused commit)" };
++        eprintln!("WMCURSOR plane {why} (pointer image {}x{})", size.0, size.1);
++    }
+     /// During an interactive move or resize each window's frame is drawn as it was for the size
+     /// of the picture its client has given (scene `sync_frame_history`).
+     fn hold_frames_for_resizing_clients(&mut self) {
+@@ -649,7 +807,7 @@
+             return Ok(());
+         };
+         // Without a seat nothing could wake it again.
+-        if self.power.unsupported || self.input.is_none() || self.power.last_input.elapsed() < idle || self.renderer.busy() {
++        if self.power.unsupported || self.input.is_none() || self.power.last_input.elapsed() < idle || self.renderer.busy() || self.renderer.staged() {
+             return Ok(());
+         }
+         if !self.renderer.set_display_power(false)? && !self.power.without_display {
+@@ -803,19 +961,37 @@
+             // A frame waiting for its moment (late latching): wake for it on time; the last
+             // two milliseconds are slept precisely (poll counts whole milliseconds).
+             let mut max = max;
+-            if let Some(due) = self.render_due {
++            let due = match (self.render_due.map(|d| d.0), self.commit_due.map(|d| d.0)) {
++                (Some(a), Some(b)) => Some(a.min(b)),
++                (a, b) => a.or(b),
++            };
++            let mut precise = None;
++            if let Some(due) = due {
+                 let left = due.saturating_duration_since(std::time::Instant::now());
+                 if left <= std::time::Duration::from_millis(2) {
+                     std::thread::sleep(left);
+                     return Ok(());
+                 }
++                // poll counts whole milliseconds and wakes late rather than early: wait for whole
++                // milliseconds short of the moment, then sleep the rest precisely (DESK5: the
++                // rounding up made commits up to a millisecond late, which the display then missed)
+                 max = max.min(left - std::time::Duration::from_millis(1));
++                precise = Some(due);
+             }
+             if fds.is_empty() {
+                 std::thread::sleep(max);
+             } else {
+-                let ms = max.as_micros().div_ceil(1000).min(1000) as libc::c_int;
+-                let _ = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
++                let ms = if precise.is_some() { (max.as_micros() / 1000).max(1) } else { max.as_micros().div_ceil(1000) }.min(1000) as libc::c_int;
++                let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
++                if n > 0 {
++                    return Ok(()); // input or a fence: the loop decides again
++                }
++            }
++            if let Some(due) = precise {
++                let left = due.saturating_duration_since(std::time::Instant::now());
++                if left <= std::time::Duration::from_millis(2) {
++                    std::thread::sleep(left);
++                }
+             }
+             return Ok(());
+         }
+@@ -835,6 +1011,7 @@
+     pub fn set_frame_pacing(&mut self, on: bool) {
+         self.pacer = crate::input_latency::FramePacer::new(on && self.renderer.output_name() == "kms");
+         self.render_due = None;
++        self.commit_due = None;
+         eprintln!("WMPACE {}", self.pacer.describe());
+     }
+     /// The input thread's wake descriptor (`InputThread::wake_fd`).
+@@ -865,8 +1042,16 @@
+     pub(crate) fn read_back_scaled(&mut self, src: wm_core::Rect, out: Size) -> Result<Option<Vec<u8>>, String> {
+         self.renderer.read_back_scaled((src.pos.x, src.pos.y, src.size.w, src.size.h), (out.w, out.h))
+     }
++    /// The frame on the screen as RGBA rows: the last rendered frame, with the pointer blended in
++    /// where its plane shows it (DESK5: the plane is not in the rendered frame).
+     pub fn read_back(&mut self) -> Result<Option<Vec<u8>>, String> {
+-        self.renderer.read_back()
++        let mut frame = self.renderer.read_back()?;
++        let backend = self.wm.backend();
++        if let (Some(pixels), true, Some((origin, image, _))) = (frame.as_mut(), backend.cursor_on_plane, backend.cursor_on_screen()) {
++            let size = wm_core::Backend::screen_size(backend);
++            blend_over(pixels, (size.w, size.h), origin, image);
++        }
++        Ok(frame)
+     }
+     pub fn output_name(&self) -> &'static str {
+         self.renderer.output_name()
+@@ -1382,6 +1567,14 @@
+                     .collect();
+                 // xdg window geometry is in logical units.
+                 let logical = fitted.logical;
++                // an interactive resize: the client's answer to the size asked (its round trip),
++                // then the compositor's part to the flip that shows it (input_latency.rs)
++                if let Some((asked, at)) = self.wm.backend().resize_asked.get(&id).copied() {
++                    if asked == logical {
++                        self.wm.backend_mut().resize_asked.remove(&id);
++                        self.latency.resize_answered(at);
++                    }
++                }
+                 let cropped = |_: u32, _: u32| {
+                     if xdg.geometry.is_some_and(|g| {
+                         g.loc.x != 0
+@@ -1785,3 +1978,130 @@
+         }
+     }
+ }
++
++/// A premultiplied RGBA image over an opaque RGBA frame (source over), clipped to the frame.
++pub(crate) fn blend_over(frame: &mut [u8], (fw, fh): (u32, u32), origin: Point, image: &wm_theme_api::DecorationBuffer) {
++    for y in 0..image.height as i32 {
++        let fy = origin.y + y;
++        if fy < 0 || fy >= fh as i32 {
++            continue;
++        }
++        for x in 0..image.width as i32 {
++            let fx = origin.x + x;
++            if fx < 0 || fx >= fw as i32 {
++                continue;
++            }
++            let s = (y as usize * image.width as usize + x as usize) * 4;
++            let d = (fy as usize * fw as usize + fx as usize) * 4;
++            let (Some(src), true) = (image.pixels.get(s..s + 4), d + 4 <= frame.len()) else { continue };
++            let a = u32::from(src[3]);
++            for c in 0..3 {
++                frame[d + c] = (u32::from(src[c]) + (u32::from(frame[d + c]) * (255 - a) + 127) / 255).min(255) as u8;
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod cursor_plane_tests {
++    use super::*;
++    use std::{cell::RefCell, rc::Rc};
++    use crate::hid::{Event, Motion};
++    /// A renderer with a pointer plane: records what it is asked to do.
++    struct PlaneRenderer {
++        log: Rc<RefCell<Vec<String>>>,
++        staged: bool,
++        takes: bool,
++    }
++    impl Renderer for PlaneRenderer {
++        fn kind(&self) -> RendererKind {
++            RendererKind::Damage
++        }
++        fn render_frame(&mut self, scene: &mut CpuBackend, _: &mut dyn Presenter) -> Result<FrameStats, String> {
++            self.log.borrow_mut().push(format!("render on_plane={}", scene.cursor_on_plane));
++            Ok(FrameStats::default())
++        }
++        fn stage_frame(&mut self, scene: &mut CpuBackend, _: &mut dyn Presenter) -> Result<FrameStats, String> {
++            self.log.borrow_mut().push(format!("stage on_plane={}", scene.cursor_on_plane));
++            self.staged = true;
++            Ok(FrameStats::default())
++        }
++        fn staged(&self) -> bool {
++            self.staged
++        }
++        fn cursor_plane_takes(&self, image: (u32, u32)) -> bool {
++            self.takes && image.0 <= 128 && image.1 <= 128
++        }
++        fn commit(&mut self, cursor: Option<(Point, &wm_theme_api::DecorationBuffer, u64)>) -> Result<bool, String> {
++            self.log.borrow_mut().push(format!("commit {:?}", cursor.map(|c| (c.0.x, c.0.y))));
++            self.staged = false;
++            Ok(true)
++        }
++        fn invalidate(&mut self) {}
++    }
++    struct Sink;
++    impl Presenter for Sink {
++        fn present(&mut self, _: &tiny_skia::Pixmap) -> Result<(), String> {
++            Ok(())
++        }
++    }
++    fn take(log: &Rc<RefCell<Vec<String>>>) -> Vec<String> {
++        std::mem::take(&mut *log.borrow_mut())
++    }
++    #[test]
++    fn a_pointer_only_move_on_the_plane_is_a_commit_without_a_render() {
++        let display = Display::<Server>::new().unwrap();
++        let mut server = Server::new(&display.handle(), Size::new(640, 480)).unwrap();
++        let log = Rc::new(RefCell::new(Vec::new()));
++        server.set_renderer_boxed(Box::new(PlaneRenderer { log: log.clone(), staged: false, takes: true }));
++        server.enable_sfhid_seat_caps(&display.handle(), crate::hid::SeatCaps { keyboard: true, pointer: true }).unwrap();
++        server.repaint(&mut Sink, 0).unwrap();
++        let first = take(&log);
++        assert_eq!(first.first().map(String::as_str), Some("stage on_plane=true"), "{first:?}");
++        assert!(first.iter().any(|l| l.starts_with("commit Some")), "the first frame is committed with the pointer's plane: {first:?}");
++        // the pointer moves: its plane is placed anew, nothing is rendered
++        for (i, x) in [1000u16, 20000, 40000].into_iter().enumerate() {
++            server.deliver_hid(Event::Pointer { motion: Motion::Absolute(x, 30000), buttons: 0, wheel: 0 }, 10 + i as u32).unwrap();
++            server.repaint(&mut Sink, 10 + i as u32).unwrap();
++            let step = take(&log);
++            assert_eq!(step.len(), 1, "one commit, no render: {step:?}");
++            let expect_x = (f64::from(x) * 639.0 / 65535.0).floor() as i32;
++            assert!(step[0].starts_with(&format!("commit Some(({expect_x}, ")), "{step:?}");
++        }
++        // nothing moved: nothing is committed
++        server.repaint(&mut Sink, 20).unwrap();
++        assert!(take(&log).is_empty());
++        // the scene changes and the pointer moves: one staged frame, committed with the pointer
++        server.wm.backend_mut().dirty = true;
++        server.deliver_hid(Event::Pointer { motion: Motion::Absolute(50000, 30000), buttons: 0, wheel: 0 }, 30).unwrap();
++        server.repaint(&mut Sink, 30).unwrap();
++        let step = take(&log);
++        assert_eq!(step.len(), 2, "{step:?}");
++        assert!(step[0] == "stage on_plane=true" && step[1].starts_with("commit Some((487, "), "{step:?}");
++        // the plane not allowed (a recording, or the instrument): the pointer is drawn into frames
++        server.cursor_plane_allowed = false;
++        server.repaint(&mut Sink, 40).unwrap();
++        assert_eq!(take(&log), vec!["render on_plane=false".to_string()]);
++        server.deliver_hid(Event::Pointer { motion: Motion::Absolute(10000, 30000), buttons: 0, wheel: 0 }, 50).unwrap();
++        server.repaint(&mut Sink, 50).unwrap();
++        assert_eq!(take(&log), vec!["render on_plane=false".to_string()], "a move is a rendered frame again");
++        // and back
++        server.cursor_plane_allowed = true;
++        server.repaint(&mut Sink, 60).unwrap();
++        let step = take(&log);
++        assert!(step.first().is_some_and(|l| l == "stage on_plane=true") && step.len() == 2, "{step:?}");
++    }
++    #[test]
++    fn a_frame_read_back_has_the_pointer_of_the_plane_blended_in() {
++        let mut frame = vec![0u8; 4 * 4 * 4];
++        for p in frame.chunks_exact_mut(4) {
++            p.copy_from_slice(&[0, 0, 200, 255]);
++        }
++        let image = wm_theme_api::DecorationBuffer { width: 2, height: 1, pixels: vec![255, 255, 255, 255, 64, 64, 64, 64] };
++        blend_over(&mut frame, (4, 4), Point::new(3, 2), &image);
++        assert_eq!(&frame[(2 * 4 + 3) * 4..(2 * 4 + 3) * 4 + 4], &[255, 255, 255, 255]);
++        assert_eq!(&frame[(2 * 4 + 2) * 4..(2 * 4 + 2) * 4 + 4], &[0, 0, 200, 255], "left of the image unchanged");
++        blend_over(&mut frame, (4, 4), Point::new(0, 0), &image);
++        assert_eq!(&frame[4..8], &[64, 64, 214, 255], "a quarter-covered pixel: source over");
++    }
++}
+diff -ruN '--exclude=.git' '--exclude=target' desk4-007/crates/wm-darwin/tests/wayland_outputs.rs desk5-003/crates/wm-darwin/tests/wayland_outputs.rs
+--- desk4-007/crates/wm-darwin/tests/wayland_outputs.rs	1969-12-31 16:00:00.000000000 -0800
++++ desk5-003/crates/wm-darwin/tests/wayland_outputs.rs	2026-11-14 20:46:26.000000000 -0800
+@@ -0,0 +1,306 @@
++#![cfg(feature = "darwin-backend")]
++//! A virtual second output (DESK5): the scene's outputs set at run time while a real Wayland
++//! client has a window: a wl_output per output, the window's surface entering the output it is
++//! on, the pointer crossing where the outputs touch, the external as the primary, and on unplug
++//! the window brought back onto the panel and the external's wl_output gone. No kernel has a
++//! second display yet (dcpext, CODEX-TB): this is the compositor's half alone.
++use std::{
++    io::Write,
++    os::fd::AsFd,
++    os::unix::net::UnixStream,
++    sync::mpsc,
++    thread,
++    time::{Duration, Instant},
++};
++use wayland_client::{
++    delegate_noop,
++    protocol::{wl_buffer, wl_compositor, wl_output, wl_registry, wl_shm, wl_shm_pool, wl_surface},
++    Connection, Dispatch, QueueHandle,
++};
++use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
++use wm_core::{Point, Rect, Size};
++use wm_darwin::outputs::{OutputKind, SceneOutput};
++use wm_darwin::presenter::Presenter;
++use wm_darwin::server::Server;
++use wm_darwin::smithay::reexports::wayland_server::Display;
++
++type Job = Box<dyn FnOnce(&mut Server) -> String + Send>;
++struct Sink;
++impl Presenter for Sink {
++    fn present(&mut self, _: &tiny_skia::Pixmap) -> Result<(), String> {
++        Ok(())
++    }
++}
++struct Harness {
++    jobs: mpsc::Sender<(Job, mpsc::Sender<String>)>,
++    thread: Option<thread::JoinHandle<()>>,
++}
++impl Harness {
++    fn start(desktop: bool) -> (Self, Connection) {
++        let (server, client) = UnixStream::pair().unwrap();
++        let (jobs, rx) = mpsc::channel::<(Job, mpsc::Sender<String>)>();
++        let thread = thread::spawn(move || {
++            let mut display = Display::<Server>::new().unwrap();
++            let mut state = Server::new(&display.handle(), Size::new(2560, 1600)).unwrap();
++            state.enable_sfhid_seat_caps(&display.handle(), wm_darwin::hid::SeatCaps { keyboard: true, pointer: true }).unwrap();
++            #[cfg(feature = "desktop-shell")]
++            if desktop {
++                state.enable_desktop_shell(wm_theme::FontState::new()).unwrap();
++            }
++            #[cfg(not(feature = "desktop-shell"))]
++            let _ = desktop;
++            Server::add_client(&mut display, server).unwrap();
++            let started = Instant::now();
++            while started.elapsed() < Duration::from_secs(30) {
++                display.dispatch_clients(&mut state).unwrap();
++                let _ = state.repaint(&mut Sink, started.elapsed().as_millis() as u32);
++                display.flush_clients().unwrap();
++                match rx.try_recv() {
++                    Ok((job, reply)) => {
++                        let answer = job(&mut state);
++                        display.flush_clients().unwrap();
++                        if reply.send(answer).is_err() {
++                            break;
++                        }
++                    }
++                    Err(mpsc::TryRecvError::Disconnected) => break,
++                    Err(mpsc::TryRecvError::Empty) => {}
++                }
++                thread::sleep(Duration::from_millis(1));
++            }
++        });
++        (Self { jobs, thread: Some(thread) }, Connection::from_socket(client).unwrap())
++    }
++    fn run(&self, job: impl FnOnce(&mut Server) -> String + Send + 'static) -> String {
++        let (tx, rx) = mpsc::channel();
++        self.jobs.send((Box::new(job), tx)).unwrap();
++        rx.recv_timeout(Duration::from_secs(10)).unwrap()
++    }
++}
++impl Drop for Harness {
++    fn drop(&mut self) {
++        let (tx, _rx) = mpsc::channel();
++        drop(std::mem::replace(&mut self.jobs, tx));
++        if let Some(t) = self.thread.take() {
++            let _ = t.join();
++        }
++    }
++}
++
++#[derive(Default)]
++struct Client {
++    compositor: Option<wl_compositor::WlCompositor>,
++    shm: Option<wl_shm::WlShm>,
++    base: Option<xdg_wm_base::XdgWmBase>,
++    /// (registry name, the bound wl_output, its name event)
++    outputs: Vec<(u32, wl_output::WlOutput, String)>,
++    /// The output names the window's surface was last told it entered.
++    entered: Vec<String>,
++    configured: bool,
++}
++impl Dispatch<wl_registry::WlRegistry, ()> for Client {
++    fn event(s: &mut Self, r: &wl_registry::WlRegistry, e: wl_registry::Event, _: &(), _: &Connection, q: &QueueHandle<Self>) {
++        match e {
++            wl_registry::Event::Global { name, interface, version } => match interface.as_str() {
++                "wl_compositor" => s.compositor = Some(r.bind(name, version.min(6), q, ())),
++                "wl_shm" => s.shm = Some(r.bind(name, 1, q, ())),
++                "xdg_wm_base" => s.base = Some(r.bind(name, 1, q, ())),
++                "wl_output" => {
++                    let output: wl_output::WlOutput = r.bind(name, version.min(4), q, name);
++                    s.outputs.push((name, output, String::new()));
++                }
++                _ => {}
++            },
++            wl_registry::Event::GlobalRemove { name } => s.outputs.retain(|(n, ..)| *n != name),
++            _ => {}
++        }
++    }
++}
++impl Dispatch<wl_output::WlOutput, u32> for Client {
++    fn event(s: &mut Self, _: &wl_output::WlOutput, e: wl_output::Event, global: &u32, _: &Connection, _: &QueueHandle<Self>) {
++        if let wl_output::Event::Name { name } = e {
++            if let Some(o) = s.outputs.iter_mut().find(|(n, ..)| n == global) {
++                o.2 = name;
++            }
++        }
++    }
++}
++impl Dispatch<wl_surface::WlSurface, ()> for Client {
++    fn event(s: &mut Self, _: &wl_surface::WlSurface, e: wl_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
++        match e {
++            wl_surface::Event::Enter { output } => {
++                let name = s.outputs.iter().find(|(_, o, _)| *o == output).map(|o| o.2.clone()).unwrap_or_default();
++                s.entered.push(name);
++            }
++            wl_surface::Event::Leave { output } => {
++                let name = s.outputs.iter().find(|(_, o, _)| *o == output).map(|o| o.2.clone()).unwrap_or_default();
++                s.entered.retain(|n| *n != name);
++            }
++            _ => {}
++        }
++    }
++}
++impl Dispatch<xdg_wm_base::XdgWmBase, ()> for Client {
++    fn event(_: &mut Self, b: &xdg_wm_base::XdgWmBase, e: xdg_wm_base::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
++        if let xdg_wm_base::Event::Ping { serial } = e {
++            b.pong(serial);
++        }
++    }
++}
++impl Dispatch<xdg_surface::XdgSurface, ()> for Client {
++    fn event(s: &mut Self, x: &xdg_surface::XdgSurface, e: xdg_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {
++        if let xdg_surface::Event::Configure { serial } = e {
++            x.ack_configure(serial);
++            s.configured = true;
++        }
++    }
++}
++delegate_noop!(Client: ignore wl_compositor::WlCompositor);
++delegate_noop!(Client: ignore wl_shm::WlShm);
++delegate_noop!(Client: ignore wl_shm_pool::WlShmPool);
++delegate_noop!(Client: ignore wl_buffer::WlBuffer);
++delegate_noop!(Client: ignore xdg_toplevel::XdgToplevel);
++
++fn panel(primary: bool) -> SceneOutput {
++    SceneOutput { primary, ..SceneOutput::panel(Size::new(2560, 1600), wm_darwin::scale::Scale::from_120(180).unwrap()) }
++}
++fn external() -> SceneOutput {
++    SceneOutput {
++        name: "DP-1".into(),
++        id: "SAM-0f00-597x336".into(),
++        kind: OutputKind::External,
++        rect: Rect::new(Point::new(2560, 0), Size::new(3840, 2160)),
++        pixels: (3840, 2160),
++        scale: wm_darwin::scale::Scale::from_120(180).unwrap(),
++        logical: (2560, 1440),
++        primary: true,
++    }
++}
++fn content(server: &Server) -> Rect {
++    server.wm.backend().windows.values().find(|w| w.mapped).map(|w| w.content).unwrap_or(Rect::new(Point::new(-1, -1), Size::new(0, 0)))
++}
++fn rect_text(r: Rect) -> String {
++    format!("{} {} {} {}", r.pos.x, r.pos.y, r.size.w, r.size.h)
++}
++fn parse(text: &str) -> Vec<i32> {
++    text.split_whitespace().filter_map(|v| v.parse().ok()).collect()
++}
++
++fn plug_move_unplug(desktop: bool) {
++    let (h, connection) = Harness::start(desktop);
++    let mut queue = connection.new_event_queue();
++    let qh = queue.handle();
++    let mut c = Client::default();
++    connection.display().get_registry(&qh, ());
++    for _ in 0..3 {
++        queue.roundtrip(&mut c).unwrap();
++    }
++    assert_eq!(c.outputs.len(), 1, "one output at start: the panel's");
++    let surface = c.compositor.as_ref().unwrap().create_surface(&qh, ());
++    let xdg = c.base.as_ref().unwrap().get_xdg_surface(&surface, &qh, ());
++    let top = xdg.get_toplevel(&qh, ());
++    top.set_title("outputs".into());
++    surface.commit();
++    while !c.configured {
++        queue.blocking_dispatch(&mut c).unwrap();
++    }
++    let (w, hgt) = (400, 300);
++    let mut file = tempfile::tempfile().unwrap();
++    file.write_all(&[40, 80, 200, 255].repeat(w * hgt)).unwrap();
++    let pool = c.shm.as_ref().unwrap().create_pool(file.as_fd(), (w * hgt * 4) as i32, &qh, ());
++    let buffer = pool.create_buffer(0, w as i32, hgt as i32, (w * 4) as i32, wl_shm::Format::Xrgb8888, &qh, ());
++    surface.attach(Some(&buffer), 0, 0);
++    surface.commit();
++    let settle = |queue: &mut wayland_client::EventQueue<Client>, c: &mut Client| {
++        for _ in 0..4 {
++            queue.roundtrip(c).unwrap();
++            thread::sleep(Duration::from_millis(15));
++        }
++    };
++    settle(&mut queue, &mut c);
++    let on_panel = parse(&h.run(|s| rect_text(content(s))));
++    assert!(on_panel[0] >= 0 && on_panel[0] + on_panel[2] <= 2560, "mapped on the panel: {on_panel:?}");
++    assert_eq!(c.entered, vec!["SFGOP-0".to_string()], "its surface is on the panel's output");
++
++    // plug: the external to the right of the panel, the primary
++    let line = h.run(|s| s.set_scene_outputs(&[panel(false), external()]).unwrap());
++    assert!(line.contains("added=[\"DP-1\"]"), "{line}");
++    settle(&mut queue, &mut c);
++    assert_eq!(c.outputs.len(), 2, "a wl_output per output");
++    assert!(c.outputs.iter().any(|o| o.2 == "DP-1"));
++    let (screen, primary, still) = {
++        let t = h.run(|s| {
++            let b = s.wm.backend();
++            format!("{} {} {} {}", wm_core::Backend::screen_size(b).w, wm_core::Backend::screen_size(b).h, rect_text(b.primary_rect()), rect_text(content(s)))
++        });
++        let v = parse(&t);
++        ((v[0], v[1]), (v[2], v[3], v[4], v[5]), (v[6], v[7]))
++    };
++    assert_eq!(screen, (6400, 2160), "the scene is both outputs");
++    assert_eq!(primary, (2560, 0, 3840, 2160), "the external is the primary");
++    assert_eq!(still, (on_panel[0], on_panel[1]), "the window stays where it was on the panel");
++    let displays = |h: &Harness| h.run(|s| s.wm.display_spaces_snapshot().map_or("none".to_string(), |d| format!("{} connected={}", d.displays.len(), d.displays.iter().filter(|x| x.connected).count())));
++    if desktop {
++        assert_eq!(displays(&h), "2 connected=2", "Spaces per display: the external has its own");
++    }
++
++    // the window to the external: its surface leaves the panel's output and enters the external's
++    let moved = parse(&h.run(|s| {
++        let id = *s.wm.backend().windows.keys().next().unwrap();
++        let client = s.wm.client_for_window(id).unwrap();
++        s.wm.set_client_content_geometry(client, Rect::new(Point::new(4000, 500), Size::new(400, 300)));
++        rect_text(content(s))
++    }));
++    settle(&mut queue, &mut c);
++    assert_eq!((moved[0], moved[1]), (4000, 500));
++    assert_eq!(c.entered, vec!["DP-1".to_string()], "the surface is on the external now");
++
++    // the pointer crosses where the outputs touch, and stops below the panel (the external is taller)
++    let crossed = parse(&h.run(|s| {
++        use wm_darwin::hid::{Event, Motion};
++        s.deliver_hid(Event::Pointer { motion: Motion::Absolute((2550 * 65535 / 6399) as u16, (800 * 65535 / 2159) as u16), buttons: 0, wheel: 0 }, 1).unwrap();
++        for i in 0..4 {
++            s.deliver_hid(Event::Pointer { motion: Motion::Relative(10, 0), buttons: 0, wheel: 0 }, 2 + i).unwrap();
++        }
++        let across = wm_core::Backend::pointer_position(s.wm.backend()).unwrap();
++        // from the external's lower part to the left: below the panel there is nothing
++        s.deliver_hid(Event::Pointer { motion: Motion::Absolute((2600 * 65535 / 6399) as u16, (2000 * 65535 / 2159) as u16), buttons: 0, wheel: 0 }, 10).unwrap();
++        for i in 0..8 {
++            s.deliver_hid(Event::Pointer { motion: Motion::Relative(-10, 0), buttons: 0, wheel: 0 }, 11 + i).unwrap();
++        }
++        let stopped = wm_core::Backend::pointer_position(s.wm.backend()).unwrap();
++        format!("{} {} {} {}", across.x, across.y, stopped.x, stopped.y)
++    }));
++    assert!(crossed[0] > 2560, "crossed onto the external: {crossed:?}");
++    assert_eq!(crossed[2], 2560, "stopped at the external's left edge below the panel: {crossed:?}");
++
++    // unplug: the window comes back onto the panel, the external's wl_output goes
++    let line = h.run(|s| s.set_scene_outputs(&[panel(true)]).unwrap());
++    assert!(line.contains("departed=[\"DP-1\"]"), "{line}");
++    settle(&mut queue, &mut c);
++    let back = parse(&h.run(|s| {
++        let b = s.wm.backend();
++        format!("{} {} {}", rect_text(content(s)), wm_core::Backend::screen_size(b).w, wm_core::Backend::pointer_position(b).unwrap().x)
++    }));
++    assert!(back[0] >= 0 && back[0] + back[2] <= 2560 && back[1] >= 0 && back[1] + back[3] <= 1600, "the window is on the panel again: {back:?}");
++    assert_eq!(back[4], 2560, "the scene is the panel again");
++    assert!(back[5] < 2560, "the pointer is on the panel");
++    assert_eq!(c.outputs.len(), 1, "the external's wl_output is gone");
++    if desktop {
++        assert_eq!(displays(&h), "2 connected=1", "the external's Spaces are kept for its return, its windows on the panel");
++    }
++    assert_eq!(c.entered, vec!["SFGOP-0".to_string()]);
++}
++
++#[test]
++fn a_window_moves_to_a_second_output_and_comes_back_when_it_is_unplugged() {
++    plug_move_unplug(false);
++}
++
++/// The desk's own session (Spaces, separate per display, as macOS): the same, through wm-core's
++/// display Spaces.
++#[test]
++#[cfg(feature = "desktop-shell")]
++fn with_the_desk_each_output_has_its_spaces_and_an_unplugged_ones_windows_come_home() {
++    plug_move_unplug(true);
++}

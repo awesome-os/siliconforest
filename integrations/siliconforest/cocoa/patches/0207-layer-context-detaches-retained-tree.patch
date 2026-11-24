@@ -1,0 +1,44 @@
+--- a/src/Frameworks/QuartzCore/CALayerContext.m
++++ b/src/Frameworks/QuartzCore/CALayerContext.m
+@@ -13,6 +13,7 @@
+ 
+ @interface CALayer(private)
+ -(void)_setContext:(CALayerContext *)context;
++-(CALayerContext *)_context;
+ -(NSNumber *)_textureId;
+ -(void)_setTextureId:(NSNumber *)value;
+ @end
+@@ -87,11 +88,7 @@
+ }
+ 
+ -(void)dealloc {
+-   os_unfair_lock_lock(&liveContextsLock);
+-   for(int i=0;i<MAX_LIVE_CONTEXTS;i++)
+-    if(liveContexts[i]==self)
+-     liveContexts[i]=nil;
+-   os_unfair_lock_unlock(&liveContextsLock);
++   [self invalidate];
+    [_timer invalidate];
+    [_timer release];
+    [super dealloc];
+@@ -118,7 +115,10 @@
+ }
+ 
+ -(void)setLayer:(CALayer *)layer {
++   if(layer==_layer)return;
+    layer=[layer retain];
++   // A retained former root must not keep a weak pointer to this context.
++   if([_layer _context]==self)[_layer _setContext:nil];
+    [_layer release];
+    _layer=layer;
+ 
+@@ -129,6 +129,9 @@
+ -(void)invalidate {
+    // the view is going away: a redisplay block already queued must not message it
+    _delegate=nil;
++   // The view can disappear while its client still owns the layer tree.
++   // Clear every weak context pointer before the context may be freed.
++   if([_layer _context]==self)[_layer _setContext:nil];
+    os_unfair_lock_lock(&liveContextsLock);
+    for(int i=0;i<MAX_LIVE_CONTEXTS;i++)
+     if(liveContexts[i]==self)

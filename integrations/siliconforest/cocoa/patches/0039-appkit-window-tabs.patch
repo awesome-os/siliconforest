@@ -1,0 +1,906 @@
+--- a/src/Frameworks/AppKit/NSWindowTabbing.m
++++ b/src/Frameworks/AppKit/NSWindowTabbing.m
+@@ -0,0 +1,741 @@
++/* SPDX-License-Identifier: MIT OR Apache-2.0
++ *
++ * Copyright (c) 2026 The Finch Project contributors
++ *   NSWindowTab, NSWindowTabGroup and NSWindow's tabbing calls follow Finch's
++ *   userland/AppKit/NSWindowTabbing.m (commit 2d9b1bb): the group's bookkeeping, the tabbing
++ *   identifier's form, where an added tab goes, which tab is selected when one leaves.
++ * Copyright (c) 2026 SiliconForest contributors
++ *   One toplevel per group, the tab bar, the hand-over when the shown tab closes.
++ *
++ * Window tabs. A window is in a group of its own until another is added to it as a tab. The windows
++ * of a group share one frame and only the selected one is on screen, as on macOS. Here a group is one
++ * toplevel of the compositor: selecting a tab hands the toplevel the group has on screen to the
++ * window of that tab (kWSWindowTakeToplevel: the WindowServer's records exchange their identities),
++ * so the compositor sees neither a window appearing nor one vanishing, and the place, size and focus
++ * of the window stay. A group of two or more shows a tab bar under the menu strip: a click selects a
++ * tab, its x closes it, + asks for a new tab (newWindowForTab:). The Window menu's Show Next Tab and
++ * Show Previous Tab (Command-Shift-] and [), Move Tab to New Window and Merge All Windows work on it.
++ */
++#import <AppKit/NSWindow.h>
++#import <AppKit/NSWindow-Private.h>
++#import <AppKit/NSWindowController.h>
++#import <AppKit/NSApplication.h>
++#import <AppKit/NSPanel.h>
++#import <AppKit/NSView.h>
++#import <AppKit/NSColor.h>
++#import <AppKit/NSGraphics.h>
++#import <AppKit/NSAppearance.h>
++#import <AppKit/NSEvent.h>
++#import <AppKit/NSFont.h>
++#import <AppKit/NSStringDrawing.h>
++#import <AppKit/NSAttributedString.h>
++#import <AppKit/NSParagraphStyle.h>
++#import <AppKit/NSBezierPath.h>
++#import <AppKit/NSTrackingArea.h>
++#import <AppKit/NSMenu.h>
++#import <AppKit/NSMenuItem.h>
++#import <Foundation/NSUserDefaults.h>
++#import <WindowServer/message.h>
++#import <WindowServer/rpc.h>
++#import <objc/runtime.h>
++#include <stdlib.h>
++
++@interface NSAppearance (SFDark)
++- (BOOL)_isDark;
++@end
++
++@class NSWindowTabGroup;
++
++@interface NSWindow (SFTabbingPrivate)
++- (NSView *)_sfTabBarView;
++- (CGFloat)_sfTabBarHeight;
++- (void)_sfUpdateTabBar;
++- (BOOL)_sfTabOrderWindow:(NSWindowOrderingMode)place relativeTo:(NSInteger)other;
++- (void)_sfTabWillClose;
++@end
++
++static char SFTabGroupKey, SFTabKey, SFTabbingIdentifierKey, SFTabbingModeKey, SFTabBarKey;
++
++@interface NSObject (SFTabBars)
++- (void)_sfUpdateBars;
++@end
++
++#pragma mark NSWindowTab
++
++@interface NSWindowTab : NSObject {
++    NSWindow *_window;      // not retained: the window owns its tab
++    NSString *_title, *_toolTip;
++    NSAttributedString *_attributedTitle;
++    NSView *_accessoryView;
++}
++@property(copy) NSString *title;
++@property(copy) NSAttributedString *attributedTitle;
++@property(copy) NSString *toolTip;
++@property(retain) NSView *accessoryView;
++@end
++
++@implementation NSWindowTab
++
++- (instancetype)_sfInitWithWindow:(NSWindow *)window
++{
++    if ((self = [super init]))
++        _window = window;
++    return self;
++}
++
++- (void)dealloc
++{
++    [_title release];
++    [_attributedTitle release];
++    [_toolTip release];
++    [_accessoryView release];
++    [super dealloc];
++}
++
++- (NSWindow *)window { return _window; }
++- (NSString *)title
++{
++    if (_title != nil)
++        return _title;
++    if (_attributedTitle != nil)
++        return [_attributedTitle string];
++    return [_window title] ?: @"";
++}
++- (void)setTitle:(NSString *)title
++{
++    if (title == _title || [title isEqualToString:_title])
++        return;
++    [_title autorelease];
++    _title = [title copy];
++    [objc_getAssociatedObject(_window, &SFTabGroupKey) _sfUpdateBars];
++}
++- (NSAttributedString *)attributedTitle { return _attributedTitle; }
++- (void)setAttributedTitle:(NSAttributedString *)title
++{
++    [_attributedTitle autorelease];
++    _attributedTitle = [title copy];
++    [objc_getAssociatedObject(_window, &SFTabGroupKey) _sfUpdateBars];
++}
++- (NSString *)toolTip { return _toolTip ?: [self title]; }
++- (void)setToolTip:(NSString *)tip
++{
++    [_toolTip autorelease];
++    _toolTip = [tip copy];
++}
++- (NSView *)accessoryView { return _accessoryView; }
++- (void)setAccessoryView:(NSView *)view
++{
++    [_accessoryView autorelease];
++    _accessoryView = [view retain];
++}
++- (NSImage *)image { return nil; }
++- (void)setImage:(NSImage *)image { }
++
++@end
++
++#pragma mark NSWindowTabGroup
++
++// while a tab hands the toplevel over, ordering windows in and out is the hand-over's own
++static int sfTabSwitching;
++
++@interface NSWindowTabGroup : NSObject {
++    NSString *_identifier;
++    NSMutableArray *_windows;   // not retained: windows own their groups
++    NSWindow *_selected;        // not retained
++    BOOL _overviewVisible, _barShownAlone;
++}
++- (void)_sfUpdateBars;
++@end
++
++@implementation NSWindowTabGroup
++
++- (instancetype)_sfInitWithIdentifier:(NSString *)identifier
++{
++    if ((self = [super init])) {
++        _identifier = [identifier copy];
++        _windows = (NSMutableArray *)CFArrayCreateMutable(NULL, 0, NULL);
++    }
++    return self;
++}
++
++- (void)dealloc
++{
++    [_identifier release];
++    [_windows release];
++    [super dealloc];
++}
++
++- (NSString *)identifier { return _identifier; }
++- (NSArray *)windows { return [[_windows copy] autorelease]; }
++- (BOOL)isOverviewVisible { return _overviewVisible; }
++- (void)setOverviewVisible:(BOOL)visible { _overviewVisible = visible; }
++- (BOOL)isTabBarVisible { return [_windows count] > 1 || _barShownAlone; }
++- (void)_sfToggleBar { _barShownAlone = !_barShownAlone; [self _sfUpdateBars]; }
++- (NSWindow *)selectedWindow { return _selected; }
++
++// every window of the group shows the bar (or not) and draws it again
++- (void)_sfUpdateBars
++{
++    for (NSWindow *window in [self windows])
++        [window _sfUpdateTabBar];
++}
++
++/* Shows WINDOW in the toplevel of the tab shown now: the same frame, the WindowServer's records
++ * exchange identities, the tab shown before is ordered out and the new one in, with the key status. */
++- (void)setSelectedWindow:(NSWindow *)window
++{
++    if (window == nil || ![_windows containsObject:window])
++        return;
++    NSWindow *shown = _selected;
++
++    _selected = window;
++    [self _sfUpdateBars];
++    if (shown == nil || shown == window || ![shown isVisible] || [window isVisible])
++        return;
++
++    BOOL key = [shown isKeyWindow] || [NSApp keyWindow] == nil;
++
++    sfTabSwitching++;
++    [window setFrame:[shown frame] display:NO];
++    struct wsRPCWindow take = {
++        { kWSWindowTakeToplevel, sizeof(struct wsRPCWindow) - sizeof(struct wsRPCBase) },
++        (int)[window windowNumber], 0, 0, 0, 0, 0, (int)[shown windowNumber], {'\0'}, 0
++    };
++    BOOL taken = _windowServerRPC(&take, sizeof(take), NULL, NULL) == KERN_SUCCESS;
++
++    [shown orderOut:nil];
++    if (key)
++        [window makeKeyAndOrderFront:nil];
++    else
++        [window orderFront:nil];
++    sfTabSwitching--;
++    if (!taken)
++        NSLog(@"AppKit: tab: the WindowServer did not hand the toplevel over (the tab is a window of its own)");
++    [window display];
++}
++
++- (void)_sfAttach:(NSWindow *)window
++{
++    NSWindowTabGroup *old = objc_getAssociatedObject(window, &SFTabGroupKey);
++
++    if (old != nil && old != self)
++        [old removeWindow:window];
++    objc_setAssociatedObject(window, &SFTabGroupKey, self, OBJC_ASSOCIATION_RETAIN);
++}
++
++- (void)insertWindow:(NSWindow *)window atIndex:(NSInteger)index
++{
++    if (window == nil || [_windows containsObject:window])
++        return;
++    [self retain];
++    [self _sfAttach:window];
++    [_windows insertObject:window atIndex:(NSUInteger)MAX(0, MIN(index, (NSInteger)[_windows count]))];
++    if (_selected == nil)
++        _selected = window;
++    // a window that was on screen on its own becomes a tab: it leaves the screen unless it is shown
++    if (window != _selected && [window isVisible] && [_selected isVisible]) {
++        sfTabSwitching++;
++        [window orderOut:nil];
++        sfTabSwitching--;
++    }
++    if (window != _selected && [_selected isVisible])
++        [window setFrame:[_selected frame] display:NO];
++    [self _sfUpdateBars];
++    [self release];
++}
++
++- (void)addWindow:(NSWindow *)window
++{
++    [self insertWindow:window atIndex:(NSInteger)[_windows count]];
++}
++
++/* A window leaves the group (closed, or moved to a window of its own); the tab beside it is
++ * selected if it was. */
++- (void)removeWindow:(NSWindow *)window
++{
++    NSUInteger i = [_windows indexOfObject:window];
++
++    if (i == NSNotFound)
++        return;
++    [self retain];
++    BOOL wasSelected = _selected == window;
++    [_windows removeObjectAtIndex:i];
++    if (wasSelected)
++        _selected = [_windows count] ? [_windows objectAtIndex:MIN(i, [_windows count] - 1)] : nil;
++    if (objc_getAssociatedObject(window, &SFTabGroupKey) == self)
++        objc_setAssociatedObject(window, &SFTabGroupKey, nil, OBJC_ASSOCIATION_RETAIN);
++    [window _sfUpdateTabBar];
++    [self _sfUpdateBars];
++    [self release];
++}
++
++@end
++
++#pragma mark the tab bar
++
++@interface SFTabBarView : NSView {
++    NSInteger _hover, _hoverClose;
++    NSTrackingArea *_tracking;
++}
++@end
++
++@implementation SFTabBarView
++
++static const CGFloat SFTabBarHeight = 28, SFTabPlusWidth = 28, SFTabCloseSize = 16;
++
++- (instancetype)initWithFrame:(NSRect)frame
++{
++    if ((self = [super initWithFrame:frame]))
++        _hover = _hoverClose = -1;
++    return self;
++}
++
++- (void)dealloc
++{
++    [_tracking release];
++    [super dealloc];
++}
++
++- (BOOL)isOpaque { return YES; }
++- (BOOL)acceptsFirstMouse:(NSEvent *)event { return YES; }
++
++- (NSArray *)_windows
++{
++    NSWindowTabGroup *group = objc_getAssociatedObject([self window], &SFTabGroupKey);
++
++    return group ? [group windows] : ([self window] ? @[ [self window] ] : @[]);
++}
++
++- (NSRect)_tabRect:(NSUInteger)index of:(NSUInteger)count
++{
++    NSRect bounds = [self bounds];
++    CGFloat width = (NSWidth(bounds) - SFTabPlusWidth) / (count ? count : 1);
++
++    return NSMakeRect(floor(index * width), 0, floor((index + 1) * width) - floor(index * width), NSHeight(bounds));
++}
++
++- (NSRect)_closeRectIn:(NSRect)tab
++{
++    return NSMakeRect(NSMinX(tab) + 8, NSMidY(tab) - SFTabCloseSize / 2, SFTabCloseSize, SFTabCloseSize);
++}
++
++- (NSRect)_plusRect
++{
++    NSRect bounds = [self bounds];
++
++    return NSMakeRect(NSMaxX(bounds) - SFTabPlusWidth, 0, SFTabPlusWidth, NSHeight(bounds));
++}
++
++- (void)drawRect:(NSRect)rect
++{
++    BOOL dark = [[NSAppearance currentDrawingAppearance] _isDark];
++    NSRect bounds = [self bounds];
++    NSArray *windows = [self _windows];
++    NSWindowTabGroup *group = objc_getAssociatedObject([self window], &SFTabGroupKey);
++    NSWindow *selected = group ? [group selectedWindow] : [self window];
++    NSUInteger count = [windows count];
++    NSColor *ground = dark ? [NSColor colorWithCalibratedWhite:0.11 alpha:1] : [NSColor colorWithCalibratedWhite:0.86 alpha:1];
++    NSColor *chosen = dark ? [NSColor colorWithCalibratedWhite:0.20 alpha:1] : [NSColor colorWithCalibratedWhite:0.97 alpha:1];
++    NSColor *line = [NSColor colorWithCalibratedWhite:0 alpha:dark ? 0.6 : 0.18];
++    NSColor *text = dark ? [NSColor colorWithCalibratedWhite:0.92 alpha:1] : [NSColor colorWithCalibratedWhite:0.12 alpha:1];
++    NSColor *dim = dark ? [NSColor colorWithCalibratedWhite:0.62 alpha:1] : [NSColor colorWithCalibratedWhite:0.38 alpha:1];
++    NSMutableParagraphStyle *style = [[[NSMutableParagraphStyle alloc] init] autorelease];
++
++    [style setAlignment:NSCenterTextAlignment];
++    [style setLineBreakMode:NSLineBreakByTruncatingMiddle];
++    [ground setFill];
++    NSRectFill(rect);
++    for (NSUInteger i = 0; i < count; i++) {
++        NSWindow *window = [windows objectAtIndex:i];
++        NSRect tab = [self _tabRect:i of:count];
++        BOOL isSelected = window == selected;
++
++        if (isSelected) {
++            [chosen setFill];
++            NSRectFill(tab);
++        }
++        else if ((NSInteger)i == _hover) {
++            [[NSColor colorWithCalibratedWhite:dark ? 1 : 0 alpha:0.05] setFill];
++            NSRectFillUsingOperation(tab, NSCompositeSourceOver);
++        }
++        // a hairline between tabs
++        if (i > 0) {
++            [line setFill];
++            NSRectFillUsingOperation(NSMakeRect(NSMinX(tab), NSMinY(tab) + 5, 1, NSHeight(tab) - 10), NSCompositeSourceOver);
++        }
++        NSString *title = [[window tab] title];
++        NSDictionary *attributes = @{ NSFontAttributeName: [NSFont systemFontOfSize:12],
++                                      NSForegroundColorAttributeName: isSelected ? text : dim,
++                                      NSParagraphStyleAttributeName: style };
++        NSRect titleRect = NSInsetRect(tab, 30, 0);
++        NSSize size = [title sizeWithAttributes:attributes];
++
++        titleRect.origin.y = floor(NSMidY(tab) - size.height / 2);
++        titleRect.size.height = ceil(size.height);
++        [title drawInRect:titleRect withAttributes:attributes];
++        // the close mark, on every tab (macOS shows it under the pointer)
++        if (count > 1) {
++            NSRect close = [self _closeRectIn:tab];
++            NSBezierPath *x = [NSBezierPath bezierPath];
++
++            if ((NSInteger)i == _hoverClose) {
++                [[NSColor colorWithCalibratedWhite:dark ? 1 : 0 alpha:0.12] setFill];
++                [[NSBezierPath bezierPathWithRoundedRect:close xRadius:3 yRadius:3] fill];
++            }
++            [x moveToPoint:NSMakePoint(NSMinX(close) + 4.5, NSMinY(close) + 4.5)];
++            [x lineToPoint:NSMakePoint(NSMaxX(close) - 4.5, NSMaxY(close) - 4.5)];
++            [x moveToPoint:NSMakePoint(NSMinX(close) + 4.5, NSMaxY(close) - 4.5)];
++            [x lineToPoint:NSMakePoint(NSMaxX(close) - 4.5, NSMinY(close) + 4.5)];
++            [x setLineWidth:1.25];
++            [(isSelected ? text : dim) setStroke];
++            [x stroke];
++        }
++    }
++    // new tab
++    NSRect plus = [self _plusRect];
++    NSBezierPath *p = [NSBezierPath bezierPath];
++
++    [line setFill];
++    NSRectFillUsingOperation(NSMakeRect(NSMinX(plus), NSMinY(plus) + 5, 1, NSHeight(plus) - 10), NSCompositeSourceOver);
++    [p moveToPoint:NSMakePoint(NSMidX(plus) - 5, NSMidY(plus))];
++    [p lineToPoint:NSMakePoint(NSMidX(plus) + 5, NSMidY(plus))];
++    [p moveToPoint:NSMakePoint(NSMidX(plus), NSMidY(plus) - 5)];
++    [p lineToPoint:NSMakePoint(NSMidX(plus), NSMidY(plus) + 5)];
++    [p setLineWidth:1.25];
++    [dim setStroke];
++    [p stroke];
++    // a hairline between the bar and the content
++    [line setFill];
++    NSRectFillUsingOperation(NSMakeRect(0, [self isFlipped] ? NSMaxY(bounds) - 1 : 0, NSWidth(bounds), 1), NSCompositeSourceOver);
++}
++
++- (void)updateTrackingAreas
++{
++    [super updateTrackingAreas];
++    if (_tracking != nil)
++        [self removeTrackingArea:_tracking];
++    [_tracking release];
++    _tracking = [[NSTrackingArea alloc] initWithRect:[self bounds]
++                                             options:NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways
++                                               owner:self userInfo:nil];
++    [self addTrackingArea:_tracking];
++}
++
++- (void)_hit:(NSPoint)point tab:(NSInteger *)tab close:(BOOL *)close
++{
++    NSArray *windows = [self _windows];
++    NSUInteger count = [windows count];
++
++    *tab = -1;
++    *close = NO;
++    for (NSUInteger i = 0; i < count; i++) {
++        NSRect rect = [self _tabRect:i of:count];
++
++        if (NSPointInRect(point, rect)) {
++            *tab = (NSInteger)i;
++            *close = count > 1 && NSPointInRect(point, NSInsetRect([self _closeRectIn:rect], -3, -3));
++            return;
++        }
++    }
++}
++
++- (void)mouseMoved:(NSEvent *)event
++{
++    NSInteger tab;
++    BOOL close;
++
++    [self _hit:[self convertPoint:[event locationInWindow] fromView:nil] tab:&tab close:&close];
++    if (tab != _hover || (close ? tab : -1) != _hoverClose) {
++        _hover = tab;
++        _hoverClose = close ? tab : -1;
++        [self setNeedsDisplay:YES];
++    }
++}
++
++- (void)mouseExited:(NSEvent *)event
++{
++    _hover = _hoverClose = -1;
++    [self setNeedsDisplay:YES];
++}
++
++- (void)mouseDown:(NSEvent *)event
++{
++    NSPoint point = [self convertPoint:[event locationInWindow] fromView:nil];
++    NSArray *windows = [self _windows];
++    NSInteger tab;
++    BOOL close;
++
++    if (NSPointInRect(point, [self _plusRect])) {
++        [NSApp sendAction:@selector(newWindowForTab:) to:nil from:[self window]];
++        return;
++    }
++    [self _hit:point tab:&tab close:&close];
++    if (tab < 0)
++        return;
++    NSWindow *window = [windows objectAtIndex:(NSUInteger)tab];
++    if (close)
++        [window performClose:self];
++    else
++        [[window tabGroup] setSelectedWindow:window];
++}
++
++@end
++
++#pragma mark NSWindow
++
++@implementation NSWindow (SFTabbing)
++
++- (NSWindowTabGroup *)tabGroup
++{
++    NSWindowTabGroup *group = objc_getAssociatedObject(self, &SFTabGroupKey);
++
++    if (group == nil) {
++        group = [[[NSWindowTabGroup alloc] _sfInitWithIdentifier:[self tabbingIdentifier]] autorelease];
++        [group addWindow:self];
++    }
++    return group;
++}
++
++- (NSWindowTab *)tab
++{
++    NSWindowTab *tab = objc_getAssociatedObject(self, &SFTabKey);
++
++    if (tab == nil) {
++        tab = [[[NSWindowTab alloc] _sfInitWithWindow:self] autorelease];
++        objc_setAssociatedObject(self, &SFTabKey, tab, OBJC_ASSOCIATION_RETAIN);
++    }
++    return tab;
++}
++
++// Unless set, Apple's form: the class, its controller's and delegate's, and "VT".
++- (NSString *)tabbingIdentifier
++{
++    NSString *set = objc_getAssociatedObject(self, &SFTabbingIdentifierKey);
++
++    if (set != nil)
++        return set;
++    return [NSString stringWithFormat:@"%@-%@-%@-VT-", [self className],
++                     [self windowController] ? NSStringFromClass([[self windowController] class]) : @"(null)",
++                     [self delegate] ? NSStringFromClass([(id)[self delegate] class]) : @"(null)"];
++}
++
++- (void)setTabbingIdentifier:(NSString *)identifier
++{
++    objc_setAssociatedObject(self, &SFTabbingIdentifierKey, identifier, OBJC_ASSOCIATION_COPY);
++}
++
++- (NSInteger)tabbingMode
++{
++    return [objc_getAssociatedObject(self, &SFTabbingModeKey) integerValue];
++}
++
++- (void)setTabbingMode:(NSInteger)mode
++{
++    objc_setAssociatedObject(self, &SFTabbingModeKey, @(mode), OBJC_ASSOCIATION_RETAIN);
++}
++
++// NSWindowUserTabbingPreferenceInFullScreen, macOS's default: new windows are windows
+++ (NSInteger)userTabbingPreference
++{
++    return 2;
++}
++
++- (NSArray *)tabbedWindows
++{
++    NSWindowTabGroup *group = objc_getAssociatedObject(self, &SFTabGroupKey);
++
++    return [[group windows] count] > 1 ? [group windows] : nil;
++}
++
++// The new tab goes beside this one (after it for NSWindowAbove) and is selected.
++- (void)addTabbedWindow:(NSWindow *)window ordered:(NSWindowOrderingMode)ordered
++{
++    if (window == nil || window == self)
++        return;
++    NSWindowTabGroup *group = [self tabGroup];
++    NSUInteger at = [[group windows] indexOfObject:self];
++
++    [group insertWindow:window atIndex:(NSInteger)(ordered == NSWindowBelow ? at : at + 1)];
++    if ([self isVisible])
++        [group setSelectedWindow:window];
++}
++
++- (void)_sfSelectTabBy:(NSInteger)step
++{
++    NSWindowTabGroup *group = objc_getAssociatedObject(self, &SFTabGroupKey);
++    NSArray *windows = [group windows];
++    NSUInteger n = [windows count], i = [windows indexOfObject:[group selectedWindow] ?: self];
++
++    if (n < 2 || i == NSNotFound)
++        return;
++    [group setSelectedWindow:[windows objectAtIndex:(i + n + (NSUInteger)step) % n]];
++}
++
++- (void)selectNextTab:(id)sender { [self _sfSelectTabBy:1]; }
++- (void)selectPreviousTab:(id)sender { [self _sfSelectTabBy:-1]; }
++
++// The tab leaves its group and becomes a window of its own, a little below and to the right.
++- (void)moveTabToNewWindow:(id)sender
++{
++    NSWindowTabGroup *group = objc_getAssociatedObject(self, &SFTabGroupKey);
++
++    if ([[group windows] count] < 2)
++        return;
++    NSRect frame = [self frame];
++
++    if ([group selectedWindow] == self)
++        [self _sfTabOrderWindow:NSWindowOut relativeTo:0];
++    [group removeWindow:self];
++    [self setFrame:NSOffsetRect(frame, 24, -24) display:NO];
++    [self makeKeyAndOrderFront:nil];
++}
++
++// Every window with this window's tabbing identifier becomes a tab of its group.
++- (void)mergeAllWindows:(id)sender
++{
++    for (NSWindow *window in [NSApp windows])
++        if (window != self && [window isVisible] && ![window isKindOfClass:[NSPanel class]] &&
++            [[window tabbingIdentifier] isEqualToString:[self tabbingIdentifier]] && [window tabbingMode] != 2)
++            [[self tabGroup] addWindow:window];
++    [[self tabGroup] setSelectedWindow:self];
++}
++
++- (void)toggleTabBar:(id)sender
++{
++    [[self tabGroup] _sfToggleBar];
++}
++
++- (void)toggleTabOverview:(id)sender
++{
++    [[self tabGroup] setOverviewVisible:![[self tabGroup] isOverviewVisible]];
++}
++
++// for -[NSWindow validateMenuItem:]: the tab commands need a second tab
++- (BOOL)_sfTabCommandEnabled:(SEL)action
++{
++    return [[objc_getAssociatedObject(self, &SFTabGroupKey) windows] count] > 1;
++}
++
++#pragma mark the tab bar of a window
++
++- (NSView *)_sfTabBarView
++{
++    return objc_getAssociatedObject(self, &SFTabBarKey);
++}
++
++- (CGFloat)_sfTabBarHeight
++{
++    NSView *bar = objc_getAssociatedObject(self, &SFTabBarKey);
++
++    return bar ? NSHeight([bar frame]) : 0;
++}
++
++/* Shows the bar where the window is a tab of a group of two or more (or the user asked for it with
++ * one), takes it away otherwise. The frame stays: the content gives up the bar's height. */
++- (void)_sfUpdateTabBar
++{
++    NSWindowTabGroup *group = objc_getAssociatedObject(self, &SFTabGroupKey);
++    BOOL want = group != nil && [group isTabBarVisible] && NSWindowFrameIsDrawnByServer([self styleMask]) &&
++                ([self styleMask] & NSTitledWindowMask) && ![self isKindOfClass:[NSPanel class]];
++    NSView *bar = objc_getAssociatedObject(self, &SFTabBarKey);
++    NSView *frameView = [[self contentView] superview];
++
++    if (want && bar == nil && frameView != nil) {
++        bar = [[[SFTabBarView alloc] initWithFrame:NSMakeRect(0, 0, NSWidth([self frame]), SFTabBarHeight)] autorelease];
++        [bar setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
++        objc_setAssociatedObject(self, &SFTabBarKey, bar, OBJC_ASSOCIATION_RETAIN);
++        [frameView addSubview:bar];
++        [frameView resizeSubviewsWithOldSize:[frameView frame].size];
++        [frameView setNeedsDisplay:YES];
++    }
++    else if (!want && bar != nil) {
++        [bar removeFromSuperview];
++        objc_setAssociatedObject(self, &SFTabBarKey, nil, OBJC_ASSOCIATION_RETAIN);
++        [frameView resizeSubviewsWithOldSize:[frameView frame].size];
++        [frameView setNeedsDisplay:YES];
++    }
++    else
++        [bar setNeedsDisplay:YES];
++}
++
++/* From -orderWindow:relativeTo: before it does anything: a tab that is ordered in while another tab
++ * of its group is on screen takes that tab's toplevel; the tab on screen that is ordered out hands
++ * its toplevel to the tab beside it. YES: done here. */
++- (BOOL)_sfTabOrderWindow:(NSWindowOrderingMode)place relativeTo:(NSInteger)other
++{
++    NSWindowTabGroup *group = objc_getAssociatedObject(self, &SFTabGroupKey);
++    NSArray *windows = [group windows];
++
++    if (sfTabSwitching || [windows count] < 2)
++        return NO;
++    NSWindow *selected = [group selectedWindow];
++
++    if (place != NSWindowOut) {
++        if (selected != self && [selected isVisible] && ![self isVisible]) {
++            [group setSelectedWindow:self];
++            return YES;
++        }
++        return NO;
++    }
++    if (selected == self && [self isVisible]) {
++        NSUInteger i = [windows indexOfObject:self];
++        NSWindow *beside = [windows objectAtIndex:i + 1 < [windows count] ? i + 1 : i - 1];
++
++        [group setSelectedWindow:beside];
++        return ![self isVisible];
++    }
++    return NO;
++}
++
++// From -close: the window leaves its group (after it has handed its toplevel over)
++- (void)_sfTabWillClose
++{
++    [objc_getAssociatedObject(self, &SFTabGroupKey) removeWindow:self];
++}
++
++@end
++
++#pragma mark the Window menu's tab commands
++
++/* As on macOS, where AppKit adds them to an application's Window menu when its windows can be
++ * tabbed: Show Previous Tab (Command-Shift-[), Show Next Tab (Command-Shift-]), Move Tab to New
++ * Window, Merge All Windows, after Zoom. Not where the application has them itself or turned
++ * automatic tabbing off (+[NSWindow allowsAutomaticWindowTabbing]). */
++@interface SFTabMenuItems : NSObject
++@end
++
++@implementation SFTabMenuItems
++
+++ (void)load
++{
++    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(_sfInstall:)
++                                                 name:NSApplicationDidFinishLaunchingNotification object:nil];
++}
++
+++ (void)_sfInstall:(NSNotification *)note
++{
++    NSMenu *menu = [NSApp windowsMenu];
++
++    if (menu == nil || ![NSWindow allowsAutomaticWindowTabbing] || [menu indexOfItemWithTarget:nil andAction:@selector(selectNextTab:)] >= 0)
++        return;
++    NSInteger at = [menu indexOfItemWithTarget:nil andAction:@selector(performZoom:)];
++
++    if (at < 0)
++        at = [menu indexOfItemWithTarget:nil andAction:@selector(zoom:)];
++    at = at < 0 ? [menu numberOfItems] : at + 1;
++    struct { NSString *title; SEL action; NSString *key; } items[] = {
++        { @"Show Previous Tab", @selector(selectPreviousTab:), @"{" },
++        { @"Show Next Tab", @selector(selectNextTab:), @"}" },
++        { @"Move Tab to New Window", @selector(moveTabToNewWindow:), @"" },
++        { @"Merge All Windows", @selector(mergeAllWindows:), @"" },
++    };
++    [menu insertItem:[NSMenuItem separatorItem] atIndex:at++];
++    for (unsigned i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
++        NSMenuItem *item = [[[NSMenuItem alloc] initWithTitle:items[i].title action:items[i].action keyEquivalent:items[i].key] autorelease];
++
++        // "{" and "}" are typed with shift: the menu counts that shift as part of the symbol
++        [menu insertItem:item atIndex:at++];
++    }
++}
++
++@end
+--- a/src/Frameworks/AppKit/NSWindow.m
++++ b/src/Frameworks/AppKit/NSWindow.m
+@@ -197,6 +197,14 @@
+ // set once a compositor that offers server-side decorations has refused them for a window
+ static BOOL sfServerFramesRefused = NO;
+ 
++// NSWindowTabbing.m
++@interface NSWindow (SFTabbingHooks)
++-(BOOL)_sfTabOrderWindow:(NSWindowOrderingMode)place relativeTo:(NSInteger)other;
++-(void)_sfTabWillClose;
++-(CGFloat)_sfTabBarHeight;
++-(BOOL)_sfTabCommandEnabled:(SEL)action;
++@end
++
+ @implementation NSWindow
+ 
+ +(NSWindowDepth)defaultDepthLimit {
+@@ -1811,6 +1819,8 @@
+    // the menu strip (NSWindowMenuStrip.m) is part of the frame, like the title bar
+    if(_menuView!=nil)
+     result.size.height+=NSHeight([_menuView frame]);
++   // the tab bar too (NSWindowTabbing.m)
++   result.size.height+=[self _sfTabBarHeight];
+ 
+     return result;
+ }
+@@ -1822,6 +1832,7 @@
+     result.size.height-=[[_toolbar _view] frame].size.height;
+    if(_menuView!=nil)
+     result.size.height-=NSHeight([_menuView frame]);
++   result.size.height-=[self _sfTabBarHeight];
+ 
+    return result;
+ }
+@@ -2487,6 +2498,8 @@
+ 
+ -(void)close {
+     [self orderOut:nil];
++    // a tab leaves its group, after it has handed the group's toplevel over (NSWindowTabbing.m)
++    [self _sfTabWillClose];
+ 
+     [_childWindows makeObjectsPerformSelector:@selector(_parentWindowDidClose:) withObject:self];
+         [_drawers makeObjectsPerformSelector:@selector(parentWindowDidClose:) withObject:self];
+@@ -2523,6 +2536,10 @@
+ -(void)orderWindow:(NSWindowOrderingMode)place relativeTo:(int)relativeTo {
+    BOOL wasVisible=_isVisible;
+ 
++   // a tab of a group: it takes the group's toplevel, or hands it to the tab beside it (NSWindowTabbing.m)
++   if([self _sfTabOrderWindow:place relativeTo:relativeTo])
++    return;
++
+ // The move notifications are sent under unknown conditions around orderFront: in the Apple AppKit, we do them all the time here until it's figured out. I suspect it is a side effect of off-screen windows being at off-screen coordinates (as opposed to just being hidden)
+    [self postNotificationName:NSWindowWillMoveNotification];
+ 
+@@ -3709,6 +3726,10 @@
+ }
+ 
+ -(BOOL)validateMenuItem:(NSMenuItem *)item {
++    // the tab commands (NSWindowTabbing.m) need a second tab
++    if ([item action] == @selector(selectNextTab:) || [item action] == @selector(selectPreviousTab:) ||
++        [item action] == @selector(moveTabToNewWindow:))
++        return [self _sfTabCommandEnabled:[item action]];
+     if ([item action] == @selector(undo:))
+         return [[self undoManager] canUndo];
+     if ([item action] == @selector(redo:))
+--- a/src/Frameworks/AppKit/NSThemeFrame.m
++++ b/src/Frameworks/AppKit/NSThemeFrame.m
+@@ -513,12 +513,14 @@
+    NSMutableArray *others=[NSMutableArray array];
+    // the window's menu strip (NSWindowMenuStrip.m) lies over the full width at the top, the toolbar under it
+    NSView *menuStrip=[[self window] _sfMenuStripView];
++   // the tab bar (NSWindowTabbing.m) lies under the strip
++   NSView *tabBar=[[self window] respondsToSelector:@selector(_sfTabBarView)] ? [[self window] performSelector:@selector(_sfTabBarView)] : nil;
+ 
+    // the content is the subview holding the window's contentView, views apps add here keep their own masks
+    for(NSView *view in _subviews){
+     if(view == _controlsView || view == _titlebarContainerView)
+      continue;
+-    if(view==menuStrip)
++    if(view==menuStrip || view==tabBar)
+      continue;
+     if([view isKindOfClass:[NSToolbarView class]])
+      toolbarView=(NSToolbarView *)view;
+@@ -540,6 +542,12 @@
+     [menuStrip setFrame:NSMakeRect(NSMinX(contentFrame),NSMaxY(contentFrame)-stripHeight,NSWidth(contentFrame),stripHeight)];
+     contentFrame.size.height-=stripHeight;
+    }
++   if(tabBar!=nil){
++    CGFloat barHeight=NSHeight([tabBar frame]);
++
++    [tabBar setFrame:NSMakeRect(NSMinX(contentFrame),NSMaxY(contentFrame)-barHeight,NSWidth(contentFrame),barHeight)];
++    contentFrame.size.height-=barHeight;
++   }
+    toolbarFrame.origin.y=NSMaxY(contentFrame)-toolbarFrame.size.height;
+    toolbarFrame.origin.x=contentFrame.origin.x;
+    toolbarFrame.size.width=contentFrame.size.width;
+--- a/src/Frameworks/AppKit/NSMacOS26Additions.m
++++ b/src/Frameworks/AppKit/NSMacOS26Additions.m
+@@ -265,8 +265,6 @@
+ - (Class)restorationClass { return objc_getAssociatedObject(self, &SFRestorationClassKey); }
+ - (void)updateConstraintsIfNeeded { [[self contentView] updateConstraintsForSubtreeIfNeeded]; }
+ - (void)layoutIfNeeded { [[self contentView] updateConstraintsForSubtreeIfNeeded]; [[self contentView] layout]; }
+-// window tabs: every window is its own toplevel here
+-- (NSArray *)tabbedWindows { return nil; }
+ // private: the bottom corners of a window are the compositor's frame's business
+ - (void)setBottomCornerRounded:(BOOL)flag { }
+ // animated property changes are applied at once: the animator of an object is the object
+@@ -384,17 +382,7 @@
+ }
+ @end
+ 
+-@implementation NSWindow (Tabs)
+-// Window tabbing: each window stays a toplevel of its own, there is no tab group to join.
+-- (void)addTabbedWindow:(NSWindow *)window ordered:(NSInteger)ordered { [window orderWindow:ordered relativeTo:[self windowNumber]]; }
+-- (id)tabGroup { return nil; }
+-- (void)selectNextTab:(id)sender { }
+-- (void)selectPreviousTab:(id)sender { }
+-- (void)moveTabToNewWindow:(id)sender { }
+-- (void)mergeAllWindows:(id)sender { }
+-- (void)toggleTabBar:(id)sender { }
+-- (void)toggleTabOverview:(id)sender { }
+-@end
++// window tabbing: NSWindowTabbing.m
+ 
+ @implementation NSObject (AccessibilityProperties)
+ // kept on the object; no assistive client reads them yet
+@@ -481,34 +469,7 @@
+ }
+ @end
+ 
+-// ---- NSWindowTab: what a window shows of itself in a tab bar. There is no tab bar; the object
+-// keeps what the application sets (title, tool tip, accessory view).
+-@interface NSWindowTab : NSObject {
+-    NSString *_title, *_toolTip; NSAttributedString *_attributedTitle; NSView *_accessoryView;
+-}
+-@property(copy) NSString *title;
+-@property(copy) NSAttributedString *attributedTitle;
+-@property(copy) NSString *toolTip;
+-@property(retain) NSView *accessoryView;
+-@end
+-@implementation NSWindowTab
+-@synthesize title = _title, attributedTitle = _attributedTitle, toolTip = _toolTip, accessoryView = _accessoryView;
+-- (void)dealloc { [_title release]; [_attributedTitle release]; [_toolTip release]; [_accessoryView release]; [super dealloc]; }
+-SF_TOLERANT
+-@end
+-
+-static char SFWindowTabKey;
+-@implementation NSWindow (WindowTab)
+-- (NSWindowTab *)tab
+-{
+-    NSWindowTab *tab = objc_getAssociatedObject(self, &SFWindowTabKey);
+-    if (tab == nil) {
+-        tab = [[NSWindowTab new] autorelease];
+-        objc_setAssociatedObject(self, &SFWindowTabKey, tab, OBJC_ASSOCIATION_RETAIN);
+-    }
+-    return tab;
+-}
+-@end
++// ---- NSWindowTab and -[NSWindow tab]: NSWindowTabbing.m
+ 
+ @implementation NSView (FindIndicator)
+ // private: whether the view is being drawn into the yellow "find indicator" bubble. Never here.

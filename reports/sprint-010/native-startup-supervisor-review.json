@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SCRIPT_REVIEW_NO_HARDWARE",
+  "reviewed": {
+    "script": "integrations/puredarwin/chonkstep-darwin/darwin-native-startup-test, sha256 dcba72def0efca28 (diff base: approved close supervisor 589e2485)",
+    "records": "reports/sprint-010/native-startup-supervisor-source.json and native-startup-qualification-criteria.json",
+    "inventory": "/nix/store/jzzzy3km.../darwin-keyboard-inventory f9e2f32d, from drv 07c099j8 whose keyboard_inventory.c is 8f5876f1 (approved in keyboard-inventory-gate-review.json). Its only filesystem import is stat, so it never opens the keyboard node."
+  },
+  "verdict": "APPROVE the native-startup supervisor source. It is the qualified closed lifecycle with the host-HID parts removed (no PRIME, no prompt, no typing), a read-only native inventory gate, a keyboard-only seat, mouse-node refusal and honest startup-only labels.",
+  "diff_vs_close_supervisor": [
+    "Every marker becomes DL12_NATIVE_* with physical_input_proven=false; the footer is 'CHONKSTEP NATIVE SEAT STARTUP ONLY - INPUT UNVERIFIED' plus DL12_NATIVE_RETURN_<nonce>.",
+    "DL11_TERMINAL_PRIME is replaced by '/usr/bin/darwin-keyboard-inventory --require-native-keyboard'. On failure it prints 'DL12_NATIVE_NOT_READY_<n> inventory_rc=' and exits 77 (BLOCKED, through the trap with nothing started).",
+    "It waits (at most 10 s, stat-only) for /dev/usb_hid_kbd only, refuses if /dev/usb_hid_mouse exists ('no native producer'), and starts the compositor with '--input pdhid-keyboard'.",
+    "The client is darwin-wayland-terminal-native-startup (ae9bd975 source, bea5f11d binary) with --seconds 80. The closed 6-record export, compositor TERM/wait, STATUS line and the all-zero gate before the footer are unchanged from 589e2485."
+  ],
+  "verified": [
+    "No input source exists in the guest script: nothing writes to the PTY or a HID node, and no SOH line is printed. The host side (native host revision b5828a07) has no HID scheduler and seals the VUART at the launcher.",
+    "The observer's exit 0 means only readiness plus a reaped child (startup-only), and the supervisor's STATUS 0/0/0 depends on that, so the footer cannot imply input.",
+    "Mouse refusal fits the native KC: with PDSerialHID omitted and the publication patch, a mouse node should never be published. Its presence means an unexpected producer and fails the run."
+  ],
+  "qualification_rules": [
+    "BLOCKED, not FAIL or PASS, if DL12_NATIVE_NOT_READY appears (exit 77).",
+    "Console must show 'PDHIDEventQueue: published /dev/usb_hid_kbd' and 'ready kind=1 ... (endpoint, not input proof)', no '/dev/usb_hid_mouse' publication, no 'publication refused', and PDM1SPIHID enumeration/descriptor acceptance from the native driver (no PDSerialHID lines at all).",
+    "Host TX ledger exactly [optional /bin/sh] + challenge + launcher with native_mode_host_write_phase 'sealed'; pty-tx.bin 0 bytes unless a human typed (any non-zero TX is reviewed as unqualified traffic and never upgraded to a typing claim).",
+    "result.json: readiness true, pty_eof false, window_closed false, term_signal false, cleanup.complete with the raw wait status; closed export decoded (6 records, digests); STATUS 0/0/0; post-close pixels with the footer and fresh DL12_NATIVE_RETURN nonce; verified Linux recovery.",
+    "Even a full pass is 'native keyboard seat startup observed' only. Physical typing needs the separate fresh challenge and human observation."
+  ],
+  "notes": [
+    {"id": "N1", "severity": "note", "text": "The mouse check is one-shot at compositor launch. A mouse node appearing later would not be opened (keyboard-only seat) but should still be caught by the console rule above."}
+  ],
+  "not_claimed": ["runtime", "native keyboard input", "physical typing"],
+  "scope": "Read-only script, record and binary-provenance review. No hardware or edits."
+}

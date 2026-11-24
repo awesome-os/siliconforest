@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "reviewer": "Grok",
+  "review_date": "2026-11-08",
+  "status": "SOURCE_ONLY_DESCRIPTOR_INSPECTION_PLAN_NO_CAPTURE_NO_WRITE",
+  "scope": "Rules for a later offline inspection of the real device-2 HID report descriptor, after a qualified T1 capture exists. This file is the only write. Collector, core, adapter, and layout sources stay frozen. No descriptor bytes are invented here. No mode write, GET, SET, build, SSH, or hardware action is specified or performed.",
+  "names": {
+    "capture_T1": "The enumeration capture: two read queries, then the 556-byte PDM1TrackpadEnumerationV1 record. Qualification criteria T1 through T7 in reports/sprint-010/trackpad-enum-qualification-criteria.json govern that capture. Criteria id T3 there is retrieval of the raw record, not a mode write.",
+    "mode_gate": "The first device-2 feature write in reports/sprint-010/native-trackpad-spi-dev2-plan.json phase T3, as restated by native-trackpad-spi-dev2-plan-addendum-001.json. This plan defines the descriptor evidence that gate requires. It does not open the write."
+  },
+  "actor": "Root is the sole test actor for any future capture. When a qualified capture lands, the independent decode of its descriptor bytes follows this plan. Nothing in this receipt asks for that capture.",
+  "input_when_a_capture_exists": {
+    "accept_only": "One collector receipt whose verdict is ENUMERATION_CAPTURED, exit 0, result 0, stage 5, request mask 31, metadata header byte 1 equal to 2, metadata payload at least 16, input length in 1..2038, descriptor_bytes in 1..512, and descriptor_payload_bytes equal to descriptor_bytes. The descriptor is record bytes [44, 44+descriptor_bytes). Bytes [44+descriptor_bytes, 556) stay zero.",
+    "bind": "Nonce, SHA-256 of the whole 556-byte record, descriptor_bytes, and SHA-256 of the descriptor slice alone. Instance absent or byte-equal stays the collector's already recorded fact.",
+    "refuse": "REFUSED, MISSING, MIG_ERROR, MALFORMED, INSTANCE_MISMATCH, descriptor_bytes 0, or a slice that disagrees with descriptor_bytes. Those captures contain no descriptor to inspect. The keyboard interface-1 descriptor is not a substitute."
+  },
+  "walk": {
+    "grammar": "Short items as tagged in sources/puredarwin-baseline/src/Kernel/Extensions/IOHIDFamily/IOHIDFamily/IOHIDDescriptorParserPrivate.h. Prefix bits: size 0..1, type 2..3, tag 4..7. Size code 0, 1, 2, 3 means 0, 1, 2, 4 data bytes, little-endian. Type 0 main, 1 global, 2 local. Main tags Input 8, Output 9, Collection 0x0A, Feature 0x0B, End Collection 0x0C. Global Report Size tag 7, Report ID tag 8, Report Count tag 9, Usage Page tag 0, Push 0x0A, Pop 0x0B. Local Usage tag 0, Usage Minimum 1, Usage Maximum 2. Collection data 1 is an application collection. No IOHID parser function is copied.",
+    "bounds": "One forward pass over the captured slice. A short item must fit in the slice. Prefix 0xFE, a pop with an empty stack, a push past 16, collection nesting past 16, or more than 64 collections fails the walk. Report ID data must be one byte, value 1..255. reportSize times reportCount, and each report's accumulated bit count, must not imply an on-wire report longer than 2038 bytes. Failure leaves no partial confirmation.",
+    "lengths": "Data bits for one Input, Output, or Feature item are reportSize times reportCount, and constant items count. Report ID bytes are not inside those data bits. When any Report ID item exists, the on-wire length of a report that has at least one matching main item is 1 plus (dataBits + 7) / 8. This is the same split IOHID uses when it starts a new report's bit count at 8 for the ID and later returns (bitCount + 7) / 8, ignoring an ID whose bit count never grows past 8 (HIDGetReportLength.c). Input, output, and feature counts stay separate for the same numeric ID.",
+    "usages": "A 1- or 2-byte local usage uses the current Usage Page. A 4-byte local usage uses its high 16 bits as the page and its low 16 bits as the usage. Local usages apply to the next main item and then clear. Each application collection records the local usage in effect at its Collection item."
+  },
+  "confirmation": {
+    "verdict_confirmed": "FEATURE_02_CONFIRMED",
+    "verdict_otherwise": "FEATURE_02_NOT_CONFIRMED",
+    "required_together": [
+      "The walk completes.",
+      "At least one Report ID item exists.",
+      "At least one Feature main item is emitted while the current Report ID is 2, and those Feature items add at least one data bit.",
+      "The on-wire length of feature report 2 is 2 bytes. The pinned J293 write is the two bytes {0x02, 0x01}: report ID 0x02 and one data byte (hid-magicmouse.c feature_mt_trackpad2_usb, hid_hw_raw_request HID_FEATURE_REPORT / HID_REQ_SET_REPORT).",
+      "That Feature item sits inside an application collection whose usage page and usage were both present.",
+      "Each Feature item of report 2 has at least one local usage, or a usage minimum/maximum pair.",
+      "Where metadata max_input is in 1..2038, every input report's on-wire length is at most max_input. Where max_output or max_control is nonzero, the same cap applies to output or feature reports. A recorded 0 is an absent diagnostic cap, not a zero-byte limit."
+    ],
+    "not_sufficient": [
+      "An Input item with report ID 2. magicmouse's SPI input path looks at data[0] == 0x02 and registers an input report of size 6; that size is the driver's stub, not a descriptor length.",
+      "The transport comment row 'mt mode: 0x40 0x02 0x52 0x02 0x00', or the SET_REPORT mapping command 0x52 / report 0x02 / payload {0x02, 0x01}. Those name the write. They are not the device descriptor.",
+      "A lone 0x02 or 0xB1 byte without a finished Feature item under report ID 2.",
+      "Interface metadata, country, or the keyboard descriptor."
+    ]
+  },
+  "inventory_always_recorded": [
+    "For every input, output, and feature report: ID, data bit count, on-wire byte length, and the enclosing application usage page and usage.",
+    "Whether input report 0x02, input report 0x60, and feature report 0xD9 occur, with their lengths. Input 0x02 and reset 0x60 are magicmouse's SPI report IDs. Feature 0xD9 is the 32-byte dimensions GET, which stays a separate review and is not authorized here.",
+    "The application usages named only as labels for whatever the bytes contain: Generic Desktop Pointer 0x01/0x01, Mouse 0x01/0x02, Digitizer Touch Pad 0x0D/0x05, Touch Screen 0x0D/0x04, Finger 0x0D/0x22 (IOHIDUsageTables.h). None of these numbers is required for FEATURE_02_CONFIRMED. The captured values are the usage evidence."
+  ],
+  "effect": "FEATURE_02_CONFIRMED is the descriptor evidence the mode gate asks for. It is not permission to send the write, to issue GET 0xD9, to touch device 3, or to claim pointer input. FEATURE_02_NOT_CONFIRMED keeps that gate closed. Pre-mode report behaviour remains unobserved.",
+  "references": {
+    "item_tags": "sources/puredarwin-baseline/src/Kernel/Extensions/IOHIDFamily/IOHIDFamily/IOHIDDescriptorParserPrivate.h",
+    "report_id_bit_init": "sources/puredarwin-baseline/src/Kernel/Extensions/IOHIDFamily/IOHIDSystem/IOHIDDescriptorParser/HIDProcessGlobalItem.c:151-175",
+    "feature_bit_add": "sources/puredarwin-baseline/src/Kernel/Extensions/IOHIDFamily/IOHIDSystem/IOHIDDescriptorParser/HIDProcessReportItem.c:190-197",
+    "byte_length": "sources/puredarwin-baseline/src/Kernel/Extensions/IOHIDFamily/IOHIDSystem/IOHIDDescriptorParser/HIDGetReportLength.c:98-118",
+    "usages": "sources/puredarwin-baseline/src/Kernel/Extensions/IOHIDFamily/IOHIDFamily/IOHIDUsageTables.h",
+    "spi_ids_and_write": "sources/linux-aurora-trackpad-reference/drivers/hid/hid-magicmouse.c:165-174, 1774-1812, 2390-2420; pin 6a08a08e; sha256 cfbc231b9e76ffac5e3cfe272ddfddc6094bee113e5404c3ac28183f8c77e2ad",
+    "product_branch": "sources/linux-aurora-trackpad-reference/drivers/hid/hid-ids.h:206 SPI_DEVICE_ID_APPLE_MACBOOK_PRO13_2020 0x0341; sha256 7627eb8a51b6b2e315ec83e2bca92192caa5633616329cff5b4159678018dcff",
+    "descriptor_is_parsed_not_invented": "sources/linux-aurora-keyboard-reference/drivers/hid/spi-hid/spi-hid-apple-core.c:385-389 apple_ll_parse passes the received descriptor to hid_parse_report; :425-432 maps a feature SET_REPORT. linux hid-core.c is not in the acquired pins.",
+    "plans": [
+      "reports/sprint-010/native-trackpad-spi-dev2-plan.json",
+      "reports/sprint-010/native-trackpad-spi-dev2-plan-addendum-001.json",
+      "reports/sprint-010/trackpad-enum-qualification-criteria.json"
+    ]
+  },
+  "not_claimed": [
+    "A device-2 descriptor has been captured",
+    "Feature report 0x02 is present on the J293 trackpad",
+    "Any particular application usage",
+    "Mode switch, feature SET, GET 0xD9, or pointer input"
+  ],
+  "hardware": false,
+  "sdk_build": false,
+  "source_edits": false
+}

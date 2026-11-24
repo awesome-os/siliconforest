@@ -1,0 +1,2269 @@
+diff --git a/crates/wm-darwin/src/cursor_thread.rs b/crates/wm-darwin/src/cursor_thread.rs
+new file mode 100644
+index 0000000..d310da0
+--- /dev/null
++++ b/crates/wm-darwin/src/cursor_thread.rs
+@@ -0,0 +1,265 @@
++//! The pointer's plane, moved by a thread of its own (DESK7, item 2b: "the pointer must NEVER stutter").
++//!
++//! Before: a pointer-only frame (a commit that moves the overlay plane) was made by the desktop's loop,
++//! so it waited for whatever the loop was doing - a client's commits (12-22 ms measured), a repaint (up
++//! to 99 ms with eight busy cores), a late wake-up (17 ms) - and with eight busy cores the pointer
++//! skipped refreshes. Now the cursor thread ("sfcursor", time-constraint class) takes the owner's pointer
++//! position from the input thread (`pointer.rs`) at every refresh, `lead` before the blank, and commits
++//! the plane's move on its own when nothing is in flight; the loop keeps rendering, staging and
++//! committing frames (which carry the newest position too). The loop commits its staged frame before the
++//! thread's moment (its margin is kept above the thread's lead); a frame that is late for its blank no
++//! longer holds the pointer: the thread moves the pointer on that blank and the frame follows on the
++//! next. The plane's buffer is the one the loop drew (image and place inside it); a place that needs a
++//! buffer drawn anew (the pointer within its plane's size of the right or bottom edge) is left to the
++//! loop (`needs_desk`).
++//!
++//! This file is the thread's bookkeeping (testable without a display); the thread and the display it
++//! shares with the loop are in `glrender.rs` (`KmsCore`).
++use crate::input_latency::Series;
++use std::time::{Duration, Instant};
++use wm_core::Point;
++
++/// What the desktop wants of the plane (set every loop turn).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct PlaneWanted {
++    /// The thread may move the plane: the pointer is on its plane and visible, no window follows it
++    /// (a move or resize grab draws the pointer with the window), no recording, one output.
++    pub enabled: bool,
++    /// The pointer image's generation, hotspot and size (the image's top left = pointer - hotspot).
++    pub generation: u64,
++    pub hotspot: Point,
++    pub image: (u32, u32),
++    pub screen: (u32, u32),
++}
++
++#[derive(Clone, Copy, Debug)]
++struct Aim {
++    blank: Instant,
++    by_thread: bool,
++    pointer_only: bool,
++    motions: Option<(Instant, Instant)>,
++}
++
++/// The thread's state, shared with the loop under the display's lock.
++pub struct PlaneShare {
++    pub wanted: PlaneWanted,
++    /// The pointer position the newest commit put on the plane.
++    pub committed: Option<Point>,
++    /// The thread found that the pointer's place needs a buffer drawn anew: the loop does that commit.
++    pub needs_desk: bool,
++    /// The hotspot and size of the last images the loop wanted, by generation: the thread moves the image
++    /// that is drawn while the loop has not drawn a new one yet (the position never waits for a shape).
++    pub images: Vec<(u64, Point, (u32, u32))>,
++    phase: Option<Instant>,
++    interval: Duration,
++    /// How long before the blank the thread commits (learned upwards from misses).
++    pub lead_us: u32,
++    aim: Option<Aim>,
++    oldest: Series,
++    newest: Series,
++    gaps: Series,
++    /// The same for the line every 10 s (kept apart: the inject `stats` windows stay whole).
++    periodic: (Series, Series, Series),
++    last_shown: Option<(Point, Instant)>,
++    pub thread_commits: u64,
++    pub desk_commits: u64,
++    pub pointer_only_late: u64,
++    pub pointer_only_on_time: u64,
++    pub skipped_busy: u64,
++    pub skipped_edge: u64,
++    logged_at: Option<Instant>,
++}
++
++pub const LEAD_START_US: u32 = 3_000;
++pub const LEAD_MIN_US: u32 = 2_600;
++pub const LEAD_MAX_US: u32 = 8_000;
++
++impl Default for PlaneShare {
++    fn default() -> Self {
++        Self {
++            wanted: PlaneWanted { enabled: false, generation: 0, hotspot: Point::new(0, 0), image: (0, 0), screen: (0, 0) },
++            committed: None,
++            needs_desk: false,
++            images: Vec::new(),
++            phase: None,
++            interval: Duration::from_micros(16_667),
++            lead_us: LEAD_START_US,
++            aim: None,
++            oldest: Series::default(),
++            newest: Series::default(),
++            gaps: Series::default(),
++            periodic: Default::default(),
++            last_shown: None,
++            thread_commits: 0,
++            desk_commits: 0,
++            pointer_only_late: 0,
++            pointer_only_on_time: 0,
++            skipped_busy: 0,
++            skipped_edge: 0,
++            logged_at: None,
++        }
++    }
++}
++
++impl PlaneShare {
++    /// The desktop's wish of this turn; the image's hotspot and size are kept by generation.
++    pub fn want(&mut self, wanted: PlaneWanted) {
++        if wanted.image.0 > 0 && !self.images.iter().any(|(g, ..)| *g == wanted.generation) {
++            if self.images.len() == 8 {
++                self.images.remove(0);
++            }
++            self.images.push((wanted.generation, wanted.hotspot, wanted.image));
++        }
++        self.wanted = wanted;
++    }
++    /// The hotspot and size of the image of `generation`, when the loop wanted it lately.
++    pub fn image_of(&self, generation: u64) -> Option<(Point, (u32, u32))> {
++        self.images.iter().rev().find(|(g, ..)| *g == generation).map(|(_, h, s)| (*h, *s))
++    }
++    /// The moment to commit for the first blank that can still be reached from `now`, and that blank.
++    pub fn next_moment(&self, now: Instant) -> Option<(Instant, Instant)> {
++        let phase = self.phase.filter(|p| now.saturating_duration_since(*p) < Duration::from_secs(1))?;
++        let lead = Duration::from_micros(u64::from(self.lead_us));
++        let i = self.interval.as_micros() as u64;
++        let since = (now + lead).saturating_duration_since(phase).as_micros() as u64;
++        let blank = phase + Duration::from_micros(since.div_ceil(i).max(1) * i);
++        Some((blank - lead, blank))
++    }
++    /// A commit was made at `at` aimed at `blank`, showing the pointer at `pos` (`motions`: the motions it
++    /// shows, from `PointerShared::take_motions`).
++    pub fn committed(&mut self, pos: Option<Point>, blank: Option<Instant>, pointer_only: bool, by_thread: bool, motions: Option<(Instant, Instant)>) {
++        if by_thread {
++            self.thread_commits += 1;
++        } else {
++            self.desk_commits += 1;
++        }
++        if pos.is_some() {
++            self.committed = pos;
++        }
++        let blank = blank.or_else(|| self.next_moment(Instant::now()).map(|(_, b)| b));
++        self.aim = blank.map(|blank| Aim { blank, by_thread, pointer_only, motions });
++    }
++    /// A flip completed at `at` (read by whichever thread read it first).
++    pub fn flipped(&mut self, at: Instant) {
++        if let Some(phase) = self.phase {
++            let d = at.saturating_duration_since(phase);
++            let i = self.interval.as_micros().max(1);
++            let off = d.as_micros() % i;
++            // a flip read a little late moves the phase only by an eighth (as the loop's pacer)
++            if off > i / 2 {
++                self.phase = Some(at);
++            } else {
++                self.phase = Some(at - Duration::from_micros(off as u64) + Duration::from_micros((off / 8) as u64));
++            }
++            if d > Duration::from_micros(15_000) && d < Duration::from_micros(18_500) {
++                self.interval = Duration::from_micros((self.interval.as_micros() as u64 * 15 + d.as_micros() as u64) / 16);
++            }
++        } else {
++            self.phase = Some(at);
++        }
++        let Some(aim) = self.aim.take() else { return };
++        let late = at > aim.blank + self.interval / 2;
++        if aim.pointer_only {
++            if late {
++                self.pointer_only_late += 1;
++                if aim.by_thread {
++                    self.lead_us = (self.lead_us + 500).min(LEAD_MAX_US);
++                }
++            } else {
++                self.pointer_only_on_time += 1;
++                if aim.by_thread {
++                    self.lead_us = self.lead_us.saturating_sub(5).max(LEAD_MIN_US);
++                }
++            }
++        }
++        if let Some((o, n)) = aim.motions {
++            self.oldest.sample(at.saturating_duration_since(o));
++            self.newest.sample(at.saturating_duration_since(n));
++            self.periodic.0.sample(at.saturating_duration_since(o));
++            self.periodic.1.sample(at.saturating_duration_since(n));
++            if let Some(pos) = self.committed {
++                if let Some((last, when)) = self.last_shown {
++                    let gap = at.saturating_duration_since(when);
++                    if last != pos && gap < Duration::from_millis(250) {
++                        self.gaps.sample(gap);
++                        self.periodic.2.sample(gap);
++                    }
++                }
++                self.last_shown = Some((pos, at));
++            }
++        }
++    }
++    /// One line of what happened since the last (the inject `stats` step, and every 10 s while the
++    /// pointer moves).
++    pub fn take_line(&mut self) -> String {
++        let text = |s: &mut Series, what: &str| {
++            let v = s.take_sorted();
++            crate::input_latency::window_text(&v, what)
++        };
++        let line = format!(
++            "WMCURSORTHREAD pointer motion->flip {} | {} | {} | commits thread={} desk={} pointer_only on_time={} late={} skipped busy={} edge={} lead_ms={:.2} interval_ms={:.3}",
++            text(&mut self.oldest, "oldest"),
++            text(&mut self.newest, "newest"),
++            text(&mut self.gaps, "gap between flips moving the pointer"),
++            self.thread_commits,
++            self.desk_commits,
++            self.pointer_only_on_time,
++            self.pointer_only_late,
++            self.skipped_busy,
++            self.skipped_edge,
++            f64::from(self.lead_us) / 1000.0,
++            self.interval.as_secs_f64() * 1000.0
++        );
++        line
++    }
++    /// A line every 10 s while samples come in (the owner's own use leaves a trace), from its own series.
++    pub fn maybe_line(&mut self) -> Option<String> {
++        if self.periodic.0.window_len() == 0 {
++            return None;
++        }
++        let at = *self.logged_at.get_or_insert_with(Instant::now);
++        if at.elapsed() < Duration::from_secs(10) {
++            return None;
++        }
++        self.logged_at = Some(Instant::now());
++        let (o, n, g) = (self.periodic.0.take_sorted(), self.periodic.1.take_sorted(), self.periodic.2.take_sorted());
++        Some(format!(
++            "WMCURSORTHREAD last pointer motion->flip {} | {} | {} | pointer_only on_time={} late={} lead_ms={:.2}",
++            crate::input_latency::window_text(&o, "oldest"),
++            crate::input_latency::window_text(&n, "newest"),
++            crate::input_latency::window_text(&g, "gap between flips moving the pointer"),
++            self.pointer_only_on_time,
++            self.pointer_only_late,
++            f64::from(self.lead_us) / 1000.0
++        ))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn the_thread_commits_its_lead_before_the_next_reachable_blank_and_learns_from_a_miss() {
++        let mut p = PlaneShare::default();
++        let t0 = Instant::now();
++        assert!(p.next_moment(t0).is_none(), "no flip seen yet: no phase");
++        p.flipped(t0);
++        let (at, blank) = p.next_moment(t0 + Duration::from_millis(1)).unwrap();
++        assert_eq!(blank, t0 + Duration::from_micros(16_667));
++        assert_eq!(at, blank - Duration::from_micros(u64::from(LEAD_START_US)));
++        // too late for that blank: the one after
++        let (_, later) = p.next_moment(t0 + Duration::from_millis(15)).unwrap();
++        assert_eq!(later, t0 + Duration::from_micros(2 * 16_667));
++        // a pointer-only commit by the thread shown a refresh late: more lead; its latency is counted
++        let motion = t0 + Duration::from_millis(2);
++        p.committed(Some(Point::new(5, 5)), Some(blank), true, true, Some((motion, motion)));
++        p.flipped(later);
++        assert_eq!((p.pointer_only_late, p.lead_us), (1, LEAD_START_US + 500));
++        let line = p.take_line();
++        assert!(line.contains("oldest n=1") && line.contains("late=1"), "{line}");
++        // on time: the lead comes back down slowly, never under the floor
++        p.committed(Some(Point::new(6, 5)), Some(later + Duration::from_micros(16_667)), true, true, None);
++        p.flipped(later + Duration::from_micros(16_667));
++        assert_eq!(p.lead_us, LEAD_START_US + 495);
++    }
++}
+diff --git a/crates/wm-darwin/src/desktop_entry.rs b/crates/wm-darwin/src/desktop_entry.rs
+index 6245a89..87c9d44 100644
+--- a/crates/wm-darwin/src/desktop_entry.rs
++++ b/crates/wm-darwin/src/desktop_entry.rs
+@@ -189,9 +189,20 @@ impl NativeIo<'_> {
+             if stamped.source == Source::Device {
+                 self.server.owner_input(&stamped.event, ms);
+             }
++            // the instrument's `seat owner` records (a timed stream already running) never move the
++            // owner's pointer while he is active (DESK7: a stream ran on for its 10 s when he came)
++            let refused = matches!(stamped.event, Event::Pointer { .. }) && stamped.pos.is_none() && self.server.pointer_shared.is_some();
++            if stamped.source == Source::InjectOwner && (self.server.owner.active() || refused) {
++                self.server.owner.synthetic_while_active += 1;
++                continue;
++            }
++            self.server.set_next_position(stamped.pos);
+             if let Event::Pointer { motion, .. } = stamped.event {
+                 if motion != Motion::Relative(0, 0) {
+-                    self.server.note_pointer_motion(stamped.at);
++                    // with the cursor thread moving the plane its own line counts the latency
++                    if !self.server.pointer_thread_covers {
++                        self.server.note_pointer_motion(stamped.at);
++                    }
+                     self.server.loop_probe.queue_wait.sample(stamped.at.elapsed());
+                 }
+             }
+@@ -454,6 +465,8 @@ fn run_session(options: Options) -> Result<(), String> {
+         },
+     };
+     server.enable_sfhid_seat_caps(&display.handle(), input.seat_caps())?;
++    // DESK7: the pointer's position kept by the input thread; the cursor thread moves the plane from it
++    server.start_pointer_thread(input.pointer());
+     server.enable_desktop_shell_with(fonts, theme.as_deref())?;
+     // A wallpaper chosen from the menu before outlives the theme's own.
+     let wallpaper_source = match chonk_shell::wallpaper::Wallpaper::load() {
+diff --git a/crates/wm-darwin/src/foreign.rs b/crates/wm-darwin/src/foreign.rs
+index 35d90dd..78e3aad 100644
+--- a/crates/wm-darwin/src/foreign.rs
++++ b/crates/wm-darwin/src/foreign.rs
+@@ -37,6 +37,30 @@ pub struct ForeignToplevels {
+     /// AppKit applications running without a window (pid, app id, name), read twice a second.
+     windowless: Vec<(i32, String, String)>,
+     windowless_at: Option<std::time::Instant>,
++    /// Applications left by a compositor that ended (DESK7, the owner: Firefox ran on with no window and
++    /// its sound playing): an AppKit process still serving its application-menu socket that is not a
++    /// client of this compositor (pid, app id, name). They cannot show a window again; their dock tile
++    /// restarts them (Quit, then open), the dock's or the switcher's Quit ends them.
++    orphans: Vec<(i32, String, String)>,
++    orphans_at: Option<std::time::Instant>,
++    /// Restarts in progress: pid, app id, since (the application opens again once the pid is gone).
++    restarting: Vec<(i32, String, std::time::Instant)>,
++    orphan_notice: bool,
++}
++
++/// `$XDG_RUNTIME_DIR/app-ids/<pid>`: the application id a client gave, for the compositor after this one
++/// (its leftover applications are shown under that id: the dock's tile matches it).
++pub(crate) fn record_app_id(pid: i32, app_id: &str) {
++    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from) else { return };
++    let dir = runtime.join("app-ids");
++    let path = dir.join(pid.to_string());
++    if std::fs::read_to_string(&path).is_ok_and(|t| t == app_id) {
++        return;
++    }
++    let _ = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, app_id));
++}
++fn recorded_app_id(runtime: &std::path::Path, pid: i32) -> Option<String> {
++    std::fs::read_to_string(runtime.join("app-ids").join(pid.to_string())).ok().filter(|t| !t.trim().is_empty()).map(|t| t.trim().to_string())
+ }
+ 
+ /// A handle for an AppKit application that runs without a window (it closed its last one, or
+@@ -81,7 +105,7 @@ impl Server {
+                 }
+                 Some((c.window, Shown { title: w.title.clone().unwrap_or_default(), app_id: w.app_id.clone().unwrap_or_default(), states: states_bytes(&states) }))
+             })
+-            .chain(self.foreign.windowless.iter().map(|(pid, app_id, name)| (WINDOWLESS_BASE + *pid as u64, Shown { title: name.clone(), app_id: app_id.clone(), states: Vec::new() })))
++            .chain(self.foreign.windowless.iter().chain(self.foreign.orphans.iter()).map(|(pid, app_id, name)| (WINDOWLESS_BASE + *pid as u64, Shown { title: name.clone(), app_id: app_id.clone(), states: Vec::new() })))
+             .collect()
+     }
+     /// The AppKit applications without a window now: a client still connected whose toplevels
+@@ -110,8 +134,94 @@ impl Server {
+             self.foreign.windowless = windowless;
+         }
+     }
++    /// Leftover applications of a compositor that ended (`ForeignToplevels::orphans`), every 2 s; the
++    /// restarts asked of them carried on.
++    fn refresh_orphans(&mut self) {
++        let now = std::time::Instant::now();
++        self.restarts_tick(now);
++        if self.foreign.orphans_at.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(2)) {
++            return;
++        }
++        self.foreign.orphans_at = Some(now);
++        let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from).unwrap_or_else(|| std::path::PathBuf::from("/private/var/run/gpu-desktop"));
++        let connected: Vec<i32> = crate::server::live_peers().iter().filter_map(|p| p.pid).collect();
++        let mut orphans: Vec<(i32, String, String)> = Vec::new();
++        let Ok(entries) = std::fs::read_dir(runtime.join("app-menu")) else { return };
++        for entry in entries.flatten() {
++            let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<i32>().ok()) else { continue };
++            if pid <= 1 || connected.contains(&pid) || self.foreign.restarting.iter().any(|(p, ..)| *p == pid) {
++                continue;
++            }
++            // alive (a stale socket file of an ended process is not an application)
++            if unsafe { libc::kill(pid, 0) } != 0 {
++                continue;
++            }
++            let Some(bundle) = crate::macdesk::pid_path(pid).and_then(|p| wm_theme::app_icon::enclosing_bundle(&p)) else { continue };
++            let app_id = recorded_app_id(&runtime, pid)
++                .or_else(|| wm_theme::app_icon::bundles().into_iter().find(|(_, path)| *path == bundle).map(|(id, _)| id))
++                .unwrap_or_else(|| bundle.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
++            let name = bundle.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| app_id.clone());
++            orphans.push((pid, app_id, name));
++        }
++        orphans.sort();
++        if orphans != self.foreign.orphans {
++            eprintln!("WMORPHAN applications left by the compositor before, running without a window: {:?}", orphans.iter().map(|(pid, id, _)| format!("{id}({pid})")).collect::<Vec<_>>());
++            if !orphans.is_empty() && !self.foreign.orphan_notice {
++                self.foreign.orphan_notice = true;
++                let names: Vec<&str> = orphans.iter().map(|(_, _, n)| n.as_str()).collect();
++                #[cfg(feature = "desktop-shell")]
++                self.show_desktop_notice(&format!("Still running without a window after the desktop restarted: {}. Click its dock tile to bring it back, or right-click it > Quit.", names.join(", ")));
++                #[cfg(not(feature = "desktop-shell"))]
++                let _ = names;
++            }
++            self.foreign.orphans = orphans;
++        }
++    }
++    /// A leftover application asked to come back: it is quit (its menu's Quit, else SIGTERM) and opened
++    /// again once it has ended; one that does not end is ended (SIGTERM at 5 s, SIGKILL at 12 s).
++    pub(crate) fn restart_orphan(&mut self, pid: i32) -> bool {
++        let Some(at) = self.foreign.orphans.iter().position(|(p, ..)| *p == pid) else { return false };
++        let (pid, app_id, _) = self.foreign.orphans.remove(at);
++        eprintln!("WMORPHAN restart {app_id}({pid}): quit, then open again");
++        crate::macdesk::quit_mac_app(pid);
++        self.foreign.restarting.push((pid, app_id, std::time::Instant::now()));
++        true
++    }
++    /// The pid of a leftover application with this app id.
++    pub(crate) fn orphan_pid(&self, app_id: &str) -> Option<i32> {
++        self.foreign.orphans.iter().find(|(_, id, _)| id.eq_ignore_ascii_case(app_id)).map(|(p, ..)| *p)
++    }
++    /// A leftover application ended from the dock or the switcher.
++    pub(crate) fn quit_orphan(&mut self, pid: i32) -> bool {
++        let Some(at) = self.foreign.orphans.iter().position(|(p, ..)| *p == pid) else { return false };
++        let (pid, app_id, _) = self.foreign.orphans.remove(at);
++        eprintln!("WMORPHAN quit {app_id}({pid})");
++        crate::macdesk::quit_mac_app(pid);
++        true
++    }
++    fn restarts_tick(&mut self, now: std::time::Instant) {
++        let mut done = Vec::new();
++        for (i, (pid, _app_id, since)) in self.foreign.restarting.iter().enumerate() {
++            let alive = unsafe { libc::kill(*pid, 0) } == 0;
++            let waited = now.duration_since(*since);
++            if !alive {
++                done.push(i);
++            } else if waited > std::time::Duration::from_secs(12) {
++                crate::server::kill_pid(*pid, libc::SIGKILL);
++            } else if waited > std::time::Duration::from_secs(5) && waited < std::time::Duration::from_millis(5600) {
++                crate::server::kill_pid(*pid, libc::SIGTERM);
++            }
++        }
++        for i in done.into_iter().rev() {
++            let (pid, app_id, since) = self.foreign.restarting.remove(i);
++            eprintln!("WMORPHAN {app_id}({pid}) ended after {} ms: opened again", since.elapsed().as_millis());
++            #[cfg(feature = "desktop-shell")]
++            self.open_application(&app_id, None);
++        }
++    }
+     /// Once a frame: new windows, changes, windows gone.
+     pub fn foreign_sync(&mut self) {
++        self.refresh_orphans();
+         if self.foreign.listeners.is_empty() {
+             return;
+         }
+@@ -187,6 +297,19 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, u64> for Server {
+         let window = *window;
+         if window >= WINDOWLESS_BASE {
+             let pid = (window - WINDOWLESS_BASE) as i32;
++            // a leftover of a compositor that ended: its tile restarts it, Quit ends it
++            if state.foreign.orphans.iter().any(|(p, ..)| *p == pid) {
++                match request {
++                    handle::Request::Activate { .. } | handle::Request::UnsetMinimized => {
++                        state.restart_orphan(pid);
++                    }
++                    handle::Request::Close => {
++                        state.quit_orphan(pid);
++                    }
++                    _ => {}
++                }
++                return;
++            }
+             if !state.foreign.windowless.iter().any(|(p, ..)| *p == pid) {
+                 return;
+             }
+diff --git a/crates/wm-darwin/src/glrender.rs b/crates/wm-darwin/src/glrender.rs
+index 7d16e26..95dab0a 100644
+--- a/crates/wm-darwin/src/glrender.rs
++++ b/crates/wm-darwin/src/glrender.rs
+@@ -81,6 +81,25 @@ pub trait GlTarget {
+     fn head_present(&mut self, _: usize, _: &Libraries) -> Result<(), String> {
+         Ok(())
+     }
++    /// The cursor thread (DESK7, `cursor_thread.rs`), for targets with a pointer plane.
++    fn start_pointer_thread(&mut self, _: std::sync::Arc<crate::pointer::PointerShared>) -> bool {
++        false
++    }
++    /// What the desktop wants of the plane now; `true`: the thread moves the pointer (the loop makes no
++    /// pointer-only commits of its own).
++    fn pointer_plane(&mut self, _: crate::cursor_thread::PlaneWanted) -> bool {
++        false
++    }
++    fn pointer_thread_line(&mut self) -> Option<String> {
++        None
++    }
++    fn pointer_thread_maybe_line(&mut self) -> Option<String> {
++        None
++    }
++    fn pointer_lead_us(&self) -> Option<u32> {
++        None
++    }
++    fn set_pointer_thread(&mut self, _: bool) {}
+ }
+ 
+ /// An external display's CRTC with its buffers and its own flips (DESK5).
+@@ -198,24 +217,44 @@ impl GlTarget for OffscreenTarget {
+     }
+ }
+ 
+-/// Three scanout buffers on the display, shown by atomic page flip. The
+-/// flip-complete event releases the previous front buffer and is the frame
+-/// clock; until it arrives the target is busy.
+-pub struct KmsTarget {
++/// The display and what is in flight on it, shared by the desktop's loop and the cursor thread
++/// (DESK7, `cursor_thread.rs`): every commit and every read of flip events happens under its lock,
++/// held only for those (never while drawing).
++pub(crate) struct KmsCore {
+     kms: Kms,
+     buffers: Vec<ScanoutBuffer>,
+     /// What is on screen and which commit the display owes an event for.
+     queue: FlipQueue,
+-    drawing: Option<usize>,
+     /// Drawn, kept for its commit (late latching with the pointer on its plane).
+     staged: Option<usize>,
+-    last: Option<usize>,
+     steps: Steps,
+     cursor: Option<CursorBuffers>,
++    /// Flips read by either thread, for the loop's `poll` (frame callbacks, pacing).
++    shown: std::collections::VecDeque<crate::kms::Shown>,
++    plane: crate::cursor_thread::PlaneShare,
++}
++// SAFETY: the core holds file descriptors, numbers and the scanout buffers' CPU mappings (used only to
++// check pixels, by the loop); every use goes through the one mutex.
++unsafe impl Send for KmsCore {}
++
++/// Three scanout buffers on the display, shown by atomic page flip. The
++/// flip-complete event releases the previous front buffer and is the frame
++/// clock; until it arrives the target is busy.
++pub struct KmsTarget {
++    core: std::sync::Arc<std::sync::Mutex<KmsCore>>,
++    card: libc::c_int,
++    drawing: Option<usize>,
++    last: Option<usize>,
+     /// External displays (DESK5), and the buffers of ones unplugged, kept for a replug at the
+     /// same mode (there is no free of a GEM buffer here yet).
+     heads: Vec<HeadTarget>,
+     spare: Vec<((u32, u32), Vec<ScanoutBuffer>)>,
++    /// The cursor thread (DESK7): its stop, the pipe it rings when it read a flip, the shared pointer.
++    thread: Option<(std::sync::Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>)>,
++    wake: Option<(std::fs::File, std::fs::File)>,
++    pointer: Option<std::sync::Arc<crate::pointer::PointerShared>>,
++    /// The test instrument's `cursorthread off` (before/after numbers).
++    pub thread_allowed: bool,
+ }
+ /// The real display behind the flip queue, for the length of one call.
+ struct Live<'a> {
+@@ -232,6 +271,188 @@ impl Scanout for Live<'_> {
+         self.kms.wait_flip(timeout)
+     }
+ }
++impl KmsCore {
++    fn placement(&self) -> Option<OverlayPlacement> {
++        let c = self.cursor.as_ref()?;
++        let (index, at) = c.next?;
++        Some(OverlayPlacement { fb: c.buffers[index].fb, x: at.x, y: at.y, w: c.size, h: c.size })
++    }
++    /// After a commit: what it put on the plane is what is shown (once its flip completes; a
++    /// buffer is only drawn in when it is neither shown nor about to be).
++    fn cursor_committed(&mut self) {
++        let failed = self.kms.overlay().is_none();
++        if let Some(c) = self.cursor.as_mut() {
++            c.shown = if failed { None } else { c.next.map(|n| n.0) };
++        }
++        if failed {
++            self.cursor = None;
++        }
++    }
++    /// The flips the display has reported, without waiting: each for the loop, and the cursor thread's
++    /// phase. `true`: one or more were read.
++    fn read_flips(&mut self, libs: &Libraries) -> Result<bool, String> {
++        let mut any = false;
++        for _ in 0..4 {
++            let mut display = Live { kms: &mut self.kms, buffers: &self.buffers, libs, steps: &mut self.steps };
++            let Some(shown) = self.queue.poll(&mut display, Duration::ZERO)? else { break };
++            self.plane.flipped(shown.flip.at);
++            self.shown.push_back(shown);
++            any = true;
++        }
++        Ok(any)
++    }
++    /// The pointer's image on the plane as the loop drew it: buffer, generation, place inside it.
++    fn drawn_cursor(&self) -> Option<(usize, u64, Point, u32)> {
++        let c = self.cursor.as_ref()?;
++        let i = c.shown?;
++        let (generation, offset) = c.holds[i]?;
++        Some((i, generation, offset, c.size))
++    }
++    /// The plane at `root` with the image the loop drew, if that needs no buffer drawn anew.
++    fn place_for(&self, root: Point) -> Result<(usize, Point), bool> {
++        let w = &self.plane.wanted;
++        let Some((index, generation, offset, size)) = self.drawn_cursor() else { return Err(false) };
++        // the image that is drawn, with its own hotspot: a new shape the loop has not drawn yet does not
++        // hold the position back (it follows with the loop's next commit)
++        let Some((hotspot, image)) = self.plane.image_of(generation) else { return Err(false) };
++        let origin = Point::new(root.x - hotspot.x, root.y - hotspot.y);
++        match place_cursor(origin, image, size, w.screen) {
++            CursorPlace::Plane { plane, offset: o } if o == offset => Ok((index, plane)),
++            _ => Err(true),
++        }
++    }
++    /// The cursor thread's commit for `blank`: the pointer's plane moved to where the owner's pointer is
++    /// now, the frame on the screen kept. Nothing when the display has something in flight, the plane
++    /// is not the thread's now, or the pointer is shown where it is.
++    fn thread_commit(&mut self, libs: &Libraries, pointer: &crate::pointer::PointerShared, blank: Option<Instant>) -> Result<bool, String> {
++        if !self.plane.wanted.enabled {
++            return Ok(false);
++        }
++        let root = pointer.root();
++        if self.plane.committed == Some(root) {
++            return Ok(false);
++        }
++        let Some(front) = self.queue.front() else { return Ok(false) };
++        if self.queue.busy() {
++            self.plane.skipped_busy += 1;
++            return Ok(false);
++        }
++        let (index, at) = match self.place_for(root) {
++            Ok(p) => p,
++            Err(edge) => {
++                if edge {
++                    self.plane.skipped_edge += 1;
++                    self.plane.needs_desk = true;
++                }
++                return Ok(false);
++            }
++        };
++        if let Some(c) = self.cursor.as_mut() {
++            c.next = Some((index, at));
++        }
++        let placement = self.placement();
++        self.kms.set_overlay(placement);
++        let mut display = Live { kms: &mut self.kms, buffers: &self.buffers, libs, steps: &mut self.steps };
++        self.queue.submit(&mut display, front)?;
++        self.cursor_committed();
++        self.plane.committed(Some(root), blank, true, true, pointer.take_motions());
++        Ok(true)
++    }
++}
++
++fn cursor_thread(core: std::sync::Arc<std::sync::Mutex<KmsCore>>, pointer: std::sync::Arc<crate::pointer::PointerShared>, stop: std::sync::Arc<std::sync::atomic::AtomicBool>, wake: std::fs::File, card: libc::c_int) {
++    let libs = match Libraries::load() {
++        Ok(libs) => libs,
++        Err(error) => {
++            eprintln!("WMCURSOR thread not started: {error}");
++            return;
++        }
++    };
++    // every refresh about a millisecond of work at most, done within four
++    crate::input_latency::time_constraint("sfcursor", 16_667, 1_000, 4_000);
++    let ring = |wake: &std::fs::File| {
++        let _ = std::io::Write::write(&mut &*wake, &[1]);
++    };
++    let mut seen = 0u64;
++    let mut errors = 0u32;
++    while !stop.load(std::sync::atomic::Ordering::Acquire) {
++        let (unshown, moment) = {
++            let mut c = core.lock().unwrap_or_else(|e| e.into_inner());
++            match c.read_flips(&libs) {
++                Ok(true) => ring(&wake),
++                Ok(false) => {}
++                Err(error) => {
++                    errors += 1;
++                    if errors <= 3 {
++                        eprintln!("WMCURSOR thread: reading flips: {error}");
++                    }
++                }
++            }
++            let unshown = c.plane.wanted.enabled && c.plane.committed != Some(pointer.root());
++            (unshown, c.plane.next_moment(Instant::now()))
++        };
++        if !unshown {
++            seen = pointer.wait_motion(seen, Duration::from_millis(20));
++            continue;
++        }
++        let blank = match moment {
++            Some((at, blank)) => {
++                if !crate::input_latency::wait_until(at) {
++                    std::thread::sleep(at.saturating_duration_since(Instant::now()));
++                }
++                Some(blank)
++            }
++            None => None,
++        };
++        let committed = {
++            let mut c = core.lock().unwrap_or_else(|e| e.into_inner());
++            if let Ok(true) = c.read_flips(&libs) {
++                ring(&wake);
++            }
++            let r = c.thread_commit(&libs, &pointer, blank);
++            if c.plane.needs_desk {
++                ring(&wake);
++            }
++            r
++        };
++        match committed {
++            // its flip is read as it completes (a flip read a refresh later would count as a miss, raise
++            // the lead and be timed a refresh late: measured on the M1, desk7-003)
++            Ok(true) => {
++                let until = blank.unwrap_or_else(Instant::now) + Duration::from_millis(8);
++                loop {
++                    let left = until.saturating_duration_since(Instant::now());
++                    if left.is_zero() {
++                        break;
++                    }
++                    let _ = crate::kms::poll_readable(card, Some(left));
++                    let mut c = core.lock().unwrap_or_else(|e| e.into_inner());
++                    if let Ok(true) = c.read_flips(&libs) {
++                        ring(&wake);
++                    }
++                    if !c.queue.busy() {
++                        break;
++                    }
++                }
++            }
++            Ok(false) => {
++                // nothing possible for this blank (in flight, an edge for the loop): the next one; without
++                // a phase, a little later
++                if moment.is_none() {
++                    std::thread::sleep(Duration::from_millis(2));
++                }
++            }
++            Err(error) => {
++                errors += 1;
++                if errors <= 3 {
++                    eprintln!("WMCURSOR thread: commit: {error}");
++                }
++                std::thread::sleep(Duration::from_millis(16));
++            }
++        }
++    }
++}
++
+ impl KmsTarget {
+     pub fn open(libs: &Libraries, context: &Context, wait: FlipWait) -> Result<Self, String> {
+         if !context.has_display_extension("EGL_EXT_image_dma_buf_import") || !context.has_gl_extension("GL_OES_EGL_image") {
+@@ -265,96 +486,163 @@ impl KmsTarget {
+                 }
+             }
+         }
+-        Ok(Self { kms, buffers, queue: FlipQueue::new(), drawing: None, staged: None, last: None, steps, cursor, heads: Vec::new(), spare: Vec::new() })
++        let card = kms.event_fd();
++        let core = KmsCore { kms, buffers, queue: FlipQueue::new(), staged: None, steps, cursor, shown: Default::default(), plane: Default::default() };
++        Ok(Self {
++            core: std::sync::Arc::new(std::sync::Mutex::new(core)),
++            card,
++            drawing: None,
++            last: None,
++            heads: Vec::new(),
++            spare: Vec::new(),
++            thread: None,
++            wake: None,
++            pointer: None,
++            thread_allowed: std::env::var("CHONKSTEP_DARWIN_CURSOR_THREAD").map_or(true, |v| v != "0"),
++        })
+     }
+-    fn placement(&self) -> Option<OverlayPlacement> {
+-        let c = self.cursor.as_ref()?;
+-        let (index, at) = c.next?;
+-        Some(OverlayPlacement { fb: c.buffers[index].fb, x: at.x, y: at.y, w: c.size, h: c.size })
++    fn core(&self) -> std::sync::MutexGuard<'_, KmsCore> {
++        self.core.lock().unwrap_or_else(|e| e.into_inner())
+     }
+-    pub fn kms(&self) -> &Kms {
+-        &self.kms
++    pub fn card_fd(&self) -> libc::c_int {
++        self.card
+     }
+-    /// After a commit: what it put on the plane is what is shown (once its flip completes; a
+-    /// buffer is only drawn in when it is neither shown nor about to be).
+-    fn cursor_committed(&mut self) {
+-        let failed = self.kms.overlay().is_none();
+-        if let Some(c) = self.cursor.as_mut() {
+-            c.shown = if failed { None } else { c.next.map(|n| n.0) };
+-        }
+-        if failed {
+-            self.cursor = None;
++    /// Waits (up to `limit`) for what the display has in flight (a pointer-only flip of the cursor thread),
++    /// for the calls that must not overlap one.
++    fn settle(&mut self, libs: &Libraries, limit: Duration) -> Result<(), String> {
++        let until = Instant::now() + limit;
++        loop {
++            {
++                let mut c = self.core();
++                c.read_flips(libs)?;
++                if !c.queue.busy() {
++                    return Ok(());
++                }
++            }
++            if Instant::now() >= until {
++                return Ok(());
++            }
++            let _ = crate::kms::poll_readable(self.card, Some(Duration::from_millis(2)));
+         }
+     }
+ }
+ impl GlTarget for KmsTarget {
+     fn size(&self) -> (u32, u32) {
+-        (self.kms.width(), self.kms.height())
++        let c = self.core();
++        (c.kms.width(), c.kms.height())
+     }
+     fn name(&self) -> &'static str {
+         "kms"
+     }
+     fn busy(&self) -> bool {
+-        self.queue.busy()
++        self.core().queue.busy()
+     }
+     fn begin(&mut self) -> Result<GLuint, String> {
+-        if self.queue.busy() {
++        let c = self.core();
++        // a pointer-only flip of the front buffer may be in flight (the cursor thread's): drawing into
++        // another buffer does not touch it
++        if c.queue.busy() && c.queue.pending_index().is_none_or(|p| Some(p) != c.queue.front()) {
+             return Err("KMS target: a commit is still in flight".into());
+         }
+-        if self.staged.is_some() {
++        if c.staged.is_some() {
+             return Err("KMS target: a staged frame has not been committed".into());
+         }
+-        let index = (0..self.buffers.len())
+-            .find(|i| Some(*i) != self.queue.front())
++        let index = (0..c.buffers.len())
++            .find(|i| Some(*i) != c.queue.front() && Some(*i) != c.queue.pending_index())
+             .ok_or("KMS target: no free buffer")?;
++        let fbo = c.buffers[index].fbo;
++        drop(c);
+         self.drawing = Some(index);
+-        Ok(self.buffers[index].fbo)
++        Ok(fbo)
+     }
+     fn present(&mut self, libs: &Libraries) -> Result<(), String> {
+         let index = self.drawing.take().ok_or("KMS target: present without begin")?;
+         self.last = Some(index);
+-        if self.queue.front().is_none() {
+-            self.steps.step("first commit (sets the mode)");
++        self.settle(libs, Duration::from_millis(40))?;
++        let mut c = self.core();
++        if c.queue.front().is_none() {
++            c.steps.step("first commit (sets the mode)");
+         }
+-        let placement = self.placement();
+-        self.kms.set_overlay(placement);
+-        let mut display = Live { kms: &mut self.kms, buffers: &self.buffers, libs, steps: &mut self.steps };
+-        self.queue.submit(&mut display, index)?;
+-        self.cursor_committed();
++        let placement = c.placement();
++        c.kms.set_overlay(placement);
++        let c = &mut *c;
++        let mut display = Live { kms: &mut c.kms, buffers: &c.buffers, libs, steps: &mut c.steps };
++        c.queue.submit(&mut display, index)?;
++        c.cursor_committed();
++        c.plane.committed(None, None, false, false, None);
+         Ok(())
+     }
+     fn stage(&mut self) -> Result<(), String> {
+         let index = self.drawing.take().ok_or("KMS target: stage without begin")?;
+         self.last = Some(index);
+-        self.staged = Some(index);
++        self.core().staged = Some(index);
+         Ok(())
+     }
+     fn staged(&self) -> bool {
+-        self.staged.is_some()
++        self.core().staged.is_some()
+     }
+     fn commit(&mut self, libs: &Libraries) -> Result<bool, String> {
+-        if self.queue.busy() {
+-            return Err("KMS target: commit while a commit is in flight".into());
++        let pointer = self.pointer.clone();
++        let mut c = self.core();
++        // the cursor thread may have taken the display since the loop looked: the frame waits
++        if c.queue.busy() {
++            return Ok(false);
+         }
+-        let Some(index) = self.staged.take().or(self.queue.front()) else {
++        let Some(index) = c.staged.take().or(c.queue.front()) else {
+             return Ok(false);
+         };
+-        if self.queue.front().is_none() {
+-            self.steps.step("first commit (sets the mode)");
++        if c.queue.front().is_none() {
++            c.steps.step("first commit (sets the mode)");
+         }
+-        let placement = self.placement();
+-        self.kms.set_overlay(placement);
+-        let mut display = Live { kms: &mut self.kms, buffers: &self.buffers, libs, steps: &mut self.steps };
+-        self.queue.submit(&mut display, index)?;
+-        self.cursor_committed();
++        // the newest position of the owner's pointer, when the plane can show it with what is drawn
++        let pointer_only = Some(index) == c.queue.front();
++        let mut shows = None;
++        let mut motions = None;
++        if let (Some(pointer), true) = (pointer.as_ref(), c.plane.wanted.enabled) {
++            let root = pointer.root();
++            let chosen = c.cursor.as_ref().and_then(|cur| cur.next).map(|n| n.0);
++            // the newest position, with the very image the loop chose for this commit (a new shape it
++            // just drew is not replaced by the one on the screen)
++            if let Ok((buffer, at)) = c.place_for(root) {
++                if Some(buffer) == chosen {
++                    if let Some(cur) = c.cursor.as_mut() {
++                        cur.next = Some((buffer, at));
++                    }
++                    shows = Some(root);
++                    motions = pointer.take_motions();
++                }
++            }
++        }
++        if shows.is_none() {
++            if let Some((_, at)) = c.cursor.as_ref().and_then(|cur| cur.next) {
++                let w = c.plane.wanted;
++                let offset = c.cursor.as_ref().and_then(|cur| cur.next.and_then(|(i, _)| cur.holds[i])).map(|(_, o)| o).unwrap_or(Point::new(0, 0));
++                shows = Some(Point::new(at.x + offset.x + w.hotspot.x, at.y + offset.y + w.hotspot.y));
++            }
++        }
++        let placement = c.placement();
++        c.kms.set_overlay(placement);
++        let core = &mut *c;
++        let mut display = Live { kms: &mut core.kms, buffers: &core.buffers, libs, steps: &mut core.steps };
++        if let Err(error) = core.queue.submit(&mut display, index) {
++            if !pointer_only {
++                core.staged = Some(index);
++            }
++            return Err(error);
++        }
++        core.cursor_committed();
++        core.plane.needs_desk = false;
++        core.plane.committed(shows, None, pointer_only, false, motions);
+         Ok(true)
+     }
+     fn cursor_plane(&self) -> Option<u32> {
+-        self.kms.overlay()?;
+-        self.cursor.as_ref().map(|c| c.size)
++        let c = self.core();
++        c.kms.overlay()?;
++        c.cursor.as_ref().map(|c| c.size)
+     }
+     fn cursor_begin(&mut self, want: (u64, Point)) -> Option<(usize, GLuint, bool)> {
+-        let c = self.cursor.as_mut()?;
++        let mut core = self.core();
++        let c = core.cursor.as_mut()?;
+         if let Some(i) = c.holds.iter().position(|h| *h == Some(want)) {
+             return Some((i, c.buffers[i].fbo, false));
+         }
+@@ -366,11 +654,14 @@ impl GlTarget for KmsTarget {
+         Some((i, c.buffers[i].fbo, true))
+     }
+     fn set_cursor(&mut self, placement: Option<(usize, Point)>) {
+-        if let Some(c) = self.cursor.as_mut() {
++        if let Some(c) = self.core().cursor.as_mut() {
+             c.next = placement;
+         }
+     }
+     fn set_heads(&mut self, libs: &Libraries, context: &Context, wanted: &[(String, wm_core::Rect)]) -> Result<Vec<String>, String> {
++        let core_arc = self.core.clone();
++        let mut core = core_arc.lock().unwrap_or_else(|e| e.into_inner());
++        let core = &mut *core;
+         // gone ones off; their buffers kept for a replug at the same mode
+         let mut i = 0;
+         while i < self.heads.len() {
+@@ -380,7 +671,7 @@ impl GlTarget for KmsTarget {
+                 continue;
+             }
+             let h = self.heads.remove(i);
+-            self.kms.close_head(libs, &h.head);
++            core.kms.close_head(libs, &h.head);
+             eprintln!("WMOUTPUT head {} (CRTC {}) off", h.head.name, h.head.crtc_id);
+             self.spare.push((h.head.size(), h.buffers));
+         }
+@@ -389,7 +680,7 @@ impl GlTarget for KmsTarget {
+             if self.heads.iter().any(|h| h.head.name == *name) {
+                 continue;
+             }
+-            let head = match self.kms.open_head(libs, name) {
++            let head = match core.kms.open_head(libs, name) {
+                 Ok(head) => head,
+                 Err(error) => {
+                     errors.push(error);
+@@ -402,7 +693,7 @@ impl GlTarget for KmsTarget {
+                 None => {
+                     let mut made = Vec::new();
+                     for index in 0..3 {
+-                        match self.kms.create_buffer_sized(libs, context, 20 + index, size, DRM_FORMAT_XRGB8888, &mut self.steps) {
++                        match core.kms.create_buffer_sized(libs, context, 20 + index, size, DRM_FORMAT_XRGB8888, &mut core.steps) {
+                             Ok(b) => made.push(b),
+                             Err(error) => {
+                                 errors.push(format!("{name}: buffer {index}: {error}"));
+@@ -443,57 +734,173 @@ impl GlTarget for KmsTarget {
+         Some((h.buffers[index].fbo, h.head.size(), h.view))
+     }
+     fn head_present(&mut self, i: usize, libs: &Libraries) -> Result<(), String> {
++        let core_arc = self.core.clone();
++        let mut core = core_arc.lock().unwrap_or_else(|e| e.into_inner());
+         let Some(h) = self.heads.get_mut(i) else { return Ok(()) };
+         let index = h.drawing.take().ok_or("head: present without begin")?;
+-        let mut display = HeadLive { kms: &mut self.kms, head: &mut h.head, buffers: &h.buffers, libs };
++        let mut display = HeadLive { kms: &mut core.kms, head: &mut h.head, buffers: &h.buffers, libs };
+         h.queue.submit(&mut display, index)
+     }
+     fn poll(&mut self, libs: &Libraries, timeout: Duration) -> Result<Option<Presented>, String> {
+-        // the external displays' flips complete on their own (no wait for them here)
+-        for h in self.heads.iter_mut() {
+-            let mut display = HeadLive { kms: &mut self.kms, head: &mut h.head, buffers: &h.buffers, libs };
+-            if let Err(error) = h.queue.poll(&mut display, Duration::ZERO) {
+-                eprintln!("WMOUTPUT head {}: {error}", h.head.name);
++        let deadline = Instant::now() + timeout;
++        loop {
++            {
++                let core_arc = self.core.clone();
++                let mut core = core_arc.lock().unwrap_or_else(|e| e.into_inner());
++                let c = &mut *core;
++                // the external displays' flips complete on their own (no wait for them here)
++                for h in self.heads.iter_mut() {
++                    let mut display = HeadLive { kms: &mut c.kms, head: &mut h.head, buffers: &h.buffers, libs };
++                    if let Err(error) = h.queue.poll(&mut display, Duration::ZERO) {
++                        eprintln!("WMOUTPUT head {}: {error}", h.head.name);
++                    }
++                }
++                let first = c.queue.front().is_none() && c.shown.is_empty();
++                let (held, lost) = (c.queue.held_frames, c.queue.wake_timeouts);
++                c.read_flips(libs)?;
++                if c.queue.held_frames != held {
++                    let n = c.queue.held_frames;
++                    c.steps.step(&format!("a flip the display refused as busy was taken on a later try ({n} so far)"));
++                }
++                if c.queue.wake_timeouts != lost {
++                    c.steps.step("display power-up event did not arrive in time; flips resume without it");
++                }
++                if let Some(shown) = c.shown.pop_front() {
++                    if first {
++                        c.steps.step(&format!("first flip-complete event, sequence {}", shown.flip.sequence));
++                    }
++                    return Ok(Some(Presented { sequence: shown.flip.sequence, at: shown.flip.at, latency: shown.latency }));
++                }
++            }
++            let left = deadline.saturating_duration_since(Instant::now());
++            if left.is_zero() {
++                return Ok(None);
++            }
++            // the card's events, or the cursor thread's ring (it read one first)
++            let mut fds = vec![libc::pollfd { fd: self.card, events: libc::POLLIN, revents: 0 }];
++            if let Some((r, _)) = &self.wake {
++                fds.push(libc::pollfd { fd: std::os::fd::AsRawFd::as_raw_fd(r), events: libc::POLLIN, revents: 0 });
++            }
++            let ms = left.as_micros().div_ceil(1000).min(1000) as libc::c_int;
++            let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) };
++            if let Some((r, _)) = &self.wake {
++                let mut byte = [0u8; 64];
++                while matches!(std::io::Read::read(&mut &*r, &mut byte), Ok(k) if k > 0) {}
++            }
++            if n <= 0 {
++                // one more look (an event the thread took meanwhile), then the caller's timeout
++                let mut c = self.core();
++                c.read_flips(libs)?;
++                if let Some(shown) = c.shown.pop_front() {
++                    return Ok(Some(Presented { sequence: shown.flip.sequence, at: shown.flip.at, latency: shown.latency }));
++                }
++                return Ok(None);
+             }
+         }
+-        let first = self.queue.front().is_none();
+-        let (held, lost) = (self.queue.held_frames, self.queue.wake_timeouts);
+-        let mut display = Live { kms: &mut self.kms, buffers: &self.buffers, libs, steps: &mut self.steps };
+-        let shown = self.queue.poll(&mut display, timeout)?;
+-        if self.queue.held_frames != held {
+-            self.steps.step(&format!("a flip the display refused as busy was taken on a later try ({} so far)", self.queue.held_frames));
+-        }
+-        if self.queue.wake_timeouts != lost {
+-            self.steps.step("display power-up event did not arrive in time; flips resume without it");
+-        }
+-        let Some(shown) = shown else {
+-            return Ok(None);
+-        };
+-        if first {
+-            self.steps.step(&format!("first flip-complete event, sequence {}", shown.flip.sequence));
+-        }
+-        Ok(Some(Presented { sequence: shown.flip.sequence, at: shown.flip.at, latency: shown.latency }))
+     }
+     fn last(&self) -> Option<GLuint> {
+-        self.last.map(|i| self.buffers[i].fbo)
++        let c = self.core();
++        self.last.map(|i| c.buffers[i].fbo)
+     }
+     fn set_power(&mut self, libs: &Libraries, on: bool) -> Result<bool, String> {
+-        if self.queue.busy() {
++        // the cursor thread leaves the display alone until the loop wants the plane again
++        self.core().plane.wanted.enabled = false;
++        self.settle(libs, Duration::from_millis(60))?;
++        let mut c = self.core();
++        if c.queue.busy() {
+             return Err("KMS target: display power changed while a commit is in flight".into());
+         }
+-        if self.queue.front().is_none() {
++        if c.queue.front().is_none() {
+             // Nothing has been shown yet: there is no display state to change.
+             return Ok(false);
+         }
+-        self.steps.step(if on { "display on (ACTIVE=1)" } else { "display off (ACTIVE=0)" });
+-        self.kms.set_active(libs, on)?;
++        c.steps.step(if on { "display on (ACTIVE=1)" } else { "display off (ACTIVE=0)" });
++        c.kms.set_active(libs, on)?;
+         if on {
+             // The power-up commit's own flip-complete event says when the
+             // panel takes flips again; until then the target is busy.
+-            self.queue.powered_up();
++            c.queue.powered_up();
+         }
+         Ok(true)
+     }
++    fn start_pointer_thread(&mut self, pointer: std::sync::Arc<crate::pointer::PointerShared>) -> bool {
++        if self.thread.is_some() || self.core().cursor.is_none() {
++            return false;
++        }
++        let mut fds = [0i32; 2];
++        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
++            return false;
++        }
++        for fd in fds {
++            unsafe {
++                libc::fcntl(fd, libc::F_SETFL, libc::fcntl(fd, libc::F_GETFL) | libc::O_NONBLOCK);
++                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
++            }
++        }
++        let (r, w) = unsafe { (<std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fds[0]), <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fds[1])) };
++        let Ok(w2) = w.try_clone() else { return false };
++        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
++        let (core, p, s, card) = (self.core.clone(), pointer.clone(), stop.clone(), self.card);
++        match std::thread::Builder::new().name("sfcursor".into()).spawn(move || cursor_thread(core, p, s, w2, card)) {
++            Ok(handle) => {
++                self.thread = Some((stop, handle));
++                self.wake = Some((r, w));
++                self.pointer = Some(pointer);
++                eprintln!("WMCURSOR thread started: the pointer's plane is moved by a thread of its own (DESK7)");
++                true
++            }
++            Err(error) => {
++                eprintln!("WMCURSOR thread not started: {error}");
++                false
++            }
++        }
++    }
++    fn pointer_plane(&mut self, mut wanted: crate::cursor_thread::PlaneWanted) -> bool {
++        wanted.enabled &= self.thread.is_some() && self.thread_allowed;
++        let mut c = self.core();
++        c.plane.want(wanted);
++        let Some(pointer) = self.pointer.clone() else { return false };
++        if !wanted.enabled {
++            // motions the thread will not show are not its to time (a stale one would be counted later)
++            let _ = pointer.take_motions();
++            return false;
++        }
++        // the thread covers pointer-only moves while the image it would show is drawn and the place
++        // needs no buffer drawn anew
++        let root = pointer.root();
++        // the thread moves what is drawn; a new image the loop draws and commits itself
++        let drawn_now = c.drawn_cursor().is_some_and(|(_, g, ..)| g == wanted.generation);
++        let covers = drawn_now && c.place_for(root).is_ok();
++        if covers {
++            c.plane.needs_desk = false;
++        }
++        covers
++    }
++    fn pointer_thread_line(&mut self) -> Option<String> {
++        self.thread.as_ref()?;
++        Some(self.core().plane.take_line())
++    }
++    fn pointer_thread_maybe_line(&mut self) -> Option<String> {
++        self.thread.as_ref()?;
++        self.core().plane.maybe_line()
++    }
++    fn pointer_lead_us(&self) -> Option<u32> {
++        (self.thread.is_some() && self.thread_allowed).then(|| self.core().plane.lead_us)
++    }
++    fn set_pointer_thread(&mut self, on: bool) {
++        self.thread_allowed = on;
++    }
++}
++impl Drop for KmsTarget {
++    fn drop(&mut self) {
++        if let Some((stop, handle)) = self.thread.take() {
++            stop.store(true, std::sync::atomic::Ordering::Release);
++            if let Some(p) = &self.pointer {
++                p.wake();
++            }
++            let _ = handle.join();
++        }
++    }
+ }
+ 
+ const VERTEX_SHADER: &str = "#version 300 es
+@@ -993,6 +1400,24 @@ impl Renderer for GlRenderer {
+     fn cursor_plane_takes(&self, image: (u32, u32)) -> bool {
+         self.target.cursor_plane().is_some_and(|size| image.0 <= size && image.1 <= size && image.0 > 0 && image.1 > 0)
+     }
++    fn start_pointer_thread(&mut self, pointer: std::sync::Arc<crate::pointer::PointerShared>) -> bool {
++        self.target.start_pointer_thread(pointer)
++    }
++    fn pointer_plane(&mut self, wanted: crate::cursor_thread::PlaneWanted) -> bool {
++        self.target.pointer_plane(wanted)
++    }
++    fn pointer_thread_line(&mut self) -> Option<String> {
++        self.target.pointer_thread_line()
++    }
++    fn pointer_thread_maybe_line(&mut self) -> Option<String> {
++        self.target.pointer_thread_maybe_line()
++    }
++    fn pointer_lead_us(&self) -> Option<u32> {
++        self.target.pointer_lead_us()
++    }
++    fn set_pointer_thread(&mut self, on: bool) {
++        self.target.set_pointer_thread(on)
++    }
+     fn commit(&mut self, cursor: Option<(Point, &DecorationBuffer, u64)>) -> Result<bool, String> {
+         let placement = match (cursor, self.target.cursor_plane()) {
+             (Some((origin, image, generation)), Some(size)) => match place_cursor(origin, (image.width, image.height), size, self.target.size()) {
+diff --git a/crates/wm-darwin/src/hid.rs b/crates/wm-darwin/src/hid.rs
+index 87849e5..7d209e6 100644
+--- a/crates/wm-darwin/src/hid.rs
++++ b/crates/wm-darwin/src/hid.rs
+@@ -608,6 +608,9 @@ pub struct Stamped {
+     pub at: std::time::Instant,
+     /// Where it came from (DESK7): only `Device` is the owner's hand.
+     pub source: Source,
++    /// The owner's pointer position after this record, as the input thread applied it (DESK7,
++    /// `pointer.rs`): the desktop uses it rather than applying the record again.
++    pub pos: Option<(f64, f64)>,
+ }
+ /// Where an event came from (DESK7). The test instrument's events are never the owner's: by default
+ /// they drive a pointer of their own (`Virtual`: never drawn, never moving the owner's pointer);
+@@ -672,6 +675,8 @@ struct Shared {
+     /// The reader thread's scheduling: 0 user-interactive QoS (DESK5), 1 the time-constraint
+     /// (real-time) class (DESK7, `inputrt on`); the thread applies a change at its next poll.
+     realtime: std::sync::atomic::AtomicU8,
++    /// The owner's pointer position, applied here as records arrive (DESK7).
++    pointer: std::sync::Arc<crate::pointer::PointerShared>,
+ }
+ 
+ /// The reader thread's timing (DESK7, item 2b): how late each poll came after its planned moment, and
+@@ -772,7 +777,11 @@ fn nonblocking_pipe() -> Result<(std::fs::File, std::fs::File), String> {
+ impl InputThread {
+     pub fn spawn(mut hid: NativeHid) -> Result<Self, String> {
+         let (wake_read, wake) = nonblocking_pipe()?;
+-        let shared = std::sync::Arc::new(Shared { pending: Default::default(), stop: false.into(), wake, timing: Default::default(), realtime: std::sync::atomic::AtomicU8::new(u8::from(std::env::var("CHONKSTEP_DARWIN_INPUT_RT").is_ok_and(|v| v == "1"))) });
++        // DESK7: the reader in the time-constraint class by default (measured on the M1 with eight busy
++        // cores: polls up to 9 ms late at user-interactive QoS, never more than 0.25 ms in the class);
++        // CHONKSTEP_DARWIN_INPUT_RT=0 keeps the QoS of before
++        let realtime = u8::from(std::env::var("CHONKSTEP_DARWIN_INPUT_RT").map_or(true, |v| v != "0"));
++        let shared = std::sync::Arc::new(Shared { pending: Default::default(), stop: false.into(), wake, timing: Default::default(), realtime: std::sync::atomic::AtomicU8::new(realtime), pointer: Default::default() });
+         let caps = hid.seat_caps();
+         let note = hid.qualification_note();
+         let thread_shared = shared.clone();
+@@ -808,7 +817,11 @@ impl InputThread {
+                         if !out.is_empty() {
+                             last_event = now;
+                         }
+-                        thread_shared.push(out.drain(..).map(|event| Stamped { event, at: now, source: Source::Device }), Some(hid.health));
++                        let pointer = thread_shared.pointer.clone();
++                        thread_shared.push(out.drain(..).map(|event| {
++                            let pos = match event { Event::Pointer { motion, .. } => pointer.apply(motion, now), _ => None };
++                            Stamped { event, at: now, source: Source::Device, pos }
++                        }), Some(hid.health));
+                     }
+                     // Every 1 ms while input arrives, 2 ms after a quarter of a second without,
+                     // 4 ms after two seconds: the first motion after a pause waits for the next
+@@ -850,6 +863,10 @@ impl InputThread {
+     pub fn timing_line(&self) -> String {
+         self.shared.timing.lock().map_or_else(|_| "reader timing unavailable".into(), |mut t| t.take_line())
+     }
++    /// The owner's pointer position the reader thread keeps (DESK7).
++    pub fn pointer(&self) -> std::sync::Arc<crate::pointer::PointerShared> {
++        self.shared.pointer.clone()
++    }
+     /// Events from elsewhere into the same queue, stamped now (the test instrument's timed
+     /// streams: they then take the path device events take).
+     pub fn injector(&self) -> Injector {
+@@ -882,7 +899,9 @@ impl Injector {
+     }
+     /// The owner's pointer and keyboard path, as a device's record (`seat owner`).
+     pub fn push(&self, event: Event) {
+-        self.shared.push([Stamped { event, at: std::time::Instant::now(), source: Source::InjectOwner }], None);
++        let at = std::time::Instant::now();
++        let pos = match event { Event::Pointer { motion, .. } => self.shared.pointer.apply_from(motion, at, false), _ => None };
++        self.shared.push([Stamped { event, at, source: Source::InjectOwner, pos }], None);
+     }
+     /// The reader thread's timing since the last call (DESK7).
+     pub fn timing_line(&self) -> String {
+@@ -895,7 +914,7 @@ impl Injector {
+     /// The test instrument's own pointer (`seat virtual`, the default): timed like a device's records,
+     /// delivered on the virtual pointer (DESK7).
+     pub fn push_virtual(&self, event: Event) {
+-        self.shared.push([Stamped { event, at: std::time::Instant::now(), source: Source::InjectVirtual }], None);
++        self.shared.push([Stamped { event, at: std::time::Instant::now(), source: Source::InjectVirtual, pos: None }], None);
+     }
+ }
+ 
+diff --git a/crates/wm-darwin/src/inject.rs b/crates/wm-darwin/src/inject.rs
+index dcb1190..743b5e6 100644
+--- a/crates/wm-darwin/src/inject.rs
++++ b/crates/wm-darwin/src/inject.rs
+@@ -35,8 +35,12 @@
+ //! cursorplane on|off               the pointer on the display's overlay plane, or drawn into frames
+ //! precise on|off                   the last 3 ms before a commit waited for in the real-time
+ //!                                  scheduling class, or by poll and nanosleep as before (DESK6)
+-//! inputrt on|off                   the input thread in the time-constraint (real-time) class, or at
+-//!                                  user-interactive QoS as before (DESK7)
++//! inputrt on|off                   the input thread in the time-constraint (real-time) class (the
++//!                                  default since DESK7), or at user-interactive QoS as before
++//! cursorthread on|off              the pointer's plane moved by the cursor thread (default), or by the
++//!                                  desktop's loop as before (DESK7)
++//! mainprio on|off                  the desktop's loop at a fixed priority (importance 16 above its base),
++//!                                  or timesharing as before (DESK7)
+ //! motions <n>                      the next <n> event steps (abs/rel/buttons/wheel/...) in one frame,
+ //!                                  as a device that reports faster than the screen refreshes
+ //! stats                            one line: the input thread's counts (records, gaps, ...), the
+@@ -58,6 +62,8 @@
+ //!                                  while he is active. `owner`: the owner's pointer and the device path,
+ //!                                  as before DESK7 (latency measurements); refused while he is active
+ //! target <window>                  the instrument's keys go to this window (`list` gives the numbers)
++//! theme <id> | theme restore       a theme change without a relaunch (a load for the pointer's latency);
++//!                                  not persisted; `restore` puts the owner's theme and wallpaper back
+ //!
+ //! The owner (DESK7, owner.rs): while real keyboard/trackpad input came within the last 10 s he is
+ //! *active* (`$XDG_RUNTIME_DIR/owner-input` says `active=1`): the instrument's events then reach client
+@@ -83,6 +89,8 @@ use std::time::{Duration, Instant};
+ use wm_core::Backend;
+ 
+ pub const ENV: &str = "CHONKSTEP_DARWIN_INJECT_DIR";
++/// The importance `mainprio on` gives the loop's thread (above its base priority, fixed).
++pub const MAIN_IMPORTANCE: i32 = 16;
+ 
+ enum Step {
+     Event(Event),
+@@ -102,6 +110,13 @@ enum Step {
+     Seat(bool),
+     /// `inputrt on|off`: the input thread in the time-constraint class or at user-interactive QoS (DESK7).
+     InputRt(bool),
++    /// `cursorthread on|off`: the pointer's plane moved by the cursor thread, or by the loop (DESK7).
++    CursorThread(bool),
++    /// `mainprio on|off`: the desktop's loop at a fixed priority above timesharing, or timesharing (DESK7).
++    MainPrio(bool),
++    /// `theme <id>` / `theme restore`: a theme change without a relaunch, as a load (DESK7); nothing is
++    /// persisted, and `restore` puts the owner's theme and wallpaper back.
++    Theme(Option<String>),
+     /// `target <window>` (DESK7).
+     Target(u64),
+     Dump(String),
+@@ -126,6 +141,8 @@ pub struct Inject {
+     owner_seat: bool,
+     /// The owner was active at some point of this request.
+     owner_seen: bool,
++    /// The owner's theme and wallpaper while a `theme` step changed them (DESK7).
++    saved_look: Option<(Option<String>, Option<String>)>,
+ }
+ 
+ impl Inject {
+@@ -136,7 +153,7 @@ impl Inject {
+             return None;
+         }
+         eprintln!("WMINJECT armed dir={} input=synthetic-inject (requested events; not physical input)", dir.display());
+-        Some(Self { dir, queue: VecDeque::new(), poll_at: Instant::now(), wait_until: None, buttons: 0, capture_since: None, done: 0, errors: Vec::new(), active: false, injector: None, burst: 0, owner_seat: false, owner_seen: false })
++        Some(Self { dir, queue: VecDeque::new(), poll_at: Instant::now(), wait_until: None, buttons: 0, capture_since: None, done: 0, errors: Vec::new(), active: false, injector: None, burst: 0, owner_seat: false, owner_seen: false, saved_look: None })
+     }
+     /// The input thread's queue: injected events take the device events' path.
+     pub fn with_injector(mut self, injector: crate::hid::Injector) -> Self {
+@@ -196,6 +213,10 @@ impl Inject {
+                 ["stats"] => Some(Step::Stats),
+                 ["precise", on @ ("on" | "off")] => Some(Step::Precise(*on == "on")),
+                 ["inputrt", on @ ("on" | "off")] => Some(Step::InputRt(*on == "on")),
++                ["cursorthread", on @ ("on" | "off")] => Some(Step::CursorThread(*on == "on")),
++                ["mainprio", on @ ("on" | "off")] => Some(Step::MainPrio(*on == "on")),
++                ["theme", "restore"] => Some(Step::Theme(None)),
++                ["theme", id] if id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') => Some(Step::Theme(Some((*id).to_string()))),
+                 ["latch", on @ ("on" | "off")] => Some(Step::Latch(*on == "on")),
+                 ["margin", "auto"] => Some(Step::Margin(None)),
+                 ["margin", us] => us.parse::<u32>().ok().filter(|us| (500..=10_000).contains(us)).map(|us| Step::Margin(Some(us))),
+@@ -257,6 +278,9 @@ impl Inject {
+                 Some(Step::CursorPlane(_)) => Some("cursorplane"),
+                 Some(Step::Precise(_)) => Some("precise"),
+                 Some(Step::InputRt(_)) => Some("inputrt"),
++                Some(Step::CursorThread(_)) => Some("cursorthread"),
++                Some(Step::MainPrio(_)) => Some("mainprio"),
++                Some(Step::Theme(Some(_))) => Some("theme"),
+                 Some(Step::Seat(true)) => Some("seat owner"),
+                 Some(Step::Event(_)) | Some(Step::Stream { .. }) if self.owner_seat => {
+                     self.owner_seat = false;
+@@ -319,6 +343,50 @@ impl Inject {
+                 self.queue.pop_front();
+                 self.done += 1;
+             }
++            Some(Step::Theme(which)) => {
++                let which = which.clone();
++                match which {
++                    Some(id) => {
++                        if self.saved_look.is_none() {
++                            self.saved_look = Some((server.desktop_theme(), server.desktop_wallpaper().map(str::to_string)));
++                            server.persist_desktop_settings(false);
++                        }
++                        if let Err(error) = server.set_desktop_theme(&id) {
++                            self.errors.push(format!("theme {id}: {error}"));
++                        }
++                        eprintln!("WMINJECT theme {id} (not persisted; `theme restore` puts the owner's back)");
++                    }
++                    None => {
++                        if let Some((theme, wallpaper)) = self.saved_look.take() {
++                            if let Some(theme) = theme {
++                                if let Err(error) = server.set_desktop_theme(&theme) {
++                                    self.errors.push(format!("theme restore {theme}: {error}"));
++                                }
++                            }
++                            if let Some(paper) = wallpaper {
++                                if !server.set_desktop_wallpaper(&paper) {
++                                    self.errors.push(format!("wallpaper restore {paper}: refused"));
++                                }
++                            }
++                            server.persist_desktop_settings(true);
++                            eprintln!("WMINJECT theme restored: {:?} wallpaper {:?}", server.desktop_theme(), server.desktop_wallpaper());
++                        }
++                    }
++                }
++                self.queue.pop_front();
++                self.done += 1;
++            }
++            Some(Step::MainPrio(on)) => {
++                crate::input_latency::fixed_priority("main", on.then_some(MAIN_IMPORTANCE));
++                self.queue.pop_front();
++                self.done += 1;
++            }
++            Some(Step::CursorThread(on)) => {
++                server.set_pointer_thread(*on);
++                eprintln!("WMINJECT cursorthread {}", if *on { "on (the cursor thread moves the pointer's plane)" } else { "off (the loop does, as before)" });
++                self.queue.pop_front();
++                self.done += 1;
++            }
+             Some(Step::Target(window)) => {
+                 if let Err(error) = server.set_virtual_key_target(*window) {
+                     self.errors.push(format!("target: {error}"));
+@@ -386,6 +454,12 @@ impl Inject {
+                 eprintln!("{}", server.latency.flush_line(&server.pacer));
+                 eprintln!("WMPACE {} cursor_on_plane={}", server.pacer.take_leads(), server.wm.backend().cursor_on_plane);
+                 eprintln!("{} | {}", server.loop_probe.take_line(), self.injector.as_ref().map_or_else(|| "no input thread".into(), |i| i.timing_line()));
++                if let Some(line) = server.renderer_pointer_thread_line() {
++                    eprintln!("{line}");
++                }
++                for line in server.pacing.take_lines() {
++                    eprintln!("{line}");
++                }
+             }
+             Some(Step::Latch(on)) => {
+                 let on = *on;
+@@ -416,7 +490,7 @@ impl Inject {
+                 self.done += 1;
+             }
+             None => {
+-                server.end_virtual_request();
++                server.end_virtual_request(ms);
+                 let owner = server.owner.describe();
+                 self.finish_with(&owner);
+             }
+diff --git a/crates/wm-darwin/src/input.rs b/crates/wm-darwin/src/input.rs
+index 1768abe..9df67ff 100644
+--- a/crates/wm-darwin/src/input.rs
++++ b/crates/wm-darwin/src/input.rs
+@@ -39,6 +39,8 @@ pub(crate) struct InputState {
+     /// The keyboard focus lent to the instrument's keys; it goes back with the owner's next key or at
+     /// the end of the instrument's request.
+     kb_lent:Option<WlSurface>,
++    /// The position the input thread applied for the record being delivered (DESK7, `pointer.rs`).
++    pub(crate) next_position:Option<(f64,f64)>,
+     /// Keys and buttons the owner holds (the device's records) and keys the instrument holds.
+     owner_keys:HashSet<u32>,owner_buttons:u8,virt_keys:HashSet<u32>,
+     /// Client images already said in the log (their hash), recognised or not: said once each.
+@@ -164,7 +166,7 @@ impl Server {
+             modifiers:Modifiers::empty(),last_time:0,suppressed_keys:HashSet::new(),cursor_surface:None,
+             physical_buttons:0,control_click:false,hid_keys:0,last_hid_key:None,hidden_at:None,
+             shown_shape:Some("default"),told_images:HashSet::new(),told_shapes:HashSet::new(),
+-            virt:VirtualPointer::default(),virtual_active:false,focus_by_virtual:false,key_target:None,kb_lent:None,
++            next_position:None,virt:VirtualPointer::default(),virtual_active:false,focus_by_virtual:false,key_target:None,kb_lent:None,
+             owner_keys:HashSet::new(),owner_buttons:0,virt_keys:HashSet::new(),
+             #[cfg(feature = "desktop-shell")]
+             deferred_focus:false});
+@@ -337,8 +339,9 @@ impl Server {
+                 // the owner's speed setting on the trackpad's relative motion (DESK7; not on the instrument's)
+                 let speed=if virt{1.0}else{self.pointer_speed.factor()};
+                 let input=self.input.as_mut().unwrap();
+-                let (x,y)=match motion {Motion::Absolute(x,y)=>(f64::from(x)*f64::from(size.w-1)/65535.,f64::from(y)*f64::from(size.h-1)/65535.),
+-                    Motion::Relative(x,y)=>(input.position.0+f64::from(x)*speed,input.position.1+f64::from(y)*speed)};
++                let applied=if virt{None}else{input.next_position.take()};
++                let (x,y)=match (applied,motion) {(Some(p),_)=>p,(None,Motion::Absolute(x,y))=>(f64::from(x)*f64::from(size.w-1)/65535.,f64::from(y)*f64::from(size.h-1)/65535.),
++                    (None,Motion::Relative(x,y))=>(input.position.0+f64::from(x)*speed,input.position.1+f64::from(y)*speed)};
+                 let from=input.position;
+                 input.position=(x.clamp(0.,f64::from(size.w-1)),y.clamp(0.,f64::from(size.h-1)));
+                 // several outputs: the pointer crosses where they touch and stops elsewhere (DESK5)
+@@ -347,6 +350,8 @@ impl Server {
+                     let kept=self.pointer_on_outputs(Point::new(from.0.floor() as i32,from.1.floor() as i32),to);
+                     let input=self.input.as_mut().unwrap();
+                     if kept!=to{input.position=(f64::from(kept.x),f64::from(kept.y));}
++                    // the input thread's copy follows (the cursor thread is off with several outputs)
++                    if !virt {if let Some(p)=&self.pointer_shared{let pos=self.input.as_ref().unwrap().position;p.set(pos.0,pos.1);}}
+                 }
+                 let input=self.input.as_mut().unwrap();
+                 let root=Point::new(input.position.0.floor() as i32,input.position.1.floor() as i32);
+@@ -849,7 +854,10 @@ impl Server {
+                     }
+                 }
+                 let input=self.input.as_mut().unwrap();
+-                if down{input.virt_keys.insert(evdev);}else{input.virt_keys.remove(&evdev);}
++                // a press of a key the instrument already holds, or a release of one it does not, is
++                // dropped: a client would see a second press (the desk's terminal ends on that)
++                if down && !input.virt_keys.insert(evdev) {return Err(format!("synthetic key {evdev} pressed again while held: dropped"));}
++                if !down && !input.virt_keys.remove(&evdev) {return Err(format!("synthetic key {evdev} released while not held: dropped"));}
+                 input.virtual_active=true;
+                 let result=self.deliver_hid(event,time);
+                 self.input.as_mut().unwrap().virtual_active=false;
+@@ -869,9 +877,14 @@ impl Server {
+     }
+     /// The end of an instrument's request: the keyboard focus goes back to the owner's window (unless
+     /// the instrument still holds a key).
+-    pub fn end_virtual_request(&mut self){
++    pub fn end_virtual_request(&mut self,time:u32){
+         let Some(input)=self.input.as_mut() else{return;};
+-        if input.virt_keys.is_empty() && input.kb_lent.take().is_some() {
++        // keys a request left held are let go (a broken test must not leave a key down for the next)
++        let held:Vec<u32>=input.virt_keys.iter().copied().collect();
++        if !held.is_empty(){eprintln!("WMINJECT the request ended with synthetic keys held {held:?}: let go");}
++        for evdev in held {let _=self.deliver_virtual(Event::Key{evdev,down:false},time);}
++        let Some(input)=self.input.as_mut() else{return;};
++        if input.kb_lent.take().is_some() {
+             self.sync_input_focus();
+         }
+     }
+@@ -918,3 +931,10 @@ impl Server {
+         Ok(())
+     }
+ }
++
++impl Server {
++    /// The position the input thread applied for the next record delivered (DESK7).
++    pub fn set_next_position(&mut self,pos:Option<(f64,f64)>){
++        if let Some(input)=self.input.as_mut(){input.next_position=pos;}
++    }
++}
+diff --git a/crates/wm-darwin/src/input_latency.rs b/crates/wm-darwin/src/input_latency.rs
+index 022317f..9644c90 100644
+--- a/crates/wm-darwin/src/input_latency.rs
++++ b/crates/wm-darwin/src/input_latency.rs
+@@ -28,6 +28,9 @@ impl Default for Series {
+     }
+ }
+ impl Series {
++    pub(crate) fn window_len(&self) -> usize {
++        self.window.len()
++    }
+     pub(crate) fn sample(&mut self, d: Duration) {
+         let us = d.as_micros().min(u128::from(u32::MAX)) as u32;
+         if self.window.len() < 100_000 {
+@@ -37,7 +40,7 @@ impl Series {
+         self.samples += 1;
+         self.max_us = self.max_us.max(us);
+     }
+-    fn take_sorted(&mut self) -> Vec<u32> {
++    pub(crate) fn take_sorted(&mut self) -> Vec<u32> {
+         let mut sorted = std::mem::take(&mut self.window);
+         sorted.sort_unstable();
+         sorted
+@@ -64,7 +67,7 @@ fn percentile(sorted: &[u32], p: f64) -> f64 {
+     let index = ((sorted.len() - 1) as f64 * p).round() as usize;
+     f64::from(sorted[index]) / 1000.0
+ }
+-fn window_text(sorted: &[u32], what: &str) -> String {
++pub(crate) fn window_text(sorted: &[u32], what: &str) -> String {
+     format!("{what} n={} p50_ms={:.1} p90_ms={:.1} p99_ms={:.1} max_ms={:.1}", sorted.len(), percentile(sorted, 0.5), percentile(sorted, 0.9), percentile(sorted, 0.99), sorted.last().map_or(0.0, |v| f64::from(*v) / 1000.0))
+ }
+ 
+@@ -102,6 +105,42 @@ pub fn time_constraint(what: &str, period_us: u64, computation_us: u64, constrai
+     #[cfg(not(target_os = "macos"))]
+     let _ = (what, period_us, computation_us, constraint_us);
+ }
++/// Waits until `due` with `mach_wait_until` (no policy change: the caller's class stays). `false`: not
++/// available here.
++pub fn wait_until(due: std::time::Instant) -> bool {
++    #[cfg(target_os = "macos")]
++    {
++        let Some(m) = mach() else { return false };
++        let left = due.saturating_duration_since(std::time::Instant::now());
++        let ticks = (left.as_nanos() as u64).saturating_mul(m.denom) / m.numer;
++        (m.wait_until)((m.now)().saturating_add(ticks));
++        true
++    }
++    #[cfg(not(target_os = "macos"))]
++    {
++        let _ = due;
++        false
++    }
++}
++/// The calling thread to a fixed priority `importance` above its base (THREAD_EXTENDED_POLICY without
++/// timesharing, THREAD_PRECEDENCE_POLICY), or back to timesharing with `None` (DESK7: the loop's thread
++/// against eight busy cores; the test instrument's `mainprio on|off`).
++pub fn fixed_priority(what: &str, importance: Option<i32>) {
++    #[cfg(target_os = "macos")]
++    {
++        let Some(m) = mach() else { return };
++        let thread = (m.thread)(unsafe { libc::pthread_self() });
++        let timeshare = [i32::from(importance.is_none())];
++        let rc1 = (m.policy_set)(thread, 1, timeshare.as_ptr(), 1); // THREAD_EXTENDED_POLICY
++        let rc2 = match importance {
++            Some(i) => (m.policy_set)(thread, 3, [i].as_ptr(), 1), // THREAD_PRECEDENCE_POLICY
++            None => 0,
++        };
++        eprintln!("WMPACE {what} thread: {} rc={rc1}/{rc2} {}", importance.map_or("timesharing again".into(), |i| format!("fixed priority, importance {i}")), sched_text());
++    }
++    #[cfg(not(target_os = "macos"))]
++    let _ = (what, importance);
++}
+ /// The calling thread back to the standard (timeshare) policy.
+ pub fn standard_policy(what: &str) {
+     #[cfg(target_os = "macos")]
+@@ -349,6 +388,8 @@ pub(crate) struct FramePacer {
+     lateness: std::collections::VecDeque<u32>,
+     /// The test instrument's fixed margin (`margin <us>`); `None`: learned.
+     pub fixed_margin_us: Option<u32>,
++    /// The least margin: the cursor thread's lead and a little (DESK7: the loop's frames go first).
++    pub margin_floor_us: u32,
+     last_flip: Option<Instant>,
+     /// The blank the commit on its way aims at, how long before it it was made (us), and whether it
+     /// only moved the pointer's plane.
+@@ -392,6 +433,7 @@ impl FramePacer {
+             min_lead_us: MIN_LEAD_US,
+             lateness: Default::default(),
+             fixed_margin_us: None,
++            margin_floor_us: 0,
+             last_flip: None,
+             aim: None,
+             pointer_first: 0,
+@@ -409,7 +451,7 @@ impl FramePacer {
+         // the latest wake-ups of the last 30 commits (half a second): a busy spell raises the
+         // margin at once, an idle desk lowers it again quickly
+         let late = self.lateness.iter().rev().take(30).copied().max().unwrap_or(500);
+-        (self.min_lead_us + late.min(4_000) + LATENESS_PAD_US).clamp(MARGIN_MIN_US, MARGIN_MAX_US)
++        (self.min_lead_us + late.min(4_000) + LATENESS_PAD_US).clamp(MARGIN_MIN_US, MARGIN_MAX_US).max(self.margin_floor_us)
+     }
+     /// How long before its blank a frame is committed: the lead the display needs and how late
+     /// the loop wakes (the test instrument can fix it).
+@@ -422,6 +464,10 @@ impl FramePacer {
+         let longest = self.renders.iter().copied().max().unwrap_or(3_000);
+         Duration::from_micros(u64::from((longest + RENDER_PAD_US).clamp(BUDGET_MIN_US, BUDGET_MAX_US)))
+     }
++    /// The refresh interval learned from the flips.
++    pub fn interval(&self) -> Duration {
++        self.interval
++    }
+     /// Render plus margin: how long before its blank a rendered frame starts (DESK4's budget).
+     pub fn budget(&self) -> Duration {
+         self.render_budget() + self.margin()
+diff --git a/crates/wm-darwin/src/kms.rs b/crates/wm-darwin/src/kms.rs
+index 3ceeee2..4cfeed2 100644
+--- a/crates/wm-darwin/src/kms.rs
++++ b/crates/wm-darwin/src/kms.rs
+@@ -1267,6 +1267,10 @@ impl FlipQueue {
+     pub fn front(&self) -> Option<usize> {
+         self.front
+     }
++    /// The buffer of the flip in flight (DESK7: the cursor thread's pointer-only flips are of the front).
++    pub fn pending_index(&self) -> Option<usize> {
++        self.pending.map(|p| p.0)
++    }
+     pub fn busy(&self) -> bool {
+         self.pending.is_some() || self.waking.is_some() || self.held.is_some()
+     }
+diff --git a/crates/wm-darwin/src/lib.rs b/crates/wm-darwin/src/lib.rs
+index c19b7cf..a583126 100644
+--- a/crates/wm-darwin/src/lib.rs
++++ b/crates/wm-darwin/src/lib.rs
+@@ -53,7 +53,10 @@ pub mod output;
+ pub mod outputs;
+ pub mod owner;
+ pub mod displays;
++pub mod pacing;
+ pub mod pixels;
++pub mod pointer;
++pub mod cursor_thread;
+ mod popups;
+ pub mod power;
+ pub mod presenter;
+diff --git a/crates/wm-darwin/src/macdesk.rs b/crates/wm-darwin/src/macdesk.rs
+index 38c80d8..4b0ce08 100644
+--- a/crates/wm-darwin/src/macdesk.rs
++++ b/crates/wm-darwin/src/macdesk.rs
+@@ -803,6 +803,11 @@ impl Server {
+     /// a Mac application quits as its own menu's Quit does (its questions, saving; SIGTERM only
+     /// without a menu socket), the desk's own windows of the application are asked to close.
+     pub fn quit_application_request(&mut self, id: &str) -> String {
++        // a leftover of a compositor that ended (DESK7): ended too
++        if let Some(pid) = self.orphan_pid(id) {
++            self.quit_orphan(pid);
++            return "ok\n".into();
++        }
+         let Some(app) = self.running_apps().into_iter().find(|a| a.app_id.eq_ignore_ascii_case(id)) else {
+             eprintln!("WMMAC quit request app={id}: not running");
+             return format!("error {id} is not running\n");
+diff --git a/crates/wm-darwin/src/pacing.rs b/crates/wm-darwin/src/pacing.rs
+new file mode 100644
+index 0000000..e6ab722
+--- /dev/null
++++ b/crates/wm-darwin/src/pacing.rs
+@@ -0,0 +1,157 @@
++//! A client's frames from its commit to the flip that shows them (DESK7, Firefox's pacing: it draws at
++//! 60 Hz but 45-57 frames a second reached the screen). For every window that commits GPU buffers
++//! (dma-bufs): how many it committed, how many were shown, how many were replaced by a newer one before
++//! any frame showed them (lost), how long from commit to flip, when in the refresh the commits came (ms
++//! after the last flip) and how often a frame waited for a client's fence. `WMPACING` every 10 s and in
++//! the inject `stats` step.
++use crate::input_latency::{window_text, Series};
++use std::collections::HashMap;
++use std::time::{Duration, Instant};
++
++#[derive(Default)]
++struct Window {
++    app_id: String,
++    commits: u64,
++    shown: u64,
++    replaced: u64,
++    /// The newest commit not drawn into a frame yet.
++    pending: Option<Instant>,
++    /// Drawn into frame `seq`, waiting for that frame's flip.
++    drawn: Option<(Instant, u64)>,
++    commit_to_flip: Series,
++    /// commits by ms after the last flip (0..16, 17 = later)
++    phase: [u32; 18],
++    last_commit: Option<Instant>,
++    intervals: Series,
++}
++
++#[derive(Default)]
++pub struct PacingTrace {
++    windows: HashMap<u64, Window>,
++    seq: u64,
++    in_flight: Option<u64>,
++    last_flip: Option<Instant>,
++    pub fence_holds: u64,
++    logged: Option<Instant>,
++}
++
++impl PacingTrace {
++    /// A client committed a GPU buffer to window `id`.
++    pub fn commit(&mut self, id: u64, app_id: Option<&str>) {
++        let now = Instant::now();
++        let last_flip = self.last_flip;
++        let w = self.windows.entry(id).or_default();
++        if let Some(app) = app_id {
++            if w.app_id != app {
++                w.app_id = app.to_string();
++            }
++        }
++        w.commits += 1;
++        if w.pending.replace(now).is_some() {
++            w.replaced += 1;
++        }
++        if let Some(flip) = last_flip {
++            let ms = now.saturating_duration_since(flip).as_millis().min(17) as usize;
++            w.phase[ms] += 1;
++        }
++        if let Some(last) = w.last_commit.replace(now) {
++            let d = now.saturating_duration_since(last);
++            if d < Duration::from_millis(250) {
++                w.intervals.sample(d);
++            }
++        }
++    }
++    /// A frame was drawn (rendered or staged): the pending commits are in it.
++    pub fn drawn(&mut self) {
++        self.seq += 1;
++        let seq = self.seq;
++        for w in self.windows.values_mut() {
++            if let Some(at) = w.pending.take() {
++                // a buffer drawn before but not flipped yet is replaced by this one on the screen
++                if w.drawn.replace((at, seq)).is_some() {
++                    w.replaced += 1;
++                }
++            }
++        }
++    }
++    /// The frame drawn last was committed to the display.
++    pub fn frame_committed(&mut self) {
++        self.in_flight = Some(self.seq);
++    }
++    /// The number of the frame drawn last.
++    pub fn seq(&self) -> u64 {
++        self.seq
++    }
++    /// A flip completed; when it was a frame's, its windows' buffers are on the screen (that frame's
++    /// number is returned).
++    pub fn flipped(&mut self, at: Instant) -> Option<u64> {
++        self.last_flip = Some(at);
++        let seq = self.in_flight.take()?;
++        for w in self.windows.values_mut() {
++            if let Some((commit, s)) = w.drawn {
++                if s <= seq {
++                    w.drawn = None;
++                    w.shown += 1;
++                    w.commit_to_flip.sample(at.saturating_duration_since(commit));
++                }
++            }
++        }
++        Some(seq)
++    }
++    pub fn gone(&mut self, id: u64) {
++        self.windows.remove(&id);
++    }
++    /// One line per window that committed since the last line.
++    pub fn take_lines(&mut self) -> Vec<String> {
++        self.logged = Some(Instant::now());
++        let fence = std::mem::take(&mut self.fence_holds);
++        let mut lines = Vec::new();
++        for (id, w) in self.windows.iter_mut() {
++            if w.commits == 0 {
++                continue;
++            }
++            let ctf = w.commit_to_flip.take_sorted();
++            let iv = w.intervals.take_sorted();
++            lines.push(format!(
++                "WMPACING window={id} app={:?} commits={} shown={} replaced_before_shown={} | {} | {} | commits by ms after the last flip {:?} | frames held for a fence={fence}",
++                w.app_id, w.commits, w.shown, w.replaced, window_text(&ctf, "commit->flip"), window_text(&iv, "commit interval"), w.phase
++            ));
++            w.commits = 0;
++            w.shown = 0;
++            w.replaced = 0;
++            w.phase = [0; 18];
++        }
++        lines
++    }
++    /// Every 10 s while a GPU client commits.
++    pub fn maybe_lines(&mut self) -> Vec<String> {
++        if self.windows.values().all(|w| w.commits == 0) {
++            return Vec::new();
++        }
++        let at = *self.logged.get_or_insert_with(Instant::now);
++        if at.elapsed() < Duration::from_secs(10) {
++            return Vec::new();
++        }
++        self.take_lines()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn commits_replaced_before_a_frame_shows_them_are_counted_as_lost() {
++        let mut p = PacingTrace::default();
++        p.commit(7, Some("org.mozilla.firefox"));
++        p.commit(7, None); // a second commit before any frame drew the first: lost
++        p.drawn();
++        p.frame_committed();
++        p.flipped(Instant::now());
++        p.commit(7, None);
++        p.drawn();
++        p.frame_committed();
++        p.flipped(Instant::now());
++        let line = p.take_lines().pop().unwrap();
++        assert!(line.contains("commits=3 shown=2 replaced_before_shown=1"), "{line}");
++    }
++}
+diff --git a/crates/wm-darwin/src/pointer.rs b/crates/wm-darwin/src/pointer.rs
+new file mode 100644
+index 0000000..8b4922f
+--- /dev/null
++++ b/crates/wm-darwin/src/pointer.rs
+@@ -0,0 +1,139 @@
++//! The owner's pointer position, kept by the input thread (DESK7, item 2b).
++//!
++//! Measured on the M1 (desk7-002, synthetic `seat owner` streams): the pointer reached the screen only when
++//! the desktop's loop got round to it, and the loop was held by other work (a client's commits 12-22 ms, a
++//! repaint up to 99 ms with eight busy cores, wake-ups 17 ms late at user-interactive QoS, which these
++//! cores do not honour: pthread priority stays 31). So the position no longer waits for the loop: the
++//! input thread applies every record of the owner's device (and the instrument's `seat owner` records)
++//! here, and the cursor thread (`cursor_thread.rs`) places the pointer's plane from it at every refresh,
++//! whatever the loop does. The loop reads the same position for its clients (`Stamped::pos`), so both
++//! agree. The test instrument's own pointer (`seat virtual`) never comes here.
++use crate::hid::Motion;
++use std::sync::{Condvar, Mutex};
++use std::time::{Duration, Instant};
++
++#[derive(Debug)]
++struct State {
++    x: f64,
++    y: f64,
++    width: u32,
++    height: u32,
++    speed: f64,
++    seq: u64,
++    /// The oldest and newest motion not shown yet (for the motion -> flip latency).
++    pending: Option<(Instant, Instant)>,
++    /// The last record of the owner's device: the instrument's `seat owner` records do not move the
++    /// pointer within `crate::owner::ACTIVE_WINDOW` of one.
++    last_device: Option<Instant>,
++}
++
++#[derive(Debug)]
++pub struct PointerShared {
++    state: Mutex<State>,
++    moved: Condvar,
++}
++
++impl Default for PointerShared {
++    fn default() -> Self {
++        Self { state: Mutex::new(State { x: 0.0, y: 0.0, width: 0, height: 0, speed: 1.0, seq: 0, pending: None, last_device: None }), moved: Condvar::new() }
++    }
++}
++
++impl PointerShared {
++    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
++        self.state.lock().unwrap_or_else(|e| e.into_inner())
++    }
++    /// A pointer record from the owner's device (or `seat owner`): the new position, panel pixels.
++    /// Before the screen size is known the record is passed on unapplied (`None`).
++    pub fn apply(&self, motion: Motion, at: Instant) -> Option<(f64, f64)> {
++        self.apply_from(motion, at, true)
++    }
++    /// `apply`, saying whether the record is the owner's device's (`false`: the instrument's `seat owner`,
++    /// which never moves the pointer while the owner is active).
++    pub fn apply_from(&self, motion: Motion, at: Instant, device: bool) -> Option<(f64, f64)> {
++        let mut s = self.lock();
++        if device {
++            s.last_device = Some(at);
++        } else if s.last_device.is_some_and(|t| at.saturating_duration_since(t) < crate::owner::ACTIVE_WINDOW) {
++            return None;
++        }
++        if s.width == 0 || s.height == 0 {
++            return None;
++        }
++        let (w, h) = (f64::from(s.width - 1), f64::from(s.height - 1));
++        let (x, y) = match motion {
++            Motion::Absolute(x, y) => (f64::from(x) * w / 65535.0, f64::from(y) * h / 65535.0),
++            Motion::Relative(x, y) => (s.x + f64::from(x) * s.speed, s.y + f64::from(y) * s.speed),
++        };
++        let (x, y) = (x.clamp(0.0, w), y.clamp(0.0, h));
++        if (x.floor(), y.floor()) != (s.x.floor(), s.y.floor()) {
++            s.seq += 1;
++            s.pending = Some(s.pending.map_or((at, at), |(o, n)| (o.min(at), n.max(at))));
++            self.moved.notify_all();
++        }
++        s.x = x;
++        s.y = y;
++        Some((x, y))
++    }
++    /// Where the pointer is drawn (whole panel pixels).
++    pub fn root(&self) -> wm_core::Point {
++        let s = self.lock();
++        wm_core::Point::new(s.x.floor() as i32, s.y.floor() as i32)
++    }
++    pub fn seq(&self) -> u64 {
++        self.lock().seq
++    }
++    /// The desktop's loop moved the pointer itself (several outputs: it stops at the edges there).
++    pub fn set(&self, x: f64, y: f64) {
++        let mut s = self.lock();
++        s.x = x;
++        s.y = y;
++    }
++    pub fn set_screen(&self, width: u32, height: u32) {
++        let mut s = self.lock();
++        s.width = width;
++        s.height = height;
++    }
++    pub fn set_speed(&self, factor: f64) {
++        self.lock().speed = factor;
++    }
++    /// The motions since the last call (a commit showing the newest position takes them).
++    pub fn take_motions(&self) -> Option<(Instant, Instant)> {
++        self.lock().pending.take()
++    }
++    /// Waits until the pointer moved past `seen` (or `timeout`); the sequence number now.
++    pub fn wait_motion(&self, seen: u64, timeout: Duration) -> u64 {
++        let s = self.lock();
++        if s.seq != seen {
++            return s.seq;
++        }
++        let (s, _) = self.moved.wait_timeout(s, timeout).unwrap_or_else(|e| e.into_inner());
++        s.seq
++    }
++    /// Wakes `wait_motion` (the cursor thread's stop).
++    pub fn wake(&self) {
++        self.moved.notify_all();
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[test]
++    fn records_move_the_shared_pointer_within_the_screen_at_the_owners_speed() {
++        let p = PointerShared::default();
++        let now = Instant::now();
++        assert_eq!(p.apply(Motion::Relative(5, 5), now), None, "no screen yet");
++        p.set_screen(2560, 1600);
++        assert_eq!(p.apply(Motion::Absolute(65535, 0), now), Some((2559.0, 0.0)));
++        assert_eq!(p.apply(Motion::Relative(10, -3), now), Some((2559.0, 0.0)), "kept on the screen");
++        p.set_speed(0.5);
++        assert_eq!(p.apply(Motion::Relative(-10, 4), now), Some((2554.0, 2.0)));
++        assert_eq!(p.root(), wm_core::Point::new(2554, 2));
++        let seq = p.seq();
++        assert!(p.take_motions().is_some());
++        assert!(p.take_motions().is_none());
++        p.apply(Motion::Relative(0, 0), now);
++        assert_eq!(p.seq(), seq, "no movement, no new sequence");
++    }
++}
+diff --git a/crates/wm-darwin/src/render.rs b/crates/wm-darwin/src/render.rs
+index a2dc779..4f17baf 100644
+--- a/crates/wm-darwin/src/render.rs
++++ b/crates/wm-darwin/src/render.rs
+@@ -234,6 +234,25 @@ pub trait Renderer {
+     /// Show the staged frame, or the frame on the screen again, with the pointer's plane showing
+     /// `cursor` (its image's top left on the screen, the image, its generation) or nothing.
+     /// `Ok(false)`: nothing to commit.
++    /// The cursor thread (DESK7, `cursor_thread.rs`): started for a display with a pointer plane.
++    fn start_pointer_thread(&mut self, _: std::sync::Arc<crate::pointer::PointerShared>) -> bool {
++        false
++    }
++    /// What the desktop wants of the pointer's plane now; `true`: the thread moves the pointer.
++    fn pointer_plane(&mut self, _: crate::cursor_thread::PlaneWanted) -> bool {
++        false
++    }
++    fn pointer_thread_line(&mut self) -> Option<String> {
++        None
++    }
++    fn pointer_thread_maybe_line(&mut self) -> Option<String> {
++        None
++    }
++    /// The thread's lead before the blank (the loop keeps its own commit moment earlier).
++    fn pointer_lead_us(&self) -> Option<u32> {
++        None
++    }
++    fn set_pointer_thread(&mut self, _: bool) {}
+     fn commit(&mut self, cursor: Option<(wm_core::Point, &wm_theme_api::DecorationBuffer, u64)>) -> Result<bool, String> {
+         let _ = cursor;
+         Ok(false)
+diff --git a/crates/wm-darwin/src/server.rs b/crates/wm-darwin/src/server.rs
+index 34c391b..9fb311c 100644
+--- a/crates/wm-darwin/src/server.rs
++++ b/crates/wm-darwin/src/server.rs
+@@ -133,6 +133,12 @@ pub struct Server {
+     shell: XdgShellState,
+     /// zwp_pointer_gestures_v1: pinches to the client under the pointer (DESK6).
+     _pointer_gestures: smithay::wayland::pointer_gestures::PointerGesturesState,
++    /// `wp_presentation` (DESK7): a client learns when its frame reached the screen (the flip's time, the
++    /// refresh, the sequence), so it can pace itself to the display (Firefox's pacing).
++    _presentation: smithay::wayland::presentation::PresentationState,
++    /// Presentation feedback: committed and not drawn yet (by window), drawn into frame `seq`.
++    feedback_pending: HashMap<u64, Vec<smithay::wayland::presentation::PresentationFeedbackCallback>>,
++    feedback_drawn: Vec<(u64, smithay::wayland::presentation::PresentationFeedbackCallback)>,
+     /// `wp_cursor_shape_v1`: a client names a shape and the desk draws it from its pointer set (DESK7).
+     _cursor_shape: smithay::wayland::cursor_shape::CursorShapeManagerState,
+     shm: ShmState,
+@@ -222,10 +228,16 @@ pub struct Server {
+     pub(crate) layer_workarea: Option<wm_core::Rect>,
+     /// The layer surface a held button went down on: it gets the pointer until the release.
+     pub(crate) layer_grab: Option<WlSurface>,
++    /// GPU clients' frames from commit to flip (DESK7, Firefox's pacing: `pacing.rs`).
++    pub(crate) pacing: crate::pacing::PacingTrace,
+     /// The loop's turns timed by part, the pointer's queue wait and commit spacing (DESK7, item 2b).
+     pub(crate) loop_probe: crate::input_latency::LoopProbe,
+     /// The owner's real input and the state file for the agents' tools (owner.rs, DESK7).
+     pub owner: crate::owner::OwnerActivity,
++    /// The owner's pointer position the input thread keeps, and whether the cursor thread moves the
++    /// pointer's plane now (DESK7, `pointer.rs`, `cursor_thread.rs`).
++    pub(crate) pointer_shared: Option<std::sync::Arc<crate::pointer::PointerShared>>,
++    pub(crate) pointer_thread_covers: bool,
+     /// The pointer's speed setting (owner.rs, DESK7).
+     pub(crate) pointer_speed: crate::owner::PointerSpeed,
+     /// The test instrument's events held back while the owner holds a key or a button (input.rs).
+@@ -344,6 +356,9 @@ impl Server {
+             shell: XdgShellState::new_with_capabilities::<Self>(dh, [WmCapabilities::Maximize, WmCapabilities::Fullscreen, WmCapabilities::Minimize]),
+             _pointer_gestures: smithay::wayland::pointer_gestures::PointerGesturesState::new::<Self>(dh),
+             _cursor_shape: smithay::wayland::cursor_shape::CursorShapeManagerState::new::<Self>(dh),
++            _presentation: smithay::wayland::presentation::PresentationState::new::<Self>(dh, libc::CLOCK_MONOTONIC as u32),
++            feedback_pending: HashMap::new(),
++            feedback_drawn: Vec::new(),
+             shm: ShmState::new::<Self>(dh, vec![]),
+             _decoration: XdgDecorationState::new::<Self>(dh),
+             output,
+@@ -400,7 +415,10 @@ impl Server {
+             layer_grab: None,
+             owner: crate::owner::OwnerActivity::default(),
+             pointer_speed: Default::default(),
++            pointer_shared: None,
++            pointer_thread_covers: false,
+             loop_probe: Default::default(),
++            pacing: Default::default(),
+             deferred_virtual: std::collections::VecDeque::new(),
+             parentless_popups: Vec::new(),
+             _xdg_output: smithay::wayland::output::OutputManagerState::new_with_xdg_output::<Self>(dh),
+@@ -440,6 +458,53 @@ impl Server {
+     pub fn drawn_pointer(&self) -> wm_core::Point {
+         self.wm.backend().pointer
+     }
++    /// The input thread's pointer position for the desktop and the cursor thread (DESK7).
++    pub fn start_pointer_thread(&mut self, pointer: std::sync::Arc<crate::pointer::PointerShared>) {
++        let size = wm_core::Backend::screen_size(self.wm.backend());
++        pointer.set_screen(size.w, size.h);
++        let p = self.input.as_ref().map_or((0.0, 0.0), |i| i.position);
++        pointer.set(p.0, p.1);
++        let started = self.renderer.start_pointer_thread(pointer.clone());
++        if !started {
++            eprintln!("WMCURSOR no cursor thread on this output (renderer {}): the loop moves the pointer's plane", self.renderer.output_name());
++        }
++        self.pointer_shared = Some(pointer);
++    }
++    /// The cursor thread's line since the last (the inject `stats` step).
++    pub fn renderer_pointer_thread_line(&mut self) -> Option<String> {
++        self.renderer.pointer_thread_line()
++    }
++    /// The test instrument's `cursorthread on|off`.
++    pub fn set_pointer_thread(&mut self, on: bool) {
++        self.renderer.set_pointer_thread(on);
++    }
++    /// What the cursor thread may do now (DESK7); `true`: it moves the pointer's plane.
++    fn pointer_plane_now(&mut self) -> bool {
++        if self.pointer_shared.is_none() {
++            return false;
++        }
++        let speed = self.pointer_speed.factor();
++        if let Some(p) = &self.pointer_shared {
++            p.set_speed(speed);
++        }
++        let backend = self.wm.backend();
++        let size = wm_core::Backend::screen_size(backend);
++        let (generation, hotspot, image) = match (backend.cursor_on_screen(), backend.cursor()) {
++            (Some((_, img, generation)), Some((hot, _))) => (generation, *hot, (img.width, img.height)),
++            _ => (0, Point::new(0, 0), (0, 0)),
++        };
++        let enabled = backend.cursor_on_plane && image.0 > 0 && !self.wm.interactive_drag_active() && !self.recorder.recording()
++            && self.extra_outputs.outputs.is_empty() && !self.power.off;
++        let wanted = crate::cursor_thread::PlaneWanted { enabled, generation, hotspot, image, screen: (size.w, size.h) };
++        let covers = self.renderer.pointer_plane(wanted);
++        // the loop commits its frames before the thread's moment
++        self.pacer.margin_floor_us = self.renderer.pointer_lead_us().filter(|_| enabled).map_or(0, |lead| lead + 700);
++        if let Some(line) = self.renderer.pointer_thread_maybe_line() {
++            eprintln!("{line}");
++        }
++        self.pointer_thread_covers = covers;
++        covers
++    }
+     /// `wl_output.scale` as clients are told it.
+     pub fn output_scale_integer(&self) -> i32 {
+         self.output.current_scale().integer_scale()
+@@ -635,6 +700,10 @@ impl Server {
+             self.sync_surface_outputs();
+         }
+         self.choose_cursor_plane();
++        // the cursor thread moves the pointer's plane (DESK7): the loop makes no pointer-only commits
++        if self.pointer_plane_now() {
++            self.wm.backend_mut().cursor_moved = false;
++        }
+         // While a frame is in flight the scene stays dirty and is rendered
+         // once, with everything that accumulated, after the flip.
+         if self.renderer.busy() {
+@@ -663,6 +732,7 @@ impl Server {
+         // Implicit sync: a client may commit before its GPU work is done. The
+         // frame is held back until every freshly committed dma-buf is ready.
+         if !self.fences_ready() {
++            self.pacing.fence_holds += 1;
+             return Ok(());
+         }
+         // Late latching: the frame is made as late as it can be and still make its blank, so
+@@ -704,6 +774,17 @@ impl Server {
+         // With the pointer on its plane the frame is staged and committed at its moment (below);
+         // otherwise it is shown at once, the pointer drawn in it.
+         let stats = if on_plane { self.renderer.stage_frame(self.wm.backend_mut(), presenter)? } else { self.renderer.render_frame(self.wm.backend_mut(), presenter)? };
++        self.pacing.drawn();
++        let seq = self.pacing.seq();
++        for (_, callbacks) in self.feedback_pending.drain() {
++            self.feedback_drawn.extend(callbacks.into_iter().map(|c| (seq, c)));
++        }
++        if !on_plane {
++            self.pacing.frame_committed();
++        }
++        for line in self.pacing.maybe_lines() {
++            eprintln!("{line}");
++        }
+         self.pacer.rendered(started.elapsed(), late);
+         self.wm.backend_mut().dirty = false;
+         if self.renderer.staged() {
+@@ -777,7 +858,7 @@ impl Server {
+             std::thread::sleep(due - now);
+         }
+         let backend = self.wm.backend();
+-        if self.renderer.staged() || (backend.cursor_on_plane && backend.cursor_moved) {
++        if self.renderer.staged() || (backend.cursor_on_plane && backend.cursor_moved && !self.pointer_thread_covers) {
+             if !self.renderer.staged() {
+                 self.render_due = None;
+             }
+@@ -808,6 +889,9 @@ impl Server {
+         if !queued {
+             return Ok(());
+         }
++        if !pointer_only {
++            self.pacing.frame_committed();
++        }
+         self.pacer.committed_kind(std::time::Instant::now(), blank, planned, pointer_only);
+         self.loop_probe.pointer_shown(drag_pointer.unwrap_or(self.wm.backend().pointer));
+         self.latency.rendered(self.renderer.busy(), drag);
+@@ -924,6 +1008,20 @@ impl Server {
+         self.selections_set
+     }
+     fn presented(&mut self, presented: &crate::render::Presented, time_ms: u32) {
++        if let Some(seq) = self.pacing.flipped(presented.at) {
++            // the flip's time on CLOCK_MONOTONIC (wp_presentation's clock)
++            let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) };
++            let now = std::time::Duration::new(now.tv_sec as u64, now.tv_nsec as u32);
++            let at = now.saturating_sub(presented.at.elapsed());
++            let refresh = smithay::wayland::presentation::Refresh::fixed(self.pacer.interval());
++            let (shown, waiting): (Vec<_>, Vec<_>) = self.feedback_drawn.drain(..).partition(|(s, _)| *s <= seq);
++            self.feedback_drawn = waiting;
++            for (_, callback) in shown {
++                use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
++                callback.presented(&self.output, at, refresh, u64::from(presented.sequence), Kind::Vsync | Kind::HwCompletion);
++            }
++        }
+         self.frames.record_presented(presented);
+         self.pacer.flipped(presented.at);
+         self.latency.presented();
+@@ -1413,6 +1511,10 @@ impl Server {
+             }
+             self.drop_held(id, None, true);
+             self.external_commits.remove(&id);
++            self.pacing.gone(id);
++            for callback in self.feedback_pending.remove(&id).into_iter().flatten() {
++                callback.discarded();
++            }
+             self.wm.dispatch(BackendEvent::Destroyed(id));
+             self.wm.backend_mut().remove(id);
+             self.callbacks.remove(&id);
+@@ -1438,6 +1540,11 @@ impl Server {
+             });
+             if let Some(app) = app_id.clone().filter(|a| !a.is_empty()) {
+                 if let Some(peer) = peer_of(surface.wl_surface()) {
++                    // kept beside the app-menu sockets for a compositor after this one: its leftover
++                    // applications are named by the id they gave (DESK7, foreign.rs orphans)
++                    if let Some(pid) = peer.pid {
++                        crate::foreign::record_app_id(pid, &app);
++                    }
+                     *peer.app_id.lock().unwrap() = Some(app);
+                 }
+             }
+@@ -1722,6 +1829,14 @@ impl CompositorHandler for Server {
+                     if !self.fences_peek(external.id) {
+                         self.dmabuf_stats.fence_waits += 1;
+                     }
++                    let app = self.wm.backend().windows.get(&id).and_then(|w| w.app_id.clone().or_else(|| w.last_app_id.clone()));
++                    self.pacing.commit(id, app.as_deref());
++                    // its presentation feedback waits for the frame that shows this buffer; one a newer
++                    // buffer replaced before any frame showed it is discarded
++                    let feedback = with_states(surface, |s| std::mem::take(&mut s.cached_state.get::<smithay::wayland::presentation::PresentationFeedbackCachedState>().current().callbacks));
++                    for old in self.feedback_pending.insert(id, feedback).into_iter().flatten() {
++                        old.discarded();
++                    }
+                     let count = self.external_commits.entry(id).or_insert(0);
+                     *count += 1;
+                     if CHECK_AT_COMMITS.contains(count) {
+@@ -2073,6 +2188,7 @@ impl FractionalScaleHandler for Server {
+ smithay::delegate_fractional_scale!(Server);
+ smithay::delegate_pointer_gestures!(Server);
+ smithay::delegate_cursor_shape!(Server);
++smithay::delegate_presentation!(Server);
+ /// No tablets on this desk; the cursor-shape protocol asks for the trait (its tablet-tool devices).
+ impl smithay::wayland::tablet_manager::TabletSeatHandler for Server {}
+ smithay::delegate_viewporter!(Server);

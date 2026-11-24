@@ -1,0 +1,351 @@
+--- a/src/Libraries/libsandbox/sbpl.c
++++ b/src/Libraries/libsandbox/sbpl.c
+@@ -55,6 +55,8 @@
+ };
+ 
+ struct compiler {
++	// inside (with-filter F ...) with a filter nothing here checks: allow rules are left out
++	unsigned unchecked_context;
+ 	const char *source;
+ 	const char *file;
+ 	const char *import_dir;
+@@ -400,6 +402,9 @@
+ 	return v;
+ }
+ 
++static bool lookup_operation(const char *name, uint32_t *ops);
++static bool truthy(struct value v);
++
+ static struct value
+ eval(struct compiler *c, const struct node *n)
+ {
+@@ -421,6 +426,18 @@
+ 				return c->bindings[i].value;
+ 			}
+ 		}
++		if ((n->text[0] >= '0' && n->text[0] <= '9') || (n->text[0] == '#' && n->text[1] == 'o')) {
++			v.kind = VALUE_STRING;
++			v.string = n->text;
++			return v;
++		}
++		/* An operation name is a value too: profiles pass one to their own functions,
++		 * as in (define (moz-deny feature) (deny feature (with no-log))) (moz-deny default). */
++		if (lookup_operation(n->text, &(uint32_t){ 0 })) {
++			v.kind = VALUE_STRING;
++			v.string = n->text;
++			return v;
++		}
+ 		fail(c, n->line, "unbound variable '%s'", n->text);
+ 		return v;
+ 	case NODE_LIST:
+@@ -434,6 +451,141 @@
+ 			}
+ 			return lookup_param(c, key.string);
+ 		}
++		/* The string functions profiles compute paths and conditions with. Results live
++		 * as long as the process (a compile is short and allocates little). */
++		if (n->count >= 1 && n->items[0]->type == NODE_SYMBOL) {
++			const char *fn = n->items[0]->text;
++
++			if (strcmp(fn, "string-append") == 0) {
++				size_t length = 0;
++				char *joined;
++
++				for (size_t i = 1; i < n->count; i++) {
++					struct value part = eval(c, n->items[i]);
++
++					if (c->failed) {
++						return v;
++					}
++					if (part.kind != VALUE_STRING) {
++						fail(c, n->line, "string-append expects strings");
++						return v;
++					}
++					length += strlen(part.string);
++				}
++				if ((joined = malloc(length + 1)) == NULL) {
++					fail(c, n->line, "out of memory");
++					return v;
++				}
++				joined[0] = '\0';
++				for (size_t i = 1; i < n->count; i++) {
++					strcat(joined, eval(c, n->items[i]).string);
++				}
++				v.kind = VALUE_STRING;
++				v.string = joined;
++				return v;
++			}
++			if (strcmp(fn, "string->number") == 0 && n->count == 2) {
++				// numbers stay their text; the comparisons below read them
++				return eval(c, n->items[1]);
++			}
++			if (n->count == 3 && (strcmp(fn, ">=") == 0 || strcmp(fn, "<=") == 0 || strcmp(fn, ">") == 0 ||
++			    strcmp(fn, "<") == 0 || strcmp(fn, "=") == 0)) {
++				struct value a = eval(c, n->items[1]), b = eval(c, n->items[2]);
++				double x, y;
++
++				if (c->failed) {
++					return v;
++				}
++				if (a.kind != VALUE_STRING || b.kind != VALUE_STRING) {
++					fail(c, n->line, "%s expects numbers", fn);
++					return v;
++				}
++				x = strtod(a.string, NULL);
++				y = strtod(b.string, NULL);
++				v.kind = VALUE_BOOL;
++				v.boolean = fn[0] == '=' ? x == y : fn[0] == '>' ? (fn[1] == '=' ? x >= y : x > y) : (fn[1] == '=' ? x <= y : x < y);
++				return v;
++			}
++			if (strcmp(fn, "defined?") == 0 && n->count == 2 && n->items[1]->type == NODE_SYMBOL) {
++				// (defined? 'name): an operation this compiler knows, or something the profile defined
++				const char *name = n->items[1]->text;
++
++				if (name[0] == '\'') {
++					name++;
++				}
++				v.kind = VALUE_BOOL;
++				v.boolean = lookup_operation(name, &(uint32_t){ 0 });
++				for (size_t i = c->binding_count; !v.boolean && i-- > 0;) {
++					v.boolean = strcmp(c->bindings[i].name, name) == 0;
++				}
++				return v;
++			}
++			if (strcmp(fn, "not") == 0 && n->count == 2) {
++				struct value a = eval(c, n->items[1]);
++
++				v.kind = VALUE_BOOL;
++				v.boolean = !truthy(a);
++				return v;
++			}
++			if (strcmp(fn, "and") == 0 || strcmp(fn, "or") == 0) {
++				bool all = fn[0] == 'a';
++
++				v.kind = VALUE_BOOL;
++				v.boolean = all;
++				for (size_t i = 1; i < n->count && !c->failed; i++) {
++					bool t = truthy(eval(c, n->items[i]));
++
++					if (t != all) {
++						v.boolean = t;
++						break;
++					}
++				}
++				return v;
++			}
++			if (strcmp(fn, "string=?") == 0 && n->count == 3) {
++				struct value a = eval(c, n->items[1]), b = eval(c, n->items[2]);
++
++				if (c->failed) {
++					return v;
++				}
++				v.kind = VALUE_BOOL;
++				v.boolean = a.kind == VALUE_STRING && b.kind == VALUE_STRING && strcmp(a.string, b.string) == 0;
++				return v;
++			}
++			if (strcmp(fn, "string?") == 0 && n->count == 2) {
++				struct value a = eval(c, n->items[1]);
++
++				if (c->failed) {
++					return v;
++				}
++				v.kind = VALUE_BOOL;
++				v.boolean = a.kind == VALUE_STRING;
++				return v;
++			}
++			if (strcmp(fn, "regex-quote") == 0 && n->count == 2) {
++				struct value a = eval(c, n->items[1]);
++				char *quoted, *out;
++
++				if (c->failed) {
++					return v;
++				}
++				if (a.kind != VALUE_STRING || (quoted = malloc(2 * strlen(a.string) + 1)) == NULL) {
++					fail(c, n->line, "regex-quote expects a string");
++					return v;
++				}
++				out = quoted;
++				for (const char *p = a.string; *p != '\0'; p++) {
++					if (strchr(".*+?()[]{}|^$\\", *p) != NULL) {
++						*out++ = '\\';
++					}
++					*out++ = *p;
++				}
++				*out = '\0';
++				v.kind = VALUE_STRING;
++				v.string = quoted;
++				return v;
++			}
++		}
+ 		fail(c, n->line, "unsupported expression");
+ 		return v;
+ 	}
+@@ -597,6 +749,9 @@
+ 	"sysctl-name", "sysctl-name-prefix", "target", "notification-name",
+ 	"global-name-prefix", "global-name-regex", "socket-domain", "socket-type",
+ 	"socket-protocol", "nvram-variable", "right-name", "signing-identifier",
++	// kernel controls, socket kinds and POSIX IPC names: nothing this compiler emits checks them either
++	"control-name", "vnode-type", "extension", "mach-task-name",
++	"iokit-connection", "sysctl-name-regex", "file-mode", "extension-class", "appleevent-destination", "process-attribute", "csr", "system-attribute", "device-major", "device-minor",
+ };
+ 
+ static bool
+@@ -626,6 +781,9 @@
+ 	}
+ }
+ 
++static const struct function *lookup_function(struct compiler *c, const char *name);
++static bool push_binding(struct compiler *c, int line, const char *name, struct value v);
++
+ static void
+ compile_filter(struct compiler *c, const struct node *f, uint32_t ops, uint8_t action, unsigned depth)
+ {
+@@ -649,10 +807,37 @@
+ 		return;
+ 	}
+ 	if (strcmp(name, "require-all") == 0) {
+-		if (f->count == 2) {
+-			compile_filter(c, f->items[1], ops, action, depth + 1);
+-		} else {
+-			fail(c, f->line, "require-all with several filters is not supported");
++		/* A conjunction. This format has no "and"; what can be said exactly is a conjunction
++		 * with one enforceable filter, the others being kinds nothing here checks (socket
++		 * domains, service names). Erring to the strict side: a deny rule keeps the enforceable
++		 * filter (it denies more), an allow rule with a condition that cannot be checked is
++		 * left out (it allows less). Two enforceable filters together stay an error. */
++		const struct node *enforced = NULL;
++		size_t unchecked = 0;
++
++		for (size_t i = 1; i < f->count; i++) {
++			const struct node *item = f->items[i];
++
++			if (item->type == NODE_LIST && item->count > 0 && item->items[0]->type == NODE_SYMBOL &&
++			    (is_non_path_filter(item->items[0]->text) || strcmp(item->items[0]->text, "require-not") == 0)) {
++				unchecked++;
++			} else if (enforced == NULL) {
++				enforced = item;
++			} else {
++				fail(c, f->line, "require-all with several path or address filters is not supported");
++				return;
++			}
++		}
++		if (enforced != NULL && (unchecked == 0 || action == SB_ACTION_DENY)) {
++			compile_filter(c, enforced, ops, action, depth + 1);
++		}
++		return;
++	}
++	if (strcmp(name, "require-not") == 0) {
++		/* "everything but F" has no form here. Strict side again: a deny rule denies all of
++		 * it, an allow rule is left out. */
++		if (action == SB_ACTION_DENY) {
++			emit_rule(c, f->line, ops, action, SB_FILTER_ANY, NULL);
+ 		}
+ 		return;
+ 	}
+@@ -673,6 +858,30 @@
+ 		filter = SB_FILTER_SUBPATH;
+ 	} else if (strcmp(name, "regex") == 0 || strcmp(name, "path-regex") == 0) {
+ 		filter = SB_FILTER_REGEX;
++	} else if (lookup_function(c, name) != NULL) {
++		/* A profile's own function used as a filter, as in
++		 * (define (home-subpath rel) (subpath (string-append home-path rel))): its arguments
++		 * are bound and its body is the filter. */
++		const struct function *fn = lookup_function(c, name);
++		const struct node *signature = fn->form->items[1];
++		size_t saved = c->binding_count;
++
++		if (f->count != signature->count) {
++			fail(c, f->line, "%s expects %zu arguments", fn->name, signature->count - 1);
++			return;
++		}
++		for (size_t i = 1; i < f->count && !c->failed; i++) {
++			struct value v = eval(c, f->items[i]);
++
++			if (!c->failed) {
++				push_binding(c, f->line, signature->items[i]->text, v);
++			}
++		}
++		for (size_t i = 2; i < fn->form->count && !c->failed; i++) {
++			compile_filter(c, fn->form->items[i], ops, action, depth + 1);
++		}
++		c->binding_count = saved;
++		return;
+ 	} else {
+ 		fail(c, f->line, "unsupported filter '%s'", name);
+ 		return;
+@@ -746,8 +955,19 @@
+ 	for (; i < form->count && form->items[i]->type == NODE_SYMBOL; i++) {
+ 		uint32_t bits;
+ 
+-		if (!lookup_operation(form->items[i]->text, &bits)) {
+-			fail(c, form->items[i]->line, "unknown operation '%s'", form->items[i]->text);
++		/* the operation may be a function's parameter bound to an operation name */
++		const char *operation = form->items[i]->text;
++
++		for (size_t b = c->binding_count; b-- > 0;) {
++			if (strcmp(c->bindings[b].name, operation) == 0) {
++				if (c->bindings[b].value.kind == VALUE_STRING) {
++					operation = c->bindings[b].value.string;
++				}
++				break;
++			}
++		}
++		if (!lookup_operation(operation, &bits)) {
++			fail(c, form->items[i]->line, "unknown operation '%s'", operation);
+ 			return;
+ 		}
+ 		ops |= bits;
+@@ -757,6 +977,9 @@
+ 		fail(c, form->line, "%s needs an operation", form->items[0]->text);
+ 		return;
+ 	}
++	if (c->unchecked_context > 0 && action != SB_ACTION_DENY) {
++		return;
++	}
+ 
+ 	// rules for unenforced operations still have their filters checked, then emit nothing
+ 
+@@ -1032,6 +1255,43 @@
+ 		}
+ 		return;
+ 	}
++	if (strcmp(head, "when") == 0 || strcmp(head, "unless") == 0) {
++		struct value v;
++
++		if (form->count < 2) {
++			fail(c, form->line, "%s expects a condition", head);
++			return;
++		}
++		v = eval(c, form->items[1]);
++		if (c->failed) {
++			return;
++		}
++		if (truthy(v) == (head[0] == 'w')) {
++			for (size_t i = 2; i < form->count && !c->failed; i++) {
++				compile_form(c, form->items[i], depth + 1);
++			}
++		}
++		return;
++	}
++	if (strcmp(head, "with-filter") == 0) {
++		/* (with-filter F rules...) adds F to every rule inside. Only filters nothing here
++		 * checks are accepted (they are what profiles use it with: IOKit classes, extensions);
++		 * the rules inside are then compiled to the strict side: deny rules without F, allow
++		 * rules not at all. */
++		const struct node *filter = form->count >= 2 ? form->items[1] : NULL;
++
++		if (filter == NULL || filter->type != NODE_LIST || filter->count == 0 || filter->items[0]->type != NODE_SYMBOL ||
++		    !is_non_path_filter(filter->items[0]->text)) {
++			fail(c, form->line, "with-filter with a path or address filter is not supported");
++			return;
++		}
++		c->unchecked_context++;
++		for (size_t i = 2; i < form->count && !c->failed; i++) {
++			compile_form(c, form->items[i], depth + 1);
++		}
++		c->unchecked_context--;
++		return;
++	}
+ 	if (strcmp(head, "begin") == 0) {
+ 		for (size_t i = 1; i < form->count; i++) {
+ 			compile_form(c, form->items[i], depth + 1);

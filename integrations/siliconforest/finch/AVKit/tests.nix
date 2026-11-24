@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT
+let
+ e=import ../environment.nix;
+ a=import ../../cocoa/arm64.nix;
+ inherit(e) pkgs p cc ld sdk libsystem finch;
+ kit=import ./build.nix;
+ player=import ../AVFoundation/player/complete.nix;
+ av=import ../AVFAudio/build.nix;
+ at=import ../AudioToolbox/build.nix;
+ headers=import ../media/headers.nix;
+in pkgs.runCommand "siliconforest-finch-avkit-value-tests-arm64" {} ''
+ export DARWIN_SDK_ROOT=${sdk}
+ mkdir -p $out/bin headers/AudioToolbox headers/AVFoundation
+ cp ${at}/System/Library/Frameworks/AudioToolbox.framework/Versions/A/Headers/Generated.h headers/AudioToolbox/
+ cp ${../AVFoundation/include}/AVFoundation/AVFoundation.h headers/AVFoundation/SFAssetCore.h
+ substituteInPlace headers/AVFoundation/SFAssetCore.h --replace-fail ',*AVCustomMediaSelectionScheme;' '; @class AVCustomMediaSelectionScheme;'
+ ${cc} -isysroot ${sdk} -mmacosx-version-min=26.5 -O2 -fblocks -fobjc-exceptions -I$PWD/headers -I${./include} -I${../AVFoundation/player/include} -I${../AVFoundation/include} -I${../AVFAudio/engine/include} -I${../AVFAudio/include} -I${../AudioToolbox/include} -I${headers} -I${libsystem}/usr/include -I${p.foundation-arm64}/usr/include -I${p.coreFoundation-arm64}/include -I${p.libobjc-arm64}/usr/include -I${p.coregraphics-arm64}/usr/include -I${p.onyx2d-arm64}/usr/include -I${a.appDeps.appkit}/usr/include -I${a.appDeps.quartzcore}/usr/include -I${e.pd.outPath}/src/Frameworks -I${a.mesa}/usr/include -F${a.openglFramework}/System/Library/Frameworks ${finch}/userland/tests/avkit-test.m --ld-path=${ld} -nostdlib -L${libsystem}/usr/lib -L${p.foundation-arm64}/usr/lib -L${p.coreFoundation-arm64}/usr/lib -L${p.libobjc-arm64}/usr/lib -L${p.coregraphics-arm64}/usr/lib -L${a.appDeps.appkit}/usr/lib -L${a.appDeps.quartzcore}/usr/lib -F${kit}/System/Library/Frameworks -F${player}/System/Library/Frameworks -F${av}/System/Library/Frameworks -framework AVKit -framework AVFoundation -Wl,-dylib_file,@loader_path/AVFoundation.pd:${player}/System/Library/Frameworks/AVFoundation.framework/Versions/A/AVFoundation.pd -lAppKit -lQuartzCore -lCoreGraphics -lFoundation -lCoreFoundation -lobjc -lSystem -Wl,-dylib_file,/usr/lib/system/libdyld.dylib:${libsystem}/usr/lib/system/libdyld.dylib -Wl,-platform_version,macos,26.5,26.5 -o $out/bin/avkit-test
+''

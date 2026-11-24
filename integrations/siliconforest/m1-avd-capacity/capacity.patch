@@ -1,0 +1,160 @@
+--- a/src/Kernel/Extensions/SFAppleAVD/kernel/sf_avd_dart.h
++++ b/src/Kernel/Extensions/SFAppleAVD/kernel/sf_avd_dart.h
+@@ -1,7 +1,7 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ /*
+  * The video decoder's own DART (dart-avd, an Apple T8020-type DART), stream 0: an IOVA
+- * space of 2 GiB with first-fit allocation in 16 KiB pages, second-level tables made on
++ * space of 3 GiB with first-fit allocation in 16 KiB pages, second-level tables made on
+  * demand. Every buffer the decoder touches is mapped here: its instruction FIFO, the
+  * codecs' work buffers, coded slices and the decoded pictures.
+  *
+@@ -16,8 +16,11 @@
+ #include <IOKit/IOLocks.h>
+ 
+ #define SF_AVD_DART_BASE   0x04000000ULL
+-#define SF_AVD_DART_SPAN   0x80000000ULL                      /* 2 GiB */
++#define SF_AVD_DART_SPAN   0xC0000000ULL                      /* 3 GiB, end 0xC4000000 < 2^32 */
+ #define SF_AVD_DART_L2S    (SF_AVD_DART_SPAN >> 25)           /* 32 MiB per second-level table */
++
++static_assert(SF_AVD_DART_BASE + SF_AVD_DART_SPAN <= (1ULL << 32), "AVD firmware IOVA is 32-bit");
++static_assert((SF_AVD_DART_BASE + SF_AVD_DART_SPAN - 1) / (1ULL << 25) < 2048, "one 16KiB L1 covers window");
+ 
+ struct SFAvdDart {
+ 	SFMmio                    regs;
+@@ -61,6 +64,7 @@
+     int unmapMemory(uint64_t iova, size_t bytes);
+ 	/* Logs and clears a pending fault; returns the raw error register (0: none). */
+ 	uint32_t check(const char *why);
++    void space(uint64_t *freeBytes, uint64_t *largestBytes);
+ };
+ 
+ #endif
+--- a/src/Kernel/Extensions/SFAppleAVD/kernel/sf_avd_dart.cpp
++++ b/src/Kernel/Extensions/SFAppleAVD/kernel/sf_avd_dart.cpp
+@@ -310,3 +310,19 @@
+ 	regs.w32(DART_T8020_ERROR, err);
+ 	return err;
+ }
++
++/* Diagnostic only; gLock -> DART lock is the existing allocation lock order. */
++void SFAvdDart::space(uint64_t *freeBytes, uint64_t *largestBytes)
++{
++    *freeBytes=0;*largestBytes=0;
++    if (!lock || !bitmap) return;
++    IOLockLock(lock);
++    uint32_t total=0,largest=0,run=0;
++    for (uint32_t p=0;p<pages;p++) {
++        if (bitmap[p/8] & (1u<<(p%8))) run=0;
++        else {total++;run++;if(run>largest)largest=run;}
++    }
++    *freeBytes=(uint64_t)total<<PAGE_SHIFT_16K;
++    *largestBytes=(uint64_t)largest<<PAGE_SHIFT_16K;
++    IOLockUnlock(lock);
++}
+--- a/src/Kernel/Extensions/SFAppleAVD/kernel/SFAppleAVD.cpp
++++ b/src/Kernel/Extensions/SFAppleAVD/kernel/SFAppleAVD.cpp
+@@ -87,6 +87,8 @@
+ OSDefineMetaClassAndStructors(SFAppleAVD, IOService);
+ 
+ struct Context {
++    uint32_t codec;
++    uint64_t mappedBytes; /* serialized CREATE/IMPORT/DECODE allocation deltas; not global inference */
+     uint64_t generation, apiDecodeCalls, apiDecodeErrors;
+ 	struct sf_avd_session *session;
+ 	struct sfavd_format    format;
+@@ -584,6 +586,7 @@
+ 	if (err != 0)
+ 		return err;
+ 	bzero(c, sizeof(*c));
++    uint64_t mappedBefore=gDart.mappedBytes;
+ 	ret = sf_avd_session_create(gDev, &c->session);
+ 	if (ret == 0)
+ 		ret = sf_avd_session_set_format(c->session, req->codec, req->width, req->height, req->format_ctrl.id, ctrl,
+@@ -598,6 +601,8 @@
+ 		gDart.check("create");
+ 		return -ret;
+ 	}
++    c->codec=req->codec;
++    c->mappedBytes=gDart.mappedBytes-mappedBefore;
+ 	c->owner = proc_selfpid();
+     c->ownerTask=current_task();task_reference(c->ownerTask);
+ 	c->buffers = req->buffers;
+@@ -842,9 +847,13 @@
+ 	case SFAVD_IOC_CREATE:
+ 		err = do_create((struct sfavd_create *)data);
+ 		break;
+-	case SFAVD_IOC_IMPORT:
++	case SFAVD_IOC_IMPORT: {
++        uint64_t before=gDart.mappedBytes;
++        Context *c=context_of(((struct sfavd_import *)data)->ctx);
+         err=do_import((struct sfavd_import*)data);
++        if(c) c->mappedBytes = c->mappedBytes + gDart.mappedBytes - before;
+         break;
++    }
+ 	case SFAVD_IOC_MAP:
+ 		err = do_map((struct sfavd_map *)data);
+ 		break;
+@@ -852,11 +861,13 @@
+         err=do_context_stats((struct sfavd_context_stats *)data);
+         break;
+     case SFAVD_IOC_DECODE: {
++        uint64_t mappedBefore=gDart.mappedBytes;
+         struct sfavd_decode *req=(struct sfavd_decode *)data;
+         Context *c=context_of(req->ctx);
+         bool owned=c && c->owner==proc_selfpid() && c->ownerTask==current_task();
+         if (owned) c->apiDecodeCalls++;
+         err=do_decode(req);
++        if(owned)c->mappedBytes=c->mappedBytes+gDart.mappedBytes-mappedBefore;
+         if (owned && err) c->apiDecodeErrors++;
+         break;
+     }
+@@ -918,6 +929,37 @@
+ 	return SYSCTL_OUT(req, text, strlen(text) + 1);
+ }
+ 
++static int
++sf_sysctl_contexts(__unused struct sysctl_oid *oidp, __unused void *arg1,
++    __unused int arg2, struct sysctl_req *req)
++{
++    char text[3072];size_t used=0;uint64_t freeBytes=0,largest=0;
++    IOLockLock(gLock);
++    gDart.space(&freeBytes,&largest);
++    used=(size_t)snprintf(text,sizeof(text),"version=1 span_kib=%llu mapped_kib=%llu free_kib=%llu largest_free_kib=%llu poisoned=%u\n",
++        SF_AVD_DART_SPAN/1024,gDart.mappedBytes/1024,freeBytes/1024,largest/1024,(unsigned)gDart.poisoned);
++    for(unsigned i=0;i<MAX_CONTEXTS && used<sizeof(text);i++) {
++        Context *c=&gContexts[i];if(!c->session)continue;
++        proc_t p=proc_find(c->owner);bool live=p && proc_task(p)==c->ownerTask;if(p)proc_rele(p);
++        uint64_t capture=0,prepared=0;
++        for(unsigned b=0;b<c->buffers;b++) {
++            void *cpu=NULL,*cookie=NULL;size_t bytes=0;
++            if(!sf_avd_session_buffer(c->session,b,&cpu,&bytes,&cookie)&&cookie) {
++                DmaCookie *d=(DmaCookie *)cookie;uint64_t rounded=(d->bytes+16383)&~(size_t)16383;
++                if(d->iova)capture+=rounded;if(d->prepared)prepared+=rounded;
++            }
++        }
++        int n=snprintf(text+used,sizeof(text)-used,
++            "ctx=%u generation=%llu pid=%d task_live=%u codec=0x%x width=%u height=%u buffers=%u imported=%u submitted=%u mapped_kib=%llu capture_iova_kib=%llu imported_iova_kib=%llu prepared_kib=%llu\n",
++            i,c->generation,c->owner,(unsigned)live,c->codec,c->format.width,c->format.height,c->buffers,
++            (unsigned)c->imported,(unsigned)c->submitted,c->mappedBytes/1024,capture/1024,
++            c->imported?capture/1024:0,prepared/1024);
++        if(n<0 || (size_t)n>=sizeof(text)-used){used=sizeof(text)-1;break;}used+=(size_t)n;
++    }
++    IOLockUnlock(gLock);
++    return SYSCTL_OUT(req,text,used+1);
++}
++
+ SYSCTL_DECL(_kern);
+ SYSCTL_NODE(_kern, OID_AUTO, sf_avd, CTLFLAG_RD | CTLFLAG_LOCKED, 0, "Apple Video Decoder");
+ SYSCTL_PROC(_kern_sf_avd, OID_AUTO, state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sf_sysctl_text, "A",
+@@ -925,7 +967,9 @@
+ SYSCTL_PROC(_kern_sf_avd, OID_AUTO, stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 1, sf_sysctl_text, "A",
+     "decode counters and times");
+ 
+-static struct sysctl_oid *const gOids[] = { &sysctl__kern_sf_avd, &sysctl__kern_sf_avd_state, &sysctl__kern_sf_avd_stats };
++SYSCTL_PROC(_kern_sf_avd, OID_AUTO, contexts, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sf_sysctl_contexts, "A", "read-only context ownership and IOVA capacity");
++
++static struct sysctl_oid *const gOids[] = { &sysctl__kern_sf_avd_contexts, &sysctl__kern_sf_avd, &sysctl__kern_sf_avd_state, &sysctl__kern_sf_avd_stats };
+ 
+ /* ---- start ----------------------------------------------------------------------------- */
+ 

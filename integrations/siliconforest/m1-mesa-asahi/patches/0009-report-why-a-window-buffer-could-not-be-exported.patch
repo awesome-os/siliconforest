@@ -1,0 +1,118 @@
+--- a/src/asahi/lib/agx_device.c	2026-11-10 13:21:18.276827961 -0800
++++ b/src/asahi/lib/agx_device.c	2026-11-10 13:21:18.291050497 -0800
+@@ -580,6 +580,7 @@
+ {
+    bool success = false;
+    int error = 0;
++   const char *stage = "";
+ 
+    /* Export is a one-way state transition shared by every pipe context on the
+     * screen. Serialize both the PRIME fd creation and implicit-writer handoff:
+@@ -589,13 +590,16 @@
+ 
+    if (!(bo->flags & AGX_BO_SHAREABLE)) {
+       error = EINVAL;
++      stage = "the BO was not created shareable";
+       goto out;
+    }
+ 
+    if (bo->flags & AGX_BO_SHARED) {
+       success = bo->prime_fd >= 0;
+-      if (!success)
++      if (!success) {
+          error = EIO;
++         stage = "the BO is marked shared but has no dma-buf fd";
++      }
+       goto out;
+    }
+ 
+@@ -606,6 +610,7 @@
+                                 &prime_fd);
+    if (ret || prime_fd < 0) {
+       error = ret < -1 ? -ret : (errno ? errno : EIO);
++      stage = "DRM_IOCTL_PRIME_HANDLE_TO_FD on the render node";
+       goto out;
+    }
+ 
+@@ -624,6 +629,7 @@
+                                      &out_sync_fd);
+       if (ret || out_sync_fd < 0) {
+          error = ret < -1 ? -ret : (errno ? errno : EIO);
++         stage = "DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD (export of the pending writer's fence as a sync file)";
+          if (out_sync_fd >= 0)
+             close(out_sync_fd);
+          goto error;
+@@ -633,6 +639,7 @@
+       close(out_sync_fd);
+       if (ret) {
+          error = ret < -1 ? -ret : (errno ? errno : EIO);
++         stage = "DMA_BUF_IOCTL_IMPORT_SYNC_FILE on the new dma-buf fd (attaching the pending writer's fence)";
+          goto error;
+       }
+    }
+@@ -647,8 +654,15 @@
+ 
+ out:
+    simple_mtx_unlock(&dev->bo_map_lock);
+-   if (error)
++   if (error) {
++      /* SiliconForest bring-up: name the step and the errno; callers only see "false". */
++      fprintf(stderr,
++              "asahi: export of BO handle %u (%zu bytes, flags 0x%x) failed at: %s: "
++              "errno %d (%s)\n",
++              bo->handle, (size_t)bo->size, (unsigned)bo->flags, stage, error,
++              strerror(error));
+       errno = error;
++   }
+    return success;
+ }
+ 
+--- a/src/egl/drivers/dri2/platform_wayland.c	2026-11-10 13:21:18.281538849 -0800
++++ b/src/egl/drivers/dri2/platform_wayland.c	2026-11-10 13:21:18.291755919 -0800
+@@ -1671,6 +1671,13 @@
+       image, __DRI_IMAGE_ATTRIB_MODIFIER_LOWER, &mod_lo);
+    if (query) {
+       modifier = combine_u32_into_u64(mod_hi, mod_lo);
++   } else {
++      /* SiliconForest bring-up: the modifier query goes through the driver's
++       * export (the buffer must become shared), so its failure is an errno. */
++      _eglLog(_EGL_WARNING,
++              "wayland-egl: modifier query of the %dx%d %.4s back buffer failed: "
++              "errno %d (%s)",
++              width, height, (const char *)&fourcc, errno, strerror(errno));
+    }
+ 
+    bool supported_modifier = false;
+@@ -1698,6 +1705,21 @@
+       supported_modifier = true;
+    }
+ 
++   if (!supported_modifier) {
++      unsigned n = 0;
++
++      _eglLog(_EGL_WARNING,
++              "wayland-egl: no wl_buffer: the %dx%d %.4s buffer has modifier "
++              "0x%llx%s, which the compositor did not advertise for this format",
++              width, height, (const char *)&fourcc, (unsigned long long)modifier,
++              modifier == DRM_FORMAT_MOD_INVALID ? " (unknown)" : "");
++      u_vector_foreach(mod, &dri2_dpy->formats.modifiers[visual_idx])
++         _eglLog(_EGL_WARNING, "wayland-egl:   compositor modifier %u: 0x%llx",
++                 n++, (unsigned long long)*mod);
++      if (!n)
++         _eglLog(_EGL_WARNING, "wayland-egl:   compositor sent no modifier for it");
++   }
++
+    if (dri2_dpy->wl_dmabuf && supported_modifier) {
+       struct zwp_linux_buffer_params_v1 *params;
+       int i;
+@@ -1730,6 +1752,10 @@
+             dri2_destroy_image(p_image);
+ 
+          if (!query) {
++            _eglLog(_EGL_WARNING,
++                    "wayland-egl: no wl_buffer: fd/stride/offset query of plane %d "
++                    "failed (fd %d): errno %d (%s)",
++                    i, fd, errno, strerror(errno));
+             if (fd >= 0)
+                close(fd);
+             zwp_linux_buffer_params_v1_destroy(params);

@@ -1,0 +1,48 @@
+#ifndef M1KBD_HID_H
+#define M1KBD_HID_H
+#include "native_protocol/dl_spi_hid.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+struct m1kbd_identity {
+    uint16_t vendor, product, version, max_input;
+    uint8_t country;
+};
+enum m1kbd_metadata_error {
+    M1KBD_META_OK=0, M1KBD_META_ARGUMENT=-1, M1KBD_META_LENGTH=-2,
+    M1KBD_META_COUNT=-3, M1KBD_META_VENDOR=-4, M1KBD_META_PRODUCT=-5,
+    M1KBD_META_INTERFACE=-6, M1KBD_META_INPUT_SIZE=-7
+};
+/* Called only on a CRC-validated, request-identity-matched message.
+ * Failure leaves output unchanged and returns a metadata error above.
+ * Unused optional strings are never followed, copied, or required. */
+int m1kbd_device_info(const uint8_t *, size_t, struct m1kbd_identity *);
+int m1kbd_interface_info(const uint8_t *, size_t, struct m1kbd_identity *);
+/* Fixed numeric headers only, not raw payloads. Device words: unknown0/1,
+ * count, vendor, product, version, then vendor/product/serial offset+length.
+ * Interface prefix: unknown0, interface, unknown2/3/4, country; words: max
+ * input/output/control, name offset+length. Exact sizes are 24 and 16 bytes.
+ * Return 1 for a complete bounded header, else zero and clear the output.
+ * No optional string or report bytes are accessed, even for invalid spans. */
+struct m1kbd_device_metadata { uint16_t words[12]; };
+struct m1kbd_interface_metadata { uint8_t prefix[6]; uint16_t words[5]; };
+int m1kbd_device_metadata_header(const uint8_t *, size_t, struct m1kbd_device_metadata *);
+int m1kbd_interface_metadata_header(const uint8_t *, size_t, struct m1kbd_interface_metadata *);
+int m1kbd_response_matches(const struct dlsp_message *, uint8_t report, uint8_t subdevice, uint8_t id);
+/* 1: eligible device-1 input, 0: another message, -1: malformed keyboard input.
+ * IOHID still validates the actual descriptor/report relationship. */
+int m1kbd_keyboard_input(const struct dlsp_message *, uint16_t max_input);
+/* Diagnostic schema v1: fixed u32 fields only, no packet/message payload or
+ * borrowed pointer. Outer fields can be untrusted when parser_error != 0.
+ * Supply message only after DLSP_MESSAGE (both CRCs/lengths checked). */
+struct m1kbd_observation {
+    uint32_t packet_available, packet_flags, packet_device, offset, remain, length;
+    uint32_t message_available, device, flags, command, report, subdevice, id;
+    uint32_t response_length, payload_length, parser_error;
+};
+void m1kbd_observe(const uint8_t *, size_t, const struct dlsp_message *,
+                  unsigned parser_error, struct m1kbd_observation *);
+#ifdef __cplusplus
+}
+#endif
+#endif

@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "status": "SOURCE_REVIEWED_AWAITING_RUNTIME_CAPTURE",
+  "scope": "Offline review only; no device access, kernel change, or active-attempt intervention",
+  "reviewed_sources": {
+    "integrations/puredarwin/m1-bringup/host_progress.py": "462361d839d45be878aa1cdfa5783399a4bc0ef2fda061603da973fca72e9467",
+    "integrations/puredarwin/m1-bringup/normal_image.py": "b985eee8bbd3f602232dfa7d8ba97ec4b16f5b22ad974fb159f1646de80ce3eb"
+  },
+  "host_validation": {
+    "command": "python3 integrations/puredarwin/m1-bringup/test_host_progress.py -v",
+    "tests": 13,
+    "passed": 13,
+    "hardware_evidence": false
+  },
+  "diagnostic_read_assessment": {
+    "immediate_address_blocker_found": false,
+    "basis": [
+      "The actual native KC inspector resolves all five selected globals inside loaded non-executable segments.",
+      "The captured bootstrap FP resolves inside the actual KC __BOOTDATA segment. The bounded 8192-byte read covers the 256-byte early-panic buffer.",
+      "Read commands require an owned paused callback and remain on its existing proxy reader. No pointer chasing, guest continuation, reset, or reboot is introduced.",
+      "The physical mapping calculation agrees with the attempt002 BootArgs-derived slide. EL12 values are additional observations, not an automatic explanation of the panic."
+    ],
+    "linked_symbols": {
+      "_PE_kputc": {"address": "0xfffffe00072c4798", "bytes": 8},
+      "_darwin_lab_m1_progress": {"address": "0xfffffe00084b3550", "bytes": 8},
+      "_debug_buf_base": {"address": "0xfffffe000843ffe0", "bytes": 8},
+      "_debug_buf_ptr": {"address": "0xfffffe000843ffe8", "bytes": 8},
+      "_debug_buf_size": {"address": "0xfffffe000843fff0", "bytes": 4}
+    }
+  },
+  "later_evidence_preservation_followups": [
+    {
+      "source": "integrations/puredarwin/m1-bringup/host_progress.py:227",
+      "finding": "stop() saves self.raw and self.event after diagnostic proxy commands. Pinned proxy.reply() can dispatch a nested REQ_BOOT while awaiting a reply; dispatch() resets these fields before stop() detects reentrance. Catching BoundedStop alone does not preserve the original event/context in that path.",
+      "action": "Snapshot the original raw bytes, event, and context error before diagnostic I/O; use those immutable locals for the final record. Reject nested boot dispatch while stopping before it mutates the original fields. Add a host-only nested-callback regression."
+    },
+    {
+      "source": "integrations/puredarwin/m1-bringup/host_progress.py:205",
+      "finding": "Partial globals are assigned to result only after the entire loop, and EL12 values only after the dictionary comprehension completes. Any EL12 failure skips the later stack read.",
+      "action": "Attach result dictionaries before incremental reads. Capture the bounded stack before optional EL12 observations so a register-read failure cannot discard the primary panic evidence."
+    }
+  ],
+  "attempt002_panic_analysis": {
+    "confirmed": "The exact linked call at panic_trap_to_debugger+0x98 enters panic_spin_forever from the PE_kputc == NULL early-panic branch. Normal debugger_panic_* globals are not populated on this branch.",
+    "source": "sources/puredarwin-m1-bringup/src/Kernel/xnu/osfmk/kern/debug.c:1268",
+    "exact_build_stack_layout": {
+      "formatted_message": {"relative_to_x29": "-0x150", "bytes": 256},
+      "saved_format_pointer": {"relative_to_x29": "-0x18", "bytes": 8},
+      "saved_va_list_pointer": {"relative_to_x29": "-0x20", "bytes": 8},
+      "saved_panic_caller": {"relative_to_x29": "-0x48", "bytes": 8},
+      "saved_frame_pointer": {"relative_to_x29": "0", "bytes": 8},
+      "saved_link_register": {"relative_to_x29": "+8", "bytes": 8}
+    },
+    "leading_cause": "Bootloader entropy length mismatch, strongly supported but awaiting the formatted stack message and saved caller.",
+    "evidence": [
+      "The captured x6 minus the supplied slide equals bootseed_init_bootloader+0x74, the exact return address of its insufficient-entropy panic call. The compiled panic wrapper puts its caller in x6.",
+      "prng_random.c:51-75 requires 4 * SHA512_DIGEST_LENGTH = 256 bootloader seed bytes on ARM64.",
+      "The saved real original ADT contains /chosen/random-seed with length 64. Only its property length was inspected for this review; seed bytes were not printed or copied into the report.",
+      "pe_gen.c:145-216 returns the available seed length, zeroing consumed ADT bytes; it returns zero for an all-zero seed. The exact actual returned count is not yet established.",
+      "arm_vm_init.c:1894 invokes early_random for the physical-aperture slide before serial initialization; earlier early_random consumers are also possible without a saved frame chain."
+    ],
+    "recommended_loader_fix_if_confirmed": "Supply exactly 256 fresh bytes from the M5 OS CSPRNG in the guest-only /chosen/random-seed property before final ADT serialization. Preserve the original ADT privately, verify byte-property roundtrip and capacity, and retain the kernel entropy checks. Do not expand the original 64 bytes deterministically or reuse a prior attempt's seed. Record source and byte count, not seed values. No kernel rebuild is required.",
+    "not_inferred": [
+      "UART FAR is not evidence that UART caused the panic.",
+      "Early panic is not arm_vm_init completion, command-line success, or full OS boot.",
+      "Attempt003 has not been observed by this reviewer; root owns execution and recovery."
+    ]
+  }
+}

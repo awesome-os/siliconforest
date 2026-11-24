@@ -1,0 +1,104 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Unattended check of the system audio path, one boot (tools/sa_boot.sh; nobody listens, the
+# proof is the driver's counters and coreaudiod's log):
+#   server   coreaudiod started by hand checks in its Mach service and finds /dev/sfaudio
+#   single   one AudioQueue client (sftone, 48 kHz): the driver's frame count moves, the queue
+#            takes frames at the device's rate
+#   volume   sfvolume through CoreAudio while a tone plays: kern.sf_sound.volume_db follows
+#   mix      two clients at once, 44.1 kHz and 48 kHz: coreaudiod's count of periods with two
+#            clients, and the time both take together
+#   pcmplay  the tree's own test player with a raw file
+#   linger   the device closes some seconds after the last client; a later client reopens it
+#   restart  coreaudiod killed and started again (does its service name come back?)
+# On a collection that also has the speakers the default output would be Speakers with the empty
+# jack: coreaudiod's test hook COREAUDIOD_JACK_FILE says "plugged" here, so this script stays the
+# headphones' proof (guest/darwin-sysaudio-speakers.in is the one for both devices).
+# Quiet throughout: codec attenuation @VOLUME@ dB or more, tones @TONEDB@ dB below full scale.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+@COMMON@
+printf '\nSA_BEGIN_%s\n' "$nonce"
+bringup
+
+phase server
+mkdir -p /var/run; echo 1 > /var/run/sfjack
+COREAUDIOD_JACK_FILE=/var/run/sfjack; export COREAUDIOD_JACK_FILE
+start_server
+sleep 1; showlog
+bounded 10 sfvolume get
+mon server
+
+phase single
+f0=$(get kern.sf_sound.frames)
+bounded 20 sftone -r 48000 -f 440 -s 4 -d @TONEDB@ -n single
+mon single
+printf 'SA_FRAMES single %s\n' $(( $(get kern.sf_sound.frames) - f0 ))
+showlog
+
+phase volume
+sftone -r 48000 -f 440 -s 9 -d @TONEDB@ -n volume 2>&1 &
+tone=$!
+sleep 3
+vol() {
+    bounded 10 sfvolume "$@"
+    printf 'SA_VOL after "%s": kern.sf_sound.volume_db=%s playing=%s\n' "$*" "$(get kern.sf_sound.volume_db)" "$(get kern.sf_sound.playing)"
+}
+vol get
+vol set 40
+vol up
+vol down
+vol mute
+vol get
+vol toggle-mute
+vol toggle-mute
+vol unmute
+vol set 20
+vol set 52
+wait_pids 20 "$tone"
+mon volume
+showlog
+
+phase mix
+f0=$(get kern.sf_sound.frames); s0=$(date +%s)
+sftone -r 44100 -f 440 -s 5 -d @TONEDB@ -c l -n mix44 2>&1 &
+a=$!
+sftone -r 48000 -f 660 -s 5 -d @TONEDB@ -c r -n mix48 2>&1 &
+b=$!
+wait_pids 25 "$a" "$b"
+printf 'SA_MIX frames=%s seconds=%s\n' $(( $(get kern.sf_sound.frames) - f0 )) $(( $(date +%s) - s0 ))
+mon mix
+showlog
+
+phase pcmplay
+if [ -f /usr/share/sysaudio-test.pcm ]; then
+    bounded 20 pcmplay /usr/share/sysaudio-test.pcm
+else
+    printf 'SA_SKIP no /usr/share/sysaudio-test.pcm\n'
+fi
+mon pcmplay
+
+phase linger
+idle 15 linger
+showlog
+mon closed
+bounded 20 sftone -r 44100 -f 440 -s 2 -d @TONEDB@ -n reopen
+mon reopen
+idle 15 reopen
+showlog
+
+phase restart
+kill "$server" 2>/dev/null; sleep 1
+start_server
+bounded 10 sfvolume get
+bounded 20 sftone -r 48000 -f 440 -s 2 -d @TONEDB@ -n restart
+idle 15 restart
+showlog
+
+phase end
+sysctl -w kern.sf_sound.volume_db=@VOLUME@ 2>&1
+mon end
+dmesg 2>/dev/null | grep 'SFSound: stopped' | tail -8
+kill "$server" 2>/dev/null
+printf 'SA_END_%s\n' "$nonce"
+# ends the capture at once (tools/pcie_iterate.sh PCIE_DONE)
+printf '\nPD_BENCH_DONE\n'

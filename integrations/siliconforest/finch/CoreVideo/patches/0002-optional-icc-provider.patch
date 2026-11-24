@@ -1,0 +1,55 @@
+Discover optional retained PD color-space providers at runtime; return NULL when absent.
+No generic RGB substitution or successful placeholder.
+--- a/userland/CoreVideo/CVMisc.m
++++ b/userland/CoreVideo/CVMisc.m
+@@ -11,6 +11,23 @@
+ #include <math.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <dlfcn.h>
++
++/* The retained PD color-space provider does not implement these two public
++ * APIs yet. Discover them at runtime and report unavailable construction as
++ * NULL. Never substitute a generic RGB space for an ICC profile. */
++static CGColorSpaceRef sf_create_icc_space(CFDataRef data)
++{
++    typedef CGColorSpaceRef (*Create)(CFDataRef);
++    Create create = (Create)dlsym(RTLD_DEFAULT, "CGColorSpaceCreateWithICCData");
++    return create ? create(data) : NULL;
++}
++static CGColorSpaceRef sf_create_media709_space(void)
++{
++    const CFStringRef *name = (const CFStringRef *)dlsym(RTLD_DEFAULT, "kCGColorSpaceCoreMedia709");
++    return name && *name ? CGColorSpaceCreateWithName(*name) : NULL;
++}
++
+ 
+ typedef struct {
+     int code;
+@@ -313,7 +330,7 @@
+         return NULL;
+     CFTypeRef icc = CFDictionaryGetValue(attachments, kCVImageBufferICCProfileKey);
+     if (icc && CFGetTypeID(icc) == CFDataGetTypeID())
+-        return CGColorSpaceCreateWithICCData(icc);
++        return sf_create_icc_space(icc);
+     CFTypeRef pv = CFDictionaryGetValue(attachments, kCVImageBufferColorPrimariesKey);
+     CFTypeRef tv = CFDictionaryGetValue(attachments, kCVImageBufferTransferFunctionKey);
+     CFTypeRef mv = CFDictionaryGetValue(attachments, kCVImageBufferYCbCrMatrixKey);
+@@ -322,7 +339,7 @@
+     int pc = CVColorPrimariesGetIntegerCodePointForString(pv), tc = CVTransferFunctionGetIntegerCodePointForString(tv);
+     int mc = mv && CFGetTypeID(mv) == CFStringGetTypeID() ? CVYCbCrMatrixGetIntegerCodePointForString(mv) : 2;
+     if (pc == 1 && tc == 1 && mc == 1)
+-        return CGColorSpaceCreateWithName(kCGColorSpaceCoreMedia709);
++        return sf_create_media709_space();
+     if (pc == 9 && tc == 16)
+         return CGColorSpaceCreateWithName(kCGColorSpaceITUR_2100_PQ);
+     if (pc == 9 && tc == 18)
+@@ -338,7 +355,7 @@
+     if (!p || !t)
+         return NULL;
+     CFDataRef profile = nclc_profile(p, t, mc);
+-    CGColorSpaceRef cs = profile ? CGColorSpaceCreateWithICCData(profile) : NULL;
++    CGColorSpaceRef cs = profile ? sf_create_icc_space(profile) : NULL;
+     if (profile)
+         CFRelease(profile);
+     return cs;

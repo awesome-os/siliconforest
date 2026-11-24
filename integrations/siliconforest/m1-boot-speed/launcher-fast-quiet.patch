@@ -1,0 +1,92 @@
+diff -ru a/integrations/puredarwin/m1-bringup/host_progress.py b/integrations/puredarwin/m1-bringup/host_progress.py
+--- a/integrations/puredarwin/m1-bringup/host_progress.py	2026-11-12 08:14:45.395120282 -0800
++++ b/integrations/puredarwin/m1-bringup/host_progress.py	2026-11-12 08:14:45.396053176 -0800
+@@ -227,7 +227,7 @@
+ 
+ 
+ BOOTARGS = ('-v -s debug=0x14e keepsyms=1 serial=3 serial-device-name=uart0 '
+-            'disable-uart-irq=1 cpus=1 rd=md0 serial_video_mirror=1 pdtextboot=1')
++            'disable-uart-irq=1 cpus=1 rd=md0 serial_video_mirror=0 pdtextboot=0 -noprogress')
+ # Guest processors. One (`cpus=1`, the hypervisor's device tree pruned to the boot CPU,
+ # secondary start refused) unless the extra boot arguments carry `cpus=N` with N > 1: then
+ # all eight /cpus nodes stay in the tree, that argument replaces `cpus=1`, and the pinned
+@@ -256,17 +256,64 @@
+ 
+ 
+ def configure_display_console(hv, backend, carveouts):
+-    # Pinned HV.set_bootargs(-v) uses legacy display=0. This kernel requires
+-    # nonzero to enter PE_create_console's video/mirror branch; 2 means text.
++    # Quiet boot. Pinned HV.set_bootargs(-v) uses legacy display=0, which this kernel
++    # treats as a text console; 1 is its graphics boot: the video console is initialised
++    # on the firmware framebuffer but paints no character and does not clear it. The
++    # console stays on the UART (serial=3, no mirror), -noprogress keeps the kernel's
++    # progress indicator off, and -v stays for launchd's console log.
+     # Retain firmware's actual framebuffer, pixel format, stride and geometry.
+     video = hv.tba.video
+     fields = framebuffer_geometry(video, backend, carveouts)
+-    video.display = 2
+-    return dict(guest_display=2, mode='text', geometry=fields,
+-                serial_video_mirror=True, pdtextboot=True,
++    video.display = 1
++    return dict(guest_display=1, mode='graphics', geometry=fields,
++                serial_video_mirror=False, pdtextboot=False,
++                boot_logo=getattr(backend, 'boot_logo', None),
+                 framebuffer_geometry_preserved=True, physical_panel_observed=False)
+ 
+ 
++def paint_boot_logo(backend, carveouts):
++    """Put boot-logo.gz (next to this file, with boot-logo.json; made by
++    integrations/puredarwin/m1-quiet-boot/boot_logo.py) on the panel: m1n1's own
++    framebuffer console is shut down without restoring its saved logo, then the picture is
++    decompressed on the target straight into the firmware framebuffer and read back.
++    After the shutdown the pinned HV.start()'s fb_improve_logo/fb_shutdown do nothing, so the
++    picture stays until a guest driver changes the display. Without the two files, or with
++    another framebuffer geometry, nothing is painted and the screen is left as it was."""
++    here = Path(__file__).resolve().parent
++    try:
++        meta = json.loads((here / 'boot-logo.json').read_text())
++        payload = (here / 'boot-logo.gz').read_bytes()
++    except OSError:
++        return dict(painted=False, reason='no boot-logo.gz/boot-logo.json in the launcher tree')
++    fields = framebuffer_geometry(backend.ba.video, backend, carveouts)
++    size = fields['stride'] * fields['height']
++    if (fields['width'], fields['height'], fields['stride'], fields['depth'] & 0xff, size) != (
++            meta['width'], meta['height'], meta['stride'], meta['depth'], meta['bytes']):
++        return dict(painted=False, reason='framebuffer geometry differs from the picture', geometry=fields)
++    image.require(0 < len(payload) <= 32 << 20, 'Boot picture payload size')
++    import gzip
++    raw = gzip.decompress(payload)
++    image.require(len(raw) == size and image.sha(raw) == meta['sha256'], 'Boot picture payload is not the recorded picture')
++    backend.p.fb_shutdown(False)
++    began = time.time()
++    # Decompressed into ordinary memory and copied: gzdec straight into the framebuffer took
++    # 2.8 s for a 0.4 MB payload (inflate reads its own output back, and the framebuffer is
++    # not cached memory). tinf checks the gzip CRC-32 of what it wrote.
++    with backend.u.heap.guarded_malloc(len(payload)) as address, backend.u.heap.guarded_malloc(size) as staging:
++        backend.iface.writemem(address, payload)
++        written = backend.p.gzdec(address, len(payload), staging, size)
++        image.require(written == size, 'Boot picture decompressed to an unexpected size')
++        backend.p.memcpy64(fields['base'], staging, size)
++    painted = time.time()
++    # Read back 16 rows spread over the panel instead of all 16 MB (1.9 s over USB).
++    stride, rows = fields['stride'], [fields['height'] * (2 * i + 1) // 32 for i in range(16)]
++    matches = all(backend.iface.readmem(fields['base'] + row * stride, stride) == raw[row * stride:(row + 1) * stride]
++                  for row in rows)
++    return dict(painted=True, sha256=meta['sha256'], readback='16 of %d rows' % fields['height'],
++                readback_matches=matches, painted_at=round(painted, 3),
++                paint_seconds=round(painted - began, 3), readback_seconds=round(time.time() - painted, 3))
++
++
+ def configure_entropy(hv):
+     # ARM64 prng_random.c requests 4*SHA512_DIGEST_LENGTH (256 bytes).
+     # Fresh OS CSPRNG output, never repetition/padding or a weakened XNU check.
+@@ -1335,6 +1382,9 @@
+         old.write_private(directory, 'original-bootargs.bin', ba)
+         old.write_private(directory, 'original-adt.bin', adt)
+         carveouts = read_carveouts(backend, directory)
++        backend.boot_logo = paint_boot_logo(backend, carveouts)
++        print('QUIET_BOOT_LOGO ' + json.dumps(backend.boot_logo), flush=True)
++        bq_mark('boot_logo_done')
+         reservation = check_reservation(backend, inputs, layout, carveouts)
+         old.write_private(directory, 'original-observations.json',
+                           dict(snapshot=snapshot, layout=layout, packet=inputs.report,

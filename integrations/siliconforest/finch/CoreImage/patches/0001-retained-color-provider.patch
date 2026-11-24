@@ -1,0 +1,90 @@
+--- a/userland/CoreImage/CIColor.m
++++ b/userland/CoreImage/CIColor.m
+@@ -5,6 +5,7 @@
+  * ("0.2 0.4 0.6 0.8", "[1 2.5 3]") and archive with its keys.
+  */
+ #import "CoreImage_Finch.h"
++#import <SFCIColorProvider.h>
+ 
+ @implementation CIColor {
+     CGFloat _c[4];
+@@ -73,13 +74,15 @@
+     if (space && CGColorSpaceGetModel(space) == kCGColorSpaceModelRGB && n >= 4)
+         return [self _finchInitWithComponents:c count:4 space:space];
+     /* any other model: what CoreGraphics makes of it in sRGB */
+-    CGColorRef converted = CGColorCreateCopyByMatchingToColorSpace(srgb(), kCGRenderingIntentDefault, color, NULL);
++    CGColorRef converted = SFCICopyColorMatched(srgb(), kCGRenderingIntentDefault, color, NULL);
+     if (converted) {
+         self = [self _finchInitWithComponents:CGColorGetComponents(converted) count:4 space:NULL];
+         CGColorRelease(converted);
+         return self;
+     }
+-    return [self initWithRed:0 green:0 blue:0 alpha:CGColorGetAlpha(color)];
++    /* Missing conversion is an unsupported color, never a black substitute. */
++    [self release];
++    return nil;
+ }
+ 
+ + (instancetype)colorWithCGColor:(CGColorRef)color { return [[[self alloc] initWithCGColor:color] autorelease]; }
+@@ -163,7 +166,7 @@
+ static NSString *
+ space_name(CGColorSpaceRef space)
+ {
+-    CFStringRef name = CGColorSpaceCopyName(space);
++    CFStringRef name = SFCICopyColorSpaceName(space);
+     NSString *out = nil;
+     if (name) {
+         if (CFEqual(name, kCGColorSpaceSRGB))
+@@ -233,7 +236,7 @@
+     float a = (float)[self alpha];
+     for (int i = 0; i < 3; i++)
+         out[i] = ci_linear_from_srgb((float)_c[i]) * a;
+-    CFStringRef name = CGColorSpaceCopyName(_space);
++    CFStringRef name = SFCICopyColorSpaceName(_space);
+     if (name && (CFEqual(name, kCGColorSpaceLinearSRGB) || CFEqual(name, kCGColorSpaceExtendedLinearSRGB) ||
+                  CFEqual(name, kCGColorSpaceGenericRGBLinear)))
+         for (int i = 0; i < 3; i++)
+--- a/userland/CoreImage/CIImage.m
++++ b/userland/CoreImage/CIImage.m
+@@ -7,6 +7,7 @@
+  * until a CIContext asks for pixels.
+  */
+ #import "CoreImage_Finch.h"
++#import <SFCIColorProvider.h>
+ #import <ImageIO/ImageIO.h>
+ 
+ CIBuf
+@@ -31,12 +32,12 @@
+ {
+     if (!space)
+         return YES;
+-    CFStringRef name = CGColorSpaceCopyName(space);
++    CFStringRef name = SFCICopyColorSpaceName(space);
+     BOOL linear = NO;
+     if (name) {
+         linear = CFEqual(name, kCGColorSpaceLinearSRGB) || CFEqual(name, kCGColorSpaceExtendedLinearSRGB) ||
+                  CFEqual(name, kCGColorSpaceGenericRGBLinear) || CFEqual(name, kCGColorSpaceLinearGray) ||
+-                 CFEqual(name, kCGColorSpaceExtendedLinearGray) || CFEqual(name, kCGColorSpaceGenericXYZ);
++                 CFEqual(name, kCGColorSpaceExtendedLinearGray) || SFCIIsGenericXYZ(name);
+         CFRelease(name);
+     }
+     return linear;
+--- a/userland/CoreImage/CIContext.m
++++ b/userland/CoreImage/CIContext.m
+@@ -6,6 +6,7 @@
+  * names a linear space (or none).
+  */
+ #import "CoreImage_Finch.h"
++#import <SFCIColorProvider.h>
+ #import <ImageIO/ImageIO.h>
+ 
+ @implementation CIContext {
+@@ -49,7 +50,7 @@
+ {
+     if (value == (id)[NSNull null])
+         return NULL;
+-    if (value && CFGetTypeID((CFTypeRef)value) == CGColorSpaceGetTypeID())
++    if (value && SFCIIsColorSpace((CFTypeRef)value))
+         return CGColorSpaceRetain((CGColorSpaceRef)value);
+     return CGColorSpaceCreateWithName(fallback);
+ }

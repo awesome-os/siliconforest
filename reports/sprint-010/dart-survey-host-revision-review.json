@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SOURCE_REVIEW_NOT_APPLIED_NO_HARDWARE",
+  "reviewed": {
+    "patch": "integrations/puredarwin/m1-dart-survey/host-revision-001/dart-survey-host.patch ef3e0a0658a4ebdb (manifest: ISOLATED_REVIEW_CANDIDATE_NOT_APPLIED)",
+    "files": "host_progress.py 09cd5735 -> 25694c88; new test_dart_survey_progress.py 345bb7d2. The 'before' overlay host is 09cd5735, the same as the live active host. Controller cce9803f is unchanged in before and after, and every other overlay file is byte-identical across before and after.",
+    "replay": "In scratch, the patch applied to the 'before' overlay reproduces 25694c88 and 345bb7d2 exactly; a recursive diff against root's 'after' overlay is empty. The active host was not modified."
+  },
+  "verdict": "APPROVE the isolated host revision for later application, after the survey packet is concrete and reviewed. The opt-in is exact and exclusive, layered strictly on the sealed native-only desktop mode, and requires exactly one built PDDARTSurvey fileset member. The 'pddartsurvey=1' boot argument is appended only when that gate passes, from one helper shared by the pre-reboot verification and the worker. Non-survey boot arguments are unchanged.",
+  "verified": [
+    "dart_survey_enabled parses the build record with object_pairs_hook=image.unique (duplicate keys refused) and returns False when 'dart_survey_experiment' is absent. If present, it must equal {version 1, driver 'PDDARTSurvey', mode 'read_only', diagnostic_property 'PDDARTSurveyDiagnosticV1', device_initialization false}, with exact int/bool types. Then native_keyboard_desktop_enabled(inputs) must be true: the exact native opt-in, no keyboard/virtual/terminal experiment keys, a desktop opt-in, bound RAM, PDM1SPIHID/IOHIDFamily/IOGOP members, no PDSerialHID, and exactly one PDM1SPIHID entry. The survey member must appear in the inspected report, and the raw fileset must contain exactly one 'org.puredarwin.driver.PDDARTSurvey' LC_FILESET_ENTRY, with bounds-checked name offsets.",
+    "Single gate in both places: verify_inputs (the pre-reboot controller check) calls dart_survey_enabled after the other opt-ins, and the worker's boot arguments come from guest_bootargs(inputs), which re-runs the same gates. The new test asserts both call sites.",
+    "guest_bootargs = BOOTARGS + (' pdm1kbd=1' if keyboard or native) + (' pddartsurvey=1' if survey). For every non-survey packet this is byte-identical to the previous inline expression; survey mode implies native mode, so 'pdm1kbd=1 pddartsurvey=1'. The full string is 155 characters, on the same append path native runs already used for pdm1kbd=1. validate_bootargs checks the struct and has no token allowlist.",
+    "Sealing is unchanged: survey mode is reachable only in native mode, so ConsoleSession keeps the native writer state machine (bootstrap, challenge, launcher, sealed) with no HID scheduler.",
+    "Suites rerun on my scratch replay: test_dart_survey_progress 6/6, test_native_desktop_progress 7/7, test_host_progress 41/41, test_terminal_input_progress 11/11, test_virtual_input_progress 18/18, test_progress_source_fidelity 2/2, all OK."
+  ],
+  "notes": [
+    {"id": "H1", "severity": "packet", "text": "The host checks the survey member by name and count only. The concrete packet review must bind the KC's PDDARTSurvey to the reviewed SDK bundle (227639dc) and show only that member added to the native KC."},
+    {"id": "H2", "severity": "audit", "text": "console-result does not record a dart-survey flag; before-start.json bootargs remain the evidence that 'pddartsurvey=1' was passed. A later revision could add 'dart_survey_enabled' to console-result. This is non-blocking."},
+    {"id": "H3", "severity": "scope", "text": "The host cannot verify that PDDARTSurvey only reads, or that the HV hook set is unchanged (dart-survey-rev002-independent-review.json S3/S4). Those remain runtime risks for root's bounded trial and recovery."}
+  ],
+  "not_claimed": ["application", "runtime", "DART read safety", "survey result"],
+  "scope": "Read-only patch review, scratch replay and host unit tests. No live host change, no hardware."
+}

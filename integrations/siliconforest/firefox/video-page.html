@@ -1,0 +1,99 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>SF-FX video fixture</title>
+<style>
+body{font:18px/1.5 system-ui;margin:20px;background:#101a20;color:#f0f7f4}
+video{display:block;max-width:90vw;width:960px;max-height:70vh;background:#000}
+pre{white-space:pre-wrap;font-size:14px}
+</style>
+<h1>Firefox video measurement</h1>
+<video id="video" controls playsinline muted></video>
+<button id="fullscreen">Fullscreen video</button>
+<pre id="result"></pre>
+<script>
+document.querySelector('#fullscreen').onclick=async event=>{
+ window.fxFullscreenRequest={trusted:event.isTrusted};
+ try{const element=document.querySelector('#video');await element.requestFullscreen();await element.play();
+  window.fxFullscreenRequest.started=true;}
+ catch(error){window.fxFullscreenRequest.error=String(error);}
+};
+const video=document.querySelector('#video'), output=document.querySelector('#result');
+const parameters=new URLSearchParams(location.search);
+const source=parameters.get('src') || 'media/bbb-1080p-h264-10s.mp4';
+video.muted=parameters.get('muted')!=='0';
+video.volume=Math.max(0,Math.min(1,Number(parameters.get('volume')??1)));
+
+window.fxVideoResult={source,timeOrigin:performance.timeOrigin,muted:true,events:[],presented:[],quality:[],canPlay:{
+  h264:video.canPlayType('video/mp4; codecs="avc1.640028"'),
+  hevc:video.canPlayType('video/mp4; codecs="hvc1.1.6.L120.B0"'),
+  vp9:video.canPlayType('video/webm; codecs="vp9"')
+}};
+function update(){
+  fxVideoResult.muted=video.muted;fxVideoResult.volume=video.volume;
+  fxVideoResult.currentTime=video.currentTime;
+  fxVideoResult.duration=Number.isFinite(video.duration)?video.duration:null;
+  fxVideoResult.readyState=video.readyState;
+  fxVideoResult.ended=video.ended;
+  fxVideoResult.error=video.error?{code:video.error.code,message:video.error.message}:null;
+  if(video.getVideoPlaybackQuality){
+    const quality=video.getVideoPlaybackQuality();
+    fxVideoResult.quality.push({wall:performance.now(),mediaTime:video.currentTime,
+      total:quality.totalVideoFrames,dropped:quality.droppedVideoFrames,
+      corrupted:quality.corruptedVideoFrames});
+  }
+  const latest=fxVideoResult.quality.at(-1);
+  output.textContent=JSON.stringify({...fxVideoResult,presented:fxVideoResult.presented.length},null,2);
+  document.title=window.fxTitleOverride||`SF-FX video t=${video.currentTime.toFixed(2)} frames=${latest?.total??0} dropped=${latest?.dropped??0} error=${video.error?.code??0}`;
+}
+for(const name of ['loadedmetadata','canplay','playing','waiting','stalled','ended','error'])
+  video.addEventListener(name,()=>{fxVideoResult.events.push({name,wall:performance.now(),mediaTime:video.currentTime});update()});
+if(video.requestVideoFrameCallback){
+  const presented=(now,metadata)=>{
+    fxVideoResult.presented.push({wall:now,mediaTime:metadata.mediaTime,
+      presentedFrames:metadata.presentedFrames,expectedDisplayTime:metadata.expectedDisplayTime,
+      presentationTime:metadata.presentationTime,processingDuration:metadata.processingDuration});
+    video.requestVideoFrameCallback(presented);
+  };
+  video.requestVideoFrameCallback(presented);
+}
+video.preload=parameters.get('autostart')==='0'?'metadata':'auto';
+if(parameters.get('deferred')!=='1')video.src=source;
+window.fxMeasureVideo=async()=>{
+  if(!video.getAttribute('src'))video.src=source;
+  video.pause();video.currentTime=0;
+  fxVideoResult.events=[];fxVideoResult.quality=[];fxVideoResult.presented=[];
+  delete fxVideoResult.playError;
+  const initial=video.getVideoPlaybackQuality();
+  fxVideoResult.initialQuality={total:initial.totalVideoFrames,dropped:initial.droppedVideoFrames,corrupted:initial.corruptedVideoFrames};
+  fxVideoResult.measureStart=performance.now();
+  // Some failed decoder paths leave play() pending. Bound the measurement
+  // independently so an audio failure still produces a useful result.
+  let timer,ended;
+  const timeout=Math.max(5000,Math.min(180000,Number(parameters.get('deadline'))||18000));
+  const completion=new Promise(resolve=>{
+    ended=()=>resolve();video.addEventListener('ended',ended,{once:true});
+  });
+  try{await Promise.race([
+    (async()=>{await video.play();await completion;await new Promise(resolve=>setTimeout(resolve,100));})(),
+    new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Playback measurement deadline')),timeout);})
+  ]);}
+  catch(error){fxVideoResult.playError=String(error);}
+  finally{clearTimeout(timer);video.removeEventListener('ended',ended);}
+  fxVideoResult.measureEnd=performance.now();
+  try {
+    const canvas=document.createElement('canvas');canvas.width=64;canvas.height=36;
+    const context=canvas.getContext('2d');context.drawImage(video,0,0,64,36);
+    const pixels=context.getImageData(0,0,64,36).data;
+    let hash=2166136261,nonBlack=0;
+    for(let i=0;i<pixels.length;i++){
+      hash=Math.imul(hash^pixels[i],16777619)>>>0;
+      if((i&3)!==3&&pixels[i]>8)nonBlack++;
+    }
+    fxVideoResult.finalPixels={hash:hash.toString(16),width:64,height:36,nonBlack,
+      videoWidth:video.videoWidth,videoHeight:video.videoHeight};
+  } catch(error){fxVideoResult.pixelReadbackError=String(error);}
+  update();return fxVideoResult;
+};
+if(parameters.get('autostart')==='1')video.play().catch(error=>{fxVideoResult.playError=String(error);update()});
+setInterval(update,1000);
+</script>

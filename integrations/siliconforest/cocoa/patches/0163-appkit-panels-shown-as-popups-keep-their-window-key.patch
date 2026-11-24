@@ -1,0 +1,91 @@
+--- a/src/Frameworks/AppKit/NSWindow.m
++++ b/src/Frameworks/AppKit/NSWindow.m
+@@ -126,6 +126,7 @@
+ @interface NSWindow ()
+ 
+ - (NSRect) zoomedFrame;
++-(void)_sfSetPopupAnchorRect:(NSRect)rect kind:(int)kind parent:(NSWindow *)parent;
+ 
+ @end
+ 
+@@ -1974,13 +1975,20 @@
+    if([_childWindows indexOfObjectIdenticalTo:child]==NSNotFound)
+     [_childWindows addObject:child];
+    [child setParentWindow:self];
++   /* (TERM11, FX-022) a child without a frame of its own (Firefox's menu panel and doorhangers) is shown by the
++    * compositor as a popup of this window, where its frame says, at whatever level it has */
++   if(!([child styleMask]&NSTitledWindowMask))
++    [child _sfSetPopupAnchorRect:NSZeroRect kind:WS_POPUP_AT_FRAME parent:self];
+    if([self isVisible] && ordered!=NSWindowOut)
+     [child orderWindow:ordered relativeTo:[self windowNumber]];
+ }
+ 
+ -(void)removeChildWindow:(NSWindow *)child {
+-   if([child parentWindow]==self)
++   if([child parentWindow]==self){
+     [child setParentWindow:nil];
++    if(!([child styleMask]&NSTitledWindowMask))
++     [child _sfSetPopupAnchorRect:NSZeroRect kind:WS_POPUP_AT_FRAME parent:nil];
++   }
+    [_childWindows removeObjectIdenticalTo:child];
+ }
+ 
+@@ -2716,6 +2724,7 @@
+ 
+ -(void)orderWindow:(NSWindowOrderingMode)place relativeTo:(int)relativeTo {
+    BOOL wasVisible=_isVisible;
++   NSPoint origin=_frame.origin;
+ 
+    if(!wasVisible && place!=NSWindowOut)
+     [self _sfGrowToFitContent];
+@@ -2724,8 +2733,10 @@
+    if([self _sfTabOrderWindow:place relativeTo:relativeTo])
+     return;
+ 
+-// The move notifications are sent under unknown conditions around orderFront: in the Apple AppKit, we do them all the time here until it's figured out. I suspect it is a side effect of off-screen windows being at off-screen coordinates (as opposed to just being hidden)
+-   [self postNotificationName:NSWindowWillMoveNotification];
++/* (TERM11, FX-022) Ordering a window posts no move notifications (macOS posts NSWindowWillMoveNotification when the
++ * user starts dragging a window, NSWindowDidMoveNotification when its origin changes). Both were posted around every
++ * order here, and Firefox rolls up its open popups in -windowWillMove: - its menu panel, shown by being attached as a
++ * child window, closed itself 26-30 ms after it opened, before the button was released. */
+ 
+    switch(place){
+     case NSWindowAbove:
+@@ -2739,7 +2750,9 @@
+      /* A menu, list or tool tip being shown: the compositor is asked for its popup before it is drawn, so
+       * that the answer (a configure, without which nothing may be shown) comes while it draws: the flush
+       * after the drawing waited for that round trip (libWindowServer kWSWindowPrepareRole). */
+-     if(!wasVisible && _level>=NSPopUpMenuWindowLevel){
++     if(!wasVisible && (_level>=NSPopUpMenuWindowLevel || (_parentWindow!=nil && !(_styleMask&NSTitledWindowMask)))){
++      // the frame it will be shown at (a popup made at an empty frame was placed there first, then moved)
++      [self _updateWSState];
+       struct wsRPCSimple prepare = { { kWSWindowPrepareRole, sizeof(struct wsRPCSimple) - sizeof(struct wsRPCBase) }, _number, 0, 0, 0 };
+       _windowServerRPC(&prepare, sizeof(prepare), NULL, NULL);
+      }
+@@ -2790,7 +2803,8 @@
+      break;
+    }
+ 
+-   [self postNotificationName:NSWindowDidMoveNotification];
++   if(!NSEqualPoints(origin,_frame.origin))
++    [self postNotificationName:NSWindowDidMoveNotification];
+ }
+ 
+ /* As on macOS a window taken off the screen is no longer key or main: the frontmost visible window that can
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -446,6 +446,14 @@
+                                     break;
+                                 case NSKeyUp:
+                                 case NSKeyDown: {
++                                    /* (TERM11, FX-022) keys go to the key window, as on macOS: a menu or panel of ours
++                                     * holding the keyboard while it is open (its compositor grab) is not key; the window
++                                     * it was opened from is, and handles them (Firefox: arrows and Escape in its menu
++                                     * panel, typing in a doorhanger's field) */
++                                    NSWindow *keyWindow = [self keyWindow];
++
++                                    if(window != nil && keyWindow != nil && window != keyWindow && ![window canBecomeKeyWindow])
++                                        window = keyWindow;
+                                     NSEvent *e = [NSEvent keyEventWithType:me.code
+                                                   location:NSMakePoint(me.x, me.y)
+                                              modifierFlags:me.mods

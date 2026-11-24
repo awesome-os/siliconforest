@@ -1,0 +1,48 @@
+#!/bin/sh
+# Host-origin virtual HID experiment in disposable RAM; never physical typing.
+set -eu
+nonce=${1-}
+case "$nonce" in ''|*[!0-9a-f]*) exit 2 ;; esac
+[ "${#nonce}" -eq 48 ] || exit 2
+printf '\nDL10_BEGIN_%s\n' "$nonce"
+runtime=/private/var/run/darwin-desktop
+mkdir -p "$runtime"
+chmod 0700 "$runtime"
+export XDG_RUNTIME_DIR="$runtime"
+export WAYLAND_DISPLAY=wayland-0
+export XKB_CONFIG_ROOT=/usr/share/X11/xkb
+export TMPDIR=/private/tmp
+printf 'DL10_INPUT_PRIME_%s\n' "$nonce"
+count=0
+while [ ! -c /dev/usb_hid_kbd ] || [ ! -c /dev/usb_hid_mouse ]; do
+    count=$((count + 1))
+    [ "$count" -le 50 ] || { printf 'DL10_INPUT_NODES_MISSING_%s\n' "$nonce"; exit 1; }
+    sleep 0.1
+done
+# The host sends full neutral releases during priming. The real compositor
+# separately drains its bounded pre-open queues before advertising a seat.
+sleep 0.5
+compositor=
+client=
+cleanup() {
+    trap - EXIT HUP INT TERM
+    if [ -n "$client" ]; then kill -TERM "$client" 2>/dev/null || :; wait "$client" 2>/dev/null || :; fi
+    if [ -n "$compositor" ]; then kill -TERM "$compositor" 2>/dev/null || :; wait "$compositor" 2>/dev/null || :; fi
+    printf '\nDL10_END_%s\n' "$nonce"
+}
+trap cleanup EXIT HUP INT TERM
+/usr/bin/chonkstep-darwin --run --socket "$runtime/wayland-0" --input sfhid &
+compositor=$!
+count=0
+while [ ! -S "$runtime/wayland-0" ]; do
+    kill -0 "$compositor"
+    count=$((count + 1))
+    [ "$count" -le 100 ] || exit 1
+    sleep 0.1
+done
+printf 'DL10_SERVER_SOCKET_%s\n' "$nonce"
+/usr/bin/darwin-wayland-client-input --socket "$runtime/wayland-0" --nonce "$nonce" --seconds 120 &
+client=$!
+sleep 100
+kill -0 "$compositor"
+kill -0 "$client"

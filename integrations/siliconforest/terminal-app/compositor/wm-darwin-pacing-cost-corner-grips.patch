@@ -1,0 +1,1084 @@
+diff --git a/crates/wm-core/src/manager.rs b/crates/wm-core/src/manager.rs
+index 37fc17e..fc694de 100644
+--- a/crates/wm-core/src/manager.rs
++++ b/crates/wm-core/src/manager.rs
+@@ -2223,6 +2223,15 @@ impl<B: Backend> WindowManager<B> {
+         // the rule says on the head it opens on.
+         let (output, workarea) = self.placement_output();
+         let monitor = self.backend.monitors_ref().get(output).map(|m| m.geometry).unwrap_or(workarea);
++        // DESK9 (FX-033): on a backend that fits new windows to the work area, the frame's invisible grab
++        // margin at the right and bottom (its resize band and corner) is kept on the screen too: placed by its
++        // visible bounds alone, a window as tall as the work area had its bottom resize band below the panel.
++        let workarea = if self.backend.fits_new_windows_to_workarea() && chrome.is_framed() {
++            let grab = layout.input_margin;
++            Rect::new(workarea.pos, Size::new(workarea.size.w.saturating_sub(grab).max(1), workarea.size.h.saturating_sub(grab).max(1)))
++        } else {
++            workarea
++        };
+         let output_scale = self.backend.decoration_scale(monitor);
+         let chrome_size = Size::new(
+             layout.visual_bounds().size.w.saturating_sub(content.size.w),
+diff --git a/crates/wm-darwin/src/glrender.rs b/crates/wm-darwin/src/glrender.rs
+index f1e1c3c..650fa5c 100644
+--- a/crates/wm-darwin/src/glrender.rs
++++ b/crates/wm-darwin/src/glrender.rs
+@@ -38,6 +38,11 @@ pub trait GlTarget {
+     fn poll(&mut self, libs: &Libraries, timeout: Duration) -> Result<Option<Presented>, String>;
+     /// Framebuffer object holding the most recently drawn frame.
+     fn last(&self) -> Option<GLuint>;
++    /// DESK9: which of the target's buffers `begin` gave (they rotate; each keeps the frame drawn into it last),
++    /// for a repaint of only what changed since; `None`: unknown, every frame is drawn whole.
++    fn drawing_index(&self) -> Option<usize> {
++        None
++    }
+     /// Power the display down or up. `Ok(false)`: this target has none.
+     fn set_power(&mut self, _: &Libraries, _: bool) -> Result<bool, String> {
+         Ok(false)
+@@ -218,6 +223,9 @@ impl GlTarget for OffscreenTarget {
+     fn last(&self) -> Option<GLuint> {
+         self.drawn.then_some(self.fbo)
+     }
++    fn drawing_index(&self) -> Option<usize> {
++        Some(0)
++    }
+ }
+ 
+ /// The display and what is in flight on it, shared by the desktop's loop and the cursor thread
+@@ -543,6 +551,9 @@ impl GlTarget for KmsTarget {
+     fn busy(&self) -> bool {
+         self.core().queue.busy()
+     }
++    fn drawing_index(&self) -> Option<usize> {
++        self.drawing
++    }
+     fn begin(&mut self) -> Result<GLuint, String> {
+         let c = self.core();
+         // a pointer-only flip of the front buffer may be in flight (the cursor thread's): drawing into
+@@ -959,6 +970,66 @@ void main() {
+ }
+ ";
+ 
++/// DESK9: the screen's changes of the last frames and which frame each of the target's buffers holds. A
++/// buffer drawn `age` frames ago needs the changes of those frames repainted, nothing else: the rest of it
++/// already shows what the screen shows (before, every frame repainted the whole 2560x1600 screen for any
++/// change, a client's one-line commit included).
++#[derive(Default)]
++struct PartialRepaint {
++    /// The display list of the frame drawn last.
++    shown: Vec<crate::damage::ItemSig>,
++    /// The changes of the last frames, newest last (at most `HISTORY`).
++    history: std::collections::VecDeque<crate::damage::Region>,
++    /// buffer index -> the frame number drawn into it last
++    drawn: HashMap<usize, u64>,
++    size: (u32, u32),
++}
++const HISTORY: usize = 4;
++/// More rectangles than this are repainted as their bounding box (one pass over the display list each).
++const SCISSOR_PASSES: usize = 4;
++impl PartialRepaint {
++    fn reset(&mut self) {
++        self.shown.clear();
++        self.history.clear();
++        self.drawn.clear();
++    }
++    /// This frame's changes (`sigs` against the frame before) and what buffer `index` needs repainted:
++    /// `None` = everything (a buffer not drawn before, too old, or no list to compare with).
++    fn plan(&mut self, sigs: Vec<crate::damage::ItemSig>, size: (u32, u32), frame: u64, index: Option<usize>, partial: impl FnMut(ItemKey) -> Option<Vec<DRect>>) -> Option<crate::damage::Region> {
++        if self.size != size {
++            self.reset();
++            self.size = size;
++        }
++        let mut fresh = crate::damage::Region::new(size.0, size.1);
++        if self.shown.is_empty() {
++            fresh.add_all();
++        } else {
++            crate::damage::diff(&self.shown, &sigs, partial, &mut fresh);
++        }
++        self.shown = sigs;
++        let need = index.and_then(|i| {
++            let last = *self.drawn.get(&i)?;
++            let between = frame.checked_sub(last)?.checked_sub(1)? as usize;
++            if between > self.history.len() {
++                return None;
++            }
++            let mut need = fresh.clone();
++            for older in self.history.iter().rev().take(between) {
++                need.add_region(older);
++            }
++            Some(need)
++        });
++        if self.history.len() == HISTORY {
++            self.history.pop_front();
++        }
++        self.history.push_back(fresh);
++        if let Some(i) = index {
++            self.drawn.insert(i, frame);
++        }
++        need
++    }
++}
++
+ #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+ struct TextureKey {
+     item: ItemKey,
+@@ -990,6 +1061,10 @@ pub struct GlRenderer {
+     frame: u64,
+     /// Bytes uploaded to textures while preparing the current frame.
+     uploaded: u64,
++    /// DESK9 (`partial_repaint`): what changed on the screen frame by frame, so that a buffer is brought up
++    /// to date by repainting only what changed since it was drawn last (`draw_frame`).
++    repaint: PartialRepaint,
++    pub(crate) partial_repaint: bool,
+     /// Client dma-bufs: id -> (EGLImage, texture). Never uploaded, never copied.
+     external: HashMap<u64, (EGLImage, GLuint)>,
+     next_external: u64,
+@@ -1093,6 +1168,8 @@ impl GlRenderer {
+                 textures: HashMap::new(),
+                 frame: 0,
+                 uploaded: 0,
++                repaint: PartialRepaint::default(),
++                partial_repaint: false,
+                 external: HashMap::new(),
+                 next_external: 1,
+                 scaled: None,
+@@ -1187,7 +1264,43 @@ impl GlRenderer {
+             (gl.glBlendFunc)(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+         }
+         let list = scene.display_list();
+-        self.draw_list(scene, &list, screen, scene.cursor_on_plane);
++        let sigs: Vec<crate::damage::ItemSig> = list.iter().map(|(sig, _)| *sig).collect();
++        let index = self.target.drawing_index();
++        let frame = self.frame;
++        let need = self.repaint.plan(sigs, (width, height), frame, index, |key| scene.partial_damage(key));
++        let need = need.filter(|_| self.partial_repaint);
++        let repainted = match &need {
++            None => {
++                self.draw_list(scene, &list, screen, scene.cursor_on_plane);
++                u64::from(width) * u64::from(height)
++            }
++            Some(region) => {
++                // only what changed since this buffer was drawn: one pass per rectangle (or their bounding box)
++                let rects: Vec<DRect> = if region.rects().len() <= SCISSOR_PASSES {
++                    region.rects().to_vec()
++                } else {
++                    vec![region.rects().iter().fold(DRect::EMPTY, |a, r| a.union(*r))]
++                };
++                for rect in &rects {
++                    let r = rect.intersect(screen);
++                    if r.is_empty() {
++                        continue;
++                    }
++                    unsafe {
++                        let gl = &self.libs.gl;
++                        (gl.glEnable)(GL_SCISSOR_TEST);
++                        (gl.glScissor)(r.x0, r.y0, r.width() as GLsizei, r.height() as GLsizei);
++                    }
++                    self.draw_list(scene, &list, r, scene.cursor_on_plane);
++                }
++                unsafe { (self.libs.gl.glDisable)(GL_SCISSOR_TEST) };
++                // a frame with nothing to repaint still marks its textures as used
++                if rects.iter().all(|r| r.intersect(screen).is_empty()) {
++                    self.mark_seen(&list);
++                }
++                rects.iter().map(|r| r.intersect(screen).area()).sum()
++            }
++        };
+         // the other outputs (an external display's CRTC): its rectangle of the scene, scaled to
+         // its mode, the pointer drawn in (the overlay plane is the panel's)
+         for head in 0..self.target.head_count() {
+@@ -1227,6 +1340,8 @@ impl GlRenderer {
+             (gl.glGetError)()
+         };
+         if error != GL_NO_ERROR {
++            // what the buffers hold is not known now: every buffer is drawn whole again
++            self.repaint.reset();
+             return Err(format!("GL error {error:#x} while rendering"));
+         }
+         let rendered = Instant::now();
+@@ -1240,7 +1355,7 @@ impl GlRenderer {
+             convert_us: 0,
+             present_us: rendered.elapsed().as_micros() as u64,
+             bytes_written: self.uploaded,
+-            damage_px: u64::from(width) * u64::from(height),
++            damage_px: repainted,
+             damage_rects: 1,
+             large_alloc_bytes: 0,
+         })
+@@ -1287,6 +1402,22 @@ impl GlRenderer {
+             }
+         }
+     }
++    /// DESK9: a frame that repainted nothing keeps the textures of what is on the screen.
++    fn mark_seen(&mut self, list: &[(crate::damage::ItemSig, DrawOp<'_>)]) {
++        let frame = self.frame;
++        for (sig, op) in list {
++            let parts = match op {
++                DrawOp::Background { outputs, .. } => outputs.len() + 1,
++                DrawOp::Decoration { surface, .. } => surface.parts.len() + 1,
++                _ => 1,
++            };
++            for part in 0..parts as u32 {
++                if let Some(t) = self.textures.get_mut(&TextureKey { item: sig.key, part }) {
++                    t.seen = frame;
++                }
++            }
++        }
++    }
+     /// The pointer's image into one of its plane's buffers at `offset`, straight alpha, nothing
+     /// blended (the plane's buffer is the image and transparency around it).
+     fn draw_cursor_buffer(&mut self, fbo: GLuint, size: u32, image: &DecorationBuffer, generation: u64, offset: Point) -> Result<(), String> {
+@@ -1402,7 +1533,14 @@ impl Renderer for GlRenderer {
+         self.target.poll(&self.libs, timeout)
+     }
+     fn invalidate(&mut self) {
+-        // Every frame is a complete repaint; textures stay valid.
++        // DESK9: the next frame of every buffer is a complete repaint; textures stay valid.
++        self.repaint.reset();
++    }
++    fn set_partial_repaint(&mut self, on: bool) {
++        if on != self.partial_repaint {
++            self.partial_repaint = on;
++            self.repaint.reset();
++        }
+     }
+     fn set_display_power(&mut self, on: bool) -> Result<bool, String> {
+         self.target.set_power(&self.libs, on)
+@@ -1761,14 +1899,86 @@ mod tests {
+     fn gl_frames_equal_the_cpu_render() {
+         const W: u32 = 193;
+         const H: u32 = 131;
+-        let mut renderer = match GlRenderer::offscreen(W, H) {
++        let renderer = match GlRenderer::offscreen(W, H) {
+             Ok(renderer) => renderer,
+             Err(error) => {
+                 eprintln!("SKIPPED gl_frames_equal_the_cpu_render: no GL on this host ({error})");
+                 return;
+             }
+         };
+-        let mut rng = Lcg(0x61);
++        gl_against_cpu(renderer, W, H, 0x61);
++    }
++
++    /// DESK9: three framebuffers taken in an irregular order, as the display's buffers are (never the one shown
++    /// last), so a buffer is drawn again 2, 3 or more frames after it was drawn last.
++    struct Rotating {
++        fbos: Vec<OffscreenTarget>,
++        drawing: Option<usize>,
++        last: Option<usize>,
++        rng: Lcg,
++    }
++    impl GlTarget for Rotating {
++        fn size(&self) -> (u32, u32) {
++            self.fbos[0].size
++        }
++        fn name(&self) -> &'static str {
++            "rotating"
++        }
++        fn busy(&self) -> bool {
++            false
++        }
++        fn begin(&mut self) -> Result<GLuint, String> {
++            let free: Vec<usize> = (0..self.fbos.len()).filter(|i| Some(*i) != self.last).collect();
++            let i = free[self.rng.next(free.len() as u32) as usize];
++            self.drawing = Some(i);
++            Ok(self.fbos[i].fbo)
++        }
++        fn present(&mut self, _: &Libraries) -> Result<(), String> {
++            self.last = self.drawing.take();
++            Ok(())
++        }
++        fn poll(&mut self, _: &Libraries, _: Duration) -> Result<Option<Presented>, String> {
++            Ok(None)
++        }
++        fn last(&self) -> Option<GLuint> {
++            self.last.map(|i| self.fbos[i].fbo)
++        }
++        fn drawing_index(&self) -> Option<usize> {
++            self.drawing
++        }
++    }
++
++    /// DESK9 (`partial_repaint`): repainting only what changed since a buffer was drawn last gives, frame after
++    /// frame, the picture a whole repaint (the CPU renderer) gives, with buffers reused at any age; and it
++    /// repaints less than the whole screen.
++    #[test]
++    fn a_partial_repaint_into_rotating_buffers_equals_the_cpu_render() {
++        const W: u32 = 193;
++        const H: u32 = 131;
++        let made = Libraries::load().and_then(|libs| {
++            let context = Context::create(&libs, &mut |_| {})?;
++            let fbos = (0..3).map(|_| OffscreenTarget::new(&libs, W, H)).collect::<Result<Vec<_>, _>>()?;
++            GlRenderer::with_target(libs, context, Box::new(Rotating { fbos, drawing: None, last: None, rng: Lcg(0x77) }))
++        });
++        let mut renderer = match made {
++            Ok(renderer) => renderer,
++            Err(error) => {
++                eprintln!("SKIPPED a_partial_repaint_into_rotating_buffers_equals_the_cpu_render: no GL on this host ({error})");
++                return;
++            }
++        };
++        renderer.set_partial_repaint(true);
++        let repainted = gl_against_cpu(renderer, W, H, 0x62);
++        let whole = 400 * u64::from(W) * u64::from(H);
++        eprintln!("partial repaint: {repainted} of {whole} pixels repainted ({:.0}%)", repainted as f64 * 100.0 / whole as f64);
++        assert!(repainted < whole * 9 / 10, "repainted {repainted} of {whole}");
++    }
++
++    /// 400 random scene changes, each frame compared with the CPU render; the pixels the renderer repainted.
++    #[allow(non_snake_case)]
++    fn gl_against_cpu(mut renderer: GlRenderer, W: u32, H: u32, seed: u64) -> u64 {
++        let mut repainted = 0u64;
++        let mut rng = Lcg(seed);
+         let mut scene = CpuBackend::new(Size::new(W, H)).unwrap();
+         let mut shells: Vec<(u64, bool)> = Vec::new();
+         let (mut worst, mut differing, mut exact_frames, mut frames) = (0u8, 0u64, 0, 0);
+@@ -1821,7 +2031,7 @@ mod tests {
+                     scene.dirty = true;
+                 }
+             }
+-            renderer.render_frame(&mut scene, &mut Nothing).unwrap();
++            repainted += renderer.render_frame(&mut scene, &mut Nothing).unwrap().damage_px;
+             let gl = renderer.read_back().unwrap().unwrap();
+             let cpu = scene.render().unwrap();
+             let (pixels, channel) = compare_frames(&gl, cpu.data());
+@@ -1837,6 +2047,7 @@ mod tests {
+         // Translucent blending may round differently on a GPU, never by more than one step.
+         assert!(worst <= 1, "max channel difference {worst}");
+         assert!(exact_frames >= 250);
++        repainted
+     }
+ 
+     #[test]
+diff --git a/crates/wm-darwin/src/gpu.rs b/crates/wm-darwin/src/gpu.rs
+index 35e0678..97880fc 100644
+--- a/crates/wm-darwin/src/gpu.rs
++++ b/crates/wm-darwin/src/gpu.rs
+@@ -101,6 +101,7 @@ library! {
+         fn glClear(mask: c_uint);
+         fn glFinish();
+         fn glDisable(cap: GLenum);
++        fn glScissor(x: GLint, y: GLint, width: GLsizei, height: GLsizei);
+         fn glPixelStorei(name: GLenum, value: GLint);
+         fn glReadPixels(x: GLint, y: GLint, width: GLsizei, height: GLsizei, format: GLenum, kind: GLenum, pixels: *mut c_void);
+         fn glBlitFramebuffer(sx0: GLint, sy0: GLint, sx1: GLint, sy1: GLint, dx0: GLint, dy0: GLint, dx1: GLint, dy1: GLint, mask: c_uint, filter: GLenum);
+@@ -354,6 +355,7 @@ pub const GL_TRIANGLE_STRIP: GLenum = 0x0005;
+ pub const GL_ONE: GLenum = 1;
+ pub const GL_ONE_MINUS_SRC_ALPHA: GLenum = 0x0303;
+ pub const GL_BLEND: GLenum = 0x0BE2;
++pub const GL_SCISSOR_TEST: GLenum = 0x0C11;
+ pub const GL_UNPACK_ROW_LENGTH: GLenum = 0x0CF2;
+ pub const GL_UNPACK_SKIP_ROWS: GLenum = 0x0CF3;
+ pub const GL_UNPACK_SKIP_PIXELS: GLenum = 0x0CF4;
+diff --git a/crates/wm-darwin/src/input_latency.rs b/crates/wm-darwin/src/input_latency.rs
+index 9644c90..ba2836c 100644
+--- a/crates/wm-darwin/src/input_latency.rs
++++ b/crates/wm-darwin/src/input_latency.rs
+@@ -498,6 +498,14 @@ impl FramePacer {
+         let since = t.saturating_duration_since(phase).as_micros() as u64;
+         phase + Duration::from_micros(since.div_ceil(i) * i)
+     }
++    /// DESK9: the next blank after `now` as the flips place them (an old phase is carried on; without one, a
++    /// refresh from now). For frame callbacks answered without a frame.
++    pub fn next_blank(&self, now: Instant) -> Instant {
++        match self.phase {
++            Some(phase) => Self::blank_after(phase, self.interval.as_micros().max(1) as u64, now + Duration::from_micros(200)),
++            None => now + self.interval,
++        }
++    }
+     /// When to commit a frame that is ready now (a pointer move, a staged frame), and the blank
+     /// it aims at; `None`: at once (no phase, latching off).
+     pub fn commit_at(&self, now: Instant) -> Option<(Instant, Instant)> {
+diff --git a/crates/wm-darwin/src/pacing.rs b/crates/wm-darwin/src/pacing.rs
+index 23ecb31..ec206ad 100644
+--- a/crates/wm-darwin/src/pacing.rs
++++ b/crates/wm-darwin/src/pacing.rs
+@@ -3,7 +3,9 @@
+ //! (dma-bufs): how many it committed, how many were shown, how many were replaced by a newer one before
+ //! any frame showed them (lost), how long from commit to flip, when in the refresh the commits came (ms
+ //! after the last flip) and how often a frame waited for a client's fence. `WMPACING` every 10 s and in
+-//! the inject `stats` step.
++//! the inject `stats` step. DESK9: frame callbacks to the next commit, commits that brought nothing new, the
++//! content of committed buffers (distinct or the same again, policy `framehash`), the commit handler's time,
++//! and the desk's cost per frame (`WMCOST`: render + GPU finish, uploads, how much of the screen was repainted).
+ use crate::input_latency::{window_text, Series};
+ use std::collections::HashMap;
+ use std::time::{Duration, Instant};
+@@ -27,6 +29,21 @@ struct Window {
+     /// 40 ms timeout instead of a frame.
+     fifo_held: u64,
+     fifo_timeouts: u64,
++    /// DESK9: when its frame callbacks last went out, and from then to its next commit (does the client
++    /// draw on the callbacks, or on a clock of its own?)
++    callback_sent: Option<Instant>,
++    callback_to_commit: Series,
++    /// commits that brought nothing new (no buffer attached, or the same buffer again without damage): no
++    /// repaint for them, only their frame callbacks at the next refresh
++    unchanged: u64,
++    /// DESK9 `framehash` (policy): committed buffers whose content differs from the window's buffer before,
++    /// equals it, or could not be read (sampled hash, `server.rs frame_hash`)
++    distinct: u64,
++    same: u64,
++    unhashed: u64,
++    last_hash: Option<u64>,
++    /// time in the desk's commit handler for this window's buffer commits (copies, imports, bookkeeping)
++    handler: Series,
+ }
+ 
+ #[derive(Default)]
+@@ -37,6 +54,14 @@ pub struct PacingTrace {
+     last_flip: Option<Instant>,
+     pub fence_holds: u64,
+     logged: Option<Instant>,
++    /// DESK9, the desk's own cost: frames rendered (draw + GPU finish, ms), bytes uploaded to textures,
++    /// the screen area each frame repainted, and frames that had nothing to repaint but frame callbacks
++    render: Series,
++    frames: u64,
++    uploaded: u64,
++    repainted_px: u64,
++    screen_px: u64,
++    callback_only_releases: u64,
+ }
+ 
+ impl PacingTrace {
+@@ -51,6 +76,9 @@ impl PacingTrace {
+             }
+         }
+         w.commits += 1;
++        if let Some(sent) = w.callback_sent.take() {
++            w.callback_to_commit.sample(now.saturating_duration_since(sent));
++        }
+         if w.pending.replace(now).is_some() {
+             w.replaced += 1;
+         }
+@@ -65,6 +93,45 @@ impl PacingTrace {
+             }
+         }
+     }
++    /// DESK9: a commit that brought nothing to show (its frame callbacks are answered without a repaint).
++    pub fn unchanged(&mut self, id: u64) {
++        let w = self.windows.entry(id).or_default();
++        w.unchanged += 1;
++        if let Some(sent) = w.callback_sent.take() {
++            w.callback_to_commit.sample(Instant::now().saturating_duration_since(sent));
++        }
++    }
++    /// DESK9: the window's frame callbacks went out (at a flip, or for a commit that needed no frame).
++    pub fn callbacks_sent(&mut self, id: u64, at: Instant) {
++        self.windows.entry(id).or_default().callback_sent = Some(at);
++    }
++    /// DESK9 `framehash`: the sampled hash of the buffer a window committed (`None`: not readable).
++    pub fn content(&mut self, id: u64, hash: Option<u64>) {
++        let w = self.windows.entry(id).or_default();
++        match hash {
++            None => w.unhashed += 1,
++            Some(h) if w.last_hash == Some(h) => w.same += 1,
++            Some(h) => {
++                w.distinct += 1;
++                w.last_hash = Some(h);
++            }
++        }
++    }
++    /// DESK9: time the commit handler spent on one buffer commit of a window.
++    pub fn handled(&mut self, id: u64, took: Duration) {
++        self.windows.entry(id).or_default().handler.sample(took);
++    }
++    /// DESK9: a frame was rendered: draw + finish time, bytes uploaded, pixels repainted of the screen's.
++    pub fn rendered(&mut self, took: Duration, uploaded: u64, repainted_px: u64, screen_px: u64) {
++        self.render.sample(took);
++        self.frames += 1;
++        self.uploaded += uploaded;
++        self.repainted_px += repainted_px;
++        self.screen_px += screen_px;
++    }
++    pub fn callback_only_release(&mut self) {
++        self.callback_only_releases += 1;
++    }
+     /// The window's newest commit has not been drawn into a frame yet (DESK8, the FIFO's test).
+     pub fn pending_unshown(&self, id: u64) -> bool {
+         self.windows.get(&id).is_some_and(|w| w.pending.is_some())
+@@ -124,30 +191,49 @@ impl PacingTrace {
+         let fence = std::mem::take(&mut self.fence_holds);
+         let mut lines = Vec::new();
+         for (id, w) in self.windows.iter_mut() {
+-            if w.commits == 0 {
++            if w.commits == 0 && w.unchanged == 0 {
+                 continue;
+             }
+             let ctf = w.commit_to_flip.take_sorted();
+             let iv = w.intervals.take_sorted();
++            let cb = w.callback_to_commit.take_sorted();
++            let handler = w.handler.take_sorted();
++            let hashes = if w.distinct + w.same + w.unhashed > 0 { format!(" | content: distinct={} same_as_before={} unread={}", w.distinct, w.same, w.unhashed) } else { String::new() };
+             lines.push(format!(
+-                "WMPACING over_ms={window_ms} window={id} app={:?} commits={} shown={} replaced_before_shown={} fifo_held={} fifo_timeouts={} | {} | {} | commits by ms after the last flip {:?} | frames held for a fence={fence}",
+-                w.app_id, w.commits, w.shown, w.replaced, w.fifo_held, w.fifo_timeouts, window_text(&ctf, "commit->flip"), window_text(&iv, "commit interval"), w.phase
++                "WMPACING over_ms={window_ms} window={id} app={:?} commits={} shown={} replaced_before_shown={} fifo_held={} fifo_timeouts={} unchanged_commits={} | {} | {} | {} | {} | commits by ms after the last flip {:?} | frames held for a fence={fence}{hashes}",
++                w.app_id, w.commits, w.shown, w.replaced, w.fifo_held, w.fifo_timeouts, w.unchanged, text95(&ctf, "commit->flip"), window_text(&iv, "commit interval"), text95(&cb, "callback->commit"), text95(&handler, "commit handler"), w.phase
+             ));
+             w.commits = 0;
+             w.shown = 0;
+             w.replaced = 0;
+             w.fifo_held = 0;
+             w.fifo_timeouts = 0;
++            w.unchanged = 0;
++            w.distinct = 0;
++            w.same = 0;
++            w.unhashed = 0;
+             w.phase = [0; 18];
+         }
+         if !lines.is_empty() {
+             lines.push(format!("WMPACING {}", crate::kms::flip_clock_line()));
++            let render = self.render.take_sorted();
++            let seconds = (window_ms as f64 / 1000.0).max(0.001);
++            lines.push(format!(
++                "WMCOST over_ms={window_ms} frames={} ({:.1}/s) {} uploaded_MB_per_s={:.1} repainted={:.0}% of the screen per frame, callback-only releases={}",
++                self.frames, self.frames as f64 / seconds, text95(&render, "render+finish"), self.uploaded as f64 / 1e6 / seconds,
++                if self.screen_px > 0 { self.repainted_px as f64 * 100.0 / self.screen_px as f64 } else { 0.0 }, self.callback_only_releases
++            ));
++            self.frames = 0;
++            self.uploaded = 0;
++            self.repainted_px = 0;
++            self.screen_px = 0;
++            self.callback_only_releases = 0;
+         }
+         lines
+     }
+     /// Every 10 s while a GPU client commits.
+     pub fn maybe_lines(&mut self) -> Vec<String> {
+-        if self.windows.values().all(|w| w.commits == 0) {
++        if self.windows.values().all(|w| w.commits == 0 && w.unchanged == 0) {
+             return Vec::new();
+         }
+         let at = *self.logged.get_or_insert_with(Instant::now);
+@@ -158,6 +244,12 @@ impl PacingTrace {
+     }
+ }
+ 
++/// n, p50, p95, p99, max (ms) of a sorted series of microseconds.
++fn text95(sorted: &[u32], what: &str) -> String {
++    let at = |p: f64| if sorted.is_empty() { 0.0 } else { f64::from(sorted[((sorted.len() - 1) as f64 * p).round() as usize]) / 1000.0 };
++    format!("{what} n={} p50_ms={:.1} p95_ms={:.1} p99_ms={:.1} max_ms={:.1}", sorted.len(), at(0.5), at(0.95), at(0.99), sorted.last().map_or(0.0, |v| f64::from(*v) / 1000.0))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -176,6 +268,7 @@ mod tests {
+         let lines = p.take_lines();
+         let line = lines.iter().find(|l| l.contains("window=7")).unwrap();
+         assert!(line.contains("commits=3 shown=2 replaced_before_shown=1 fifo_held=0"), "{line}");
+-        assert!(lines.last().unwrap().contains("flip stamps:"), "{lines:?}");
++        assert!(lines.iter().any(|l| l.contains("flip stamps:")), "{lines:?}");
++        assert!(lines.last().unwrap().starts_with("WMCOST "), "{lines:?}");
+     }
+ }
+diff --git a/crates/wm-darwin/src/policy.rs b/crates/wm-darwin/src/policy.rs
+index 4139514..c00bbe8 100644
+--- a/crates/wm-darwin/src/policy.rs
++++ b/crates/wm-darwin/src/policy.rs
+@@ -12,6 +12,9 @@
+ //! | `flip_time_callbacks` | on | frame callbacks carry the flip's time (CLOCK_MONOTONIC ms, wp_presentation's clock) and go out at the flip |
+ //! | `flip_stamps` | on | a flip's time is the kernel's stamp of it (when on a clock we read), not when its event was read |
+ //! | `restore` | on | applications the desk opened that had windows when the compositor before this one ended are opened again (`session_restore.rs`) |
++//! | `skip_unchanged` | off (desk9-001) | DESK9: a commit that brings nothing new (no buffer, or the same buffer without damage) repaints nothing; its frame callbacks go out at the next refresh |
++//! | `partial_repaint` | off (desk9-001) | DESK9: the GPU renderer repaints only what changed since the buffer it draws into was last drawn (scissor), not the whole screen |
++//! | `framehash` | off | DESK9: every committed buffer's content is hashed (sampled) to count distinct frames (`WMPACING ... content:`); a test's switch, it reads client memory |
+ use std::path::PathBuf;
+ use std::time::{Duration, Instant, SystemTime};
+ 
+@@ -23,10 +26,13 @@ pub struct Switches {
+     pub flip_time_callbacks: bool,
+     pub flip_stamps: bool,
+     pub restore: bool,
++    pub skip_unchanged: bool,
++    pub partial_repaint: bool,
++    pub framehash: bool,
+ }
+ 
+ impl Switches {
+-    const KEYS: [&'static str; 6] = ["fifo", "fifo_shm", "client_wake", "flip_time_callbacks", "flip_stamps", "restore"];
++    const KEYS: [&'static str; 9] = ["fifo", "fifo_shm", "client_wake", "flip_time_callbacks", "flip_stamps", "restore", "skip_unchanged", "partial_repaint", "framehash"];
+     fn defaults() -> Self {
+         let env = |key: &str| std::env::var(format!("CHONKSTEP_DARWIN_{}", key.to_ascii_uppercase())).ok().and_then(|v| parse_bool(&v));
+         Self {
+@@ -36,6 +42,9 @@ impl Switches {
+             flip_time_callbacks: env("flip_time_callbacks").unwrap_or(true),
+             flip_stamps: env("flip_stamps").unwrap_or(true),
+             restore: env("restore").unwrap_or(true),
++            skip_unchanged: env("skip_unchanged").unwrap_or(false),
++            partial_repaint: env("partial_repaint").unwrap_or(false),
++            framehash: env("framehash").unwrap_or(false),
+         }
+     }
+     fn slot(&mut self, key: &str) -> Option<&mut bool> {
+@@ -46,6 +55,9 @@ impl Switches {
+             "flip_time_callbacks" => &mut self.flip_time_callbacks,
+             "flip_stamps" => &mut self.flip_stamps,
+             "restore" => &mut self.restore,
++            "skip_unchanged" => &mut self.skip_unchanged,
++            "partial_repaint" => &mut self.partial_repaint,
++            "framehash" => &mut self.framehash,
+             _ => return None,
+         })
+     }
+@@ -167,7 +179,7 @@ mod tests {
+     use super::*;
+     #[test]
+     fn the_policy_file_changes_switches_without_a_relaunch_and_a_test_pin_wins_until_released() {
+-        let base = Switches { fifo: true, fifo_shm: true, client_wake: true, flip_time_callbacks: true, flip_stamps: true, restore: true };
++        let base = Switches { fifo: true, fifo_shm: true, client_wake: true, flip_time_callbacks: true, flip_stamps: true, restore: true, skip_unchanged: true, partial_repaint: true, framehash: false };
+         let (s, refused) = Switches::parse("# comment\nfifo=off\nrestore = 0\nbogus=1\nclient_wake=maybe\n", base);
+         assert!(!s.fifo && !s.restore && s.client_wake && s.flip_time_callbacks);
+         assert_eq!(refused, vec!["bogus=1".to_string(), "client_wake=maybe".to_string()]);
+diff --git a/crates/wm-darwin/src/render.rs b/crates/wm-darwin/src/render.rs
+index d3006ef..910f184 100644
+--- a/crates/wm-darwin/src/render.rs
++++ b/crates/wm-darwin/src/render.rs
+@@ -201,6 +201,9 @@ impl FrameTotals {
+ 
+ pub trait Renderer {
+     fn kind(&self) -> RendererKind;
++    /// DESK9: repaint only what changed since the target buffer was drawn last (GPU renderer; policy
++    /// `partial_repaint`). Others ignore it.
++    fn set_partial_repaint(&mut self, _: bool) {}
+     /// Bring the presenter's output up to date with `scene`. On error nothing
+     /// is considered shown: the caller keeps the scene dirty and the next call
+     /// must deliver everything that is still outstanding.
+diff --git a/crates/wm-darwin/src/scene.rs b/crates/wm-darwin/src/scene.rs
+index 6eb9004..339090f 100644
+--- a/crates/wm-darwin/src/scene.rs
++++ b/crates/wm-darwin/src/scene.rs
+@@ -725,6 +725,14 @@ impl CpuBackend {
+             let frame=self.frames.iter().find(|(_,f)|f.window==*id);
+             if frame.is_some_and(|(_,f)|!f.mapped){continue;}
+             if w.mapped && w.image.is_some() && inside(point,w.content){
++                // DESK9 (FX-033): a resizable frame's corner grip wins over the client in the content's last
++                // CORNER_GRIP pixels at each corner (the band outside the content is a few pixels wide; a corner
++                // pressed a little inside the window resized nothing and went to the page)
++                if let Some((fid,f))=frame {
++                    if corner_grip(&f.layout,f.geometry.pos,w.content,point) {
++                        return Some((SurfaceRef::Frame(*fid),Point::new(point.x-f.geometry.pos.x,point.y-f.geometry.pos.y)));
++                    }
++                }
+                 let local=Point::new(point.x-w.content.pos.x,point.y-w.content.pos.y);
+                 // The input region is in the surface's logical units.
+                 let density=if w.unscaled{1.0}else{self.scale.factor()};
+@@ -1413,3 +1421,25 @@ mod output_background_tests {
+         assert!(scene.output_backgrounds.is_empty(), "unplugged: no picture kept for it");
+     }
+ }
++
++/// DESK9 (FX-033): how far into a window's content its frame's corner grips reach (panel pixels).
++pub(crate) const CORNER_GRIP: i32 = 8;
++/// Is `point` (inside the content) within `CORNER_GRIP` of a content corner, on a corner resize hitbox of the
++/// frame (at `origin`)? Only a resizable frame has those hitboxes.
++pub(crate) fn corner_grip(layout: &wm_theme_api::DecorationLayout, origin: Point, content: Rect, point: Point) -> bool {
++    let (x0, y0) = (content.pos.x, content.pos.y);
++    let (x1, y1) = (x0 + content.size.w as i32, y0 + content.size.h as i32);
++    let near = |a: i32, b: i32| (a - b).abs() < CORNER_GRIP;
++    layout.resize_hitboxes.iter().any(|(edge, r)| {
++        let corner = match edge {
++            ResizeEdge::NorthWest => (x0, y0),
++            ResizeEdge::NorthEast => (x1 - 1, y0),
++            ResizeEdge::SouthWest => (x0, y1 - 1),
++            ResizeEdge::SouthEast => (x1 - 1, y1 - 1),
++            _ => return false,
++        };
++        let (rx, ry) = (origin.x + r.pos.x, origin.y + r.pos.y);
++        let on_box = point.x >= rx && point.y >= ry && point.x < rx + r.size.w as i32 && point.y < ry + r.size.h as i32;
++        on_box && near(point.x, corner.0) && near(point.y, corner.1)
++    })
++}
+diff --git a/crates/wm-darwin/src/server.rs b/crates/wm-darwin/src/server.rs
+index 2c43fb3..ed8de80 100644
+--- a/crates/wm-darwin/src/server.rs
++++ b/crates/wm-darwin/src/server.rs
+@@ -171,6 +171,15 @@ pub struct Server {
+     /// Frame callbacks of a frame that is on its way to the screen; they are
+     /// sent when its flip completes.
+     awaiting_flip: Vec<wl_callback::WlCallback>,
++    /// DESK9: the windows whose frame callbacks wait in `awaiting_flip` (the pacing trace's callback times).
++    callback_flip_windows: Vec<u64>,
++    /// DESK9 (`skip_unchanged`): commits that brought nothing new have their frame callbacks (and presentation
++    /// feedback) answered at this blank, without a repaint.
++    callback_only_due: Option<std::time::Instant>,
++    /// DESK9: the last flip (when, its sequence), for the feedback of commits answered without a frame.
++    last_flip: Option<(std::time::Instant, u32)>,
++    /// DESK9 `framehash`: client dma-bufs mapped for reading (import id -> address, length), until released.
++    frame_maps: HashMap<u64, (usize, usize)>,
+     dmabuf: DmabufState,
+     dmabuf_global: Option<DmabufGlobal>,
+     /// wl_buffer -> the texture the renderer made of its dma-buf.
+@@ -405,6 +414,10 @@ impl Server {
+             frames: FrameTotals::default(),
+             frame_log,
+             awaiting_flip: Vec::new(),
++            callback_flip_windows: Vec::new(),
++            callback_only_due: None,
++            last_flip: None,
++            frame_maps: HashMap::new(),
+             dmabuf: DmabufState::new(),
+             dmabuf_global: None,
+             external_by_buffer: HashMap::new(),
+@@ -763,6 +776,11 @@ impl Server {
+         if self.renderer.busy() {
+             return Ok(());
+         }
++        // DESK9: commits that brought nothing new repaint nothing; their frame callbacks go out at the blank
++        if self.policy.now.skip_unchanged && !self.wm.backend().dirty && !self.renderer.staged() {
++            self.release_unchanged_callbacks(time_ms);
++        }
++        self.renderer.set_partial_repaint(self.policy.now.partial_repaint);
+         let now = std::time::Instant::now();
+         // A frame that is ready (staged, or only the pointer's plane moved) is committed at the
+         // last safe moment before its blank, with the pointer where the newest input put it.
+@@ -829,6 +847,8 @@ impl Server {
+         // otherwise it is shown at once, the pointer drawn in it.
+         let stats = if on_plane { self.renderer.stage_frame(self.wm.backend_mut(), presenter)? } else { self.renderer.render_frame(self.wm.backend_mut(), presenter)? };
+         self.pacing.drawn();
++        let screen = wm_core::Backend::screen_size(self.wm.backend());
++        self.pacing.rendered(started.elapsed(), stats.bytes_written, stats.damage_px, u64::from(screen.w) * u64::from(screen.h));
+         let seq = self.pacing.seq();
+         for (_, callbacks) in self.feedback_pending.drain() {
+             self.feedback_drawn.extend(callbacks.into_iter().map(|c| (seq, c)));
+@@ -877,12 +897,18 @@ impl Server {
+             .copied()
+             .filter(|id| self.wm.backend().visible(*id))
+             .collect();
++        let later = self.renderer.busy() || self.renderer.staged();
+         for id in visible {
+             if let Some(callbacks) = self.callbacks.remove(&id) {
+                 ready.extend(callbacks);
++                if later {
++                    self.callback_flip_windows.push(id);
++                } else {
++                    self.pacing.callbacks_sent(id, std::time::Instant::now());
++                }
+             }
+         }
+-        if self.renderer.busy() || self.renderer.staged() {
++        if later {
+             self.awaiting_flip.extend(ready);
+         } else {
+             for callback in ready {
+@@ -1090,6 +1116,72 @@ impl Server {
+         for callback in self.awaiting_flip.drain(..) {
+             callback.done(time_ms);
+         }
++        let sent = std::time::Instant::now();
++        for id in std::mem::take(&mut self.callback_flip_windows) {
++            self.pacing.callbacks_sent(id, sent);
++        }
++        self.last_flip = Some((presented.at, presented.sequence));
++    }
++    /// DESK9 (`skip_unchanged`): frame callbacks of commits that brought nothing new (no buffer, or the same
++    /// buffer without damage) go out at the next blank without a repaint - before, each such commit repainted
++    /// the whole screen - and their presentation feedback says presented at that blank (what is shown did not
++    /// change; vsync, not a hardware completion).
++    fn release_unchanged_callbacks(&mut self, time_ms: u32) {
++        let waiting: Vec<u64> = self.callbacks.iter().filter(|(id, c)| !c.is_empty() && self.wm.backend().visible(**id)).map(|(id, _)| *id).collect();
++        if waiting.is_empty() && self.feedback_pending.values().all(|f| f.is_empty()) {
++            self.callback_only_due = None;
++            return;
++        }
++        let now = std::time::Instant::now();
++        let blank = *self.callback_only_due.get_or_insert_with(|| self.pacer.next_blank(now));
++        if now < blank {
++            return; // the loop wakes for it (idle_wait)
++        }
++        self.callback_only_due = None;
++        let mut mono = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut mono) };
++        let at = std::time::Duration::new(mono.tv_sec as u64, mono.tv_nsec as u32).saturating_sub(blank.elapsed());
++        let ms = if self.policy.now.flip_time_callbacks { at.as_millis() as u32 } else { time_ms };
++        for id in waiting {
++            for callback in self.callbacks.remove(&id).unwrap_or_default() {
++                callback.done(ms);
++            }
++            self.pacing.callbacks_sent(id, now);
++        }
++        let interval = self.pacer.interval();
++        let sequence = self.last_flip.map_or(0, |(t, s)| {
++            let i = interval.as_micros().max(1) as u64;
++            u64::from(s) + (blank.saturating_duration_since(t).as_micros() as u64 + i / 2) / i
++        });
++        use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind;
++        for (_, list) in self.feedback_pending.drain() {
++            for feedback in list {
++                feedback.presented(&self.output, at, smithay::wayland::presentation::Refresh::fixed(interval), sequence, Kind::Vsync);
++            }
++        }
++        self.pacing.callback_only_release();
++    }
++    /// DESK9 `framehash`: a sampled hash of what a buffer shows (every third pixel of every third row), to count
++    /// distinct frames; `None` when the buffer cannot be read. A dma-buf's mapping is kept until it is released.
++    fn frame_hash_external(&mut self, external: ExternalBuffer) -> Option<u64> {
++        let (address, length) = match self.frame_maps.get(&external.id) {
++            Some(m) => *m,
++            None => {
++                let dmabuf = self.external_dmabufs.get(&external.id)?;
++                let (fd, offset, stride) = (dmabuf.handles().next()?, dmabuf.offsets().next()?, dmabuf.strides().next()?);
++                let length = offset as usize + stride as usize * external.height as usize;
++                let map = unsafe { libc::mmap(std::ptr::null_mut(), length, libc::PROT_READ, libc::MAP_SHARED, std::os::fd::AsRawFd::as_raw_fd(&fd), 0) };
++                if map == libc::MAP_FAILED {
++                    return None;
++                }
++                self.frame_maps.insert(external.id, (map as usize, length));
++                (map as usize, length)
++            }
++        };
++        let dmabuf = self.external_dmabufs.get(&external.id)?;
++        let (offset, stride) = (dmabuf.offsets().next()? as usize, dmabuf.strides().next()? as usize);
++        let bytes = unsafe { std::slice::from_raw_parts(address as *const u8, length) };
++        Some(sampled_hash(bytes, offset, stride, external.width as usize, external.height as usize))
+     }
+     fn log_frames(&mut self, last: bool) {
+         if let Some((every, since, at)) = &mut self.frame_log {
+@@ -1190,10 +1282,7 @@ impl Server {
+             // A frame waiting for its moment (late latching): wake for it on time; the last
+             // two milliseconds are slept precisely (poll counts whole milliseconds).
+             let mut max = max;
+-            let due = match (self.render_due.map(|d| d.0), self.commit_due.map(|d| d.0)) {
+-                (Some(a), Some(b)) => Some(a.min(b)),
+-                (a, b) => a.or(b),
+-            };
++            let due = [self.render_due.map(|d| d.0), self.commit_due.map(|d| d.0), self.callback_only_due].into_iter().flatten().min();
+             let mut precise = None;
+             // DESK6: the last PRECISE_WINDOW before the moment is waited for in the real-time
+             // scheduling class (input_latency::precise_wait_until); without it, as before
+@@ -1423,6 +1512,9 @@ impl Server {
+             *count -= 1;
+             if *count == 0 {
+                 self.external_refs.remove(&id);
++                if let Some((address, length)) = self.frame_maps.remove(&id) {
++                    unsafe { libc::munmap(address as *mut libc::c_void, length) };
++                }
+                 self.external_dmabufs.remove(&id);
+                 self.pending_fences.retain(|(pending, _)| *pending != id);
+                 self.renderer.release_dmabuf(id);
+@@ -1872,6 +1964,9 @@ impl CompositorHandler for Server {
+         let Some(id) = self.wm.backend().window_for_surface(surface) else {
+             return;
+         };
++        // DESK9: the handler's own time per buffer commit, and whether the commit brought anything to show
++        let handler_started = std::time::Instant::now();
++        let mut unchanged = false;
+         let (buffer, buffer_scale, transform, delta, callbacks, xdg, raw_damage, viewport) = with_states(surface, |s| {
+             let xdg = *s.cached_state.get::<SurfaceCachedState>().current();
+             let viewport = *s.cached_state.get::<ViewportCachedState>().current();
+@@ -1931,6 +2026,8 @@ impl CompositorHandler for Server {
+         }
+         let destination = viewport.dst.map(|d| Size::new(d.w.max(1) as u32, d.h.max(1) as u32));
+         let display_scale = self.scale;
++        let attached = matches!(buffer, Some(BufferAssignment::NewBuffer(_)));
++        let removed = matches!(buffer, Some(BufferAssignment::Removed));
+         match buffer {
+             Some(BufferAssignment::NewBuffer(buffer)) => {
+                 if !self.wm.backend().windows[&id].surface.ensure_configured() {
+@@ -1989,7 +2086,18 @@ impl CompositorHandler for Server {
+                     }
+                 };
+                 let mut unscaled = false;
+-                let size = if let Some(external) = external {
++                // DESK9: the buffer the window shows already, attached again without damage: nothing new
++                let same_again = external.is_some()
++                    && raw_damage.is_empty()
++                    && self.policy.now.skip_unchanged
++                    && self.wm.backend().windows[&id].committed
++                    && self.held.get(&id).is_some_and(|(held, _)| *held == buffer)
++                    && external.is_some_and(|e| self.wm.backend().windows[&id].content.size == Size::new(e.width, e.height));
++                let size = if let (true, Some(external)) = (same_again, external) {
++                    unchanged = true;
++                    self.pacing.unchanged(id);
++                    Size::new(external.width, external.height)
++                } else if let Some(external) = external {
+                     // A dma-buf: nothing is copied. The window shows the
+                     // client's GPU memory, so the buffer stays held (not
+                     // released) until a newer one has replaced it on screen.
+@@ -2020,11 +2128,9 @@ impl CompositorHandler for Server {
+                     }
+                     let app = self.wm.backend().windows.get(&id).and_then(|w| w.app_id.clone().or_else(|| w.last_app_id.clone()));
+                     self.pacing.commit(id, app.as_deref());
+-                    // its presentation feedback waits for the frame that shows this buffer; one a newer
+-                    // buffer replaced before any frame showed it is discarded
+-                    let feedback = with_states(surface, |s| std::mem::take(&mut s.cached_state.get::<smithay::wayland::presentation::PresentationFeedbackCachedState>().current().callbacks));
+-                    for old in self.feedback_pending.insert(id, feedback).into_iter().flatten() {
+-                        old.discarded();
++                    if self.policy.now.framehash {
++                        let hash = self.frame_hash_external(external);
++                        self.pacing.content(id, hash);
+                     }
+                     let count = self.external_commits.entry(id).or_insert(0);
+                     *count += 1;
+@@ -2101,6 +2207,10 @@ impl CompositorHandler for Server {
+                 if external.is_none() {
+                     let app = self.wm.backend().windows.get(&id).and_then(|w| w.app_id.clone().or_else(|| w.last_app_id.clone()));
+                     self.pacing.commit(id, app.as_deref());
++                    if self.policy.now.framehash {
++                        let hash = self.wm.backend().windows[&id].image.as_ref().filter(|i| !i.pixels.is_empty()).map(|i| sampled_hash(&i.pixels, 0, i.width as usize * 4, i.width as usize, i.height as usize));
++                        self.pacing.content(id, hash);
++                    }
+                 }
+                 let w = self.wm.backend_mut().windows.get_mut(&id).unwrap();
+                 let first = !w.committed;
+@@ -2215,21 +2325,51 @@ impl CompositorHandler for Server {
+                     self.wm.backend().windows[&id]
+                         .surface
+                         .send_pending_configure();
+-                } else if !self.wm.interactive_drag_active() && !Self::client_behind(surface) {
+-                    // A commit without a buffer that answers the last
+-                    // configure: the client keeps what it drew. If that is
+-                    // another size than it was asked for (a terminal whose
+-                    // grid did not change), the frame is fitted to it now.
+-                    let w = &self.wm.backend().windows[&id];
+-                    let drawn = w.image.as_ref().map(|i| Size::new(i.width, i.height));
+-                    if let Some(size) = drawn.filter(|size| *size != w.content.size && w.mapped) {
+-                        self.wm.dispatch(BackendEvent::ClientSizeCommitted { window: id, size });
++                } else {
++                    let mut fitted = false;
++                    if !self.wm.interactive_drag_active() && !Self::client_behind(surface) {
++                        // A commit without a buffer that answers the last
++                        // configure: the client keeps what it drew. If that is
++                        // another size than it was asked for (a terminal whose
++                        // grid did not change), the frame is fitted to it now.
++                        let w = &self.wm.backend().windows[&id];
++                        let drawn = w.image.as_ref().map(|i| Size::new(i.width, i.height));
++                        if let Some(size) = drawn.filter(|size| *size != w.content.size && w.mapped) {
++                            self.wm.dispatch(BackendEvent::ClientSizeCommitted { window: id, size });
++                            fitted = true;
++                        }
++                    }
++                    // DESK9: frame callbacks (or state) only: nothing to repaint
++                    if !fitted && self.policy.now.skip_unchanged {
++                        unchanged = true;
++                        self.pacing.unchanged(id);
+                     }
+                 }
+             }
+         }
++        // DESK9: presentation feedback for every commit, not only a dma-buf's (TERM9: an shm commit's feedback was
++        // never answered and piled up). A new picture's feedback waits for the frame that shows it and replaces
++        // (discards) the feedback of a picture no frame showed; a commit that brought nothing new keeps what waits
++        // and is answered with it, or at the next blank (`release_unchanged_callbacks`).
++        let feedback = with_states(surface, |s| std::mem::take(&mut s.cached_state.get::<smithay::wayland::presentation::PresentationFeedbackCachedState>().current().callbacks));
++        if removed {
++            for old in feedback.into_iter().chain(self.feedback_pending.remove(&id).into_iter().flatten()) {
++                old.discarded();
++            }
++        } else if attached && !unchanged {
++            for old in self.feedback_pending.insert(id, feedback).into_iter().flatten() {
++                old.discarded();
++            }
++        } else if !feedback.is_empty() {
++            self.feedback_pending.entry(id).or_default().extend(feedback);
++        }
++        if attached {
++            self.pacing.handled(id, handler_started.elapsed());
++        }
+         self.callbacks.entry(id).or_default().extend(callbacks);
+-        self.wm.backend_mut().dirty = true;
++        if !unchanged {
++            self.wm.backend_mut().dirty = true;
++        }
+     }
+ }
+ impl XdgShellHandler for Server {
+@@ -2579,3 +2719,23 @@ mod cursor_plane_tests {
+         assert_eq!(&frame[4..8], &[64, 64, 214, 255], "a quarter-covered pixel: source over");
+     }
+ }
++
++/// DESK9 `framehash`: FNV-1a over every third pixel of every third row of a 32-bit-per-pixel image (`offset` to
++/// the first row, `stride` bytes a row): enough to tell one frame of a video or a scroll from the next.
++pub(crate) fn sampled_hash(bytes: &[u8], offset: usize, stride: usize, width: usize, height: usize) -> u64 {
++    let mut h: u64 = 0xcbf29ce484222325;
++    let mut y = 0;
++    while y < height {
++        let row = offset + y * stride;
++        let mut x = 0;
++        while x < width {
++            let at = row + x * 4;
++            if let Some(p) = bytes.get(at..at + 4) {
++                h = (h ^ u64::from(u32::from_le_bytes([p[0], p[1], p[2], p[3]]))).wrapping_mul(0x100000001b3);
++            }
++            x += 3;
++        }
++        y += 3;
++    }
++    h
++}
+diff --git a/crates/wm-darwin/tests/wayland_dmabuf.rs b/crates/wm-darwin/tests/wayland_dmabuf.rs
+index a3000e4..c267732 100644
+--- a/crates/wm-darwin/tests/wayland_dmabuf.rs
++++ b/crates/wm-darwin/tests/wayland_dmabuf.rs
+@@ -673,3 +673,70 @@ fn presentation_feedback_carries_the_flip_and_the_fifo_presents_every_buffer_of_
+         }
+     }
+ }
++
++/// DESK9 (`skip_unchanged`): a commit that brings nothing new - a frame callback alone, or the buffer the window
++/// shows attached again without damage - repaints nothing, and its frame callback and presentation feedback come
++/// all the same, one refresh apart (never at once: a client drawing on its callbacks does not spin). With the
++/// switch off every such commit drew a frame, as before DESK9.
++#[test]
++fn a_commit_that_brings_nothing_new_repaints_nothing_and_is_answered_at_the_next_refresh() {
++    for skip in [true, false] {
++        let (h, connection) = Harness::start_full(true, if skip { "skip_unchanged=on" } else { "skip_unchanged=off" }, true);
++        let mut queue = connection.new_event_queue();
++        let qh = queue.handle();
++        let mut client = Client::default();
++        connection.display().get_registry(&qh, ());
++        queue.roundtrip(&mut client).unwrap();
++        let presentation = client.presentation.clone().expect("wp_presentation advertised");
++        let (dmabuf, _) = client.dmabuf.clone().unwrap();
++        let surface = client.compositor.as_ref().unwrap().create_surface(&qh, ());
++        let xdg = client.shell.as_ref().unwrap().get_xdg_surface(&surface, &qh, ());
++        let _top = xdg.get_toplevel(&qh, ());
++        surface.commit();
++        queue.roundtrip(&mut client).unwrap();
++        let (w, hgt, stride) = (64i32, 32i32, 256u32);
++        let file = fake_dmabuf(stride as usize * hgt as usize);
++        let params = dmabuf.create_params(&qh, ());
++        params.add(file.as_fd(), 0, 0, stride, 0, 0);
++        let buffer = params.create_immed(w, hgt, XR24, zwp_linux_buffer_params_v1::Flags::empty(), &qh, 1);
++        params.destroy();
++        surface.attach(Some(&buffer), 0, 0);
++        surface.damage_buffer(0, 0, w, hgt);
++        surface.frame(&qh, ());
++        surface.commit();
++        let until = |client: &mut Client, queue: &mut wayland_client::EventQueue<Client>, frames: u32| {
++            let started = Instant::now();
++            while client.frames < frames {
++                queue.roundtrip(client).unwrap();
++                assert!(started.elapsed() < Duration::from_secs(5), "callback {frames} did not come");
++                thread::sleep(Duration::from_millis(1));
++            }
++        };
++        until(&mut client, &mut queue, 1);
++        thread::sleep(Duration::from_millis(40));
++        let drawn_before = h.log.lock().unwrap().frames;
++        let started = Instant::now();
++        for i in 0..8u32 {
++            if i % 2 == 1 {
++                surface.attach(Some(&buffer), 0, 0); // the same buffer again, no damage
++            }
++            surface.frame(&qh, ());
++            presentation.feedback(&surface, &qh, 100 + i);
++            surface.commit();
++            until(&mut client, &mut queue, 2 + i);
++        }
++        let took = started.elapsed();
++        let drawn = h.log.lock().unwrap().frames - drawn_before;
++        let presented = client.feedback.iter().filter(|(t, f)| *t >= 100 && f.is_some()).count();
++        if skip {
++            assert_eq!(drawn, 0, "nothing new: no frame drawn for 8 commits");
++            assert_eq!(presented, 8, "every feedback presented: {:?}", client.feedback);
++            assert!(took >= Duration::from_millis(8 * 12), "answered a refresh apart, not at once: {took:?}");
++            let times = &client.callback_times[1..];
++            assert!(times.windows(2).all(|p| p[1] > p[0]), "callback times advance: {times:?}");
++        } else {
++            assert!(drawn >= 8, "as before: a frame for each commit ({drawn})");
++        }
++        drop(h);
++    }
++}

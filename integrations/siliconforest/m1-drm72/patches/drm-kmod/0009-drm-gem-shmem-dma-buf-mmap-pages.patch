@@ -1,0 +1,60 @@
+drm/shmem-helper: answer the page question of a dma-buf descriptor's mmap (SiliconForest)
+
+SiliconForest maps a linux file's pages when mmap() is called: the layer walks
+dma_buf_mmap_internal() -> drm_gem_dmabuf_mmap() -> drm_gem_prime_mmap() -> the object's
+mmap op with a vma that carries a struct sf_vma_pages (linux/mm.h, layer patch 0023).
+drm_gem_shmem_mmap()'s FreeBSD branch already takes the pages reference a mapping holds
+and drm_gem_shmem_vm_close() drops it; this fills in the page numbers and the cache mode,
+from the object-relative offset, and refuses a range outside the object.
+
+--- a/drivers/gpu/drm/drm_gem_shmem_helper.c
++++ b/drivers/gpu/drm/drm_gem_shmem_helper.c
+@@ -1196,7 +1196,10 @@
+ 
+ 		return ret;
+ #elif defined(__FreeBSD__)
+-		/* SiliconForest's dma-buf has no mmap */
++		/*
++		 * A user mapping of an imported object is made on the exporter's dma-buf
++		 * descriptor; this path would need the importer to forward the page question.
++		 */
+ 		return -ENODEV;
+ #endif
+ 	}
+@@ -1242,6 +1245,36 @@
+ 	if (ret)
+ 		return ret;
+ 
++#ifdef __FreeBSD__
++	/*
++	 * SiliconForest: an mmap of the object's dma-buf descriptor asks for the pages now
++	 * (struct sf_vma_pages, linux/mm.h); no fault handler runs later. The page
++	 * reference taken above is the mapping's and drm_gem_shmem_vm_close() drops it.
++	 * drm_gem_prime_mmap() has added the object's fake offset to vm_pgoff.
++	 */
++	if (vma->sf_pages != NULL) {
++		pgoff_t base = drm_vma_node_start(&obj->vma_node);
++		pgoff_t first = vma->vm_pgoff >= base ? vma->vm_pgoff - base : vma->vm_pgoff;
++		pgoff_t total = obj->size >> PAGE_SHIFT;
++		unsigned long n = vma_pages(vma), i;
++
++		if (first > total || n > total - first) {
++			dma_resv_lock(shmem->base.resv, NULL);
++			drm_gem_shmem_put_pages_locked(shmem);
++			dma_resv_unlock(shmem->base.resv);
++			return -EINVAL;
++		}
++		for (i = 0; i < n; i++)
++			vma->sf_pages->pages[i] =
++				(uint32_t)(page_to_phys(shmem->pages[first + i]) >> PAGE_SHIFT);
++		vma->sf_pages->wimg = shmem->map_wc ? SF_SHMEM_WIMG_WCOMB : SF_SHMEM_WIMG_DEFAULT;
++		vma->sf_pages->filled = true;
++		shmem->pages_mark_accessed_on_put = true;
++		if (vma->vm_flags & VM_WRITE)
++			shmem->pages_mark_dirty_on_put = true;
++	}
++#endif
++
+ 	vm_flags_set(vma, VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+ 	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
+ 	if (shmem->map_wc)

@@ -1,0 +1,65 @@
+#!/bin/sh
+# Guest side of the linux-dmabuf test (SFAgx + SFDcp, sfagx=1 sfdcp=2): a client's GPU buffers
+# on screen with no copy.
+# The bare compositor runs on its GL renderer (KMS page flips) and advertises
+# zwp_linux_dmabuf_v1 version 3. darwin-wayland-dmabuf-client allocates three linear XRGB8888
+# buffers on the asahi render node, exports them as dma-bufs, passes the fds over the Wayland
+# socket (create_immed) and animates, repainting a buffer only after wl_buffer.release.
+# Phase 1 (12 s): that client together with the SHM test client, so both buffer kinds are
+# composited in one scene. The client's DMACLIENT done line gives callbacks, releases, fps.
+# Phase 2: a second dma-buf client alone; after 3 s the compositor is stopped and prints, for
+# the dma-buf window, the colour its last GL frame has at the window centre (WMEXT). The client
+# always paints 33,99,cc there, so center_rgb=33,99,cc means the client's GPU memory is what
+# the compositor rendered.
+# Lines: WMSTAT (selected ... linux_dmabuf=v3; frames, fps), DMACLIENT, WMEXT, WMGL4_*.
+# (@SSID@/@PSK@ are unused; the placeholders exist because the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin; export PATH
+case "$nonce" in *[!0-9a-f]*|'') session=000000000000000000000000000000000000000000000001 ;; *) session=$nonce ;; esac
+[ "${#session}" -eq 48 ] || session=000000000000000000000000000000000000000000000001
+runtime=/private/var/run/wm-gl-dmabuf
+mkdir -p "$runtime" && chmod 0700 "$runtime"
+export XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=wayland-0
+export XKB_CONFIG_ROOT=/usr/share/X11/xkb TMPDIR=/private/tmp
+printf '\nWMGL4_BEGIN_%s\n' "$nonce"
+ls -l /dev/dri 2>&1 | head -6
+for f in /usr/bin/chonkstep-darwin /usr/bin/darwin-wayland-dmabuf-client /usr/bin/darwin-wayland-client; do
+    [ -e "$f" ] && s=present || s=MISSING
+    printf 'WMGL4_FILE %s %s\n' "$s" "$f"
+done
+CHONKSTEP_DARWIN_RENDERER=gl CHONKSTEP_DARWIN_FRAME_STATS=120 /usr/bin/chonkstep-darwin --run --socket "$runtime/wayland-0" 2>&1 &
+compositor=$!
+count=0
+while [ ! -S "$runtime/wayland-0" ] && kill -0 "$compositor" 2>/dev/null; do
+    count=$((count + 1))
+    [ "$count" -le 100 ] || break
+    sleep 0.1
+done
+if [ ! -S "$runtime/wayland-0" ]; then
+    printf 'WMGL4_NO_SOCKET\n'
+    wait "$compositor"
+    printf 'WMGL4_COMPOSITOR_RC=%s\n' "$?"
+    printf 'WMGL4_END_%s\n' "$nonce"
+    exit 1
+fi
+printf 'WMGL4_PHASE1 dmabuf client + shm client start=%s\n' "$(date +%s)"
+shm=
+if [ -x /usr/bin/darwin-wayland-client ]; then
+    /usr/bin/darwin-wayland-client --socket "$runtime/wayland-0" --nonce "$session" --seconds 12 2>&1 | tail -2 &
+    shm=$!
+fi
+/usr/bin/darwin-wayland-dmabuf-client --socket "$runtime/wayland-0" --seconds 12 2>&1
+client_rc=$?
+printf 'WMGL4_DMABUF_CLIENT_RC=%s end=%s\n' "$client_rc" "$(date +%s)"
+[ -n "$shm" ] && wait "$shm"
+printf 'WMGL4_PHASE2 dmabuf client alone, then stop the compositor start=%s\n' "$(date +%s)"
+/usr/bin/darwin-wayland-dmabuf-client --socket "$runtime/wayland-0" --seconds 30 > /dev/null 2>&1 &
+second=$!
+sleep 3
+kill -TERM "$compositor" 2>/dev/null
+wait "$compositor"
+compositor_rc=$?
+kill -TERM "$second" 2>/dev/null
+wait "$second" 2>/dev/null
+printf 'WMGL4_RESULT client=%s compositor=%s\n' "$client_rc" "$compositor_rc"
+printf 'WMGL4_END_%s\n' "$nonce"

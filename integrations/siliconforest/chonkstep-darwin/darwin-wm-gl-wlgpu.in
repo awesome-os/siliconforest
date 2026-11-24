@@ -1,0 +1,85 @@
+#!/bin/sh
+# Guest side of the GPU-rendered application test (SFAgx + SFDcp, sfagx=1 sfdcp=2): a Mesa
+# EGL Wayland client rendering on the GPU, its buffers composited on the GPU with no copy.
+#
+# The compositor runs on its GL renderer (KMS page flips) and advertises zwp_linux_dmabuf_v1
+# version 3. agx-wl-demo (integrations/siliconforest/m1-mesa-asahi, its own Mesa under
+# /usr/local/lib/mesa-asahi-wl) creates an EGL window surface on the Wayland display; Mesa
+# allocates its back buffers on the asahi render node and sends them with create_immed.
+# The desktop session (shared shell, SFHID seat) is used when the input nodes exist, the bare
+# compositor otherwise.
+#
+# Lines:
+#   WMSTAT selected renderer=gl output=kms ... linux_dmabuf=v3
+#   AGXWL_INFO globals ... zwp_linux_dmabuf_v1=3, AGXWLCHECK ... result=ok, AGXWL scene=... fps=...,
+#     AGXWL_BUFFERS ... dmabuf_create_immed=N shm_create_pool=0, AGXWL_DONE status=ok   (the client)
+#   WMDMABUF import id=.. size=800x600 format=XR24 modifier=0x0 ... zero_copy=1          (compositor)
+#   WMDMABUF check window=.. commit=30|150 ... differing_pixels=0 ... result=client-pixels-are-on-the-frame
+#     (the window's region of the compositor's GL frame against the client's dma-buf read through
+#      a CPU mapping; "not-mappable" with a hash and flat=false if the buffer cannot be mapped)
+#   WMSTAT ... fps=.. missed_refreshes=.. (every 120 frames while the client animates, and final)
+#   WMDMABUF total imported=.. commits=.. fence_waits=.. fence_timeouts=..
+# (@SSID@/@PSK@ are unused; the placeholders exist because the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin; export PATH
+case "$nonce" in *[!0-9a-f]*|'') session=000000000000000000000000000000000000000000000001 ;; *) session=$nonce ;; esac
+[ "${#session}" -eq 48 ] || session=000000000000000000000000000000000000000000000001
+runtime=/private/var/run/wm-gl-wlgpu
+mkdir -p "$runtime" && chmod 0700 "$runtime"
+export XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=wayland-0
+export XKB_CONFIG_ROOT=/usr/share/X11/xkb TMPDIR=/private/tmp
+export CHONKSTEP_DARWIN_FRAME_STATS=120
+printf '\nWMGL5_BEGIN_%s\n' "$nonce"
+ls -l /dev/dri 2>&1 | head -6
+# agx-wl-demo keeps its protocol log under /tmp.
+[ -d /tmp ] || mkdir -p /tmp 2>/dev/null || ln -s private/tmp /tmp 2>/dev/null
+if [ -d /tmp ] && touch /tmp/.wm-gl-wlgpu 2>/dev/null; then rm -f /tmp/.wm-gl-wlgpu; printf 'WMGL5_TMP writable\n'; else printf 'WMGL5_TMP NOT-WRITABLE\n'; fi
+for f in /usr/bin/chonkstep-darwin-desktop /usr/bin/chonkstep-darwin /usr/local/bin/agx-wl-demo /usr/local/lib/mesa-asahi-wl/libEGL.1.dylib /usr/local/lib/mesa-asahi-wl/libwayland-client.0.dylib /usr/local/lib/mesa-asahi/libEGL.1.dylib; do
+    [ -e "$f" ] && s=present || s=MISSING
+    printf 'WMGL5_FILE %s %s\n' "$s" "$f"
+done
+if [ -x /usr/bin/darwin-trackpad-enum ]; then
+    /usr/bin/darwin-trackpad-enum --nonce "$session"
+    printf 'WMGL5_ENUM rc=%s\n' "$?"
+fi
+count=0
+while [ ! -c /dev/usb_hid_kbd ] || [ ! -c /dev/usb_hid_mouse ]; do
+    count=$((count + 1))
+    [ "$count" -le 50 ] || break
+    sleep 0.1
+done
+if [ -c /dev/usb_hid_kbd ] && [ -c /dev/usb_hid_mouse ] && [ -x /usr/bin/chonk-terminal-darwin ]; then
+    records=$runtime/session-$session
+    mkdir -m 0700 "$records"
+    printf 'WMGL5_COMPOSITOR desktop-session renderer=gl seconds=40 start=%s\n' "$(date +%s)"
+    /usr/bin/chonkstep-darwin-desktop --run --socket "$runtime/wayland-0" --records "$records" --session "$session" --terminal /usr/bin/chonk-terminal-darwin --seconds 40 --font-regular /usr/share/darwin-desktop/DejaVuSans.ttf --font-bold /usr/share/darwin-desktop/DejaVuSans-Bold.ttf --input sfhid --renderer gl 2>&1 &
+    compositor=$!
+    kind=desktop
+else
+    printf 'WMGL5_COMPOSITOR bare renderer=gl input=off start=%s\n' "$(date +%s)"
+    CHONKSTEP_DARWIN_RENDERER=gl /usr/bin/chonkstep-darwin --run --socket "$runtime/wayland-0" 2>&1 &
+    compositor=$!
+    kind=bare
+fi
+count=0
+while [ ! -S "$runtime/wayland-0" ] && kill -0 "$compositor" 2>/dev/null; do
+    count=$((count + 1))
+    [ "$count" -le 100 ] || break
+    sleep 0.1
+done
+client_rc=not-run
+if [ -S "$runtime/wayland-0" ]; then
+    sleep 1
+    printf 'WMGL5_CLIENT_START agx-wl-demo start=%s\n' "$(date +%s)"
+    /usr/local/bin/agx-wl-demo --crash-test 2>&1 | head -12; /usr/local/bin/agx-wl-demo --require-renderer "Apple M1" --seconds 12 2>&1
+    client_rc=$?
+    printf 'WMGL5_CLIENT_RC=%s end=%s\n' "$client_rc" "$(date +%s)"
+else
+    printf 'WMGL5_NO_SOCKET\n'
+fi
+# The bare compositor runs until told to stop; the desktop session ends by its own deadline.
+[ "$kind" = bare ] && kill -TERM "$compositor" 2>/dev/null
+wait "$compositor"
+compositor_rc=$?
+printf 'WMGL5_RESULT client=%s compositor=%s kind=%s\n' "$client_rc" "$compositor_rc" "$kind"
+printf 'WMGL5_END_%s\n' "$nonce"

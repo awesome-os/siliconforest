@@ -1,0 +1,106 @@
+diff --git a/src/Kernel/xnu/pexpert/arm/pe_init.c b/src/Kernel/xnu/pexpert/arm/pe_init.c
+--- a/src/Kernel/xnu/pexpert/arm/pe_init.c
++++ b/src/Kernel/xnu/pexpert/arm/pe_init.c
+@@ -228,18 +228,28 @@
+ 	switch (op) {
+ 	case kPEDisableScreen:
+ 		initialize_screen(info, op);
+-		last_console = switch_to_serial_console();
++		/* Preserve the original route across repeated disables. */
++		int previous_console = switch_to_serial_console();
++		if (last_console == -1) {
++			last_console = previous_console;
++		}
+ 		kprintf("kPEDisableScreen %d\n", last_console);
+ 		break;
+ 
++	case kPEAcquireScreen:
+ 	case kPEEnableScreen:
+-		initialize_screen(info, op);
+-		if (info) {
+-			PE_state.video = *info;
+-		}
+-		kprintf("kPEEnableScreen %d\n", last_console);
++		/* Explicit ownership return also restores the pre-disable route. */
++		if (op == kPEEnableScreen) {
++			kprintf("kPEEnableScreen %d\n", last_console);
++		}
+ 		if (last_console != -1) {
+ 			switch_to_old_console(last_console);
++			last_console = -1;
++		}
++		/* initialize_screen tests this route when resuming remapped text. */
++		initialize_screen(info, op);
++		if (info && op == kPEEnableScreen) {
++			PE_state.video = *info;
+ 		}
+ 		break;
+ 
+diff --git a/src/Kernel/xnu/osfmk/console/video_console.c b/src/Kernel/xnu/osfmk/console/video_console.c
+--- a/src/Kernel/xnu/osfmk/console/video_console.c
++++ b/src/Kernel/xnu/osfmk/console/video_console.c
+@@ -2769,6 +2769,8 @@
+ // so the panel keeps the boot log like serial. pdtextboot=0 turns this off
+ static boolean_t gc_text_boot     = FALSE;
+ static boolean_t gc_text_boot_set = FALSE;
++/* A remap may resume console-owned text; an ownership release may not. */
++static boolean_t gc_reacquire_text = FALSE;
+ static boolean_t gc_paused_progress;
+ 
+ static vm_offset_t  lastVideoVirt    = 0;
+@@ -2967,15 +2969,18 @@
+ 	graphics_now = gc_graphics_boot && !gc_desire_text;
+ 	switch (op) {
+ 	case kPEGraphicsMode:
++		gc_reacquire_text = FALSE;
+ 		gc_graphics_boot = TRUE;
+ 		gc_desire_text = FALSE;
+ 		break;
+ 
+ 	case kPETextMode:
++		gc_reacquire_text = FALSE;
+ 		gc_graphics_boot = FALSE;
+ 		break;
+ 
+ 	case kPEAcquireScreen:
++		gc_reacquire_text = FALSE;
+ 		if (gc_acquired) {
+ 			break;
+ 		}
+@@ -3014,9 +3019,8 @@
+ 	case kPEEnableScreen:
+ 		if (gc_acquired) {
+ 			gc_pause( FALSE, graphics_now );
+-		} else if (gc_text_boot && !console_is_serial()) {
+-			// The framebuffer driver's handoff released the screen: take it back
+-			// as text on the new framebuffer
++		} else if (gc_reacquire_text && !console_is_serial()) {
++			/* Resume only text retained across a framebuffer remap. */
+ 			gc_graphics_boot = FALSE;
+ 			gc_desire_text = FALSE;
+ 			vc_progress_set( FALSE, 0 );
+@@ -3026,6 +3030,7 @@
+ 			gc_enable( TRUE );
+ 			gc_acquired = TRUE;
+ 		}
++		gc_reacquire_text = FALSE;
+ 		break;
+ 
+ 	case kPETextScreen:
+@@ -3049,6 +3054,16 @@
+ 		break;
+ 
+ 	case kPEReleaseScreen:
++		/*
++		 * IOFramebuffer::findConsole supplies new video information for a
++		 * remap. Its server-open path releases with NULL before open(),
++		 * transferring ownership even before fServerConnect is installed.
++		 * Such a release cancels automatic text resume until an explicit
++		 * kPEAcquireScreen (the server-close path). A later remap while
++		 * released must not take the framebuffer away from that owner.
++		 */
++		gc_reacquire_text = gc_text_boot && !gc_graphics_boot && boot_vinfo &&
++		    (gc_acquired || gc_reacquire_text);
+ 		gc_acquired = FALSE;
+ 		gc_desire_text = FALSE;
+ 		gc_enable( FALSE );

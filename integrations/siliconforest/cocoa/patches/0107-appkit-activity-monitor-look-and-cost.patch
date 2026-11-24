@@ -1,0 +1,835 @@
+--- a/src/Frameworks/AppKit/NSSymbolImages.m
++++ b/src/Frameworks/AppKit/NSSymbolImages.m
+@@ -0,0 +1,174 @@
++// NSSymbolImages.m - stand-ins for the few system symbol images applications here ask for
++// Copyright (c) 2026 The SiliconForest contributors, SPDX-License-Identifier: MPL-2.0 OR BSD-2-Clause
++//
++// macOS draws a symbol image (+imageWithSystemSymbolName:..., or a nib's image resource named
++// "info.circle") from its SF Symbols font. That font is Apple's and is not copied here; the few
++// names below are our own drawings with NSBezierPath, in the symbols' usual shapes, so that a
++// toolbar is not a row of empty buttons. Any other name still gives nil, as an unknown name does
++// on macOS. They are template images (the shape is what counts, the colour is the control's).
++// First users: Apple's Activity Monitor (its toolbar's Stop, Info and action buttons, the inspector's
++// link to a parent process).
++#import <AppKit/NSImage.h>
++#import <AppKit/NSBitmapImageRep.h>
++#import <AppKit/NSGraphicsContext.h>
++#import <AppKit/NSBezierPath.h>
++#import <AppKit/NSColor.h>
++#import <Foundation/NSAffineTransform.h>
++#import <Foundation/NSDictionary.h>
++#import <Foundation/NSString.h>
++#include <math.h>
++
++typedef void (*SFSymbolDrawer)(NSRect box, CGFloat line);
++
++static NSBezierPath *sfStroke(CGFloat line) {
++    NSBezierPath *path = [NSBezierPath bezierPath];
++
++    [path setLineWidth:line];
++    [path setLineCapStyle:NSRoundLineCapStyle];
++    [path setLineJoinStyle:NSRoundLineJoinStyle];
++    return path;
++}
++
++static void sfCircle(NSRect box, CGFloat line) {
++    NSBezierPath *path = sfStroke(line);
++
++    [path appendBezierPathWithOvalInRect:NSInsetRect(box, line / 2, line / 2)];
++    [path stroke];
++}
++
++static void sfDot(NSPoint centre, CGFloat radius) {
++    [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(centre.x - radius, centre.y - radius, 2 * radius, 2 * radius)] fill];
++}
++
++// a circle with a lower-case i: a dot over a stroke with a foot
++static void sfInfoCircle(NSRect box, CGFloat line) {
++    CGFloat cx = NSMidX(box), unit = NSWidth(box) / 16;
++    NSBezierPath *path = sfStroke(line);
++
++    sfCircle(box, line);
++    sfDot(NSMakePoint(cx, NSMinY(box) + 11.3 * unit), 1.15 * unit);
++    [path moveToPoint:NSMakePoint(cx - 1.4 * unit, NSMinY(box) + 8.6 * unit)];
++    [path lineToPoint:NSMakePoint(cx, NSMinY(box) + 8.6 * unit)];
++    [path lineToPoint:NSMakePoint(cx, NSMinY(box) + 4.2 * unit)];
++    [path moveToPoint:NSMakePoint(cx - 1.8 * unit, NSMinY(box) + 4.2 * unit)];
++    [path lineToPoint:NSMakePoint(cx + 1.8 * unit, NSMinY(box) + 4.2 * unit)];
++    [path stroke];
++}
++
++// a circle with three dots across its middle
++static void sfEllipsisCircle(NSRect box, CGFloat line) {
++    CGFloat cx = NSMidX(box), cy = NSMidY(box), unit = NSWidth(box) / 16;
++
++    sfCircle(box, line);
++    sfDot(NSMakePoint(cx - 4 * unit, cy), 1.1 * unit);
++    sfDot(NSMakePoint(cx, cy), 1.1 * unit);
++    sfDot(NSMakePoint(cx + 4 * unit, cy), 1.1 * unit);
++}
++
++// a regular octagon, flat at top and bottom, with a cross in it
++static void sfXmarkOctagon(NSRect box, CGFloat line) {
++    NSBezierPath *path = sfStroke(line);
++    CGFloat cx = NSMidX(box), cy = NSMidY(box), r = (NSWidth(box) - line) / 2 / cos(M_PI / 8), unit = NSWidth(box) / 16;
++
++    for (int i = 0; i < 8; i++) {
++        CGFloat a = M_PI / 8 + i * M_PI / 4;
++        NSPoint p = NSMakePoint(cx + r * cos(a), cy + r * sin(a));
++
++        if (i == 0)
++            [path moveToPoint:p];
++        else
++            [path lineToPoint:p];
++    }
++    [path closePath];
++    [path moveToPoint:NSMakePoint(cx - 3.2 * unit, cy - 3.2 * unit)];
++    [path lineToPoint:NSMakePoint(cx + 3.2 * unit, cy + 3.2 * unit)];
++    [path moveToPoint:NSMakePoint(cx - 3.2 * unit, cy + 3.2 * unit)];
++    [path lineToPoint:NSMakePoint(cx + 3.2 * unit, cy - 3.2 * unit)];
++    [path stroke];
++}
++
++// a magnifying glass: a ring and a handle to the lower right
++static void sfMagnifyingGlass(NSRect box, CGFloat line) {
++    NSBezierPath *path = sfStroke(line);
++    CGFloat unit = NSWidth(box) / 16, d = 10 * unit;
++    NSRect ring = NSMakeRect(NSMinX(box) + 1.2 * unit, NSMaxY(box) - 1.2 * unit - d, d, d);
++    CGFloat c = M_SQRT1_2 * d / 2;
++
++    [path appendBezierPathWithOvalInRect:ring];
++    [path moveToPoint:NSMakePoint(NSMidX(ring) + c, NSMidY(ring) - c)];
++    [path lineToPoint:NSMakePoint(NSMaxX(box) - 1.5 * unit, NSMinY(box) + 1.5 * unit)];
++    [path stroke];
++}
++
++// a filled circle with an arrow to the right cut out of it (the inspector's link to a parent process)
++static void sfArrowForwardCircleFill(NSRect box, CGFloat line) {
++    NSBezierPath *path = sfStroke(line * 1.2);
++    CGFloat cx = NSMidX(box), cy = NSMidY(box), unit = NSWidth(box) / 16;
++
++    [[NSBezierPath bezierPathWithOvalInRect:NSInsetRect(box, 0.5, 0.5)] fill];
++    [NSGraphicsContext saveGraphicsState];
++    [[NSGraphicsContext currentContext] setCompositingOperation:NSCompositeClear];
++    [path moveToPoint:NSMakePoint(cx - 4 * unit, cy)];
++    [path lineToPoint:NSMakePoint(cx + 4 * unit, cy)];
++    [path moveToPoint:NSMakePoint(cx + 0.8 * unit, cy + 3.2 * unit)];
++    [path lineToPoint:NSMakePoint(cx + 4 * unit, cy)];
++    [path lineToPoint:NSMakePoint(cx + 0.8 * unit, cy - 3.2 * unit)];
++    [path stroke];
++    [NSGraphicsContext restoreGraphicsState];
++}
++
++@implementation NSImage (SFSymbolImages)
++
+++ (NSImage *)_sfSymbolImageNamed:(NSString *)name {
++    static NSMutableDictionary *made;
++    static const struct { const char *name; SFSymbolDrawer draw; } table[] = {
++        { "info.circle", sfInfoCircle },
++        { "ellipsis.circle", sfEllipsisCircle },
++        { "xmark.octagon", sfXmarkOctagon },
++        { "magnifyingglass", sfMagnifyingGlass },
++        { "arrow.forward.circle.fill", sfArrowForwardCircleFill },
++    };
++    SFSymbolDrawer draw = NULL;
++    NSImage *image;
++
++    if (![name isKindOfClass:[NSString class]])
++        return nil;
++    for (unsigned i = 0; i < sizeof(table) / sizeof(table[0]); i++)
++        if ([name isEqualToString:[NSString stringWithUTF8String:table[i].name]])
++            draw = table[i].draw;
++    if (draw == NULL)
++        return nil;
++    if ((image = [made objectForKey:name]) != nil)
++        return [[image copy] autorelease];
++
++    // a symbol of the regular toolbar size (about 17 points), drawn at three pixels a point so that it
++    // stays sharp at the desktop's scales (1.5, 2)
++    const CGFloat points = 17, scale = 3;
++    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:(NSInteger)(points * scale)
++                                                                    pixelsHigh:(NSInteger)(points * scale) bitsPerSample:8
++                                                               samplesPerPixel:4 hasAlpha:YES isPlanar:NO
++                                                                colorSpaceName:NSDeviceRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
++    NSGraphicsContext *context = [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
++    NSAffineTransform *transform = [NSAffineTransform transform];
++
++    [NSGraphicsContext saveGraphicsState];
++    [NSGraphicsContext setCurrentContext:context];
++    [transform scaleBy:scale];
++    [transform concat];
++    [[NSColor colorWithCalibratedWhite:0.2 alpha:0.9] set];
++    draw(NSMakeRect(0.5, 0.5, points - 1, points - 1), 1.35);
++    [context flushGraphics];
++    [NSGraphicsContext restoreGraphicsState];
++    [rep setSize:NSMakeSize(points, points)];
++
++    image = [[NSImage alloc] initWithSize:NSMakeSize(points, points)];
++    [image addRepresentation:rep];
++    [rep release];
++    [image setTemplate:YES];
++    if (made == nil)
++        made = [[NSMutableDictionary alloc] init];
++    [made setObject:image forKey:name];
++    return [image autorelease];
++}
++
++@end
+--- a/src/Frameworks/AppKit/NSImage.m
++++ b/src/Frameworks/AppKit/NSImage.m
+@@ -53,15 +53,19 @@
+ }
+ @end
+ 
++@interface NSImage (SFSymbolImages)
+++(NSImage *)_sfSymbolImageNamed:(NSString *)name;
++@end
++
+ @implementation NSImage
+ 
+-// there are no system symbol images here, an unknown name gives nil as on macOS
++// SF Symbols are not here: a few names have our own drawings (NSSymbolImages.m), an unknown name gives nil as on macOS
+ +(NSImage *)imageWithSystemSymbolName:(NSString *)name accessibilityDescription:(NSString *)description {
+-   return nil;
++   return [self _sfSymbolImageNamed:name];
+ }
+ 
+ +(NSImage *)imageWithSystemSymbolName:(NSString *)name variableValue:(double)value accessibilityDescription:(NSString *)description {
+-   return nil;
++   return [self _sfSymbolImageNamed:name];
+ }
+ 
+ +(NSArray *)imageFileTypes {
+--- a/src/Frameworks/AppKit/nib.subproj/NSCustomResource.m
++++ b/src/Frameworks/AppKit/nib.subproj/NSCustomResource.m
+@@ -36,6 +36,10 @@
+ -awakeAfterUsingCoder:(NSCoder *)coder {
+    if([_className isEqualToString:@"NSImage"]){
+     NSImage *image=[NSImage imageNamed:_resourceName];
++
++    // a nib names a system symbol image the same way (Interface Builder's image of "info.circle")
++    if(image==nil)
++     image=[NSImage imageWithSystemSymbolName:_resourceName accessibilityDescription:nil];
+     
+     if([_resourceName hasSuffix:@"Template"])
+      [image setTemplate:YES];
+--- a/src/Frameworks/AppKit/NSImageCell.m
++++ b/src/Frameworks/AppKit/NSImageCell.m
+@@ -44,6 +44,16 @@
+ 
+ }
+ 
++// an image cell's image is its object value, as on macOS: an image set to nil leaves nothing (the
++// object value a nib archived came back, so Activity Monitor's rows of processes without an icon all
++// showed the nib's placeholder, the application's own icon)
++-(void)setImage:(NSImage *)image {
++   [super setImage:image];
++   image=[image retain];
++   [_objectValue release];
++   _objectValue=image;
++}
++
+ -(NSImage *)_imageValue {
+    id result=[self image];
+ 
+--- a/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
++++ b/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
+@@ -261,7 +261,10 @@
+         NSMenuItem *item = [items objectAtIndex:i];
+ 
+         if (i < firstLoose || i >= tailStart) {
+-            [bar addObject:item];
++            // a hidden title takes no room in the bar either (Activity Monitor's "Hidden" menu holds
++            // key equivalents only)
++            if (![item isHidden])
++                [bar addObject:item];
+         }
+         else {
+             [app addObject:item];
+--- a/src/Frameworks/AppKit/NSTableHeaderView.m
++++ b/src/Frameworks/AppKit/NSTableHeaderView.m
+@@ -7,6 +7,7 @@
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+ 
+ #import <AppKit/NSTableHeaderView.h>
++#import <AppKit/NSTableHeaderCell.h>
+ #import <AppKit/NSBezierPath.h>
+ #import <AppKit/NSImage.h>
+ #import <AppKit/NSColor.h>
+@@ -150,6 +151,16 @@
+         [self _sfDrawSortIndicatorForColumn:column inRect:columnRect];
+         columnRect.origin.x += [column width] + spacing.width;
+     }
++    // right of the last column (a table wider than its columns): an empty header, as macOS draws it
++    if (columnRect.origin.x < NSMaxX(_bounds) && NSMaxX(rect) > columnRect.origin.x) {
++        static NSTableHeaderCell *filler;
++
++        if (filler == nil)
++            filler = [[NSTableHeaderCell alloc] initTextCell:@""];
++        columnRect.size.width = NSMaxX(_bounds) - columnRect.origin.x;
++        [filler setControlView:self];
++        [filler drawWithFrame:columnRect inView:self];
++    }
+ }
+ 
+ -(NSRect)_resizeRectBeforeColumn:(int)column {
+--- a/src/Frameworks/AppKit/NSTableView.m
++++ b/src/Frameworks/AppKit/NSTableView.m
+@@ -42,6 +42,7 @@
+ -(void)_sfDecodeViewBasedWithCoder:(NSCoder *)coder;
+ -(BOOL)_sfIsViewBased;
+ -(void)_sfInvalidateViews;
++-(BOOL)_sfReloadsInPlace;
+ @end
+ 
+ // a column's share of the table's width: none when it is hidden
+@@ -50,6 +51,10 @@
+    return [c isHidden] ? 0 : [c width]+spacing;
+ }
+ 
++@interface NSTableView (SFColumnAutoresizingStyle)
++-(NSInteger)columnAutoresizingStyle;
++@end
++
+ @implementation NSTableView
+ 
+ -(id)_replacementKeyPathForBinding:(id)binding
+@@ -1165,11 +1170,21 @@
+     // (a maximised one) is never drawn
+     if ([[self superview] isKindOfClass:[NSClipView class]])
+         size.width = MAX(size.width, [[self superview] bounds].size.width);
++    // and never shorter than it (as macOS draws a table's empty stripes to the bottom): a list filtered
++    // to a few rows left what its other rows had covered undrawn, in black bands
++    if ([[self superview] isKindOfClass:[NSClipView class]] && [self _sfReloadsInPlace])
++        size.height = MAX(size.height, [[self superview] bounds].size.height);
+ 
+     headerSize.width = size.width;
+ 
++    // a table reloaded in place (view-based) draws only what changes; a new size is drawn whole
++    BOOL resized = !NSEqualSizes(size, [self frame].size);
+     [self setFrameSize:size];
+     [_headerView setFrameSize:headerSize];
++    if (resized && [self _sfReloadsInPlace]) {
++     [self setNeedsDisplay:YES];
++     [_headerView setNeedsDisplay:YES];
++    }
+ 
+     NSMutableIndexSet *selection=[[_selectedRowIndexes mutableCopy] autorelease];
+     NSInteger count=[selection count];
+@@ -1194,14 +1209,21 @@
+ 
+ -(void)reloadData {
+     [self noteNumberOfRowsChanged];
+-    [self setNeedsDisplay:YES];
+-    [_headerView setNeedsDisplay:YES];
++    // a view-based table draws what changes in its row views (NSTableViewViewBased.m)
++    if (![self _sfReloadsInPlace]) {
++     [self setNeedsDisplay:YES];
++     [_headerView setNeedsDisplay:YES];
++    }
+ }
+ 
+ -(void)tile {
+     NSRect rect;
+ 
+-    [self sizeLastColumnToFit];
++    // the columns are resized only as the table's column autoresizing style says: a table that has
++    // none (Activity Monitor's) keeps the widths it was given (its last shown column grew to whatever
++    // the others left, each time a column was hidden, and the application saved those widths)
++    if ([self columnAutoresizingStyle] != 0)
++        [self sizeLastColumnToFit];
+     [self noteNumberOfRowsChanged];
+     rect=[_headerView frame];
+     rect.size.width=[self frame].size.width;
+@@ -1340,26 +1362,34 @@
+    }
+    else {
+         NSRange rangeOfRows = [self rowsInRect:clipRect];
+-        NSInteger i;
+-        NSRect rectToFill = clipRect;
+-        float heightFilled = 0.;
++        NSInteger i, numberOfRows = [self numberOfRows];
++        CGFloat rowHeight = _standardRowHeight + _intercellSpacing.height, y;
+ 
+-        for (i = rangeOfRows.location; i < rangeOfRows.location + rangeOfRows.length; i++) {
+-            rectToFill = [self rectOfRow:i];
++        for (i = rangeOfRows.location; i < (NSInteger)NSMaxRange(rangeOfRows); i++) {
++            NSRect rectToFill = [self rectOfRow:i];
+ 
++            // the stripe runs across the whole table, past the last column (a table wider than its
++            // columns, as a maximised window makes it, was left undrawn there: black)
++            rectToFill.origin.x = NSMinX(_bounds);
++            rectToFill.size.width = NSWidth(_bounds);
+             [(NSColor *)[rowColors objectAtIndex:i%colorCount] setFill];
+             NSRectFill(rectToFill);
+-            rectToFill.origin.y += rectToFill.size.height; // This is for beyond the loop.
+-            heightFilled = rectToFill.origin.y;
+         }
+-        if (_standardRowHeight > 0.) {
+-            rectToFill.size.height = _standardRowHeight + _intercellSpacing.height;
+-            while (heightFilled < clipRect.size.height) {
++        // below the last row the stripes go on, on the rows' grid, as far as the rect to draw reaches
++        // (they were drawn from the rect's top and only for its height: a rect below the rows, which a
++        // list filtered to a few rows leaves, stayed black)
++        if (rowHeight > 0.) {
++            y = numberOfRows > 0 ? NSMaxY([self rectOfRow:numberOfRows - 1]) : NSMinY(_bounds);
++            i = numberOfRows;
++            if (y < NSMinY(clipRect)) {
++                NSInteger skip = (NSInteger)floor((NSMinY(clipRect) - y) / rowHeight);
++
++                y += skip * rowHeight;
++                i += skip;
++            }
++            for (; y < NSMaxY(clipRect); y += rowHeight, i++) {
+                 [(NSColor *)[rowColors objectAtIndex:i%colorCount] setFill];
+-                NSRectFill(rectToFill);
+-                heightFilled += rectToFill.size.height;
+-                rectToFill.origin.y += rectToFill.size.height;
+-                i++;
++                NSRectFill(NSMakeRect(NSMinX(_bounds), y, NSWidth(_bounds), rowHeight));
+             }
+         }
+     }
+@@ -1446,7 +1476,7 @@
+         }
+ 
+     }
+-    else
++    else if ([self columnAutoresizingStyle] != 0)
+         [self sizeLastColumnToFit];
+ 
+    [self tile];
+--- a/src/Frameworks/AppKit/NSTableViewViewBased.m
++++ b/src/Frameworks/AppKit/NSTableViewViewBased.m
+@@ -195,6 +195,8 @@
+     NSInteger autoresizingStyle;
+     NSMutableDictionary *indicators;    /* column identifier -> image */
+     NSInteger updates;
++    NSView *preferred;                  /* during a reload: the view a cell has, which
++                                           -makeViewWithIdentifier:owner: gives back for it (not retained) */
+ }
+ @end
+ 
+@@ -270,6 +272,16 @@
+     SFViewBasedState *s = [self _sfViewState];
+     if (identifier == nil)
+         return nil;
++    /* a reload asks again for the views of the rows shown: the cell's own view comes back to it, so
++     * that one whose values did not change is not drawn again (each reload made every view of every
++     * row anew, and Activity Monitor reloads at every update) */
++    if (s->preferred != nil) {
++        NSView *p = s->preferred;
++        if ([p respondsToSelector:@selector(identifier)] && [[(id)p identifier] isEqual:identifier]) {
++            s->preferred = nil;
++            return [[p retain] autorelease];
++        }
++    }
+     NSMutableArray *pool = [s->reuse objectForKey:identifier];
+     if ([pool count] > 0) {
+         NSView *v = [[[pool lastObject] retain] autorelease];
+@@ -291,30 +303,65 @@
+     return nil;
+ }
+ 
+-- (void)_sfRecycleRowView:(NSTableRowView *)rv {
++/* a cell view that has left its row goes to the pool of its identifier */
++- (void)_sfRecycleView:(NSView *)v {
+     SFViewBasedState *s = [self _sfViewState];
+-    for (NSView *v in [[[rv subviews] copy] autorelease]) {
+-        NSString *ident = [v respondsToSelector:@selector(identifier)] ? [(id)v identifier] : nil;
+-        if ([self isKindOfClass:[NSOutlineView class]] && [[self delegate] respondsToSelector:@selector(outlineView:didRemoveRowView:forRow:)])
+-            ;
+-        [v retain];
+-        [v removeFromSuperview];
+-        if ([v respondsToSelector:@selector(setBackgroundStyle:)])
+-            [(NSTableCellView *)v setBackgroundStyle:NSBackgroundStyleLight];
+-        if ([ident length] > 0) {
+-            NSMutableArray *pool = [s->reuse objectForKey:ident];
+-            if (pool == nil) {
+-                pool = [NSMutableArray array];
+-                [s->reuse setObject:pool forKey:ident];
+-            }
+-            if ([pool count] < 64)
+-                [pool addObject:v];
++    NSString *ident = [v respondsToSelector:@selector(identifier)] ? [(id)v identifier] : nil;
++    [v retain];
++    [v removeFromSuperview];
++    if ([v respondsToSelector:@selector(setBackgroundStyle:)])
++        [(NSTableCellView *)v setBackgroundStyle:NSBackgroundStyleLight];
++    if ([ident length] > 0) {
++        NSMutableArray *pool = [s->reuse objectForKey:ident];
++        if (pool == nil) {
++            pool = [NSMutableArray array];
++            [s->reuse setObject:pool forKey:ident];
+         }
+-        [v release];
++        if ([pool count] < 64)
++            [pool addObject:v];
+     }
++    [v release];
++}
++
++- (void)_sfRecycleRowView:(NSTableRowView *)rv {
++    for (NSView *v in [[[rv subviews] copy] autorelease])
++        [self _sfRecycleView:v];
+     [rv removeFromSuperview];
+ }
+ 
++/* a reload of a row shown: each column's view asked for again, the cell's own view offered back
++ * first; a different view takes its place */
++- (void)_sfReloadRowView:(NSTableRowView *)rv row:(NSInteger)row {
++    SFViewBasedState *s = [self _sfViewState];
++    NSArray *cells = [[[rv subviews] copy] autorelease];
++    NSInteger ncols = [[self tableColumns] count];
++    for (NSInteger c = 0; c < ncols; c++) {
++        NSTableColumn *tc = [[self tableColumns] objectAtIndex:c];
++        NSView *old = c < (NSInteger)[cells count] ? [cells objectAtIndex:c] : nil;
++        NSView *v = nil;
++        if (![tc isHidden]) {
++            s->preferred = old;
++            v = [self _sfMakeViewForColumn:c row:row];
++            s->preferred = nil;
++        }
++        if (v == nil) {
++            BOOL plain = old != nil && [old class] == [NSView class];
++            v = plain ? old : [[[NSView alloc] initWithFrame:NSZeroRect] autorelease];   /* keeps column order */
++        }
++        if (v == old)
++            continue;
++        if (old != nil) {
++            [v retain];
++            [v removeFromSuperview];
++            [rv replaceSubview:old with:v];
++            [v release];
++            if ([old superview] == nil)
++                [self _sfRecycleView:old];
++        } else
++            [rv addSubview:v];
++    }
++}
++
+ - (void)_sfRemoveAllRowViews {
+     SFViewBasedState *s = [self _sfViewState];
+     for (NSTableRowView *rv in [s->rows allValues])
+@@ -394,10 +441,8 @@
+     if (debug)
+         NSLog(@"view-based %@: rows %ld, columns %ld, visible %@, frame %@, dirty %d", [self class], (long)nrows, (long)ncols,
+             [NSString stringWithFormat:@"{%lu, %lu}", (unsigned long)visible.location, (unsigned long)visible.length], NSStringFromRect([self frame]), s->dirty);
+-    if (s->dirty) {
+-        [self _sfRemoveAllRowViews];
+-        s->dirty = NO;
+-    }
++    BOOL reload = s->dirty;
++    s->dirty = NO;
+     /* rows that left the screen give their views back */
+     for (NSNumber *key in [[s->rows allKeys] copy]) {
+         NSInteger r = [key integerValue];
+@@ -419,8 +464,21 @@
+             fresh = YES;
+         }
+         NSRect rowRect = [self rectOfRow:r];
++        /* a row view spans the table, as on macOS: its background and selection reach past the last
++         * column (what was right of it was never drawn after a reload, black) */
++        rowRect.size.width = MAX(NSWidth(rowRect), NSWidth([self bounds]));
+         if (!NSEqualRects([rv frame], rowRect))
+             [rv setFrame:rowRect];
++        if (!fresh && reload) {
++            [self _sfReloadRowView:rv row:r];
++            /* as for a row view added by a reload on macOS: the delegate sees it again (Activity
++             * Monitor colours a hung process's name there) */
++            if ([self isKindOfClass:[NSOutlineView class]]) {
++                if ([d respondsToSelector:@selector(outlineView:didAddRowView:forRow:)])
++                    [d outlineView:(NSOutlineView *)self didAddRowView:rv forRow:r];
++            } else if ([d respondsToSelector:@selector(tableView:didAddRowView:forRow:)])
++                [d tableView:self didAddRowView:rv forRow:r];
++        }
+         if (fresh) {
+             for (NSInteger c = 0; c < ncols; c++) {
+                 NSTableColumn *tc = [[self tableColumns] objectAtIndex:c];
+@@ -460,30 +518,28 @@
+         [self setNeedsDisplay:YES];
+         [header setNeedsDisplay:YES];
+     }
+-    /* and the last shown column takes what the others leave, as when the table was tiled: nothing
+-     * draws right of the last column (a maximised window showed black there) */
+-    if ([clip isKindOfClass:[NSClipView class]]) {
+-        CGFloat total = 0;
+-        for (NSTableColumn *c in [self tableColumns])
+-            if (![c isHidden])
+-                total += [c width] + [self intercellSpacing].width;
+-        if (total + 0.5 < NSWidth([clip bounds])) {
+-            [self sizeLastColumnToFit];
+-            [self setNeedsDisplay:YES];
+-            [[self headerView] setNeedsDisplay:YES];
+-        }
+-    }
++    /* the columns keep their widths (a table without column autoresizing, as Activity Monitor's: it
++     * saves them); the rows, their backgrounds and an empty header fill what is right of the last one */
+     [self _sfLayoutViews];
+     [super viewWillDraw];
+ }
+ 
++/* a reload of a view-based table: its row views are filled again at the next display; only what
++ * changes in them is drawn (the whole table was drawn at each reload) */
+ - (void)_sfInvalidateViews {
+     if (objc_getAssociatedObject(self, &sfViewBasedKey) != nil || [self _sfIsViewBased]) {
+         [self _sfViewState]->dirty = YES;
+-        [self setNeedsDisplay:YES];
++        if ([self window] != nil)
++            [[self window] setViewsNeedDisplay:YES];
++        else
++            [self setNeedsDisplay:YES];
+     }
+ }
+ 
++- (BOOL)_sfReloadsInPlace {
++    return [self _sfIsViewBased] && [self window] != nil;
++}
++
+ - (id)viewAtColumn:(NSInteger)column row:(NSInteger)row makeIfNecessary:(BOOL)make {
+     NSTableRowView *rv = [self rowViewAtRow:row makeIfNecessary:make];
+     return [rv viewAtColumn:column];
+@@ -529,7 +585,8 @@
+ 
+ - (void)reloadDataForRowIndexes:(NSIndexSet *)rowIndexes columnIndexes:(NSIndexSet *)columnIndexes {
+     [self _sfInvalidateViews];
+-    [self setNeedsDisplay:YES];
++    if (![self _sfReloadsInPlace])
++        [self setNeedsDisplay:YES];
+ }
+ 
+ - (void)beginUpdates { [self _sfViewState]->updates++; }
+--- a/src/Frameworks/AppKit/NSOutlineView.m
++++ b/src/Frameworks/AppKit/NSOutlineView.m
+@@ -55,6 +55,10 @@
+ -(BOOL)_sfIsViewBased;
+ @end
+ 
++@interface NSTableView (SFViewBasedReload)
++-(BOOL)_sfReloadsInPlace;
++@end
++
+ @implementation NSOutlineView
+ 
+ static inline BOOL isItemExpanded(NSOutlineView *self,id item){
+@@ -420,7 +424,8 @@
+     [self _resetMapTables];
+     [self invalidateRowCache];
+     [self noteNumberOfRowsChanged];
+-    [self setNeedsDisplay:YES];
++    if (![self _sfReloadsInPlace])
++        [self setNeedsDisplay:YES];
+ }
+ 
+ -(void)reloadItem:(id)item {
+--- a/src/Frameworks/AppKit/NSToolbar.subproj/NSToolbarItemView.m
++++ b/src/Frameworks/AppKit/NSToolbar.subproj/NSToolbarItemView.m
+@@ -55,8 +55,13 @@
+ {
+     NSRect rect=[self bounds];
+     CGFloat labelHeight=[_toolbarItem _labelSize].height;
+-    rect.size.height -= labelHeight;
+-    rect.origin.y += labelHeight + 4; // 4 is Cocotron magic padding (see NSToolbarItem drawInRect:
++
++    // the label's room and its padding only where a label is shown (an icon-only toolbar's views were
++    // pushed 4 points up out of their item and cut at the top)
++    if(labelHeight>0){
++     rect.size.height -= labelHeight + 4;
++     rect.origin.y += labelHeight + 4; // 4 is Cocotron magic padding (see NSToolbarItem drawInRect:
++    }
+     return rect;
+ }
+ 
+@@ -71,8 +76,8 @@
+         
+         // Center the subview within the available bounds
+         viewRect.origin.x=NSMinX(availableRect) + (NSWidth(availableRect) - NSWidth(viewRect)) / 2.f;
+-        // Align top
+-        viewRect.origin.y=NSMinY(availableRect);
++        // in the middle of what is left (as macOS centres a toolbar item's view)
++        viewRect.origin.y=floor(NSMinY(availableRect) + (NSHeight(availableRect) - NSHeight(viewRect)) / 2.f);
+         [view setFrame: viewRect];
+     }
+ }
+--- a/src/Frameworks/AppKit/NSToolbar.subproj/NSToolbarView.m
++++ b/src/Frameworks/AppKit/NSToolbar.subproj/NSToolbarView.m
+@@ -106,6 +106,8 @@
+    return result;
+ }
+ 
++static const CGFloat SFToolbarVerticalMargin=5;
++
+ -(void)layoutViewsWithWidth:(CGFloat)desiredWidth setFrame:(BOOL)setFrame {
+    NSArray  *items=[_toolbar items];
+    NSInteger i,count=[items count];
+@@ -226,6 +228,8 @@
+     }
+    }
+ 
++   // a margin above and below the items, as macOS's toolbar row has (the items filled it edge to edge)
++   resultHeight+=2*SFToolbarVerticalMargin;
+    if(setFrame){
+     NSRect frame=[self frame];
+ 
+@@ -241,6 +245,7 @@
+     else {
+ 
+      frames[i].origin.x=x;
++     frames[i].origin.y=floor((NSHeight([self bounds])-frames[i].size.height)/2);
+      [item _setItemViewFrame:frames[i]];
+      if([item _enclosingView]!=self)
+       [self addSubview:[item _enclosingView]];
+--- a/src/Frameworks/AppKit/NSColor.subproj/NSColor_catalog.h
++++ b/src/Frameworks/AppKit/NSColor.subproj/NSColor_catalog.h
+@@ -12,6 +12,10 @@
+     NSString *_catalogName;
+     NSString *_colorName;
+     NSColor *_color;
++    // a system colour as last resolved for the light [0] and dark [1] appearance, and the generation of
++    // the system colours it was resolved in (NSSystemColorsDidChangeNotification starts a new one)
++    NSColor *_sfResolved[2];
++    unsigned _sfResolvedGeneration[2];
+ }
+ 
+ //+ (NSColor *)colorWithCatalogName:(NSString *)catalogName colorName:(NSString *)colorName;
+--- a/src/Frameworks/AppKit/NSColor.subproj/NSColor_catalog.m
++++ b/src/Frameworks/AppKit/NSColor.subproj/NSColor_catalog.m
+@@ -10,6 +10,7 @@
+ #import <AppKit/NSColorList.h>
+ #import <AppKit/NSGraphics.h>
+ #import <AppKit/NSAppearance.h>
++#import <Foundation/NSNotification.h>
+ 
+ @interface NSColor(NSAppKitPrivate)
+ -(CGColorRef)CGColorRef;
+@@ -32,6 +33,8 @@
+    [_colorName release];
+    [_catalogName release];
+    [_color release];
++   [_sfResolved[0] release];
++   [_sfResolved[1] release];
+    NSDeallocateObject(self);
+    return;
+    [super dealloc];
+@@ -66,13 +69,34 @@
+    return [[self _resolvedColor] colorUsingColorSpaceName:NSCalibratedRGBColorSpace];
+ }
+ 
+-// system colours follow the appearance being drawn, other catalogs keep their colour
++static unsigned sfSystemColorGeneration=1;
++
+++(void)_sfSystemColorsDidChange:(NSNotification *)note {
++   sfSystemColorGeneration++;
++}
++
+++(void)initialize {
++   if(self==[NSColor_catalog class])
++    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(_sfSystemColorsDidChange:)
++                                                 name:NSSystemColorsDidChangeNotification object:nil];
++}
++
++// system colours follow the appearance being drawn, other catalogs keep their colour. The colour of an
++// appearance is resolved once (a name looked up in the display's table and in two lists at every fill
++// and stroke was a tenth of Activity Monitor's drawing), until the system colours change
+ -(NSColor *)_resolvedColor {
+    if([_catalogName isEqualToString:@"System"]){
+-    NSColor *color=[NSColor _systemColorNamed:_colorName dark:[[NSAppearance currentDrawingAppearance] _isDark]];
++    int dark=[[NSAppearance currentDrawingAppearance] _isDark]?1:0;
++
++    if(_sfResolvedGeneration[dark]!=sfSystemColorGeneration){
++     NSColor *color=[NSColor _systemColorNamed:_colorName dark:dark];
+ 
+-    if(color!=nil)
+-     return color;
++     [_sfResolved[dark] release];
++     _sfResolved[dark]=[color retain];
++     _sfResolvedGeneration[dark]=sfSystemColorGeneration;
++    }
++    if(_sfResolved[dark]!=nil)
++     return _sfResolved[dark];
+    }
+    return _color;
+ }
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -60,6 +60,17 @@
+ NSString * const NSViewBoundsDidChangeNotification=@"NSViewBoundsDidChangeNotification";
+ NSString * const NSViewFocusDidChangeNotification=@"NSViewFocusDidChangeNotification";
+ 
++
++// SF_CA_TRACE, read once: -setFrame: asked the environment at every frame change (a getenv walks the
++// whole environment; a table's layout sets thousands of frames)
++static int sfCATrace(void) {
++   static int on=-1;
++
++   if(on<0)
++    on=getenv("SF_CA_TRACE")!=NULL;
++   return on;
++}
++
+ @interface NSView(NSView_forward)
+ -(CGAffineTransform)transformFromWindow;
+ -(CGAffineTransform)transformToWindow;
+@@ -831,7 +842,7 @@
+ // as on macOS, a frame change goes through -setFrameOrigin: and -setFrameSize:, so a
+ // subclass that overrides either one sees every resize
+ -(void)setFrame:(NSRect)frame {
+-   if(getenv("SF_CA_TRACE"))
++   if(sfCATrace())
+     fprintf(stderr,"PD-CA view %s %p setFrame: %g %g %g %g\n",object_getClassName(self),self,frame.origin.x,frame.origin.y,frame.size.width,frame.size.height);
+    if(!NSEqualPoints(frame.origin,_frame.origin))
+     [self setFrameOrigin:frame.origin];
+@@ -927,7 +938,7 @@
+ }
+ 
+ -(void)setFrameSize:(NSSize)size {
+-   if(getenv("SF_CA_TRACE"))
++   if(sfCATrace())
+     fprintf(stderr,"PD-CA view %s %p setFrameSize: %g %g\n",object_getClassName(self),self,size.width,size.height);
+    NSRect frame=_frame;
+ 
+@@ -1845,7 +1856,7 @@
+ }
+ 
+ -(void)setWantsLayer:(BOOL)value {
+-   if(getenv("SF_CA_TRACE"))
++   if(sfCATrace())
+     fprintf(stderr,"PD-CA view %s %p setWantsLayer: %d\n",object_getClassName(self),self,value);
+    if(!value){
+     if(_wantsLayer){
+@@ -1865,7 +1876,7 @@
+ }
+ 
+ -(void)setLayer:(CALayer *)value {
+-   if(getenv("SF_CA_TRACE"))
++   if(sfCATrace())
+     fprintf(stderr,"PD-CA view %s %p setLayer: %s %p\n",object_getClassName(self),self,value ? object_getClassName(value) : "nil",value);
+    // a hosted CAMetalLayer or CALayerHost goes to its own subsurface, outside the CALayer renderer (which may be off)
+    if(isSurfaceLayer(value) || isSurfaceLayer(_layer)){
+--- a/src/Frameworks/AppKit/NSPopUpButtonCell.m
++++ b/src/Frameworks/AppKit/NSPopUpButtonCell.m
+@@ -151,7 +151,16 @@
+    return [_menu indexOfItemWithTarget:target andAction:action];
+ }
+ 
++// a pop-up (not pull-down) menu with items has one of them selected, as on macOS: items put in its
++// menu directly, or a nib that archived no selection, left none, and Activity Monitor's Send Signal
++// sheet read the signal of no item (0: nothing was sent)
++static void sfSelectFirstIfNone(NSPopUpButtonCell *self, NSInteger *selected, BOOL pullsDown, NSMenu *menu) {
++  if(*selected<0 && !pullsDown && [menu numberOfItems]>0)
++   *selected=0;
++}
++
+ -(NSMenuItem *)selectedItem {
++  sfSelectFirstIfNone(self,&_selectedIndex,_pullsDown,_menu);
+   if(_selectedIndex<0)
+    return nil;
+    
+@@ -167,6 +176,7 @@
+ }
+ 
+ -(NSInteger)indexOfSelectedItem {
++   sfSelectFirstIfNone(self,&_selectedIndex,_pullsDown,_menu);
+    return _selectedIndex;
+ }
+ 

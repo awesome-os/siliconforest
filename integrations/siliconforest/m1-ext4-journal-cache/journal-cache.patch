@@ -1,0 +1,129 @@
+--- a/src/Kernel/Extensions/ext4/ext4_subr.c
++++ b/src/Kernel/Extensions/ext4/ext4_subr.c
+@@ -105,6 +105,69 @@
+  * ext4_mount() in ext4_vfsops.c), convert pblk into the device's real native
+  * sector units ourselves using em_dev_bsize queried at mount time.
+  */
++/* Read authoritative metadata from the pending WAL image before disk I/O.
++ * Callers serialize metadata with em_fs_lock (mount bootstrap is single-threaded).
++ * The borrowed buffer is explicitly invalidated on release: no synthetic I/O
++ * completion, delayed write, or checkpoint ordering change is introduced.
++ */
++#include <sys/sysctl.h>
++static int sf_ext4_journal_cache = 1;
++static uint64_t sf_ext4_cache_reads, sf_ext4_cache_hits, sf_ext4_cache_breads;
++static void
++sf_ext4_cache_count(uint64_t *counter)
++{
++	__atomic_fetch_add(counter, 1, __ATOMIC_RELAXED);
++}
++static int
++sf_ext4_cache_enabled(void)
++{
++	return __atomic_load_n(&sf_ext4_journal_cache, __ATOMIC_RELAXED);
++}
++static int
++sf_ext4_cache_switch SYSCTL_HANDLER_ARGS
++{
++	int value = sf_ext4_cache_enabled();
++	int error = sysctl_handle_int(oidp, &value, 0, req);
++	if (error || req->newptr == USER_ADDR_NULL)
++		return error;
++	if (value != 0 && value != 1)
++		return EINVAL;
++	__atomic_store_n(&sf_ext4_journal_cache, value, __ATOMIC_RELAXED);
++	return 0;
++}
++static int
++sf_ext4_cache_stats SYSCTL_HANDLER_ARGS
++{
++	char text[192];
++	snprintf(text, sizeof(text), "enabled=%d reads=%llu journal_hits=%llu bread_calls=%llu",
++	    sf_ext4_cache_enabled(),
++	    (unsigned long long)__atomic_load_n(&sf_ext4_cache_reads, __ATOMIC_RELAXED),
++	    (unsigned long long)__atomic_load_n(&sf_ext4_cache_hits, __ATOMIC_RELAXED),
++	    (unsigned long long)__atomic_load_n(&sf_ext4_cache_breads, __ATOMIC_RELAXED));
++	return SYSCTL_OUT(req, text, strlen(text) + 1);
++}
++SYSCTL_DECL(_kern);
++SYSCTL_NODE(_kern, OID_AUTO, sf_ext4, CTLFLAG_RD | CTLFLAG_LOCKED, 0, "ext4 journal read cache");
++SYSCTL_PROC(_kern_sf_ext4, OID_AUTO, journal_cache, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED,
++    0, 0, sf_ext4_cache_switch, "I", "use pending journal image before metadata disk read");
++SYSCTL_PROC(_kern_sf_ext4, OID_AUTO, cache_stats, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sf_ext4_cache_stats, "A", "aggregate cache counters, no timer or polling");
++
++void
++sf_ext4_cache_register(void)
++{
++	sysctl_register_oid(&sysctl__kern_sf_ext4);
++	sysctl_register_oid(&sysctl__kern_sf_ext4_journal_cache);
++	sysctl_register_oid(&sysctl__kern_sf_ext4_cache_stats);
++}
++void
++sf_ext4_cache_unregister(void)
++{
++	sysctl_unregister_oid(&sysctl__kern_sf_ext4_cache_stats);
++	sysctl_unregister_oid(&sysctl__kern_sf_ext4_journal_cache);
++	sysctl_unregister_oid(&sysctl__kern_sf_ext4);
++}
++
+ int
+ ext4_blkread(struct ext4mount *emp, uint64_t pblk, buf_t *bpp)
+ {
+@@ -114,6 +177,25 @@
+ 
+ 	devblk = (daddr64_t)(pblk * ((uint64_t)emp->em_blocksize / emp->em_dev_bsize));
+ 
++	sf_ext4_cache_count(&sf_ext4_cache_reads);
++	if (sf_ext4_cache_enabled() && emp->em_jnl != NULL) {
++		bp = buf_getblk(emp->em_devvp, devblk, (int)emp->em_blocksize, 0, 0, BLK_META);
++		if (bp != NULL) {
++			if (ext4_jnl_read_overlay(emp, pblk, (void *)buf_dataptr(bp))) {
++				/* Complete WAL image, owned by the current transaction. Do not
++				 * make an unissued I/O appear complete or dirty this buffer. */
++				buf_seterror(bp, 0);
++				buf_setresid(bp, 0);
++				buf_markinvalid(bp);
++				sf_ext4_cache_count(&sf_ext4_cache_hits);
++				*bpp = bp;
++				return 0;
++			}
++			buf_brelse(bp);
++			bp = NULL;
++		}
++	}
++	sf_ext4_cache_count(&sf_ext4_cache_breads);
+ 	error = buf_meta_bread(emp->em_devvp, devblk,
+ 	    (int)emp->em_blocksize, NOCRED, &bp);
+ 	if (error) {
+--- a/src/Kernel/Extensions/ext4/ext4_vfsops.c
++++ b/src/Kernel/Extensions/ext4/ext4_vfsops.c
+@@ -419,6 +419,9 @@
+ 	return 0;
+ }
+ 
++void sf_ext4_cache_register(void);
++void sf_ext4_cache_unregister(void);
++
+ /* filesystem (de)registration
+  *
+  * Called from the ext4 IOService's start()/stop() (ext4_iokit.cpp) rather
+@@ -457,6 +460,7 @@
+ 		E4LOG("vfs_fsadd failed: %d", error);
+ 		return error;
+ 	}
++	sf_ext4_cache_register();
+ 	E4LOG("registered ext4 filesystem");
+ 	return 0;
+ }
+@@ -468,6 +472,7 @@
+ 		if (vfs_fsremove(ext4_vfsconf) != 0)
+ 			return -1;
+ 		ext4_vfsconf = NULL;
+-	}
+-	return 0;
+-}
++		sf_ext4_cache_unregister();
++	}
++	return 0;
++}

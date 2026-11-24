@@ -1,0 +1,51 @@
+xnu: IOSetRecoveryBoot() does nothing on SiliconForest
+
+When no root device appears within 60 s (IOFindBSDRoot) or a root's seal is broken, Apple's
+kernel sets recovery-boot-mode, boot-picker-bringup-reason and boot-command=recover-system
+in NVRAM and panics on purpose, so that the machine restarts into recovery. A kernel that
+lost its command line takes that path too: the lab's first boots through a stage loader
+(sfb01..sfb03) wrote the command line four bytes from where the kernel reads it, the kernel
+saw none, and with no rd=md0 it had no root to find.
+
+The function now logs the request and returns without touching NVRAM or restarting. This
+is unconditional: the case it defends against is the one with no boot arguments. Callers
+are IOFindBSDRoot (which keeps waiting for the root) and bsd_init's wrapper.
+UPSTREAM: needs a SiliconForest decision (what a failed boot should do on a multi-boot machine).
+
+--- a/src/Kernel/xnu/iokit/bsddev/IOKitBSDInit.cpp
++++ b/src/Kernel/xnu/iokit/bsddev/IOKitBSDInit.cpp
+@@ -580,6 +580,9 @@
+  * Returns true if `mode` was understood, false otherwise.
+  * (Does not return if `reboot` is true.)
+  */
++/* SiliconForest: never set; see IOSetRecoveryBoot(). Not a boot argument on purpose. */
++static boolean_t sf_recovery_boot_allowed = false;
++
+ boolean_t
+ IOSetRecoveryBoot(bsd_bootfail_mode_t mode, uuid_t volume_uuid, boolean_t reboot)
+ {
+@@ -587,6 +590,24 @@
+ 	const OSSymbol *boot_command_sym = NULL;
+ 	OSString *boot_command_recover = NULL;
+ 
++	/*
++	 * SiliconForest: never. This path writes recovery-boot-mode, boot-picker-bringup-reason
++	 * and boot-command to NVRAM and restarts into Apple's recovery. On a machine that
++	 * also boots other systems, a kernel that merely could not find its root (a wrong or
++	 * lost command line is enough: boots sfb01..sfb03 of the lab) must not redirect the
++	 * machine's next boot. It does not depend on a boot argument, because the case to
++	 * defend against is the one in which there are none. The caller goes on waiting for
++	 * a root device, or sees the failure it reported.
++	 */
++	IOLog("IOSetRecoveryBoot(mode %d, reboot %d): not taken on SiliconForest; NVRAM is left alone\n",
++	    (int)mode, (int)reboot);
++	if (mode != BSD_BOOTFAIL_SEAL_BROKEN && mode != BSD_BOOTFAIL_MEDIA_MISSING) {
++		return false;
++	}
++	if (!sf_recovery_boot_allowed) {
++		return true;
++	}
++
+ 	if (mode == BSD_BOOTFAIL_SEAL_BROKEN) {
+ 		const char *boot_mode = "ssv-seal-broken";
+ 		uuid_string_t volume_uuid_str;

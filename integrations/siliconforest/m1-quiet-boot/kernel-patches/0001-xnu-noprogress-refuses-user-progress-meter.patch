@@ -1,0 +1,34 @@
+xnu: -noprogress also refuses the user-space progress meter
+
+With a graphics boot (boot-args Video.v_display 1) the kernel paints nothing on the
+framebuffer once -noprogress keeps its own progress indicator off, but user space can
+still switch the meter on: SiliconForest's launchctl sets kern.progressmeterenable=1 and
+kern.progressmeter=576 at the start of the system bootstrap, and the kernel then draws
+the bar (468x36 pixels at 94% of the height on a 2560x1600 panel) over whatever the
+boot loader put there. Seen on the M1 in boots qb01 and qb02: the boot picture painted by
+the launcher was untouched except for that bar. With this, -noprogress means no
+progress drawing at all; without the boot-arg nothing changes.
+UPSTREAM: yes.
+
+--- a/src/Kernel/xnu/osfmk/console/video_console.c
++++ b/src/Kernel/xnu/osfmk/console/video_console.c
+@@ -3253,6 +3253,10 @@
+ 	void    * new_buffer;
+ 	boolean_t stashBackbuffer;
+ 	int flags = vinfo.v_rotate;
++	uint32_t notused;
++	// PD: -noprogress also refuses the meter user space asks for (launchctl's boot bar),
++	// so a boot picture put up before the kernel stays as it is
++	boolean_t no_user_meter = PE_parse_boot_argn("-noprogress", &notused, sizeof(notused));
+ 
+ 	stashBackbuffer = FALSE;
+ 	new_buffer = NULL;
+@@ -3264,7 +3268,7 @@
+ 	simple_lock(&vc_progress_lock, LCK_GRP_NULL);
+ 
+ 	if (kProgressMeterUser == new_value) {
+-		if (gc_enabled || !gc_acquired || !gc_graphics_boot) {
++		if (gc_enabled || !gc_acquired || !gc_graphics_boot || no_user_meter) {
+ 			new_value = vc_progressmeter_enable;
+ 		}
+ 	}

@@ -1,0 +1,35 @@
+--- a/src/Frameworks/AppKit/NSWindow.m
++++ b/src/Frameworks/AppKit/NSWindow.m
+@@ -1959,18 +1959,28 @@
+    return _childWindows;
+ }
+ 
++/* (TERM10, FX-022) As on macOS: a child window is ordered in above (or below) its parent when the parent is visible,
++ * and never made key by being attached. It was made key and ordered front, so the parent resigned key: Firefox, which
++ * attaches its menu panel (the toolbar's menu button) as a child of the browser window right after showing it, took
++ * that as its window being deactivated and closed the panel at once ("showing, then hiding before shown"); the
++ * panel window then came back as a toplevel the desk focused, and the next click lost the window to a configure
++ * serial error. Removing a child only detaches it (macOS does not order it out). */
+ -(void)addChildWindow:(NSWindow *)child ordered:(NSWindowOrderingMode)ordered {
++   if(child==nil || child==self)
++    return;
+    if(_childWindows==nil)
+     _childWindows=[NSMutableArray new];
+ 
+-   [_childWindows addObject:child];
++   if([_childWindows indexOfObjectIdenticalTo:child]==NSNotFound)
++    [_childWindows addObject:child];
+    [child setParentWindow:self];
+-   [child makeKeyAndOrderFront:nil];
++   if([self isVisible] && ordered!=NSWindowOut)
++    [child orderWindow:ordered relativeTo:[self windowNumber]];
+ }
+ 
+ -(void)removeChildWindow:(NSWindow *)child {
+-   [child orderOut:nil];
+-   [child setParentWindow:nil];
++   if([child parentWindow]==self)
++    [child setParentWindow:nil];
+    [_childWindows removeObjectIdenticalTo:child];
+ }
+ 

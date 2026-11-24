@@ -1,0 +1,83 @@
+--- a/src/Frameworks/AppKit/NSFoundWithTerminalAdditions.m
++++ b/src/Frameworks/AppKit/NSFoundWithTerminalAdditions.m
+@@ -74,6 +74,7 @@
+ @end
+ 
+ #import <AppKit/NSCell.h>
++#import <AppKit/NSTextField.h>
+ 
+ /* -[NSCell interiorBackgroundStyle]: the background a cell's interior is drawn on (light, unless
+  * the cell is highlighted in a list, where it is the selection's dark fill). A table's custom cell
+@@ -86,3 +87,30 @@
+ }
+ 
+ @end
++
++/* +[NSCountedSet setWithCapacity:] (Terminal's check for running processes when it quits): this
++ * Foundation's counted set does not inherit NSMutableSet's convenience constructor. */
++@implementation NSCountedSet (SFCapacity)
++
+++ (id)setWithCapacity:(NSUInteger)capacity
++{
++    return [[[self alloc] initWithCapacity:capacity] autorelease];
++}
++
++@end
++
++/* -[NSTextField setLineBreakMode:] (macOS 10.11; Terminal sets it on its tab's accessory field):
++ * the cell's. */
++@implementation NSTextField (SFLineBreakMode)
++
++- (void)setLineBreakMode:(NSLineBreakMode)mode
++{
++    [[self cell] setLineBreakMode:mode];
++}
++
++- (NSLineBreakMode)lineBreakMode
++{
++    return [[self cell] lineBreakMode];
++}
++
++@end
+--- a/src/Frameworks/AppKit/NSFontFamily.m
++++ b/src/Frameworks/AppKit/NSFontFamily.m
+@@ -140,16 +140,37 @@
+    return nil;
+ }
+ 
++/* Of the faces with the traits, the one whose style is the plain form of them: "Bold" for bold,
++ * "Italic" (or "Regular Italic") for italic, "Regular" for neither. A family with weights between
++ * (a variable font's named instances: Light, Medium, Semibold, Bold, Heavy) has several faces with
++ * the bold or the italic trait; the first in the list was taken (Terminal's bold came out Heavy,
++ * its italic Light Italic). Then the first, as before. */
++static NSString *SFPlainStyle(NSFontTraitMask traits) {
++   BOOL bold=(traits&NSBoldFontMask)!=0,italic=(traits&NSItalicFontMask)!=0;
++
++   return bold ? (italic ? @"bold italic" : @"bold") : (italic ? @"italic" : @"regular");
++}
++
+ -(NSFontTypeface *)typefaceWithTraits:(NSFontTraitMask)traits {
+    int i,count=[_typefaces count];
++   NSFontTypeface *first=nil;
++   NSString *plain=SFPlainStyle(traits);
+ 
+    for(i=0;i<count;i++){
+     NSFontTypeface *typeface=[_typefaces objectAtIndex:i];
+-    if([typeface traits]==traits)
++
++    if([typeface traits]!=traits)
++     continue;
++    NSString *style=[[[typeface traitName] lowercaseString] stringByReplacingOccurrencesOfString:@"oblique" withString:@"italic"];
++
++    if([style isEqualToString:plain] || [style isEqualToString:[@"regular " stringByAppendingString:plain]] ||
++       ([plain isEqualToString:@"regular"] && ([style isEqualToString:@"book"] || [style isEqualToString:@"roman"] || [style isEqualToString:@"normal"])))
+      return typeface;
++    if(first==nil)
++     first=typeface;
+    }
+ 
+-   return nil;
++   return first;
+ }
+ 
+ -(void)addTypeface:(NSFontTypeface *)typeface {

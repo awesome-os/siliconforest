@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude (independent read-only delta review; did not author 002 or 003)",
+  "status": "READ_ONLY_SOURCE_AND_HOST_REVIEW_NO_NATIVE_BUILD_NO_ADMISSION",
+  "target": "desktop-shell/implementation-revisions/003: source set ee989413457ae24006f66bcfa3a6c0a9f8708c9736cec10b85ee4f6778cce816, incremental d43be413, full tree 881bf287 (3966 files)",
+  "base": "Approved 002 (set c78e3586, receipt 257b9e77; my review desktop-shell-implementation002-source-review.json c5cd7fde)",
+  "verdict": "APPROVED. E1 is resolved and this is an E1-only delta. A new session_signals module installs checked sigaction dispositions before any session file, listener, device or process work: SIGPIPE=SIG_IGN; SIGCHLD=SIG_DFL with flags 0, clearing inherited SIG_IGN/SA_NOCLDWAIT auto-reap; INT/TERM/HUP get the stop handler with SA_RESTART. Each install saves the full old action. On setup failure it rolls back. After run_session's cleanup and drops, it restores in reverse and attempts every restore even after an earlier error. A restore failure is a nonzero session failure even if the inner result was already sealed, and it poisons later entries. Source and host evidence only.",
+  "binding": {
+    "replay": "verify_checkpoint.py (temp dir in scratch): 'Verified003 cumulative 23 and incremental 3 files, full tree and dependencies'. The 002 receipt recomputes as 257b9e77 (unchanged).",
+    "delta": "There are exactly three incremental files. desktop_entry.rs: run() now calls with_process_signals(&STOP, stop, || run_session(options)), and the 002 STOP.store and libc::signal loop are removed. lib.rs: a private mod session_signals. session_signals.rs is new (366 lines including tests). All non-delta bytes equal 002."
+  },
+  "checks": {
+    "action_construction": "new_action zeroes the struct, sets sa_sigaction to the handler (SIG_IGN, SIG_DFL or the stop function), uses sa_flags 0 for PIPE and CHLD and SA_RESTART only for INT/TERM/HUP, and empties sa_mask with a checked sigemptyset (session_signals.rs:18-34).",
+    "xnu_autoreap": "In the pinned XNU kern_sig.c:675-685, a SIGCHLD sigaction sets P_NOCLDWAIT only for SA_NOCLDWAIT or SIG_IGN, and otherwise clears it (P_NOCLDSTOP likewise). So SIG_DFL with flags 0 really clears inherited auto-reap, and the manager's exclusive waitpid cannot be turned into ECHILD 'ownership lost' by an inherited disposition.",
+    "order_and_scope": "The order is PIPE, CHLD, INT, TERM, HUP, all before run_session opens records, socket, fonts, devices or the manager. 002 installed the stop handlers only after the listener bind. STOP is reset under the entry claim. The calling thread's blocked-signal mask is deliberately left unchanged (documented).",
+    "restoration": "restore_all pops saved actions in reverse and attempts each one even after an earlier error, recording every errno with no retry. checked_scope wraps the body in an outer catch_unwind, so a panic outside the inner frame coordinator (for example in seal) still restores dispositions; the panic is reported, never turned into app-cleanup success. A value is returned only for Ok(Ok) with no restore errors; otherwise Failure carries setup, restore, body and panicked. A setup failure at any of the 5 positions rolls back the saved prefix and never runs the body.",
+    "reentry_and_poison": "EntryClaim uses compare_exchange on ACTIVE to refuse a concurrent or nested managed entry and releases on drop. POISONED is set when any restore fails, and every later entry in the process is refused. Unrelated process-global sigaction users are explicitly not synchronized (documented single-process scope).",
+    "exit_semantics": "with_process_signals maps any Failure to Err, so desktop_main prints and exits 1. A qualifying run therefore needs actual executable exit 0 after restoration, not just a sealed session-result.txt. That matches the frozen qualification_contract postseal_failure clause."
+  },
+  "independent_host_checks": {
+    "mutations": "test_signal_policy.py rerun in a scratch temp dir: 6 policy tests pass, and all 7 mutants are rejected (pipe_default, child_ignored, autoreap_flag, skip_restore, restore_error_success, skip_setup_rollback, ignore_poisoned_state). The entry-shape check passes.",
+    "recorded_logs": "52 library tests, 5 Wayland tests and 6 signal-policy tests pass. Clippy passes with only the two existing baseline lint allowances. I did not rerun cargo, to keep the tree unchanged."
+  },
+  "notes": {
+    "S1_sigpipe_context": "Informational correction to my 002 E1 note. Rust std normally sets SIGPIPE to SIG_IGN before main on unix (not verified here against the pinned toolchain's source, because no rust-src is present). The substantive E1 gain is therefore the SIGCHLD auto-reap clearing plus explicit, checked, restorable dispositions. The C shim still resets SIGPIPE to default in spawned children through its setsigdefault set.",
+    "S2_unchanged_002_notes": "E2 (outer time budget), E3 (requested startup without manager PID/READY/result must fail), E4 (exec by package-bound path) and E5 (panic window between spawn and insert) stay as recorded in 002. 003's qualification_contract restates E2-E4 for root's packet."
+  },
+  "not_claimed": ["Darwin signal runtime or SDK ABI", "native 003 build or execution", "synchronization with unrelated signal owners", "app/PTY cleanup after unwind outside the inner coordinator"],
+  "scope": "Read-only: frozen 003 delta, verifier replay, pinned XNU kern_sig.c, signal mutation script rerun in a scratch temp dir. No edits, cargo build, SSH or hardware."
+}

@@ -1,0 +1,147 @@
+--- a/src/Frameworks/AppKit/NSSharingService.h
++++ b/src/Frameworks/AppKit/NSSharingService.h
+@@ -3,6 +3,7 @@
+ 
+ #import <Foundation/NSObject.h>
+ #import <AppKit/AppKitExport.h>
++#import <Foundation/NSGeometry.h>
+ 
+ @class NSString, NSArray, NSImage, NSURL;
+ 
+@@ -32,3 +33,21 @@
+ - (BOOL)canPerformWithItems:(NSArray *)items;
+ - (void)performWithItems:(NSArray *)items;
+ @end
++
++@class NSSharingServicePicker, NSView, NSMenuItem;
++
++@protocol NSSharingServicePickerDelegate <NSObject>
++@optional
++- (NSArray *)sharingServicePicker:(NSSharingServicePicker *)picker sharingServicesForItems:(NSArray *)items proposedSharingServices:(NSArray *)proposed;
++- (id)sharingServicePicker:(NSSharingServicePicker *)picker delegateForSharingService:(NSSharingService *)service;
++- (void)sharingServicePicker:(NSSharingServicePicker *)picker didChooseSharingService:(NSSharingService *)service;
++@end
++
++// the menu of services that can take some items; with no system services it holds what the delegate adds
++@interface NSSharingServicePicker : NSObject
++- (instancetype)initWithItems:(NSArray *)items;
++@property(assign) id<NSSharingServicePickerDelegate> delegate;
++@property(readonly, retain) NSMenuItem *standardShareMenuItem;
++- (void)showRelativeToRect:(NSRect)rect ofView:(NSView *)view preferredEdge:(NSRectEdge)preferredEdge;
++- (void)close;
++@end
+--- a/src/Frameworks/AppKit/NSSharingService.m
++++ b/src/Frameworks/AppKit/NSSharingService.m
+@@ -3,6 +3,9 @@
+ 
+ #import <AppKit/NSSharingService.h>
+ #import <AppKit/NSImage.h>
++#import <AppKit/NSMenu.h>
++#import <AppKit/NSMenuItem.h>
++#import <AppKit/NSView.h>
+ #import <Foundation/Foundation.h>
+ 
+ NSString *const NSSharingServiceNameComposeEmail = @"com.apple.share.Mail.compose";
+@@ -86,3 +89,102 @@
+ }
+ 
+ @end
++
++// the picker: system services there are none, so the menu holds what the delegate proposes
++@implementation NSSharingServicePicker {
++    NSArray *_items;
++    NSArray *_services;
++    NSMenu *_menu;
++    NSMenuItem *_standardItem;
++    id<NSSharingServicePickerDelegate> _delegate;
++}
++
++- (instancetype)initWithItems:(NSArray *)items
++{
++    if ((self = [super init]))
++        _items = [items copy];
++    return self;
++}
++
++- (void)dealloc
++{
++    [_items release];
++    [_services release];
++    [_menu release];
++    [_standardItem release];
++    [super dealloc];
++}
++
++- (id<NSSharingServicePickerDelegate>)delegate { return _delegate; }
++- (void)setDelegate:(id<NSSharingServicePickerDelegate>)delegate { _delegate = delegate; }
++
++// the services for the items: the system's (none) as the delegate reshapes them
++- (NSArray *)_services
++{
++    NSArray *proposed = [NSSharingService sharingServicesForItems:_items] ?: @[];
++
++    if ([_delegate respondsToSelector:@selector(sharingServicePicker:sharingServicesForItems:proposedSharingServices:)])
++        proposed = [_delegate sharingServicePicker:self sharingServicesForItems:_items proposedSharingServices:proposed] ?: @[];
++    return proposed;
++}
++
++- (void)_chooseService:(NSMenuItem *)item
++{
++    NSSharingService *service = [item representedObject];
++
++    if ([_delegate respondsToSelector:@selector(sharingServicePicker:delegateForSharingService:)])
++        [service setDelegate:[_delegate sharingServicePicker:self delegateForSharingService:service]];
++    if ([_delegate respondsToSelector:@selector(sharingServicePicker:didChooseSharingService:)])
++        [_delegate sharingServicePicker:self didChooseSharingService:service];
++    [service performWithItems:_items];
++}
++
++- (NSMenu *)_buildMenu
++{
++    NSMenu *menu = [[[NSMenu alloc] initWithTitle:@"Share"] autorelease];
++
++    [_services release];
++    _services = [[self _services] copy];
++    for (NSSharingService *service in _services) {
++        NSString *title = [service menuItemTitle] ?: [service title] ?: @"";
++        NSMenuItem *item = [[[NSMenuItem alloc] initWithTitle:title action:@selector(_chooseService:) keyEquivalent:@""] autorelease];
++
++        [item setTarget:self];
++        [item setRepresentedObject:service];
++        [item setImage:[service image]];
++        [menu addItem:item];
++    }
++    return menu;
++}
++
++// a menu item whose submenu is the picker's menu, for an application's own Share menu
++- (NSMenuItem *)standardShareMenuItem
++{
++    if (_standardItem == nil) {
++        _standardItem = [[NSMenuItem alloc] initWithTitle:@"Share" action:NULL keyEquivalent:@""];
++        [_standardItem setSubmenu:[self _buildMenu]];
++    }
++    return _standardItem;
++}
++
++// with no service to offer nothing is shown, and the delegate hears that nothing was chosen
++- (void)showRelativeToRect:(NSRect)rect ofView:(NSView *)view preferredEdge:(NSRectEdge)preferredEdge
++{
++    [_menu release];
++    _menu = [[self _buildMenu] retain];
++    if ([_menu numberOfItems] == 0) {
++        if ([_delegate respondsToSelector:@selector(sharingServicePicker:didChooseSharingService:)])
++            [_delegate sharingServicePicker:self didChooseSharingService:nil];
++        return;
++    }
++    NSPoint where = NSMakePoint(preferredEdge == NSMaxXEdge ? NSMaxX(rect) : NSMinX(rect),
++                                preferredEdge == NSMaxYEdge ? NSMaxY(rect) : NSMinY(rect));
++    [_menu popUpMenuPositioningItem:nil atLocation:where inView:view];
++}
++
++- (void)close
++{
++    [_menu cancelTracking];
++}
++
++@end

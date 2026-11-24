@@ -1,0 +1,46 @@
+fbsdkpi: drm: a dma-buf file made by another DRM kext is recognised
+
+is_dma_buf_file() compared the file's operations with this kext's own table. Every DRM kext
+links its own copy of sf_dma_buf.c, so a dma-buf exported by one (SFAgx's render node) was
+not a dma-buf to another (SFDcp's card node): dma_buf_get() returned -EINVAL. linux_file gets
+a kind word, set for dma-buf files; both copies are built from the same sources, so the
+structures match.
+UPSTREAM: yes.
+
+--- a/src/Kernel/fbsdkpi/drm/src/sf_dma_buf.c
++++ b/src/Kernel/fbsdkpi/drm/src/sf_dma_buf.c
+@@ -125,7 +133,8 @@
+ bool
+ is_dma_buf_file(struct linux_file *filp)
+ {
+-	return filp->f_op == &sf_dma_buf_fops;
++	// ours, or one another drm kext made with its own copy of this file
++	return filp->f_op == &sf_dma_buf_fops || filp->sf_kind == SF_LFILE_KIND_DMA_BUF;
+ }
+ 
+ // the descriptor takes over the caller's reference on the buffer
+@@ -155,6 +164,7 @@
+ 			return -ENOMEM;
+ 		}
+ 		filp->private_data = db;
++		filp->sf_kind = SF_LFILE_KIND_DMA_BUF;
+ 		db->file = filp;
+ 		mutex_unlock(&db->lock);
+ 	}
+--- a/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/include/linux/fs.h
++++ b/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/include/linux/fs.h
+@@ -98,6 +98,14 @@
+ 	/* anonymous shmem object */
+ 	vm_object_t	f_shmem;
+ 
++	/*
++	 * SiliconForest: what kind of file this is, for code that must recognise a file made by
++	 * another kext's copy of this layer (a dma-buf exported by another DRM kext cannot be
++	 * known by the address of its file_operations).
++	 */
++	unsigned int	sf_kind;
++#define	SF_LFILE_KIND_DMA_BUF	0x64627566	/* "dbuf" */
++
+ 	/* kqfilter support */
+ 	int		f_kqflags;
+ #define	LINUX_KQ_FLAG_HAS_READ (1 << 0)

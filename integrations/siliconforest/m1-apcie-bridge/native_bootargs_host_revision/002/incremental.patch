@@ -1,0 +1,68 @@
+--- a/integrations/puredarwin/m1-bringup/host_progress.py
++++ b/integrations/puredarwin/m1-bringup/host_progress.py
+@@ -124,6 +124,27 @@
+     return values
+ 
+ 
++def _native_bootargs_pointer_state(hv):
++    guest_base = _native_integer(hv.guest_base, 64, 'guest_base')
++    bootargs_off = _native_integer(hv.bootargs_off, 64, 'bootargs_off')
++    address = guest_base + bootargs_off
++    image.require(address < 1 << 64, 'Native BootArgs address overflow')
++    return dict(guest_base=guest_base, bootargs_off=bootargs_off, address=address,
++                adt_base=_native_integer(hv.adt_base, 64, 'adt_base'),
++                entry=_native_integer(hv.entry, 64, 'entry'))
++
++
++def _native_bootargs_start_wrapper(hv, metadata):
++    # Capture private plain values, not a reference to caller-mutable evidence.
++    expected = dict(metadata['start_pointer_state'])
++    original_start = hv.start
++    def checked_start(*args, **kwargs):
++        image.require(_native_bootargs_pointer_state(hv) == expected,
++                      'Native BootArgs pointer state changed before HV.start')
++        return original_start(*args, **kwargs)
++    return checked_start
++
++
+ def _write_native_bootargs(hv, backend, inputs, directory, reservation, carveouts, adt_address):
+     image.require(directory is not None and type(reservation) is dict and type(carveouts) is list,
+                   'Native BootArgs requires private evidence and checked reservation')
+@@ -134,7 +155,9 @@
+     command = values['cmdline'].encode('ascii')
+     image.require(len(command) <= 607 and image.sha(command) == proof['command_sha256'], 'Changed native cmdline')
+     image.require((values['revision'], values['version']) == (2, 2), 'Native source ABI is not R2/V2')
+-    address = _native_integer(hv.guest_base, 64, 'guest_base') + _native_integer(hv.bootargs_off, 64, 'bootargs_off')
++    pointer_state = _native_bootargs_pointer_state(hv)
++    address = pointer_state['address']
++    image.require(pointer_state['adt_base'] == adt_address, 'Native BootArgs ADT destination changed before write')
+     pair = hv.adt['chosen']['memory-map'].BootArgs
+     image.require(isinstance(pair, (tuple, list)) and len(pair) == 2, 'Missing exact BootArgs allocation')
+     base = _native_integer(pair[0], 64, 'BootArgs.base')
+@@ -166,7 +189,8 @@
+         old.write_private(directory, 'guest-bootargs-readback.bin', actual)
+     image.require(type(actual) is bytes and actual == plan.payload, 'Native BootArgs short/corrupt readback')
+     final_pair = hv.adt['chosen']['memory-map'].BootArgs
+-    image.require(_native_values(hv.tba) == values and isinstance(final_pair, (tuple, list)) and
++    image.require(_native_bootargs_pointer_state(hv) == pointer_state and
++                  _native_values(hv.tba) == values and isinstance(final_pair, (tuple, list)) and
+                   len(final_pair) == 2 and
+                   tuple(_native_integer(v, 64, 'final BootArgs allocation') for v in final_pair) == (base, capacity) and
+                   (reservation['start'], reservation['end']) == reserved and
+@@ -175,6 +199,7 @@
+                   'Native BootArgs fields/allocation/provenance changed during write/readback')
+     old.write_private(directory, 'guest-bootargs.bin', actual)
+     metadata = dict(plan.metadata(), abi=proof['abi'], source_contract=contract,
++                    start_pointer_state=pointer_state,
+                     checked_allocation=dict(base=base, bytes=capacity, expected_address=address,
+                                             guest_low=values['phys_base'], guest_high=high,
+                                             reservation_start=reserved[0], reservation_end=reserved[1],
+@@ -1218,6 +1243,8 @@
+                                  virtual_input=virtual_input, terminal_input=terminal_input,
+                                  native_keyboard_desktop=native_keyboard_desktop,
+                                  native_trackpad_child=native_trackpad_child)
++        if native_wire is not None:
++            hv.start = _native_bootargs_start_wrapper(hv, payloads['native_bootargs'])
+         ProgressCapture(hv, backend, inputs, layout, directory, args.runtime,
+                         console=console, capture_framebuffer=not keyboard).run()
+     finally:

@@ -1,0 +1,24 @@
+hk: accept a Mach-O LC_UUID as the driver's build id
+
+vkCreateInstance failed with VK_ERROR_INITIALIZATION_FAILED on the M1 ("build-id too short"):
+util/build_id.c returns the 16-byte LC_UUID on Apple, Honeykrisp asked for a 20-byte SHA-1.
+copy_build_id_to_sha1() zero-pads; the UUID changes with every link, which is what the
+pipeline-cache identity needs. SiliconForest's PowerVR build carries the same kind of fix.
+Upstream: possible (any Mach-O build of Honeykrisp hits it).
+
+--- a/src/asahi/vulkan/hk_instance.c
++++ b/src/asahi/vulkan/hk_instance.c
+@@ -138,7 +138,13 @@
+    }
+ 
+    unsigned build_id_len = build_id_length(note);
++#if DETECT_OS_APPLE
++   /* Mach-O identifies a link by its 16-byte LC_UUID, not a SHA-1 build-id;
++    * copy_build_id_to_sha1() zero-pads it, which is all the cache key needs. */
++   if (build_id_len < 16) {
++#else
+    if (build_id_len < BUILD_ID_EXPECTED_HASH_LENGTH) {
++#endif
+       result = vk_errorf(NULL, VK_ERROR_INITIALIZATION_FAILED,
+                          "build-id too short.  It needs to be a SHA");
+       goto fail_init;

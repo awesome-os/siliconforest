@@ -1,0 +1,97 @@
+--- a/src/Frameworks/AppKit/NSThemeFrame.m
++++ b/src/Frameworks/AppKit/NSThemeFrame.m
+@@ -373,7 +373,7 @@
+ 
+ // the frame drawn into any context, so a frame for a window AppKit does not own can be rendered offscreen
+ -(void)_sfDrawFrameInContext:(O2Context *)_context {
+-    NSRect bounds = [NSWindow contentRectForFrameRect:[self bounds]
++    NSRect bounds = [NSWindow _sfFrameInteriorRect:[self bounds]
+         styleMask:[[self window] styleMask]];
+     float cheatSheet = 0;
+ 
+@@ -547,7 +547,7 @@
+    }
+ 
+    NSRect toolbarFrame=(toolbarView!=nil)?[toolbarView frame]:NSZeroRect;
+-   NSRect contentFrame=[[[self window] class] contentRectForFrameRect:[self bounds] styleMask:[[self window] styleMask]];
++   NSRect contentFrame=[NSWindow _sfFrameInteriorRect:[self bounds] styleMask:[[self window] styleMask]];
+    if(menuStrip!=nil){
+     CGFloat stripHeight=NSHeight([menuStrip frame]);
+ 
+--- a/src/Frameworks/AppKit/NSWindow.m
++++ b/src/Frameworks/AppKit/NSWindow.m
+@@ -219,15 +219,23 @@
+ 
+ // a full-size content view runs under the title bar, so frame and content are the same rect
+ +(NSRect)frameRectForContentRect:(NSRect)contentRect styleMask:(unsigned)styleMask {
+-   if(styleMask & NSFullSizeContentViewWindowMask)
+-    return contentRect;
+-   return CGOutsetRectForNativeWindowBorder(contentRect,styleMask);
++   NSRect result=(styleMask & NSFullSizeContentViewWindowMask)?contentRect:
++       CGOutsetRectForNativeWindowBorder(contentRect,styleMask);
++   result.size.height+=[self _sfMenuStripHeightForStyleMask:styleMask];
++   return result;
++}
++
++// Frame decoration layout needs the border interior before placing its own
++// menu/tab/toolbar views. Public conversion includes the menu exactly once.
+++(NSRect)_sfFrameInteriorRect:(NSRect)frameRect styleMask:(unsigned)styleMask {
++   return (styleMask & NSFullSizeContentViewWindowMask)?frameRect:
++       CGInsetRectForNativeWindowBorder(frameRect,styleMask);
+ }
+ 
+ +(NSRect)contentRectForFrameRect:(NSRect)frameRect styleMask:(unsigned)styleMask {
+-   if(styleMask & NSFullSizeContentViewWindowMask)
+-    return frameRect;
+-   return CGInsetRectForNativeWindowBorder(frameRect,styleMask);
++   NSRect result=[self _sfFrameInteriorRect:frameRect styleMask:styleMask];
++   result.size.height-=[self _sfMenuStripHeightForStyleMask:styleMask];
++   return result;
+ }
+ 
+ +(CGFloat)minFrameWidthWithTitle:(NSString *)title styleMask:(unsigned)styleMask {
+--- a/src/Frameworks/AppKit/NSWindowMenuStrip.m
++++ b/src/Frameworks/AppKit/NSWindowMenuStrip.m
+@@ -147,6 +147,31 @@
+     return sfMenuStripsEnabled > 0;
+ }
+ 
++// The class conversion API is also used by custom window subclasses when
++// sizing a child view. Account for the same strip the instance places above
++// its content, including a full-size-content view on our server-framed desk.
+++ (CGFloat)_sfMenuStripHeightForStyleMask:(NSUInteger)styleMask
++{
++    if (![self _sfMenuStripsEnabled] || [[NSApp mainMenu] numberOfItems] == 0 ||
++        !(styleMask & NSTitledWindowMask) || !NSWindowFrameIsDrawnByServer(styleMask) ||
++        [self isSubclassOfClass:[NSPanel class]])
++        return 0;
++    for (NSWindow *window in [NSApp windows]) {
++        NSView *strip = [window _sfMenuStripView];
++        if (strip != nil)
++            return NSHeight([strip frame]);
++    }
++    // Before the first strip exists, measure with its actual drawing class.
++    SFMenuStripView *strip = [[SFMenuStripView alloc] initWithFrame:NSMakeRect(0,0,100,22)];
++    [strip setHorizontal:YES];
++    [strip _sfSetInWindow:YES];
++    [strip setMenu:[NSApp mainMenu]];
++    [strip sizeToFit];
++    CGFloat height = MAX(22,ceil(NSHeight([strip frame])));
++    [strip release];
++    return height;
++}
++
+ // the desk's title-bar menu (Show/Hide Menu Bar): every window of the application, remembered in its defaults
+ + (void)_sfSetMenuStripsEnabled:(BOOL)on
+ {
+--- a/src/Frameworks/AppKit/NSWindow-Private.h
++++ b/src/Frameworks/AppKit/NSWindow-Private.h
+@@ -53,6 +53,8 @@
+ // the main menu as a strip at the top of a standard window: NSWindowMenuStrip.m
+ @interface NSWindow (SFMenuStrip)
+ + (BOOL)_sfMenuStripsEnabled;
+++ (CGFloat)_sfMenuStripHeightForStyleMask:(NSUInteger)styleMask;
+++ (NSRect)_sfFrameInteriorRect:(NSRect)frameRect styleMask:(unsigned)styleMask;
+ + (void)_sfSetMenuStripsEnabled:(BOOL)on;
+ + (void)_sfStartAppMenuServer;
+ - (NSView *)_sfMenuStripView;

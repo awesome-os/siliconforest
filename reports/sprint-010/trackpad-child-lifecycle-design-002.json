@@ -1,0 +1,174 @@
+{
+  "schema_version": 1,
+  "revision": 2,
+  "reviewer": "Astra",
+  "status": "DESIGN_ONLY_AWAITING_ROOT_AND_CLAUDE_REVIEW",
+  "date": "2026-11-08",
+  "scope": "T2 passive dev2 child lifecycle and explicit parent-publication correction. Source reads plus owned design/report only; no implementation, tests of an implementation, SDK build, source-tree changes, host edits, SSH, hardware, or goal API.",
+  "design": {
+    "path": "integrations/puredarwin/m1-trackpad-child/DESIGN.md",
+    "sha256": "bf807cee59aa3ea4b8e3dbf9d9ff014c313491c4d4b7d3f962c0e029ffa6103b",
+    "bytes": 33160
+  },
+  "superseded_design": {
+    "path": "integrations/puredarwin/m1-trackpad-child/revisions/001/DESIGN.md",
+    "sha256": "2926b6df99e3d4bde4cf15b1e712f9e96bc5150492f21cc61f62710a28a680d8",
+    "bytes": 22036
+  },
+  "requested_resolution": {
+    "parent_staging": "Required on T2 only: both devices set and verify RegisterService=kOSBooleanFalse before their respective IOHIDDevice::start. Never rely on the old published-parent rollback.",
+    "precommit_failure": "Timer-arm or earlier failure registers neither device; withdraw the unpublished child, balance successful base starts exactly once, then dispose the private transport. Base-start self-stop is not duplicated. No matched keyboard clients exist on this corrected failure path.",
+    "commit": "Arm under the shared gate, acquire explicit permanent parent/child retains, then commit. Outside the gate request parent then child asynchronous registration. No false-return or rollback is permitted after commit. A concurrent runtime stop may suppress an as-yet-unissued registration; an already issued request is handled with retained state and stopped admission guards.",
+    "postcommit_retention": "Both committed stop wrappers inhibit delivery and defer superclass destruction unconditionally, including at zero dispatch count. No shared-loop disposal or permanent-pin release. Precommit-only handleStop/dispose/free guards prevent bypass; reaching committed free via balanced releases is forbidden and must be tested, not repaired by resurrection.",
+    "interface_property": {
+      "key": "PDM1SPIInterfaceID",
+      "producer_type": "OSNumber",
+      "bit_width": 32,
+      "value": 2,
+      "wire_bytes": 4,
+      "wire_hex": "02000000",
+      "runtime_type_claim": false
+    },
+    "descriptor_property": {
+      "key": "ReportDescriptor",
+      "producer_type": "OSData",
+      "bytes": 110,
+      "sha256": "4ae5bc2626bff5458ba2325e29614f1fec5e8c5a4d32c396f64d59508ec77609",
+      "require_same_boot_acquired_bytes": true
+    },
+    "state_property": {
+      "key": "PDM1TrackpadChildStateV1",
+      "producer_type": "OSData",
+      "bytes": 32,
+      "layout": "Eight LE32 fields: version, byte_size, committed, route_ready, faulted, stop_requested, signed last_error, reserved.",
+      "ready_values": [
+        1,
+        32,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      "scope": "One copied observation. Non-atomic across copies, registry/descriptor/endpoint reads, callbacks and subsequent startup. Not future liveness or physical-input proof.",
+      "failure_rule": "Fault/stop disables routing and removes old ready properties before replacement. Failed replacement leaves absence; original T2 error and publication error remain distinct. A reader may already hold the previous immutable copy."
+    }
+  },
+  "source_findings": [
+    {
+      "id": "L1",
+      "evidence": "integrations/puredarwin/m1-trackpad-enum/adapter/PDM1SPIHID.cpp:117-120; IOHIDDevice.cpp:476-487; IOService.cpp:5121-5149",
+      "finding": "Frozen T1 calls base start before timer arm. Base may register the keyboard before returning. startCandidate false cleanup only detaches; it is not a proof that matched keyboard clients are gone.",
+      "classification": "SOURCE_CORRECTNESS_GAP; not a claimed observed T1 runtime fault"
+    },
+    {
+      "id": "STAGING",
+      "evidence": "IOHIDDevice.cpp:468-479,499-508; include/pd_hid_compat.h:58-60",
+      "finding": "RegisterService=false suppresses base registration; own first-match notification later creates interfaces. Explicit IOService::registerService does not consult that property, so the design intentionally leaves it false after commit."
+    },
+    {
+      "id": "L2",
+      "evidence": "IOHIDDevice.cpp:376; IOUserClient.cpp:3708-3782",
+      "finding": "ReportDescriptor is the real base-published descriptor OSData. Property-bytes returns OSNumber.numberOfBytes bytes of unsigned64BitValue; a width32 value2 is four native LE bytes here. The RPC cannot distinguish a four-byte OSData from the same OSNumber representation; source binding establishes type."
+    },
+    {
+      "id": "LIFETIME",
+      "evidence": "IOHIDDevice.cpp:516-551; parent adapter:393-405; OSObject.cpp:163-230,399-414",
+      "finding": "Guarding only handleStop is too late: base stop removes notifier/event-source state. Existing parent free/dispose are unconditional and need T2 destruction barriers. OSObject reaches a freeing sentinel before virtual free, so a free-time retain is not a legitimate lifetime mechanism."
+    },
+    {
+      "id": "SNAPSHOT",
+      "evidence": "IOUserClient.cpp:3708-3782",
+      "finding": "The property getter retains/copies one property object; separate reads are not one coherent transaction. Mutable in-place OSData updates and stale ready fallback are excluded by the design."
+    }
+  ],
+  "review_reconciliation": {
+    "claude_reviewed_revision": 1,
+    "l1": "Addressed with T2-only parent staging. Frozen T1/keyboard builds are not modified.",
+    "l2": "Settled exact interface key/type, real ReportDescriptor read, and separate state record. Root owns registry-gate code and its final schema tests.",
+    "l3": "Explicit permanent parent and child pins plus stricter unconditional postcommit retention. No superclass stop after commit, even if current dispatch count is zero. This stricter detail requires review; it is not claimed already approved by the draft001 review.",
+    "differences_requiring_final_review": [
+      "RegisterService=false stays installed; explicit asynchronous registerService is the only publication path. Source supports this without removing the property.",
+      "Unexpected runtime stop before a request can skip registration; normal committed successful paths request parent once before child. A late async match is permitted only against retained, stopped state.",
+      "Committed child base stop is deferred too, rather than authorizing destruction from a sampled zero dispatch count.",
+      "Committed diagnostic installation failure is a runtime fault retaining the cohort, never a false parent-start return. Storage is prepared before commit; a committed1 record is not published before actual commit."
+    ]
+  },
+  "planned_tests_not_run": [
+    "Execute future real start/stop bodies with failures at parent/child property installation, allocation, attach, base start, descriptor, gated verify and timer arm; zero registrations on every false-return path.",
+    "Model actual base self-stop; balanced private rollback, no duplicate stop, detach or release.",
+    "Direct precommit registry opens refuse; atomic admission phase does not invert arbitration and workloop locks.",
+    "Immediate/reentrant first-match, stop between requests, child stop during dispatch and concurrent parent stop preserve lifetime; normal committed order is parent before child.",
+    "Zero-dispatch committed stop still cannot call base stop/dispose; permanent pins survive ordinary framework/attachment/dispatch releases; committed free remains unreachable.",
+    "Exact dev2 ID/length routing, immutable copied report lifetime and unchanged 2038-byte receive bounds; no feature/output/request path.",
+    "Exact four-byte interface and110-byte descriptor reads; malformed/missing/MIG errors fail. State flags/size/version and diagnostic allocation/update failures cannot admit a retired child."
+  ],
+  "unchanged_scope": [
+    "Frozen T1 producer and core002, SPI power/PIO/protocol, five request keys, 556-byte enumeration record, prior captures/KCs and existing host.",
+    "No Feature/Output/mode/dimensions/haptic operation; descriptor gate remains closed.",
+    "Root-owned HOST_CONTRACT.md and REGISTRY_GATE_DESIGN.md were read, not edited. Their recorded hashes are observed concurrent snapshots, not an Astra freeze."
+  ],
+  "evidence_refs": [
+    {
+      "path": "integrations/puredarwin/m1-trackpad-child/HOST_CONTRACT.md",
+      "sha256": "60bcf0d40631b32eb3cd9aa56b5fbb0fa2f807dc3b053b0b1bf208698f47e86e",
+      "bytes": 4723
+    },
+    {
+      "path": "integrations/puredarwin/m1-trackpad-child/REGISTRY_GATE_DESIGN.md",
+      "sha256": "c3b9f6767772c9bfe9a685efb1104a1a2708b8c843f089562b974fbc858d4e6d",
+      "bytes": 7199
+    },
+    {
+      "path": "reports/sprint-010/trackpad-child-host-contract-preliminary-review.json",
+      "sha256": "b1027d44ebe469233351bbbb958eb8b35209607ae84d2fb27a77ee8d8a33694a",
+      "bytes": 6575
+    },
+    {
+      "path": "reports/sprint-010/trackpad-child-lifecycle-design-review.json",
+      "sha256": "fabb9c71e13c48c208c578da08c43599d1917f6e03fc2048dc3a3de0d77b5afd",
+      "bytes": 11219
+    },
+    {
+      "path": "integrations/puredarwin/m1-trackpad-enum/adapter/PDM1SPIHID.cpp",
+      "sha256": "74a22b56a8a738e04acc56cadb869c106482689410d2c83eacfeec43a074e360",
+      "bytes": 22818
+    },
+    {
+      "path": "integrations/puredarwin/m1-trackpad-enum/adapter/PDM1SPIHID.h",
+      "sha256": "8c8e5c5bd15590204b9cbf7101523f8b6c6a609cf695e1c8e0fcf784fc49f986",
+      "bytes": 3094
+    },
+    {
+      "path": "sources/puredarwin-baseline/src/Kernel/Extensions/IOHIDFamily/IOHIDFamily/IOHIDDevice.cpp",
+      "sha256": "1101181b2731a176da8712384f69485ae8a10e33f56846f0ca1047855d42aa8a",
+      "bytes": 70758
+    },
+    {
+      "path": "sources/puredarwin-baseline/src/Kernel/Extensions/IOHIDFamily/include/pd_hid_compat.h",
+      "sha256": "481bce493a43af44f6932bcdb4040e9833129fbe21c9068958abb1f800f158d8",
+      "bytes": 4539
+    },
+    {
+      "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IOService.cpp",
+      "sha256": "1d7746819697aca183d1dd8451c5c98c4ab268ecd89268a1ee49555a335f7b8e",
+      "bytes": 251078
+    },
+    {
+      "path": "sources/puredarwin-baseline/src/Kernel/xnu/iokit/Kernel/IOUserClient.cpp",
+      "sha256": "8714352e8c78dc3295b32ded8d7fa6cd2d5cf28bf8e1f8ef186d744400d139f3",
+      "bytes": 177439
+    },
+    {
+      "path": "sources/puredarwin-baseline/src/Kernel/xnu/libkern/c++/OSObject.cpp",
+      "sha256": "2f66fcdfe761959cb0fc04669ea65c807220b5b72b6afb5dd5702d42e483817e",
+      "bytes": 11612
+    }
+  ],
+  "limitations": [
+    "No T2 implementation exists or has been built/run.",
+    "No physical trackpad/keyboard input, multitouch, pointer delivery, physical-panel or safe resource-reclamation claim.",
+    "Future implementation and exact diagnostic error table need independent review, source-aware tests, SDK/KC binding and host admission before any candidate."
+  ]
+}

@@ -1,0 +1,121 @@
+--- a/src/Frameworks/CoreText/CTRegistry.m
++++ b/src/Frameworks/CoreText/CTRegistry.m
+@@ -499,13 +499,22 @@
+ 
+ // a PostScript-style name split at the dash, its style words picked up as weight and slant
+ static const CTFontRecord *aliasRecordForName(CFStringRef name) {
+-    // the core macOS families map to the metric-compatible or closest free faces
+-    static const char *const aliases[][2] = {
++    // the core macOS families map to the metric-compatible or closest free faces: the name asked
++    // for, then up to three families in the order of preference (the first that is installed is
++    // taken; fontconfig tries a pattern's families in order)
++    static const char *const aliases[][4] = {
+         { "Helvetica", "Nimbus Sans" }, { "HelveticaNeue", "Nimbus Sans" }, { "Helvetica Neue", "Nimbus Sans" },
+         { "Arial", "Nimbus Sans" }, { "ArialMT", "Nimbus Sans" }, { "Times", "Nimbus Roman" }, { "Times New Roman", "Nimbus Roman" },
+         { "TimesNewRomanPSMT", "Nimbus Roman" }, { "Courier", "Nimbus Mono PS" }, { "Courier New", "Nimbus Mono PS" },
+-        { "CourierNewPSMT", "Nimbus Mono PS" }, { "Menlo", "DejaVu Sans Mono" }, { "Monaco", "DejaVu Sans Mono" },
+-        { "SF Mono", "DejaVu Sans Mono" }, { "Lucida Grande", "Inter" }, { "LucidaGrande", "Inter" }, { ".AppleSystemUIFont", "Inter" },
++        { "CourierNewPSMT", "Nimbus Mono PS" },
++        // the fixed-pitch families: Menlo is drawn from DejaVu Sans Mono (same metrics); where that
++        // is not installed another fixed-pitch family, never a proportional one (a terminal sizes
++        // its cells from one glyph's advance)
++        { "Menlo", "DejaVu Sans Mono", "Source Code Pro", "Nimbus Mono PS" }, { "Monaco", "DejaVu Sans Mono", "Source Code Pro", "Nimbus Mono PS" },
++        { "SF Mono", "DejaVu Sans Mono", "Source Code Pro", "Nimbus Mono PS" }, { "SFMono", "DejaVu Sans Mono", "Source Code Pro", "Nimbus Mono PS" },
++        { "Andale Mono", "DejaVu Sans Mono", "Source Code Pro", "Nimbus Mono PS" }, { "AndaleMono", "DejaVu Sans Mono", "Source Code Pro", "Nimbus Mono PS" },
++        { "PT Mono", "DejaVu Sans Mono", "Source Code Pro", "Nimbus Mono PS" }, { "PTMono", "DejaVu Sans Mono", "Source Code Pro", "Nimbus Mono PS" },
++        { "Lucida Grande", "Inter" }, { "LucidaGrande", "Inter" }, { ".AppleSystemUIFont", "Inter" },
+         { "SF Pro", "Inter" }, { "SF Pro Text", "Inter" }, { "SF NS", "Inter" }, { "system-ui", "Inter" }, { "Geneva", "DejaVu Sans" },
+         { "Verdana", "DejaVu Sans" }, { "Georgia", "DejaVu Serif" }, { "Palatino", "P052" }, { "Bookman", "URW Bookman" },
+     };
+@@ -515,6 +524,7 @@
+     FcChar8 *file = NULL;
+     int index = 0;
+     const CTFontRecord *record = NULL;
++    bool aliased = false;
+ 
+     if (!CFStringGetCString(name, buffer, sizeof(buffer), kCFStringEncodingUTF8)) return NULL;
+     dash = buffer[0] == '.' ? NULL : strchr(buffer, '-');
+@@ -522,10 +532,19 @@
+     pattern = FcPatternCreate();
+     for (size_t i = 0; i < sizeof(aliases) / sizeof(aliases[0]); i++) {
+         if (strcasecmp(buffer, aliases[i][0]) == 0) {
+-            FcPatternAddString(pattern, FC_FAMILY, (const FcChar8 *)aliases[i][1]);
++            for (int k = 1; k < 4 && aliases[i][k] != NULL; k++)
++                FcPatternAddString(pattern, FC_FAMILY, (const FcChar8 *)aliases[i][k]);
++            aliased = true;
+             break;
+         }
+     }
++    // a family this table does not know whose name says it is fixed-pitch ("SF Mono Terminal",
++    // "JetBrains Mono", "Consolas" ...) gets a fixed-pitch face, not the proportional default
++    if (!aliased && (strcasestr(buffer, "mono") || strcasestr(buffer, "courier") || strcasestr(buffer, "consol") || strcasestr(buffer, "terminal") || strcasestr(buffer, "fixed"))) {
++        FcPatternAddString(pattern, FC_FAMILY, (const FcChar8 *)"DejaVu Sans Mono");
++        FcPatternAddString(pattern, FC_FAMILY, (const FcChar8 *)"Source Code Pro");
++        FcPatternAddString(pattern, FC_FAMILY, (const FcChar8 *)"Nimbus Mono PS");
++    }
+     FcPatternAddString(pattern, FC_FAMILY, (const FcChar8 *)buffer);
+     if (dash && (strstr(dash, "Bold") || strstr(dash, "Black") || strstr(dash, "Heavy")))
+         FcPatternAddInteger(pattern, FC_WEIGHT, FC_WEIGHT_BOLD);
+--- a/src/Frameworks/CoreText/KTFont.m
++++ b/src/Frameworks/CoreText/KTFont.m
+@@ -64,12 +64,17 @@
+ 
+    CGFontRef font=NULL;
+ 
+-   // the fixed-pitch face is whichever monospace family is installed
++   // the fixed-pitch face is the one the registry gives for Menlo: that family, or the first
++   // installed fixed-pitch family of its alias list. (CGFontCreateWithFontName never fails: for a
++   // name that is not installed it matches loosely and gave the proportional default.)
+    if(uiFontType==kCTFontUserFixedPitchFontType){
+-    NSString *mono[]={ @"Menlo-Regular", @"SourceCodePro-Regular", @"DejaVuSansMono" };
++    CTFontRef fixed=CTFontCreateWithName(CFSTR("Menlo-Regular"),size,NULL);
+ 
+-    for(int i=0;i<3 && font==NULL;i++)
+-     font=CGFontCreateWithFontName((CFStringRef)mono[i]);
++    if(fixed!=NULL){
++     if(CTFontGetSymbolicTraits(fixed)&kCTFontTraitMonoSpace)
++      font=CGFontRetain([(KTFont *)fixed graphicsFont]);
++     CFRelease(fixed);
++    }
+    }
+    if(font==NULL)
+     font=CGFontCreateWithFontName((CFStringRef)name);
+--- a/src/Frameworks/CoreText/CTFont.m
++++ b/src/Frameworks/CoreText/CTFont.m
+@@ -668,6 +668,36 @@
+    }
+ }
+ 
++// Private to macOS, imported by Apple's Terminal: glyphs laid out by their advances from the
++// context's text position, which moves on by their sum.
++void CTFontDrawGlyphsWithAdvances(CTFontRef font,const CGGlyph *glyphs,const CGSize *advances,size_t count,CGContextRef context) {
++   if(font==NULL || glyphs==NULL || advances==NULL || context==NULL || count==0)
++    return;
++
++   CGPoint stack[256],*positions=count<=256 ? stack : malloc(count*sizeof(CGPoint));
++
++   if(positions==NULL)
++    return;
++
++   CGPoint at=CGContextGetTextPosition(context);
++   CGFloat x=0,y=0;
++
++   for(size_t i=0;i<count;i++){
++    positions[i]=CGPointMake(at.x+x,at.y+y);
++    x+=advances[i].width;
++    y+=advances[i].height;
++   }
++   CTFontDrawGlyphs(font,glyphs,positions,count,context);
++   CGContextSetTextPosition(context,at.x+x,at.y+y);
++   if(positions!=stack)
++    free(positions);
++}
++
++// Private to macOS: every font is drawn anti-aliased by Onyx2D.
++bool CTFontShouldAntiAlias(CTFontRef font) {
++   return true;
++}
++
+ CFIndex CTFontGetLigatureCaretPositions(CTFontRef font,CGGlyph glyph,CGFloat *positions,CFIndex maxPositions) {
+    hb_font_t *hb=[font _hbFont];
+    CTFace *face=[font _ctFace];

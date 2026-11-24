@@ -1,0 +1,965 @@
+--- a/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
++++ b/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
+@@ -163,6 +163,178 @@
+ 
+ @end
+ 
++
++// the panel of a vertical menu as vectors: clear, then a soft shadow and the rounded panel (light or dark)
++static void sfDrawPanel(NSRect bounds, BOOL dark)
++{
++    // the window is clear, so the panel's rounded corners and shadow show what is behind it
++    NSRect box = NSInsetRect(bounds, SHADOW_M, SHADOW_M);
++
++    // back to transparent first, NSRectFill copies, or every redraw would stack the translucent layers
++    [[NSColor clearColor] setFill];
++    NSRectFill(bounds);
++    NSBezierPath *panel = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(box, 0.5, 0.5)
++                                                          xRadius:PANEL_R yRadius:PANEL_R];
++
++    // stacked faint rounded rects make the soft shadow, dropped a few pixels as in the demo; each
++    // is a ring round the panel (even-odd), not the panel's whole area again: eight fills of
++    // the whole menu were half the time it took to open
++    NSRect inner = NSInsetRect(box, PANEL_R, PANEL_R);
++    for (int k = 8; k >= 1; k--) {
++        NSRect r = NSOffsetRect(NSInsetRect(box, -k * 1.5, -k * 1.5), 0, 5);
++        NSBezierPath *ring = [NSBezierPath bezierPathWithRoundedRect:r xRadius:PANEL_R + k yRadius:PANEL_R + k];
++
++        if (inner.size.width > 0 && inner.size.height > 0) {
++            [ring appendBezierPathWithRect:inner];
++            [ring setWindingRule:NSEvenOddWindingRule];
++        }
++        [[NSColor colorWithCalibratedWhite:0 alpha:0.018] setFill];
++        [ring fill];
++    }
++    // the demo's 92%, the compositor blurs what shows through
++    [(dark ? [NSColor colorWithCalibratedRed:0.172 green:0.172 blue:0.18 alpha:0.92]
++           : [NSColor colorWithCalibratedRed:0.98 green:0.969 blue:0.961 alpha:0.92]) setFill];
++    [panel fill];
++    [[NSColor colorWithCalibratedWhite:dark ? 1 : 0 alpha:0.12] setStroke];
++    [panel setLineWidth:1];
++    [panel stroke];
++}
++
++/* The panel drawn once small, then pieced together for any size (nine pieces: corners as they are, edges
++ * stretched along themselves, the middle one colour). Its shadow is eight path fills over the whole menu:
++ * that rasterising was half the time a menu took to open, and every row the highlight moved to paid for it
++ * again (clipped). The pieces are cut on the device's pixels at the menu's own pixel phases, so that the
++ * result is the vector drawing's pixels (SF_MENU_VECTOR=1 draws the vectors, for comparison). */
++typedef struct {
++    int used, dark, K;
++    CGFloat scale, pl, pr, pb, pt;
++    CGImageRef piece[9];
++    CGFloat center[4];
++} SFPanelTemplate;
++
++static SFPanelTemplate sfPanelCache[6];
++static unsigned sfPanelNext;
++
++// the rows and columns the corners take, beyond which every row (column) of the panel is the same
++#define PANEL_CORNER (SHADOW_M + 14.0)
++
++static SFPanelTemplate *sfPanelTemplate(BOOL dark, CGFloat scale, CGFloat pl, CGFloat pr, CGFloat pb, CGFloat pt)
++{
++    SFPanelTemplate *t;
++    unsigned i;
++
++    for (i = 0; i < sizeof(sfPanelCache) / sizeof(sfPanelCache[0]); i++) {
++        t = &sfPanelCache[i];
++        if (t->used && t->dark == dark && fabs(t->scale - scale) < 1e-4 && fabs(t->pl - pl) < 1.0 / 64 &&
++            fabs(t->pr - pr) < 1.0 / 64 && fabs(t->pb - pb) < 1.0 / 64 && fabs(t->pt - pt) < 1.0 / 64)
++            return t;
++    }
++    t = &sfPanelCache[sfPanelNext++ % (sizeof(sfPanelCache) / sizeof(sfPanelCache[0]))];
++    for (i = 0; i < 9; i++)
++        if (t->piece[i] != NULL)
++            CGImageRelease(t->piece[i]), t->piece[i] = NULL;
++    t->used = 0;
++
++    int K = (int)ceil(PANEL_CORNER * scale) + 1, T = 2 * K + 1;
++    CGFloat vw = T - pl - pr, vh = T - pb - pt;
++    CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
++    CGContextRef c = CGBitmapContextCreate(NULL, T, T, 8, T * 4, space, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
++
++    CGColorSpaceRelease(space);
++    if (c == NULL)
++        return NULL;
++    // the view's flipped points onto the template's pixels: (x, y) -> (pl + x s, pb + vh - y s)
++    CGContextConcatCTM(c, CGAffineTransformMake(scale, 0, 0, -scale, pl, pb + vh));
++    [NSGraphicsContext saveGraphicsState];
++    [NSGraphicsContext setCurrentContext:[NSGraphicsContext graphicsContextWithGraphicsPort:c flipped:YES]];
++    sfDrawPanel(NSMakeRect(0, 0, vw / scale, vh / scale), dark);
++    [NSGraphicsContext restoreGraphicsState];
++
++    CGImageRef all = CGBitmapContextCreateImage(c);
++    const uint8_t *px = CGBitmapContextGetData(c);
++    size_t row = CGBitmapContextGetBytesPerRow(c);
++
++    if (all == NULL || px == NULL) {
++        if (all != NULL)
++            CGImageRelease(all);
++        CGContextRelease(c);
++        return NULL;
++    }
++    // columns (and rows, the image's from its top) [0, K), [K, K + 1), [K + 1, T)
++    int at[4] = { 0, K, K + 1, T };
++    for (int j = 0; j < 3; j++) {
++        for (int k = 0; k < 3; k++) {
++            // piece (k, j): k across, j up the device (the image counts rows down from its top)
++            CGRect r = CGRectMake(at[k], T - at[j + 1], at[k + 1] - at[k], at[j + 1] - at[j]);
++
++            t->piece[j * 3 + k] = (j == 1 && k == 1) ? NULL : CGImageCreateWithImageInRect(all, r);
++        }
++    }
++    // the middle pixel, premultiplied blue, green, red, alpha in memory
++    const uint8_t *m = px + (size_t)K * row + (size_t)K * 4;
++    CGFloat a = m[3] / 255.0;
++
++    t->center[3] = a;
++    t->center[0] = a > 0 ? m[2] / 255.0 / a : 0;
++    t->center[1] = a > 0 ? m[1] / 255.0 / a : 0;
++    t->center[2] = a > 0 ? m[0] / 255.0 / a : 0;
++    CGImageRelease(all);
++    CGContextRelease(c);
++    t->dark = dark, t->K = K, t->scale = scale, t->pl = pl, t->pr = pr, t->pb = pb, t->pt = pt;
++    t->used = 1;
++    return t;
++}
++
++static BOOL sfDrawPanelFromTemplate(NSRect bounds, NSRect dirty)
++{
++    static int vector = -1;
++
++    if (vector < 0)
++        vector = getenv("SF_MENU_VECTOR") != NULL;
++    if (vector)
++        return NO;
++
++    CGContextRef ctx = (CGContextRef)[[NSGraphicsContext currentContext] graphicsPort];
++    CGAffineTransform m = ctx != NULL ? CGContextGetCTM(ctx) : CGAffineTransformIdentity;
++
++    // only where the view's points go onto the device's pixels by a scale and a flip (a menu's window)
++    if (ctx == NULL || fabs(m.b) > 1e-9 || fabs(m.c) > 1e-9 || m.a <= 0 || m.d >= 0 || fabs(m.a + m.d) > 1e-9)
++        return NO;
++
++    CGRect dev = CGRectApplyAffineTransform(NSRectToCGRect(bounds), m);
++    CGFloat x0 = dev.origin.x, y0 = dev.origin.y, x1 = x0 + dev.size.width, y1 = y0 + dev.size.height;
++    BOOL dark = [[NSAppearance currentDrawingAppearance] _isDark];
++    SFPanelTemplate *t = sfPanelTemplate(dark, m.a, x0 - floor(x0), ceil(x1) - x1, y0 - floor(y0), ceil(y1) - y1);
++
++    if (t == NULL || ceil(x1) - floor(x0) < 2 * t->K + 1 || ceil(y1) - floor(y0) < 2 * t->K + 1)
++        return NO;
++
++    CGFloat xs[4] = { floor(x0), floor(x0) + t->K, ceil(x1) - t->K, ceil(x1) };
++    CGFloat ys[4] = { floor(y0), floor(y0) + t->K, ceil(y1) - t->K, ceil(y1) };
++    CGRect want = CGRectInset(CGRectApplyAffineTransform(NSRectToCGRect(dirty), m), -1, -1);
++
++    CGContextSaveGState(ctx);
++    CGContextConcatCTM(ctx, CGAffineTransformInvert(m));
++    CGContextSetBlendMode(ctx, kCGBlendModeCopy);
++    CGContextSetInterpolationQuality(ctx, kCGInterpolationNone);
++    for (int j = 0; j < 3; j++) {
++        for (int k = 0; k < 3; k++) {
++            CGRect r = CGRectMake(xs[k], ys[j], xs[k + 1] - xs[k], ys[j + 1] - ys[j]);
++
++            if (r.size.width <= 0 || r.size.height <= 0 || !CGRectIntersectsRect(r, want))
++                continue;
++            if (j == 1 && k == 1) {
++                CGContextSetRGBFillColor(ctx, t->center[0], t->center[1], t->center[2], t->center[3]);
++                CGContextFillRect(ctx, r);
++            }
++            else
++                CGContextDrawImage(ctx, r, t->piece[j * 3 + k]);
++        }
++    }
++    CGContextRestoreGState(ctx);
++    return YES;
++}
++
+ @implementation NSMenuView
+ 
+ - (instancetype)initWithFrame:(NSRect)frame
+@@ -606,41 +778,8 @@
+         if (!_sfBarGroundDrawn)
+             [style drawMenuBarBackgroundInRect:[self bounds]];
+     }
+-    else {
+-        // the window is clear, so the panel's rounded corners and shadow show what is behind it
+-        NSRect box = NSInsetRect([self bounds], SHADOW_M, SHADOW_M);
+-
+-        // back to transparent first, NSRectFill copies, or every redraw would stack the translucent layers
+-        [[NSColor clearColor] setFill];
+-        NSRectFill([self bounds]);
+-        NSBezierPath *panel = [NSBezierPath bezierPathWithRoundedRect:NSInsetRect(box, 0.5, 0.5)
+-                                                              xRadius:PANEL_R yRadius:PANEL_R];
+-
+-        // stacked faint rounded rects make the soft shadow, dropped a few pixels as in the demo; each
+-        // is a ring round the panel (even-odd), not the panel's whole area again: eight fills of
+-        // the whole menu were half the time it took to open
+-        NSRect inner = NSInsetRect(box, PANEL_R, PANEL_R);
+-        for (int k = 8; k >= 1; k--) {
+-            NSRect r = NSOffsetRect(NSInsetRect(box, -k * 1.5, -k * 1.5), 0, 5);
+-            NSBezierPath *ring = [NSBezierPath bezierPathWithRoundedRect:r xRadius:PANEL_R + k yRadius:PANEL_R + k];
+-
+-            if (inner.size.width > 0 && inner.size.height > 0) {
+-                [ring appendBezierPathWithRect:inner];
+-                [ring setWindingRule:NSEvenOddWindingRule];
+-            }
+-            [[NSColor colorWithCalibratedWhite:0 alpha:0.018] setFill];
+-            [ring fill];
+-        }
+-        // the demo's 92%, the compositor blurs what shows through
+-        BOOL dark = [[NSAppearance currentDrawingAppearance] _isDark];
+-
+-        [(dark ? [NSColor colorWithCalibratedRed:0.172 green:0.172 blue:0.18 alpha:0.92]
+-               : [NSColor colorWithCalibratedRed:0.98 green:0.969 blue:0.961 alpha:0.92]) setFill];
+-        [panel fill];
+-        [[NSColor colorWithCalibratedWhite:dark ? 1 : 0 alpha:0.12] setStroke];
+-        [panel setLineWidth:1];
+-        [panel stroke];
+-    }
++    else if (!sfDrawPanelFromTemplate([self bounds], dirtyRect))
++        sfDrawPanel([self bounds], [[NSAppearance currentDrawingAppearance] _isDark]);
+ 
+     for (NSInteger i = 0; i < count; i++) {
+         NSMenuItem *item = [items objectAtIndex:i];
+@@ -738,10 +877,12 @@
+ + (NSWindow *)_sfWindowForView:(NSMenuView *)view frame:(NSRect)frame anchor:(NSRect)anchor kind:(int)kind
+                         parent:(NSWindow *)parent
+ {
++    double t0 = sfTiming() ? sfNowMs() : 0;
+     NSWindow *window = [[NSWindow alloc] initWithContentRect:frame
+                                                    styleMask:NSBorderlessWindowMask
+                                                      backing:NSBackingStoreBuffered
+                                                        defer:NO];
++    double t1 = sfTiming() ? sfNowMs() : 0;
+ 
+     [window setLevel:NSPopUpMenuWindowLevel];
+     [window setOpaque:NO];
+@@ -750,14 +891,21 @@
+     [window _setBackgroundBlurInset:SHADOW_M radius:8];
+     [window _sfSetPopupAnchorRect:anchor kind:kind parent:parent];
+     [[window contentView] addSubview:view];
++    double t2 = sfTiming() ? sfNowMs() : 0;
+     [window orderFront:nil];
++    double t3 = sfTiming() ? sfNowMs() : 0;
+     /* Drawn now: the tracking loop holds the run loop that would otherwise paint it. Ordering it in
+      * has drawn it already, before the popup had its role: the drawing is handed over again rather
+      * than made a second time (that was a third of the time a menu took to open). */
+-    if ([window viewsNeedDisplay])
++    BOOL needed = [window viewsNeedDisplay];
++
++    if (needed)
+         [window display];
+     else
+         [window flushWindow];
++    if (sfTiming())
++        fprintf(stderr, "WSTIME %.1f menu-window init=%.1f setup=%.1f orderFront=%.1f display%s=%.1f\n", sfNowMs(), t1 - t0, t2 - t1,
++                t3 - t2, needed ? "" : "(flush)", sfNowMs() - t3);
+     return window;
+ }
+ 
+@@ -797,8 +945,10 @@
+     }
+     // the submenu's owner fills it in and its items are enabled or not as of now
+     [submenu update];
++    double sfUpdated = sfTiming() ? sfNowMs() : 0;
+     if ([[submenu delegate] respondsToSelector:@selector(menuWillOpen:)])
+         [[submenu delegate] menuWillOpen:submenu];
++    double sfWillOpen = sfTiming() ? sfNowMs() : 0;
+ 
+     NSMenuView *view = [[NSMenuView alloc] initWithFrame:NSMakeRect(0.0, 0.0, 10.0, 10.0)];
+ 
+@@ -819,6 +969,9 @@
+     }
+     [view sizeToFit];
+     view->_supermenuView = self;
++    if (sfTiming())
++        fprintf(stderr, "WSTIME %.1f menu-prepared update=%.1f willOpen=%.1f view+size=%.1f items=%lu\n", sfNowMs(), sfUpdated - sfOpenBegan,
++                sfWillOpen - sfUpdated, sfNowMs() - sfWillOpen, (unsigned long)[[view presentedItems] count]);
+ 
+     /* An empty menu sizes to nothing, and a zero-sized window gets no surface:
+      * it would look exactly like a menu that failed to open. */
+@@ -1009,7 +1162,10 @@
+     [self closeSubmenu];
+     [self setHighlightedItemIndex:index];
+     // the title is lit before its menu is built and drawn
++    double t0 = sfTiming() ? sfNowMs() : 0;
+     [[self window] displayIfNeeded];
++    if (sfTiming())
++        fprintf(stderr, "WSTIME %.1f menu-title-lit took=%.1f\n", sfNowMs(), sfNowMs() - t0);
+     if (![self _sfItemOpensAtIndex:index])
+         return self;
+     [self openSubmenuAtIndex:index];
+@@ -1111,7 +1267,11 @@
+     [[NSNotificationCenter defaultCenter] postNotificationName:NSMenuDidBeginTrackingNotification object:_menu];
+     [self retain];
+     if (_horizontal && _sfInWindow) {
++        double t0 = sfTiming() ? sfNowMs() : 0;
++
+         [_menu update];
++        if (sfTiming())
++            fprintf(stderr, "WSTIME %.1f menu-track-start bar-update=%.1f\n", sfNowMs(), sfNowMs() - t0);
+         if (byButton) {
+             // the press on a title opens its menu at once
+             NSInteger at = [self indexOfItemAtPoint:[self convertPoint:[event locationInWindow] fromView:nil]];
+--- a/src/Frameworks/AppKit/NSMenu.subproj/NSMenu.m
++++ b/src/Frameworks/AppKit/NSMenu.subproj/NSMenu.m
+@@ -481,10 +481,12 @@
+         [_delegate menuNeedsUpdate:self];
+     }
+ 
+-    int i,count=[_itemArray count];
++    // over a copy: a validation or a submenu's delegate may change this menu while it is updated
++    NSArray *items=[[_itemArray copy] autorelease];
++    int i,count=[items count];
+     
+     for(i=0;i<count;i++){
+-        NSMenuItem *item=[_itemArray objectAtIndex:i];
++        NSMenuItem *item=[items objectAtIndex:i];
+         
+         if(_autoenablesItems){
+             BOOL enabled = itemIsEnabled(item) ? YES : NO;
+@@ -527,7 +529,8 @@
+ }
+ 
+ -(BOOL)performKeyEquivalent:(NSEvent *)event {
+-    int       i,count=[_itemArray count];
++    int       i,count;
++    NSArray  *items;
+     NSString *characters=SFNormalizedKey([event charactersIgnoringModifiers]);
+     NSUInteger modifiers=[event modifierFlags]&(NSCommandKeyMask|NSAlternateKeyMask|NSShiftKeyMask|NSControlKeyMask);
+     
+@@ -536,9 +539,14 @@
+        level of submenus, was most of the time of every Command key in Terminal. */
+     if ([_delegate respondsToSelector:@selector(menuNeedsUpdate:)])
+         [_delegate menuNeedsUpdate:self];
+-    
++
++    /* The items as they are now, after the delegate filled the menu in: the count was taken before, and a
++       delegate that rebuilds its menu (Terminal's) left fewer items than the loop went to (a CFArray index
++       trap on a Command key). A submenu's search may rebuild this menu too: the loop goes over a copy. */
++    items=[[_itemArray copy] autorelease];
++    count=[items count];
+     for(i=0;i<count;i++){
+-        NSMenuItem *item=[_itemArray objectAtIndex:i];
++        NSMenuItem *item=[items objectAtIndex:i];
+         NSString *key=[item keyEquivalent];
+ 
+         /* An item without a key equivalent has no shortcut to match; a bare
+--- a/src/Frameworks/AppKit/NSColor.subproj/NSColor.m
++++ b/src/Frameworks/AppKit/NSColor.subproj/NSColor.m
+@@ -222,20 +222,35 @@
+         { -1, 0x8c, 0x8c, 0x8c }, { 0, 0xe5, 0x48, 0x3f }, { 1, 0xf0, 0x8a, 0x24 }, { 2, 0xf2, 0xc2, 0x30 },
+         { 3, 0x4c, 0xae, 0x4f }, { 4, 0x00, 0x7a, 0xff }, { 5, 0x9b, 0x4f, 0xd1 }, { 6, 0xe0, 0x45, 0x7b },
+     };
++    // the global domain is read again at most once a second: reading it (CFPreferencesAppSynchronize reads
++    // the file) was a millisecond or two each time, and every highlighted menu row and selection asked
++    static NSColor *cached;
++    static CFAbsoluteTime readAt;
++    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+     CFPropertyListRef v;
+     int value = 4;
++    NSColor *color = nil;
+ 
++    if (cached != nil && now - readAt < 1.0 && now >= readAt)
++        return cached;
++    readAt = now;
+     CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
+     v = CFPreferencesCopyAppValue(CFSTR("AppleAccentColor"), kCFPreferencesAnyApplication);
+     if (v != NULL) {
+         value = [(id)v intValue];
+         CFRelease(v);
+     }
+-    for (unsigned i = 0; i < sizeof(accents) / sizeof(accents[0]); i++) {
++    for (unsigned i = 0; i < sizeof(accents) / sizeof(accents[0]) && color == nil; i++) {
+         if (accents[i].value == value)
+-            return [NSColor colorWithCalibratedRed:accents[i].r / 255 green:accents[i].g / 255 blue:accents[i].b / 255 alpha:1];
++            color = [NSColor colorWithCalibratedRed:accents[i].r / 255 green:accents[i].g / 255 blue:accents[i].b / 255 alpha:1];
+     }
+-    return [NSColor colorWithCalibratedRed:0x2f / 255.0 green:0x6f / 255.0 blue:0xdb / 255.0 alpha:1];
++    if (color == nil)
++        color = [NSColor colorWithCalibratedRed:0x2f / 255.0 green:0x6f / 255.0 blue:0xdb / 255.0 alpha:1];
++    if (![color isEqual:cached]) {
++        [cached release];
++        cached = [color retain];
++    }
++    return cached;
+ }
+ 
+ +(NSColor *)alternateSelectedControlColor {
+--- a/src/Frameworks/AppKit/NSWindow.m
++++ b/src/Frameworks/AppKit/NSWindow.m
+@@ -34,6 +34,7 @@
+ #import <Onyx2D/O2Surface.h>
+ #import <Onyx2D/O2GraphicsState.h>
+ #import <AppKit/NSWindow.h>
++#include <pthread.h>
+ #import <AppKit/NSColorSpace.h>
+ #import <AppKit/NSTextField.h>
+ #import <objc/runtime.h>
+@@ -2384,13 +2385,22 @@
+    return _viewsNeedDisplay;
+ }
+ 
+--(void)setViewsNeedDisplay:(BOOL)flag {
+-   // every request schedules, a skipped display of a hidden window leaves the flag set
+-   if(flag){
++-(void)_sfScheduleDisplay {
+     // NSApplication does a _displayAllWindowsIfNeeded before every event, but there are some things which wont generate
+     // an event such as performOnMainThread, so we do the callout here too. There is probably a better way to do this
+        [[NSRunLoop currentRunLoop] cancelPerformSelector:@selector(_displayAllWindowsIfNeeded) target:NSApp argument:nil]; // Be sure we don't accumulate unneeded perform operations
+        [[NSRunLoop currentRunLoop] performSelector:@selector(_displayAllWindowsIfNeeded) target:NSApp argument:nil order:0 modes:[NSArray arrayWithObjects:NSDefaultRunLoopMode, NSModalPanelRunLoopMode, NSEventTrackingRunLoopMode, nil]];
++}
++
++-(void)setViewsNeedDisplay:(BOOL)flag {
++   // every request schedules, a skipped display of a hidden window leaves the flag set
++   if(flag){
++    // the display is the main thread's: a view marked from another thread (a dispatch queue, a thread of the
++    // application's) had every window drawn on that thread's run loop, beside the main thread's drawing
++    if(pthread_main_np())
++     [self _sfScheduleDisplay];
++    else
++     [self performSelectorOnMainThread:@selector(_sfScheduleDisplay) withObject:nil waitUntilDone:NO];
+    }
+     _viewsNeedDisplay=flag;
+ }
+@@ -2653,6 +2663,13 @@
+      if(!wasVisible)
+       [_backgroundView setNeedsDisplay:YES];
+ 
++     /* A menu, list or tool tip being shown: the compositor is asked for its popup before it is drawn, so
++      * that the answer (a configure, without which nothing may be shown) comes while it draws: the flush
++      * after the drawing waited for that round trip (libWindowServer kWSWindowPrepareRole). */
++     if(!wasVisible && _level>=NSPopUpMenuWindowLevel){
++      struct wsRPCSimple prepare = { { kWSWindowPrepareRole, sizeof(struct wsRPCSimple) - sizeof(struct wsRPCBase) }, _number, 0, 0, 0 };
++      _windowServerRPC(&prepare, sizeof(prepare), NULL, NULL);
++     }
+      _isVisible=YES;
+      [self displayIfNeeded];
+      [self _updateWSState];
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -12,6 +12,7 @@
+ #include <stdlib.h>
+ #import <AppKit/NSTextInputContext.h>
+ #import <objc/runtime.h>
++#import <objc/message.h>
+ #import <AppKit/NSLayoutConstraint.h>
+ #import <AppKit/NSModernAppKit.h>
+ #import <AppKit/NSViewLayout.h>
+@@ -49,6 +50,9 @@
+ #include <stdlib.h>
+ 
+ static BOOL sfLayerRenderingAvailable(void);
++static void sfCPULayerForget(NSView *view);
++// the alpha of the views being displayed, multiplied down the tree (no layers: see -displayRectIgnoringOpacity:)
++static CGFloat sfInheritedAlpha=1.0;
+ #import <QuartzCore/CATransaction.h>
+ #import <QuartzCore/CADisplayLink.h>
+ #import <QuartzCore/CAMetalLayer-Private.h>
+@@ -223,6 +227,7 @@
+ 
+     // Do this first?
+     [self _unbindAllBindings];
++   sfCPULayerForget(self);
+ 
+    _window=nil;
+    [_menu release];
+@@ -2506,6 +2511,289 @@
+    [opaque displayRectIgnoringOpacity:rect];
+ }
+ 
++
++/* Layers without OpenGL. Where there is no EGL (sfLayerRenderingAvailable() is NO) nothing renders a layer
++ * tree: a layer an application hosts (-setLayer:, e.g. a movie whose frames are CGImages set as the layer's
++ * contents) was never shown. Such a view now draws its layer tree itself, on the CPU, into the window after
++ * its own -drawRect:: background colour, contents (CGImage, NSImage, a 32-bit BGRA CVPixelBuffer, with the
++ * contents gravity), border, sublayers, opacity, hidden, masksToBounds and corner radius; position, bounds,
++ * anchor point and the affine part of the transform. A 60 Hz check of each such view's tree (its layers'
++ * contents seeds, geometry and colours) marks the view for display when the tree changed: a layer changes
++ * on the screen at the next display refresh, without the application asking. */
++// the views that draw a hosted layer themselves, and their trees' signatures at the last check (not retained:
++// a view leaves the list in its -dealloc)
++typedef struct { NSView *view; uint64_t sig; int have; } SFCPULayerView;
++static SFCPULayerView *sfCPULayerViews;
++static unsigned sfCPULayerCount, sfCPULayerCap;
++static CFRunLoopTimerRef sfCPULayerTimer;
++
++static uint64_t sfMix(uint64_t h, uint64_t v) {
++   h^=v; h*=0x100000001b3ULL; return h;
++}
++
++static uint64_t sfLayerSignature(CALayer *layer, int depth) {
++   uint64_t h=0xcbf29ce484222325ULL;
++   CGRect b=[layer bounds];
++   CGPoint p=[layer position];
++   float o=[layer opacity];
++   uint32_t ob;
++
++   memcpy(&ob,&o,4);
++   h=sfMix(h,(uintptr_t)[layer contents]);
++   if([layer respondsToSelector:@selector(_contentsSeed)])
++    h=sfMix(h,((uint32_t (*)(id,SEL))objc_msgSend)(layer,@selector(_contentsSeed)));
++   h=sfMix(h,(uint64_t)(int64_t)(b.size.width*64)); h=sfMix(h,(uint64_t)(int64_t)(b.size.height*64));
++   h=sfMix(h,(uint64_t)(int64_t)(b.origin.x*64)); h=sfMix(h,(uint64_t)(int64_t)(b.origin.y*64));
++   h=sfMix(h,(uint64_t)(int64_t)(p.x*64)); h=sfMix(h,(uint64_t)(int64_t)(p.y*64));
++   h=sfMix(h,ob); h=sfMix(h,[layer isHidden]); h=sfMix(h,(uintptr_t)[layer backgroundColor]);
++   NSArray *subs=[layer sublayers];
++   h=sfMix(h,[subs count]);
++   if(depth<16)
++    for(CALayer *sub in subs)
++     h=sfMix(h,sfLayerSignature(sub,depth+1));
++   return h;
++}
++
++static void sfCPULayerTick(CFRunLoopTimerRef timer,void *info) {
++   for(unsigned i=0;i<sfCPULayerCount;i++){
++    NSView *view=sfCPULayerViews[i].view;
++    NSWindow *window=[view window];
++    CALayer *layer=[view layer];
++
++    if(window==nil || ![window isVisible] || layer==nil)
++     continue;
++    uint64_t sig=sfLayerSignature(layer,0);
++
++    if(!sfCPULayerViews[i].have || sfCPULayerViews[i].sig!=sig){
++     if(sfCPULayerViews[i].have)
++      [view setNeedsDisplay:YES];
++     sfCPULayerViews[i].sig=sig;
++     sfCPULayerViews[i].have=1;
++    }
++   }
++}
++
++static void sfCPULayerRegister(NSView *view) {
++   for(unsigned i=0;i<sfCPULayerCount;i++)
++    if(sfCPULayerViews[i].view==view)
++     return;
++   if(sfCPULayerCount==sfCPULayerCap){
++    sfCPULayerCap=sfCPULayerCap ? sfCPULayerCap*2 : 8;
++    sfCPULayerViews=realloc(sfCPULayerViews,sfCPULayerCap*sizeof(SFCPULayerView));
++   }
++   sfCPULayerViews[sfCPULayerCount++]=(SFCPULayerView){ view, 0, 0 };
++   if(sfCPULayerTimer==NULL){
++    sfCPULayerTimer=CFRunLoopTimerCreate(NULL,CFAbsoluteTimeGetCurrent()+1.0/60,1.0/60,0,0,sfCPULayerTick,NULL);
++    CFRunLoopAddTimer(CFRunLoopGetMain(),sfCPULayerTimer,kCFRunLoopCommonModes);
++   }
++}
++
++static void sfCPULayerForget(NSView *view) {
++   for(unsigned i=0;i<sfCPULayerCount;i++){
++    if(sfCPULayerViews[i].view!=view)
++     continue;
++    sfCPULayerViews[i]=sfCPULayerViews[--sfCPULayerCount];
++    if(sfCPULayerCount==0 && sfCPULayerTimer!=NULL){
++     CFRunLoopTimerInvalidate(sfCPULayerTimer);
++     CFRelease(sfCPULayerTimer);
++     sfCPULayerTimer=NULL;
++    }
++    return;
++   }
++}
++
++// a CVPixelBuffer's pixels as a CGImage without a copy (32-bit BGRA or ARGB only), NULL for anything else
++static CGImageRef sfImageOfPixelBuffer(id contents, void **lockedOut) {
++   static CFTypeID (*getTypeID)(void);
++   static int (*lock)(void *,uint64_t), (*unlock)(void *,uint64_t);
++   static void *(*base)(void *);
++   static size_t (*rowBytes)(void *), (*width)(void *), (*height)(void *);
++   static uint32_t (*format)(void *);
++   static int looked;
++
++   *lockedOut=NULL;
++   if(!looked){
++    looked=1;
++    getTypeID=dlsym(RTLD_DEFAULT,"CVPixelBufferGetTypeID");
++    lock=dlsym(RTLD_DEFAULT,"CVPixelBufferLockBaseAddress"); unlock=dlsym(RTLD_DEFAULT,"CVPixelBufferUnlockBaseAddress");
++    base=dlsym(RTLD_DEFAULT,"CVPixelBufferGetBaseAddress"); rowBytes=dlsym(RTLD_DEFAULT,"CVPixelBufferGetBytesPerRow");
++    width=dlsym(RTLD_DEFAULT,"CVPixelBufferGetWidth"); height=dlsym(RTLD_DEFAULT,"CVPixelBufferGetHeight");
++    format=dlsym(RTLD_DEFAULT,"CVPixelBufferGetPixelFormatType");
++   }
++   if(getTypeID==NULL || lock==NULL || unlock==NULL || base==NULL || rowBytes==NULL || width==NULL || height==NULL || format==NULL)
++    return NULL;
++   if(CFGetTypeID((CFTypeRef)contents)!=getTypeID())
++    return NULL;
++   uint32_t f=format(contents);
++   CGBitmapInfo info;
++
++   if(f=='BGRA')
++    info=kCGImageAlphaPremultipliedFirst|kCGBitmapByteOrder32Little;
++   else if(f==0x20 /* kCVPixelFormatType_32ARGB */)
++    info=kCGImageAlphaPremultipliedFirst|kCGBitmapByteOrder32Big;
++   else
++    return NULL;
++   if(lock(contents,1 /* read only */)!=0)
++    return NULL;
++   size_t w=width(contents),h=height(contents),r=rowBytes(contents);
++   CGDataProviderRef provider=CGDataProviderCreateWithData(NULL,base(contents),r*h,NULL);
++   CGColorSpaceRef space=CGColorSpaceCreateDeviceRGB();
++   CGImageRef image=CGImageCreate(w,h,8,32,r,space,info,provider,NULL,false,kCGRenderingIntentDefault);
++
++   CGColorSpaceRelease(space);
++   CGDataProviderRelease(provider);
++   if(image==NULL){
++    unlock(contents,1);
++    return NULL;
++   }
++   *lockedOut=(void *)unlock;
++   return image;
++}
++
++// where contents of a size go in a layer's bounds (layer coordinates, y up)
++static CGRect sfGravityRect(NSString *g,CGRect b,CGSize size) {
++   if(size.width<=0 || size.height<=0 || g==nil || [g isEqualToString:@"resize"])
++    return b;
++   if([g isEqualToString:@"resizeAspect"] || [g isEqualToString:@"resizeAspectFill"]){
++    CGFloat sx=b.size.width/size.width,sy=b.size.height/size.height;
++    CGFloat k=[g isEqualToString:@"resizeAspect"] ? MIN(sx,sy) : MAX(sx,sy);
++    CGSize s=CGSizeMake(size.width*k,size.height*k);
++
++    return CGRectMake(CGRectGetMidX(b)-s.width/2,CGRectGetMidY(b)-s.height/2,s.width,s.height);
++   }
++   CGFloat x=CGRectGetMidX(b)-size.width/2,y=CGRectGetMidY(b)-size.height/2;
++
++   if([g hasSuffix:@"eft"] || [g isEqualToString:@"left"]) x=CGRectGetMinX(b);
++   if([g hasSuffix:@"ight"]) x=CGRectGetMaxX(b)-size.width;
++   if([g hasPrefix:@"top"]) y=CGRectGetMaxY(b)-size.height;
++   if([g hasPrefix:@"bottom"]) y=CGRectGetMinY(b);
++   return CGRectMake(x,y,size.width,size.height);
++}
++
++static void sfAddRoundedRect(CGContextRef ctx,CGRect r,CGFloat radius) {
++   radius=MIN(radius,MIN(r.size.width,r.size.height)/2);
++   if(radius<=0){
++    CGContextAddRect(ctx,r);
++    return;
++   }
++   CGContextMoveToPoint(ctx,CGRectGetMinX(r)+radius,CGRectGetMinY(r));
++   CGContextAddArcToPoint(ctx,CGRectGetMaxX(r),CGRectGetMinY(r),CGRectGetMaxX(r),CGRectGetMaxY(r),radius);
++   CGContextAddArcToPoint(ctx,CGRectGetMaxX(r),CGRectGetMaxY(r),CGRectGetMinX(r),CGRectGetMaxY(r),radius);
++   CGContextAddArcToPoint(ctx,CGRectGetMinX(r),CGRectGetMaxY(r),CGRectGetMinX(r),CGRectGetMinY(r),radius);
++   CGContextAddArcToPoint(ctx,CGRectGetMinX(r),CGRectGetMinY(r),CGRectGetMaxX(r),CGRectGetMinY(r),radius);
++   CGContextClosePath(ctx);
++}
++
++// one layer and its sublayers, in its own coordinates (the caller put its bounds where they go)
++static void sfDrawLayerCPU(CALayer *layer,CGContextRef ctx,CGFloat alpha,int depth) {
++   if([layer isHidden] || alpha*[layer opacity]<=0.001 || depth>32)
++    return;
++   alpha*=[layer opacity];
++
++   CGRect b=[layer bounds];
++   CGFloat radius=[layer cornerRadius];
++   id contents=[layer contents];
++
++   CGContextSaveGState(ctx);
++   CGContextSetAlpha(ctx,alpha);
++   if([layer masksToBounds]){
++    CGContextBeginPath(ctx);
++    sfAddRoundedRect(ctx,b,radius);
++    CGContextClip(ctx);
++   }
++   if([layer backgroundColor]!=NULL){
++    CGContextSetFillColorWithColor(ctx,[layer backgroundColor]);
++    CGContextBeginPath(ctx);
++    sfAddRoundedRect(ctx,b,radius);
++    CGContextFillPath(ctx);
++   }
++   if(contents!=nil){
++    Class cls=object_getClass(contents);
++    static Class o2Image;
++
++    if(o2Image==Nil)
++     o2Image=NSClassFromString(@"O2Image");
++    if(cls!=Nil && o2Image!=Nil && [contents isKindOfClass:o2Image]){
++     CGImageRef image=(CGImageRef)contents;
++     CGFloat scale=[layer contentsScale]>0 ? [layer contentsScale] : 1;
++     CGRect r=sfGravityRect([layer contentsGravity],b,CGSizeMake(CGImageGetWidth(image)/scale,CGImageGetHeight(image)/scale));
++
++     CGContextDrawImage(ctx,r,image);
++    }
++    else if(cls!=Nil && [contents isKindOfClass:[NSImage class]]){
++     NSImage *image=contents;
++     CGRect r=sfGravityRect([layer contentsGravity],b,NSSizeToCGSize([image size]));
++     NSGraphicsContext *g=[NSGraphicsContext graphicsContextWithGraphicsPort:ctx flipped:NO];
++
++     [NSGraphicsContext saveGraphicsState];
++     [NSGraphicsContext setCurrentContext:g];
++     [image drawInRect:NSRectFromCGRect(r) fromRect:NSZeroRect operation:NSCompositeSourceOver fraction:1];
++     [NSGraphicsContext restoreGraphicsState];
++    }
++    else if(cls==Nil){
++     void *unlock=NULL;
++     CGImageRef image=sfImageOfPixelBuffer(contents,&unlock);
++
++     if(image!=NULL){
++      CGContextDrawImage(ctx,sfGravityRect([layer contentsGravity],b,CGSizeMake(CGImageGetWidth(image),CGImageGetHeight(image))),image);
++      CGImageRelease(image);
++      ((int (*)(void *,uint64_t))unlock)(contents,1);
++     }
++    }
++   }
++   if([layer borderWidth]>0 && [layer borderColor]!=NULL){
++    CGFloat w=[layer borderWidth];
++
++    CGContextSetStrokeColorWithColor(ctx,[layer borderColor]);
++    CGContextSetLineWidth(ctx,w);
++    CGContextBeginPath(ctx);
++    sfAddRoundedRect(ctx,CGRectInset(b,w/2,w/2),MAX(0,radius-w/2));
++    CGContextStrokePath(ctx);
++   }
++   for(CALayer *sub in [layer sublayers]){
++    CGRect sb=[sub bounds];
++    CGPoint pos=[sub position],anchor=[sub anchorPoint];
++    CGAffineTransform t=CATransform3DGetAffineTransform([sub transform]);
++
++    CGContextSaveGState(ctx);
++    CGContextTranslateCTM(ctx,pos.x,pos.y);
++    CGContextConcatCTM(ctx,t);
++    CGContextTranslateCTM(ctx,-anchor.x*sb.size.width-sb.origin.x,-anchor.y*sb.size.height-sb.origin.y);
++    if([sub isGeometryFlipped]!=[layer isGeometryFlipped]){
++     CGContextTranslateCTM(ctx,0,2*sb.origin.y+sb.size.height);
++     CGContextScaleCTM(ctx,1,-1);
++    }
++    sfDrawLayerCPU(sub,ctx,1,depth+1);
++    CGContextRestoreGState(ctx);
++   }
++   CGContextRestoreGState(ctx);
++}
++
++// a view hosting a layer draws the layer's tree when nothing else does (no EGL); NO when it has none to draw
++static BOOL sfDrawHostedLayer(NSView *view,CALayer *layer,CGContextRef ctx) {
++   if(layer==nil || [layer isKindOfClass:[NSViewBackingLayer class]])
++    return NO;
++   if([layer contents]==nil && [layer backgroundColor]==NULL && [[layer sublayers] count]==0){
++    sfCPULayerRegister(view);
++    return NO;
++   }
++   CGRect b=[layer bounds];
++
++   sfCPULayerRegister(view);
++   CGContextSaveGState(ctx);
++   // the root layer's bounds are the view's (configureLayerGeometry); layer geometry is y up
++   if([view isFlipped] && ![layer isGeometryFlipped]){
++    NSRect vb=[view bounds];
++
++    CGContextTranslateCTM(ctx,0,NSMinY(vb)+NSMaxY(vb));
++    CGContextScaleCTM(ctx,1,-1);
++   }
++   CGContextTranslateCTM(ctx,-b.origin.x+[view bounds].origin.x,-b.origin.y+[view bounds].origin.y);
++   sfDrawLayerCPU(layer,ctx,1,0);
++   CGContextRestoreGState(ctx);
++   return YES;
++}
++
+ -(void)displayRectIgnoringOpacity:(NSRect)rect {
+    NSRect visibleRect=[self visibleRect];
+ 
+@@ -2535,7 +2823,14 @@
+                [child displayRectIgnoringOpacity:check];
+        }
+    }
+-   else if ([self canDraw]) {
++   else if ([self canDraw] && (sfInheritedAlpha*([self alphaValue])>0.001 || sfLayerRenderingAvailable())) {
++      // a view's alphaValue (and its superviews') applies to what it and its subviews draw: a layer does that
++      // where there are layers; without OpenGL the drawing is faded (Activity Monitor's CPU Usage segments are
++      // views whose alphaValue it sets)
++      CGFloat savedAlpha=sfInheritedAlpha;
++
++      if(!sfLayerRenderingAvailable())
++       sfInheritedAlpha*=[self alphaValue];
+       // This view must be locked/unlocked prior to drawing subviews otherwise gState changes may affect subviews.
+       [self lockFocus];
+ 
+@@ -2543,6 +2838,8 @@
+       CGContextRef       graphicsPort=[context graphicsPort];
+ 
+        CGContextClipToRect(graphicsPort,rect);
++       if(sfInheritedAlpha<0.999)
++        CGContextSetAlpha(graphicsPort,sfInheritedAlpha);
+ 
+        // Onyx2D clips to a rectangle only (a list of rects becomes their bounding box), so every
+        // view behind this one has painted all of rect: a view that fills only the rects it is told
+@@ -2561,6 +2858,9 @@
+        }
+       else
+            _NSAppearanceDrawView(self, ^{ [self drawRect:rect]; });
++      // without OpenGL a layer the application hosts is drawn here, over the view's own drawing
++      if(_layer!=nil && !sfLayerRenderingAvailable())
++       sfDrawHostedLayer(self,_layer,graphicsPort);
+ 
+       [self unlockFocus];
+ 
+@@ -2575,6 +2875,7 @@
+            if(!NSIsEmptyRect(check))
+                [child displayRectIgnoringOpacity:check];
+        }
++       sfInheritedAlpha=savedAlpha;
+    }
+ 
+    [self _drawLayerContext];
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -760,6 +760,11 @@
+       return;
+    char dir[900];
+ 
++   // every level (a new home has no ~/Library/Logs: the report of a crash there was never written)
++   snprintf(dir, sizeof(dir), "%s/Library", home);
++   mkdir(dir, 0755);
++   snprintf(dir, sizeof(dir), "%s/Library/Logs", home);
++   mkdir(dir, 0755);
+    snprintf(dir, sizeof(dir), "%s/Library/Logs/DiagnosticReports", home);
+    mkdir(dir, 0755);
+    snprintf(sfCrashPath, sizeof(sfCrashPath), "%s/%s-%d.crash", dir, name, (int)getpid());
+@@ -1875,8 +1880,10 @@
+ 
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    // the menu bar never asks, so enabled states are revalidated here a few times a second
+-   // and a change goes out with the next publish
+-   if (_mainMenu != nil && now >= sfMenuNextValidate) {
++   // and a change goes out with the next publish; only while a menu bar server takes them: a window's
++   // strip and the desk's title-bar menu validate a menu when they show it, and the whole main menu
++   // validated four times a second (Terminal's 196 items) was work while idle and in every flood of output
++   if (_mainMenu != nil && sfMenuServerProxy != nil && now >= sfMenuNextValidate) {
+     sfMenuNextValidate = now + 0.25;
+     [_mainMenu update];
+    }
+--- a/src/Frameworks/AppKit/NSTableView.m
++++ b/src/Frameworks/AppKit/NSTableView.m
+@@ -1707,7 +1707,11 @@
+         return;
+     }
+ 
+-    NSTableColumn *clickedColumnObject = [_tableColumns objectAtIndex:_clickedColumn];
++    // a click on a row but beside every column (right of the last one, or where a hidden column was) is on no
++    // column: the row is selected as on macOS, there is no cell to track. Activity Monitor ended with a
++    // CFArray index trap when such a click took column -1 as an index.
++    NSTableColumn *clickedColumnObject = (_clickedColumn >= 0 && _clickedColumn < (NSInteger)[_tableColumns count])
++                                       ? [_tableColumns objectAtIndex:_clickedColumn] : nil;
+ 
+     // a click in the rows does not ask -tableView:shouldSelectTableColumn: (Apple asks it for clicks in
+     // the header only, where applications sort: Activity Monitor's answers NO after re-sorting)
+@@ -1717,7 +1721,7 @@
+     NSCell *clickedCell = [clickedColumnObject dataCellForRow:_clickedRow];
+ 
+     [clickedCell setControlView:self];
+-    if ([clickedCell isKindOfClass:[NSButtonCell class]])
++    if (clickedColumnObject != nil && [clickedCell isKindOfClass:[NSButtonCell class]])
+     {
+      [clickedCell setObjectValue:[self dataSourceObjectValueForTableColumn:clickedColumnObject row:_clickedRow]];
+ 
+@@ -1859,6 +1863,10 @@
+ 
+         [self sendAction:[self action] to:[self target]];
+     }
++    else if ([event clickCount] == 2 && clickedColumnObject == nil) {
++       // a double click beside the columns: the double action, nothing to edit
++       [self sendAction:[self doubleAction] to:[self target]];
++    }
+     else if ([event clickCount] == 2) {
+        // nb this logic was backwards previously
+ 
+--- a/src/Frameworks/AppKit/NSProgressIndicator.m
++++ b/src/Frameworks/AppKit/NSProgressIndicator.m
+@@ -324,12 +324,16 @@
+     if (!_isIndeterminate)
+         return;
+ 
+-    if (_usesThreadedAnimation) {
+-        [NSThread detachNewThreadSelector: @selector(_runThreadedAnimation:) toTarget: self withObject: nil];
+-    } else {
+-        [self _buildTimer];
+-        [self setNeedsDisplay:YES];
++    /* Threaded animation runs on the main thread too: the thread it had ran a run loop of its own, and its
++     * -setNeedsDisplay: scheduled the display of every window on that thread's run loop, which then drew all of
++     * them there while the main thread drew as well (Activity Monitor ended with SIGBUS in Onyx2D's rasteriser,
++     * called from -_runThreadedAnimation:). AppKit draws on the main thread only. */
++    if (![NSThread isMainThread]) {
++        [self performSelectorOnMainThread:@selector(startAnimation:) withObject:sender waitUntilDone:NO];
++        return;
+     }
++    [self _buildTimer];
++    [self setNeedsDisplay:YES];
+ }
+ 
+ -(void)stopAnimation:sender {
+@@ -337,13 +341,13 @@
+     if (!_isIndeterminate)
+         return;
+ 
+-    if (_usesThreadedAnimation) {
+-        [self _stopThreadedAnimation];
+-    } else {
+-
+-        [self _invalidateTimer];
+-        [self setNeedsDisplay:YES];
++    if (![NSThread isMainThread]) {
++        [self performSelectorOnMainThread:@selector(stopAnimation:) withObject:sender waitUntilDone:NO];
++        return;
+     }
++    [self _stopThreadedAnimation];
++    [self _invalidateTimer];
++    [self setNeedsDisplay:YES];
+ }
+ 
+ -(void)animate:sender {
+--- a/src/Frameworks/AppKit/NSColorWell.m
++++ b/src/Frameworks/AppKit/NSColorWell.m
+@@ -7,6 +7,9 @@
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+ 
+ #import <AppKit/NSColorWell.h>
++#include <stdlib.h>
++#include <stdio.h>
++#import <objc/runtime.h>
+ #import <AppKit/NSColor.h>
+ #import <AppKit/NSColorPanel.h>
+ #import <AppKit/NSApplication.h>
+@@ -21,6 +24,13 @@
+ #import <Foundation/NSKeyValueObserving.h>
+ #import <AppKit/NSRaise.h>
+ 
++// SF_COLORPANEL_TRACE=1: clicks on wells and their activation on standard error
++static int sfColorTrace(void) {
++        static int on = -1;
++        if (on < 0) on = getenv("SF_COLORPANEL_TRACE") != NULL;
++        return on;
++}
++
+ @implementation NSColorWell
+ 
+ +(void)initialize
+@@ -173,6 +183,8 @@
+ }
+ 
+ -(void)activate:(BOOL)exclusive {
++    if (sfColorTrace())
++        fprintf(stderr, "NSColorWell: %s %p activate:%d (was %d)\n", object_getClassName(self), self, (int)exclusive, (int)_isActive);
+ 
+     if (_isActive == YES) {
+                 return;
+@@ -235,7 +247,9 @@
+ 
+ -(void)mouseDown:(NSEvent *)event
+ {
+-
++        if (sfColorTrace())
++                fprintf(stderr, "NSColorWell: %s %p mouseDown enabled=%d bordered=%d active=%d\n", object_getClassName(self), self,
++                        (int)[self isEnabled], (int)[self isBordered], (int)[self isActive]);
+         if(![self isEnabled]) {
+                 return;
+         }
+--- a/src/Frameworks/AppKit/NSColorPanel.m
++++ b/src/Frameworks/AppKit/NSColorPanel.m
+@@ -441,6 +441,9 @@
+    if(_colorPickers!=nil && [_colorPickers count]==0)
+     [self setShowsAlpha:![NSColor ignoresAlpha]];
+    [super orderFront:sender];
++   if(getenv("SF_COLORPANEL_TRACE")!=NULL)
++    fprintf(stderr,"NSColorPanel: orderFront from %s: visible=%d frame=%s level=%d number=%ld\n",sender ? object_getClassName(sender) : "nil",
++            (int)[self isVisible],[NSStringFromRect([self frame]) UTF8String],(int)[self level],(long)[self windowNumber]);
+ }
+ 
+ @end

@@ -1,0 +1,89 @@
+--- a/userland/AVFAudio/AVAudioConverter.m
++++ b/userland/AVFAudio/AVAudioConverter.m
+@@ -23,6 +23,9 @@
+     NSInteger quality;
+     AVAudioConverterPrimeMethod primeMethod;
+     AVAudioConverterPrimeInfo primeInfo;
++    AVAudioCompressedBuffer *pendingCompressed;
++    UInt32 compressedPacket;
++    AudioStreamPacketDescription compressedDescription;
+     AVAudioPCMBuffer *pendingInputBuffer;
+     UInt32 pendingInputOffset;
+     BOOL dither;
+@@ -65,6 +68,47 @@
+     [impl->pendingInputBuffer release];
+     impl->pendingInputBuffer = nil;
+     impl->pendingInputOffset = 0;
++    [impl->pendingCompressed release]; impl->pendingCompressed=nil; impl->compressedPacket=0;
++}
++
++static BOOL is_compressed(AVAudioFormat *format) {
++    if(!format || !format.streamDescription)return NO;
++    AudioFormatID id=format.streamDescription->mFormatID;
++    return id==kAudioFormatMPEG4AAC || id==kAudioFormatMPEGLayer3 || id==kAudioFormatAppleLossless;
++}
++static OSStatus compressed_input(struct AVAudioConverterInputContext *context, UInt32 *packets,
++    AudioBufferList *data, AudioStreamPacketDescription **descriptions) {
++    struct AVAudioConverterImpl *impl=context->impl;
++    if(impl->endOfStream){*packets=0;context->lastStatus=AVAudioConverterInputStatus_EndOfStream;return noErr;}
++    if(impl->pendingCompressed && impl->compressedPacket>=impl->pendingCompressed.packetCount){
++        [impl->pendingCompressed release];impl->pendingCompressed=nil;impl->compressedPacket=0;
++    }
++    if(!impl->pendingCompressed) {
++        AVAudioConverterInputStatus status=AVAudioConverterInputStatus_NoDataNow;
++        AVAudioBuffer *input=nil;
++        @try {input=context->block(1,&status);} @catch(NSException *e){return kAudioConverterErr_InvalidInputSize;}
++        context->lastStatus=status;
++        if(status==AVAudioConverterInputStatus_EndOfStream || status==AVAudioConverterInputStatus_NoDataNow){
++            if(input)return kAudioConverterErr_InvalidInputSize;
++            if(status==AVAudioConverterInputStatus_EndOfStream)impl->endOfStream=YES;
++            *packets=0;return noErr;
++        }
++        if(status!=AVAudioConverterInputStatus_HaveData || ![input isKindOfClass:[AVAudioCompressedBuffer class]] ||
++            ![input.format isEqual:context->format])return kAudioConverterErr_FormatNotSupported;
++        impl->pendingCompressed=[(AVAudioCompressedBuffer *)input retain];impl->compressedPacket=0;
++    }
++    AVAudioCompressedBuffer *buffer=impl->pendingCompressed;
++    if(!buffer.packetCount || impl->compressedPacket>=buffer.packetCount)return kAudioConverterErr_InvalidInputSize;
++    AudioStreamPacketDescription description;
++    if(buffer.packetDescriptions) description=buffer.packetDescriptions[impl->compressedPacket];
++    else if(buffer.packetCount==1) description=(AudioStreamPacketDescription){0,0,buffer.byteLength};
++    else return kAudioConverterErr_InvalidInputSize;
++    if(description.mStartOffset<0 || (uint64_t)description.mStartOffset>buffer.byteLength ||
++        description.mDataByteSize>buffer.byteLength-(uint64_t)description.mStartOffset)return kAudioConverterErr_InvalidInputSize;
++    data->mNumberBuffers=1;data->mBuffers[0]=(AudioBuffer){context->format.channelCount,description.mDataByteSize,(UInt8*)buffer.data+description.mStartOffset};
++    description.mStartOffset=0;impl->compressedDescription=description;
++    if(descriptions)*descriptions=&impl->compressedDescription;
++    impl->compressedPacket++;*packets=1;return noErr;
+ }
+ 
+ static OSStatus
+@@ -75,6 +119,7 @@
+     (void)descriptions;
+     struct AVAudioConverterInputContext *context = userData;
+     context->lastStatus = AVAudioConverterInputStatus_NoDataNow;
++    if(is_compressed(context->format))return compressed_input(context,packets,data,descriptions);
+     if (!packets || !data || !context->block) {
+         context->callbackError = kAudio_ParamError;
+         return context->callbackError;
+@@ -188,7 +233,7 @@
+ 
+ - (instancetype)initFromFormat:(AVAudioFormat *)fromFormat toFormat:(AVAudioFormat *)toFormat
+ {
+-    if (!is_pcm(fromFormat) || !is_pcm(toFormat) || !fromFormat.channelCount || !toFormat.channelCount ||
++    if ((!is_pcm(fromFormat) && !is_compressed(fromFormat)) || !is_pcm(toFormat) || !fromFormat.channelCount || !toFormat.channelCount ||
+         fromFormat.channelCount > 256 || toFormat.channelCount > 256) {
+         [self release];
+         return nil;
+@@ -312,6 +357,11 @@
+     struct AVAudioConverterImpl *impl = _impl;
+     if (magicCookie == impl->magicCookie)
+         return;
++    if(is_compressed(impl->inputFormat)) {
++        OSStatus status=magicCookie.length ? AudioConverterSetProperty(impl->converter,
++            kAudioConverterDecompressionMagicCookie,(UInt32)magicCookie.length,magicCookie.bytes) : kAudio_ParamError;
++        if(status)[NSException raise:NSInvalidArgumentException format:@"Compressed decoder rejected magic cookie (%d).",(int)status];
++    }
+     [magicCookie retain];
+     [impl->magicCookie release];
+     impl->magicCookie = magicCookie;

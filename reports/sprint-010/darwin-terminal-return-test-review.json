@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SCRIPT_REVIEW_NO_HARDWARE",
+  "reviewed": "integrations/puredarwin/chonkstep-darwin/darwin-terminal-return-test, sha256 589e2485cfa5c013 (diff base: approved live supervisor 0347556f)",
+  "verdict": "APPROVE the closed-cycle supervisor source. It owns cleanup in a finite way, gives one closed-phase evidence export after the app has finished, and prints the console-return footer only when the client, compositor and records all return 0. This is a source review; nothing here is qualified from expected timings.",
+  "diff_vs_live": [
+    "Terminal '--seconds 80' instead of 120.",
+    "The 85 s sleep and live-phase export are removed.",
+    "After 'wait client': one 'darwin-terminal-records --phase closed' export, with rc captured and 'DL11_TERMINAL_RECORDS_<n> phase=closed rc='. Then 'kill -TERM compositor || :', wait, and the STATUS line (always printed). Only if all three rcs are 0: the footer 'CHONKSTEP TERMINAL CLOSED - DARWIN TEXT CONSOLE', 'DL11_TERMINAL_RETURN_<n>', /bin/uname -s/-m/-r and DL10_END. Everything else, including PRIME, the stat-only node wait, '--input pdhid', socket wait and trap cleanup, is byte-identical to the approved live supervisor."
+  ],
+  "verified": [
+    "Finite ownership: the app's session is deadline-driven (it always runs to --seconds unless TERM, window close or PTY EOF), then its own cleanup TERM/KILLs the owned shell group and reaps within 2 s, writes grid-final.txt (session Ok path) and result.json, and exits 0 only if the strict response was observed and cleanup.complete. The supervisor then owns the compositor stop. The trap covers early exits (node/socket timeouts, compositor death).",
+    "Closed evidence: the export runs after the app has exited, so the files are final. The closed phase requires all six records (pty-rx, pty-tx, child.json, child-ready.json, grid-final.txt, result.json) with an unchanged size during the read. If the session ended in error, grid-final.txt is absent, so records rc != 0 and no footer: fail-closed, with the STATUS line still printed.",
+    "Console path with input enabled: the compositor holds /dev/usb_hid_kbd (the console grab) until it exits. On TERM it exits through its handler and RAII close, and the IOGOP close override issues kPEAcquireScreen (qualified in attempts 005/006). The footer, RETURN marker and uname are printed only after that, so they land on the returned text console. Host typing has completed and sent its final neutral releases before the app's deadline, so nothing is typed into the console after close.",
+    "Deadline consistency: host TerminalInput gives READY 30 s after PRIME and typing 55 s after READY. The app has a 20 s readiness bound and an 80 s session; the typical typing of about 25 s leaves a large margin. In the worst case (READY at 20 s plus 55 s of typing) only about 5 s remain for the shell's response before the app's deadline. Missing it gives client_rc 1 and no footer, which fails closed."
+  ],
+  "notes": [
+    {"id": "R1", "severity": "qualification rule", "text": "Qualify the close cycle only from the saved capture: the host TX ledger (terminal-input-result complete, exact reports), a decoder-verified closed export (all six records, digests, chunks), result.json showing response true and cleanup complete with the raw child wait status (a signal is allowed per K2 revision 2), STATUS 0/0/0, and post-close framebuffer pixels showing a cleared text console with the footer and the fresh RETURN nonce (ISO 8x16 glyph match). Then verified Linux. The first live cycle (008) claims no cleanup."},
+    {"id": "R2", "severity": "note", "text": "If the closed export or footer ever approaches the 180 s host stop, the capture loses the console-return pixels but keeps the console lines; treat that as incomplete, not as a pass. Use the actual host timings from the run."}
+  ],
+  "not_claimed": ["terminal runtime", "cleanup", "console return for the terminal", "typing"],
+  "scope": "Read-only script review. No deployment, hardware or edits."
+}

@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SOURCE_AND_BINARY_REVIEW_NO_HARDWARE_NO_BUILDS",
+  "reviewed": {
+    "integrations/puredarwin/chonkstep-darwin/darwin-desktop-return-test": "b10b1cdd0512efe0d119713955a67a4f29c8379c3c771a444b0d866a160ea379",
+    "integrations/puredarwin/m1-userspace-diagnostics/page-probe.c": "ab66c18f15c5db03",
+    "/nix/store/j14fl4ff7wx6zs9z306kd5629p76c0vb-darwin-lab-page-probe-arm64/usr/bin/darwin-page-probe": "856d742eac14d0adcbe33a290c1ded38e8104b8d8b9951d012029c9b4560f4a8",
+    "build-page-probe.nix": "puredarwin-baseline flake pinned at e7aa00a6 (the same puredarwin pin as candidate-002)"
+  },
+  "verdict": "APPROVE both for a RAM-only packet003, with one recommended one-line script change (R1). Neither file has an input, storage, privileged or persistent action. The probe is observation-only and fails safe: a crash or dyld failure only sets page_rc, and the script continues.",
+  "page_probe": {
+    "binding": "The derivation agiinfqp...-darwin-lab-page-probe-arm64.drv produces output j14fl4ff and takes /nix/store/qfzydvn2...-page-probe.c, whose sha256 is ab66c18f, the only page-probe.c in the store. The binary is 856d742e: a 34622-byte arm64 PIE MH_EXECUTE that links only /usr/lib/libSystem.B.dylib. It contains the source's JSON format strings.",
+    "imports": "llvm-nm -u lists only ___error, ___stdoutp, fflush, fputc, printf, putchar, puts, getpagesize, sysconf, host_page_size, mach_host_self, mach_task_self_, mmap, mprotect, munmap, vm_protect, and the libSystem data globals vm_page_size/mask/shift and vm_kernel_page_size/mask/shift. There is no open, write to a file, ioctl, sysctl, kill, reboot or network call. The page-size values are libSystem's published globals, not a direct commpage read.",
+    "memory_safety": "One 64 KiB MAP_PRIVATE|MAP_ANON RW mapping. The 16 KiB-aligned base satisfies slack <= 16383, so the furthest span end (base + 8192 + 16384) is at most raw + 40959. Even if a 16 KiB VM rounds vm_protect outward from base+4096, the span stays inside [raw, raw + 49151), well within the mapping. span_inside cannot overflow (length <= region_len is checked first), and the base-plus-offset wrap is guarded. The mapping is never loaded from or stored to, so PROT_NONE cannot fault. Every NONE is followed by a whole-mapping RW restore through both calls, set_maximum is FALSE, and munmap runs at the end.",
+    "abi_guard": "checked_vm_protect skips the Mach call, with called 0 and abi_truncation 1 and no ret/errno, if the address or length does not round-trip through vm_address_t/vm_size_t. The mprotect observation still uses void * and size_t. So a 32-bit typedef cannot silently protect the wrong range.",
+    "output": "One JSON object. Commas are emitted only between records. If mmap fails, it prints an empty probes array and omits the base fields. 20 probe records, about 3 KB on the console. Always exits 0 and claims no verdict. errno after vm_protect is informational only, since Mach calls do not set it.",
+    "build": "-std=c11 -Wall -Wextra -Werror -Wpedantic -O1, against libsystem-arm64 headers and libs from the same pin. The recipe asserts ARM64 EXECUTE and exactly one dependency, libSystem."
+  },
+  "return_test": {
+    "flow": "Nonce check (48 lowercase hex) -> DL10_BEGIN -> DL10_PAGE_BEGIN -> 'if /usr/bin/darwin-page-probe; then :; else page_rc=$?; fi' -> DL10_PAGE_END rc=N -> 0700 runtime dir -> compositor -> socket wait (at most 100 x 0.1 s) -> DL10_SERVER_SOCKET -> SSD client --seconds 20 -> wait client and record client_rc -> TERM compositor -> wait and record compositor_rc -> DL10_RETURN_STATUS client=X compositor=Y -> require both 0 -> footer 'CHONKSTEP CLOSED - DARWIN TEXT CONSOLE' -> DL10_RETURN_<nonce> -> uname -s/-m/-r -> DL10_END.",
+    "verified": [
+      "In 'if cmd; then :; else rc=$?; fi', $? in the else branch is cmd's status, and set -e does not fire on an if condition. Both the probe status and the client/compositor wait statuses are recorded correctly.",
+      "The compositor turns SIGTERM into a clean exit 0. main.rs installs SIGINT/SIGTERM handlers that set STOP, so the loop ends, run() returns Ok, and RAII drops the presenter, so drawing stops before PDGOP unmap/close. The handlers are installed after bind, Pdgop::open and Server::new. The script only sends TERM after the client's 20 s run, so the handler is live by then.",
+      "The client exits 0 after its 20 s loop only if SSD was acknowledged and at least one frame callback arrived (main.rs:162-165). Otherwise it exits nonzero, which client_rc records.",
+      "The footer and DL10_RETURN print only after both processes have been reaped with status 0, so a text-console footer in the post-close framebuffer cannot predate compositor teardown.",
+      "Compared with the qualified SSD script, the only changes are: page probe added; rust-hello, --help and the write probe removed; client seconds 120 -> 20; sleep 100 and kill -0 replaced by wait plus explicit statuses; DL10_END moved out of the trap, so it appears only on full success. Nothing else changed."
+    ]
+  },
+  "findings": [
+    {"id": "R1", "severity": "low, diagnostics only", "where": "darwin-desktop-return-test:42", "text": "'kill -TERM \"$compositor\"' runs under set -e. If the compositor has already exited (crashed, or exited on a client protocol error), a shell that has already reaped it returns ESRCH from kill. The script then exits through the trap, which discards the compositor's wait status, so DL10_RETURN_STATUS never prints. Fail-closed, but the status line is lost exactly when it is most useful. Suggest 'kill -TERM \"$compositor\" 2>/dev/null || :' so the following wait still records compositor_rc. The guest /bin/sh is a 50783-byte launcher, not a known shell, so treat this as possible rather than certain."},
+    {"id": "R2", "severity": "note", "text": "The early-exit paths (socket timeout, or kill -0 failing during the wait) send TERM through the trap, possibly before the compositor has installed its handler. That kills it by default action with no RAII close, so the kernel's client-died path does the PDGOP cleanup. Such a run is a failure anyway, with no footer and no END, but it is not evidence about console return."},
+    {"id": "R3", "severity": "qualification rule", "text": "A zero exit only proves the compositor exited cleanly. PDGOP close discards unmap/close statuses, so the compositor's exit 0 does not prove the console returned. Console return is qualified only when the post-close framebuffer pixels show the footer and 'DL10_RETURN_<fresh nonce>' (and/or the uname lines) drawn by the kernel text console, and the console log shows DL10_RETURN_STATUS client=0 compositor=0 before them."}
+  ],
+  "next_qualification_plan": "For packet003, require the following. Console: BEGIN, PAGE_BEGIN, one JSON line with record OBSERVATION_ONLY, PAGE_END rc=0 (or record the rc), SERVER_SOCKET, SSD_CONFIGURED before FRAME 1, CLIENT_DONE with callbacks>0, RETURN_STATUS client=0 compositor=0, RETURN, END, all with the fresh nonce. Framebuffer at capture: no Chonkstep frame present, and the text console shows the footer and the RETURN nonce. Page-size values are recorded as observations only: not a guard-page fix, no pass/fail.",
+  "not_claimed": ["any runtime result", "page size value", "console return", "input", "GPU", "physical panel"],
+  "scope": "Read-only. No builds, hardware, SSH or fetches. The nix store and derivation were read only."
+}

@@ -1,0 +1,22 @@
+#!/bin/sh
+# Guest side of the sync_file / dma-buf readiness test (sfdcp=2, on the kernel of
+# ../kernel.nix). Each flip asks for the CRTC's out-fence (a sync_file descriptor), imports it
+# into the other buffer's dma-buf, and waits for both with poll, select or kevent (1 s timeout).
+# Pass per mode: DL48_FENCE_<mode>_RC=0, "0 timeouts, 0 errors", as many fences pending after
+# the commit as there were flips (or nearly), commit-to-wakeup at most about one frame, and
+# about 60 flips per second. A wait that never wakes shows as timeouts and ~1 flip per second.
+# The last run takes the buffers from the GPU driver (needs SFAgx, sfagx=1): the dma-buf whose
+# poll is used then belongs to the other kext.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin; export PATH
+printf '\nDL48_FENCE_BEGIN_%s\n' "$nonce"
+for mode in poll select kqueue; do
+    out=$(dcp-flip-test --seconds 1 --fence "$mode" 2>&1); rc=$?
+    printf '%s\n' "$out" | grep -e 'flips in' -e 'fence' -e FAIL -e 'failed' | cut -c1-240 | sed 's/^/DL48 /'
+    printf 'DL48_FENCE_%s_RC=%s\n' "$mode" "$rc"
+done
+out=$(dcp-flip-test --seconds 1 --prime-from auto --fence poll 2>&1); rc=$?
+printf '%s\n' "$out" | grep -e 'flips in' -e 'fence' -e FAIL -e 'failed' | cut -c1-240 | sed 's/^/DL48 /'
+printf 'DL48_FENCE_gpubuf_RC=%s\n' "$rc"
+printf 'DL48_FENCE_END_%s\n' "$nonce"

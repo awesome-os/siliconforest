@@ -1,0 +1,102 @@
+#!/bin/sh
+# Two existing windows on the passive-child seat. No input injection or human prompt.
+# The live export is a prefix snapshot, not a cleanup or protocol verdict.
+set -eu
+nonce=${1-}
+case "$nonce" in ''|*[!0-9a-f]*) exit 2 ;; esac
+[ "${#nonce}" -eq 48 ] || exit 2
+printf '\nDL18_TWO_WINDOW_BEGIN_%s physical_input_proven=false\n' "$nonce"
+runtime=/private/var/run/darwin-desktop
+mkdir -p "$runtime"
+chmod 0700 "$runtime"
+export XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=wayland-0
+export XKB_CONFIG_ROOT=/usr/share/X11/xkb TMPDIR=/private/tmp
+compositor=
+ssd=
+observer=
+pause=
+cleanup() {
+    trap - EXIT HUP INT TERM
+    code=${1-}
+    if [ -n "$pause" ]; then kill -TERM "$pause" 2>/dev/null || :; wait "$pause" 2>/dev/null || :; pause=; fi
+    if [ -n "$ssd" ]; then kill -TERM "$ssd" 2>/dev/null || :; wait "$ssd" 2>/dev/null || :; ssd=; fi
+    if [ -n "$observer" ]; then kill -TERM "$observer" 2>/dev/null || :; wait "$observer" 2>/dev/null || :; observer=; fi
+    if [ -n "$compositor" ]; then kill -TERM "$compositor" 2>/dev/null || :; wait "$compositor" 2>/dev/null || :; compositor=; fi
+    if [ -n "$code" ]; then exit "$code"; fi
+}
+trap 'cleanup 143' HUP INT TERM
+trap cleanup EXIT
+# Same-boot raw enumeration, then strict child identity, before any window.
+enum_rc=0
+if /usr/bin/darwin-trackpad-enum --nonce "$nonce"; then :; else enum_rc=$?; fi
+printf 'DL18_TWO_WINDOW_ENUM_%s rc=%s physical_input_proven=false\n' "$nonce" "$enum_rc"
+case "$enum_rc" in 0) ;; 77) exit 77 ;; *) exit 1 ;; esac
+# Stat both character nodes. A mouse node is required, matching the passive-child seat.
+count=0
+while [ ! -c /dev/usb_hid_kbd ] || [ ! -c /dev/usb_hid_mouse ]; do
+    count=$((count + 1))
+    [ "$count" -le 100 ] || break
+    sleep 0.1
+done
+printf 'DL18_TWO_WINDOW_ENDPOINT_WAIT_%s missing_checks=%s max_sleeps=100 physical_input_proven=false\n' "$nonce" "$count"
+gate_rc=0
+if /usr/bin/darwin-native-input-inventory --nonce "$nonce"; then :; else gate_rc=$?; fi
+printf 'DL18_TWO_WINDOW_IDENTITY_%s rc=%s physical_input_proven=false\n' "$nonce" "$gate_rc"
+case "$gate_rc" in
+    0) ;;
+    77) printf 'DL18_TWO_WINDOW_NOT_READY_%s source=identity_gate physical_input_proven=false\n' "$nonce"; exit 77 ;;
+    *) printf 'DL18_TWO_WINDOW_FAILED_%s source=identity_gate rc=%s physical_input_proven=false\n' "$nonce" "$gate_rc"; exit 1 ;;
+esac
+/usr/bin/chonkstep-darwin --run --socket "$runtime/wayland-0" --input pdhid &
+compositor=$!
+count=0
+while [ ! -S "$runtime/wayland-0" ]; do
+    kill -0 "$compositor"
+    count=$((count + 1))
+    [ "$count" -le 100 ] || exit 1
+    sleep 0.1
+done
+printf 'DL18_TWO_WINDOW_SERVER_SOCKET_%s physical_input_proven=false\n' "$nonce"
+# Existing SSD client first, then the existing native observer. Distinct processes.
+/usr/bin/darwin-wayland-client-ssd --socket "$runtime/wayland-0" --nonce "$nonce" --seconds 120 &
+ssd=$!
+printf 'DL18_TWO_WINDOW_SSD_PID_%s pid=%s physical_input_proven=false\n' "$nonce" "$ssd"
+/usr/bin/darwin-wayland-terminal-native-startup --socket "$runtime/wayland-0" --nonce "$nonce" --seconds 120 &
+observer=$!
+printf 'DL18_TWO_WINDOW_OBSERVER_PID_%s pid=%s physical_input_proven=false\n' "$nonce" "$observer"
+# Background the pause so a signal can run the trap without waiting out the full 85s.
+sleep 85 &
+pause=$!
+pause_rc=0
+if wait "$pause"; then :; else pause_rc=$?; fi
+pause=
+if [ "$pause_rc" -ne 0 ]; then
+    printf 'DL18_TWO_WINDOW_FAILED_%s source=pause rc=%s physical_input_proven=false\n' "$nonce" "$pause_rc"
+    exit 1
+fi
+kill -0 "$compositor"
+kill -0 "$ssd"
+kill -0 "$observer"
+records_rc=0
+if /usr/bin/darwin-terminal-records --directory "$runtime/terminal-$nonce" --nonce "$nonce" --phase live; then :; else records_rc=$?; fi
+printf 'DL18_TWO_WINDOW_LIVE_RECORDS_%s phase=live rc=%s cleanup_claimed=false physical_input_proven=false\n' "$nonce" "$records_rc"
+kill -0 "$ssd"
+kill -0 "$observer"
+ssd_rc=0
+if wait "$ssd"; then :; else ssd_rc=$?; fi
+ssd=
+observer_rc=0
+if wait "$observer"; then :; else observer_rc=$?; fi
+observer=
+kill -TERM "$compositor" 2>/dev/null || :
+compositor_rc=0
+if wait "$compositor"; then :; else compositor_rc=$?; fi
+compositor=
+printf 'DL18_TWO_WINDOW_STATUS_%s ssd=%s observer=%s compositor=%s records=%s physical_input_proven=false\n' "$nonce" "$ssd_rc" "$observer_rc" "$compositor_rc" "$records_rc"
+[ "$ssd_rc" -eq 0 ] && [ "$observer_rc" -eq 0 ] && [ "$compositor_rc" -eq 0 ] && [ "$records_rc" -eq 0 ]
+printf '\nCHONKSTEP TWO WINDOW LIVE ONLY - INPUT UNVERIFIED\n'
+printf 'DL18_TWO_WINDOW_RETURN_%s\n' "$nonce"
+/bin/uname -s
+/bin/uname -m
+/bin/uname -r
+printf 'DL18_TWO_WINDOW_END_%s physical_input_proven=false\n' "$nonce"

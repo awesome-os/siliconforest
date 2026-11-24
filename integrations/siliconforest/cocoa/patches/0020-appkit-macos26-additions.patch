@@ -1,0 +1,647 @@
+--- a/src/Frameworks/AppKit/NSMacOS26Additions.h
++++ b/src/Frameworks/AppKit/NSMacOS26Additions.h
+@@ -0,0 +1,113 @@
++// NSMacOS26Additions.h - names applications built against the macOS 26 SDK import from AppKit
++// that this AppKit did not have (first user: Apple's Terminal.app). SPDX-License-Identifier: MIT
++#import <Foundation/Foundation.h>
++#import <AppKit/AppKitExport.h>
++#import <AppKit/NSTouchBar.h>
++
++#import <AppKit/NSView.h>
++
++@class NSEvent, NSWindow, NSScroller;
++
++APPKIT_EXPORT NSString *const NSAllRomanInputSourcesLocaleIdentifier;
++APPKIT_EXPORT NSString *const NSApplicationDidFinishRestoringWindowsNotification;
++APPKIT_EXPORT NSString *const NSApplicationLaunchIsDefaultLaunchKey;
++APPKIT_EXPORT NSString *const NSFilesPromisePboardType;
++APPKIT_EXPORT NSString *const NSMultipleTextSelectionPboardType;
++APPKIT_EXPORT NSString *const NSPasteboardURLReadingFileURLsOnlyKey;
++APPKIT_EXPORT NSString *const NSPrintScalingFactor;
++APPKIT_EXPORT NSString *const NSScrollViewDidEndLiveScrollNotification;
++APPKIT_EXPORT NSString *const NSTouchBarItemIdentifierCharacterPicker;
++APPKIT_EXPORT NSString *const NSValueBinding;
++APPKIT_EXPORT NSString *const NSWindowDidOrderOffScreenNotification;
++APPKIT_EXPORT NSString *const NSWindowDidOrderOnScreenNotification;
++APPKIT_EXPORT NSString *const NSWorkspaceSessionDidBecomeActiveNotification;
++APPKIT_EXPORT NSString *const NSWorkspaceSessionDidResignActiveNotification;
++APPKIT_EXPORT NSString *const NSImageNameInfo;
++APPKIT_EXPORT NSString *const NSImageNameMenuOnStateTemplate;
++APPKIT_EXPORT NSString *const NSImageNameTouchBarAddTabTemplate;
++APPKIT_EXPORT NSString *const NSImageNameTouchBarGoDownTemplate;
++APPKIT_EXPORT NSString *const NSImageNameTouchBarGoUpTemplate;
++
++APPKIT_EXPORT void NSAccessibilityRaiseBadArgumentException(id element, NSString *attribute, id value);
++APPKIT_EXPORT NSString *NSAccessibilityRoleDescriptionForUIElement(id element);
++APPKIT_EXPORT NSArray *NSAccessibilityUnignoredChildrenForOnlyChild(id child);
++APPKIT_EXPORT id NSAccessibilityUnignoredDescendant(id element);
++APPKIT_EXPORT void NSShowSystemInfoPanel(NSDictionary *options);
++APPKIT_EXPORT BOOL NSSolariumEnabled(void);
++
++typedef NS_ENUM(NSInteger, NSGestureRecognizerState) {
++    NSGestureRecognizerStatePossible, NSGestureRecognizerStateBegan, NSGestureRecognizerStateChanged,
++    NSGestureRecognizerStateEnded, NSGestureRecognizerStateCancelled, NSGestureRecognizerStateFailed,
++};
++
++// Gesture recognizers hold their target, action and configuration. Nothing feeds them events
++// yet (the trackpad's force and long presses do not reach AppKit), so they stay "possible".
++@interface NSGestureRecognizer : NSObject <NSCoding> {
++    id _target; SEL _action; id _delegate; NSView *_view; BOOL _enabled;
++    BOOL _delaysPrimaryMouseButtonEvents, _delaysSecondaryMouseButtonEvents, _delaysOtherMouseButtonEvents;
++}
++- (instancetype)initWithTarget:(id)target action:(SEL)action;
++@property(assign) id target;
++@property SEL action;
++@property(assign) id delegate;
++@property(getter=isEnabled) BOOL enabled;
++@property(readonly) NSGestureRecognizerState state;
++@property(readonly) NSView *view;
++@property BOOL delaysPrimaryMouseButtonEvents;
++@property BOOL delaysSecondaryMouseButtonEvents;
++@property BOOL delaysOtherMouseButtonEvents;
++- (NSPoint)locationInView:(NSView *)view;
++@end
++
++@interface NSPressGestureRecognizer : NSGestureRecognizer {
++    NSUInteger _buttonMask; NSTimeInterval _minimumPressDuration; CGFloat _allowableMovement;
++}
++@property NSUInteger buttonMask;
++@property NSTimeInterval minimumPressDuration;
++@property CGFloat allowableMovement;
++@end
++
++@interface NSImmediateActionGestureRecognizer : NSGestureRecognizer {
++    id _animationController;
++}
++@property(retain) id animationController;
++@property(readonly) CGFloat animationProgress;
++@end
++
++@interface NSView (NSGestureRecognizers)
++- (NSArray *)gestureRecognizers;
++- (void)addGestureRecognizer:(NSGestureRecognizer *)recognizer;
++- (void)removeGestureRecognizer:(NSGestureRecognizer *)recognizer;
++@end
++
++@interface NSColorPickerTouchBarItem : NSTouchBarItem
++@end
++
++// Classes of AppKit's private interface that applications of Apple's name. Each answers the
++// part of its interface that has a meaning here and answers nothing (nil, 0, NO) to the rest,
++// saying so once per selector on the console (SFPrivateClassTolerant).
++@interface NSScrollerImpPair : NSObject
++@end
++@interface NSFunctionRow : NSObject
++@end
++@interface NSFindIndicator : NSObject
++@end
++@interface NSInputManager : NSObject
+++ (NSInputManager *)currentInputManager;
++@end
++
++// The find bar's controller. There is no find bar in this AppKit yet: the object keeps its
++// client and container and reports that an action cannot be performed.
++@interface NSTextFinder : NSObject <NSCoding> {
++    id _client, _findBarContainer; BOOL _incremental, _dimming;
++}
++@property(assign) id client;
++@property(assign) id findBarContainer;
++@property BOOL findIndicatorNeedsUpdate;
++@property(getter=isIncrementalSearchingEnabled) BOOL incrementalSearchingEnabled;
++@property BOOL incrementalSearchingShouldDimContentView;
++- (void)performAction:(NSInteger)action;
++- (BOOL)validateAction:(NSInteger)action;
++- (void)cancelFindIndicator;
++- (void)noteClientStringWillChange;
++@end
+--- a/src/Frameworks/AppKit/NSMacOS26Additions.m
++++ b/src/Frameworks/AppKit/NSMacOS26Additions.m
+@@ -0,0 +1,516 @@
++// NSMacOS26Additions.m - see the header. SPDX-License-Identifier: MIT
++#import <AppKit/NSMacOS26Additions.h>
++#import <AppKit/NSAccessibility.h>
++#import <AppKit/NSView.h>
++#import <AppKit/NSWindow.h>
++#import <AppKit/NSApplication.h>
++#import <AppKit/NSGraphics.h>
++#import <AppKit/NSPasteboard.h>
++#import <objc/runtime.h>
++
++NSString *const NSAllRomanInputSourcesLocaleIdentifier = @"NSAllRomanInputSourcesLocaleIdentifier";
++NSString *const NSApplicationDidFinishRestoringWindowsNotification = @"NSApplicationDidFinishRestoringWindowsNotification";
++NSString *const NSApplicationLaunchIsDefaultLaunchKey = @"NSApplicationLaunchIsDefaultLaunchKey";
++NSString *const NSFilesPromisePboardType = @"Apple files promise pasteboard type";
++NSString *const NSMultipleTextSelectionPboardType = @"NSMultipleTextSelectionPboardType";
++NSString *const NSPasteboardURLReadingFileURLsOnlyKey = @"NSPasteboardURLReadingFileURLsOnlyKey";
++NSString *const NSPrintScalingFactor = @"NSScalingFactor";
++NSString *const NSScrollViewDidEndLiveScrollNotification = @"NSScrollViewDidEndLiveScrollNotification";
++NSString *const NSTouchBarItemIdentifierCharacterPicker = @"NSTouchBarItemIdentifierCharacterPicker";
++NSString *const NSValueBinding = @"value";
++NSString *const NSWindowDidOrderOffScreenNotification = @"NSWindowDidOrderOffScreenNotification";
++NSString *const NSWindowDidOrderOnScreenNotification = @"NSWindowDidOrderOnScreenNotification";
++NSString *const NSWorkspaceSessionDidBecomeActiveNotification = @"NSWorkspaceSessionDidBecomeActiveNotification";
++NSString *const NSWorkspaceSessionDidResignActiveNotification = @"NSWorkspaceSessionDidResignActiveNotification";
++NSString *const NSImageNameInfo = @"NSInfo";
++NSString *const NSImageNameMenuOnStateTemplate = @"NSMenuOnStateTemplate";
++NSString *const NSImageNameTouchBarAddTabTemplate = @"NSTouchBarAddTabTemplate";
++NSString *const NSImageNameTouchBarGoDownTemplate = @"NSTouchBarGoDownTemplate";
++NSString *const NSImageNameTouchBarGoUpTemplate = @"NSTouchBarGoUpTemplate";
++
++void NSAccessibilityRaiseBadArgumentException(id element, NSString *attribute, id value)
++{
++    [NSException raise:@"NSAccessibilityException" format:@"bad argument %@ for attribute %@ of %@", value, attribute, element];
++}
++
++NSString *NSAccessibilityRoleDescriptionForUIElement(id element)
++{
++    NSString *role = nil, *subrole = nil;
++    @try {
++        if ([element respondsToSelector:@selector(accessibilityAttributeValue:)]) {
++            role = [element accessibilityAttributeValue:NSAccessibilityRoleAttribute];
++            subrole = [element accessibilityAttributeValue:NSAccessibilitySubroleAttribute];
++        }
++    } @catch (id e) { }
++    return role ? NSAccessibilityRoleDescription(role, subrole) : nil;
++}
++
++static BOOL SFAccessibilityIgnored(id element)
++{
++    return [element respondsToSelector:@selector(accessibilityIsIgnored)] && [element accessibilityIsIgnored];
++}
++
++id NSAccessibilityUnignoredDescendant(id element)
++{
++    for (int depth = 0; element != nil && depth < 64 && SFAccessibilityIgnored(element); depth++) {
++        NSArray *children = nil;
++        @try { children = [element accessibilityAttributeValue:NSAccessibilityChildrenAttribute]; } @catch (id e) { }
++        element = [children count] ? [children objectAtIndex:0] : nil;
++    }
++    return element;
++}
++
++NSArray *NSAccessibilityUnignoredChildrenForOnlyChild(id child)
++{
++    id found = NSAccessibilityUnignoredDescendant(child);
++    return found ? [NSArray arrayWithObject:found] : [NSArray array];
++}
++
++// private: the "About This Mac" style panel. There is none here.
++void NSShowSystemInfoPanel(NSDictionary *options) { }
++
++// private: whether the macOS 26 "Liquid Glass" design is on. This AppKit draws the macOS 26
++// control geometry without glass materials: applications lay out for the earlier design.
++BOOL NSSolariumEnabled(void) { return NO; }
++
++// ---- a private class that answers nothing to what it does not implement
++static void SFTolerantLog(id object, SEL selector)
++{
++    static NSMutableSet *seen;
++    @synchronized([NSApplication class]) {
++        if (seen == nil) seen = [NSMutableSet new];
++        NSString *key = [NSString stringWithFormat:@"%s %s", object_getClassName(object), sel_getName(selector)];
++        if ([seen containsObject:key]) return;
++        [seen addObject:key];
++        NSLog(@"AppKit: -[%@] is not implemented on this system (answers nothing)", key);
++    }
++}
++#define SF_TOLERANT \
++- (NSMethodSignature *)methodSignatureForSelector:(SEL)selector { \
++    NSMethodSignature *s = [super methodSignatureForSelector:selector]; \
++    if (s == nil) { SFTolerantLog(self, selector); s = [NSMethodSignature signatureWithObjCTypes:"@@:"]; } \
++    return s; } \
++- (void)forwardInvocation:(NSInvocation *)invocation { id none = nil; if ([[invocation methodSignature] methodReturnLength] == sizeof(id)) [invocation setReturnValue:&none]; } \
+++ (NSMethodSignature *)methodSignatureForSelector:(SEL)selector { \
++    NSMethodSignature *s = [super methodSignatureForSelector:selector]; \
++    if (s == nil) { SFTolerantLog(self, selector); s = [NSMethodSignature signatureWithObjCTypes:"@@:"]; } \
++    return s; } \
+++ (void)forwardInvocation:(NSInvocation *)invocation { id none = nil; if ([[invocation methodSignature] methodReturnLength] == sizeof(id)) [invocation setReturnValue:&none]; }
++
++// ---- gesture recognizers
++static char SFGestureRecognizersKey;
++
++@implementation NSGestureRecognizer
++@synthesize target = _target, action = _action, delegate = _delegate, enabled = _enabled, view = _view;
++@synthesize delaysPrimaryMouseButtonEvents = _delaysPrimaryMouseButtonEvents, delaysSecondaryMouseButtonEvents = _delaysSecondaryMouseButtonEvents;
++@synthesize delaysOtherMouseButtonEvents = _delaysOtherMouseButtonEvents;
++- (instancetype)initWithTarget:(id)target action:(SEL)action
++{
++    if ((self = [super init])) { _target = target; _action = action; _enabled = YES; }
++    return self;
++}
++- (instancetype)init { return [self initWithTarget:nil action:NULL]; }
++- (instancetype)initWithCoder:(NSCoder *)coder { return [self initWithTarget:nil action:NULL]; }
++- (void)encodeWithCoder:(NSCoder *)coder { }
++- (NSGestureRecognizerState)state { return NSGestureRecognizerStatePossible; }
++- (NSPoint)locationInView:(NSView *)view
++{
++    NSPoint p = [[_view window] mouseLocationOutsideOfEventStream];
++    return view ? [view convertPoint:p fromView:nil] : p;
++}
++- (void)_sfSetView:(NSView *)view { _view = view; }
++SF_TOLERANT
++@end
++
++@implementation NSPressGestureRecognizer
++@synthesize buttonMask = _buttonMask, minimumPressDuration = _minimumPressDuration, allowableMovement = _allowableMovement;
++- (instancetype)initWithTarget:(id)target action:(SEL)action
++{
++    if ((self = [super initWithTarget:target action:action])) { _buttonMask = 1; _minimumPressDuration = 0.5; _allowableMovement = 10; }
++    return self;
++}
++@end
++
++@implementation NSImmediateActionGestureRecognizer
++@synthesize animationController = _animationController;
++- (void)dealloc { [_animationController release]; [super dealloc]; }
++- (CGFloat)animationProgress { return 0; }
++@end
++
++@implementation NSView (NSGestureRecognizers)
++- (NSArray *)gestureRecognizers
++{
++    NSArray *list = objc_getAssociatedObject(self, &SFGestureRecognizersKey);
++    return list ? list : [NSArray array];
++}
++- (void)addGestureRecognizer:(NSGestureRecognizer *)recognizer
++{
++    if (recognizer == nil) return;
++    NSMutableArray *list = objc_getAssociatedObject(self, &SFGestureRecognizersKey);
++    if (list == nil) { list = [NSMutableArray array]; objc_setAssociatedObject(self, &SFGestureRecognizersKey, list, OBJC_ASSOCIATION_RETAIN); }
++    if (![list containsObject:recognizer]) { [list addObject:recognizer]; [recognizer _sfSetView:self]; }
++}
++- (void)removeGestureRecognizer:(NSGestureRecognizer *)recognizer
++{
++    NSMutableArray *list = objc_getAssociatedObject(self, &SFGestureRecognizersKey);
++    if ([list containsObject:recognizer]) { [recognizer _sfSetView:nil]; [list removeObject:recognizer]; }
++}
++@end
++
++@implementation NSColorPickerTouchBarItem
+++ (instancetype)colorPickerWithIdentifier:(NSString *)identifier { return [[[self alloc] initWithIdentifier:identifier] autorelease]; }
+++ (instancetype)textColorPickerWithIdentifier:(NSString *)identifier { return [self colorPickerWithIdentifier:identifier]; }
+++ (instancetype)strokeColorPickerWithIdentifier:(NSString *)identifier { return [self colorPickerWithIdentifier:identifier]; }
++SF_TOLERANT
++@end
++
++@implementation NSScrollerImpPair
++// overlay scrollers and their animations live in this object on macOS; scrollers here are plain
++// views, so the pair has nothing to drive. What is asked of it has no effect.
+++ (NSInteger)scrollerLayoutDirection { return 0; }
++SF_TOLERANT
++@end
++@implementation NSFunctionRow
+++ (BOOL)isDynamicFunctionRowAvailable { return NO; }      // no Touch Bar is driven by AppKit here
++SF_TOLERANT
++@end
++@implementation NSFindIndicator
++SF_TOLERANT
++@end
++@implementation NSInputManager
+++ (NSInputManager *)currentInputManager { return nil; }   // the pre-10.6 input manager: there is none
++SF_TOLERANT
++@end
++
++@implementation NSTextFinder
++@synthesize client = _client, findBarContainer = _findBarContainer;
++- (instancetype)initWithCoder:(NSCoder *)coder { return [self init]; }
++- (void)encodeWithCoder:(NSCoder *)coder { }
++- (BOOL)findIndicatorNeedsUpdate { return NO; }
++- (void)setFindIndicatorNeedsUpdate:(BOOL)flag { }
++- (BOOL)isIncrementalSearchingEnabled { return _incremental; }
++- (void)setIncrementalSearchingEnabled:(BOOL)flag { _incremental = flag; }
++- (BOOL)incrementalSearchingShouldDimContentView { return _dimming; }
++- (void)setIncrementalSearchingShouldDimContentView:(BOOL)flag { _dimming = flag; }
++- (void)performAction:(NSInteger)action { NSBeep(); }
++- (BOOL)validateAction:(NSInteger)action { return NO; }
++- (void)cancelFindIndicator { }
++- (void)noteClientStringWillChange { }
++- (NSArray *)incrementalMatchRanges { return [NSArray array]; }
+++ (void)drawIncrementalMatchHighlightInRect:(NSRect)rect { }
++SF_TOLERANT
++@end
++
++
++// ---- methods of existing classes that applications built against the macOS 26 SDK send
++#import <AppKit/NSColor.h>
++#import <AppKit/NSCell.h>
++#import <AppKit/NSTableView.h>
++#import <AppKit/NSFontManager.h>
++#import <AppKit/NSFont.h>
++#import <AppKit/NSScroller.h>
++#import <AppKit/NSImage.h>
++#import <AppKit/NSButton.h>
++#import <AppKit/NSResponder.h>
++#import <AppKit/NSMenuItem.h>
++#import <CoreText/CoreText.h>
++
++static char SFIgnoresAlphaKey, SFLayoutDirectionKey, SFDragMaskLocalKey, SFDragMaskRemoteKey, SFTableStyleKey, SFFontManagerTargetKey;
++static char SFRestorationClassKey, SFScrollerStyleKey, SFKnobStyleKey, SFFontTwinKey;
++#define SF_GET_INT(object, key) [objc_getAssociatedObject(object, &key) integerValue]
++#define SF_SET_INT(object, key, value) objc_setAssociatedObject(object, &key, [NSNumber numberWithInteger:(value)], OBJC_ASSOCIATION_RETAIN)
++
++@implementation NSColor (IgnoresAlpha)
++// whether colour panels and wells strip the alpha component; the application-wide setting
++static BOOL sfIgnoresAlpha = YES;
+++ (void)setIgnoresAlpha:(BOOL)flag { sfIgnoresAlpha = flag; }
+++ (BOOL)ignoresAlpha { return sfIgnoresAlpha; }
++@end
++
++@implementation NSCell (UserInterfaceLayoutDirection)
++// kept; this AppKit lays out left to right only
++- (void)setUserInterfaceLayoutDirection:(NSInteger)direction { SF_SET_INT(self, SFLayoutDirectionKey, direction); }
++- (NSInteger)userInterfaceLayoutDirection { return SF_GET_INT(self, SFLayoutDirectionKey); }
++@end
++
++@implementation NSTableView (DraggingAndStyle)
++- (void)setDraggingSourceOperationMask:(NSUInteger)mask forLocal:(BOOL)isLocal
++{
++    if (isLocal) SF_SET_INT(self, SFDragMaskLocalKey, mask); else SF_SET_INT(self, SFDragMaskRemoteKey, mask);
++}
++- (NSUInteger)draggingSourceOperationMaskForLocal:(BOOL)isLocal
++{
++    id stored = objc_getAssociatedObject(self, isLocal ? (void *)&SFDragMaskLocalKey : (void *)&SFDragMaskRemoteKey);
++    return stored ? [stored unsignedIntegerValue] : (isLocal ? ~(NSUInteger)0 : 0);     // every operation locally, none to others
++}
++// NSTableViewStyle: kept; rows are drawn in the one (plain) style this AppKit has
++- (void)setStyle:(NSInteger)style { SF_SET_INT(self, SFTableStyleKey, style); }
++- (NSInteger)style { return SF_GET_INT(self, SFTableStyleKey); }
++- (NSInteger)effectiveStyle { return 4; /* NSTableViewStylePlain */ }
++@end
++
++@implementation NSObject (AccessibilityOverride)
++// no accessibility client exists that would read an overridden attribute
++- (BOOL)accessibilitySetOverrideValue:(id)value forAttribute:(NSString *)attribute { return NO; }
++@end
++
++@implementation NSFontManager (Target)
++- (void)setTarget:(id)target { objc_setAssociatedObject(self, &SFFontManagerTargetKey, target, OBJC_ASSOCIATION_ASSIGN); }
++- (id)target { return objc_getAssociatedObject(self, &SFFontManagerTargetKey); }
++@end
++
++@implementation NSWindow (MacOS26)
++// State restoration ("Resume") is not provided: nothing saves or restores windows across launches.
++- (void)setRestorationClass:(Class)restorationClass { objc_setAssociatedObject(self, &SFRestorationClassKey, restorationClass, OBJC_ASSOCIATION_ASSIGN); }
++- (Class)restorationClass { return objc_getAssociatedObject(self, &SFRestorationClassKey); }
++- (void)updateConstraintsIfNeeded { [[self contentView] updateConstraintsForSubtreeIfNeeded]; }
++- (void)layoutIfNeeded { [[self contentView] updateConstraintsForSubtreeIfNeeded]; [[self contentView] layout]; }
++// window tabs: every window is its own toplevel here
++- (NSArray *)tabbedWindows { return nil; }
++// private: the bottom corners of a window are the compositor's frame's business
++- (void)setBottomCornerRounded:(BOOL)flag { }
++// animated property changes are applied at once: the animator of an object is the object
++- (id)animator { return self; }
++@end
++
++@implementation NSView (Animator)
++- (id)animator { return self; }
++@end
++
++@implementation NSResponder (RestorableState)
++- (void)invalidateRestorableState { }
++- (void)encodeRestorableStateWithCoder:(NSCoder *)coder { }
++- (void)restoreStateWithCoder:(NSCoder *)coder { }
+++ (NSArray *)restorableStateKeyPaths { return [NSArray array]; }
++@end
++
++@implementation NSApplication (MenuValidation)
++// the default answer of the validation protocols: an item whose action the target implements is enabled
++- (BOOL)validateMenuItem:(NSMenuItem *)item { return YES; }
++@end
++
++@implementation NSFont (CoreTextTwin)
++// On macOS an NSFont is a CTFont (toll-free bridged) and applications hand one to CoreText. Here
++// they are two classes: an NSFont given to CoreText passes what it does not answer itself to a
++// CTFont of the same name and size.
++- (id)_sfCoreTextTwin
++{
++    id twin = objc_getAssociatedObject(self, &SFFontTwinKey);
++    if (twin == nil) {
++        twin = (id)CTFontCreateWithName((CFStringRef)[self fontName], [self pointSize], NULL);
++        if (twin != nil) { objc_setAssociatedObject(self, &SFFontTwinKey, twin, OBJC_ASSOCIATION_RETAIN); CFRelease((CFTypeRef)twin); }
++    }
++    return twin;
++}
++- (id)forwardingTargetForSelector:(SEL)selector
++{
++    id twin = [self _sfCoreTextTwin];
++    return (twin != nil && twin != self && [twin respondsToSelector:selector]) ? twin : nil;
++}
++@end
++
++@implementation NSScroller (Styles)
+++ (CGFloat)scrollerWidthForControlSize:(NSUInteger)controlSize scrollerStyle:(NSInteger)style
++{
++    // overlay scrollers (style 1) take no room; legacy ones their usual width
++    return style == 1 ? 0 : [self scrollerWidth];
++}
+++ (NSInteger)preferredScrollerStyle { return 0; /* NSScrollerStyleLegacy: scrollers are always shown */ }
++- (void)setScrollerStyle:(NSInteger)style { SF_SET_INT(self, SFScrollerStyleKey, style); }
++- (NSInteger)scrollerStyle { return SF_GET_INT(self, SFScrollerStyleKey); }
++- (void)setKnobStyle:(NSInteger)style { SF_SET_INT(self, SFKnobStyleKey, style); }
++- (NSInteger)knobStyle { return SF_GET_INT(self, SFKnobStyleKey); }
++- (void)setKnobProportion:(CGFloat)proportion { [self setFloatValue:[self floatValue] knobProportion:proportion]; }
++// private: the object that draws a scroller on macOS. Scrollers draw themselves here.
++- (id)scrollerImp { return nil; }
++@end
++
++@implementation NSImage (DrawHandler)
+++ (NSImage *)imageWithSize:(NSSize)size drawHandler:(BOOL (^)(NSRect dstRect))handler
++{
++    return [self imageWithSize:size flipped:NO drawingHandler:handler];
++}
++@end
++
++@implementation NSButton (ImageConvenience)
+++ (instancetype)buttonWithImage:(NSImage *)image target:(id)target action:(SEL)action
++{
++    NSButton *button = [self buttonWithTitle:@"" target:target action:action];
++    [button setImage:image];
++    [button setImagePosition:NSImageOnly];
++    return button;
++}
+++ (instancetype)buttonWithTitle:(NSString *)title image:(NSImage *)image target:(id)target action:(SEL)action
++{
++    NSButton *button = [self buttonWithTitle:title target:target action:action];
++    [button setImage:image];
++    [button setImagePosition:NSImageLeft];
++    return button;
++}
++@end
++
++@implementation NSBundle (ImageAndStringResources)
++- (NSURL *)URLForImageResource:(NSString *)name
++{
++    NSString *path = [self pathForImageResource:name];
++    return path ? [NSURL fileURLWithPath:path] : nil;
++}
++// private: a strings table of one localization as a dictionary
++- (NSDictionary *)localizedStringsForTable:(NSString *)table localization:(NSString *)localization
++{
++    if (table == nil) table = @"Localizable";
++    NSString *path = [self pathForResource:table ofType:@"strings" inDirectory:nil forLocalization:localization];
++    if (path == nil) path = [self pathForResource:table ofType:@"strings"];
++    NSDictionary *strings = path ? [NSDictionary dictionaryWithContentsOfFile:path] : nil;
++    return strings;
++}
++@end
++
++// ---- second batch (selectors Terminal.app sends that no class here answered)
++#import <AppKit/NSScrollView.h>
++#import <AppKit/NSEvent.h>
++#import <AppKit/NSWorkspace.h>
++#import <AppKit/NSStackView.h>
++
++static char SFAccessibilityDescriptionKey, SFAccessibilityTitleKey, SFAccessibilityIdentifierKey, SFAlternateKey, SFElasticityKey, SFTouchTypesKey;
++static char SFVisibilityKey;
++
++@implementation NSColor (GenericConstructors)
++// the generic (sRGB, gamma 2.2 grey) colour spaces; drawn as the calibrated ones
+++ (NSColor *)colorWithWhite:(CGFloat)white alpha:(CGFloat)alpha { return [self colorWithCalibratedWhite:white alpha:alpha]; }
+++ (NSColor *)colorWithHue:(CGFloat)hue saturation:(CGFloat)saturation brightness:(CGFloat)brightness alpha:(CGFloat)alpha
++{
++    return [self colorWithCalibratedHue:hue saturation:saturation brightness:brightness alpha:alpha];
++}
++@end
++
++@implementation NSWindow (Tabs)
++// Window tabbing: each window stays a toplevel of its own, there is no tab group to join.
++- (void)addTabbedWindow:(NSWindow *)window ordered:(NSInteger)ordered { [window orderWindow:ordered relativeTo:[self windowNumber]]; }
++- (id)tabGroup { return nil; }
++- (void)selectNextTab:(id)sender { }
++- (void)selectPreviousTab:(id)sender { }
++- (void)moveTabToNewWindow:(id)sender { }
++- (void)mergeAllWindows:(id)sender { }
++- (void)toggleTabBar:(id)sender { }
++- (void)toggleTabOverview:(id)sender { }
++@end
++
++@implementation NSObject (AccessibilityProperties)
++// kept on the object; no assistive client reads them yet
++- (void)setAccessibilityDescription:(NSString *)value { objc_setAssociatedObject(self, &SFAccessibilityDescriptionKey, value, OBJC_ASSOCIATION_COPY); }
++- (void)setAccessibilityTitle:(NSString *)value { objc_setAssociatedObject(self, &SFAccessibilityTitleKey, value, OBJC_ASSOCIATION_COPY); }
++- (NSString *)accessibilityTitle { return objc_getAssociatedObject(self, &SFAccessibilityTitleKey); }
++- (void)setAccessibilityIdentifier:(NSString *)value { objc_setAssociatedObject(self, &SFAccessibilityIdentifierKey, value, OBJC_ASSOCIATION_COPY); }
++- (NSString *)accessibilityIdentifier { return objc_getAssociatedObject(self, &SFAccessibilityIdentifierKey); }
++- (BOOL)isAccessibilityFocused { return NO; }
++@end
++
++@implementation NSScrollView (Elasticity)
++// rubber-band scrolling is not implemented: the setting is kept, scrolling stops at the ends
++- (void)setVerticalScrollElasticity:(NSInteger)elasticity { SF_SET_INT(self, SFElasticityKey, elasticity); }
++- (NSInteger)verticalScrollElasticity { return SF_GET_INT(self, SFElasticityKey); }
++- (void)setHorizontalScrollElasticity:(NSInteger)elasticity { }
++- (NSInteger)horizontalScrollElasticity { return 0; }
++@end
++
++@implementation NSView (TouchTypes)
++// no touch events reach views: the mask is kept
++- (void)setAllowedTouchTypes:(NSUInteger)types { SF_SET_INT(self, SFTouchTypesKey, types); }
++- (NSUInteger)allowedTouchTypes { return (NSUInteger)SF_GET_INT(self, SFTouchTypesKey); }
++@end
++
++@implementation NSEvent (CarbonEvent)
++// events here never were Carbon events
++- (const void *)eventRef { return NULL; }
++@end
++
++@implementation NSApplication (UserInterfaceItemSearch)
++// the Help menu's search field does not exist here: handlers are accepted and never asked
++- (void)registerUserInterfaceItemSearchHandler:(id)handler { }
++- (void)unregisterUserInterfaceItemSearchHandler:(id)handler { }
++// private, sent by Terminal at launch: whether the Help menu's search also searches help books.
++// There are no help books and no search field here: nothing to switch.
++- (void)setDefaultHelpBookSearchEnabled:(BOOL)flag { }
++// private: the application's window-server (CoreGraphics Services) context. The window server
++// here is a Wayland compositor: there is no such context, and the calls that would take the
++// number (CGS*, CoreGraphics patch 0025) answer "not implemented".
++- (unsigned int)contextID { return 0; }
++- (BOOL)searchString:(NSString *)searchString inUserInterfaceItemString:(NSString *)stringToSearch searchRange:(NSRange)searchRange foundRange:(NSRange *)foundRange
++{
++    NSRange found = [stringToSearch rangeOfString:searchString options:NSCaseInsensitiveSearch range:searchRange];
++    if (foundRange) *foundRange = found;
++    return found.location != NSNotFound;
++}
++@end
++
++@implementation NSPasteboard (PasteSource)
++// private, asked by Terminal before it pastes: the code-signing identifier of the application
++// that put the content on the pasteboard. Nothing here signs applications or records who wrote
++// a pasteboard: there is no identifier.
++- (NSString *)_sourceSigningIdentifier { return nil; }
++@end
++
++@implementation NSMenuItem (Alternate)
++// an alternate item replaces its predecessor while its modifier is held; menus here show every
++// item, so an alternate is kept out of sight (hidden) rather than shown twice
++- (void)setAlternate:(BOOL)flag { SF_SET_INT(self, SFAlternateKey, flag); if (flag) [self setHidden:YES]; }
++- (BOOL)isAlternate { return SF_GET_INT(self, SFAlternateKey) != 0; }
++- (NSString *)userKeyEquivalent { return @""; }
++@end
++
++@implementation NSWorkspace (FileViewer)
++// there is no file viewer application to show files in
++- (void)activateFileViewerSelectingURLs:(NSArray *)fileURLs { NSBeep(); }
++@end
++
++@implementation NSTableView (DropTarget)
++- (void)setDropRow:(NSInteger)row dropOperation:(NSUInteger)operation { }
++@end
++
++@implementation NSStackView (VisibilityPriority)
++- (void)setVisibilityPriority:(float)priority forView:(NSView *)view
++{
++    objc_setAssociatedObject(view, &SFVisibilityKey, [NSNumber numberWithFloat:priority], OBJC_ASSOCIATION_RETAIN);
++    [view setHidden:priority <= 0];        // NSStackViewVisibilityPriorityNotVisible
++}
++- (float)visibilityPriorityForView:(NSView *)view
++{
++    id stored = objc_getAssociatedObject(view, &SFVisibilityKey);
++    return stored ? [stored floatValue] : 1000;
++}
++@end
++
++// ---- NSWindowTab: what a window shows of itself in a tab bar. There is no tab bar; the object
++// keeps what the application sets (title, tool tip, accessory view).
++@interface NSWindowTab : NSObject {
++    NSString *_title, *_toolTip; NSAttributedString *_attributedTitle; NSView *_accessoryView;
++}
++@property(copy) NSString *title;
++@property(copy) NSAttributedString *attributedTitle;
++@property(copy) NSString *toolTip;
++@property(retain) NSView *accessoryView;
++@end
++@implementation NSWindowTab
++@synthesize title = _title, attributedTitle = _attributedTitle, toolTip = _toolTip, accessoryView = _accessoryView;
++- (void)dealloc { [_title release]; [_attributedTitle release]; [_toolTip release]; [_accessoryView release]; [super dealloc]; }
++SF_TOLERANT
++@end
++
++static char SFWindowTabKey;
++@implementation NSWindow (WindowTab)
++- (NSWindowTab *)tab
++{
++    NSWindowTab *tab = objc_getAssociatedObject(self, &SFWindowTabKey);
++    if (tab == nil) {
++        tab = [[NSWindowTab new] autorelease];
++        objc_setAssociatedObject(self, &SFWindowTabKey, tab, OBJC_ASSOCIATION_RETAIN);
++    }
++    return tab;
++}
++@end
++
++@implementation NSView (FindIndicator)
++// private: whether the view is being drawn into the yellow "find indicator" bubble. Never here.
++- (BOOL)isDrawingFindIndicator { return NO; }
++@end
+--- a/src/Frameworks/AppKit/AppKit.h
++++ b/src/Frameworks/AppKit/AppKit.h
+@@ -175,6 +175,9 @@
+ #import <AppKit/NSSharingService.h>
+ #import <AppKit/NSAccessibilityCustomAction.h>
+ #import <AppKit/NSModernAppKit.h>
++#import <AppKit/NSStackView.h>
++#import <AppKit/NSAccessibilityElement.h>
++#import <AppKit/NSMacOS26Additions.h>
+ #import <AppKit/NSLayoutAnchor.h>
+ #import <AppKit/NSGlassEffectView.h>
+ #import <AppKit/NSMenuItemBadge.h>

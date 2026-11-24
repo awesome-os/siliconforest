@@ -1,0 +1,84 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>SiliconForest frame identity</title>
+<style>
+body{margin:16px;background:#13202b;color:#eef6fa;font:16px sans-serif}
+h1{font-size:20px;margin:0 0 12px}
+video{display:block;width:960px;max-width:95vw;height:auto;background:black}
+pre{white-space:pre-wrap}
+</style>
+<h1>Known video frame identities · 1080p60</h1>
+<video id="video" muted playsinline preload="auto" src="frame-id-1080p60.mp4"></video>
+<pre id="status">Paused for marker and geometry calibration.</pre>
+<script>
+const video=document.querySelector('video');
+window.fxVideoResult={source:new URL('frame-id-1080p60.mp4',location.href).href,
+ timeOrigin:performance.timeOrigin,muted:true,events:[],presented:[],quality:[],
+ diagnosticReadback:true,panelPresentationProved:false};
+for(const name of ['loadedmetadata','canplay','playing','waiting','stalled','ended','error'])
+ video.addEventListener(name,()=>fxVideoResult.events.push({name,wall:performance.now(),mediaTime:video.currentTime}));
+if(video.requestVideoFrameCallback){
+ const callback=(wall,m)=>{
+  fxVideoResult.presented.push({wall,mediaTime:m.mediaTime,presentedFrames:m.presentedFrames,
+   expectedDisplayTime:m.expectedDisplayTime,presentationTime:m.presentationTime});
+  video.requestVideoFrameCallback(callback);
+ };video.requestVideoFrameCallback(callback);
+}
+function quality(){const q=video.getVideoPlaybackQuality();return {total:q.totalVideoFrames,dropped:q.droppedVideoFrames,corrupted:q.corruptedVideoFrames};}
+let capturePaint=null;
+window.fxArmFrameIDCapture=()=>{
+ if(capturePaint)throw new Error('Own capture paint already armed');
+ const node=document.querySelector('#status'),previous=node.textContent;
+ const state={start:performance.now(),updates:0,finishBy:performance.now()+650};
+ capturePaint={state,node,previous};
+ // A paused/static page need not submit another frame. Force only three own
+ // calibration repaints after the capture request can be armed, outside play.
+ for(const delay of [100,300,600])setTimeout(()=>{
+  node.textContent='Calibration capture repaint '+(++state.updates);},delay);
+ return state;
+};
+window.fxFinishFrameIDCapture=async()=>{
+ if(!capturePaint)throw new Error('Own capture paint not armed');
+ const {state,node,previous}=capturePaint;
+ await new Promise(resolve=>setTimeout(resolve,Math.max(0,state.finishBy-performance.now())));
+ if(state.updates!==3)throw new Error('Own capture repaint did not complete');
+ node.textContent=previous;
+ await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ state.end=performance.now();capturePaint=null;
+ fxVideoResult.capturePaints??=[];fxVideoResult.capturePaints.push({...state});
+ return state;
+};
+window.fxPrepareFrameID=async()=>{
+ const deadline=performance.now()+12000;
+ while(video.readyState<2&&!video.error){
+  if(performance.now()>deadline)throw new Error('Own marker preview deadline');
+  await new Promise(resolve=>setTimeout(resolve,30));
+ }
+ if(video.error||video.videoWidth!==1920||video.videoHeight!==1080||!video.paused)throw new Error('Wrong own preview state');
+ await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+ const rect=video.getBoundingClientRect();
+ return {paused:video.paused,currentTime:video.currentTime,quality:quality(),
+  videoWidth:video.videoWidth,videoHeight:video.videoHeight,source:video.currentSrc,
+  rect:{x:rect.x,y:rect.y,width:rect.width,height:rect.height},devicePixelRatio,
+  innerWidth,innerHeight,outerWidth,outerHeight,screenX,screenY,
+  innerScreenX:window.mozInnerScreenX,innerScreenY:window.mozInnerScreenY};
+};
+window.fxMeasureVideo=async()=>{
+ if(capturePaint)throw new Error('Capture paint must finish before timed playback');
+ const r=window.fxVideoResult;r.events=[];r.presented=[];r.quality=[];
+ r.initialQuality=quality();r.initialMediaTime=video.currentTime;r.measureStart=performance.now();
+ let timer,ended;
+ const completion=new Promise(resolve=>{ended=resolve;video.addEventListener('ended',ended,{once:true});});
+ const samples=setInterval(()=>r.quality.push({...quality(),wall:performance.now(),mediaTime:video.currentTime}),250);
+ try{await Promise.race([(async()=>{await video.play();await completion;})(),
+  new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('Own 15s video deadline')),30000);})]);}
+ catch(error){r.playError=String(error);}
+ finally{clearInterval(samples);clearTimeout(timer);video.removeEventListener('ended',ended);}
+ r.measureEnd=performance.now();r.currentTime=video.currentTime;r.duration=video.duration;
+ r.ended=video.ended;r.readyState=video.readyState;r.error=video.error?{code:video.error.code,message:video.error.message}:null;
+ r.quality.push({...quality(),wall:performance.now(),mediaTime:video.currentTime});
+ r.sourceFrameCount=900;r.initialPreviewOutsideTimedInterval=true;
+ document.querySelector('#status').textContent='Completed '+r.quality.at(-1).total+' decoded frames; native export and completed-flip evidence are separate.';
+ return r;
+};
+</script>

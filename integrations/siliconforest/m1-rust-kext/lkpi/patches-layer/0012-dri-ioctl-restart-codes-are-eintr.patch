@@ -1,0 +1,20 @@
+fbsdkpi: drm: an ioctl interrupted by a signal returns EINTR, not Linux's 512
+
+sf_dri_ioctl() handed -ERESTARTSYS (and its relatives) to user space as errno 512. Linux
+never shows those to a process. EINTR is what libdrm's drmIoctl() retries on.
+UPSTREAM: yes.
+
+--- a/src/Kernel/fbsdkpi/drm/src/sf_drm_cdev.c
++++ b/src/Kernel/fbsdkpi/drm/src/sf_drm_cdev.c
+@@ -141,6 +175,11 @@
+ 		printf("sf_dri: ioctl 0x%08x returned %ld, failing it\n", cmd, ret);
+ 		return EINVAL;
+ 	}
++	// Linux's own restart codes never reach user space there (the signal code turns them
++	// into EINTR or a restart); here libdrm's drmIoctl() retries on EINTR
++	if (ret == -ERESTARTSYS || ret == -ERESTART || ret == -ERESTARTNOINTR ||
++	    ret == -ERESTARTNOHAND || ret == -ERESTART_RESTARTBLOCK)
++		return EINTR;
+ 	return (int)-ret;
+ }
+ 

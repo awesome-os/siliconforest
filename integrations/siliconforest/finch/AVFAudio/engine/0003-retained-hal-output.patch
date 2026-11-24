@@ -1,0 +1,153 @@
+--- a/userland/AVFAudio/AVAudioEngine.m
++++ b/userland/AVFAudio/AVAudioEngine.m
+@@ -9,10 +9,8 @@
+  * does (equal power, except that a centred mono input goes to both sides at full
+  * level; a stereo input's pan is a balance), sums, and applies its output volume.
+  *
+- * Offline manual rendering renders on the caller's thread. Real-time rendering has no
+- * audio device to play through yet, so a started engine renders on a timer at the
+- * output's rate and the audio goes nowhere: players, taps and completion handlers run
+- * as they would.
++ * Offline rendering runs on the caller thread. SiliconForest realtime output is
++ * pulled by the retained PD AudioQueue callback path into HAL/coreaudiod buffers.
+  */
+ #import "AVAudioNodeInternal.h"
+ #import <Block.h>
+@@ -20,6 +18,7 @@
+ #include <math.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include "sf-engine-output.h"
+ 
+ NSString *const AVAudioEngineConfigurationChangeNotification = @"AVAudioEngineConfigurationChangeNotification";
+ 
+@@ -1105,6 +1104,8 @@
+     MusicSequence _sequence;
+     dispatch_source_t _clock;
+     dispatch_queue_t _queue;
++    SFEngineHAL *_sfOutput;
++    double _sfDeviceRate;
+ }
+ @end
+ 
+@@ -1113,6 +1114,7 @@
+ - (instancetype)init
+ {
+     if ((self = [super init])) {
++        _sfDeviceRate = sfEngineDeviceRate();
+         _nodes = [NSMutableSet new];
+         _output = [[AVAudioOutputNode alloc] _init];
+         [self attachNode:_output];
+@@ -1164,7 +1166,7 @@
+ /* The format the engine's output runs at: the manual rendering format, or the device's. */
+ - (AVAudioFormat *)_outputFormat
+ {
+-    return _manual ? _manualFormat : standard(44100, 2);
++    return _manual ? _manualFormat : standard(_sfDeviceRate > 0 ? _sfDeviceRate : 44100, 2);
+ }
+ 
+ - (void)connect:(AVAudioNode *)node1 to:(AVAudioNode *)node2 fromBus:(AVAudioNodeBus)bus1 toBus:(AVAudioNodeBus)bus2 format:(AVAudioFormat *)format
+@@ -1346,11 +1348,92 @@
+     }
+     _running = YES;
+     if (!_manual) {
+-        _running=NO;
+-        if(outError)*outError=[NSError errorWithDomain:NSOSStatusErrorDomain code:kAudioUnitErr_NoConnection userInfo:nil];
+-        return NO;
++        OSStatus status = _sfDeviceRate > 0 ? noErr : kAudioUnitErr_NoConnection;
++        if (!status) {
++            _sfOutput = calloc(1, sizeof(*_sfOutput));
++            if (!_sfOutput) status = -108;
++        }
++        if (!status) {
++            SFEngineHAL *state = _sfOutput;
++            state->engine = self;
++            pthread_mutex_init(&state->lock, NULL);
++            AVAudioFormat *format = [self _outputFormat];
++            _output->_outFormats[@0] = format;
++            if (_mixer) [self connect:_mixer to:_output format:format];
++            state->pcm = [[AVAudioPCMBuffer alloc] initWithPCMFormat:format frameCapacity:1024];
++            AudioStreamBasicDescription wire = *format.streamDescription;
++            wire.mFormatFlags &= ~kAudioFormatFlagIsNonInterleaved;
++            wire.mBytesPerFrame = wire.mBytesPerPacket = sizeof(float) * wire.mChannelsPerFrame;
++            status = state->pcm ? AudioQueueNewOutput(&wire, sfEngineReturned, state, NULL, NULL, 0, &state->queue) : -108;
++            for (int n=0; !status && n<3; n++) {
++                AudioQueueBufferRef buffer=NULL;
++                status=AudioQueueAllocateBuffer(state->queue,1024*wire.mBytesPerFrame,&buffer);
++                if(!status)status=[self _sfFillOutput:buffer];
++            }
++            if(!status)status=AudioQueueStart(state->queue,NULL);
++        }
++        if(status) {
++            [self _sfStopOutput]; _running=NO;
++            if(outError)*outError=[NSError errorWithDomain:NSOSStatusErrorDomain code:status userInfo:nil];
++            return NO;
++        }
+     }
+     return YES;
++}
++
++/* Called serially by the queue callback thread (initial priming precedes Start). */
++- (OSStatus)_sfFillOutput:(AudioQueueBufferRef)buffer
++{
++    SFEngineHAL *s=_sfOutput;
++    OSStatus error=[self _renderCycle:1024 into:s->pcm];
++    if(error)return error;
++    float *wire=buffer->mAudioData;
++    UInt32 channels=s->pcm.format.channelCount;
++    for(UInt32 n=0;n<1024;n++) for(UInt32 c=0;c<channels;c++) {
++        float value=s->pcm.floatChannelData[c][n];
++        wire[n*channels+c]=value;
++        if(value!=0)s->nonzero++;
++    }
++    buffer->mAudioDataByteSize=1024*channels*sizeof(float);
++    error=AudioQueueEnqueueBuffer(s->queue,buffer,0,NULL);
++    if(!error)s->queued+=1024;
++    return error;
++}
++
++- (void)_sfReturnOutput:(AudioQueueBufferRef)buffer
++{
++    SFEngineHAL *s=_sfOutput;
++    pthread_mutex_lock(&s->lock);
++    if(!s->stopping) {
++        s->returned+=buffer->mAudioDataByteSize/(2*sizeof(float));s->callbacks++;
++        if(!s->error)s->error=[self _sfFillOutput:buffer];
++    }
++    pthread_mutex_unlock(&s->lock);
++}
++
++/* Own diagnostic: buffer returns are not a DAC presentation acknowledgement. */
++- (NSDictionary *)sf_outputStatistics
++{
++    SFEngineHAL *s=_sfOutput;
++    if(!s)return @{};
++    pthread_mutex_lock(&s->lock);
++    AudioTimeStamp stamp={0};OSStatus clock=AudioQueueGetCurrentTime(s->queue,NULL,&stamp,NULL);
++    NSDictionary *result=@{@"queued":@(s->queued),@"returned":@(s->returned),@"nonzero":@(s->nonzero),
++      @"callbacks":@(s->callbacks),@"rate":@(_sfDeviceRate),@"sampleTime":@(stamp.mSampleTime),
++      @"clockError":@(clock),@"error":@(s->error)};
++    pthread_mutex_unlock(&s->lock);
++    return result;
++}
++
++- (void)_sfStopOutput
++{
++    SFEngineHAL *s=_sfOutput;
++    if(!s)return;
++    pthread_mutex_lock(&s->lock);s->stopping=YES;pthread_mutex_unlock(&s->lock);
++    if(s->queue){AudioQueueStop(s->queue,true);AudioQueueDispose(s->queue,true);}
++    /* Dispose has joined the retained provider's callback thread. */
++    _sfOutput=NULL;
++    [s->pcm release];pthread_mutex_destroy(&s->lock);free(s);
+ }
+ 
+ - (BOOL)_hasSinks
+@@ -1363,6 +1446,7 @@
+ 
+ - (void)_stopClock
+ {
++    [self _sfStopOutput];
+     if (_clock) {
+         dispatch_source_cancel(_clock);
+         dispatch_sync(_queue, ^{

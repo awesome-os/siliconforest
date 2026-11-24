@@ -1,0 +1,716 @@
+--- a/src/Frameworks/AppKit/NSWindowMenuStrip.m
++++ b/src/Frameworks/AppKit/NSWindowMenuStrip.m
+@@ -0,0 +1,223 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * The application's main menu as a strip at the top of each of its standard windows.
++ *
++ * SiliconForest's desktop has no global menu bar: a window is its content inside the frame the
++ * compositor draws. The main menu of a Mac application is shown where the user already looks, as
++ * the first row inside that frame, in every titled window that is not a panel. It is the
++ * application's own NSMenu drawn by a horizontal NSMenuView: the menu of a title is the same popup
++ * window (an xdg_popup of the window) as every other menu, tracked by the same loop, so pointer and
++ * keyboard behave as in a context menu; Control-F2 (macOS: "move focus to the menu bar") opens the
++ * first menu from the keyboard, Left and Right go along the titles.
++ *
++ * The strip belongs to the window's frame, not to its content: -frameRectForContentRect: and
++ * -contentRectForFrameRect: count it like the title bar, so an application that sizes its window
++ * from its content (a terminal: columns by rows) gets the content it asked for.
++ *
++ * Only where the compositor draws the frames (NSWindowFrameIsDrawnByServer): on upstream's desktop
++ * the menu bar process shows the menu. The default SFWindowMenuStrip=NO turns it off.
++ */
++#import <AppKit/NSWindow.h>
++#import <AppKit/NSWindow-Private.h>
++#import <AppKit/NSPanel.h>
++#import <AppKit/NSApplication.h>
++#import <AppKit/NSMenu.h>
++#import <AppKit/NSMenuItem.h>
++#import <AppKit/NSMenuView.h>
++#import <AppKit/NSColor.h>
++#import <AppKit/NSGraphics.h>
++#import <AppKit/NSAppearance.h>
++#import <AppKit/NSEvent.h>
++#import <Foundation/NSUserDefaults.h>
++#import <Foundation/NSBundle.h>
++#import <Foundation/NSProcessInfo.h>
++#include <stdlib.h>
++
++@interface NSAppearance (SFDark)
++- (BOOL)_isDark;
++@end
++
++@interface SFMenuStripView : NSMenuView {
++    NSString *_shownTitles;
++}
++- (void)_sfRefresh;
++@end
++
++@interface NSMenuView (SFSizes)
++- (void)_sfForgetSizes;
++@end
++
++@implementation SFMenuStripView
++
++- (void)dealloc
++{
++    [_shownTitles release];
++    [super dealloc];
++}
++
++/* The first item of a main menu is the application menu. macOS shows it under the application's
++ * name whatever title the item carries (nibs carry placeholders). */
++- (NSString *)_sfTitleOfItem:(NSMenuItem *)item
++{
++    NSArray *items = [[self menu] itemArray];
++
++    if ([items count] > 0 && item == [items objectAtIndex:0] && [item hasSubmenu]) {
++        NSBundle *bundle = [NSBundle mainBundle];
++        NSString *name = [bundle objectForInfoDictionaryKey:@"CFBundleDisplayName"];
++
++        if (![name isKindOfClass:[NSString class]] || [name length] == 0)
++            name = [bundle objectForInfoDictionaryKey:@"CFBundleName"];
++        if (![name isKindOfClass:[NSString class]] || [name length] == 0)
++            name = [[NSProcessInfo processInfo] processName];
++        return name;
++    }
++    return [item title];
++}
++
++- (NSString *)_titles
++{
++    NSMutableString *all = [NSMutableString string];
++
++    for (NSMenuItem *item in [self presentedItems])
++        [all appendFormat:@"%@%c\n", [self _sfTitleOfItem:item], [item isEnabled] ? '+' : '-'];
++    return all;
++}
++
++// the titles are drawn again when one of them changed (an application may fill its menu in late)
++- (void)_sfRefresh
++{
++    NSString *now = [self _titles];
++
++    if (_shownTitles == nil || ![now isEqualToString:_shownTitles]) {
++        [_shownTitles release];
++        _shownTitles = [now copy];
++        [self _sfForgetSizes];
++        if (getenv("SF_MENU_TRACE") != NULL)
++            NSLog(@"menu strip titles: %@", [[self presentedItems] valueForKey:@"title"]);
++        [self setNeedsDisplay:YES];
++    }
++}
++
++- (BOOL)isOpaque
++{
++    return YES;
++}
++
++- (void)drawRect:(NSRect)rect
++{
++    BOOL dark = [[NSAppearance currentDrawingAppearance] _isDark];
++    NSRect bounds = [self bounds];
++
++    // the window's own ground rather than a bar of another look
++    [(dark ? [NSColor colorWithCalibratedWhite:0.16 alpha:1] : [NSColor colorWithCalibratedWhite:0.955 alpha:1]) setFill];
++    NSRectFill(rect);
++    _sfBarGroundDrawn = YES;
++    [super drawRect:rect];
++    _sfBarGroundDrawn = NO;
++    // a hairline between the strip and what lies under it
++    [[NSColor colorWithCalibratedWhite:dark ? 0.0 : 0.0 alpha:dark ? 0.5 : 0.14] setFill];
++    NSRectFillUsingOperation(NSMakeRect(0, NSMaxY(bounds) - 1, NSWidth(bounds), 1), NSCompositeSourceOver);
++}
++
++- (BOOL)acceptsFirstMouse:(NSEvent *)event
++{
++    return YES;
++}
++
++@end
++
++@implementation NSWindow (SFMenuStrip)
++
+++ (BOOL)_sfMenuStripsEnabled
++{
++    static int enabled = -1;
++
++    if (enabled < 0) {
++        id value = [[NSUserDefaults standardUserDefaults] objectForKey:@"SFWindowMenuStrip"];
++
++        enabled = (value == nil || [value boolValue]) ? 1 : 0;
++    }
++    return enabled > 0;
++}
++
++- (BOOL)_sfWantsMenuStrip
++{
++    if (![NSWindow _sfMenuStripsEnabled] || [[NSApp mainMenu] numberOfItems] == 0)
++        return NO;
++    if ([self isKindOfClass:[NSPanel class]] || [self isSheet])
++        return NO;
++    if (!(_styleMask & NSTitledWindowMask) || (_styleMask & (NSFullScreenWindowMask | NSFullSizeContentViewWindowMask)))
++        return NO;
++    return NSWindowFrameIsDrawnByServer(_styleMask);
++}
++
++- (NSView *)_sfMenuStripView
++{
++    return _menuView;
++}
++
++/* Gives the window its strip, or takes it away, when what decides that changed (the application
++ * got its main menu, the window was created); the content keeps its size and the window's top edge
++ * its place. */
++- (void)_sfUpdateMenuStrip
++{
++    BOOL want = [self _sfWantsMenuStrip];
++    NSRect content, frame;
++    CGFloat height = 0;
++
++    if (want == (_menuView != nil)) {
++        if (_menuView != nil) {
++            [(SFMenuStripView *)_menuView setMenu:[NSApp mainMenu]];
++            [(SFMenuStripView *)_menuView _sfRefresh];
++        }
++        return;
++    }
++    content = [self contentRectForFrameRect:_frame];
++    if (want) {
++        SFMenuStripView *strip = [[SFMenuStripView alloc] initWithFrame:NSMakeRect(0, 0, NSWidth(content), 22)];
++
++        [strip setHorizontal:YES];
++        [strip _sfSetInWindow:YES];
++        [strip setMenu:[NSApp mainMenu]];
++        [strip sizeToFit];
++        height = MAX(22, ceil(NSHeight([strip frame])));
++        [strip setFrame:NSMakeRect(0, 0, NSWidth(content), height)];
++        [strip setAutoresizingMask:NSViewWidthSizable | NSViewMinYMargin];
++        _menuView = strip;
++        [_backgroundView addSubview:strip];
++        [strip _sfRefresh];
++    }
++    else {
++        height = -NSHeight([_menuView frame]);
++        [_menuView removeFromSuperview];
++        [_menuView release];
++        _menuView = nil;
++    }
++    if (_minSize.height > 0)
++        _minSize.height += height;
++    if (_maxSize.height < 32767)
++        _maxSize.height += height;
++    frame = [self frameRectForContentRect:content];
++    frame.origin.y = NSMaxY(_frame) - frame.size.height;
++    [self setFrame:frame display:NO];
++    [_backgroundView resizeSubviewsWithOldSize:[_backgroundView frame].size];
++    [_backgroundView setNeedsDisplay:YES];
++    [self _sendSizeLimits];
++}
++
++// Control-F2 with this window in front
++- (BOOL)_sfMenuStripTakesKeyEvent:(NSEvent *)event
++{
++    NSString *chars;
++
++    if (_menuView == nil || [event type] != NSKeyDown || !([event modifierFlags] & NSControlKeyMask) ||
++        ([event modifierFlags] & (NSCommandKeyMask | NSAlternateKeyMask)))
++        return NO;
++    chars = [event charactersIgnoringModifiers];
++    if ([chars length] != 1 || [chars characterAtIndex:0] != NSF2FunctionKey)
++        return NO;
++    [(SFMenuStripView *)_menuView _sfTrackFromKeyEvent:event];
++    return YES;
++}
++
++@end
+--- a/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.h
++++ b/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.h
+@@ -26,6 +26,12 @@
+     NSMenuItem *_macSourceFirst;
+     // the least width of the panel (a pop-up button's menu is at least as wide as the button)
+     CGFloat _sfMinimumWidth;
++    // a bar that is the menu strip of a window
++    BOOL _sfInWindow;
++    // the items' sizes as last measured (measuring a title is slow, and every rectangle needs all before it)
++    NSMutableData *_sfSizes;
++    // set by a subclass that has painted the bar's ground itself
++    BOOL _sfBarGroundDrawn;
+ }
+ 
+ - (void)setMenu:(NSMenu *)menu;
+@@ -56,4 +62,9 @@
+ - (void)setHighlightedItemIndex:(NSInteger)index;
+ - (NSInteger)highlightedItemIndex;
+ 
++// the menu strip of a window: see -[NSWindow _sfUpdateMenuStrip]
++- (void)_sfSetInWindow:(BOOL)flag;
++- (NSString *)_sfTitleOfItem:(NSMenuItem *)item;
++- (void)_sfTrackFromKeyEvent:(NSEvent *)event;
++
+ @end
+--- a/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
++++ b/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
+@@ -138,6 +138,7 @@
+ {
+     [_submenuWindow release];
+     [_submenuView release];
++    [_sfSizes release];
+     [_font release];
+     [_presentedItems release];
+     [self _invalidatePresentation];
+@@ -315,6 +316,7 @@
+     }
+     [_presentedItems release];
+     _presentedItems = [items retain];
++    [self _sfForgetSizes];
+     [self setNeedsDisplay:YES];
+ }
+ 
+@@ -332,6 +334,7 @@
+     [self closeSubmenu];
+ 
+     [super setMenu:menu];
++    [self _sfForgetSizes];
+     [self _invalidatePresentation];
+     _highlightedIndex = -1;
+ 
+@@ -375,8 +378,13 @@
+ - (void)setHighlightedItemIndex:(NSInteger)index
+ {
+     if (index != _highlightedIndex) {
++        // only the row that loses the highlight and the row that gets it are drawn again (drawing a
++        // menu's text is slow enough to be felt when the whole panel follows the pointer)
++        NSRect was = NSInsetRect([self rectOfItemAtIndex:_highlightedIndex], -1, -1);
++
+         _highlightedIndex = index;
+-        [self setNeedsDisplay:YES];
++        [self setNeedsDisplayInRect:was];
++        [self setNeedsDisplayInRect:NSInsetRect([self rectOfItemAtIndex:index], -1, -1)];
+         // the menu's delegate hears which item is about to be lit (nil: none), as on macOS
+         if (!_horizontal && _tracking + (_supermenuView != nil) > 0) {
+             id delegate = [_menu delegate];
+@@ -406,6 +414,35 @@
+     return 0;
+ }
+ 
++// the measured sizes are thrown away when what they were measured from may have changed
++- (void)_sfForgetSizes
++{
++    [_sfSizes release];
++    _sfSizes = nil;
++}
++
++- (NSSize)_sfSizeOfItemAtIndex:(NSInteger)index
++{
++    NSArray *items = [self presentedItems];
++    NSUInteger count = [items count];
++
++    if (_sfSizes == nil || [_sfSizes length] != count * sizeof(NSSize)) {
++        NSUInteger i;
++
++        [_sfSizes release];
++        _sfSizes = [[NSMutableData alloc] initWithLength:count * sizeof(NSSize)];
++        for (i = 0; i < count; i++)
++            ((NSSize *)[_sfSizes mutableBytes])[i] = [self sizeOfItem:[items objectAtIndex:i]];
++    }
++    return ((const NSSize *)[_sfSizes bytes])[index];
++}
++
++// what an item is called in this view (a window's menu strip calls the application menu by the application's name)
++- (NSString *)_sfTitleOfItem:(NSMenuItem *)item
++{
++    return [item title];
++}
++
+ - (NSSize)sizeOfItem:(NSMenuItem *)item
+ {
+     NSSize size;
+@@ -416,7 +453,7 @@
+         return size;
+     }
+ 
+-    NSString *title = [item title];
++    NSString *title = [self _sfTitleOfItem:item];
+ 
+     /* -itemAttributes is the single source of truth for menu text metrics:
+      * whoever draws the title must measure with the same dictionary, or the
+@@ -449,12 +486,12 @@
+     CGFloat offset = 0.0;
+ 
+     for (NSInteger i = 0; i < index; i++) {
+-        NSSize size = [self sizeOfItem:[items objectAtIndex:i]];
++        NSSize size = [self _sfSizeOfItemAtIndex:i];
+ 
+         offset += _horizontal ? size.width : size.height;
+     }
+ 
+-    NSSize size = [self sizeOfItem:[items objectAtIndex:index]];
++    NSSize size = [self _sfSizeOfItemAtIndex:index];
+ 
+     if (_horizontal) {
+         return NSMakeRect(offset, 0.0, size.width, bounds.size.height);
+@@ -479,9 +516,13 @@
+ {
+     NSArray *items = [self presentedItems];
+     NSSize total = NSMakeSize(0.0, 0.0);
++    NSInteger at = 0;
+ 
++    [self _sfForgetSizes];
+     for (NSMenuItem *item in items) {
+-        NSSize size = [self sizeOfItem:item];
++        NSSize size = [self _sfSizeOfItemAtIndex:at++];
++
++        (void)item;
+ 
+         if (_horizontal) {
+             total.width += size.width;
+@@ -515,7 +556,8 @@
+     NSInteger count = (NSInteger)[items count];
+ 
+     if (_horizontal) {
+-        [style drawMenuBarBackgroundInRect:[self bounds]];
++        if (!_sfBarGroundDrawn)
++            [style drawMenuBarBackgroundInRect:[self bounds]];
+     }
+     else {
+         // the window is clear, so the panel's rounded corners and shadow show what is behind it
+@@ -565,7 +607,7 @@
+ {
+     BOOL selected = (i == _highlightedIndex);
+     BOOL enabled = [item isEnabled];
+-    NSString *title = [item title];
++    NSString *title = [self _sfTitleOfItem:item];
+ 
+     if ([item isSeparatorItem]) {
+         [style drawMenuSeparatorInRect:rect];
+@@ -727,6 +769,11 @@
+         origin = [[self window] convertBaseToScreen:origin];
+         frame.origin = origin;
+         frame.origin.y -= frame.size.height;
++        if (_sfInWindow) {
++            // a strip inside a window: the panel's corner, not the corner of its shadow margin, sits under the title
++            frame.origin.x -= SHADOW_M;
++            frame.origin.y += SHADOW_M;
++        }
+     }
+     else {
+         /* Beside its item: the panels overlap by two points and the submenu's first item is level
+@@ -877,6 +924,55 @@
+         [[view window] displayIfNeeded];
+ }
+ 
++// a bar that is a strip of a window (-[NSWindow _sfUpdateMenuStrip]) rather than upstream's menu bar process
++- (void)_sfSetInWindow:(BOOL)flag
++{
++    _sfInWindow = flag;
++}
++
++// the bar opens the menu of a title; the keyboard goes to the menu's first item when asked
++- (NSMenuView *)_sfBarOpenIndex:(NSInteger)index selectFirst:(BOOL)first
++{
++    [self closeSubmenu];
++    [self setHighlightedItemIndex:index];
++    // the title is lit before its menu is built and drawn
++    [[self window] displayIfNeeded];
++    if (![self _sfItemOpensAtIndex:index])
++        return self;
++    [self openSubmenuAtIndex:index];
++    if (_submenuView == nil)
++        return self;
++    if (first)
++        [_submenuView setHighlightedItemIndex:[_submenuView _sfLiveIndexFrom:0 step:1]];
++    return _submenuView;
++}
++
++// the next title of the bar that can be opened, going round
++- (NSInteger)_sfBarIndexFrom:(NSInteger)from step:(NSInteger)step
++{
++    NSInteger count = (NSInteger)[[self presentedItems] count], i, at = from;
++
++    for (i = 0; i < count; i++) {
++        at = (at + step + count) % count;
++        if ([self _sfItemOpensAtIndex:at])
++            return at;
++    }
++    return from;
++}
++
++/* The keyboard's way into a window's menu strip (Control-F2, as macOS moves the focus to the menu
++ * bar): the first menu opens with its first item lit; the arrows go on from there. */
++- (void)_sfTrackFromKeyEvent:(NSEvent *)event
++{
++    NSMenuItem *chosen;
++
++    if (_menu == nil || _tracking || !_horizontal)
++        return;
++    chosen = [self _trackFromEvent:event];
++    if (chosen != nil && [chosen action] != NULL)
++        [NSApp sendAction:[chosen action] to:[chosen target] from:chosen];
++}
++
+ - (void)mouseDown:(NSEvent *)event
+ {
+     NSMenuItem *chosen;
+@@ -937,6 +1033,18 @@
+     _tracking = YES;
+     [[NSNotificationCenter defaultCenter] postNotificationName:NSMenuDidBeginTrackingNotification object:_menu];
+     [self retain];
++    if (_horizontal && _sfInWindow) {
++        [_menu update];
++        if (byButton) {
++            // the press on a title opens its menu at once
++            NSInteger at = [self indexOfItemAtPoint:[self convertPoint:[event locationInWindow] fromView:nil]];
++
++            if ([self _sfItemOpensAtIndex:at])
++                keyView = [self _sfBarOpenIndex:at selectFirst:NO];
++        }
++        else
++            keyView = [self _sfBarOpenIndex:[self _sfBarIndexFrom:-1 step:1] selectFirst:YES];
++    }
+ 
+     for (;;) {
+         NSUInteger mask = NSLeftMouseDownMask | NSLeftMouseUpMask | NSLeftMouseDraggedMask | NSRightMouseDownMask |
+@@ -1001,6 +1109,22 @@
+             // the submenu the keyboard is in may have been closed by the pointer
+             if (c == 0x1b || (c == '.' && ([event modifierFlags] & NSCommandKeyMask)))
+                 break;
++            BOOL bar = _horizontal && _sfInWindow;
++
++            if (bar && keyView == self && arrow) {
++                // on a title: Down (or Up) opens its menu
++                keyView = [self _sfBarOpenIndex:at selectFirst:YES];
++                continue;
++            }
++            // Left in a title's menu, Right on an item that opens nothing: the neighbouring title's menu
++            if (bar && ((c == NSLeftArrowFunctionKey && (keyView == self || keyView->_supermenuView == self)) ||
++                        (c == NSRightArrowFunctionKey && (keyView == self || ![keyView _sfItemOpensAtIndex:at])))) {
++                NSInteger from = (_openSubmenuIndex >= 0) ? _openSubmenuIndex : [self highlightedItemIndex];
++
++                keyView = [self _sfBarOpenIndex:[self _sfBarIndexFrom:from step:(c == NSLeftArrowFunctionKey) ? -1 : 1] selectFirst:YES];
++                lingerView = nil;
++                continue;
++            }
+             if (c == NSDownArrowFunctionKey)
+                 to = [keyView _sfLiveIndexFrom:at + 1 step:1];
+             else if (c == NSUpArrowFunctionKey)
+@@ -1115,7 +1239,15 @@
+                 [view setHighlightedItemIndex:[view _sfItemIsLiveAtIndex:index] ? index : -1];
+                 for (up_ = view->_supermenuView; up_ != nil && view != self; up_ = (up_ == self) ? nil : up_->_supermenuView)
+                     [up_ setHighlightedItemIndex:up_->_openSubmenuIndex];
+-                if (view->_openSubmenuIndex >= 0 && index != view->_openSubmenuIndex) {
++                if (view == self && _horizontal && _sfInWindow) {
++                    // along the bar the open menu follows the pointer at once (and a second press on its title closes it)
++                    if (down && sticky && index == _openSubmenuIndex && index >= 0)
++                        break;
++                    if (index != _openSubmenuIndex && [self _sfItemOpensAtIndex:index])
++                        [self _sfBarOpenIndex:index selectFirst:NO];
++                    lingerView = nil;
++                }
++                else if (view->_openSubmenuIndex >= 0 && index != view->_openSubmenuIndex) {
+                     // on to another item while a submenu is open: it lingers for a slanted move into it
+                     if (lingerView != view || lingerIndex != index) {
+                         lingerView = view;
+--- a/src/Frameworks/AppKit/NSThemeFrame.m
++++ b/src/Frameworks/AppKit/NSThemeFrame.m
+@@ -511,11 +511,15 @@
+ 
+    NSView *windowContent=[[self window] contentView];
+    NSMutableArray *others=[NSMutableArray array];
++   // the window's menu strip (NSWindowMenuStrip.m) lies over the full width at the top, the toolbar under it
++   NSView *menuStrip=[[self window] _sfMenuStripView];
+ 
+    // the content is the subview holding the window's contentView, views apps add here keep their own masks
+    for(NSView *view in _subviews){
+     if(view == _controlsView || view == _titlebarContainerView)
+      continue;
++    if(view==menuStrip)
++     continue;
+     if([view isKindOfClass:[NSToolbarView class]])
+      toolbarView=(NSToolbarView *)view;
+     else if(contentView==nil && windowContent!=nil && (view==windowContent || [windowContent isDescendantOf:view]))
+@@ -530,6 +534,12 @@
+ 
+    NSRect toolbarFrame=(toolbarView!=nil)?[toolbarView frame]:NSZeroRect;
+    NSRect contentFrame=[[[self window] class] contentRectForFrameRect:[self bounds] styleMask:[[self window] styleMask]];
++   if(menuStrip!=nil){
++    CGFloat stripHeight=NSHeight([menuStrip frame]);
++
++    [menuStrip setFrame:NSMakeRect(NSMinX(contentFrame),NSMaxY(contentFrame)-stripHeight,NSWidth(contentFrame),stripHeight)];
++    contentFrame.size.height-=stripHeight;
++   }
+    toolbarFrame.origin.y=NSMaxY(contentFrame)-toolbarFrame.size.height;
+    toolbarFrame.origin.x=contentFrame.origin.x;
+    toolbarFrame.size.width=contentFrame.size.width;
+--- a/src/Frameworks/AppKit/NSWindow.m
++++ b/src/Frameworks/AppKit/NSWindow.m
+@@ -413,6 +413,7 @@
+     }
+ 
+     _context = [self cgContext];
++    [self _sfUpdateMenuStrip];
+     return self;
+ }
+ 
+@@ -1334,6 +1335,12 @@
+ 
+    frame.size.height+=contentHeightDelta;
+    frame.origin.y-=contentHeightDelta;
++   // the toolbar is part of the frame: the limits of the frame move with it (a window whose nib
++   // fixes its size could not grow for its toolbar, and its content was cut off at the bottom)
++   if(_minSize.height>0)
++    _minSize.height=MAX(0,_minSize.height+contentHeightDelta);
++   if(_maxSize.height<32767)
++    _maxSize.height=MAX(0,_maxSize.height+contentHeightDelta);
+ 
+    NSPoint toolbarOrigin;
+    NSRect backgroundBounds=[self _backgroundView].bounds;
+@@ -1801,6 +1808,9 @@
+ 
+    if([_toolbar _view]!=nil && ![[_toolbar _view] isHidden])
+     result.size.height+=[[_toolbar _view] frame].size.height;
++   // the menu strip (NSWindowMenuStrip.m) is part of the frame, like the title bar
++   if(_menuView!=nil)
++    result.size.height+=NSHeight([_menuView frame]);
+ 
+     return result;
+ }
+@@ -1810,6 +1820,8 @@
+ 
+    if([_toolbar _view]!=nil && ![[_toolbar _view] isHidden])
+     result.size.height-=[[_toolbar _view] frame].size.height;
++   if(_menuView!=nil)
++    result.size.height-=NSHeight([_menuView frame]);
+ 
+    return result;
+ }
+--- a/src/Frameworks/AppKit/NSWindow-Private.h
++++ b/src/Frameworks/AppKit/NSWindow-Private.h
+@@ -47,4 +47,13 @@
+ - (BOOL)validateMenuItem:(NSMenuItem *)item;
+ - (void)dirtyRect:(NSRect)rect;
+ - (int)_resizeEdgesAtPoint:(NSPoint)point;
++- (void)_sendSizeLimits;
++@end
++
++// the main menu as a strip at the top of a standard window: NSWindowMenuStrip.m
++@interface NSWindow (SFMenuStrip)
+++ (BOOL)_sfMenuStripsEnabled;
++- (NSView *)_sfMenuStripView;
++- (void)_sfUpdateMenuStrip;
++- (BOOL)_sfMenuStripTakesKeyEvent:(NSEvent *)event;
+ @end
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -110,6 +110,10 @@
+ static BOOL sfMenuLoggedWaitingForMenu;
+ static BOOL sfMenuLoggedWaitingForServer;
+ 
++static BOOL sfMenuStripsStale;
++static BOOL sfLastWindowCheckPending;
++static BOOL sfHadWindow;
++
+ static NSDictionary *sfSerializeMenu(NSMenu *menu)
+ {
+     NSMutableArray *serializedItems = [NSMutableArray array];
+@@ -996,6 +1000,8 @@
+     if(![window isKindOfClass:[NSPanel class]])
+      [window setMenu:_mainMenu];
+    }
++   // each standard window shows the menu as its first row where the desktop has no menu bar
++   [[NSArray arrayWithArray:_windows] makeObjectsPerformSelector:@selector(_sfUpdateMenuStrip)];
+ 
+     [self sendMenusToWindowServer];
+     sfMenuNeedsPublish = YES;
+@@ -1107,6 +1113,15 @@
+ // an item's title, state or enabled flag changed, the menu bar gets the menu again
+ -(void)_sfMenuItemChanged {
+     sfMenuNeedsPublish = YES;
++    if(!sfMenuStripsStale){
++     sfMenuStripsStale = YES;
++     [self performSelector:@selector(_sfRefreshMenuStrips) withObject:nil afterDelay:0];
++    }
++}
++
++-(void)_sfRefreshMenuStrips {
++    sfMenuStripsStale = NO;
++    [[NSArray arrayWithArray:_windows] makeObjectsPerformSelector:@selector(_sfUpdateMenuStrip)];
+ }
+ 
+ - (oneway void)requestMenuUpdateForWindow:(NSNumber *)windowId
+@@ -1511,19 +1526,60 @@
+ -(void)_checkForTerminate {
+    int  count=[_windows count];
+ 
+-   // as on macOS an app outlives its last window unless its delegate asks otherwise
+-   if(![_delegate respondsToSelector:@selector(applicationShouldTerminateAfterLastWindowClosed:)])
++   /* As on macOS an app outlives its last window unless its delegate asks otherwise - where
++    * there is a menu bar or a Dock to reach it by. On a desktop whose windows carry the menu
++    * (NSWindowMenuStrip.m) an application without a window can never be reached again: there it
++    * ends once its last window has been closed (the default SFQuitsWithLastWindow=NO keeps it),
++    * through -terminate:, so its delegate is still asked. */
++   BOOL asks=[_delegate respondsToSelector:@selector(applicationShouldTerminateAfterLastWindowClosed:)];
++   BOOL unreachable=[self _sfEndsWithLastWindow];
++
++   if(!asks && !unreachable)
+     return;
+ 
+    while(--count>=0){
+     NSWindow *check=[_windows objectAtIndex:count];
+ 
+-    if(![check isKindOfClass:[NSPanel class]] && [check isVisible]){
++    if(![check isKindOfClass:[NSPanel class]] && ([check isVisible] || [check isMiniaturized])){
++     sfHadWindow=YES;
+      return;
+     }
+    }
++   // (this runs after every event: an application that has not shown its first window yet is not without windows)
++   if(!sfHadWindow)
++    return;
++
++   if(asks && [_delegate applicationShouldTerminateAfterLastWindowClosed:self]){
++    [self terminate:self];
++    return;
++   }
++   if(unreachable && !sfLastWindowCheckPending){
++    // not at once: an application may close one window to open the next
++    sfLastWindowCheckPending=YES;
++    [self performSelector:@selector(_sfLastWindowClosed) withObject:nil afterDelay:0.7];
++   }
++}
++
++-(BOOL)_sfEndsWithLastWindow {
++   static int allowed=-1;   // asked after every event
++
++   if(allowed<0){
++    id value=[[NSUserDefaults standardUserDefaults] objectForKey:@"SFQuitsWithLastWindow"];
++
++    allowed=(value!=nil && ![value boolValue]) ? 0 : 1;
++   }
++   if(!allowed)
++    return NO;
++   return [NSWindow _sfMenuStripsEnabled] && _windowServerServerDecorations() && [_mainMenu numberOfItems]>0;
++}
+ 
+-   if(![_delegate applicationShouldTerminateAfterLastWindowClosed:self])
++-(void)_sfLastWindowClosed {
++   sfLastWindowCheckPending=NO;
++   for(NSWindow *check in _windows){
++    if(![check isKindOfClass:[NSPanel class]] && ([check isVisible] || [check isMiniaturized]))
++     return;
++   }
++   if([self modalWindow]!=nil)
+     return;
+    [self terminate:self];
+ }
+@@ -1601,6 +1657,10 @@
+    if([event type]==NSKeyDown){
+     unsigned modifierFlags=[event modifierFlags];
+ 
++    // Control-F2: the keyboard's way into the front window's menu strip
++    if((modifierFlags&NSControlKeyMask) && [[self keyWindow] _sfMenuStripTakesKeyEvent:event])
++     return;
++
+     if(modifierFlags&(NSCommandKeyMask|NSAlternateKeyMask))
+      if([self _performKeyEquivalent:event])
+       return;

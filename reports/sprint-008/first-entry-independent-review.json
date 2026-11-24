@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "record": "first-entry-independent-review",
+  "recorded_at": "2026-11-08T03:00:12Z",
+  "reviewer": "Claude (independent, read-only review of local private evidence)",
+  "scope": {
+    "files_written": ["reports/sprint-008/first-entry-independent-review.json"],
+    "ssh": false, "hardware_accessed": false, "maclab_server_contacted": false,
+    "sanitization": "No serial numbers, ECIDs, user paths or log text are copied except the single bounded diagnostic console line defined in the reviewed source. Private evidence stays in runs/ (gitignored)."
+  },
+  "private_evidence_sha256": {
+    "runs/m1-unattended-008/kernel-entry-001/exception-context.bin": "da90a9504669cd11e2c0311c51337aee9178b87de2c384bd97f8a846e1f10082",
+    "runs/m1-unattended-008/kernel-entry-001/exception-context.json": "98badb770ed824d7f3d3ed08ccce56e30776fa089db43e791ba0f369466e266a",
+    "runs/m1-unattended-008/kernel-entry-001/before-start.json": "884f79a8846ebef0ff1ef3fb1d268c2788ab7f194331455e4edc25b1b00e0b6c",
+    "runs/m1-unattended-008/kernel-entry-001/original-observations.json": "ed858bc713451290bb714c01cf4412ffb20c72bf4df366320d3ef347fc09bf0e",
+    "runs/m1-unattended-008/kernel-entry-001/worker.log": "4cfa367587a8a84bb0c54cee5e5a718034184b971961a42ffc08e2f7344ac450",
+    "runs/m1-unattended-008/kernel-entry-001/host-result.json": "f4f9d180eb6b295b23e8c71dd41831350d5ff6a8a63a3768484055c7ef9a6a97",
+    "runs/m1-unattended-008/kernel-entry-001/evidence.private.tar": "b283f017b1ebd6a6f8b3ec2488c51004993ed9e1d1b1f2511aa796a775c8f162 (hash only; contents not reviewed)"
+  },
+  "source_inputs_sha256": {
+    "artifacts/m1-firstboot-007-r6/kernel.macho": "d6c7ba75025d595d12e171810b89344dfaa6b467f7a444bcce277a35b8175ff2 (matches packet manifest)",
+    "artifacts/m1-firstboot-007-r6/manifest.json": "112e18a9a11db7c4638f735783945787b5c14ef613a3302b60d9a5102608dcb3",
+    "artifacts/m1-firstboot-007-r6/m1n1.bin": "05b36cc8288843211e97bd4f68adcf521c81e5e68afd98a4d094a6f03defb32c (exact 121fcbf image)",
+    "integrations/puredarwin/m1-firstboot/host_console.py": "a9f68695c6465bc5a3c1a9df04f67da6a72f99265e899cf3b89ba671ab6d4417 (frozen; unchanged from the reviewed capture code)"
+  },
+  "method": "Decoded exception-context.bin independently as the pinned 368-byte ExcInfo layout (proxyclient/m1n1/proxy.py:84-98) with a reviewer scratch parser. Derived the expected park address directly from the packet kernel Mach-O (LC_UNIXTHREAD entry, __start and _darwin_lab_m1_first_entry symbols, the entry branch, the unique console literal and the last b . before it), then mapped it through before-start.json's guest_base and vmin.",
+  "verdict": "FIRST_REAL_M1_PRE_VM_XNU_ENTRY_CHECKPOINT_INDEPENDENTLY_CORROBORATED",
+  "findings": {
+    "kernel_and_entry": [
+      "The packet kernel hash matches the manifest; the LC_UNIXTHREAD entry equals __start (0xfffffe000779a490), which branches to _darwin_lab_m1_first_entry (0xfffffe000779a494).",
+      "The park is the self-branch at first_entry + 0xCC (0xfffffe000779a560), immediately followed by the console literal (0xfffffe000779a564). vmin 0xfffffe0004004000 matches before-start.json.",
+      "Expected physical entry guest_base + entry - vmin = 35801359504 equals the layout entry and the worker log's 'Jumping to entrypoint at 0x855ed6490'."
+    ],
+    "raw_context_vs_expected": {
+      "elr": "35801359712 = guest_base + park - vmin (exact); elr_phys identical (MMU off)",
+      "x0": "35827777536 = guest_base + bootargs_off (BootArgs pointer preserved)",
+      "x19": "3 (complete console line, then TXE observed)",
+      "spsr": "0x600003c5: mode/DAIF bits 0x3c5 = EL1h with D, A, I, F masked; NZCV 0110 is consistent with the final cmp x10,#0x22 succeeding on the Icestorm path",
+      "cpu_id": "0; MPIDR Aff0/Aff1 = 0",
+      "decoded_json_agreement": "Independent decode equals exception-context.json observed values; event (reason 3, code 3) = (START.HV, HV_EVENT.USER_INTERRUPT); alarm_requested and interrupt_write_completed are true; expected_park_conditions_match is true."
+    },
+    "corroborating_registers": [
+      "x1 = 0x235200000 (pinned T8103 UART base); x5 = 0x6 (UTRSTAT TXBE|TXE as emulated by the m1n1 VUART); x4 = 0x100000 (drain budget untouched, as expected under VUART); x9 = 0x611f0221 (MIDR implementer 0x61, part 0x022 Icestorm); x10 = 0x22.",
+      "Stale syndrome from the last synchronous trap (FIQ entry does not update ESR/FAR): ESR 0x93850007 = data abort from lower EL, valid ISS, 32-bit read into x5; FAR = 0x235200010 = UART base + UTRSTAT. The last trapped guest access was therefore the final UTRSTAT poll before the park."
+    ],
+    "console_line": "worker.log contains exactly one 'HVLOG: DARWIN_LAB_M1_EARLY_CONSOLE checkpoint=entry-before-vm next=park kernel_init=not_started' (shown with the host proxyclient 'TTY> ' prefix for raw m1n1 console bytes), between the entrypoint jump and 'HV: User interrupt'. This matches the m1n1 hv_vuart HVLOG pass-through path.",
+    "identity_and_preconditions": "original-observations.json: target J293 / MacBookPro17,1, ADT and proxy chip 0x8103, uart0 0x235200000, exactly one running CPU (id 0), observation layout equal to before-start.json. Pre-start guest SCTLR_EL12 0x100030d50980 (M=0, MMU off); VPIDR_EL2 0x611f0221 (equals the real Icestorm MIDR).",
+    "capture_behavior": "The worker log shows BoundedStop raised from the wrapped _load_context inside the HV_START reply (no continuation, no p.exit). host-result.json reports worker exit 1 with no boot verdict and target state unknown, as designed.",
+    "resolved_prior_unknowns": [
+      "The m1n1 HV tick preempted a guest spinning with DAIF fully masked: the USER_INTERRUPT arrived at the park.",
+      "Pinned m1n1 left guest SCTLR_EL1.M = 0 and VPIDR_EL2 = the real MIDR on this machine."
+    ]
+  },
+  "conclusion": "Independent evidence supports that the hash-bound packet XNU kernel's real __start entry ran on the M1's boot CPU (cpu0, Icestorm) as an m1n1 HV guest at EL1 with the MMU off, passed its EL/MMU/MIDR checks, emitted the complete bounded console line through the VUART path, and parked at the expected self-branch with interrupts masked and the BootArgs pointer intact.",
+  "limits": [
+    "This is a pre-VM diagnostic checkpoint only: kernel_init=not_started; no VM, IOKit, kexts, launchd, native OS or userspace ran.",
+    "It ran as an m1n1 hypervisor guest (EL1, stage 2 active), not bare metal; UART traffic was VUART emulation, so real UART readiness, polling and timeout were not exercised.",
+    "Single observation; repeatability not yet shown.",
+    "ESR/FAR interpretation relies on FIQ entry not updating those registers; it is consistent with, but not required for, the conclusion.",
+    "Target state after the host disconnected is unknown (autonomous reboot possible); recovery to Linux is root's separate step.",
+    "evidence.private.tar was hashed but not inspected; m1n1 HV host identity relies on host_console's live tag check having passed (the run proceeded past collect)."
+  ],
+  "boot_proof": false,
+  "native_os_or_userspace_observed": false,
+  "hardware_accessed_by_reviewer": false
+}

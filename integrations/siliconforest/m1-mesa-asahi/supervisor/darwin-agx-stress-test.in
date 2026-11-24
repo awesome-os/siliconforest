@@ -1,0 +1,16 @@
+#!/bin/sh
+# Guest side of a GPU repeat test: the off-screen GL test on the GPU, many times in sequence,
+# then four at once. (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin; export PATH
+B=8fee6b41134a7b3eaa7e9b0f61aa6e907d21cafd4a2685a00a4699c3b32da274
+printf '\nDL41_STRESS_BEGIN_%s\n' "$nonce"
+pass=0; fail=0; i=0; start=$(date +%s)
+while [ $i -lt 40 ]; do
+    if agx-offscreen-test --require-renderer "Apple M1" --expect-b $B >/tmp/agx.out 2>&1; then pass=$((pass+1)); else fail=$((fail+1)); grep -v '^agx-offscreen-test:   ' /tmp/agx.out | tail -4 | cut -c1-160; fi
+    i=$((i+1))
+done
+printf 'DL41_SEQUENTIAL pass=%s fail=%s seconds=%s\n' "$pass" "$fail" "$(( $(date +%s) - start ))"
+for n in 1 2 3 4; do ( agx-offscreen-test --require-renderer "Apple M1" --expect-b $B >/tmp/agx.$n 2>&1; echo "DL41_PARALLEL $n rc=$?" ) & done
+wait
+printf 'DL41_STRESS_END_%s\n' "$nonce"

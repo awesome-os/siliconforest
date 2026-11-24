@@ -1,0 +1,172 @@
+{
+ "report": "sprint-009 platform path (independent source review + bounded platform patch)",
+ "author_role": "independent reviewer/implementer (Claude), pane-reported",
+ "date": "2026-11-07",
+ "claim_class": "source_architecture_and_uncompiled_patch",
+ "status": "SOURCE_PATCH_READY_NOT_COMPILED_NOT_BOOTED",
+ "pins": {
+  "puredarwin": "e7aa00a60f0b56ef35aa24252e81467787bf71ea",
+  "m1n1": "121fcbf35d4501814b58ca5347926a4173b6a512"
+ },
+ "inputs_not_reverified_here": {
+  "adt_facts_from_root": "Root parsed the existing increment008 cycle003 guest ADT offline (private runs/m1-bringup-009). Used as given: cpu0 interrupts=[70] count 1, interrupt-parent 112; other 7 CPUs removed by HV; AIC phandle 112 compatible aic,1; pmgr phandle 135 pmgr1,t8103; uart0 parent 112 irq 605; timebase 24 MHz; /chosen has no lock-regs. Not reparsed by this reviewer."
+ },
+ "findings": [
+  {
+   "id": "F1",
+   "severity": "blocking",
+   "fact": "T8103 board_config sets USE_APPLEARMSMP=1. xnu's cpu_boot_thread (iokit/Kernel/arm/AppleARMSMP.cpp) owns ml_processor_register and processor_boot, and waits for: the IOPlatformExpert to match; a child IC registered into PassthruInterruptController; IOPMGR (UINT64_MAX wait); per-cpu IOPlatformDevice nubs. sleh_irq calls PE_handle_ext_interrupt, which goes through Passthru to the child. Generic IOCPU.cpp paths are compiled out."
+  },
+  {
+   "id": "F2",
+   "severity": "blocking",
+   "fact": "PDArmPlatformExpert::start builds PDArmCPU. startForCPU calls PDArmGIC_map_cpu, which returns false because gGicrAll is NULL (PDArmGIC_init is never called on Apple), so PE start fails before PDAppleAIC_init. Even without that failure, PDArmCPU would double-register processors against cpu_boot_thread."
+  },
+  {
+   "id": "F3",
+   "severity": "blocking",
+   "fact": "PDAppleAIC registered only gIODTDefaultInterruptController. ADT nubs with interrupts+interrupt-parent are named IOInterruptController%08X(phandle) by IODTInterruptControllerName, so IOService::registerInterrupt would sleep THREAD_UNINT forever in lookUpInterruptController."
+  },
+  {
+   "id": "F4",
+   "severity": "functional",
+   "fact": "PDAppleAIC never unmasked a source after dispatch. Reading AIC_EVENT masks it (Linux irq-apple-aic.c aic_irq_eoi), so each device IRQ fired once."
+  },
+  {
+   "id": "F5",
+   "severity": "blocking",
+   "fact": "An IOPMGR is required. ApplePMGR is unavailable. IOPMGR.h and its vtable, metaclass and constructors are exported in config/IOKit.exports."
+  },
+  {
+   "id": "F6",
+   "severity": "info",
+   "fact": "Timer and IPI need no PD driver. H13 sleh_fiq (HAS_IPI, no HAS_GICV3_FIQ) handles fast IPIs via IPI_SR and otherwise calls ml_get_timer_pending and rtclock_intr. ml_processor_register returns pmi_handler NULL (no CPMU_AIC_PMI)."
+  },
+  {
+   "id": "F7",
+   "severity": "info",
+   "fact": "m1n1 HV HCR, from source; runtime value not observed. C hv_init (src/hv/hv.c:183-189) writes HCR without FMO/IMO. The proxyclient HV.init() then sets FMO=1, IMO=0, TACR=1, TIDCP=0, TVM=0, TTLBOS=1 (proxyclient/m1n1/hv/__init__.py:1405-1416) before hv_start. hv_start only copies HCR for secondaries; later C writes toggle only VF (hv_exc.c hv_update_fiq) and TTLB (hv_sprr.c). So physical FIQs go to m1n1 at EL2. Guest CNTP/CNTV timer, IPI and PMC FIQs are injected separately as a virtual FIQ (HCR_VF, timer gated via VM_TMR_FIQ_ENA). Physical IRQs (IMO=0) are taken by the guest at EL1. /arm-io MMIO, including the AIC, is mapped HW passthrough unless traced. IPI_SR, IPI_RR and PMCR0 are trapped and emulated; CYC_OVRD writes setting DISABLE_WFI_RET or FIQ_MODE are refused.",
+   "correction": "Revision 2: the first handoff wrongly said HCR has no FMO; root flagged it from the Python HV.init."
+  },
+  {
+   "id": "F8",
+   "severity": "info",
+   "fact": "m1n1 hv_vuart hooks uart0 with RX (UTRSTAT.RXD/URXH from the USB vUART iodev). That suits xnu's polled Samsung pe_serial and the serial keyboard poll (serial=3) once the timer FIQ runs."
+  },
+  {
+   "id": "F9",
+   "severity": "blocking_for_kernel_owner",
+   "fact": "With KERNEL_INTEGRITY_CTRR, ml_lockdown_init calls rorgn_stash_range, which calls find_lock_group_data and panics with '/chosen/lock-regs not found', because the observed ADT has none. The only early-outs: -unsafe_kernel_text (DEVELOPMENT/DEBUG only; the firstboot experiment requires DEBUG) or CONFIG_CSR_FROM_DT unsafe text. Either way CTRR stays unlocked and kernel text is not hardware-protected. Honest options: (a) DEBUG plus -unsafe_kernel_text, declared as CTRR not engaged; (b) omit KERNEL_INTEGRITY_CTRR in the experiment board block, declared. Do not synthesize lock-regs."
+  },
+  {
+   "id": "F10",
+   "severity": "info",
+   "fact": "With cpu0 interrupts count 1, register_aic_handlers takes neither the legacy 3-IPI branch nor the PMI branch (pmi NULL), so no ADT property changes are needed for CPU service. The ADT topology is 1 CPU under HV; cpus=1 is still recommended (ml_parse_cpu_topology honors it)."
+  }
+ ],
+ "required_adt_and_cpu_service_changes": {
+  "adt_edits": "none for CPU service, given the observed cpu0 interrupts=[70]",
+  "kernel_side": "keep upstream USE_APPLEARMSMP; no PDArmCPU on Apple",
+  "platform_side": "this patch: Apple PE skips PDArmCPU; AIC phandle-name registration; boot-CPU IOPMGR",
+  "boot_args_recommended": [
+   "cpus=1",
+   "serial=3 (console in/out over the HV vUART)",
+   "-unsafe_kernel_text only if the kernel owner keeps CTRR compiled in (DEBUG), declared as CTRR not engaged"
+  ]
+ },
+ "earliest_breakpoints": [
+  {
+   "id": "B0",
+   "owner": "kernel (Astra)",
+   "item": "the first-entry park must be gone from both cold entries; that build cannot proceed by design"
+  },
+  {
+   "id": "B1",
+   "owner": "kernel",
+   "item": "arm_init/arm_vm_init/pmap without XNU_MONITOR/PMAP_CS: first never-executed code on M1"
+  },
+  {
+   "id": "B2",
+   "owner": "kernel",
+   "item": "PE_init_platform, timebase (24 MHz in ADT), serial_init on uart0 through hv_vuart"
+  },
+  {
+   "id": "B3",
+   "owner": "kernel",
+   "item": "ml_lockdown_init/rorgn_stash_range CTRR panic without lock-regs (F9); later machine_lockdown"
+  },
+  {
+   "id": "B4",
+   "owner": "platform (this patch)",
+   "item": "IOKit: PE match, Passthru, PMGR publish, AIC child, cpu_boot_thread, processor_boot(boot cpu), gIOAllCPUInitializedKey"
+  },
+  {
+   "id": "B5",
+   "owner": "root/userspace",
+   "item": "BSD root: KC with PDArmPlatformExpert, rd=md0 ramdisk with launchd and shell, serial console tty"
+  }
+ ],
+ "patch": {
+  "path": "integrations/puredarwin/m1-bringup-platform/platform.patch",
+  "sha256": "c4a4e83a202177c7e91e5a0d9b187d657fa0f11fa8f0b554827fb8a2501a8c12",
+  "applies_to": "PureDarwin e7aa00a, src/Kernel/Extensions/PDArmPlatformExpert only",
+  "files": [
+   "CMakeLists.txt",
+   "PDAppleAIC.cpp",
+   "PDAppleBootCPUPMGR.cpp (new)",
+   "PDAppleBootCPUPMGR.h (new)",
+   "PDArmPlatformExpert.cpp"
+  ],
+  "generic_path": "unchanged; the base startProcessors() is the original loop moved verbatim (test-checked)",
+  "success_stubs": "none; secondary core and cluster requests panic with the reason; idle is a declared WFI-only policy"
+ },
+ "checks": {
+  "source_tests": "python3 integrations/puredarwin/m1-bringup-platform/test_platform_patch.py: 10/10 passed, including 8 caught mutants",
+  "test_sha256": "cd5e5e1d254ffdce2ed28db1eadbbf8004bc2f1fd7230134ad51da601528c407",
+  "compile": "NOT DONE. Host clang 22 and the store Darwin cross clang++ both stop in the built Kernel.framework headers (IOLib.h/OSData.h typed-allocator templates) before reaching patch code. The first compile is root's platform build."
+ },
+ "residual_risks": [
+  "Apple PE start waits up to 30 s for Passthru. No-deadlock reasoning is source-only (cpu_boot_thread waits for kIOServiceMatchedState, which the async PE registerService sets); needs runtime evidence.",
+  "PDAppleAIC handleInterrupt loops with 'continue' on non-ExtInt AIC events; an unacknowledged AIC IPI event could livelock. Not expected with fast IPIs and HV emulation.",
+  "PE_halt_restart is the PSCI handler on Apple too; reboot(2) would issue hvc/smc with no PSCI behind it. Needs a real reset path later.",
+  "Retention WFI (HAS_RETENTION_STATE, arm64_retention_wfi) under m1n1 HV is unverified at runtime.",
+  "The boot-framebuffer nub publication on M1 is unverified."
+ ],
+ "not_claimed": [
+  "compile",
+  "link",
+  "kernel collection inclusion",
+  "kext load",
+  "boot",
+  "interrupt delivery on hardware",
+  "userspace"
+ ],
+ "hardware_or_ssh_used": false,
+ "frozen_files_modified": false,
+ "revision": 3,
+ "built_artifact_export_review": {
+  "scope": "read-only llvm-nm/strings/plist comparison; no load or boot",
+  "kext": "/nix/store/7s13ygyk7av9b5ryydvqzx13x82sbiph-puredarwin-m1-bringup-platform-0.1/.../PDArmPlatformExpert.kext (binary sha256 prefix 3ede4251724b8974)",
+  "kernel": "/nix/store/vnvmpk43am2q49h0wf7ajgg4zxdj48dm-puredarwin-kernel-arm64-t8103-bringup-0.1/System/Library/Kernels/kernel.debug.t8103 (sha256 prefix ce5c7ee376174ba2)",
+  "baseline_for_diff": "/nix/store/m37z8jk1n8qgz8dm15ambpbh5jhq1r81-puredarwin-kexts-arm64-0.1 PDArmPlatformExpert (a388qdcp... identical undefined set)",
+  "undefined_symbols": 507,
+  "undefined_not_defined_by_kernel": [
+   "dyld_stub_binder (also undefined in baseline)"
+  ],
+  "new_undefined_vs_baseline": [
+   "__ZN6IOPMGR10gMetaClassE",
+   "__ZN6IOPMGRC2EPK11OSMetaClass",
+   "__ZN6IOPMGRD2Ev",
+   "__ZN9IOService15serviceMatchingEPKcP12OSDictionary",
+   "__ZN9IOService22waitForMatchingServiceEP12OSDictionaryy"
+  ],
+  "new_symbols_status": "all 5 defined by the native kernel and listed in IOKit.exports (com.apple.kpi.iokit, declared)",
+  "pre_existing_non_kpi": "89 IOPlatformExpert/IODTPlatformExpert/IOCPU/IOCPUInterruptController references absent from the declared arm64 KPI export lists; identical set in the baseline kext, not introduced by this patch; resolution depends on the KC builder, as for baseline",
+  "info_plist": "byte-identical to baseline (OSBundleLibraries and personalities unchanged)",
+  "binary_contains_apple_path": "strings show the Passthru matching name, the AppleARMSMP log lines and the PMGR fail-stop panic strings",
+  "kernel_observations": {
+   "applearmsmp_compiled": "PE_cpu_start_from_kext, PE_handle_ext_interrupt, PassthruInterruptController metaclass and IOCPUInitialize are defined",
+   "ctrr_lockdown_code": "no rorgn_* symbols and no 'lock-regs: /chosen/lock-regs not found' string in kernel.debug.t8103; ml_lockdown_init present. CTRR lock-group code appears not linked in this image, so F9's panic would not occur with it. No CTRR decision is recorded in the sprint-009 reports; the kernel owner should declare the omission."
+  }
+ }
+}

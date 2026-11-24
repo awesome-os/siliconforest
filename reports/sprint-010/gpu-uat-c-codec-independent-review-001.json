@@ -1,0 +1,137 @@
+{
+  "schema_version": 1,
+  "reviewer": "Astra",
+  "review_date": "2026-11-08",
+  "status": "APPROVE_SCALAR_SOFTWARE_SCOPE_WITH_PRE_INTEGRATION_API_FIXES",
+  "scope": "Independent read-only review of the frozen T8103 scalar C codec against Python003 and locally pinned primary-source numeric facts. This receipt is the only file written for this review.",
+  "hardware_operation": false,
+  "sdk_build": false,
+  "production_source_changed": false,
+  "current_consumer": "None reported; no mapper, table walker, firmware-table adoption, MMIO or DMA consumer is qualified here.",
+  "binding": {
+    "directory": "integrations/puredarwin/m1-gpu-uat/c",
+    "PROVENANCE.json": "3be8968d8dea5a689d0a551d779dd959e7946f471ac62fce87527b9175d9c0f9",
+    "uat_t8103.h": "1533eb634517cd582c3d0f33634e61e1c699ac8e0e36350fb9a9b452d34ae1ac",
+    "uat_t8103.c": "a45204f77243734029c63d253b1cd04b8ee11922c011d48b53e24785c7e4f2d1",
+    "test_uat_t8103.c": "a5f46eb5169eb4b478c28b168f805f586e7feb73e4578ec71c072ff457cfea96",
+    "test_uat_oracle.py": "dfcb5d8ded2935f6170009144054f6b07ea4cb6d3f636a243274cc07de22c243",
+    "README.md": "70245415469a56c90998c6a4448ddb6c5c7a20828a888843ed47117a315ae060",
+    "python003_path": "integrations/puredarwin/m1-gpu-uat/revisions/003/uat_codec.py",
+    "python003_sha256": "97b2b9a706ab6112e59047c4f70ba8f116d3f4e4dcaaec487207acc91973f252",
+    "verification": "Independently recomputed all five original-file hashes and sizes, oracle hash and size, every listed Python001/002/003 archive hash, and all seven reference-file hashes, sizes and Git blob IDs. Every value matched PROVENANCE.json. Reference contents were read as data; no m1n1 modules were imported. This confirms the locally retained provenance binding, not a new remote acquisition."
+  },
+  "findings": [
+    {
+      "id": "C1",
+      "priority": "FIX_BEFORE_CPP_INTEGRATION",
+      "title": "Public declarations lack C linkage guards",
+      "evidence": ["integrations/puredarwin/m1-gpu-uat/c/uat_t8103.h:65-96"],
+      "conclusion": "Confirmed root's observation. A C++ IOKit caller including this header normally declares mangled C++ functions, whereas separately compiling uat_t8103.c as C supplies C symbols. Existing C/ctypes tests do not cover that linkage boundary. This is a prospective linkage blocker, not a current scalar encoding failure.",
+      "action": "Wrap public function declarations in an __cplusplus-guarded extern C block. Preserve C compilation of the implementation and the existing struct layouts.",
+      "test": "Compile the codec with a C compiler, compile a separate C++ caller including the public header directly, and link them. Call uat_pa_bits and encode/decode one page through that linked interface; require the expected result. A test that compiles both files as C++ or wraps the include externally would not test this fix."
+    },
+    {
+      "id": "C2",
+      "priority": "FIX_BEFORE_CONSUMER_INTEGRATION",
+      "title": "translated means a decoded PA base is present, not a completed translation",
+      "evidence": [
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.h:46-57",
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.c:312-322",
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.c:347-357",
+        "integrations/puredarwin/m1-gpu-uat/revisions/003/uat_codec.py:278-333"
+      ],
+      "conclusion": "Confirmed root's observation. TTBR/table/page decode sets translated=1 after extracting the aligned descriptor address. No VA is supplied, no table walk happens, and no page offset is added. For TTBR/table this is a next-table base. Even for a page it is only the output-page base. Python003 represents this by presence of the pa field. Block/empty decode leaves the flag zero.",
+      "action": "Rename the one-byte field to has_pa, preserving its offset and the 48-byte struct size. Document pa as a decoded base and distinguish kind TABLE from PAGE. Do not introduce a translation-success flag or invent a walker in this revision.",
+      "test": "Require has_pa=1 for valid TTBR/table/page including PA zero, and has_pa=0 for empty/block. Check a page base separately from a nonzero virtual offset; neither the decode flag nor its pa value may imply that offset was applied. Keep block refusal tests checking that the supplied PA sentinel remains unchanged."
+    },
+    {
+      "id": "C3",
+      "priority": "LOW_DOCUMENTATION",
+      "title": "Header's blanket refusal promise contradicts the block-facts API",
+      "evidence": [
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.h:1-3",
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.h:91-95",
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.c:385-405"
+      ],
+      "conclusion": "The top comment says a refused call leaves outputs unchanged, but UAT_REFUSED intentionally writes block facts. The more specific API comment and README describe the implementation correctly. Error returns leave facts unchanged; a valid refusal publishes facts while preserving the separate PA output.",
+      "action": "Change the top comment to distinguish UAT_ERR_* from valid UAT_REFUSED. Document ordinary valid caller-owned buffers and disjoint PA/facts storage for the unchanged-PA guarantee; facts publication cannot preserve a PA object aliased into those facts.",
+      "test": "Retain separate poisoned PA/facts tests for valid nonzero-offset refusal and malformed input. Do not count UAT_REFUSED as a successful translation."
+    },
+    {
+      "id": "C4",
+      "priority": "LOW_TEST_CLARITY",
+      "title": "One named expected-status check is tautological",
+      "evidence": ["integrations/puredarwin/m1-gpu-uat/c/test_uat_oracle.py:287-290"],
+      "conclusion": "assertEqual(code, code) does not check the tuple's named expected error. compare_decode already checks C/Python agreement and output preservation, so this is not a missing differential check or a discovered codec bug. It does omit an independent assertion of the stated descriptor/alignment/address classifications.",
+      "action": "Compare the actual decoded status to the tuple's expected status, or remove the unused label and tautology. Prefer retaining the explicit independent expected-code assertion."
+    }
+  ],
+  "numeric_review": [
+    {
+      "topic": "Geometry and widths",
+      "result": "MATCH",
+      "evidence": [
+        "sources/m1n1-baseline/proxyclient/m1n1/hw/uat.py:243-266",
+        "sources/m1n1-baseline/proxyclient/m1n1/hw/uat.py:298-301",
+        "sources/linux-aurora-gpu-reference/drivers/gpu/drm/asahi/hw/t8103.rs:10-17",
+        "sources/linux-aurora-gpu-reference/drivers/gpu/drm/asahi/hw/mod.rs:216-219",
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.c:20-35",
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.c:53-76"
+      ],
+      "details": "16 KiB pages, 40-bit physical outputs, two roots selected at bit 39, shifts 39/36/25/14, entry counts 2/8/2048/2048, 64 contexts with 16-byte stride, and 16-bit ASID agree. The 48-bit descriptor address field is not accepted as a 48-bit physical-output limit. G15's shift 42 is excluded. Canonical acceptance is the deliberate Python003 policy: zero-extended raw 40-bit addresses or proper sign extension of that 40-bit field, not arbitrary truncation."
+    },
+    {
+      "topic": "Descriptor masks, roles and reserved bits",
+      "result": "MATCH",
+      "evidence": [
+        "sources/m1n1-baseline/proxyclient/m1n1/hw/uat.py:40-84",
+        "sources/m1n1-baseline/proxyclient/m1n1/hw/uat.py:129-134",
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.c:15-18",
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.c:212-247",
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.c:291-358"
+      ],
+      "details": "TTBR ASID 63:48/address 47:1/valid 0 and PTE named fields match the primary definitions. PTE bits 5, 13:12, 52:48 and 63:56 are refused. Bits 47:40 in address fields fail the independent 40-bit PA bound. Nonzero invalid descriptors fail; zero is explicitly empty. Level 0 is TTBR-only; level 3 requires page type; only levels 1 and 2 admit block facts. Flags are range-checked without truncation. This conservative named-field acceptance does not claim hardware support for every flag combination."
+    },
+    {
+      "topic": "Integer bounds and output preservation",
+      "result": "NO_SCALAR_BLOCKER_FOUND",
+      "evidence": [
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.c:30-43",
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.c:143-194",
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.c:249-358",
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.c:360-383"
+      ],
+      "details": "All shifts use bounded constants or validated level-derived shifts. The uint32 index is widened before multiplying by eight; start+8 cannot overflow uint64. Context multiplication follows a less-than-64 check. PA alignment and the 40-bit bound prevent an aligned represented span from crossing that bound for the supported spans. Decode builds a private local record and publishes only after validation; scalar encoders assign outputs last; byte stores validate the complete eight-byte range before writing. Buffer validity/lifetime remains a caller responsibility. These byte stores are ordinary software serialization, not atomic live page-table publication, cache maintenance or hardware barriers."
+    },
+    {
+      "topic": "Blocks and unsupported formats",
+      "result": "REFUSAL_PRESERVED",
+      "evidence": [
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.c:78-86",
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.c:347-355",
+        "integrations/puredarwin/m1-gpu-uat/c/uat_t8103.c:385-405",
+        "integrations/puredarwin/m1-gpu-uat/revisions/003/uat_codec.py:336-387"
+      ],
+      "details": "The only accepted format name is exactly t8103. The scalar API has fixed T8103 geometry. Block decode exposes raw_output and span but no PA-presence flag; uat_refuse_block validates level/canonical VA/aligned bounded raw output, records the nonzero virtual offset as a fact and never computes or stores a translated PA. Python003's table walker is not ported. No additional generation, broad format, identity fallback or successful block translation is introduced."
+    }
+  ],
+  "provenance_review": {
+    "m1n1_pin": "121fcbf35d4501814b58ca5347926a4173b6a512",
+    "linux_reference_pin": "6a08a08e57558083f552733a5276d71b1a4d8ff6",
+    "result": "Reference bytes, sizes and Git blob IDs match the recorded acquisitions. Numeric facts are correctly separated from the lab commit and from the pending license selection for original code. No upstream license was replaced by this review.",
+    "limit": "Source inspection and matching hashes support the declared numeric provenance. They are not an independent legal authorship determination or permission to publish under an unselected license."
+  },
+  "validation_evidence": {
+    "root_log": "runs/m1-desktop-010/uat-c-root-check-001.log",
+    "root_log_sha256": "dc0a97d57f63ea4ba7fbabd296419b657d3dd51105e425629b9c45da2e14e573",
+    "observed_log": "uat t8103 host checks passed; Ran 7 tests; OK",
+    "reviewed_test_coverage": "The runner compiles a freestanding C object with no unresolved symbols, runs the C assertion suite under ASan/UBSan with leak detection disabled, checks the explicit NDEBUG rejection, and exercises a ctypes oracle comparison. The source covers all 4096 flag combinations, seeded address/ASID cases, canonical boundaries, reserved bits, unchanged outputs and nonzero block offsets, plus 40-to-48-bit and reserved-bit-5 mutants.",
+    "independent_actions": "Read the implementation, public header, provenance, tests, Python003 and pinned numeric source definitions; independently recomputed every listed hash/size/blob binding. Did not rerun or claim ownership of root's C test execution. No SDK or hardware tests performed."
+  },
+  "ordered_next_steps": [
+    "Preserve frozen C revision001 and this exact provenance binding.",
+    "In the next revision add extern C guards, rename translated to has_pa without changing record layout, and clarify the refusal contract. Correct the tautological named-status assertion while updating tests.",
+    "Run the existing host differential/sanitizer/mutation suite plus a separately compiled C/C++ linkage test; freeze new before/after hashes. Keep any future hardware adapter subject to separate ownership, invalidation and lifetime review."
+  ],
+  "runtime_conclusion": "No scalar numeric correctness blocker found in the reviewed software scope. This review establishes neither GPU address translation nor initialized UAT, firmware ownership, DMA safety, an IOMapper, a native SDK artifact or runtime readiness."
+}

@@ -1,0 +1,109 @@
+Proposed changes to SiliconForest fbsdkpi/sf/lkpi/sf_linux_of.c for the GPU
+nodes published by SFGpuDT. NOT APPLIED and not compiled: this directory
+may not edit that file. Line numbers are those of
+sources/puredarwin-m1-desktop/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_of.c.
+
+1. A node can say which of its properties are text.
+
+   to_fdt() decides from the bytes whether a property is text or cells. A cell
+   whose little-endian bytes are printable characters and a trailing NUL is
+   taken for text and handed to the driver unswapped. That happens to one value
+   of this machine's GPU table: opp01 opp-microwatt = 3817800 = 0x003a4148,
+   stored as 48 41 3a 00 ("HA:"), which the driver would read as 1212234240.
+   With "pd,string-props" (a NUL-separated list of names) on the node, the list
+   decides and the bytes are not inspected.
+
+--- a/sf/lkpi/sf_linux_of.c
++++ b/sf/lkpi/sf_linux_of.c
+@@ -139,6 +139,24 @@ tuples_to_be(uint8_t *out, const uint8_t *in, uint32_t len, const uint32_t *f, i
+ 	return (true);
+ }
+ 
++// text or cells: a node that lists its text properties in "pd,string-props" is believed, any
++// other node is judged by the loader's rule
++static bool
++is_text(void *entry, const char *name, const uint8_t *in, uint32_t len)
++{
++	const void *list;
++	uint32_t n;
++
++	if (sfos_dt_prop(entry, "pd,string-props", &list, &n) != 0)
++		return (looks_like_strings(in, len) || ends(name, "-names"));
++	if (n == 0 || ((const char *)list)[n - 1] != 0)
++		return (false);
++	for (const char *p = list; p < (const char *)list + n; p += strlen(p) + 1) {
++		if (strcmp(p, name) == 0)
++			return (true);
++	}
++	return (false);
++}
++
+ // the inverse of the loader's import, so drivers see the property exactly as the fdt had it
+ static void
+ to_fdt(void *entry, const char *name, const uint8_t *in, uint32_t len, uint8_t *out)
+@@ -150,7 +168,7 @@ to_fdt(void *entry, const char *name, const uint8_t *in, uint32_t len, uint8_t *
+ 	    name[0] == '#';
+ 	void *parent = sfos_dt_parent(entry);
+ 
+-	if ((!numeric && (looks_like_strings(in, len) || ends(name, "-names"))) || len % 4 != 0) {
++	if ((!numeric && is_text(entry, name, in, len)) || len % 4 != 0) {
+ 		memcpy(out, in, len);
+ 		return;
+ 	}
+
+2. Symbols the Rust abstractions bind that the layer does not define. Checked
+   against all of sources/puredarwin-m1-desktop/src/Kernel/fbsdkpi/ and
+   integrations/siliconforest/m1-rust-kext/ (whole-word search, .c/.cpp/.h).
+   The driver's T8103 path does not use the OPP library (no dev_pm_opp_*, no
+   kernel::opp): it walks the table's children itself.
+
+   Implemented in sf_linux_fwnode.c in this directory (about 190 lines of code;
+   host-tested against stand-in headers, not compiled against the layer's):
+
+     of_reserved_mem_region_to_resource_byname   used by the driver (5 call sites)
+     of_reserved_mem_region_to_resource
+     __dev_fwnode                                 used by the driver (fwnode())
+     fwnode_property_read_u32_array               used by the driver (firmware-compat,
+                                                  firmware-version, debug sizes)
+     fwnode_property_read_u8_array, _u16_array, _u64_array
+     fwnode_property_present, fwnode_property_read_bool
+     fwnode_property_read_string, fwnode_property_match_string
+     fwnode_property_get_reference_args           (cells-property form only)
+     fwnode_get_name, fwnode_get_name_prefix      used when a required property is missing
+     fwnode_count_parents, fwnode_get_nth_parent  (the same error path)
+     fwnode_get_named_child_node, fwnode_get_next_child_node
+     fwnode_handle_get, fwnode_handle_put
+     of_root, of_chosen, of_aliases, of_stdout    globals, set by sf_of_globals_init()
+     of_node_is_root
+
+   It needs `struct fwnode_handle fwnode;` added to struct device_node in
+   lkpi-override/linux/of.h, a linux/of_reserved_mem.h and linux/property.h
+   with the prototypes, and a call to sf_of_globals_init() from the layer's init.
+
+   Missing and not implemented here (platform bus, not `of`; each is a few
+   lines in sf_linux_platform.c):
+
+     __platform_driver_register       ~5 lines: Linux's platform_driver_register() is a
+                                      macro over it; the layer has only the plain name
+     platform_device_put              ~3 lines (no-op or kobject_put)
+     platform_bus_type                ~3 lines: a struct bus_type object the Rust
+                                      platform adapter takes the address of
+     platform_get_irq_byname_optional ~5 lines over platform_get_irq_byname
+     dev_is_platform                  declared in a header only; the layer has
+                                      sf_dev_is_platform() to forward to
+
+   Present already: of_find_property, of_get_property, of_parse_phandle,
+   of_get_next_child, of_get_child_by_name, of_get_parent,
+   of_find_node_by_phandle, of_device_is_compatible, of_node_get, of_node_put,
+   platform_get_resource, platform_get_resource_byname, platform_get_irq,
+   platform_get_irq_byname, platform_get_irq_optional,
+   platform_driver_unregister.
+
+   of_property_match_string() in the layer returns -ENODATA where Linux returns
+   -EINVAL for a missing property; the driver treats both as "no such region".
+
+3. No change, but relied on: of_get_next_child() returns children in
+   IORegistry link order (sfos_dt_child() indexes the child iterator). The
+   driver builds its performance-state table from the opp nodes in that order
+   and does not sort. SFGpuDT attaches opp00..opp06 in order; if link
+   order ever stops being attach order, of_get_next_child() must sort by name.

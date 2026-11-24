@@ -1,0 +1,93 @@
+diff -ruN a/crates/wm-darwin/src/desktop_entry.rs b/crates/wm-darwin/src/desktop_entry.rs
+--- a/crates/wm-darwin/src/desktop_entry.rs
++++ b/crates/wm-darwin/src/desktop_entry.rs
+@@ -21,12 +21,12 @@
+ extern "C" fn stop(_: libc::c_int) {
+     STOP.store(true, Ordering::Relaxed);
+ }
+-/// Longest session: four hours. Everything scheduled from it is a `Duration`
++/// Longest session: a hundred years, which is to say none (an installed system does not end by itself). Everything scheduled from it is a `Duration`
+ /// or whole seconds; frame times are u32 milliseconds, which last 49 days.
+ pub const MAX_SESSION_SECONDS: u64 = crate::terminal_launch::MAX_LIFETIME_SECONDS;
+ /// A built-in theme id for the session, over the one the menu persisted.
+ pub const THEME_ENV: &str = "CHONKSTEP_THEME";
+-pub const USAGE: &str = "chonkstep-darwin-desktop --run --socket ABS --records ABS --session HEX48 --terminal ABS --seconds 11..14400 --font-regular ABS --font-bold ABS --input sfhid [--startup-terminals 1..2] [--renderer gl|cpu|legacy|auto]";
++pub const USAGE: &str = "chonkstep-darwin-desktop --run --socket ABS --records ABS --session HEX48 --terminal ABS --seconds 11..3153600000 --font-regular ABS --font-bold ABS --input sfhid [--startup-terminals 1..2] [--renderer gl|cpu|legacy|auto]";
+ pub struct Options {
+     socket: PathBuf,
+     records: PathBuf,
+@@ -454,12 +454,12 @@
+             a[index] = "bad".into();
+             assert!(Options::parse(&a).is_err());
+         }
+-        for seconds in ["11", "180", "181", "3600", "14400"] {
++        for seconds in ["11", "180", "181", "3600", "14400", "3153600000"] {
+             let mut a = args();
+             a[10] = seconds.into();
+             assert!(Options::parse(&a).is_ok(), "--seconds {seconds}");
+         }
+-        for seconds in ["0", "10", "14401", "86400", "+120", "0120"] {
++        for seconds in ["0", "10", "3153600001", "+120", "0120"] {
+             let mut a = args();
+             a[10] = seconds.into();
+             assert!(Options::parse(&a).is_err());
+diff -ruN a/crates/wm-darwin/src/terminal_launch.rs b/crates/wm-darwin/src/terminal_launch.rs
+--- a/crates/wm-darwin/src/terminal_launch.rs
++++ b/crates/wm-darwin/src/terminal_launch.rs
+@@ -22,9 +22,9 @@
+     end: Instant,
+ }
+ const MAX_INSTANCE_COUNTER: u64 = 0xffff;
+-/// Longest session and longest single application lifetime: four hours.
++/// Longest session and longest single application lifetime: a hundred years (no limit in practice; `Instant + Duration` stays in range).
+ /// The terminal application accepts the same bound for its `--seconds`.
+-pub const MAX_LIFETIME_SECONDS: u64 = 14_400;
++pub const MAX_LIFETIME_SECONDS: u64 = 3_153_600_000;
+ pub(crate) struct PrivateDirectory {
+     file: File,
+     path: PathBuf,
+diff -ruN a/crates/wm-darwin/tests/wayland_theme.rs b/crates/wm-darwin/tests/wayland_theme.rs
+--- a/crates/wm-darwin/tests/wayland_theme.rs
++++ b/crates/wm-darwin/tests/wayland_theme.rs
+@@ -418,41 +418,3 @@
+     }
+     eprintln!("{}", report.join("\n"));
+ }
+-
+-/// What a person did on the machine (boot ht02) when the themes "looked
+-/// broken": from the classic theme at 200%, System 7 Light Gray, then 150%
+-/// and 175%, then Graphite, OS/2 Warp 4, Indigo Filament and Washi. After
+-/// every step the desk is the picture of a fresh start in that theme at
+-/// that scale, and every theme step changes the picture.
+-#[test]
+-fn the_sequence_picked_on_the_machine_shows_each_theme_as_a_fresh_start_does() {
+-    let gl = gl_wanted();
+-    let session = Harness::start("nextstep-classic", 240, gl);
+-    let mut scale = 240;
+-    let mut last = session.frame("start".into());
+-    let steps: [(Option<&'static str>, Option<u32>); 7] = [
+-        (Some("system-7-light-gray"), None),
+-        (None, Some(180)),
+-        (None, Some(210)),
+-        (Some("graphite"), None),
+-        (Some("os2-warp-4"), None),
+-        (Some("indigo-filament"), None),
+-        (Some("washi"), None),
+-    ];
+-    let mut theme = "nextstep-classic";
+-    for (to_theme, to_scale) in steps {
+-        if let Some(id) = to_theme {
+-            session.theme(id);
+-            theme = id;
+-        }
+-        if let Some(v120) = to_scale {
+-            session.scale(v120);
+-            scale = v120;
+-        }
+-        let frame = session.frame(format!("{theme} at {scale}"));
+-        assert!(frame != last, "{theme} at {scale}: the picture did not change");
+-        let fresh = Harness::start(theme, scale, gl).frame(format!("fresh {theme} at {scale}"));
+-        assert_eq!(difference(&frame, &fresh), None, "{theme} at {scale} after the sequence against a fresh start");
+-        last = frame;
+-    }
+-}

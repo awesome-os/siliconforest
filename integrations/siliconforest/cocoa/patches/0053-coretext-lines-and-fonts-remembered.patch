@@ -1,0 +1,193 @@
+--- a/src/Frameworks/CoreText/CTLine.m
++++ b/src/Frameworks/CoreText/CTLine.m
+@@ -1,6 +1,10 @@
+ // CTLine.m - glyph runs and lines: metrics, carets, truncation, justification, drawing
+ // Copyright (c) 2026 The PureDarwin Project, SPDX-License-Identifier: MPL-2.0 OR BSD-2-Clause
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
+ #import "CTLayout.h"
++#import <CoreGraphics/CGColor.h>
+ 
+ static CFTypeID runTypeID, lineTypeID;
+ 
+@@ -334,13 +338,132 @@
+     return (CTLineRef)line;
+ }
+ 
++/* Lines made recently, by their text and attributes. A line is immutable, so the same text with the
++ * same attributes is the same line: a terminal lays out every row of its window for every frame it
++ * draws (a scroll by one row redraws thirty rows that were laid out a frame ago), and each layout
++ * is a bidi pass, a font per run and a HarfBuzz shaping. The key is the text (its characters, hashed
++ * here: an application's own string class may hash by address) and a copy of the attributed string
++ * (its attribute dictionaries retained); a hit is checked character by character and run by run,
++ * colours by their components (an application may make a new colour object for each row). */
++#define SF_LINE_SLOTS 1024
++#define SF_LINE_MAX 512
++static struct { CFAttributedStringRef key; UniChar *text; CFIndex length; CTLineRef line; } recentLines[SF_LINE_SLOTS];
++static pthread_mutex_t recentLinesLock = PTHREAD_MUTEX_INITIALIZER;
++
++static BOOL sameValue(CFTypeRef a, CFTypeRef b) {
++    if (a == b)
++        return YES;
++    if (a == NULL || b == NULL)
++        return NO;
++    if (CFEqual(a, b))
++        return YES;
++    CGColorRef ca = NULL, cb = NULL;
++    if (CFGetTypeID(a) == CGColorGetTypeID()) ca = (CGColorRef)a;
++    else if ([(id)a respondsToSelector:@selector(CGColor)]) ca = (CGColorRef)[(id)a CGColor];
++    if (CFGetTypeID(b) == CGColorGetTypeID()) cb = (CGColorRef)b;
++    else if ([(id)b respondsToSelector:@selector(CGColor)]) cb = (CGColorRef)[(id)b CGColor];
++    return ca != NULL && cb != NULL && CGColorEqualToColor(ca, cb);
++}
++
++static BOOL sameAttributes(CFDictionaryRef a, CFDictionaryRef b) {
++    CFIndex n;
++
++    if (a == b)
++        return YES;
++    if (a == NULL || b == NULL || (n = CFDictionaryGetCount(a)) != CFDictionaryGetCount(b))
++        return NO;
++    if (n > 32)
++        return NO;
++    const void *keys[32], *values[32];
++    CFDictionaryGetKeysAndValues(a, keys, values);
++    for (CFIndex i = 0; i < n; i++) {
++        const void *other = NULL;
++        if (!CFDictionaryGetValueIfPresent(b, keys[i], &other))
++            return NO;
++        // fonts the same object or the same face at the same size: AppKit's NSFont is equal to the
++        // same face at another size (a terminal's Bigger then measured the cell with the old size)
++        if (values[i] != other && CFGetTypeID(keys[i]) == CFStringGetTypeID() &&
++            CFStringFind(keys[i], CFSTR("Font"), 0).location != kCFNotFound) {
++            id fa = (id)values[i], fb = (id)other;
++            if (![fa respondsToSelector:@selector(pointSize)] || ![fb respondsToSelector:@selector(pointSize)] ||
++                [fa pointSize] != [fb pointSize] || ![fa isEqual:fb])
++                return NO;
++            continue;
++        }
++        // colours (NSColor or CGColor values of the attributes named ...Color) by their components;
++        // any other value only when it is equal
++        if (values[i] != other && !CFEqual(values[i], other) &&
++            !(CFGetTypeID(keys[i]) == CFStringGetTypeID() && CFStringFind(keys[i], CFSTR("Color"), 0).location != kCFNotFound &&
++              sameValue(values[i], other)))
++            return NO;
++    }
++    return YES;
++}
++
++static BOOL sameRuns(CFAttributedStringRef a, CFAttributedStringRef b, CFIndex length) {
++    for (CFIndex i = 0; i < length;) {
++        CFRange ra, rb;
++        // the longest runs: a string that answers one character at a time is still the same text
++        CFDictionaryRef da = CFAttributedStringGetAttributesAndLongestEffectiveRange(a, i, CFRangeMake(i, length - i), &ra);
++        CFDictionaryRef db = CFAttributedStringGetAttributesAndLongestEffectiveRange(b, i, CFRangeMake(i, length - i), &rb);
++
++        if (ra.length <= 0 || ra.location + ra.length != rb.location + rb.length || !sameAttributes(da, db))
++            return NO;
++        i = ra.location + ra.length;
++    }
++    return YES;
++}
++
+ CTLineRef CTLineCreateWithAttributedString(CFAttributedStringRef string) {
+-    CTTypesetterRef ts = CTTypesetterCreateWithAttributedString(string);
++    CTTypesetterRef ts;
+     CTLineRef line;
+-
++    CFIndex length = string ? CFAttributedStringGetLength(string) : 0;
++    UniChar text[SF_LINE_MAX];
++    unsigned slot = 0, hash = 2166136261u;
++    static int off = -1;
++
++    if (off < 0)
++        off = getenv("CT_NO_LINE_CACHE") != NULL;
++    BOOL cache = !off && length > 0 && length <= SF_LINE_MAX;
++    if (cache) {
++        CFStringGetCharacters(CFAttributedStringGetString(string), CFRangeMake(0, length), text);
++        for (CFIndex i = 0; i < length; i++)
++            hash = (hash ^ text[i]) * 16777619u;
++        slot = (hash ^ (unsigned)length) % SF_LINE_SLOTS;
++        pthread_mutex_lock(&recentLinesLock);
++        if (recentLines[slot].key != NULL && recentLines[slot].length == length &&
++            memcmp(recentLines[slot].text, text, length * sizeof(UniChar)) == 0 &&
++            sameRuns(recentLines[slot].key, string, length)) {
++            line = CFRetain(recentLines[slot].line);
++            pthread_mutex_unlock(&recentLinesLock);
++            return line;
++        }
++        pthread_mutex_unlock(&recentLinesLock);
++    }
++    ts = CTTypesetterCreateWithAttributedString(string);
+     if (ts == NULL) return NULL;
+-    line = CTTypesetterCreateLine(ts, CFRangeMake(0, CFAttributedStringGetLength(string)));
++    line = CTTypesetterCreateLine(ts, CFRangeMake(0, length));
+     CFRelease(ts);
++    if (cache && line != NULL) {
++        CFAttributedStringRef key = CFAttributedStringCreateCopy(NULL, string);
++        UniChar *copy = malloc(length * sizeof(UniChar));
++
++        if (key != NULL && copy != NULL) {
++            memcpy(copy, text, length * sizeof(UniChar));
++            pthread_mutex_lock(&recentLinesLock);
++            if (recentLines[slot].key != NULL) CFRelease(recentLines[slot].key);
++            if (recentLines[slot].line != NULL) CFRelease(recentLines[slot].line);
++            free(recentLines[slot].text);
++            recentLines[slot].key = key;
++            recentLines[slot].text = copy;
++            recentLines[slot].length = length;
++            recentLines[slot].line = CFRetain(line);
++            pthread_mutex_unlock(&recentLinesLock);
++        } else {
++            if (key != NULL) CFRelease(key);
++            free(copy);
++        }
++    }
+     return line;
+ }
+ 
+--- a/src/Frameworks/CoreText/CTTypesetter.m
++++ b/src/Frameworks/CoreText/CTTypesetter.m
+@@ -9,6 +9,7 @@
+  *
+  * SPDX-License-Identifier: MPL-2.0 OR BSD-2-Clause
+  */
++#include <pthread.h>
+ #import "CTLayout.h"
+ #import "KTFont.h"
+ #include <fribidi.h>
+@@ -60,9 +61,31 @@
+     if ([value isKindOfClass:[KTFont class]]) return CFRetain(value);
+     // AppKit's NSFont wraps a CTFont of its own
+     if ([value respondsToSelector:@selector(fontName)] && [value respondsToSelector:@selector(pointSize)]) {
+-        CTFontRef font = CTFontCreateWithName((CFStringRef)[value fontName], [value pointSize], NULL);
+-
++        /* An NSFont never changes: the CTFont made for one is remembered (the object is kept, so its
++         * address is not another font's). A terminal lays out every row of every frame with the
++         * same two or three fonts; making each by name was a third of the time of a line. */
++        static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
++        static struct { id key; CTFontRef font; } recent[16];
++        static unsigned next;
++        CTFontRef font = NULL;
++
++        pthread_mutex_lock(&lock);
++        for (unsigned i = 0; i < 16 && font == NULL; i++)
++            if (recent[i].key == value)
++                font = CFRetain(recent[i].font);
++        pthread_mutex_unlock(&lock);
+         if (font) return font;
++        font = CTFontCreateWithName((CFStringRef)[value fontName], [value pointSize], NULL);
++        if (font) {
++            pthread_mutex_lock(&lock);
++            unsigned slot = next++ % 16;
++            [recent[slot].key release];
++            if (recent[slot].font) CFRelease(recent[slot].font);
++            recent[slot].key = [value retain];
++            recent[slot].font = CFRetain(font);
++            pthread_mutex_unlock(&lock);
++            return font;
++        }
+     }
+     return CTCopyDefaultFont();
+ }

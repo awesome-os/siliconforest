@@ -1,0 +1,80 @@
+--- a/src/Frameworks/CoreText/CTFontManager.m
++++ b/src/Frameworks/CoreText/CTFontManager.m
+@@ -99,31 +99,36 @@
+     return result;
+ }
+ 
+-// data fonts go through a private file so the registry, FreeType and fontconfig all see a path
+-static CFURLRef copyURLForData(CFDataRef data) {
+-    char path[] = "/tmp/CoreText.XXXXXX";
+-    int fd = mkstemp(path);
+-    CFURLRef url;
+-
+-    if (fd < 0) return NULL;
+-    if (write(fd, CFDataGetBytePtr(data), CFDataGetLength(data)) != CFDataGetLength(data)) {
+-        close(fd);
+-        unlink(path);
+-        return NULL;
+-    }
+-    close(fd);
+-    url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, strlen(path), false);
+-    return url;
+-}
++// Data descriptors own their graphics font. They are not registered by name,
++// and need no filesystem permission (Firefox reconstructs them in its GPU
++// sandbox). The provider keeps the data alive for the graphics font's face.
++@interface NSObject (SFMemoryFontCollection)
++- (id)initWithDataProvider:(id)provider faceIndex:(long)index;
++- (void *)face;
++@end
+ 
+ CFArrayRef CTFontManagerCreateFontDescriptorsFromData(CFDataRef data) {
+-    CFURLRef url = data ? copyURLForData(data) : NULL;
+-    CFArrayRef result;
+-
+-    if (url == NULL) return NULL;
+-    CTFontManagerRegisterFontsForURL(url, kCTFontManagerScopeProcess, NULL);
+-    result = CTFontManagerCreateFontDescriptorsFromURL(url);
+-    CFRelease(url);
++    CFMutableArrayRef result=CFArrayCreateMutable(NULL,0,&kCFTypeArrayCallBacks);
++    if(data==NULL || CFDataGetLength(data)==0)return result;
++    CGDataProviderRef provider=CGDataProviderCreateWithCFData(data);
++    CGFontRef first=provider ? CGFontCreateWithDataProvider(provider) : NULL;
++    if(first==NULL){if(provider)CGDataProviderRelease(provider);return result;}
++    FT_Face ft=[(id)first respondsToSelector:@selector(face)] ? (FT_Face)[(id)first face] : NULL;
++    long faces=ft ? ft->num_faces : 1;
++    for(long index=0;index<faces;index++){
++        CGFontRef graphics=index==0 ? CGFontRetain(first) :
++            (CGFontRef)[[[(id)first class] alloc] initWithDataProvider:(id)provider faceIndex:index];
++        if(graphics==NULL)continue;
++        CFMutableDictionaryRef attrs=CFDictionaryCreateMutable(NULL,0,&kCFTypeDictionaryKeyCallBacks,&kCFTypeDictionaryValueCallBacks);
++        CFDictionarySetValue(attrs,CFSTR("_SFCTMemoryGraphicsFont"),graphics);
++        CFStringRef ps=CGFontCopyPostScriptName(graphics),full=CGFontCopyFullName(graphics);
++        if(ps){CFDictionarySetValue(attrs,kCTFontNameAttribute,ps);CFRelease(ps);}
++        if(full){CFDictionarySetValue(attrs,kCTFontDisplayNameAttribute,full);CFRelease(full);}
++        CTFontDescriptorRef descriptor=CTFontDescriptorCreateWithAttributes(attrs);
++        if(descriptor){CFArrayAppendValue(result,descriptor);CFRelease(descriptor);}
++        CFRelease(attrs);CGFontRelease(graphics);
++    }
++    CGFontRelease(first);CGDataProviderRelease(provider);
+     return result;
+ }
+ 
+--- a/src/Frameworks/CoreText/CTFont.m
++++ b/src/Frameworks/CoreText/CTFont.m
+@@ -21,6 +21,15 @@
+ #pragma mark creation
+ 
+ static CTFontRef createWithAttributes(CFDictionaryRef attributes,CGFloat size,const CGAffineTransform *matrix) {
++   CGFontRef memory=attributes ? (CGFontRef)CFDictionaryGetValue(attributes,CFSTR("_SFCTMemoryGraphicsFont")) : NULL;
++   if(memory!=NULL){
++    CFNumberRef wanted=CFDictionaryGetValue(attributes,kCTFontSizeAttribute);
++    if(size<=0 && wanted!=NULL)CFNumberGetValue(wanted,kCFNumberCGFloatType,&size);
++    CTFontDescriptorRef descriptor=CTFontDescriptorCreateWithAttributes(attributes);
++    CTFontRef font=CTFontCreateWithGraphicsFont(memory,size,matrix,descriptor);
++    CFRelease(descriptor);
++    return font;
++   }
+    const CTFontRecord **matches=NULL;
+    CFIndex count=CTRegistryCopyMatches(attributes,&matches);
+    const CTFontRecord *record=count>0 ? matches[0] : NULL;

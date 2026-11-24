@@ -1,0 +1,106 @@
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -9,6 +9,9 @@
+ 
+ #include <time.h>
+ #import <AppKit/NSView.h>
++#include <dlfcn.h>
++#include <math.h>
++#include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ #import <AppKit/NSTextInputContext.h>
+@@ -98,6 +101,29 @@
+ -(void)setBackingScale:(CGFloat)value;
+ @end
+ 
++@interface NSObject(SFFXGPUFrame)
++-(CFTypeRef)copySFFXRenderedSurface;
++@end
++// (TERM9) the whole-window GPU presenter is asked for only with SFFX_GPU_PRESENT=1 (Firefox's launcher sets it);
++// the answer and WindowServer's entry are looked up once: every other application never calls it
++typedef int (*sfSFFXSetGPULayerFn)(int,uintptr_t,void *,double,double,double,double,double,double,double,double);
++static sfSFFXSetGPULayerFn sfSFFXGPUPresenter(void){
++ static sfSFFXSetGPULayerFn set;
++ static int known;
++ if(!known){
++  const char *gpu=getenv("SFFX_GPU_PRESENT");
++  set=(gpu&&!strcmp(gpu,"1"))?(sfSFFXSetGPULayerFn)dlsym(RTLD_DEFAULT,"_windowServerSFFXSetGPULayer"):NULL;
++  known=1;
++ }
++ return set;
++}
++static int sfSFFXSetGPULayer(NSView *view,NSWindow *window,CFTypeRef surface,
++ double sx,double sy,double sw,double sh,double dx,double dy,double dw,double dh){
++ sfSFFXSetGPULayerFn set=sfSFFXGPUPresenter();
++ return set&&window?set((int)[window windowNumber],(uintptr_t)view,(void *)surface,sx,sy,sw,sh,dx,dy,dw,dh):0;
++}
++static void sfSFFXClearGPULayer(NSView *view,NSWindow *window){sfSFFXSetGPULayer(view,window,NULL,0,0,0,0,0,0,0,0);}
++
+ @implementation NSView
+ 
+ static BOOL NSViewLayersEnabled=NO;
+@@ -229,6 +255,7 @@
+ }
+ 
+ -(void)dealloc {
++   sfSFFXClearGPULayer(self,_window);
+ 
+     // Do this first?
+     [self _unbindAllBindings];
+@@ -603,6 +630,7 @@
+ }
+ 
+ -(void)setHidden:(BOOL)flag {
++    if(flag)sfSFFXClearGPULayer(self,_window);
+     flag=flag?YES:NO;
+ 
+     if (_isHidden != flag) {
+@@ -1134,6 +1162,7 @@
+ }
+ 
+ -(void)_setWindow:(NSWindow *)window {
++    if(_window!=window)sfSFFXClearGPULayer(self,_window);
+     if (_window != window) {
+         BOOL windowRecalulatesKeyViewLoop = [window autorecalculatesKeyViewLoop];
+         if (windowRecalulatesKeyViewLoop)
+@@ -1914,6 +1943,23 @@
+    if([_layerContext respondsToSelector:@selector(setBackingScale:)])
+     [_layerContext setBackingScale:[[self window] backingScaleFactor]];
+    [_layerContext render];
++   if(sfSFFXGPUPresenter()!=NULL&&[_layerContext respondsToSelector:@selector(copySFFXRenderedSurface)]){
++    CGAffineTransform transform=[self transformToWindow];
++    if(fabs(transform.b)<.0001&&fabs(transform.c)<.0001&&fabs(fabs(transform.a)-1)<.0001&&fabs(fabs(transform.d)-1)<.0001){
++     CFTypeRef surface=[_layerContext copySFFXRenderedSurface];
++     if(surface){
++      NSRect bounds=[self bounds],visible=[self visibleRect],target=[self convertRect:visible toView:nil];
++      CGFloat scale=[_window backingScaleFactor];
++      CGFloat sy=[self isFlipped]?NSMinY(visible)-NSMinY(bounds):NSMaxY(bounds)-NSMaxY(visible);
++      BOOL registered=sfSFFXSetGPULayer(self,_window,surface,
++       (NSMinX(visible)-NSMinX(bounds))*scale,sy*scale,NSWidth(visible)*scale,NSHeight(visible)*scale,
++       NSMinX(target)*scale,(NSHeight([_window frame])-NSMaxY(target))*scale,NSWidth(target)*scale,NSHeight(target)*scale);
++      CFRelease(surface);
++      if(registered)return;
++     }
++    }
++   }
++   sfSFFXClearGPULayer(self,_window);
+    if((image=[_layerContext createImage])==NULL)
+     return;
+    // a view with a layer draws into a bitmap of its own, so this goes to the window's context directly
+@@ -1996,6 +2042,7 @@
+ }
+ 
+ -(void)setWantsLayer:(BOOL)value {
++   if(!value)sfSFFXClearGPULayer(self,_window);
+    if(sfCATrace())
+     fprintf(stderr,"PD-CA view %s %p setWantsLayer: %d\n",object_getClassName(self),self,value);
+    if(!value){
+@@ -2016,6 +2063,7 @@
+ }
+ 
+ -(void)setLayer:(CALayer *)value {
++   if(_layer!=value)sfSFFXClearGPULayer(self,_window);
+    if(sfCATrace())
+     fprintf(stderr,"PD-CA view %s %p setLayer: %s %p\n",object_getClassName(self),self,value ? object_getClassName(value) : "nil",value);
+    // a hosted CAMetalLayer or CALayerHost goes to its own subsurface, outside the CALayer renderer (which may be off)

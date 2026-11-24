@@ -1,0 +1,903 @@
+--- a/src/Frameworks/WindowServer/message.h
++++ b/src/Frameworks/WindowServer/message.h
+@@ -32,6 +32,8 @@
+     kWSWindowSetBlur = 10,
+     // wsRPCSimple: window, 1 to let pointer events pass through to what is below
+     kWSWindowSetIgnoresMouse = 11,
++    // wsRPCWindow: window, x and y the smallest size, w and h the largest, in points, 0 for no limit
++    kWSWindowSetSizeLimits = 12,
+     kCGGetLastMouseDelta = 100,
+     kCGGetMouseLocation = 101,
+     /* windowID 0 asks for the active application window. */
+@@ -132,6 +134,39 @@
+ #define WS_EVENT_DRAG_MOTION  1006
+ #define WS_EVENT_DRAG_LEAVE   1007
+ #define WS_EVENT_DRAG_DROP    1008
++// the compositor's scale changed, dx is the new scale in 120ths (240 is 200%): the backing store has to be redrawn at it
++#define WS_EVENT_SCALE        1009
++// the compositor answered who draws this window's frame, dx is 1 when it does (server-side decoration), 0 when the client must
++#define WS_EVENT_DECORATION   1010
++
++// what the compositor did with the window, dx is a set of WS_STATE_* bits (xdg_toplevel's states)
++#define WS_EVENT_STATE        1011
++// the compositor dismissed a popup (a menu, a pop-up list): the pointer was pressed outside the application
++#define WS_EVENT_POPUP_DONE   1012
++#define WS_STATE_MAXIMIZED    1
++#define WS_STATE_SUSPENDED    2
++#define WS_STATE_FULLSCREEN   4
++
++// the style mask bits of NSWindow that decide whether a window has a standard frame (Cocoa's numbers)
++#define WS_STYLE_TITLED            (1u << 0)
++#define WS_STYLE_DOC_MODAL         (1u << 6)
++#define WS_STYLE_FULLSCREEN        (1u << 14)
++
++/* Which windows have their frame drawn by the compositor when it offers to (xdg-decoration):
++ * every titled window. That includes windows whose content runs under the title bar (a
++ * full-size content view, as browsers and many newer applications have): their content
++ * simply starts below the compositor's title bar, and AppKit draws no title bar or controls
++ * over it. Borderless windows (menus, tool tips, splash screens), sheets and full screen
++ * windows have no standard frame and keep drawing everything themselves. */
++static inline int wsStyleWantsServerFrame(unsigned int style) {
++    return (style & WS_STYLE_TITLED) != 0 && (style & (WS_STYLE_DOC_MODAL | WS_STYLE_FULLSCREEN)) == 0;
++}
++
++/* Pixels of a backing store for a length in points at a scale in 120ths, the rounding the
++ * window server and AppKit must agree on (and the one wp_fractional_scale asks of clients). */
++static inline int wsPixelsForPoints(double points, int scale120) {
++    return (int)(((long)points * scale120 + 60) / 120);
++}
+ 
+ struct mach_event {
+     int windowID;
+--- a/src/Frameworks/WindowServer/rpc.h
++++ b/src/Frameworks/WindowServer/rpc.h
+@@ -29,6 +29,15 @@
+  */
+ int _windowServerReceiveMessage(PortMessage *msg);
+ 
++/* The scale windows are drawn at, in 120ths (120 is 100%, 240 is 200%, 150 is 125%): what the
++ * compositor prefers through wp_fractional_scale, or the output's whole scale without it.
++ * Window sizes, positions and pointer locations stay in points; a window's backing store is
++ * wsPixelsForPoints() of its size. */
++int _windowServerBackingScale120(void);
++/* 1 when the compositor draws the frame of standard windows (xdg-decoration is offered and
++ * SF_WS_CLIENT_FRAME is not set), so AppKit leaves title bar and controls out of them. */
++int _windowServerServerDecorations(void);
++
+ // metal: the process's wl_display, and a desynchronised child surface of a window at (x, y) from its top left
+ // (wl_surface, with its wl_subsurface in *subsurfaceOut) for CAMetalLayer to present into with Vulkan. NULL without a wl_subcompositor or window.
+ void *_windowServerWaylandDisplay(void);
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -17,6 +17,9 @@
+ #include "wlr-output-management-unstable-v1-client-protocol.h"
+ #include "sf-window-position-v1-client-protocol.h"
+ #include "sf-surface-host-v1-client-protocol.h"
++#include "xdg-decoration-unstable-v1-client-protocol.h"
++#include "fractional-scale-v1-client-protocol.h"
++#include "viewporter-client-protocol.h"
+ #include <CoreGraphics/CGDirectDisplay_siliconforest.h>
+ #include <CoreGraphics/CGWindowLevel.h>
+ #include <CoreFoundation/CFBundle.h>
+@@ -40,6 +43,8 @@
+     void *pixels;
+     size_t size;
+     int w, h;
++    // the size in points the frame was drawn for, what the viewport stretches the buffer to
++    int pointsW, pointsH;
+     int busy;
+ };
+ 
+@@ -53,17 +58,37 @@
+     // where the compositor placed this window, NULL without sf_window_position
+     struct sf_window_position_v1 *position;
+     struct zwlr_layer_surface_v1 *layerSurface;
++    // who draws the frame, asked of the compositor for every toplevel when it offers xdg-decoration
++    struct zxdg_toplevel_decoration_v1 *decoration;
++    int serverDecorated;
++    // the compositor's preferred scale for this surface and the viewport that maps a scaled buffer to points
++    struct wp_fractional_scale_v1 *fractional;
++    struct wp_viewport *viewport;
++    // the scale the backing store was made for, in 120ths
++    int scale120;
++    unsigned int style;
++    int minW, minH, maxW, maxH;
++    // WS_STATE_* as the compositor last sent them
++    int stateBits;
+     int level;
+     // the backing store AppKit maps by path and draws into, never attached to the surface itself
+     void *pixels;
+     size_t pixelsSize;
+     int pixelsW, pixelsH;
++    // the size in points the backing store was made for
++    int pointsW, pointsH;
+     int shmFd;
+     struct wsFrame frames[WS_FRAMES];
+     struct wsFrame *front;
+     double x, y, w, h;
+     int state;
+     int configured;
++    int attached;          // a buffer is on the surface: the compositor has it mapped
++    // a popup (xdg_popup): a menu, a pop-up list or a tool tip, placed against the window it belongs to
++    struct xdg_popup *popup;
++    int popupParentID;
++    int flushed;           // AppKit has flushed the backing store at its current size
++    int staleConfigures;   // unmaps the compositor has not passed yet: configures from before them are void
+     char title[64];
+     /* Last anchor/margins actually sent, so an unchanged layout does not
+      * re-issue the requests. */
+@@ -121,9 +146,18 @@
+     int connected;
+     int lastMouseX, lastMouseY;
+     int screenW, screenH;
++    // the output's mode in pixels and its whole scale, screenW and screenH are that mode in points
++    int outputW, outputH, outputScale;
++    // the scale windows are drawn at, in 120ths, see _windowServerBackingScale120
++    int scale120;
++    struct zxdg_decoration_manager_v1 *decorationManager;
++    struct wp_fractional_scale_manager_v1 *fractionalManager;
++    struct wp_viewporter *viewporter;
+     // modes the compositor lists through wlr-output-management, read from any thread under modesLock
+     struct zwlr_output_manager_v1 *outputManager;
+     struct sf_window_position_manager_v1 *positionManager;
++    int refused;   // the connection was denied (sandbox): headless for good
++    uint32_t popupToken;
+     struct sf_surface_host_manager_v1 *surfaceHost;
+     struct zwlr_output_head_v1 *head;
+     uint32_t outputSerial;
+@@ -133,7 +167,7 @@
+     struct wsMode *modes;
+     struct wsMode *currentMode;
+     int32_t nextModeID;
+-} ws = { .modesLock = PTHREAD_MUTEX_INITIALIZER };
++} ws = { .modesLock = PTHREAD_MUTEX_INITIALIZER, .scale120 = 120, .outputScale = 1 };
+ 
+ struct wsMode {
+     struct zwlr_output_mode_v1 *proxy;
+@@ -162,19 +196,33 @@
+ 
+ static void relayoutLayerWindows(void);
+ 
++/* The screen in points: the output's mode divided by the scale windows are drawn at. AppKit
++ * lays everything out in points, as on a Retina display. CoreGraphics cannot discover
++ * displays itself; it is handed the geometry whenever the mode or the scale changes. */
++static void screenUpdate(void) {
++    if (ws.outputW <= 0 || ws.outputH <= 0)
++        return;
++
++    int width = (int)(((long)ws.outputW * 120 + ws.scale120 / 2) / ws.scale120);
++    int height = (int)(((long)ws.outputH * 120 + ws.scale120 / 2) / ws.scale120);
++    int resized = ws.screenW > 0 && (ws.screenW != width || ws.screenH != height);
++
++    if (ws.screenW == width && ws.screenH == height)
++        return;
++    ws.screenW = width;
++    ws.screenH = height;
++    // panels are anchored to the nearest edges, so margins from the old size would move them
++    if (resized)
++        relayoutLayerWindows();
++    CGDirectDisplaySetMainDisplayBounds(CGRectMake(0, 0, width, height));
++}
++
+ static void outputMode(void *data, struct wl_output *output, uint32_t flags,
+                        int32_t width, int32_t height, int32_t refresh) {
+     if (flags & WL_OUTPUT_MODE_CURRENT) {
+-        int resized = ws.screenW > 0 && (ws.screenW != width || ws.screenH != height);
+-
+-        /* CoreGraphics cannot discover displays itself; hand it the real
+-         * geometry now that the compositor has told us. */
+-        ws.screenW = width;
+-        ws.screenH = height;
+-        // panels are anchored to the nearest edges, so margins from the old size would move them
+-        if (resized)
+-            relayoutLayerWindows();
+-        CGDirectDisplaySetMainDisplayBounds(CGRectMake(0, 0, width, height));
++        ws.outputW = width;
++        ws.outputH = height;
++        screenUpdate();
+     }
+ }
+ 
+@@ -186,7 +234,13 @@
+ static void outputDone(void *data, struct wl_output *output) {
+ }
+ 
++// without wp_fractional_scale the output's whole scale is all a client is told
+ static void outputScale(void *data, struct wl_output *output, int32_t factor) {
++    ws.outputScale = factor > 0 ? factor : 1;
++    if (ws.fractionalManager == NULL || ws.viewporter == NULL) {
++        ws.scale120 = ws.outputScale * 120;
++        screenUpdate();
++    }
+ }
+ 
+ static const struct wl_output_listener outputListener = {
+@@ -410,7 +464,8 @@
+     if (strcmp(interface, wl_compositor_interface.name) == 0) {
+         ws.compositor = wl_registry_bind(registry, name, &wl_compositor_interface, 4);
+     } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
+-        ws.wmBase = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
++        // version 6 has the suspended state, how a compositor says it put a window away
++        ws.wmBase = wl_registry_bind(registry, name, &xdg_wm_base_interface, version < 6 ? version : 6);
+         xdg_wm_base_add_listener(ws.wmBase, &wmBaseListener, NULL);
+     } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
+         /* Version 4 is the first with on-demand keyboard focus, which is what
+@@ -445,6 +500,12 @@
+         ws.positionManager = wl_registry_bind(registry, name, &sf_window_position_manager_v1_interface, 1);
+     } else if (strcmp(interface, sf_surface_host_manager_v1_interface.name) == 0) {
+         ws.surfaceHost = wl_registry_bind(registry, name, &sf_surface_host_manager_v1_interface, 1);
++    } else if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0) {
++        ws.decorationManager = wl_registry_bind(registry, name, &zxdg_decoration_manager_v1_interface, 1);
++    } else if (strcmp(interface, wp_fractional_scale_manager_v1_interface.name) == 0) {
++        ws.fractionalManager = wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1);
++    } else if (strcmp(interface, wp_viewporter_interface.name) == 0) {
++        ws.viewporter = wl_registry_bind(registry, name, &wp_viewporter_interface, 1);
+     } else if (strcmp(interface, zwlr_output_manager_v1_interface.name) == 0) {
+         ws.outputManager = wl_registry_bind(registry, name, &zwlr_output_manager_v1_interface,
+                                             version < 2 ? version : 2);
+@@ -466,6 +527,46 @@
+ 
+ static void dataDeviceStart(void);
+ 
++static void queuePush(const struct mach_event *event);
++
++/* The compositor's preferred scale for a surface (wp_fractional_scale, in 120ths). There is one
++ * scale for the whole client: the first surface to hear a new value makes it current, and every
++ * window is told to redraw its backing store at it. `data` is the window, NULL for the probe
++ * surface made while connecting. */
++static void fractionalPreferredScale(void *data, struct wp_fractional_scale_v1 *fractional, uint32_t scale) {
++    struct wsWindow *window = data;
++
++    if (scale < 60 || scale > 120 * 8)
++        return;
++    if (getenv("SF_WS_TRACE") != NULL)
++        fprintf(stderr, "WindowServer: preferred scale %u/120 (was %d) window %d\n", scale, ws.scale120,
++                window != NULL ? window->windowID : 0);
++    if ((int)scale != ws.scale120) {
++        ws.scale120 = (int)scale;
++        screenUpdate();
++    }
++    if (window != NULL && window->scale120 != ws.scale120) {
++        struct mach_event event = {0};
++
++        event.windowID = window->windowID;
++        event.code = WS_EVENT_SCALE;
++        event.dx = ws.scale120;
++        queuePush(&event);
++    }
++}
++
++static const struct wp_fractional_scale_v1_listener fractionalListener = {
++    .preferred_scale = fractionalPreferredScale,
++};
++
++int _windowServerBackingScale120(void) {
++    return ws.scale120;
++}
++
++int _windowServerServerDecorations(void) {
++    return ws.decorationManager != NULL && getenv("SF_WS_CLIENT_FRAME") == NULL;
++}
++
+ static int ensureConnected(void) {
+     if (ws.connected) {
+         return 1;
+@@ -474,11 +575,24 @@
+     /* launchd starts clients and the compositor independently. Match the
+      * standalone Wayland probe's startup tolerance so an AppKit process does
+      * not fail merely because neuswc has not created its socket yet. */
++    /* A process the sandbox keeps from the compositor is not waiting for
++     * anything: it is headless, as a process without the window server is on
++     * macOS (a browser's content process is one by design), and stays so. The
++     * refusal is remembered - every later call would otherwise sit out the
++     * whole wait again. */
++    if (ws.refused) {
++        return 0;
++    }
+     for (unsigned attempt = 0; attempt < 1200; ++attempt) {
+         ws.display = wl_display_connect(NULL);
+         if (ws.display != NULL) {
+             break;
+         }
++        if (errno == EPERM || errno == EACCES) {
++            ws.refused = 1;
++            fprintf(stderr, "WindowServer: no access to the Wayland display (%s): this process is headless\n", strerror(errno));
++            return 0;
++        }
+         usleep(50000);
+     }
+     if (ws.display == NULL) {
+@@ -499,6 +613,29 @@
+         return 0;
+     }
+ 
++    /* AppKit sizes its screen and its first window before any window surface exists, so the
++     * scale is asked for a surface made only for the question. A compositor that tells the
++     * preferred scale only once a surface is on an output answers later, through the window's
++     * own object; until then the output's whole scale stands. */
++    if (ws.fractionalManager != NULL && ws.viewporter != NULL) {
++        struct wl_surface *probe = wl_compositor_create_surface(ws.compositor);
++        struct wp_fractional_scale_v1 *fractional =
++            wp_fractional_scale_manager_v1_get_fractional_scale(ws.fractionalManager, probe);
++
++        wp_fractional_scale_v1_add_listener(fractional, &fractionalListener, NULL);
++        wl_display_roundtrip(ws.display);
++        wp_fractional_scale_v1_destroy(fractional);
++        wl_surface_destroy(probe);
++    } else {
++        ws.scale120 = ws.outputScale * 120;
++    }
++    screenUpdate();
++    if (getenv("SF_WS_TRACE") != NULL)
++        fprintf(stderr, "WindowServer: scale %d/120 (%s), screen %dx%d points of %dx%d pixels, frames by the %s\n",
++                ws.scale120, ws.fractionalManager != NULL && ws.viewporter != NULL ? "fractional" : "whole",
++                ws.screenW, ws.screenH, ws.outputW, ws.outputH,
++                _windowServerServerDecorations() ? "compositor" : "application");
++
+     pthread_mutex_init(&ws.queueLock, NULL);
+     {
+         pthread_mutexattr_t recursive;
+@@ -526,10 +663,26 @@
+ 
+ static void xdgSurfaceConfigure(void *data, struct xdg_surface *surface, uint32_t serial) {
+     struct wsWindow *window = data;
++    int stale;
++
++    /* Unmapping returns a toplevel to its initial state, and with it every
++     * configure sent before goes void: answering one is a protocol error
++     * ("wrong configure serial"). Such a configure can still be on its way
++     * when the null buffer is committed, so those that arrive before the
++     * compositor has passed the unmap are dropped unanswered. */
++    pthread_mutex_lock(&ws.queueLock);
++    stale = window->staleConfigures > 0;
++    pthread_mutex_unlock(&ws.queueLock);
++    if (stale) {
++        if (getenv("SF_WS_TRACE") != NULL)
++            fprintf(stderr, "WindowServer: toplevel %d configure %u predates an unmap, dropped\n", window->windowID, serial);
++        return;
++    }
+ 
+     xdg_surface_ack_configure(surface, serial);
+     // a rebuilt role starts unmapped: put the last finished frame back, or wait for the first flush
+-    windowShowFront(window);
++    if (window->state != MINIMIZED && window->state != HIDDEN)
++        windowShowFront(window);
+     wl_surface_commit(window->surface);
+ 
+     pthread_mutex_lock(&ws.queueLock);
+@@ -740,8 +893,14 @@
+ /* Backing store sized to the frame, ARGB8888 - which is what AppKit's
+  * O2Surface writes (premultiplied-first, host byte order). */
+ static int windowCreateBuffer(struct wsWindow *window) {
+-    int width = (int)window->w;
+-    int height = (int)window->h;
++    // the size in points times the scale: AppKit draws through a context scaled the same way
++    int width = wsPixelsForPoints(window->w, ws.scale120);
++    int height = wsPixelsForPoints(window->h, ws.scale120);
++
++    window->scale120 = ws.scale120;
++    window->pointsW = (int)window->w;
++    window->pointsH = (int)window->h;
++    window->flushed = 0;
+ 
+     if (width <= 0 || height <= 0) {
+         return 0;
+@@ -892,6 +1051,23 @@
+     return pick;
+ }
+ 
++/* Puts a frame on the surface. The surface's size is the frame's size in points whatever the
++ * buffer's size in pixels: the viewport says so, and a compositor at the same scale shows the
++ * buffer pixel for pixel. Without a viewport only whole scales are possible (buffer scale). */
++static void windowAttachFrame(struct wsWindow *window, struct wsFrame *frame) {
++    wl_surface_attach(window->surface, frame->buffer, 0, 0);
++    window->attached = 1;
++    if (window->viewport != NULL && frame->pointsW > 0 && frame->pointsH > 0) {
++        wp_viewport_set_destination(window->viewport, frame->pointsW, frame->pointsH);
++        wl_surface_damage(window->surface, 0, 0, frame->pointsW, frame->pointsH);
++    } else {
++        int whole = frame->pointsW > 0 ? (frame->w + frame->pointsW / 2) / frame->pointsW : 1;
++
++        wl_surface_set_buffer_scale(window->surface, whole > 0 ? whole : 1);
++        wl_surface_damage(window->surface, 0, 0, frame->w, frame->h);
++    }
++}
++
+ // copies what AppKit has finished drawing into a free frame and puts it on the surface, the caller commits
+ static int windowPresent(struct wsWindow *window) {
+     pthread_mutex_lock(&ws.pixelsLock);
+@@ -907,10 +1083,11 @@
+     }
+ 
+     memcpy(frame->pixels, window->pixels, frame->size);
++    frame->pointsW = window->pointsW;
++    frame->pointsH = window->pointsH;
+     pthread_mutex_unlock(&ws.pixelsLock);
+     window->front = frame;
+-    wl_surface_attach(window->surface, frame->buffer, 0, 0);
+-    wl_surface_damage(window->surface, 0, 0, frame->w, frame->h);
++    windowAttachFrame(window, frame);
+     return 1;
+ }
+ 
+@@ -918,12 +1095,17 @@
+ static int windowShowFront(struct wsWindow *window) {
+     if (window->front == NULL || window->state == MINIMIZED || window->state == HIDDEN)
+         return 0;
++    /* A frame from before the window was given another size is not the window
++     * any more. Shown while mapped it is only late; mapping with it would have
++     * the compositor place and frame a window of the old size (Firefox makes
++     * its window 1 by 1, hides it, sizes it and shows it). */
++    if (!window->attached && (window->front->w != window->pixelsW || window->front->h != window->pixelsH))
++        return 0;
+ 
+     pthread_mutex_lock(&ws.queueLock);
+     window->front->busy = 1;
+     pthread_mutex_unlock(&ws.queueLock);
+-    wl_surface_attach(window->surface, window->front->buffer, 0, 0);
+-    wl_surface_damage(window->surface, 0, 0, window->front->w, window->front->h);
++    windowAttachFrame(window, window->front);
+     return 1;
+ }
+ 
+@@ -1848,6 +2030,31 @@
+     if (getenv("SF_WS_TRACE") != NULL)
+         fprintf(stderr, "WindowServer: toplevel %d configure %dx%d (now %gx%g)\n",
+                 window->windowID, width, height, window->w, window->h);
++    /* Maximised, put away (suspended) or made full screen by the compositor, from its frame's
++     * buttons or its own shortcuts: AppKit keeps the window's zoomed and miniaturised state
++     * and the notifications applications wait for. */
++    {
++        int bits = 0;
++        uint32_t *state;
++
++        wl_array_for_each(state, states) {
++            if (*state == XDG_TOPLEVEL_STATE_MAXIMIZED)
++                bits |= WS_STATE_MAXIMIZED;
++            else if (*state == XDG_TOPLEVEL_STATE_SUSPENDED)
++                bits |= WS_STATE_SUSPENDED;
++            else if (*state == XDG_TOPLEVEL_STATE_FULLSCREEN)
++                bits |= WS_STATE_FULLSCREEN;
++        }
++        if (bits != window->stateBits) {
++            struct mach_event changed = {0};
++
++            window->stateBits = bits;
++            changed.windowID = window->windowID;
++            changed.code = WS_EVENT_STATE;
++            changed.dx = bits;
++            queuePush(&changed);
++        }
++    }
+     if (width <= 0 || height <= 0 || (width == (int32_t)window->w && height == (int32_t)window->h))
+         return;
+ 
+@@ -1890,9 +2097,51 @@
+     .position = windowPositionChanged,
+ };
+ 
++/* The compositor's answer to who draws the frame. AppKit assumed the compositor would for a
++ * standard window (it laid the window out without a title bar); it is told when that is not so. */
++static void decorationConfigure(void *data, struct zxdg_toplevel_decoration_v1 *decoration, uint32_t mode) {
++    struct wsWindow *window = data;
++    int server = mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE;
++    int wanted = _windowServerServerDecorations() && wsStyleWantsServerFrame(window->style);
++
++    if (getenv("SF_WS_TRACE") != NULL)
++        fprintf(stderr, "WindowServer: toplevel %d frame by the %s (asked for the %s)\n", window->windowID,
++                server ? "compositor" : "application", wanted ? "compositor" : "application");
++    window->serverDecorated = server;
++    if (server != wanted) {
++        struct mach_event event = {0};
++
++        event.windowID = window->windowID;
++        event.code = WS_EVENT_DECORATION;
++        event.dx = server;
++        queuePush(&event);
++    }
++}
++
++static const struct zxdg_toplevel_decoration_v1_listener decorationListener = {
++    .configure = decorationConfigure,
++};
++
++// the limits AppKit keeps a window's size within, so the compositor's resize stops at them too
++static void windowSendSizeLimits(struct wsWindow *window) {
++    if (window->toplevel == NULL)
++        return;
++    xdg_toplevel_set_min_size(window->toplevel, window->minW, window->minH);
++    xdg_toplevel_set_max_size(window->toplevel, window->maxW, window->maxH);
++}
++
++// the bounds a compositor suggests and the window operations it has: nothing here depends on either
++static void toplevelConfigureBounds(void *data, struct xdg_toplevel *toplevel, int32_t width, int32_t height) {
++}
++
++static void toplevelCapabilities(void *data, struct xdg_toplevel *toplevel, struct wl_array *capabilities) {
++}
++
+ static const struct xdg_toplevel_listener toplevelListener = {
+     .configure = toplevelConfigure,
+     .close = toplevelClose,
++    .configure_bounds = toplevelConfigureBounds,
++    .wm_capabilities = toplevelCapabilities,
+ };
+ 
+ // AppKit frames count up from the bottom, the compositor's from the top
+@@ -1906,6 +2155,122 @@
+ /* Gives the surface its shell role. A window whose level maps to a layer gets
+  * a layer-shell surface; everything else gets an xdg_toplevel. The role cannot
+  * be changed in place, so a level change tears this down and rebuilds it. */
++/* Popups. AppKit shows menus, pop-up button lists, combo box lists and tool tips as borderless
++ * windows at the pop-up menu level, at a place it works out on the screen from the window they
++ * belong to. A Wayland client cannot place a toplevel, and a toplevel is a window of the desk
++ * (framed, stacked, focused) - so these are xdg_popups: surfaces positioned by the compositor
++ * relative to a parent surface. The parent is the popup opened last (a submenu), else the window
++ * under the pointer, else the one with the keyboard; the place is the difference of the two
++ * frames as AppKit has them, which is right wherever the compositor really put the parent. */
++static struct wsWindow *popupParentFor(struct wsWindow *window) {
++    struct wsWindow *candidate, *best = NULL;
++
++    if (window->level != kWSPopUpMenuLevel || wsStyleWantsServerFrame(window->style))
++        return NULL;
++    for (candidate = ws.windows; candidate != NULL; candidate = candidate->next) {
++        // the list is newest first: the first mapped popup found is the last one opened
++        if (candidate != window && candidate->popup != NULL && candidate->attached)
++            return candidate;
++    }
++    best = windowForID(ws.pointerWindowID);
++    if (best == NULL || best == window || best->xdgSurface == NULL || !best->attached)
++        best = windowForID(ws.focusWindowID);
++    if (best == NULL || best == window || best->xdgSurface == NULL || !best->attached)
++        return NULL;
++    return best;
++}
++
++static void popupConfigure(void *data, struct xdg_popup *popup, int32_t x, int32_t y, int32_t width, int32_t height) {
++    struct wsWindow *window = data;
++
++    (void)popup;
++    if (getenv("SF_WS_TRACE") != NULL)
++        fprintf(stderr, "WindowServer: popup %d placed at %d,%d in its parent, %dx%d\n", window->windowID, x, y, width, height);
++}
++
++static void popupDone(void *data, struct xdg_popup *popup) {
++    struct wsWindow *window = data;
++    struct mach_event done = {0};
++
++    (void)popup;
++    if (getenv("SF_WS_TRACE") != NULL)
++        fprintf(stderr, "WindowServer: popup %d dismissed by the compositor\n", window->windowID);
++    done.windowID = window->windowID;
++    done.code = WS_EVENT_POPUP_DONE;
++    queuePush(&done);
++}
++
++static void popupRepositioned(void *data, struct xdg_popup *popup, uint32_t token) {
++    (void)data, (void)popup, (void)token;
++}
++
++static const struct xdg_popup_listener popupListener = {
++    .configure = popupConfigure,
++    .popup_done = popupDone,
++    .repositioned = popupRepositioned,
++};
++
++// where a popup goes: its frame against its parent's, as AppKit has them
++static struct xdg_positioner *popupPositioner(struct wsWindow *window, struct wsWindow *parent, int32_t *xp, int32_t *yp) {
++    struct xdg_positioner *positioner;
++    int32_t x, y;
++
++    // AppKit's y runs up from the bottom of the screen: the popup's top edge below the parent's top edge
++    x = (int32_t)floor(window->x - parent->x);
++    y = (int32_t)floor((parent->y + parent->h) - (window->y + window->h));
++    positioner = xdg_wm_base_create_positioner(ws.wmBase);
++    xdg_positioner_set_size(positioner, (int32_t)fmax(1, window->w), (int32_t)fmax(1, window->h));
++    xdg_positioner_set_anchor_rect(positioner, x, y, 1, 1);
++    xdg_positioner_set_anchor(positioner, XDG_POSITIONER_ANCHOR_TOP_LEFT);
++    xdg_positioner_set_gravity(positioner, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
++    // kept on the screen by sliding, as a menu at the screen's edge is on macOS
++    xdg_positioner_set_constraint_adjustment(positioner, XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_X |
++                                                         XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y);
++    *xp = x, *yp = y;
++    return positioner;
++}
++
++// AppKit gave a shown popup another frame (a list sized to its items after it was made)
++static void popupReposition(struct wsWindow *window) {
++    struct wsWindow *parent = windowForID(window->popupParentID);
++    struct xdg_positioner *positioner;
++    int32_t x, y;
++
++    if (parent == NULL || window->popup == NULL || xdg_popup_get_version(window->popup) < XDG_POPUP_REPOSITION_SINCE_VERSION)
++        return;
++    positioner = popupPositioner(window, parent, &x, &y);
++    xdg_popup_reposition(window->popup, positioner, ++ws.popupToken);
++    xdg_positioner_destroy(positioner);
++    if (getenv("SF_WS_TRACE") != NULL)
++        fprintf(stderr, "WindowServer: popup %d moved to %d,%d of window %d, %gx%g\n", window->windowID, x, y,
++                parent->windowID, window->w, window->h);
++}
++
++static int windowCreatePopupRole(struct wsWindow *window) {
++    struct wsWindow *parent = popupParentFor(window);
++    struct xdg_positioner *positioner;
++    int32_t x, y;
++
++    if (parent == NULL)
++        return 0;
++    positioner = popupPositioner(window, parent, &x, &y);
++    window->xdgSurface = xdg_wm_base_get_xdg_surface(ws.wmBase, window->surface);
++    xdg_surface_add_listener(window->xdgSurface, &xdgSurfaceListener, window);
++    window->popup = xdg_surface_get_popup(window->xdgSurface, parent->xdgSurface, positioner);
++    xdg_popup_add_listener(window->popup, &popupListener, window);
++    xdg_positioner_destroy(positioner);
++    window->popupParentID = parent->windowID;
++    /* A menu holds the pointer until it is closed: the compositor then dismisses it when the
++     * pointer is pressed outside the application. A window that takes no mouse events (a tool
++     * tip) just sits there. */
++    if (!window->ignoresMouse && ws.seat != NULL)
++        xdg_popup_grab(window->popup, ws.seat, ws.inputSerial);
++    if (getenv("SF_WS_TRACE") != NULL)
++        fprintf(stderr, "WindowServer: popup %d at %d,%d of window %d, %gx%g%s\n", window->windowID, x, y,
++                parent->windowID, window->w, window->h, window->ignoresMouse ? "" : " (grab)");
++    return 1;
++}
++
+ static void windowCreateRole(struct wsWindow *window, const char *title) {
+     uint32_t layer;
+ 
+@@ -1942,10 +2307,25 @@
+         return;
+     }
+ 
++    if (windowCreatePopupRole(window))
++        return;
++
+     window->xdgSurface = xdg_wm_base_get_xdg_surface(ws.wmBase, window->surface);
+     xdg_surface_add_listener(window->xdgSurface, &xdgSurfaceListener, window);
+     window->toplevel = xdg_surface_get_toplevel(window->xdgSurface);
+     xdg_toplevel_add_listener(window->toplevel, &toplevelListener, window);
++    /* Every toplevel says who should draw its frame: the compositor for a standard window, the
++     * application for the kinds that have no standard frame. Asked before the first commit, so
++     * the first configure already carries the answer. */
++    if (ws.decorationManager != NULL) {
++        int server = _windowServerServerDecorations() && wsStyleWantsServerFrame(window->style);
++
++        window->decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(ws.decorationManager, window->toplevel);
++        zxdg_toplevel_decoration_v1_add_listener(window->decoration, &decorationListener, window);
++        zxdg_toplevel_decoration_v1_set_mode(window->decoration, server ? ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE
++                                                                         : ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
++    }
++    windowSendSizeLimits(window);
+     if (ws.positionManager != NULL) {
+         window->position = sf_window_position_manager_v1_get_window_position(ws.positionManager, window->surface);
+         sf_window_position_v1_add_listener(window->position, &positionListener, window);
+@@ -1977,6 +2357,57 @@
+             window->h, ws.screenW, ws.screenH);
+ }
+ 
++static void unmapPassed(void *data, struct wl_callback *callback, uint32_t serial) {
++    struct wsWindow *window = windowForID((int)(intptr_t)data);
++
++    (void)serial;
++    wl_callback_destroy(callback);
++    if (window != NULL) {
++        pthread_mutex_lock(&ws.queueLock);
++        if (window->staleConfigures > 0)
++            window->staleConfigures--;
++        pthread_mutex_unlock(&ws.queueLock);
++    }
++}
++
++static const struct wl_callback_listener unmapListener = { unmapPassed };
++
++/* Wayland has no hide: a surface is unmapped by committing a null buffer. An
++ * xdg toplevel is then as new - it needs the empty commit and a configure
++ * again before the next buffer (windowRemap). */
++static void windowUnmap(struct wsWindow *window) {
++    if (getenv("SF_WS_TRACE") != NULL)
++        fprintf(stderr, "WindowServer: surface %d unmapped\n", window->windowID);
++    wl_surface_attach(window->surface, NULL, 0, 0);
++    wl_surface_commit(window->surface);
++    // one that never had a buffer was not mapped, and stays configured
++    if (window->toplevel != NULL && window->attached) {
++        struct wl_callback *passed;
++
++        pthread_mutex_lock(&ws.queueLock);
++        window->staleConfigures++;
++        window->configured = 0;
++        pthread_mutex_unlock(&ws.queueLock);
++        passed = wl_display_sync(ws.display);
++        wl_callback_add_listener(passed, &unmapListener, (void *)(intptr_t)window->windowID);
++    }
++    window->attached = 0;
++    wl_display_flush(ws.display);
++}
++
++// the empty commit and the wait for the configure a toplevel owes after an unmap
++static void windowRemap(struct wsWindow *window) {
++    if (window->toplevel == NULL || window->configured)
++        return;
++    wl_surface_commit(window->surface);
++    wl_display_flush(ws.display);
++    pthread_mutex_lock(&ws.queueLock);
++    while (!window->configured && ws.dispatchRunning) {
++        pthread_cond_wait(&ws.queueReady, &ws.queueLock);
++    }
++    pthread_mutex_unlock(&ws.queueLock);
++}
++
+ static void windowDestroyRole(struct wsWindow *window) {
+     /* A replacement layer surface starts with no anchor or margins, so the
+      * record of what was sent must not outlive the surface it described - or
+@@ -1991,10 +2422,19 @@
+         sf_window_position_v1_destroy(window->position);
+         window->position = NULL;
+     }
++    // the decoration object goes before the toplevel it belongs to
++    if (window->decoration != NULL) {
++        zxdg_toplevel_decoration_v1_destroy(window->decoration);
++        window->decoration = NULL;
++    }
+     if (window->toplevel != NULL) {
+         xdg_toplevel_destroy(window->toplevel);
+         window->toplevel = NULL;
+     }
++    if (window->popup != NULL) {
++        xdg_popup_destroy(window->popup);
++        window->popup = NULL;
++    }
+     if (window->xdgSurface != NULL) {
+         xdg_surface_destroy(window->xdgSurface);
+         window->xdgSurface = NULL;
+@@ -2019,7 +2459,13 @@
+     window->h = msg->h;
+ 
+     window->level = msg->level;
++    window->style = msg->style;
+     window->surface = wl_compositor_create_surface(ws.compositor);
++    if (ws.fractionalManager != NULL && ws.viewporter != NULL) {
++        window->fractional = wp_fractional_scale_manager_v1_get_fractional_scale(ws.fractionalManager, window->surface);
++        wp_fractional_scale_v1_add_listener(window->fractional, &fractionalListener, window);
++        window->viewport = wp_viewporter_get_viewport(ws.viewporter, window->surface);
++    }
+     strncpy(window->title, msg->title, sizeof(window->title) - 1);
+ 
+     window->next = ws.windows;
+@@ -2041,6 +2487,8 @@
+             windowReleaseBuffer(window);
+             windowDestroyRole(window);
+             if (window->blurEffect != NULL) { ext_background_effect_surface_v1_destroy(window->blurEffect); }
++            if (window->fractional != NULL) { wp_fractional_scale_v1_destroy(window->fractional); }
++            if (window->viewport != NULL)   { wp_viewport_destroy(window->viewport); }
+             if (window->surface != NULL)    { wl_surface_destroy(window->surface); }
+             windowReleaseFrames(window);
+             free(window);
+@@ -2055,7 +2503,7 @@
+ }
+ 
+ static int windowEnsureRole(struct wsWindow *window) {
+-    if (window->layerSurface != NULL || window->toplevel != NULL) {
++    if (window->layerSurface != NULL || window->toplevel != NULL || window->popup != NULL) {
+         return 1;
+     }
+ 
+@@ -2089,8 +2537,9 @@
+         }
+     }
+ 
++    // a new size, or the same size at a new scale (AppKit answers WS_EVENT_SCALE with this message)
+     if (msg->w > 0 && msg->h > 0 &&
+-        (msg->w != window->w || msg->h != window->h)) {
++        (msg->w != window->w || msg->h != window->h || window->scale120 != ws.scale120)) {
+         window->w = msg->w;
+         window->h = msg->h;
+ 
+@@ -2105,7 +2554,7 @@
+         strncpy(window->title, msg->title, sizeof(window->title) - 1);
+     }
+ 
+-    if (window->layerSurface == NULL && window->toplevel == NULL) {
++    if (window->layerSurface == NULL && window->toplevel == NULL && window->popup == NULL) {
+         window->level = msg->level;
+     }
+ 
+@@ -2126,6 +2575,7 @@
+              * error, so detach first and re-attach once reconfigured. */
+             wl_surface_attach(window->surface, NULL, 0, 0);
+             wl_surface_commit(window->surface);
++            window->attached = 0;
+             windowDestroyRole(window);
+             window->configured = 0;
+             windowCreateRole(window, msg->title);
+@@ -2143,6 +2593,8 @@
+ 
+     if (msg->title[0] != '\0' && window->toplevel != NULL) {
+         xdg_toplevel_set_title(window->toplevel, msg->title);
++        if (getenv("SF_WS_TRACE") != NULL)
++            fprintf(stderr, "WindowServer: window %d is titled \"%s\"\n", window->windowID, msg->title);
+     }
+ 
+     if (msg->state != window->state) {
+@@ -2154,8 +2606,7 @@
+                  * through a taskbar protocol - and a window minimized that way
+                  * can never be restored. Unmapping looks the same and is
+                  * reversible, which is what -deminiaturize: needs. */
+-                wl_surface_attach(window->surface, NULL, 0, 0);
+-                wl_surface_commit(window->surface);
++                windowUnmap(window);
+                 break;
+             case MAXIMIZED:
+                 if (window->toplevel != NULL && window->state == FULLSCREEN)
+@@ -2178,17 +2629,25 @@
+                 if (window->state == MINIMIZED || window->state == HIDDEN) {
+                     // a surface without its role yet is mapped by the first flush instead
+                     window->state = NORMAL;
++                    windowRemap(window);
++                    // what AppKit last flushed, if it flushed at this size; else its next flush maps the window
+                     if ((window->toplevel != NULL || window->layerSurface != NULL) &&
+-                        (windowShowFront(window) || windowPresent(window))) {
++                        (windowShowFront(window) || (window->flushed && windowPresent(window)))) {
+                         wl_surface_commit(window->surface);
+                     }
+                 }
+                 break;
+             case HIDDEN:
+                 /* Wayland has no hide; the surface is unmapped by attaching a
+-                 * null buffer. */
+-                wl_surface_attach(window->surface, NULL, 0, 0);
+-                wl_surface_commit(window->surface);
++                 * null buffer. A popup cannot be mapped a second time: it goes
++                 * altogether, and the next flush makes a new one where the
++                 * window then is. */
++                windowUnmap(window);
++                if (window->popup != NULL) {
++                    windowDestroyRole(window);
++                    window->configured = 0;
++                    wl_display_flush(ws.display);
++                }
+                 break;
+             default:
+                 break;
+@@ -2210,6 +2669,8 @@
+             windowApplyLayerGeometry(window, layer);
+             wl_surface_commit(window->surface);
+         }
++    } else if (moved && window->popup != NULL) {
++        popupReposition(window);
+     } else if (moved && window->toplevel != NULL) {
+         // the app moved its own window, the compositor's moves come back as WS_EVENT_MOVED and never get here
+         windowSendPosition(window);
+@@ -2282,6 +2743,7 @@
+             if (window->pixels == NULL) {
+                 return KERN_SUCCESS;
+             }
++            window->flushed = 1;
+ 
+             if (getenv("SF_WS_TRACE") != NULL && window->pixels != NULL &&
+                 window->level >= kWSMainMenuLevel) {
+@@ -2318,6 +2780,23 @@
+                 wl_surface_commit(window->surface);
+                 wl_display_flush(ws.display);
+             }
++            return KERN_SUCCESS;
++        }
++
++        case kWSWindowSetSizeLimits: {
++            struct wsRPCWindow *msg = (struct wsRPCWindow *)data;
++            struct wsWindow *window = windowForID(msg->windowID);
++
++            if (window == NULL) {
++                return KERN_FAILURE;
++            }
++            window->minW = (int)msg->x, window->minH = (int)msg->y;
++            window->maxW = (int)msg->w, window->maxH = (int)msg->h;
++            windowSendSizeLimits(window);
++            if (window->toplevel != NULL) {
++                wl_surface_commit(window->surface);
++                wl_display_flush(ws.display);
++            }
+             return KERN_SUCCESS;
+         }
+ 

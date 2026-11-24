@@ -1,0 +1,1086 @@
+--- a/src/Frameworks/AppKit/NSTableViewViewBased.m
++++ b/src/Frameworks/AppKit/NSTableViewViewBased.m
+@@ -0,0 +1,603 @@
++/* SPDX-License-Identifier: MIT */
++/* View-based table and outline views (docs/roadmap/issues/SF-AA-activity-monitor.md; first user:
++   Apple's Activity Monitor, whose process list is a view-based NSOutlineView with 38 archived cell
++   views). This AppKit's tables drew cells only.
++
++   A table is view-based when its delegate answers -tableView:viewForTableColumn:row: (an outline
++   view: -outlineView:viewForTableColumn:item:), as on macOS. Then each visible row is an
++   NSTableRowView, a subview of the table at -rectOfRow:, and each column's view is a subview of
++   the row view at the column's cell frame (the outline column indented by the row's level and the
++   disclosure triangle, which the outline view still draws itself). Views come from the delegate,
++   which gets them from -makeViewWithIdentifier:owner:: a view of that identifier that left the
++   screen, or a new one from the nib registered for it (-registerNib:forIdentifier:, or the nibs the
++   table's own archive carries, NSTableViewArchivedReusableViewsKey). A cell view's objectValue is
++   the data source's value for the cell, or (an outline view without one) the row's item.
++
++   The views are laid out before each display (-viewWillDraw): rows that scrolled away give their
++   views back for reuse, rows that came into view get new ones, and a -reloadData asks the delegate
++   again for every visible row. The row view draws the selection; a selected row's text fields are
++   drawn in the selected text colour. Clicks go to the table (selection, double-click) unless they
++   land on a button inside a cell. Not done: animations, row actions, drag images of views,
++   floating group rows, variable row heights from autolayout. */
++#import <AppKit/AppKit.h>
++#import <AppKit/NSTableView.h>
++#import <AppKit/NSOutlineView.h>
++#import <AppKit/NSNib.h>
++#include <objc/runtime.h>
++
++#define EXPORT __attribute__((visibility("default")))
++
++/* ---- NSTableCellView, NSTableRowView ---- */
++
++EXPORT
++@interface NSTableCellView : NSView {
++    id _objectValue;
++    NSTextField *_textField;
++    NSImageView *_imageView;
++    NSBackgroundStyle _backgroundStyle;
++    NSInteger _rowSizeStyle;
++    NSArray *_draggingImageComponents;
++}
++@end
++
++@implementation NSTableCellView
++
++- (void)dealloc {
++    [_objectValue release];
++    [_textField release];
++    [_imageView release];
++    [super dealloc];
++}
++
++- (id)objectValue { return _objectValue; }
++- (void)setObjectValue:(id)value {
++    if (value != _objectValue) {
++        [self willChangeValueForKey:@"objectValue"];
++        [_objectValue release];
++        _objectValue = [value retain];
++        [self didChangeValueForKey:@"objectValue"];
++    }
++}
++- (NSTextField *)textField { return _textField; }
++- (void)setTextField:(NSTextField *)field { [field retain]; [_textField release]; _textField = field; }
++- (NSImageView *)imageView { return _imageView; }
++- (void)setImageView:(NSImageView *)view { [view retain]; [_imageView release]; _imageView = view; }
++- (NSBackgroundStyle)backgroundStyle { return _backgroundStyle; }
++
++static const char sfOriginalTextColorKey;
++
++static void sfStyleTextFields(NSView *view, BOOL selected) {
++    for (NSView *v in [view subviews]) {
++        if ([v isKindOfClass:[NSTextField class]]) {
++            NSTextField *f = (NSTextField *)v;
++            NSColor *original = objc_getAssociatedObject(f, &sfOriginalTextColorKey);
++            if (selected) {
++                if (original == nil && [f textColor] != nil)
++                    objc_setAssociatedObject(f, &sfOriginalTextColorKey, [f textColor], OBJC_ASSOCIATION_RETAIN);
++                [f setTextColor:[NSColor alternateSelectedControlTextColor]];
++            } else if (original != nil) {
++                [f setTextColor:original];
++                objc_setAssociatedObject(f, &sfOriginalTextColorKey, nil, OBJC_ASSOCIATION_RETAIN);
++            }
++            [[f cell] setBackgroundStyle:selected ? NSBackgroundStyleDark : NSBackgroundStyleLight];
++        }
++        sfStyleTextFields(v, selected);
++    }
++}
++
++- (void)setBackgroundStyle:(NSBackgroundStyle)style {
++    if (style == _backgroundStyle)
++        return;
++    _backgroundStyle = style;
++    sfStyleTextFields(self, style == NSBackgroundStyleDark);
++    [self setNeedsDisplay:YES];
++}
++- (NSInteger)rowSizeStyle { return _rowSizeStyle; }
++- (void)setRowSizeStyle:(NSInteger)style { _rowSizeStyle = style; }
++- (NSArray *)draggingImageComponents { return [NSArray array]; }
++- (BOOL)isOpaque { return NO; }
++@end
++
++EXPORT
++@interface NSTableRowView : NSView {
++    BOOL _selected, _emphasized, _groupRowStyle, _floating, _targetForDropOperation;
++    NSColor *_backgroundColor;
++    NSInteger _selectionHighlightStyle;
++    NSInteger _row;
++}
++@end
++
++@implementation NSTableRowView
++
++- (id)initWithFrame:(NSRect)frame {
++    if ((self = [super initWithFrame:frame]) != nil)
++        _emphasized = YES;
++    return self;
++}
++
++- (void)dealloc {
++    [_backgroundColor release];
++    [super dealloc];
++}
++
++- (BOOL)isFlipped { return YES; }
++- (BOOL)isOpaque { return NO; }
++- (BOOL)isSelected { return _selected; }
++- (void)setSelected:(BOOL)b {
++    if (b == _selected)
++        return;
++    _selected = b;
++    for (NSView *v in [self subviews])
++        if ([v respondsToSelector:@selector(setBackgroundStyle:)])
++            [(NSTableCellView *)v setBackgroundStyle:b && _emphasized ? NSBackgroundStyleDark : NSBackgroundStyleLight];
++    [self setNeedsDisplay:YES];
++}
++- (BOOL)isEmphasized { return _emphasized; }
++- (void)setEmphasized:(BOOL)b { if (b != _emphasized) { _emphasized = b; [self setNeedsDisplay:YES]; } }
++- (BOOL)isGroupRowStyle { return _groupRowStyle; }
++- (void)setGroupRowStyle:(BOOL)b { _groupRowStyle = b; }
++- (BOOL)isFloating { return _floating; }
++- (void)setFloating:(BOOL)b { _floating = b; }
++- (BOOL)isTargetForDropOperation { return _targetForDropOperation; }
++- (void)setTargetForDropOperation:(BOOL)b { _targetForDropOperation = b; }
++- (NSColor *)backgroundColor { return _backgroundColor; }
++- (void)setBackgroundColor:(NSColor *)c { [c retain]; [_backgroundColor release]; _backgroundColor = c; [self setNeedsDisplay:YES]; }
++- (NSInteger)selectionHighlightStyle { return _selectionHighlightStyle; }
++- (void)setSelectionHighlightStyle:(NSInteger)s { _selectionHighlightStyle = s; }
++- (NSBackgroundStyle)interiorBackgroundStyle { return _selected && _emphasized ? NSBackgroundStyleDark : NSBackgroundStyleLight; }
++- (NSInteger)numberOfColumns { return [[self subviews] count]; }
++- (id)viewAtColumn:(NSInteger)column {
++    NSArray *s = [self subviews];
++    return column >= 0 && column < (NSInteger)[s count] ? [s objectAtIndex:column] : nil;
++}
++
++- (void)drawBackgroundInRect:(NSRect)rect {
++    if (_backgroundColor != nil) {
++        [_backgroundColor setFill];
++        NSRectFill(rect);
++    }
++}
++
++- (void)drawSelectionInRect:(NSRect)rect {
++    NSColor *c = _emphasized ? [NSColor alternateSelectedControlColor] : [NSColor secondarySelectedControlColor];
++    [c setFill];
++    NSRect r = NSInsetRect([self bounds], 0, 0);
++    NSRectFill(NSIntersectionRect(r, rect));
++}
++
++- (void)drawSeparatorInRect:(NSRect)rect {}
++
++- (void)drawRect:(NSRect)rect {
++    [self drawBackgroundInRect:rect];
++    if (_selected && _selectionHighlightStyle != -1 /* NSTableViewSelectionHighlightStyleNone */)
++        [self drawSelectionInRect:rect];
++}
++
++/* the table takes the clicks, except on buttons inside a cell (as with a cell-based table) */
++- (NSView *)hitTest:(NSPoint)point {
++    NSView *hit = [super hitTest:point];
++    if (hit == nil || hit == self)
++        return nil;
++    if ([hit isKindOfClass:[NSButton class]] || ([hit isKindOfClass:[NSTextField class]] && [(NSTextField *)hit isEditable]))
++        return hit;
++    return nil;
++}
++@end
++
++/* ---- the table's side of it ---- */
++
++@interface SFViewBasedState : NSObject {
++  @public
++    NSMutableDictionary *nibs;          /* identifier -> NSNib */
++    NSMutableDictionary *reuse;         /* identifier -> NSMutableArray of views */
++    NSMutableDictionary *rows;          /* NSNumber row -> NSTableRowView */
++    BOOL dirty;                         /* -reloadData since the last layout */
++    NSInteger autoresizingStyle;
++    NSMutableDictionary *indicators;    /* column identifier -> image */
++    NSInteger updates;
++}
++@end
++
++@implementation SFViewBasedState
++- (id)init {
++    if ((self = [super init]) != nil) {
++        nibs = [[NSMutableDictionary alloc] init];
++        reuse = [[NSMutableDictionary alloc] init];
++        rows = [[NSMutableDictionary alloc] init];
++        indicators = [[NSMutableDictionary alloc] init];
++        autoresizingStyle = 1; /* NSTableViewUniformColumnAutoresizingStyle */
++        dirty = YES;
++    }
++    return self;
++}
++- (void)dealloc {
++    [nibs release];
++    [reuse release];
++    [rows release];
++    [indicators release];
++    [super dealloc];
++}
++@end
++
++static const char sfViewBasedKey;
++
++@interface NSTableView (SFViewBasedPrivate)
++- (id)dataSourceObjectValueForTableColumn:(NSTableColumn *)tableColumn row:(int)row;
++@end
++
++@implementation NSTableView (SFViewBased)
++
++- (SFViewBasedState *)_sfViewState {
++    SFViewBasedState *s = objc_getAssociatedObject(self, &sfViewBasedKey);
++    if (s == nil) {
++        s = [[[SFViewBasedState alloc] init] autorelease];
++        objc_setAssociatedObject(self, &sfViewBasedKey, s, OBJC_ASSOCIATION_RETAIN);
++    }
++    return s;
++}
++
++/* called by -initWithCoder: */
++- (void)_sfDecodeViewBasedWithCoder:(NSCoder *)coder {
++    NSDictionary *archived = [coder containsValueForKey:@"NSTableViewArchivedReusableViewsKey"] ?
++        [coder decodeObjectForKey:@"NSTableViewArchivedReusableViewsKey"] : nil;
++    if ([archived isKindOfClass:[NSDictionary class]] && [archived count] > 0)
++        [[self _sfViewState]->nibs addEntriesFromDictionary:archived];
++    if ([coder containsValueForKey:@"NSColumnAutoresizingStyle"])
++        [self _sfViewState]->autoresizingStyle = [coder decodeIntegerForKey:@"NSColumnAutoresizingStyle"];
++}
++
++- (BOOL)_sfIsViewBased {
++    id d = [self delegate];
++    if ([self isKindOfClass:[NSOutlineView class]])
++        return [d respondsToSelector:@selector(outlineView:viewForTableColumn:item:)];
++    return [d respondsToSelector:@selector(tableView:viewForTableColumn:row:)];
++}
++
++- (void)registerNib:(NSNib *)nib forIdentifier:(NSString *)identifier {
++    if (identifier == nil)
++        return;
++    if (nib)
++        [[self _sfViewState]->nibs setObject:nib forKey:identifier];
++    else
++        [[self _sfViewState]->nibs removeObjectForKey:identifier];
++}
++
++- (NSDictionary *)registeredNibsByIdentifier {
++    return [[[self _sfViewState]->nibs copy] autorelease];
++}
++
++- (id)makeViewWithIdentifier:(NSString *)identifier owner:(id)owner {
++    SFViewBasedState *s = [self _sfViewState];
++    if (identifier == nil)
++        return nil;
++    NSMutableArray *pool = [s->reuse objectForKey:identifier];
++    if ([pool count] > 0) {
++        NSView *v = [[[pool lastObject] retain] autorelease];
++        [pool removeLastObject];
++        return v;
++    }
++    NSNib *nib = [s->nibs objectForKey:identifier];
++    if (nib == nil)
++        return nil;
++    NSArray *top = nil;
++    if (![nib instantiateNibWithOwner:owner topLevelObjects:&top])
++        return nil;
++    for (id o in top)
++        if ([o isKindOfClass:[NSView class]]) {
++            if ([o respondsToSelector:@selector(setIdentifier:)])
++                [o setIdentifier:identifier];
++            return o;
++        }
++    return nil;
++}
++
++- (void)_sfRecycleRowView:(NSTableRowView *)rv {
++    SFViewBasedState *s = [self _sfViewState];
++    for (NSView *v in [[[rv subviews] copy] autorelease]) {
++        NSString *ident = [v respondsToSelector:@selector(identifier)] ? [(id)v identifier] : nil;
++        if ([self isKindOfClass:[NSOutlineView class]] && [[self delegate] respondsToSelector:@selector(outlineView:didRemoveRowView:forRow:)])
++            ;
++        [v retain];
++        [v removeFromSuperview];
++        if ([v respondsToSelector:@selector(setBackgroundStyle:)])
++            [(NSTableCellView *)v setBackgroundStyle:NSBackgroundStyleLight];
++        if ([ident length] > 0) {
++            NSMutableArray *pool = [s->reuse objectForKey:ident];
++            if (pool == nil) {
++                pool = [NSMutableArray array];
++                [s->reuse setObject:pool forKey:ident];
++            }
++            if ([pool count] < 64)
++                [pool addObject:v];
++        }
++        [v release];
++    }
++    [rv removeFromSuperview];
++}
++
++- (void)_sfRemoveAllRowViews {
++    SFViewBasedState *s = [self _sfViewState];
++    for (NSTableRowView *rv in [s->rows allValues])
++        [self _sfRecycleRowView:rv];
++    [s->rows removeAllObjects];
++}
++
++/* the frame of a column's view inside its row view */
++- (NSRect)_sfFrameOfViewAtColumn:(NSInteger)column row:(NSInteger)row {
++    NSRect rowRect = [self rectOfRow:row];
++    NSRect cell = [self rectOfColumn:column];
++    NSSize spacing = [self intercellSpacing];
++    cell.origin.x += floor(spacing.width / 2);
++    cell.size.width -= spacing.width;
++    cell.origin.y = 0;
++    cell.size.height = rowRect.size.height;
++    if ([self isKindOfClass:[NSOutlineView class]]) {
++        NSOutlineView *ov = (NSOutlineView *)self;
++        if ([[self tableColumns] objectAtIndex:column] == [ov outlineTableColumn]) {
++            CGFloat indent = [ov levelForRow:row] * [ov indentationPerLevel] + 16;   /* level, then the disclosure triangle */
++            cell.origin.x += indent;
++            cell.size.width -= indent;
++        }
++    }
++    if (cell.size.width < 0)
++        cell.size.width = 0;
++    return cell;
++}
++
++- (NSView *)_sfMakeViewForColumn:(NSInteger)column row:(NSInteger)row {
++    NSTableColumn *tc = [[self tableColumns] objectAtIndex:column];
++    id d = [self delegate];
++    NSView *v = nil;
++    id value = nil;
++    if ([self isKindOfClass:[NSOutlineView class]]) {
++        id item = [(NSOutlineView *)self itemAtRow:row];
++        v = [d outlineView:(NSOutlineView *)self viewForTableColumn:tc item:item];
++        id ds = [self dataSource];
++        if ([ds respondsToSelector:@selector(outlineView:objectValueForTableColumn:byItem:)])
++            value = [ds outlineView:(NSOutlineView *)self objectValueForTableColumn:tc byItem:item];
++        else
++            value = item;
++    } else {
++        v = [d tableView:self viewForTableColumn:tc row:row];
++        id ds = [self dataSource];
++        if ([ds respondsToSelector:@selector(tableView:objectValueForTableColumn:row:)])
++            value = [ds tableView:self objectValueForTableColumn:tc row:row];
++    }
++    if ([v isKindOfClass:[NSTableCellView class]] && value != nil)
++        [(NSTableCellView *)v setObjectValue:value];
++    return v;
++}
++
++- (NSTableRowView *)_sfMakeRowViewForRow:(NSInteger)row {
++    id d = [self delegate];
++    NSTableRowView *rv = nil;
++    if ([self isKindOfClass:[NSOutlineView class]]) {
++        if ([d respondsToSelector:@selector(outlineView:rowViewForItem:)])
++            rv = [d outlineView:(NSOutlineView *)self rowViewForItem:[(NSOutlineView *)self itemAtRow:row]];
++    } else if ([d respondsToSelector:@selector(tableView:rowViewForRow:)])
++        rv = [d tableView:self rowViewForRow:row];
++    if (rv == nil)
++        rv = [[[NSTableRowView alloc] initWithFrame:[self rectOfRow:row]] autorelease];
++    return rv;
++}
++
++/* lay the row and cell views out for what is visible */
++- (void)_sfLayoutViews {
++    if (![self _sfIsViewBased])
++        return;
++    SFViewBasedState *s = [self _sfViewState];
++    NSInteger nrows = [self numberOfRows], ncols = [[self tableColumns] count];
++    NSRange visible = [self rowsInRect:[self visibleRect]];
++    static int debug = -1;
++    if (debug < 0)
++        debug = getenv("SFTableDebug") != NULL;
++    if (debug)
++        NSLog(@"view-based %@: rows %ld, columns %ld, visible %@, frame %@, dirty %d", [self class], (long)nrows, (long)ncols,
++            [NSString stringWithFormat:@"{%lu, %lu}", (unsigned long)visible.location, (unsigned long)visible.length], NSStringFromRect([self frame]), s->dirty);
++    if (s->dirty) {
++        [self _sfRemoveAllRowViews];
++        s->dirty = NO;
++    }
++    /* rows that left the screen give their views back */
++    for (NSNumber *key in [[s->rows allKeys] copy]) {
++        NSInteger r = [key integerValue];
++        if (r >= nrows || !NSLocationInRange(r, visible)) {
++            [self _sfRecycleRowView:[s->rows objectForKey:key]];
++            [s->rows removeObjectForKey:key];
++        }
++    }
++    NSIndexSet *selected = [self selectedRowIndexes];
++    BOOL emphasized = [[self window] isKeyWindow] && [[self window] firstResponder] == self;
++    id d = [self delegate];
++    for (NSInteger r = visible.location; r < (NSInteger)NSMaxRange(visible) && r < nrows; r++) {
++        NSNumber *key = [NSNumber numberWithInteger:r];
++        NSTableRowView *rv = [s->rows objectForKey:key];
++        BOOL fresh = NO;
++        if (rv == nil) {
++            rv = [self _sfMakeRowViewForRow:r];
++            [s->rows setObject:rv forKey:key];
++            fresh = YES;
++        }
++        NSRect rowRect = [self rectOfRow:r];
++        if (!NSEqualRects([rv frame], rowRect))
++            [rv setFrame:rowRect];
++        if (fresh) {
++            for (NSInteger c = 0; c < ncols; c++) {
++                NSTableColumn *tc = [[self tableColumns] objectAtIndex:c];
++                NSView *v = [tc isHidden] ? nil : [self _sfMakeViewForColumn:c row:r];
++                if (v == nil)
++                    v = [[[NSView alloc] initWithFrame:NSZeroRect] autorelease];   /* keeps column order */
++                [rv addSubview:v];
++            }
++            [self addSubview:rv];
++            if ([self isKindOfClass:[NSOutlineView class]]) {
++                if ([d respondsToSelector:@selector(outlineView:didAddRowView:forRow:)])
++                    [d outlineView:(NSOutlineView *)self didAddRowView:rv forRow:r];
++            } else if ([d respondsToSelector:@selector(tableView:didAddRowView:forRow:)])
++                [d tableView:self didAddRowView:rv forRow:r];
++        }
++        NSArray *cells = [rv subviews];
++        for (NSInteger c = 0; c < ncols && c < (NSInteger)[cells count]; c++) {
++            NSView *v = [cells objectAtIndex:c];
++            NSRect f = [[[self tableColumns] objectAtIndex:c] isHidden] ? NSZeroRect : [self _sfFrameOfViewAtColumn:c row:r];
++            if (!NSEqualRects([v frame], f))
++                [v setFrame:f];
++        }
++        [rv setEmphasized:emphasized || ![self window]];
++        [rv setSelected:[selected containsIndex:r]];
++    }
++}
++
++- (void)viewWillDraw {
++    /* never narrower than the clip view (as Apple's): a window made wider (maximised) left what the
++     * columns do not cover undrawn, black */
++    NSView *clip = [self superview];
++    if ([clip isKindOfClass:[NSClipView class]] && NSWidth([self frame]) < NSWidth([clip bounds])) {
++        [self setFrameSize:NSMakeSize(NSWidth([clip bounds]), NSHeight([self frame]))];
++        NSView *header = [self headerView];
++        if (header != nil && NSWidth([header frame]) < NSWidth([clip bounds]))
++            [header setFrameSize:NSMakeSize(NSWidth([clip bounds]), NSHeight([header frame]))];
++        [self setNeedsDisplay:YES];
++        [header setNeedsDisplay:YES];
++    }
++    /* and the last shown column takes what the others leave, as when the table was tiled: nothing
++     * draws right of the last column (a maximised window showed black there) */
++    if ([clip isKindOfClass:[NSClipView class]]) {
++        CGFloat total = 0;
++        for (NSTableColumn *c in [self tableColumns])
++            if (![c isHidden])
++                total += [c width] + [self intercellSpacing].width;
++        if (total + 0.5 < NSWidth([clip bounds])) {
++            [self sizeLastColumnToFit];
++            [self setNeedsDisplay:YES];
++            [[self headerView] setNeedsDisplay:YES];
++        }
++    }
++    [self _sfLayoutViews];
++    [super viewWillDraw];
++}
++
++- (void)_sfInvalidateViews {
++    if (objc_getAssociatedObject(self, &sfViewBasedKey) != nil || [self _sfIsViewBased]) {
++        [self _sfViewState]->dirty = YES;
++        [self setNeedsDisplay:YES];
++    }
++}
++
++- (id)viewAtColumn:(NSInteger)column row:(NSInteger)row makeIfNecessary:(BOOL)make {
++    NSTableRowView *rv = [self rowViewAtRow:row makeIfNecessary:make];
++    return [rv viewAtColumn:column];
++}
++
++- (id)rowViewAtRow:(NSInteger)row makeIfNecessary:(BOOL)make {
++    if (![self _sfIsViewBased] || row < 0 || row >= [self numberOfRows])
++        return nil;
++    SFViewBasedState *s = [self _sfViewState];
++    if (s->dirty && make)
++        [self _sfLayoutViews];
++    NSTableRowView *rv = [s->rows objectForKey:[NSNumber numberWithInteger:row]];
++    if (rv == nil && make) {
++        [self _sfLayoutViews];
++        rv = [s->rows objectForKey:[NSNumber numberWithInteger:row]];
++    }
++    return rv;
++}
++
++- (void)enumerateAvailableRowViewsUsingBlock:(void (^)(NSTableRowView *rowView, NSInteger row))block {
++    SFViewBasedState *s = [self _sfViewState];
++    NSArray *keys = [[s->rows allKeys] sortedArrayUsingSelector:@selector(compare:)];
++    for (NSNumber *k in keys)
++        block([s->rows objectForKey:k], [k integerValue]);
++}
++
++- (NSInteger)rowForView:(NSView *)view {
++    SFViewBasedState *s = [self _sfViewState];
++    for (NSView *v = view; v != nil && v != self; v = [v superview])
++        if ([v isKindOfClass:[NSTableRowView class]])
++            for (NSNumber *k in s->rows)
++                if ([s->rows objectForKey:k] == v)
++                    return [k integerValue];
++    return -1;
++}
++
++- (NSInteger)columnForView:(NSView *)view {
++    for (NSView *v = view; v != nil && v != self; v = [v superview])
++        if ([[v superview] isKindOfClass:[NSTableRowView class]])
++            return [[[v superview] subviews] indexOfObjectIdenticalTo:v];
++    return -1;
++}
++
++- (void)reloadDataForRowIndexes:(NSIndexSet *)rowIndexes columnIndexes:(NSIndexSet *)columnIndexes {
++    [self _sfInvalidateViews];
++    [self setNeedsDisplay:YES];
++}
++
++- (void)beginUpdates { [self _sfViewState]->updates++; }
++- (void)endUpdates {
++    SFViewBasedState *s = [self _sfViewState];
++    if (s->updates > 0 && --s->updates == 0)
++        [self noteNumberOfRowsChanged];
++}
++- (void)insertRowsAtIndexes:(NSIndexSet *)indexes withAnimation:(NSUInteger)options {
++    if ([self _sfViewState]->updates == 0)
++        [self noteNumberOfRowsChanged];
++}
++- (void)removeRowsAtIndexes:(NSIndexSet *)indexes withAnimation:(NSUInteger)options {
++    if ([self _sfViewState]->updates == 0)
++        [self noteNumberOfRowsChanged];
++}
++- (void)moveRowAtIndex:(NSInteger)oldIndex toIndex:(NSInteger)newIndex { [self _sfInvalidateViews]; }
++
++- (NSInteger)columnAutoresizingStyle { return [self _sfViewState]->autoresizingStyle; }
++- (void)setColumnAutoresizingStyle:(NSInteger)style { [self _sfViewState]->autoresizingStyle = style; }
++
++- (void)setIndicatorImage:(NSImage *)image inTableColumn:(NSTableColumn *)column {
++    id key = [column identifier] ? [column identifier] : [NSValue valueWithNonretainedObject:column];
++    if (image)
++        [[self _sfViewState]->indicators setObject:image forKey:key];
++    else
++        [[self _sfViewState]->indicators removeObjectForKey:key];
++    [[self headerView] setNeedsDisplay:YES];
++}
++- (NSImage *)indicatorImageInTableColumn:(NSTableColumn *)column {
++    id key = [column identifier] ? [column identifier] : [NSValue valueWithNonretainedObject:column];
++    return [[self _sfViewState]->indicators objectForKey:key];
++}
++
++- (NSInteger)rowSizeStyle { return -1; /* NSTableViewRowSizeStyleDefault */ }
++- (void)setRowSizeStyle:(NSInteger)style {}
++- (NSInteger)effectiveRowSizeStyle { return 2; /* NSTableViewRowSizeStyleMedium */ }
++- (BOOL)usesAutomaticRowHeights { return NO; }
++- (void)setUsesAutomaticRowHeights:(BOOL)b {}
++- (BOOL)floatsGroupRows { return NO; }
++- (void)setFloatsGroupRows:(BOOL)b {}
++- (NSIndexSet *)hiddenRowIndexes { return [NSIndexSet indexSet]; }
++- (void)hideRowsAtIndexes:(NSIndexSet *)indexes withAnimation:(NSUInteger)options {}
++- (void)unhideRowsAtIndexes:(NSIndexSet *)indexes withAnimation:(NSUInteger)options {}
++@end
++
++/* ---- NSNib from a nib that carries it (a table's archived cell views) ---- */
++
++@implementation NSNib (SFArchived)
++- (id)initWithCoder:(NSCoder *)coder {
++    if ((self = [super init]) != nil) {
++        _data = [[coder decodeObjectForKey:@"NSNibFileData"] retain];
++        _allObjects = [[NSMutableArray alloc] init];
++        if (_data == nil) {
++            [self release];
++            return nil;
++        }
++    }
++    return self;
++}
++- (id)initWithNibData:(NSData *)data bundle:(NSBundle *)bundle {
++    if ((self = [super init]) != nil) {
++        _data = [data retain];
++        _allObjects = [[NSMutableArray alloc] init];
++    }
++    return self;
++}
++- (BOOL)instantiateWithOwner:(id)owner topLevelObjects:(NSArray **)objects {
++    return [self instantiateNibWithOwner:owner topLevelObjects:objects];
++}
++@end
+--- a/src/Frameworks/AppKit/NSTableView.m
++++ b/src/Frameworks/AppKit/NSTableView.m
+@@ -38,6 +38,18 @@
+ 
+ @end
+ 
++@interface NSTableView (SFViewBasedHooks)
++-(void)_sfDecodeViewBasedWithCoder:(NSCoder *)coder;
++-(BOOL)_sfIsViewBased;
++-(void)_sfInvalidateViews;
++@end
++
++// a column's share of the table's width: none when it is hidden
++static inline CGFloat sfColumnAdvance(NSArray *columns,NSInteger i,CGFloat spacing){
++   NSTableColumn *c=[columns objectAtIndex:i];
++   return [c isHidden] ? 0 : [c width]+spacing;
++}
++
+ @implementation NSTableView
+ 
+ -(id)_replacementKeyPathForBinding:(id)binding
+@@ -115,6 +127,8 @@
+        _gridStyleMask=[keyed decodeIntForKey:@"NSGridStyleMask"];
+     else
+        _gridStyleMask=NSTableViewGridNone;
++    // view-based tables: the cell views' nibs (NSTableViewViewBased.m)
++    [self _sfDecodeViewBasedWithCoder:keyed];
+    }
+    else {
+     [NSException raise:NSInvalidArgumentException format:@"-[%@ %s] is not implemented for coder %@",[self class], sel_getName(_cmd),coder];
+@@ -408,7 +422,7 @@
+     rect.size.width = 0.;
+     count = [_tableColumns count];
+     for (i = 0; i < count; i++)
+-        rect.size.width += [[_tableColumns objectAtIndex:i] width] + _intercellSpacing.width;
++        rect.size.width += sfColumnAdvance(_tableColumns,i,_intercellSpacing.width);
+     rect.size.height = rowHeightAtIndex(self,row) + _intercellSpacing.height;
+ 
+     return rect;
+@@ -426,10 +440,10 @@
+ 
+     rect.origin.x = 0.;
+     for (i = 0; i < column; i++)
+-        rect.origin.x += [[_tableColumns objectAtIndex:i] width] + _intercellSpacing.width;
++        rect.origin.x += sfColumnAdvance(_tableColumns,i,_intercellSpacing.width);
+     rect.origin.y = 0.;
+ 
+-    rect.size.width = [[_tableColumns objectAtIndex:column] width] + _intercellSpacing.width;
++    rect.size.width = sfColumnAdvance(_tableColumns,column,_intercellSpacing.width);
+     rect.size.height = 0.;
+     for (i = 0; i < numberOfRows; i++)
+         rect.size.height += rowHeightAtIndex(self,i) + _intercellSpacing.height;
+@@ -478,7 +492,7 @@
+     float width = 0.;
+ 
+     for (i = 0; i < numberOfColumns; i++) {
+-     width += [[_tableColumns objectAtIndex:i] width] + _intercellSpacing.width;
++     width += sfColumnAdvance(_tableColumns,i,_intercellSpacing.width);
+ 
+         if (width > rect.origin.x)
+             break;
+@@ -491,7 +505,7 @@
+             if (width > rect.origin.x + rect.size.width)
+                 break;
+ 
+-                width += [[_tableColumns objectAtIndex:i] width] + _intercellSpacing.width;
++                width += sfColumnAdvance(_tableColumns,i,_intercellSpacing.width);
+         }
+         if (i < numberOfColumns)
+             range.length = i - range.location + 1;
+@@ -533,13 +547,13 @@
+ 
+    frame.origin.x = 0.;
+    for (i = 0; i < column; i++)
+-    frame.origin.x += [[_tableColumns objectAtIndex:i] width] + _intercellSpacing.width;
++    frame.origin.x += sfColumnAdvance(_tableColumns,i,_intercellSpacing.width);
+ 
+    frame.origin.y = 0.;
+    for (i = 0; i < row; i++)
+     frame.origin.y += rowHeightAtIndex(self,i) + _intercellSpacing.height;
+ 
+-   frame.size.width = [[_tableColumns objectAtIndex:column] width] + _intercellSpacing.width;
++   frame.size.width = sfColumnAdvance(_tableColumns,column,_intercellSpacing.width);
+    frame.size.height = rowHeightAtIndex(self,row) + _intercellSpacing.height;
+ 
+    return frame;
+@@ -1051,10 +1065,10 @@
+     if (extend == NO)
+         [_selectedColumns removeAllObjects];
+ 
+-    if ([_selectedColumns containsObject:tableColumn] == NO) {
+-        if ([self delegateShouldSelectTableColumn:tableColumn] == YES)
+-            [_selectedColumns addObject:tableColumn];
+-    }
++    // the header view asked the delegate before calling this (as Apple's does); programmatic selection
++    // does not ask
++    if ([_selectedColumns containsObject:tableColumn] == NO)
++        [_selectedColumns addObject:tableColumn];
+ 
+     [self noteSelectionDidChange];
+     [self setNeedsDisplay:YES];
+@@ -1127,6 +1141,7 @@
+ }
+ 
+ -(void)noteNumberOfRowsChanged {
++    [self _sfInvalidateViews];
+     NSSize size = [self frame].size;
+     NSSize headerSize = [_headerView frame].size;
+ 
+@@ -1146,6 +1161,10 @@
+     }
+     if ([_tableColumns count] > 0)
+         size.height = [self rectOfColumn:0].size.height;
++    // as Apple's: never narrower than the clip view, else what the columns leave of a wider window
++    // (a maximised one) is never drawn
++    if ([[self superview] isKindOfClass:[NSClipView class]])
++        size.width = MAX(size.width, [[self superview] bounds].size.width);
+ 
+     headerSize.width = size.width;
+ 
+@@ -1200,16 +1219,28 @@
+     if ([clipView isKindOfClass:[NSClipView class]]) {
+         NSSize size = [clipView bounds].size;
+         int i, count = [_tableColumns count];
+-        float lastWidth = size.width - (count * _intercellSpacing.width);
+-        NSTableColumn *lastColumn = [_tableColumns lastObject];
++        NSTableColumn *lastColumn = nil;
++        float lastWidth = size.width;
+ 
+-        for (i = 0; i < count-1; ++i)
+-            lastWidth -= [[_tableColumns objectAtIndex:i] width];
++        // the last column that is shown takes what the others leave (hidden ones take nothing)
++        for (i = 0; i < count; ++i)
++            if (![[_tableColumns objectAtIndex:i] isHidden])
++                lastColumn = [_tableColumns objectAtIndex:i];
++        for (i = 0; i < count; ++i) {
++            NSTableColumn *c = [_tableColumns objectAtIndex:i];
++            if ([c isHidden])
++                continue;
++            lastWidth -= _intercellSpacing.width;
++            if (c != lastColumn)
++                lastWidth -= [c width];
++        }
++        if (lastColumn == nil)
++            return;
+ 
+-        if (lastWidth > 0)
++        if (lastWidth > [lastColumn minWidth])
+             [lastColumn setWidth:lastWidth];
+-        else if (lastWidth < 0)
+-            [lastColumn setWidth:[lastColumn width]+lastWidth];
++        else
++            [lastColumn setWidth:MAX([lastColumn minWidth],[lastColumn width])];
+ 
+         [self setNeedsDisplay:YES];
+     }
+@@ -1222,6 +1253,8 @@
+ }
+ 
+ -(void)highlightSelectionInClipRect:(NSRect)rect {
++    if ([self _sfIsViewBased])
++        return;   // the row views draw the selection
+     NSInteger row, column;
+     NSInteger numberOfRows=[self numberOfRows];
+ 
+@@ -1262,6 +1295,8 @@
+ }
+ 
+ - (void)drawRow:(int)row clipRect:(NSRect)clipRect {
++    if ([self _sfIsViewBased])
++        return;   // its row and cell views draw it (NSTableViewViewBased.m)
+     // draw only visible columns.
+     NSRange visibleColumns = [self columnsInRect:clipRect];
+     int drawThisColumn = visibleColumns.location;
+@@ -1388,7 +1423,7 @@
+     float result = 0;
+ 
+     for (i = 0; i < count; ++i)
+-        result += [[_tableColumns objectAtIndex:i] width] + _intercellSpacing.width;
++        result += sfColumnAdvance(_tableColumns,i,_intercellSpacing.width);
+ 
+     return result;
+ }
+@@ -1640,8 +1675,8 @@
+ 
+     NSTableColumn *clickedColumnObject = [_tableColumns objectAtIndex:_clickedColumn];
+ 
+-    if(![self delegateShouldSelectTableColumn:clickedColumnObject])
+-     return;
++    // a click in the rows does not ask -tableView:shouldSelectTableColumn: (Apple asks it for clicks in
++    // the header only, where applications sort: Activity Monitor's answers NO after re-sorting)
+     if(![self delegateShouldSelectRow:_clickedRow])
+      return;
+ 
+--- a/src/Frameworks/AppKit/NSOutlineView.m
++++ b/src/Frameworks/AppKit/NSOutlineView.m
+@@ -51,6 +51,10 @@
+ 
+ @end
+ 
++@interface NSTableView (SFViewBasedHooks)
++-(BOOL)_sfIsViewBased;
++@end
++
+ @implementation NSOutlineView
+ 
+ static inline BOOL isItemExpanded(NSOutlineView *self,id item){
+@@ -442,7 +446,8 @@
+         @selector(outlineView:child:ofItem:),
+         @selector(outlineView:isItemExpandable:),
+         @selector(outlineView:numberOfChildrenOfItem:),
+-        @selector(outlineView:objectValueForTableColumn:byItem:),
++        // -outlineView:objectValueForTableColumn:byItem: is not required: a view-based outline
++        // view's data source need not answer it (macOS asks for it only where it is implemented)
+         NULL};
+     int i;
+ 
+@@ -711,7 +716,7 @@
+       NSFrameRectWithWidth(_editingBorder, 2.0);
+      }
+     }
+-    else {
++    else if (![self _sfIsViewBased]) {   // view-based: the row's views draw the cells, the outline view its triangles
+      NSCell *dataCell=[self preparedCellAtColumn:drawThisColumn row:row];
+      [dataCell drawWithFrame:[self frameOfCellAtColumn:drawThisColumn row:row] inView:self];
+     }
+--- a/src/Frameworks/AppKit/NSTableColumn.h
++++ b/src/Frameworks/AppKit/NSTableColumn.h
+@@ -27,6 +27,7 @@
+     float _maxWidth;
+     BOOL _isResizable;
+     BOOL _isEditable;
++    BOOL _isHidden;
+     NSUInteger _resizingMask;
+     NSSortDescriptor *_sortDescriptorPrototype;
+ }
+@@ -69,4 +70,6 @@
+ - (void)_boundValuesChanged;
+ - (void)_sort;
+ 
++-(BOOL)isHidden;
++-(void)setHidden:(BOOL)flag;
+ @end
+--- a/src/Frameworks/AppKit/NSTableColumn.m
++++ b/src/Frameworks/AppKit/NSTableColumn.m
+@@ -38,6 +38,7 @@
+     _maxWidth=[keyed decodeFloatForKey:@"NSMaxWidth"];
+     _isResizable=[keyed decodeBoolForKey:@"NSIsResizeable"];
+     _isEditable=[keyed decodeBoolForKey:@"NSIsEditable"];
++    _isHidden=[keyed decodeBoolForKey:@"NSHidden"];
+    }
+    else {
+     [NSException raise:NSInvalidArgumentException format:@"-[%@ %s] is not implemented for coder %@",[self class], sel_getName(_cmd),coder];
+@@ -177,6 +178,20 @@
+    _resizingMask=value;
+ }
+ 
++// hidden columns take no space in the table or its header (Activity Monitor shows each tab's
++// columns of one outline view this way)
++-(BOOL)isHidden {
++   return _isHidden;
++}
++
++-(void)setHidden:(BOOL)flag {
++   if(flag==_isHidden)
++    return;
++   _isHidden=flag;
++   [_tableView tile];
++   [[_tableView headerView] setNeedsDisplay:YES];
++}
++
+ -(NSCell *)dataCellForRow:(int)row {
+     return [self dataCell];
+ }
+@@ -237,8 +252,8 @@
+ 			if(i==0)
+ 				newDescriptor=[desc reversedSortDescriptor];
+ 			
++			[allDescs removeObjectAtIndex:i];
+ 			[allDescs insertObject:newDescriptor atIndex:0];
+-			[allDescs removeObject:desc];
+ 			[_tableView setSortDescriptors:allDescs];
+ 			return;
+ 		}
+--- a/src/Frameworks/AppKit/NSTableHeaderView.m
++++ b/src/Frameworks/AppKit/NSTableHeaderView.m
+@@ -7,6 +7,10 @@
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+ 
+ #import <AppKit/NSTableHeaderView.h>
++#import <AppKit/NSBezierPath.h>
++#import <AppKit/NSImage.h>
++#import <AppKit/NSColor.h>
++#import <Foundation/NSSortDescriptor.h>
+ #import <AppKit/NSTableView.h>
+ #import <AppKit/NSTableColumn.h>
+ #import <AppKit/NSCell.h>
+@@ -17,6 +21,8 @@
+ #import <AppKit/NSClipView.h>
+ #import <Foundation/NSKeyedArchiver.h>
+ #import <AppKit/NSRaise.h>
++#import <AppKit/NSOutlineView.h>
++#import <objc/message.h>
+ 
+ @interface NSTableView(NSTableView_private)
+ -(void)noteColumnDidResizeWithOldWidth:(CGFloat)oldWidth;
+@@ -67,9 +73,14 @@
+             column, 0, [tableColumns count]];
+     }
+ 
+-    headerRect.size.width = [[tableColumns objectAtIndex:column--] width] + spacing.width;
+-    while (column >= 0)
+-        headerRect.origin.x += [[tableColumns objectAtIndex:column--] width] + spacing.width;
++    // hidden columns take no space
++    headerRect.size.width = [[tableColumns objectAtIndex:column] isHidden] ? 0 : [[tableColumns objectAtIndex:column] width] + spacing.width;
++    column--;
++    while (column >= 0){
++        if (![[tableColumns objectAtIndex:column] isHidden])
++            headerRect.origin.x += [[tableColumns objectAtIndex:column] width] + spacing.width;
++        column--;
++    }
+     
+     return headerRect;
+ }
+@@ -85,6 +96,37 @@
+     return NSNotFound;
+ }
+ 
++// the sort indicator: the image the table was given for the column (-setIndicatorImage:inTableColumn:),
++// or, for the highlighted column without one, a chevron in the direction of the table's first sort
++// descriptor (this AppKit has no NSAscendingSortIndicator image)
++-(void)_sfDrawSortIndicatorForColumn:(NSTableColumn *)column inRect:(NSRect)rect {
++    NSImage *image = [_tableView respondsToSelector:@selector(indicatorImageInTableColumn:)] ? [_tableView indicatorImageInTableColumn:column] : nil;
++    BOOL highlighted = [_tableView respondsToSelector:@selector(highlightedTableColumn)] && [_tableView highlightedTableColumn] == column;
++    if (image == nil && !highlighted)
++        return;
++    NSRect r = NSMakeRect(NSMaxX(rect) - 16, NSMinY(rect) + (NSHeight(rect) - 8) / 2, 9, 8);
++    if (image != nil && [image size].width > 1) {
++        [image drawInRect:r fromRect:NSZeroRect operation:NSCompositeSourceOver fraction:1.0];
++        return;
++    }
++    NSArray *sort = [_tableView sortDescriptors];
++    BOOL ascending = [sort count] ? [[sort objectAtIndex:0] ascending] : YES;
++    BOOL up = [self isFlipped] ? !ascending : ascending;
++    NSBezierPath *p = [NSBezierPath bezierPath];
++    if (up) {
++        [p moveToPoint:NSMakePoint(NSMinX(r), NSMaxY(r) - 2)];
++        [p lineToPoint:NSMakePoint(NSMidX(r), NSMinY(r) + 2)];
++        [p lineToPoint:NSMakePoint(NSMaxX(r), NSMaxY(r) - 2)];
++    } else {
++        [p moveToPoint:NSMakePoint(NSMinX(r), NSMinY(r) + 2)];
++        [p lineToPoint:NSMakePoint(NSMidX(r), NSMaxY(r) - 2)];
++        [p lineToPoint:NSMakePoint(NSMaxX(r), NSMinY(r) + 2)];
++    }
++    [p setLineWidth:1.5];
++    [[NSColor secondaryLabelColor] setStroke];
++    [p stroke];
++}
++
+ -(void)drawRect:(NSRect)rect {
+     NSArray *tableColumns = [_tableView tableColumns];
+     int i, count = [tableColumns count];
+@@ -98,11 +140,14 @@
+ 
+     for (i = 0; i < count; ++i) {
+         NSTableColumn *column = [tableColumns objectAtIndex:i];
+-        
++
++        if ([column isHidden])
++            continue;
+         columnRect.size.width = [column width] + spacing.width;
+         [[column headerCell] setHighlighted:[_tableView isColumnSelected:[[_tableView tableColumns] indexOfObject:column]]];
+         [[column headerCell] setControlView:self];
+         [[column headerCell] drawWithFrame:columnRect inView:self];        
++        [self _sfDrawSortIndicatorForColumn:column inRect:columnRect];
+         columnRect.origin.x += [column width] + spacing.width;
+     }
+ }
+@@ -120,6 +165,8 @@
+     NSPoint location = [self convertPoint:[theEvent locationInWindow] fromView:nil];
+     int clickedColumn = [self columnAtPoint:location];
+ 
++    if (clickedColumn < 0 || clickedColumn == NSNotFound)
++        return;
+     if ([[_tableView delegate] respondsToSelector:@selector(tableView:mouseDownInHeaderOfTableColumn:)])
+         [[_tableView delegate] tableView:_tableView
+           mouseDownInHeaderOfTableColumn:[[_tableView tableColumns] objectAtIndex:clickedColumn]];
+@@ -178,7 +225,18 @@
+         }
+     }
+ 	
+-    if ([_tableView allowsColumnSelection]) {
++    // Apple asks the delegate on every click in a header (not on a resize edge) whether the column may
++    // be selected, whether or not the table allows column selection; applications sort there
++    // (Activity Monitor's -outlineView:shouldSelectTableColumn: sets its sort column and direction)
++    NSTableColumn *column = [[_tableView tableColumns] objectAtIndex:clickedColumn];
++    id delegate = [_tableView delegate];
++    BOOL outline = [_tableView isKindOfClass:[NSOutlineView class]];
++    SEL should = outline ? @selector(outlineView:shouldSelectTableColumn:) : @selector(tableView:shouldSelectTableColumn:);
++    BOOL mayselect = YES;
++    if ([delegate respondsToSelector:should])
++        mayselect = ((BOOL (*)(id, SEL, id, id))objc_msgSend)(delegate, should, _tableView, column);
++
++    if (mayselect && [_tableView allowsColumnSelection]) {
+         if ([theEvent modifierFlags] & NSAlternateKeyMask) {		// extend/change selection
+             if ([_tableView isColumnSelected:clickedColumn])		// deselect previously selected?
+                 [_tableView deselectColumn:clickedColumn];
+@@ -205,7 +263,12 @@
+             [_tableView selectColumn:clickedColumn byExtendingSelection:NO];
+     }
+ 	
+-	[[[_tableView tableColumns] objectAtIndex:clickedColumn] _sort];
++	[column _sort];
++
++    SEL clicked = outline ? @selector(outlineView:didClickTableColumn:) : @selector(tableView:didClickTableColumn:);
++    if ([delegate respondsToSelector:clicked])
++        ((void (*)(id, SEL, id, id))objc_msgSend)(delegate, clicked, _tableView, column);
++    [self setNeedsDisplay:YES];
+ }
+ 
+ -(void)resetCursorRects {
+--- a/src/Frameworks/AppKit/NSLayoutConstraint.m
++++ b/src/Frameworks/AppKit/NSLayoutConstraint.m
+@@ -165,6 +165,24 @@
+ }
+ 
+ // the constraints every view in the subtree holds, those that are active
++/* A view whose subtree is laid out on its own (a table's row view: the constraints of the cell views
++ * in it name only views of that row) is the top of its own layouts and is left out of its window's:
++ * a window of a hundred rows otherwise solved every row's constraints whenever any one row's view
++ * asked, at each display. (Activity Monitor: docs/roadmap/issues/SF-AA-activity-monitor.md.) */
++static BOOL sfIsLayoutBoundary(NSView *view) {
++    static Class rowView;
++
++    if (rowView == Nil)
++        rowView = NSClassFromString(@"NSTableRowView");
++    return rowView != Nil && [view isKindOfClass:rowView];
++}
++
++static NSView *sfLayoutTop(NSView *view) {
++    while ([view superview] != nil && !sfIsLayoutBoundary(view))
++        view = [view superview];
++    return view;
++}
++
+ static void collectConstraints(NSView *view, NSMutableArray *into) {
+     NSArray *held = objc_getAssociatedObject(view, &constraintsKey);
+ 
+@@ -173,7 +191,8 @@
+             [into addObject:c];
+     }
+     for (NSView *subview in [view subviews])
+-        collectConstraints(subview, into);
++        if (!sfIsLayoutBoundary(subview))
++            collectConstraints(subview, into);
+ }
+ 
+ // a view's place in the bounds of one above it, as an alignment rectangle from that one's top left
+@@ -292,10 +311,8 @@
+         [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(_sfLayoutPending) object:nil];
+     }
+     if (outermost) {
+-        NSView *top = self;
++        NSView *top = sfLayoutTop(self);
+ 
+-        while ([top superview] != nil)
+-            top = [top superview];
+         for (int pass = 0; pass < 2 && sfLayoutApplying == 0; pass++)
+             [top _sfLayoutTreeFitting:NO apply:YES];
+         sfLayoutSubtreePass = YES;
+@@ -534,8 +551,7 @@
+ 
+     if (sfLayoutApplying > 0 || sfLayoutSubtreePass || [[self _sfConstraints:NO] count] == 0)
+         return;
+-    while ([top superview] != nil)
+-        top = [top superview];
++    top = sfLayoutTop(self);
+     if (sfResizeDepth > 1) {
+         // inside a resize cascade: once, at its end
+         if (sfResizePending != top) {

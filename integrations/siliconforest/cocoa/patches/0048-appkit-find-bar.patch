@@ -1,0 +1,518 @@
+--- a/src/Frameworks/AppKit/NSTextFinder.m
++++ b/src/Frameworks/AppKit/NSTextFinder.m
+@@ -0,0 +1,460 @@
++/*
++ * Copyright (c) 2026 The Finch Project contributors.
++ * SPDX-License-Identifier: MIT OR Apache-2.0
++ *
++ * Taken from Finch (an open Darwin for Apple Silicon), userland/AppKit/NSTextFinder.m at commit
++ * 2d9b1bb, for SiliconForest's AppKit (GitHub issue 52: Terminal's Command-F find bar,
++ * docs/roadmap/issues/SF-Y-terminal-app.md). Finch's description:
++ *
++ * NSTextFinder: the find bar and its actions, for any NSTextFinderClient [...] The search string
++ * lives on the find pasteboard as on macOS, so it's shared with other text views. Matching ignores
++ * case; next and previous wrap around. The bar (Apple's class name, NSTextFinderBarView) is a
++ * search field, previous/next buttons and Done, with a replace row when asked for.
++ *
++ * Adapted here: the class keeps the ivars this AppKit's header declares (NSMacOS26Additions.h,
++ * where it was a finder without a bar), manual retain/release, the action numbers as constants,
++ * the bar taken from a container that is not a scroll view (Terminal's pane places it itself);
++ * Finch's NSTextView category is not taken (this AppKit's text view keeps its own find panel).
++ */
++#import <AppKit/NSMacOS26Additions.h>
++#import <AppKit/NSModernAppKit.h>
++#import <AppKit/NSSearchField.h>
++#import <AppKit/NSSegmentedControl.h>
++#import <AppKit/NSButton.h>
++#import <AppKit/NSTextField.h>
++#import <AppKit/NSColor.h>
++#import <AppKit/NSFont.h>
++#import <AppKit/NSPasteboard.h>
++#import <AppKit/NSWindow.h>
++#import <AppKit/NSBezierPath.h>
++#import <AppKit/NSGraphics.h>
++#import <AppKit/NSTextView.h>
++#import <objc/message.h>
++
++enum {
++    NSTextFinderActionShowFindInterface = 1, NSTextFinderActionNextMatch = 2, NSTextFinderActionPreviousMatch = 3,
++    NSTextFinderActionReplaceAll = 4, NSTextFinderActionReplace = 5, NSTextFinderActionReplaceAndFind = 6,
++    NSTextFinderActionSetSearchString = 7, NSTextFinderActionReplaceAllInSelection = 8, NSTextFinderActionSelectAll = 9,
++    NSTextFinderActionSelectAllInSelection = 10, NSTextFinderActionHideFindInterface = 11,
++    NSTextFinderActionShowReplaceInterface = 12, NSTextFinderActionHideReplaceInterface = 13,
++};
++typedef NSInteger NSTextFinderAction;
++
++@interface NSTextFinderBarView : NSView {
++    NSTextFinder *_finder;
++    NSSearchField *_searchField;
++    NSTextField *_replaceField, *_countLabel;
++    BOOL _showsReplace;
++}
++- (instancetype)initWithFinder:(NSTextFinder *)finder;
++- (NSSearchField *)searchField;
++- (NSTextField *)replaceField;
++- (NSTextField *)countLabel;
++- (BOOL)showsReplace;
++- (void)setShowsReplace:(BOOL)shows;
++@end
++
++@interface NSTextFinder (FinchPrivate)
++- (void)_finchSearchFieldChanged:(id)sender;
++- (void)_finchPrevNext:(NSSegmentedControl *)sender;
++- (void)_finchDone:(id)sender;
++- (void)_finchReplace:(id)sender;
++- (void)_finchReplaceAll:(id)sender;
++- (NSArray *)_matchesIn:(NSRange)scope;
++@end
++
++static const CGFloat kFindRow = 32, kReplaceRow = 28;
++
++@implementation NSTextFinderBarView
++
++- (instancetype)initWithFinder:(NSTextFinder *)finder
++{
++    self = [super initWithFrame:NSMakeRect(0, 0, 400, kFindRow)];
++    if (self) {
++        _finder = finder;
++        _searchField = [[NSSearchField alloc] initWithFrame:NSMakeRect(8, 5, 220, 22)];
++        [_searchField setTarget:finder];
++        [_searchField setAction:@selector(_finchSearchFieldChanged:)];
++        [_searchField setDelegate:(id)finder];
++        [_searchField setAutoresizingMask:NSViewWidthSizable];
++        [self addSubview:_searchField];
++        /* "3 found" / "Not found", inside the search field's right end, as
++           Apple's bar shows it. */
++        _countLabel = [[NSTextField labelWithString:@""] retain];
++        [_countLabel setFont:[NSFont systemFontOfSize:11]];
++        [_countLabel setTextColor:[NSColor secondaryLabelColor]];
++        [_countLabel setAlignment:NSRightTextAlignment];
++        [_countLabel setFrame:NSMakeRect(228 - 22 - 76, 8, 76, 16)];
++        [_countLabel setAutoresizingMask:NSViewMinXMargin];
++        [self addSubview:_countLabel];
++        NSSegmentedControl *nav = [NSSegmentedControl segmentedControlWithLabels:@[ @"‹", @"›" ]
++                                                                    trackingMode:NSSegmentSwitchTrackingMomentary
++                                                                          target:finder
++                                                                          action:@selector(_finchPrevNext:)];
++        [nav setFrame:NSMakeRect(236, 5, 52, 22)];
++        [nav setAutoresizingMask:NSViewMinXMargin];
++        [self addSubview:nav];
++        NSButton *done = [NSButton buttonWithTitle:@"Done" target:finder action:@selector(_finchDone:)];
++        [done setFrame:NSMakeRect(296, 4, 64, 24)];
++        [done setAutoresizingMask:NSViewMinXMargin];
++        [self addSubview:done];
++    }
++    return self;
++}
++
++- (void)dealloc
++{
++    [_searchField release];
++    [_replaceField release];
++    [_countLabel release];
++    [super dealloc];
++}
++
++- (NSSearchField *)searchField { return _searchField; }
++- (NSTextField *)replaceField { return _replaceField; }
++- (NSTextField *)countLabel { return _countLabel; }
++- (BOOL)showsReplace { return _showsReplace; }
++
++- (BOOL)isFlipped { return YES; }
++
++// While the search field has the keys the client is not in the responder chain: the bar takes the
++// find menu's actions itself (Command-G, Command-Shift-G, Command-E with the bar focused).
++- (void)performTextFinderAction:(id)sender { [_finder performAction:[sender tag]]; }
++- (void)performFindPanelAction:(id)sender { [_finder performAction:[sender tag]]; }
++- (BOOL)validateMenuItem:(NSMenuItem *)item { return [_finder validateAction:[item tag]]; }
++- (BOOL)validateUserInterfaceItem:(id)item { return [_finder validateAction:[item tag]]; }
++
++- (void)setShowsReplace:(BOOL)shows
++{
++    if (shows == _showsReplace)
++        return;
++    _showsReplace = shows;
++    NSRect f = [self frame];
++    f.size.height = shows ? kFindRow + kReplaceRow : kFindRow;
++    [self setFrame:f];
++    if (shows && !_replaceField) {
++        _replaceField = [[NSTextField alloc] initWithFrame:NSMakeRect(8, kFindRow, 220, 22)];
++        [_replaceField setPlaceholderString:@"Replace"];
++        [_replaceField setAutoresizingMask:NSViewWidthSizable];
++        [self addSubview:_replaceField];
++        NSButton *one = [NSButton buttonWithTitle:@"Replace" target:_finder action:@selector(_finchReplace:)];
++        [one setFrame:NSMakeRect(236, kFindRow - 1, 72, 24)];
++        [one setTag:1001];
++        [self addSubview:one];
++        NSButton *all = [NSButton buttonWithTitle:@"All" target:_finder action:@selector(_finchReplaceAll:)];
++        [all setFrame:NSMakeRect(312, kFindRow - 1, 48, 24)];
++        [all setTag:1002];
++        [self addSubview:all];
++    }
++    for (NSView *v in [self subviews])
++        if (v == _replaceField || [v tag] == 1001 || [v tag] == 1002)
++            [v setHidden:!shows];
++}
++
++- (void)drawRect:(NSRect)dirty
++{
++    [[NSColor windowBackgroundColor] setFill];
++    NSRectFill(dirty);
++    [[NSColor separatorColor] setFill];
++    NSRectFill(NSMakeRect(0, NSHeight([self bounds]) - 1, NSWidth([self bounds]), 1));
++}
++
++@end
++
++@implementation NSTextFinder {
++    NSTextFinderBarView *_bar;
++}
++
++#define _container _findBarContainer
++
++- (instancetype)initWithCoder:(NSCoder *)coder { return [self init]; }
++- (void)encodeWithCoder:(NSCoder *)coder {}
++
++- (void)dealloc
++{
++    [_bar release];
++    [super dealloc];
++}
++
++- (id)client { return _client; }
++- (void)setClient:(id)c { _client = c; }
++- (id)findBarContainer { return _container; }
++- (void)setFindBarContainer:(id)c { _container = c; }
++- (BOOL)findIndicatorNeedsUpdate { return NO; }
++- (void)setFindIndicatorNeedsUpdate:(BOOL)flag { }
++- (BOOL)isIncrementalSearchingEnabled { return _incremental; }
++- (void)setIncrementalSearchingEnabled:(BOOL)f { _incremental = f; }
++- (BOOL)incrementalSearchingShouldDimContentView { return _dimming; }
++- (void)setIncrementalSearchingShouldDimContentView:(BOOL)f { _dimming = f; }
++- (NSArray *)incrementalMatchRanges
++{
++    if (!_incremental || ![[[_bar searchField] stringValue] length])
++        return @[];
++    return [self _matchesIn:NSMakeRange(0, [[self _string] length])];
++}
++- (void)cancelFindIndicator {}
++- (void)noteClientStringWillChange
++{
++    [self performSelector:@selector(_updateCount) withObject:nil afterDelay:0];
++}
++
+++ (void)drawIncrementalMatchHighlightInRect:(NSRect)rect
++{
++    [[NSColor findHighlightColor] setFill];
++    [[NSBezierPath bezierPathWithRoundedRect:rect xRadius:3 yRadius:3] fill];
++}
++
++#pragma mark The client
++
++- (NSString *)_string
++{
++    if ([(id)_client respondsToSelector:@selector(string)])
++        return [_client string];
++    return @"";
++}
++
++- (NSRange)_selection
++{
++    if ([(id)_client respondsToSelector:@selector(firstSelectedRange)])
++        return ((NSRange (*)(id, SEL))objc_msgSend)(_client, @selector(firstSelectedRange));
++    if ([(id)_client respondsToSelector:@selector(selectedRanges)])
++        return [[[_client selectedRanges] firstObject] rangeValue];
++    return NSMakeRange(0, 0);
++}
++
++- (void)_select:(NSRange)r
++{
++    if ([(id)_client respondsToSelector:@selector(setSelectedRanges:)])
++        [_client setSelectedRanges:@[ [NSValue valueWithRange:r] ]];
++    if ([(id)_client respondsToSelector:@selector(scrollRangeToVisible:)])
++        [_client scrollRangeToVisible:r];
++}
++
++static NSPasteboard *
++find_pasteboard(void)
++{
++    return [NSPasteboard pasteboardWithName:NSPasteboardNameFind];
++}
++
++- (NSString *)_searchString
++{
++    NSString *field = [[_bar searchField] stringValue];
++    if ([field length])
++        return field;
++    return [find_pasteboard() stringForType:NSPasteboardTypeString] ?: @"";
++}
++
++- (void)_setSearchString:(NSString *)s
++{
++    NSPasteboard *pb = find_pasteboard();
++    [pb clearContents];
++    [pb setString:s forType:NSPasteboardTypeString];
++    [[_bar searchField] setStringValue:s];
++}
++
++#pragma mark The bar
++
++- (NSTextFinderBarView *)_finchBar
++{
++    if (!_bar)
++        _bar = [[NSTextFinderBarView alloc] initWithFinder:self];
++    return _bar;
++}
++
++- (void)_showBar:(BOOL)replace
++{
++    NSTextFinderBarView *bar = [self _finchBar];
++    [bar setShowsReplace:replace];
++    NSString *s = [find_pasteboard() stringForType:NSPasteboardTypeString];
++    if (s && ![[[bar searchField] stringValue] length])
++        [[bar searchField] setStringValue:s];
++    [_container setFindBarView:bar];
++    [_container setFindBarVisible:YES];
++    [_container findBarViewDidChangeHeight];
++    [[bar window] makeFirstResponder:[bar searchField]];
++}
++
++- (void)_hideBar
++{
++    [_container setFindBarVisible:NO];
++    NSView *content = [_container respondsToSelector:@selector(contentView)] ? [(id)_container contentView] : nil;
++    if ([_client isKindOfClass:[NSView class]])
++        [[(NSView *)_client window] makeFirstResponder:(NSView *)_client];
++    (void)content;
++}
++
++#pragma mark Finding
++
++- (BOOL)_findForward:(BOOL)forward
++{
++    NSString *needle = [self _searchString], *hay = [self _string];
++    if (![needle length] || ![hay length])
++        return NO;
++    NSRange sel = [self _selection];
++    NSRange r;
++    if (forward) {
++        NSUInteger from = MIN(NSMaxRange(sel), [hay length]);
++        r = [hay rangeOfString:needle options:NSCaseInsensitiveSearch range:NSMakeRange(from, [hay length] - from)];
++        if (r.location == NSNotFound)
++            r = [hay rangeOfString:needle options:NSCaseInsensitiveSearch range:NSMakeRange(0, [hay length])];
++    } else {
++        NSUInteger to = MIN(sel.location, [hay length]);
++        r = [hay rangeOfString:needle options:NSCaseInsensitiveSearch | NSBackwardsSearch range:NSMakeRange(0, to)];
++        if (r.location == NSNotFound)
++            r = [hay rangeOfString:needle options:NSCaseInsensitiveSearch | NSBackwardsSearch
++                             range:NSMakeRange(0, [hay length])];
++    }
++    if (r.location == NSNotFound) {
++        NSBeep();
++        return NO;
++    }
++    [self _select:r];
++    return YES;
++}
++
++- (NSArray *)_matchesIn:(NSRange)scope
++{
++    NSString *needle = [self _searchString], *hay = [self _string];
++    NSMutableArray *ranges = [NSMutableArray array];
++    if (![needle length] || NSMaxRange(scope) > [hay length])
++        return ranges;
++    NSRange r = [hay rangeOfString:needle options:NSCaseInsensitiveSearch range:scope];
++    while (r.location != NSNotFound) {
++        [ranges addObject:[NSValue valueWithRange:r]];
++        NSUInteger from = NSMaxRange(r);
++        if (from >= NSMaxRange(scope))
++            break;
++        r = [hay rangeOfString:needle options:NSCaseInsensitiveSearch range:NSMakeRange(from, NSMaxRange(scope) - from)];
++    }
++    return ranges;
++}
++
++/* The bar's match count, for what the search field holds. */
++- (void)_updateCount
++{
++    if (!_bar)
++        return;
++    NSString *field = [[_bar searchField] stringValue];
++    NSString *text = @"";
++    if ([field length]) {
++        NSUInteger n = [[self _matchesIn:NSMakeRange(0, [[self _string] length])] count];
++        text = n ? [NSString stringWithFormat:@"%lu found", (unsigned long)n] : @"Not found";
++    }
++    [[_bar countLabel] setStringValue:text];
++}
++
++- (BOOL)_editable
++{
++    return ![(id)_client respondsToSelector:@selector(isEditable)] || [_client isEditable];
++}
++
++- (void)_replaceRange:(NSRange)r with:(NSString *)with
++{
++    if ([(id)_client respondsToSelector:@selector(shouldReplaceCharactersInRanges:withStrings:)] &&
++        ![_client shouldReplaceCharactersInRanges:@[ [NSValue valueWithRange:r] ] withStrings:@[ with ]])
++        return;
++    if ([(id)_client respondsToSelector:@selector(replaceCharactersInRange:withString:)])
++        [_client replaceCharactersInRange:r withString:with];
++    if ([(id)_client respondsToSelector:@selector(didReplaceCharacters)])
++        [_client didReplaceCharacters];
++}
++
++- (NSUInteger)_replaceAllIn:(NSRange)scope
++{
++    NSString *needle = [self _searchString], *with = [[_bar replaceField] stringValue] ?: @"";
++    if (![needle length] || ![self _editable])
++        return 0;
++    NSUInteger count = 0;
++    NSString *hay = [self _string];
++    NSRange r = [hay rangeOfString:needle options:NSCaseInsensitiveSearch | NSBackwardsSearch range:scope];
++    while (r.location != NSNotFound) {
++        [self _replaceRange:r with:with];
++        count++;
++        hay = [self _string];
++        if (r.location == scope.location)
++            break;
++        r = [hay rangeOfString:needle options:NSCaseInsensitiveSearch | NSBackwardsSearch
++                         range:NSMakeRange(scope.location, r.location - scope.location)];
++    }
++    return count;
++}
++
++- (void)_selectAllIn:(NSRange)scope
++{
++    NSArray *ranges = [self _matchesIn:scope];
++    if ([ranges count] && [(id)_client respondsToSelector:@selector(setSelectedRanges:)])
++        [_client setSelectedRanges:ranges];
++}
++
++- (void)performAction:(NSInteger)op
++{
++    NSString *string = [self _string];
++    switch (op) {
++    case NSTextFinderActionShowFindInterface: [self _showBar:[_bar showsReplace]]; break;
++    case NSTextFinderActionShowReplaceInterface: [self _showBar:YES]; break;
++    case NSTextFinderActionHideReplaceInterface: [[self _finchBar] setShowsReplace:NO]; [_container findBarViewDidChangeHeight]; break;
++    case NSTextFinderActionHideFindInterface: [self _hideBar]; break;
++    case NSTextFinderActionNextMatch: [self _findForward:YES]; break;
++    case NSTextFinderActionPreviousMatch: [self _findForward:NO]; break;
++    case NSTextFinderActionSetSearchString: {
++        NSRange sel = [self _selection];
++        if (sel.length && NSMaxRange(sel) <= [string length])
++            [self _setSearchString:[string substringWithRange:sel]];
++        break;
++    }
++    case NSTextFinderActionReplace:
++    case NSTextFinderActionReplaceAndFind: {
++        NSRange sel = [self _selection];
++        if (sel.length && [self _editable] && NSMaxRange(sel) <= [string length] &&
++            [[string substringWithRange:sel] compare:[self _searchString] options:NSCaseInsensitiveSearch] == NSOrderedSame)
++            [self _replaceRange:sel with:[[_bar replaceField] stringValue] ?: @""];
++        if (op == NSTextFinderActionReplaceAndFind)
++            [self _findForward:YES];
++        break;
++    }
++    case NSTextFinderActionReplaceAll: [self _replaceAllIn:NSMakeRange(0, [string length])]; break;
++    case NSTextFinderActionReplaceAllInSelection: [self _replaceAllIn:[self _selection]]; break;
++    case NSTextFinderActionSelectAll: [self _selectAllIn:NSMakeRange(0, [string length])]; break;
++    case NSTextFinderActionSelectAllInSelection: [self _selectAllIn:[self _selection]]; break;
++    default: break;
++    }
++    [self _updateCount];
++}
++
++/* As Apple's: every action is offered. */
++- (BOOL)validateAction:(NSInteger)op { return op >= 1 && op <= 13; }
++
++#pragma mark The bar's controls
++
++- (void)_finchSearchFieldChanged:(id)sender
++{
++    NSString *s = [sender stringValue];
++    NSPasteboard *pb = find_pasteboard();
++    [pb clearContents];
++    [pb setString:s forType:NSPasteboardTypeString];
++    if ([s length])
++        [self _findForward:YES];
++    [self _updateCount];
++}
++
++- (void)_finchPrevNext:(NSSegmentedControl *)sender
++{
++    [self _findForward:[sender selectedSegment] == 1];
++}
++
++- (void)_finchDone:(id)sender { [self _hideBar]; }
++
++/* As Apple's: Escape in the search field closes the bar, the match staying selected in the
++   client, which takes the keys again. */
++- (BOOL)control:(NSControl *)control textView:(NSTextView *)textView doCommandBySelector:(SEL)selector
++{
++    if (selector != @selector(cancelOperation:))
++        return NO;
++    [self _hideBar];
++    return YES;
++}
++- (void)_finchReplace:(id)sender { [self performAction:NSTextFinderActionReplaceAndFind]; }
++- (void)_finchReplaceAll:(id)sender { [self performAction:NSTextFinderActionReplaceAll]; }
++
++@end
++
+--- a/src/Frameworks/AppKit/NSMacOS26Additions.m
++++ b/src/Frameworks/AppKit/NSMacOS26Additions.m
+@@ -182,24 +182,7 @@
+ SF_TOLERANT
+ @end
+ 
+-@implementation NSTextFinder
+-@synthesize client = _client, findBarContainer = _findBarContainer;
+-- (instancetype)initWithCoder:(NSCoder *)coder { return [self init]; }
+-- (void)encodeWithCoder:(NSCoder *)coder { }
+-- (BOOL)findIndicatorNeedsUpdate { return NO; }
+-- (void)setFindIndicatorNeedsUpdate:(BOOL)flag { }
+-- (BOOL)isIncrementalSearchingEnabled { return _incremental; }
+-- (void)setIncrementalSearchingEnabled:(BOOL)flag { _incremental = flag; }
+-- (BOOL)incrementalSearchingShouldDimContentView { return _dimming; }
+-- (void)setIncrementalSearchingShouldDimContentView:(BOOL)flag { _dimming = flag; }
+-- (void)performAction:(NSInteger)action { NSBeep(); }
+-- (BOOL)validateAction:(NSInteger)action { return NO; }
+-- (void)cancelFindIndicator { }
+-- (void)noteClientStringWillChange { }
+-- (NSArray *)incrementalMatchRanges { return [NSArray array]; }
+-+ (void)drawIncrementalMatchHighlightInRect:(NSRect)rect { }
+-SF_TOLERANT
+-@end
++// NSTextFinder: NSTextFinder.m (the find bar, after Finch)
+ 
+ 
+ // ---- methods of existing classes that applications built against the macOS 26 SDK send
+--- a/src/Frameworks/AppKit/NSMacOS26Additions.h
++++ b/src/Frameworks/AppKit/NSMacOS26Additions.h
+@@ -96,8 +96,8 @@
+ + (NSInputManager *)currentInputManager;
+ @end
+ 
+-// The find bar's controller. There is no find bar in this AppKit yet: the object keeps its
+-// client and container and reports that an action cannot be performed.
++// The find bar's controller (NSTextFinder.m, after Finch's): a find bar with a search field,
++// previous and next, Done and a replace row, put in its container (-setFindBarView:).
+ @interface NSTextFinder : NSObject <NSCoding> {
+     id _client, _findBarContainer; BOOL _incremental, _dimming;
+ }
+--- a/src/Frameworks/AppKit/NSResponder.m
++++ b/src/Frameworks/AppKit/NSResponder.m
+@@ -97,6 +97,11 @@
+       [self doCommandBySelector:NSSelectorFromString([selectorNames objectAtIndex:j])];
+      }
+     }
++    else if([event modifierFlags]&NSCommandKeyMask){
++     // as on macOS: a Command key that no menu took inserts nothing (Command-G typed a "g" into
++     // the find bar's field)
++     [self doCommandBySelector:@selector(noop:)];
++    }
+     else if([self respondsToSelector:@selector(insertText:)] || [self respondsToSelector:@selector(insertText:replacementRange:)]){
+      string=[event characters];
+  

@@ -1,0 +1,36 @@
+linuxkpi: wake_up() wakes every waiter
+
+Audit finding W5. linux_wake_up() stopped after nr successful wakeups, and wake_up()
+passes 1. In linux nr limits exclusive waiters only; non-exclusive ones are all woken.
+There are no exclusive waiters in this layer, so with two threads waiting on one queue
+(two entities flushing on one scheduler) the second slept until its timeout.
+
+--- a/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/src/linux_schedule.c
++++ b/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/src/linux_schedule.c
+@@ -295,14 +295,18 @@
+ 
+ 	if (!locked)
+ 		spin_lock(&wqh->lock);
++	/*
++	 * linux's nr counts exclusive waiters only, and every non-exclusive
++	 * waiter is woken whatever nr is. This layer has no exclusive waiters
++	 * (no WQ_FLAG_EXCLUSIVE), so wake_up() must wake them all: stopping
++	 * after the first left a second waiter of the same queue asleep.
++	 */
++	(void)nr;
+ 	list_for_each_entry_safe(pos, next, &wqh->task_list, task_list) {
+-		if (pos->func == NULL) {
+-			if (wake_up_task(pos->private, state) != 0 && --nr == 0)
+-				break;
+-		} else {
+-			if (pos->func(pos, state, 0, NULL) != 0 && --nr == 0)
+-				break;
+-		}
++		if (pos->func == NULL)
++			(void)wake_up_task(pos->private, state);
++		else
++			(void)pos->func(pos, state, 0, NULL);
+ 	}
+ 	if (!locked)
+ 		spin_unlock(&wqh->lock);
+

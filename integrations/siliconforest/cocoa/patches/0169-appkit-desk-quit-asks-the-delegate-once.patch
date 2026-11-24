@@ -1,0 +1,28 @@
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -2616,12 +2616,24 @@
+  * -terminate: by a method that only posts NSApplicationWillTerminateNotification (it expects its delegate to have been
+  * asked, and quits itself from there): a windowless Firefox told to quit with -terminate: alone stayed alive. An
+  * application with open documents goes through -terminate:, which reviews them first. */
++static IMP sfOwnTerminate;
++
+++(void)load {
++   sfOwnTerminate=class_getMethodImplementation(self,@selector(terminate:));
++}
++
+ -(void)_sfQuitFromDesk {
+    if([[[NSDocumentController sharedDocumentController] documents] count]==0 &&
+       [_delegate respondsToSelector:@selector(applicationShouldTerminate:)]){
+     NSApplicationTerminateReply reply=[_delegate applicationShouldTerminate:self];
+ 
+-    if(reply==NSTerminateNow)
++    if(reply!=NSTerminateNow)
++     return;
++    // the delegate was asked once: our own -terminate: would ask it again, a replaced one (Firefox's) is what the
++    // application wants run after its delegate said Now
++    if(class_getMethodImplementation([self class],@selector(terminate:))==sfOwnTerminate)
++     [self replyToApplicationShouldTerminate:YES];
++    else
+      [self terminate:nil];
+     return;
+    }

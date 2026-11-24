@@ -1,0 +1,845 @@
+--- a/src/Kernel/Extensions/IOHIDFamily/IOHIDFamily/IOHIDEventService.cpp
++++ b/src/Kernel/Extensions/IOHIDFamily/IOHIDFamily/IOHIDEventService.cpp
+@@ -260,6 +260,33 @@
+ 
+     return true;
+ }
++/* The parsed collection capabilities of a successfully started event service
++ * authorize only matching real queue endpoints. No report is manufactured.
++ * Native SPI keyboard: keyboard only. PDSerialHID: keyboard + virtual mouse. */
++static void
++pdHIDPublishSupportedQueues(bool ready, OSArray *pairs)
++{
++    if (!ready || !pairs) return;
++    for (unsigned i = 0; i < pairs->getCount(); i++) {
++        OSDictionary *pair = OSDynamicCast(OSDictionary, pairs->getObject(i));
++        if (!pair) continue;
++        OSNumber *page = OSDynamicCast(OSNumber, pair->getObject(kIOHIDDeviceUsagePageKey));
++        OSNumber *usage = OSDynamicCast(OSNumber, pair->getObject(kIOHIDDeviceUsageKey));
++        if (!page || !usage || page->unsigned32BitValue() != kHIDPage_GenericDesktop) continue;
++        switch (usage->unsigned32BitValue()) {
++            case kHIDUsage_GD_Keyboard:
++            case kHIDUsage_GD_Keypad:
++                PDHIDPublishKeyboardDevice();
++                break;
++            case kHIDUsage_GD_Mouse:
++                PDHIDPublishMouseDevice();
++                break;
++            default:
++                break;
++        }
++    }
++}
++
+ //====================================================================================================
+ // IOHIDEventService::start
+ //====================================================================================================
+@@ -371,6 +398,7 @@
+     }
+ 
+     _readyForInputReports = true;
++    pdHIDPublishSupportedQueues(_readyForInputReports, _deviceUsagePairs);
+     
+     obj = getProperty(kIOHIDRegisterServiceKey);
+     if (obj != kOSBooleanFalse) {
+--- a/src/Kernel/Extensions/IOHIDFamily/IOHIDSystem/PDHIDEventQueue.cpp
++++ b/src/Kernel/Extensions/IOHIDFamily/IOHIDSystem/PDHIDEventQueue.cpp
+@@ -6,8 +6,9 @@
+ #include "PDHIDEventQueue.h"
+ 
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <kern/clock.h>
+ #include <libkern/OSAtomic.h>
+-#include <IOKit/IOService.h>
+ #include <kern/thread_call.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <sys/conf.h>
+@@ -50,10 +51,7 @@
+ 
+ static void *gKbdNode;
+ static void *gPS2KbdNode;
+-static bool gWantPS2KbdNode;
+ static int gKbdMajor = -1;
+-static thread_call_t gKbdRetryCall;
+-static IONotifier *gKbdBSDNotifier;
+ static IOLock *gKbdLock;
+ static UInt32 gKbdSequence;
+ static UInt32 gKbdReadIndex;
+@@ -81,23 +79,73 @@
+ 
+ static void *gMouseNode;
+ static void *gPS2MouseNode;
+-static bool gWantPS2MouseNode;
+ static int gMouseMajor = -1;
+-static thread_call_t gMouseRetryCall;
+-static IONotifier *gMouseBSDNotifier;
+ static IOLock *gMouseLock;
+ static UInt32 gMouseSequence;
+ static UInt32 gMouseReadIndex;
+ static UInt32 gMouseWriteIndex;
+ static PDHIDMouseEvent gMouseEvents[64];
+ 
+-static void pd_hid_kbd_publish_retry(thread_call_param_t, thread_call_param_t);
+ static void pd_hid_console_work(thread_call_param_t, thread_call_param_t);
+-static void pd_hid_mouse_publish_retry(thread_call_param_t, thread_call_param_t);
+-static bool pd_hid_kbd_iobsd_published(void *, void *, IOService *, IONotifier *);
+-static bool pd_hid_mouse_iobsd_published(void *, void *, IOService *, IONotifier *);
+-
+-static int pd_hid_open(dev_t, int, int, struct proc *) { return 0; }
++static void pd_hid_publish_work(thread_call_param_t, thread_call_param_t);
++
++/* Only the ONCE worker touches majors and devfs-node pointers. Requested
++ * capabilities are monotonic for these boot-lifetime shared queues. A caller
++ * arriving during publication re-pends the same worker, never recurses into
++ * devfs or IOKit notification registration. */
++static thread_call_t gPublishCall;
++static volatile UInt32 gPublishRequests;
++static volatile UInt32 gPublishReady;
++static volatile UInt32 gPublishStopped;
++static volatile UInt32 gQueueReady;
++static volatile UInt32 gKbdEarlyDrops, gMouseEarlyDrops;
++static volatile UInt32 gPublishAllocationFailures;
++struct PDHIDPublicationState {
++    UInt32 attempts, lastError;
++    AbsoluteTime startedAt, nextAttempt;
++};
++/* The notifier and all non-atomic readiness state belong only to the ONCE
++ * worker. Its callback may run synchronously before registration returns. */
++static IONotifier *gBSDNotifier;
++static volatile UInt32 gBSDSeen;
++static bool gBSDWaitStarted, gBSDReady, gBSDWaitRefused;
++static AbsoluteTime gBSDWaitStart, gBSDWaitDeadline, gBSDRegisterAfter;
++static UInt32 gBSDRegistrationFailures;
++static const UInt32 kBSDWaitSeconds = 180;
++static const UInt32 kBSDRegistrationLimit = 60;
++static PDHIDPublicationState gKbdPublication, gMousePublication;
++enum {
++    kPublishAttemptLimit = 60,
++    kPublishOK = 0, kPublishStorage = 1, kPublishMajor = 2,
++    kPublishDevfs = 3, kPublishNode = 4,
++    kPublishNotification = 5, kPublishReadinessTimeout = 6
++};
++enum {
++    kPublishKeyboard = 1, kPublishMouse = 2,
++    kPublishPS2Keyboard = 4, kPublishPS2Mouse = 8
++};
++
++template <typename T> static T
++pd_hid_load(T const *slot)
++{
++    return __atomic_load_n(slot, __ATOMIC_ACQUIRE);
++}
++
++static bool
++pd_hid_setup_lock(IOLock **slot)
++{
++    if (!pd_hid_load(slot)) {
++        IOLock *lock = IOLockAlloc();
++        if (lock && !OSCompareAndSwapPtr(NULL, lock, (void * volatile *)slot))
++            IOLockFree(lock);
++    }
++    return pd_hid_load(slot) != NULL;
++}
++
++static int pd_hid_open(dev_t, int, int, struct proc *)
++{
++    return (OSBitOrAtomic(0, &gQueueReady) & kPublishMouse) ? 0 : ENXIO;
++}
+ static int pd_hid_close(dev_t, int, int, struct proc *) { return 0; }
+ 
+ /* spec_open() calls d_open on every open but spec_close() only reaches d_close
+@@ -108,21 +156,22 @@
+ static int
+ pd_hid_kbd_open(dev_t, int, int, struct proc *)
+ {
+-    gKbdGrabbed = true;
++    if (!(OSBitOrAtomic(0, &gQueueReady) & kPublishKeyboard)) return ENXIO;
++    __atomic_store_n(&gKbdGrabbed, true, __ATOMIC_RELEASE);
+     return 0;
+ }
+ 
+ static int
+ pd_hid_kbd_close(dev_t, int, int, struct proc *)
+ {
+-    gKbdGrabbed = false;
++    __atomic_store_n(&gKbdGrabbed, false, __ATOMIC_RELEASE);
+     return 0;
+ }
+ 
+ bool
+ PDHIDKeyboardIsGrabbed(void)
+ {
+-    return gKbdGrabbed;
++    return __atomic_load_n(&gKbdGrabbed, __ATOMIC_ACQUIRE);
+ }
+ 
+ static int
+@@ -131,17 +180,17 @@
+     PDHIDKbdEvent event;
+     int error = 0;
+ 
+-    if (!gKbdLock) return ENXIO;
++    if (!(OSBitOrAtomic(0, &gQueueReady) & kPublishKeyboard)) return ENXIO;
+     if (uio_resid(uio) < (user_ssize_t)sizeof(event)) return EINVAL;
+ 
+-    IOLockLock(gKbdLock);
++    IOLockLock(pd_hid_load(&gKbdLock));
+     if (gKbdReadIndex == gKbdWriteIndex) {
+         error = EAGAIN;
+     } else {
+         event = gKbdEvents[gKbdReadIndex % (UInt32)(sizeof(gKbdEvents) / sizeof(gKbdEvents[0]))];
+         gKbdReadIndex++;
+     }
+-    IOLockUnlock(gKbdLock);
++    IOLockUnlock(pd_hid_load(&gKbdLock));
+ 
+     if (error) return error;
+     return uiomove((const char *)&event, (int)sizeof(event), uio);
+@@ -153,17 +202,17 @@
+     PDHIDMouseEvent event;
+     int error = 0;
+ 
+-    if (!gMouseLock) return ENXIO;
++    if (!(OSBitOrAtomic(0, &gQueueReady) & kPublishMouse)) return ENXIO;
+     if (uio_resid(uio) < (user_ssize_t)sizeof(event)) return EINVAL;
+ 
+-    IOLockLock(gMouseLock);
++    IOLockLock(pd_hid_load(&gMouseLock));
+     if (gMouseReadIndex == gMouseWriteIndex) {
+         error = EAGAIN;
+     } else {
+         event = gMouseEvents[gMouseReadIndex % (UInt32)(sizeof(gMouseEvents) / sizeof(gMouseEvents[0]))];
+         gMouseReadIndex++;
+     }
+-    IOLockUnlock(gMouseLock);
++    IOLockUnlock(pd_hid_load(&gMouseLock));
+ 
+     if (error) return error;
+     return uiomove((const char *)&event, (int)sizeof(event), uio);
+@@ -181,172 +230,292 @@
+     eno_strat, eno_getc, eno_putc, 0
+ };
+ 
+-static void
+-schedule_retry(thread_call_t *call, thread_call_func_t func)
+-{
+-    AbsoluteTime deadline;
+-    if (!*call) {
+-        *call = thread_call_allocate(func, NULL);
+-        if (!*call) return;
+-    }
+-    clock_interval_to_deadline(1, kSecondScale, &deadline);
+-    thread_call_enter_delayed(*call, deadline);
+-}
+-
+-// drivers on different threads can get here first, so each object is swapped in once
++/* All pointer installations are CAS-once. Uninstalled losers are freed before
++ * they can be queued; installed locks and calls remain valid until reboot. */
+ static bool
+ pd_hid_kbd_setup(void)
+ {
+-    if (!gKbdLock) {
+-        IOLock *lock = IOLockAlloc();
+-        if (lock && !OSCompareAndSwapPtr(NULL, lock, (void * volatile *)&gKbdLock)) IOLockFree(lock);
+-    }
+-    if (!gLEDLock) {
+-        IOLock *lock = IOLockAlloc();
+-        if (lock && !OSCompareAndSwapPtr(NULL, lock, (void * volatile *)&gLEDLock)) IOLockFree(lock);
+-    }
+-    if (!gConsoleCall) {
++    if (!pd_hid_setup_lock(&gKbdLock) || !pd_hid_setup_lock(&gLEDLock)) return false;
++    if (!pd_hid_load(&gConsoleCall)) {
+         thread_call_t call = thread_call_allocate(pd_hid_console_work, NULL);
+-        if (call && !OSCompareAndSwapPtr(NULL, call, (void * volatile *)&gConsoleCall)) thread_call_free(call);
+-    }
+-    return gKbdLock && gLEDLock && gConsoleCall;
+-}
+-
+-void
+-PDHIDPublishKeyboardDevice(void)
+-{
+-    if (gKbdNode && (!gWantPS2KbdNode || gPS2KbdNode)) return;
+-    if (!pd_hid_kbd_setup()) return;
+-    if (gKbdMajor < 0) {
+-        gKbdMajor = cdevsw_add(-1, &pd_hid_kbd_cdevsw);
+-        if (gKbdMajor < 0) return;
+-    }
++        if (call && !OSCompareAndSwapPtr(NULL, call, (void * volatile *)&gConsoleCall))
++            thread_call_free(call);
++    }
++    return pd_hid_load(&gConsoleCall) != NULL;
++}
++
++static void
++pd_hid_request_publication(UInt32 requested)
++{
++    const UInt32 previous = OSBitOrAtomic(requested, &gPublishRequests);
++    if (!(requested & ~(OSBitOrAtomic(0, &gPublishReady) |
++                        OSBitOrAtomic(0, &gPublishStopped)))) return;
++    // Repeated requests must not accelerate a one-second failure retry or
++    // consume its budget. A new capability may wake the one owner early.
++    if (pd_hid_load(&gPublishCall) && !(requested & ~previous)) return;
++    if (!pd_hid_load(&gPublishCall)) {
++        thread_call_t call = thread_call_allocate_with_options(pd_hid_publish_work,
++            NULL, THREAD_CALL_PRIORITY_KERNEL, THREAD_CALL_OPTIONS_ONCE);
++        if (call && !OSCompareAndSwapPtr(NULL, call, (void * volatile *)&gPublishCall))
++            thread_call_free(call);
++    }
++    thread_call_t call = pd_hid_load(&gPublishCall);
++    /* If even the call cannot be allocated, preserve the request for a later
++     * caller. There is no endpoint and no success indication in this API. */
++    if (call) thread_call_enter(call);
++    else if (__atomic_fetch_add(&gPublishAllocationFailures, 1U, __ATOMIC_RELAXED) == 0)
++        IOLog("PDHIDEventQueue: publication call allocation failed; endpoint absent\n");
++}
++
++static unsigned long long
++pd_hid_milliseconds(AbsoluteTime value)
++{
++    uint64_t ns = 0;
++    absolutetime_to_nanoseconds(value, &ns);
++    return (unsigned long long)(ns / 1000000);
++}
++
++/* Never inspect/remove the returned notifier here: addMatchingNotification
++ * invokes this callback for an existing IOBSD before it returns that pointer.
++ * An event marks readiness-to-recheck, not devfs success. Duplicate callbacks
++ * do not accelerate deadlines or spend publication attempts. */
++static bool
++pd_hid_iobsd_published(void *, void *, IOService *, IONotifier *)
++{
++    if (!(OSBitOrAtomic(1, &gBSDSeen) & 1)) {
++        thread_call_t call = pd_hid_load(&gPublishCall);
++        if (call) thread_call_enter(call);
++    }
++    return true;
++}
++
++static void
++pd_hid_remove_notifier(void)
++{
++    IONotifier *notifier = gBSDNotifier;
++    gBSDNotifier = NULL;
++    if (notifier) notifier->remove();
++}
++
++static void
++pd_hid_schedule_readiness(AbsoluteTime deadline, UInt32 observedSeen)
++{
++    thread_call_enter_delayed(pd_hid_load(&gPublishCall), deadline);
++    /* Close the event-before-delayed-arm race. If the event arrives after
++     * this check, its callback is instead the last writer and queues us. */
++    if (OSBitOrAtomic(0, &gBSDSeen) != observedSeen)
++        thread_call_enter(pd_hid_load(&gPublishCall));
++}
++
++static bool
++pd_hid_refuse_readiness(UInt32 error, AbsoluteTime now)
++{
++    gBSDWaitRefused = true;
++    OSBitOrAtomic(kPublishKeyboard | kPublishMouse | kPublishPS2Keyboard |
++                  kPublishPS2Mouse, &gPublishStopped);
++    pd_hid_remove_notifier();
++    IOLog("PDHIDEventQueue: BSD wait refused error=%u registration_failures=%u seen=%u uptime_ms=%llu elapsed_ms=%llu\n",
++        (unsigned)error, (unsigned)gBSDRegistrationFailures,
++        (unsigned)OSBitOrAtomic(0, &gBSDSeen), pd_hid_milliseconds(now),
++        pd_hid_milliseconds(now - gBSDWaitStart));
++    return false;
++}
++
++/* Registration failure has its own bounded one-second retry policy. Once a
++ * notifier is installed we sleep until IOBSD or the finite readiness watchdog.
++ * IOBSD is published after vfsinit/devfs_sinit in pinned bsd_init; still check
++ * devfs_is_ready itself and fail closed if that contract is not fulfilled. */
++static bool
++pd_hid_devfs_gate(void)
++{
++    AbsoluteTime now;
++    clock_get_uptime(&now);
++    const UInt32 observedSeen = OSBitOrAtomic(0, &gBSDSeen);
++    if (gBSDWaitRefused) return false;
++    if (gBSDReady) return true;
++    if (gBSDWaitStarted && now >= gBSDWaitDeadline)
++        return pd_hid_refuse_readiness(kPublishReadinessTimeout, now);
++    if (devfs_is_ready()) {
++        gBSDReady = true;
++        pd_hid_remove_notifier();
++        IOLog("PDHIDEventQueue: BSD ready seen=%u uptime_ms=%llu elapsed_ms=%llu\n",
++            (unsigned)observedSeen, pd_hid_milliseconds(now),
++            gBSDWaitStarted ? pd_hid_milliseconds(now - gBSDWaitStart) : 0ULL);
++        return true;
++    }
++    if (!gBSDWaitStarted) {
++        gBSDWaitStarted = true;
++        gBSDWaitStart = now;
++        clock_interval_to_deadline(kBSDWaitSeconds, kSecondScale, &gBSDWaitDeadline);
++        IOLog("PDHIDEventQueue: BSD wait error=3 uptime_ms=%llu timeout_ms=%u\n",
++            pd_hid_milliseconds(now), (unsigned)(kBSDWaitSeconds * 1000));
++    }
++    if (!observedSeen && !gBSDNotifier && now >= gBSDRegisterAfter) {
++        OSDictionary *matching = IOService::resourceMatching("IOBSD");
++        IONotifier *notifier = NULL;
++        if (matching) {
++            notifier = IOService::addMatchingNotification(gIOPublishNotification,
++                matching, pd_hid_iobsd_published, NULL, NULL);
++            matching->release();
++        }
++        /* Only the owner stores this, after any synchronous callback returned. */
++        gBSDNotifier = notifier;
++        if (!notifier) {
++            ++gBSDRegistrationFailures;
++            if (gBSDRegistrationFailures >= kBSDRegistrationLimit)
++                return pd_hid_refuse_readiness(kPublishNotification, now);
++            clock_interval_to_deadline(1, kSecondScale, &gBSDRegisterAfter);
++            if (gBSDRegistrationFailures == 1)
++                IOLog("PDHIDEventQueue: BSD notification deferred error=5 uptime_ms=%llu\n",
++                    pd_hid_milliseconds(now));
++        }
++    }
++    /* Recheck after registration, including the synchronous-existing case.
++     * Registration itself may have consumed time; do not use a stale sample. */
++    clock_get_uptime(&now);
++    if (now >= gBSDWaitDeadline)
++        return pd_hid_refuse_readiness(kPublishReadinessTimeout, now);
++    if (devfs_is_ready()) {
++        gBSDReady = true;
++        pd_hid_remove_notifier();
++        IOLog("PDHIDEventQueue: BSD ready seen=%u uptime_ms=%llu elapsed_ms=%llu\n",
++            (unsigned)OSBitOrAtomic(0, &gBSDSeen), pd_hid_milliseconds(now),
++            pd_hid_milliseconds(now - gBSDWaitStart));
++        return true;
++    }
++    AbsoluteTime next = gBSDWaitDeadline;
++    if (OSBitOrAtomic(0, &gBSDSeen)) {
++        /* An IOBSD event is not permission to fabricate a ready devfs. */
++        pd_hid_remove_notifier();
++        clock_interval_to_deadline(1, kSecondScale, &next);
++    } else if (!gBSDNotifier) {
++        next = gBSDRegisterAfter;
++    }
++    if (next > gBSDWaitDeadline) next = gBSDWaitDeadline;
++    pd_hid_schedule_readiness(next, observedSeen);
++    return false;
++}
++
++/* Worker-only: no lock is held across cdevsw/devfs calls. Even if one of them
++ * re-enters a public publisher, it can only schedule another ONCE invocation. */
++static UInt32
++pd_hid_publish_nodes(int *major, struct cdevsw *ops, void **node,
++    const char *name, void **alias, bool wantAlias, const char *aliasName)
++{
++    if (*major < 0) {
++        *major = cdevsw_add(-1, ops);
++        if (*major < 0) return kPublishMajor;
++    }
++    if (!devfs_is_ready()) return kPublishDevfs;
++    if (!*node) {
++        *node = devfs_make_node(makedev(*major, 0), DEVFS_CHAR, 0, 0, 0666, "%s", name);
++        if (*node) IOLog("PDHIDEventQueue: published /dev/%s\n", name);
++    }
++    if (wantAlias && !*alias) {
++        *alias = devfs_make_node(makedev(*major, 0), DEVFS_CHAR, 0, 0, 0666, "%s", aliasName);
++        if (*alias) IOLog("PDHIDEventQueue: published /dev/%s\n", aliasName);
++    }
++    return *node && (!wantAlias || *alias) ? kPublishOK : kPublishNode;
++}
++
++/* Worker-only. Retry exhaustion is terminal for that queue for this boot;
++ * repeated events/requests cannot silently restart the budget. Error values
++ * describe which API failed, not invented errno values from devfs_make_node. */
++static bool
++pd_hid_publish_one(bool keyboard, UInt32 requested)
++{
++    const UInt32 primary = keyboard ? kPublishKeyboard : kPublishMouse;
++    const UInt32 alias = keyboard ? kPublishPS2Keyboard : kPublishPS2Mouse;
++    const UInt32 wanted = requested & (primary | alias);
++    if (!(wanted & primary) || (OSBitOrAtomic(0, &gPublishStopped) & primary) ||
++        !(wanted & ~OSBitOrAtomic(0, &gPublishReady))) return true;
++    PDHIDPublicationState &state = keyboard ? gKbdPublication : gMousePublication;
++    AbsoluteTime now;
++    clock_get_uptime(&now);
++    if (state.attempts && now < state.nextAttempt) return false;
++    if (!state.attempts) state.startedAt = now;
++    state.attempts++;
++    state.lastError = kPublishStorage;
++    if (keyboard ? pd_hid_kbd_setup() : pd_hid_setup_lock(&gMouseLock)) {
++        /* Storage and its actual startup request precede node visibility.
++         * Open/read use this barrier; an early input may now enqueue safely. */
++        OSBitOrAtomic(primary, &gQueueReady);
++        state.lastError = keyboard ?
++            pd_hid_publish_nodes(&gKbdMajor, &pd_hid_kbd_cdevsw, &gKbdNode,
++                "usb_hid_kbd", &gPS2KbdNode, wanted & alias, "ps2_kbd") :
++            pd_hid_publish_nodes(&gMouseMajor, &pd_hid_mouse_cdevsw, &gMouseNode,
++                "usb_hid_mouse", &gPS2MouseNode, wanted & alias, "ps2_mouse");
++    }
++    if (state.lastError == kPublishOK) {
++        OSBitOrAtomic(wanted, &gPublishReady);
++        IOLog("PDHIDEventQueue: ready kind=%u attempts=%u early_drops=%u uptime_ms=%llu elapsed_ms=%llu (endpoint, not input proof)\n",
++            (unsigned)primary, (unsigned)state.attempts,
++            (unsigned)__atomic_load_n(keyboard ? &gKbdEarlyDrops : &gMouseEarlyDrops, __ATOMIC_RELAXED),
++            pd_hid_milliseconds(now), pd_hid_milliseconds(now - state.startedAt));
++        return true;
++    }
++    if (state.attempts >= kPublishAttemptLimit) {
++        OSBitOrAtomic(primary | alias, &gPublishStopped);
++        IOLog("PDHIDEventQueue: publication refused kind=%u attempts=%u error=%u uptime_ms=%llu elapsed_ms=%llu\n",
++            (unsigned)primary, (unsigned)state.attempts, (unsigned)state.lastError,
++            pd_hid_milliseconds(now), pd_hid_milliseconds(now - state.startedAt));
++        return true; // refused, not ready; no retry after the bound
++    }
++    if (state.attempts == 1)
++        IOLog("PDHIDEventQueue: publication deferred kind=%u attempt=1 error=%u uptime_ms=%llu elapsed_ms=0\n",
++            (unsigned)primary, (unsigned)state.lastError, pd_hid_milliseconds(now));
++    clock_interval_to_deadline(1, kSecondScale, &state.nextAttempt);
++    return false;
++}
++
++static void
++pd_hid_publish_work(thread_call_param_t, thread_call_param_t)
++{
++    const UInt32 requested = OSBitOrAtomic(0, &gPublishRequests);
++    if (!(requested & ~(OSBitOrAtomic(0, &gPublishReady) |
++                        OSBitOrAtomic(0, &gPublishStopped)))) return;
++    /* Prepare real storage so arriving reports can enqueue while BSD starts.
++     * No major/node allocation and no publication-failure budget before BSD. */
+     if (!devfs_is_ready()) {
+-        if (!gKbdBSDNotifier) {
+-            OSDictionary *matching = IOService::resourceMatching("IOBSD");
+-            if (matching) {
+-                gKbdBSDNotifier = IOService::addMatchingNotification(gIOPublishNotification,
+-                                                                     matching,
+-                                                                     pd_hid_kbd_iobsd_published,
+-                                                                     NULL, NULL);
+-                matching->release();
+-            }
+-        }
+-        schedule_retry(&gKbdRetryCall, pd_hid_kbd_publish_retry);
+-        return;
+-    }
+-    if (!gKbdNode) {
+-        gKbdNode = devfs_make_node(makedev(gKbdMajor, 0), DEVFS_CHAR,
+-                                   0, 0, 0666, "usb_hid_kbd");
+-        if (!gKbdNode)
+-            schedule_retry(&gKbdRetryCall, pd_hid_kbd_publish_retry);
+-        else
+-            IOLog("PDHIDEventQueue: published /dev/usb_hid_kbd\n");
+-    }
+-
+-    if (gWantPS2KbdNode && !gPS2KbdNode) {
+-        gPS2KbdNode = devfs_make_node(makedev(gKbdMajor, 0), DEVFS_CHAR,
+-                                     0, 0, 0666, "ps2_kbd");
+-        if (!gPS2KbdNode)
+-            schedule_retry(&gKbdRetryCall, pd_hid_kbd_publish_retry);
+-        else
+-            IOLog("PDHIDEventQueue: published /dev/ps2_kbd\n");
+-    }
+-}
+-
+-void
+-PDHIDPublishPS2KeyboardDevice(void)
+-{
+-    gWantPS2KbdNode = true;
+-    PDHIDPublishKeyboardDevice();
+-}
+-
+-UInt8
+-PDHIDAllocateMouseIndex(void)
++        if ((requested & kPublishKeyboard) && pd_hid_kbd_setup())
++            OSBitOrAtomic(kPublishKeyboard, &gQueueReady);
++        if ((requested & kPublishMouse) && pd_hid_setup_lock(&gMouseLock))
++            OSBitOrAtomic(kPublishMouse, &gQueueReady);
++    }
++    if (!pd_hid_devfs_gate()) return;
++    const bool keyboardDone = pd_hid_publish_one(true, requested);
++    const bool mouseDone = pd_hid_publish_one(false, requested);
++    if (!keyboardDone || !mouseDone) {
++        AbsoluteTime deadline = !keyboardDone ? gKbdPublication.nextAttempt : gMousePublication.nextAttempt;
++        if (!mouseDone && gMousePublication.nextAttempt < deadline)
++            deadline = gMousePublication.nextAttempt;
++        thread_call_enter_delayed(pd_hid_load(&gPublishCall), deadline);
++    }
++}
++
++void PDHIDPublishKeyboardDevice(void)
++{
++    pd_hid_request_publication(kPublishKeyboard);
++}
++
++void PDHIDPublishPS2KeyboardDevice(void)
++{
++    pd_hid_request_publication(kPublishKeyboard | kPublishPS2Keyboard);
++}
++
++UInt8 PDHIDAllocateMouseIndex(void)
+ {
+     return gNextMouseIndex++;
+ }
+ 
+-void
+-PDHIDPublishMouseDevice(void)
+-{
+-    if (gMouseNode && (!gWantPS2MouseNode || gPS2MouseNode)) return;
+-    if (!gMouseLock) {
+-        gMouseLock = IOLockAlloc();
+-        if (!gMouseLock) return;
+-    }
+-    if (gMouseMajor < 0) {
+-        gMouseMajor = cdevsw_add(-1, &pd_hid_mouse_cdevsw);
+-        if (gMouseMajor < 0) return;
+-    }
+-    if (!devfs_is_ready()) {
+-        if (!gMouseBSDNotifier) {
+-            OSDictionary *matching = IOService::resourceMatching("IOBSD");
+-            if (matching) {
+-                gMouseBSDNotifier = IOService::addMatchingNotification(gIOPublishNotification,
+-                                                                       matching,
+-                                                                       pd_hid_mouse_iobsd_published,
+-                                                                       NULL, NULL);
+-                matching->release();
+-            }
+-        }
+-        schedule_retry(&gMouseRetryCall, pd_hid_mouse_publish_retry);
+-        return;
+-    }
+-    if (!gMouseNode) {
+-        gMouseNode = devfs_make_node(makedev(gMouseMajor, 0), DEVFS_CHAR,
+-                                     0, 0, 0666, "usb_hid_mouse");
+-        if (!gMouseNode)
+-            schedule_retry(&gMouseRetryCall, pd_hid_mouse_publish_retry);
+-        else
+-            IOLog("PDHIDEventQueue: published /dev/usb_hid_mouse\n");
+-    }
+-
+-    if (gWantPS2MouseNode && !gPS2MouseNode) {
+-        gPS2MouseNode = devfs_make_node(makedev(gMouseMajor, 0), DEVFS_CHAR,
+-                                       0, 0, 0666, "ps2_mouse");
+-        if (!gPS2MouseNode)
+-            schedule_retry(&gMouseRetryCall, pd_hid_mouse_publish_retry);
+-        else
+-            IOLog("PDHIDEventQueue: published /dev/ps2_mouse\n");
+-    }
+-}
+-
+-void
+-PDHIDPublishPS2MouseDevice(void)
+-{
+-    gWantPS2MouseNode = true;
+-    PDHIDPublishMouseDevice();
+-}
+-
+-static void pd_hid_kbd_publish_retry(thread_call_param_t, thread_call_param_t)
+-{
+-    PDHIDPublishKeyboardDevice();
+-}
+-
+-static void pd_hid_mouse_publish_retry(thread_call_param_t, thread_call_param_t)
+-{
+-    PDHIDPublishMouseDevice();
+-}
+-
+-static bool pd_hid_kbd_iobsd_published(void *, void *, IOService *, IONotifier *notifier)
+-{
+-    PDHIDPublishKeyboardDevice();
+-    if (gKbdNode && notifier) {
+-        notifier->remove();
+-        if (gKbdBSDNotifier == notifier) gKbdBSDNotifier = NULL;
+-    }
+-    return true;
+-}
+-
+-static bool pd_hid_mouse_iobsd_published(void *, void *, IOService *, IONotifier *notifier)
+-{
+-    PDHIDPublishMouseDevice();
+-    if (gMouseNode && notifier) {
+-        notifier->remove();
+-        if (gMouseBSDNotifier == notifier) gMouseBSDNotifier = NULL;
+-    }
+-    return true;
++void PDHIDPublishMouseDevice(void)
++{
++    pd_hid_request_publication(kPublishMouse);
++}
++
++void PDHIDPublishPS2MouseDevice(void)
++{
++    pd_hid_request_publication(kPublishMouse | kPublishPS2Mouse);
+ }
+ 
+ // US layout for keyboard page usages 0x04-0x38 (HID Usage Tables 1.12, section 10)
+@@ -404,7 +573,7 @@
+         gLEDsDirty = true;
+         return true;
+     }
+-    if (gKbdGrabbed) return false;
++    if (PDHIDKeyboardIsGrabbed()) return false;
+ 
+     shift = (gModifiers & 0x22) != 0;
+     ctrl = (gModifiers & 0x11) != 0;
+@@ -460,7 +629,7 @@
+         bool leds;
+         UInt8 state;
+ 
+-        IOLockLock(gKbdLock);
++        IOLockLock(pd_hid_load(&gKbdLock));
+         while (count < sizeof(bytes) && gConsReadIndex != gConsWriteIndex) {
+             bytes[count++] = gConsBytes[gConsReadIndex % (UInt32)sizeof(gConsBytes)];
+             gConsReadIndex++;
+@@ -468,7 +637,7 @@
+         leds = gLEDsDirty;
+         gLEDsDirty = false;
+         state = gLockLEDs;
+-        IOLockUnlock(gKbdLock);
++        IOLockUnlock(pd_hid_load(&gKbdLock));
+ 
+         if (!count && !leds) break;
+ 
+@@ -478,11 +647,11 @@
+         }
+ 
+         if (leds) {
+-            IOLockLock(gLEDLock);
++            IOLockLock(pd_hid_load(&gLEDLock));
+             for (unsigned i = 0; i < sizeof(gLEDHandlers) / sizeof(gLEDHandlers[0]); i++) {
+                 if (gLEDHandlers[i].handler) gLEDHandlers[i].handler(gLEDHandlers[i].target, state);
+             }
+-            IOLockUnlock(gLEDLock);
++            IOLockUnlock(pd_hid_load(&gLEDLock));
+         }
+     }
+ }
+@@ -494,7 +663,7 @@
+ 
+     if (!handler || !pd_hid_kbd_setup()) return false;
+ 
+-    IOLockLock(gLEDLock);
++    IOLockLock(pd_hid_load(&gLEDLock));
+     for (unsigned i = 0; i < sizeof(gLEDHandlers) / sizeof(gLEDHandlers[0]); i++) {
+         if (gLEDHandlers[i].handler) continue;
+         gLEDHandlers[i].handler = handler;
+@@ -502,14 +671,14 @@
+         ok = true;
+         break;
+     }
+-    IOLockUnlock(gLEDLock);
++    IOLockUnlock(pd_hid_load(&gLEDLock));
+ 
+     // a keyboard plugged in later picks up the current lock state
+     if (ok) {
+-        IOLockLock(gKbdLock);
++        IOLockLock(pd_hid_load(&gKbdLock));
+         gLEDsDirty = true;
+-        IOLockUnlock(gKbdLock);
+-        thread_call_enter(gConsoleCall);
++        IOLockUnlock(pd_hid_load(&gKbdLock));
++        thread_call_enter(pd_hid_load(&gConsoleCall));
+     }
+     return ok;
+ }
+@@ -517,15 +686,15 @@
+ void
+ PDHIDUnregisterLEDHandler(PDHIDLEDHandler handler, void *target)
+ {
+-    if (!gLEDLock) return;
+-
+-    IOLockLock(gLEDLock);
++    if (!pd_hid_load(&gLEDLock)) return;
++
++    IOLockLock(pd_hid_load(&gLEDLock));
+     for (unsigned i = 0; i < sizeof(gLEDHandlers) / sizeof(gLEDHandlers[0]); i++) {
+         if (gLEDHandlers[i].handler != handler || gLEDHandlers[i].target != target) continue;
+         gLEDHandlers[i].handler = NULL;
+         gLEDHandlers[i].target = NULL;
+     }
+-    IOLockUnlock(gLEDLock);
++    IOLockUnlock(pd_hid_load(&gLEDLock));
+ }
+ 
+ UInt8
+@@ -541,24 +710,25 @@
+     UInt32 slot;
+     bool kick;
+ 
+-    if (!gKbdLock) PDHIDPublishKeyboardDevice();
+-    if (!pd_hid_kbd_setup()) return;
+-
+-    event.sequence = ++gKbdSequence;
++    if (!(OSBitOrAtomic(0, &gQueueReady) & kPublishKeyboard)) {
++        __atomic_fetch_add(&gKbdEarlyDrops, 1U, __ATOMIC_RELAXED);
++        return;
++    }
+     event.usage = usage;
+     event.down = down ? 1 : 0;
+     event.reserved[0] = event.reserved[1] = 0;
+ 
+-    IOLockLock(gKbdLock);
++    IOLockLock(pd_hid_load(&gKbdLock));
++    event.sequence = ++gKbdSequence;
+     slot = gKbdWriteIndex % (UInt32)(sizeof(gKbdEvents) / sizeof(gKbdEvents[0]));
+     gKbdEvents[slot] = event;
+     gKbdWriteIndex++;
+     if (gKbdWriteIndex - gKbdReadIndex > (UInt32)(sizeof(gKbdEvents) / sizeof(gKbdEvents[0])))
+         gKbdReadIndex = gKbdWriteIndex - (UInt32)(sizeof(gKbdEvents) / sizeof(gKbdEvents[0]));
+     kick = pd_hid_console_key(usage, down);
+-    IOLockUnlock(gKbdLock);
+-
+-    if (kick) thread_call_enter(gConsoleCall);
++    IOLockUnlock(pd_hid_load(&gKbdLock));
++
++    if (kick) thread_call_enter(pd_hid_load(&gConsoleCall));
+ }
+ 
+ static void
+@@ -566,19 +736,19 @@
+ {
+     UInt32 slot;
+ 
+-    if (!gMouseLock) {
+-        PDHIDPublishMouseDevice();
+-        if (!gMouseLock) return;
+-    }
+-
+-    IOLockLock(gMouseLock);
++    if (!(OSBitOrAtomic(0, &gQueueReady) & kPublishMouse)) {
++        __atomic_fetch_add(&gMouseEarlyDrops, 1U, __ATOMIC_RELAXED);
++        return;
++    }
++
++    IOLockLock(pd_hid_load(&gMouseLock));
+     event.sequence = ++gMouseSequence;
+     slot = gMouseWriteIndex % (UInt32)(sizeof(gMouseEvents) / sizeof(gMouseEvents[0]));
+     gMouseEvents[slot] = event;
+     gMouseWriteIndex++;
+     if (gMouseWriteIndex - gMouseReadIndex > (UInt32)(sizeof(gMouseEvents) / sizeof(gMouseEvents[0])))
+         gMouseReadIndex = gMouseWriteIndex - (UInt32)(sizeof(gMouseEvents) / sizeof(gMouseEvents[0]));
+-    IOLockUnlock(gMouseLock);
++    IOLockUnlock(pd_hid_load(&gMouseLock));
+ }
+ 
+ void
+--- a/src/Kernel/Extensions/IOHIDFamily/IOHIDSystem/PDHIDEventQueue.h
++++ b/src/Kernel/Extensions/IOHIDFamily/IOHIDSystem/PDHIDEventQueue.h
+@@ -31,6 +31,11 @@
+ #define kPDHIDMouseAbsolute 0x01
+ 
+ 
++/* Request asynchronous endpoint publication, without generating any event.
++ * Repeated requests are safe. Allocation/devfs failures leave the endpoint
++ * absent; callers must observe devfs readiness rather than infer success from
++ * this void API. Call only from a successfully attached producer's startup,
++ * never from an input callback. Shared queues/callouts have boot lifetime. */
+ void PDHIDPublishKeyboardDevice(void);
+ void PDHIDPublishMouseDevice(void);
+ void PDHIDPublishPS2KeyboardDevice(void);
+@@ -66,7 +71,10 @@
+ #define kPDHIDLEDCapsLock   0x02
+ #define kPDHIDLEDScrollLock 0x04
+ 
+-// called from a thread call with the current lock LED bits, so it may block
++// Called under the shared LED lock from a thread call. Handlers must not
++// re-enter Register/Unregister or acquire a lock that can call either API.
++// Existing handlers may block; do not add native SPI LED work without a
++// separate bounded-callback/quiescence review. This patch adds no LED handler.
+ typedef void (*PDHIDLEDHandler)(void *target, UInt8 leds);
+ 
+ // a keyboard driver registers to have its LEDs follow the kernel's lock state

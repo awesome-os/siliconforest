@@ -1,0 +1,47 @@
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -1979,6 +1979,20 @@
+    sfSFFXFlushLayersOnly([self window]);
+ }
+ 
++// (TERM11) SF_WIN_TRACE: the shape of a layer tree read back
++static void sfTraceLayerTree(CALayer *layer,int depth){
++   static int lines;
++   if(layer==nil || depth>8 || lines++>400)
++    return;
++   CGRect b=[layer bounds];
++   fprintf(stderr,"SFWIN   %*s%s %p bounds %gx%g hidden %d opacity %.2f contents %s %p sublayers %lu delegate %s\n",depth*2,"",
++           object_getClassName(layer),(void *)layer,b.size.width,b.size.height,(int)[layer isHidden],(double)[layer opacity],
++           [layer contents]?object_getClassName([layer contents]):"-",[layer contents],(unsigned long)[[layer sublayers] count],
++           [layer delegate]?object_getClassName([layer delegate]):"-");
++   for(CALayer *sub in [layer sublayers])
++    sfTraceLayerTree(sub,depth+1);
++}
++
+ // the layer tree renders offscreen, its pixels go into the window over what the views drew
+ -(void)_drawLayerContext {
+    CGImageRef image;
+@@ -1986,7 +2000,7 @@
+ 
+    if(_layerContext==nil || ![self canDraw]){
+     if(getenv("SF_WIN_TRACE")!=NULL && [_window level]>=3)
+-     fprintf(stderr,"SFWIN layers of window %d: context %p canDraw %d\n",(int)[_window windowNumber],(void *)_layerContext,(int)[self canDraw]);
++     fprintf(stderr,"SFWIN layers of window %d: view %s layer %p context %p canDraw %d\n",(int)[_window windowNumber],object_getClassName(self),(void *)_layer,(void *)_layerContext,(int)[self canDraw]);
+     return;
+    }
+    // a bare backing layer has nothing of its own to show, so skip the readback
+@@ -2030,9 +2044,12 @@
+       if(px[i]!=0)nonzero++;
+      if(data)CFRelease(data);
+     }
+-    fprintf(stderr,"SFWIN layers of window %d (%s): %lu sublayers, contents %p, image %p %zux%zu, %zu/%zu non-zero\n",(int)[_window windowNumber],
+-            object_getClassName(_window),(unsigned long)[[_layer sublayers] count],[_layer contents],(void *)image,
++    fprintf(stderr,"SFWIN layers of window %d (%s) view %s in %s: %lu sublayers, contents %p, image %p %zux%zu, %zu/%zu non-zero\n",(int)[_window windowNumber],
++            object_getClassName(_window),object_getClassName(self),object_getClassName(_superview),(unsigned long)[[_layer sublayers] count],[_layer contents],(void *)image,
+             image?CGImageGetWidth(image):0,image?CGImageGetHeight(image):0,nonzero,count);
++    static int dumps;
++    if(dumps++<6)
++     sfTraceLayerTree(_layer,0);
+    }
+    if(image==NULL)
+     return;

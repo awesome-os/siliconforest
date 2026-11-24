@@ -1,0 +1,23 @@
+xnu: cpu_init reports a core's MIDR with kprintf
+
+cpu_init() runs on a secondary core with interrupts disabled. Its SiliconForest line naming
+the core's MIDR part and cluster type used printf, and on arm64 console output from an
+interrupt-disabled context panics once a serial console is up ("Console I/O from
+interrupt-disabled context", osfmk/console/serial_console.c). The first secondary core of
+the M1 died there (boot sm01, cpu 1, cpu_init+0x2c4 <- arm_init_cpu). kprintf is what the
+neighbouring start-up lines (cpu_start, PD-cpudata) already use.
+UPSTREAM: yes.
+
+--- a/src/Kernel/xnu/osfmk/arm64/cpu.c
++++ b/src/Kernel/xnu/osfmk/arm64/cpu.c
+@@ -756,7 +756,9 @@
+ 			int big = part == 0xd0b, little = part == 0xd05;	// Cortex-A76, Cortex-A55
+ 			int type = cdp->cpu_cluster_type;
+ 
+-			printf("cpu %d: MIDR part 0x%03x, cluster type %s%s\n", cdp->cpu_number, part,
++			// kprintf: a secondary gets here with interrupts disabled, where printf
++			// on a serial console panics (console_io_allowed)
++			kprintf("cpu %d: MIDR part 0x%03x, cluster type %s%s\n", cdp->cpu_number, part,
+ 			    type == CLUSTER_TYPE_P ? "P" : type == CLUSTER_TYPE_E ? "E" : "SMP",
+ 			    (type == CLUSTER_TYPE_P && little) || (type == CLUSTER_TYPE_E && big) ? " (MISMATCH)" : "");
+ 		}

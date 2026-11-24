@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "author": "Claude (acting lead). Read-only analysis of attempt002 private records and pinned XNU sources; separate from Grok's independent criteria-002 qualification.",
+  "status": "CAUSE_NARROWED_NOT_ESTABLISHED",
+  "inputs": "Decoded session records of runs/m1-desktop-010/shared-shell-return-attempt-002, via the pinned DL22 decoder 60ec1598. Exit-reason payload decoded by a scratch host decoder written against pinned kern/kcdata.h and sys/reason.h.",
+  "recorded_fact": "Attempt 0 (pid 14, chonk-terminal-darwin) was reaped with raw wait 9 about 9 ms after posix_spawn returned success. Its kernel exit reason, read from the zombie before the reap, is OS_REASON_SIGNAL (2), code 9 (SIGKILL), flags 0, with kcdata items PID=14 and PROCNAME='chonk-terminal-darwin'.",
+  "what_the_record_means_in_pinned_XNU": {
+    "reason_construction": "kill(2) calls psignal(p, signum) with no reason (kern_sig.c kill ~1381+31). For SIGKILL, psignal_internal then builds the reason with build_signal_reason(signum, NULL), which records current_proc() as the sender pid and name (kern_sig.c ~2446-2452, ~1978-2018). threadsignal(), used by the code-signing page kill, reaches the same construction on the faulting thread.",
+    "consequence": "PID=14 in the payload means the SIGKILL was generated while APP14 itself was the current process: either APP14's own kill/killpg syscall targeting itself, or a kernel path that raised SIGKILL on APP14's own thread without an explicit reason."
+  },
+  "excluded_by_the_record": {
+    "manager_or_any_other_process_kill": "The sender would be that process. The desktop is pid 13, and the manager journal shows no TERM or KILL attempt for attempt 0.",
+    "spawn_time_process_signature_failure": "Uses an explicit EXEC, CODESIGNING or SECURITY reason via psignal_vfork_with_reason (kern_exec.c ~8600-8830), not SIGNAL.",
+    "jetsam_memorystatus": "Runs in kernel context and normally carries OS_REASON_JETSAM. The sender would not be pid 14.",
+    "dyld_abort_guard_exec_failure": "These would be OS_REASON_DYLD, OS_REASON_GUARD or OS_REASON_EXEC.",
+    "vnode_guard_SIGKILL_policy": "The default vng_policy_flags are LOGMSG|EXC_CORPSE|UPRINTMSG (kern_guarded.c ~1588), the boot arguments carry no vnguard override, and no vnguard message was logged."
+  },
+  "remaining_candidates": {
+    "C1_code_signing_page_kill": "vm_fault calls cs_invalid_page, which, when the process has CS_KILL, calls threadsignal(current_thread(), SIGKILL, EXC_BAD_ACCESS, FALSE) (kern_cs.c ~249-310; vm_fault.c ~2986). That is silent when CS_HARD is also set or CS_VALID is already clear (the log needs cs_debug or a VALID clear). The binary's CodeDirectory flags are 0x20002, with no CS_KILL or CS_HARD, but exec also ORs in CS_KILL or CS_HARD from the process's inherited CS_EXEC_SET_KILL/SET_HARD (kern_exec.c ~2176-2182). This system does produce invalid code pages: launchd and launchctl each logged 'cs_invalid_page ... allowing (remove VALID)' at boot in both attempts. The timing (the first of two back-to-back spawns of the same binary, killed within about 9 ms) is compatible with a page-validation event during early execution. Not proven.",
+    "C2_self_kill_syscall": "APP14 dies before creating pty-rx.bin. The app002 code before that point (argument parse, signal setup, fd3 adopt, private_dir, application.json) makes no kill call, and its only kill sites are in Pty::cleanup, after the PTY child exists. Considered unlikely but not excluded at binary level (libSystem or dyld initializers were not audited).",
+    "C3_csops_markkill_on_self": "CS_OPS_MARKKILL or CS_OPS_MARKINVALID on an already invalid process signals SIGKILL in the caller's context (kern_proc.c ~3851-3896). No caller was found in the PureDarwin userspace sources searched (only a header in Libraries/Security/compat). Unlikely, not excluded."
+  },
+  "reproduction": "Attempts 001 and 002 show the identical pattern: first startup app killed about 9 ms after spawn with no records; second app runs. That rules out a one-off.",
+  "next_diagnostic_proposal_not_a_fix": [
+    "Revision006 diagnostic: the manager records csops(pid, CS_OPS_STATUS) code-signing flags for each application immediately after posix_spawn returns (and the frontend's own flags), so a run shows whether CS_KILL, CS_HARD or CS_VALID are present on the apps. Absence of CS_KILL would exclude C1.",
+    "Revision006 behaviour test: issue the second explicit startup request only after the first application reports READY, or a bounded deadline passes. If the first app then survives, the concurrent second exec of the same executable becomes the leading trigger. If it is still killed, concurrency is excluded. This changes launch order, so it needs its own review, packet and criteria, and must not be presented as a fix.",
+    "Optional separate host revision: a boot with cs_debug=1 would make cs_invalid_page and csops kill paths log. That changes the native boot arguments, so it needs a reviewed host change; it is not proposed for the next run."
+  ],
+  "not_claimed": ["the exact kernel subsystem that raised the SIGKILL", "a fix", "any runtime pass"]
+}

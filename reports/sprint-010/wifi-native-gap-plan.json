@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_PLAN_NO_FETCH_NO_HARDWARE_NO_EDITS",
+  "target": "J293 Wi-Fi: PCI 14e4:4425 class 0x028000 (BCM4378), Linux driver brcmfmac, per root's runs/m1-desktop-010/m1-followon-inventory.json. The Bluetooth function 14e4:5f69 (hci_bcm4377) is excluded.",
+  "existing_in_puredarwin_e7aa00a": {
+    "IOPCIFamily": "Generic IOPCIBridge/IOPCIDevice (21k lines).",
+    "pci_hosts": "PDArmPCI and PDEcamPCI match only pci-host-ecam-generic and qcom,pcie-sc8280xp (DesignWare). No Apple PCIe (apcie) host driver.",
+    "IONetworkingFamily": "Present (32k lines).",
+    "IO80211Family": "Present (30k lines). IO80211Controller : IOEthernetController turns a net80211 ieee80211com into an Ethernet-like interface and answers apple80211 requests. The net80211 tree is an OpenBSD port (net80211/OPENBSD_REVISION c27e9422...).",
+    "linuxkpi_80211": "fbsdkpi/freebsd/linuxkpi (linux_80211.c, 10k lines) bridges Linux mac80211 SoftMAC drivers onto net80211. It is used by PDFBSDrtw89, PDFBSDrtwn and PDFBSDrun, whose IOKit class is an IO80211Controller.",
+    "fullmac_gap": "cfg80211 FullMAC support is stubbed: include/net/cfg80211.h has 132 TODO() bodies, including cfg80211_scan_done, cfg80211_inform_bss/_data, cfg80211_disconnected, cfg80211_roamed and cfg80211_ibss_joined, and linuxkpi_80211_wiphy_register is 'TODO: Lots of checks and initialization'. brcmfmac is a cfg80211 FullMAC driver, so it cannot run over this layer without a new cfg80211-to-net80211 bridge.",
+    "dart": "No Apple DART IOMapper anywhere in the tree.",
+    "broadcom": "No Broadcom Wi-Fi driver. Only a linuxkpi platform_data/brcmfmac.h header exists."
+  },
+  "m1n1_assets_MIT": {
+    "pcie": "src/pcie.c and tunables.c apply ADT apcie-* tunables, port config/LTSSM/PHY and link-up. kboot runs it only on the Linux boot path (kboot.c:6683), but it is also exposed as the proxy command P_PCIE_INIT (proxy.py:703,1212). The current HV path never calls it: no 'pcie:' lines in any guest worker log.",
+    "dart": "src/dart.c (m1n1's own DART code)."
+  },
+  "gaps_in_order": [
+    {"id": "G1", "gap": "Apple PCIe host bring-up and config access", "options": "(a) host calls p.pcie_init() before HV start, so the m1n1 (MIT) tunables and link-up run unchanged; this is a root-owned host change. (b) Port pcie.c logic into a Darwin Apple PCIe host driver. Either way Darwin then needs a host bridge exposing config space and MSI to IOPCIFamily."},
+    {"id": "G2", "gap": "DMA through the PCIe DART", "options": "Bypass if the PCIe DART supports it for the Wi-Fi stream; otherwise a minimal IOMapper programming the DART page tables. Linux's choice (identity vs translated) is observable read-only through the iommu_group type."},
+    {"id": "G3", "gap": "MSI delivery", "options": "Apple PCIe implements its own MSI to AIC (msi-ranges). It must map onto Darwin IOPCIDevice interrupts through the existing AIC platform driver."},
+    {"id": "G4", "gap": "FullMAC Broadcom driver", "options": "(A, recommended) Native IO80211Controller driver following OpenBSD bwfm/bwfm_pci over the existing OpenBSD net80211 port: a structural fit, BSD/ISC licence, and OpenBSD runs bwfm on Apple silicon. (B) Port brcmfmac (ISC) over LinuxKPI and implement the missing cfg80211 FullMAC bridge (scan cache, connect/disconnect/roam events, key handling): a large new layer. Use Linux brcmfmac as the BCM4378/Apple-specific reference in either case."},
+    {"id": "G5", "gap": "Firmware, NVRAM, CLM and txcap selection plus Apple quirks", "detail": "Firmware naming from ADT module-instance/antenna-sku/board-type, OTP read, the firmware random-seed requirement, and CLM/txcap download. Blobs are Apple-owned: keep them out of Git and stage them privately in a RAM image only when the user allows."},
+    {"id": "G6", "gap": "Wi-Fi port power", "detail": "J293 port power/enable GPIO (pwren) and PERST/CLKREQ sequencing, plus PMGR apcie power domains. Verify against the ADT before any driver writes."}
+  ],
+  "minimal_primary_pins_linux_aurora_6a08a08e": {
+    "note": "Paths to verify and acquire by root at the exact commit (not fetched here). GPL files are behavioural references only; ISC brcmfmac files may be adapted with attribution.",
+    "platform_reference_GPL": ["drivers/pci/controller/pcie-apple.c", "drivers/iommu/apple-dart.c", "drivers/iommu/io-pgtable-dart.c", "arch/arm64/boot/dts/apple/t8103.dtsi", "arch/arm64/boot/dts/apple/t8103-jxxx.dtsi", "arch/arm64/boot/dts/apple/t8103-j293.dts"],
+    "brcmfmac_ISC_core_for_BCM4378_PCIe": ["drivers/net/wireless/broadcom/brcm80211/brcmfmac/pcie.c", "pcie.h", "chip.c", "chip.h", "firmware.c", "firmware.h", "of.c", "of.h", "common.c", "common.h", "msgbuf.c", "msgbuf.h", "commonring.c", "commonring.h", "flowring.c", "flowring.h", "fwil.c", "fwil.h", "fwil_types.h", "feature.c", "feature.h", "proto.c", "proto.h", "bus.h", "core.h", "fwvid.c", "fwvid.h"],
+    "brcm80211_shared_headers": ["drivers/net/wireless/broadcom/brcm80211/include/brcm_hw_ids.h", "brcmu_wifi.h", "brcmu_utils.h", "chipcommon.h", "soc.h", "defs.h"],
+    "optional_reference_large": ["brcmfmac/cfg80211.c and cfg80211.h (join/scan/key iovar sequences only)"]
+  },
+  "optional_alternative_pins_not_linux": "OpenBSD sys/dev/ic/bwfm.c, bwfmvar.h, bwfmreg.h, sys/dev/pci/if_bwfm_pci.c, if_bwfm_pci.h at a pinned revision, if route A is chosen. That is a source decision for root and the user.",
+  "safe_readonly_linux_inventory_additions": {
+    "allowed": [
+      "Wi-Fi and its parent bridge under /sys/bus/pci/devices: vendor, device, class, revision, subsystem_vendor, subsystem_device, current/max_link_speed, current/max_link_width, power_state, irq, msi_bus; basename of the driver and iommu_group links; count of msi_irqs entries only",
+      "/sys/kernel/iommu_groups/<group of 14e4:4425>/type (identity vs DMA answers the DART bypass question); /sys/class/iommu entry names",
+      "/proc/device-tree Wi-Fi and PCIe nodes: compatible, brcm,board-type, apple,antenna-sku, apple,module-instance, reg-names, msi-ranges/iommu-map presence, and the names (not values) of *-gpios properties",
+      "Firmware filenames only: ls /lib/firmware/brcm | grep 4378",
+      "Kernel log lines for brcmfmac, apple-pcie and apple-dart, piped through a MAC redactor (sed -E 's/([0-9a-f]{2}:){5}[0-9a-f]{2}/<mac>/Ig') and dropping any line mentioning SSID, connect or wlan association"
+    ],
+    "forbidden": ["/sys/class/net/*/address", "local-mac-address or mac-address properties", "PCI config files or BAR contents", "firmware, NVRAM, CLM or txcap file contents (NVRAM can contain macaddr=)", "iw, nmcli, wpa_cli, ip link", "NetworkManager or iwd connection files", "serial numbers"]
+  },
+  "not_claimed": "No source acquired, no hardware access, no firmware handling. Bluetooth excluded. Effort and route choice remain root/user decisions."
+}

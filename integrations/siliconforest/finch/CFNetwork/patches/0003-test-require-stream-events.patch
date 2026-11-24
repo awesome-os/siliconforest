@@ -1,0 +1,45 @@
+Make missing run-loop delivery an actual test failure, preserving comparison stdout.
+--- a/userland/tests/cfnetwork-test.c
++++ b/userland/tests/cfnetwork-test.c
+@@ -260,7 +260,8 @@
+         print_masked("sent", wire[i]);
+ }
+ 
+-static CFIndex event_reads;
++static CFIndex event_reads, event_bytes;
++static bool event_done, event_error;
+ 
+ static void
+ event(CFReadStreamRef s, CFStreamEventType t, void *info)
+@@ -271,7 +272,10 @@
+         CFIndex n = CFReadStreamRead(s, b, sizeof b);
+         printf("  read %ld\n", (long)n);
+         event_reads++;
+-    }
++        if (n > 0) event_bytes += n;
++    }
++    if (t & kCFStreamEventErrorOccurred) event_error = true;
++    if (t & kCFStreamEventEndEncountered) event_done = true;
+     if (t & (kCFStreamEventEndEncountered | kCFStreamEventErrorOccurred))
+         CFRunLoopStop(CFRunLoopGetCurrent());
+ }
+@@ -283,12 +287,17 @@
+     CFHTTPMessageRef m = CFHTTPMessageCreateRequest(NULL, CFSTR("GET"), url(path), kCFHTTPVersion1_1);
+     CFReadStreamRef s = CFReadStreamCreateForHTTPRequest(NULL, m);
+     CFStreamClientContext ctx = {0, NULL, NULL, NULL, NULL};
+-    CFReadStreamSetClient(s, kCFStreamEventOpenCompleted | kCFStreamEventHasBytesAvailable | kCFStreamEventEndEncountered |
++    if (!CFReadStreamSetClient(s, kCFStreamEventOpenCompleted | kCFStreamEventHasBytesAvailable | kCFStreamEventEndEncountered |
+                                  kCFStreamEventErrorOccurred,
+-                          event, &ctx);
++                          event, &ctx)) { fprintf(stderr,"CFReadStreamSetClient failed\n"); exit(1); }
+     CFReadStreamScheduleWithRunLoop(s, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+     printf("open %d status %ld\n", CFReadStreamOpen(s), (long)CFReadStreamGetStatus(s));
+     CFRunLoopRunInMode(kCFRunLoopDefaultMode, 10, false);
++    if (!event_done || event_error || !event_reads || event_bytes != 11) {
++        fprintf(stderr,"HTTP run-loop callbacks failed: done=%d error=%d reads=%ld bytes=%ld\n",
++                event_done,event_error,(long)event_reads,(long)event_bytes);
++        exit(1);
++    }
+     CFReadStreamUnscheduleFromRunLoop(s, CFRunLoopGetCurrent(), kCFRunLoopDefaultMode);
+     CFReadStreamClose(s);
+     CFRelease(s);

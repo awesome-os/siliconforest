@@ -1,0 +1,238 @@
+diff --git a/crates/wm-darwin/src/policy.rs b/crates/wm-darwin/src/policy.rs
+index 46d48c7..3cbabd9 100644
+--- a/crates/wm-darwin/src/policy.rs
++++ b/crates/wm-darwin/src/policy.rs
+@@ -15,6 +15,7 @@
+ //! | `skip_unchanged` | off (desk9-001) | DESK9: a commit that brings nothing new (no buffer, or the same buffer without damage) repaints nothing; its frame callbacks go out at the next refresh |
+ //! | `partial_repaint` | off (desk9-001) | DESK9: the GPU renderer repaints only what changed since the buffer it draws into was last drawn (scissor), not the whole screen |
+ //! | `late_latch` | on | frames are made as late as they can be and still make their blank (DESK5's late latching); off: a frame is drawn as soon as something changed and the display is free, and committed at once (DESK9: Firefox's commits came 10-11 ms after a flip and waited a whole refresh more for the latched frame) |
++//! | `restore_after_reboot` | off | DESK9: the first compositor of a boot opens again the applications the desk had opened that had windows when the machine went down (a reboot, a kernel install), as a Mac does after a restart (`session_restore.rs`) |
+ //! | `framehash` | off | DESK9: every committed buffer's content is hashed (sampled) to count distinct frames (`WMPACING ... content:`); a test's switch, it reads client memory |
+ use std::path::PathBuf;
+ use std::time::{Duration, Instant, SystemTime};
+@@ -31,10 +32,11 @@ pub struct Switches {
+     pub partial_repaint: bool,
+     pub framehash: bool,
+     pub late_latch: bool,
++    pub restore_after_reboot: bool,
+ }
+ 
+ impl Switches {
+-    const KEYS: [&'static str; 10] = ["fifo", "fifo_shm", "client_wake", "flip_time_callbacks", "flip_stamps", "restore", "skip_unchanged", "partial_repaint", "framehash", "late_latch"];
++    const KEYS: [&'static str; 11] = ["fifo", "fifo_shm", "client_wake", "flip_time_callbacks", "flip_stamps", "restore", "skip_unchanged", "partial_repaint", "framehash", "late_latch", "restore_after_reboot"];
+     fn defaults() -> Self {
+         let env = |key: &str| std::env::var(format!("CHONKSTEP_DARWIN_{}", key.to_ascii_uppercase())).ok().and_then(|v| parse_bool(&v));
+         Self {
+@@ -48,6 +50,7 @@ impl Switches {
+             partial_repaint: env("partial_repaint").unwrap_or(false),
+             framehash: env("framehash").unwrap_or(false),
+             late_latch: env("late_latch").unwrap_or(true),
++            restore_after_reboot: env("restore_after_reboot").unwrap_or(false),
+         }
+     }
+     fn slot(&mut self, key: &str) -> Option<&mut bool> {
+@@ -62,6 +65,7 @@ impl Switches {
+             "partial_repaint" => &mut self.partial_repaint,
+             "framehash" => &mut self.framehash,
+             "late_latch" => &mut self.late_latch,
++            "restore_after_reboot" => &mut self.restore_after_reboot,
+             _ => return None,
+         })
+     }
+@@ -183,7 +187,7 @@ mod tests {
+     use super::*;
+     #[test]
+     fn the_policy_file_changes_switches_without_a_relaunch_and_a_test_pin_wins_until_released() {
+-        let base = Switches { fifo: true, fifo_shm: true, client_wake: true, flip_time_callbacks: true, flip_stamps: true, restore: true, skip_unchanged: true, partial_repaint: true, framehash: false, late_latch: true };
++        let base = Switches { fifo: true, fifo_shm: true, client_wake: true, flip_time_callbacks: true, flip_stamps: true, restore: true, skip_unchanged: true, partial_repaint: true, framehash: false, late_latch: true, restore_after_reboot: false };
+         let (s, refused) = Switches::parse("# comment\nfifo=off\nrestore = 0\nbogus=1\nclient_wake=maybe\n", base);
+         assert!(!s.fifo && !s.restore && s.client_wake && s.flip_time_callbacks);
+         assert_eq!(refused, vec!["bogus=1".to_string(), "client_wake=maybe".to_string()]);
+diff --git a/crates/wm-darwin/src/session_restore.rs b/crates/wm-darwin/src/session_restore.rs
+index c9ed21f..65294cc 100644
+--- a/crates/wm-darwin/src/session_restore.rs
++++ b/crates/wm-darwin/src/session_restore.rs
+@@ -12,11 +12,19 @@
+ //! ended for a power-off, reboot or log-out, applications started some other way (an agent's test instance
+ //! started from a shell with its own profile; a `open` from a terminal), and with the policy's
+ //! `restore=off`. Said in the log as `WMRESTORE`.
++//!
++//! DESK9, after a reboot (policy `restore_after_reboot`, off by default): the file is also kept where a reboot
++//! does not clear it (`$XDG_STATE_HOME/chonkstep/session-apps.last`, with the boot it was written in). The first
++//! compositor of a new boot opens again the applications the desk had opened that had windows when the machine
++//! went down - as a Mac reopens them after a restart - unless it went down for a power-off or log-out, or more
++//! than 30 minutes ago. Nothing of the boot before is alive, so nothing is signalled.
+ use std::collections::{HashMap, HashSet};
+ use std::path::PathBuf;
+ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+ 
+ pub const FILE: &str = "session-apps";
++/// DESK9: the copy a reboot keeps.
++pub const LAST: &str = "session-apps.last";
+ const HEADER: &str = "# chonkstep-darwin session-apps v1";
+ 
+ #[derive(Clone, Debug, PartialEq, Eq)]
+@@ -88,6 +96,48 @@ pub fn plan(text: &str, now_ms: u128, alive: impl Fn(i32) -> bool) -> (Vec<Recor
+     (open, skipped)
+ }
+ 
++/// DESK9: when this boot began (unix ms, from the monotonic clock; good to a few ms).
++pub fn boot_unix_ms() -> u128 {
++    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
++    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut t) };
++    unix_ms().saturating_sub(t.tv_sec as u128 * 1000 + t.tv_nsec as u128 / 1_000_000)
++}
++
++/// DESK9: the applications to open again in a new boot, from the copy the boot before kept (`text`, with its
++/// `boot=` field): those the desk had opened that had windows, when the boot before is another one, went down
++/// less than 30 minutes ago and not for a power-off or log-out.
++pub fn plan_after_reboot(text: &str, now_ms: u128, boot_ms: u128) -> (Vec<Record>, Vec<(Record, &'static str)>) {
++    let Some((records, updated, ended)) = parse(text) else { return (Vec::new(), Vec::new()) };
++    let header = text.lines().next().unwrap_or("");
++    let before: Option<u128> = header.split_whitespace().find_map(|f| f.strip_prefix("boot=")?.parse().ok());
++    let same_boot = before.is_none_or(|b| b.abs_diff(boot_ms) < 60_000);
++    let old = now_ms.saturating_sub(updated) > 30 * 60_000;
++    let down = matches!(ended.as_str(), "poweroff" | "shutdown" | "logout");
++    let mut open = Vec::new();
++    let mut skipped = Vec::new();
++    let mut seen = HashSet::new();
++    for r in records.into_iter().filter(|r| r.windows > 0) {
++        let why = if same_boot {
++            Some("the same boot (a relaunch: the runtime file decides)")
++        } else if old {
++            Some("the machine went down more than 30 minutes ago")
++        } else if down {
++            Some("the session ended with a power-off or log-out")
++        } else if !r.desk {
++            Some("not opened by the desk (a shell's or an agent's instance)")
++        } else if !seen.insert(r.app_id.to_ascii_lowercase()) {
++            Some("another process of the same application is opened already")
++        } else {
++            None
++        };
++        match why {
++            Some(why) => skipped.push((r, why)),
++            None => open.push(r),
++        }
++    }
++    (open, skipped)
++}
++
+ pub fn unix_ms() -> u128 {
+     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis())
+ }
+@@ -108,11 +158,19 @@ pub struct SessionApps {
+     pub desk_pids: HashSet<i32>,
+     /// Application ids (lower case) opened again by the restore.
+     restored: HashSet<String>,
++    /// DESK9: the copy kept across a reboot, and the boot before's copy read at start (when there was no
++    /// runtime file: the first compositor of a boot).
++    last_path: Option<PathBuf>,
++    pub(crate) after_reboot: Option<String>,
+ }
+ 
+ impl SessionApps {
+     /// At start: the file of the compositor before is moved aside and kept for the restore.
+     pub fn start(runtime: Option<PathBuf>) -> Self {
++        Self::start_with(runtime, std::env::var_os("XDG_STATE_HOME").map(|d| PathBuf::from(d).join("chonkstep")))
++    }
++    pub fn start_with(runtime: Option<PathBuf>, state: Option<PathBuf>) -> Self {
++        let last_path = state.map(|d| d.join(LAST));
+         let path = runtime.map(|r| r.join(FILE));
+         let previous = path.as_ref().and_then(|p| {
+             let text = std::fs::read_to_string(p).ok()?;
+@@ -121,13 +179,14 @@ impl SessionApps {
+         });
+         // the processes the desk before had opened stay desk-opened (a leftover of them may be restarted)
+         let desk_pids = previous.as_deref().and_then(parse).map(|(r, _, _)| r.into_iter().filter(|r| r.desk).map(|r| r.pid).collect()).unwrap_or_default();
+-        Self { path, previous, desk_pids, started: Some(Instant::now()), ..Default::default() }
++        let after_reboot = if previous.is_none() { last_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok()) } else { None };
++        Self { path, previous, desk_pids, started: Some(Instant::now()), last_path, after_reboot, ..Default::default() }
+     }
+     /// Whether the restore is due now (4 s after the start: the dock is up, applications that end with
+     /// their connection have ended), then once more at 10 s for those that ended later.
+     pub fn restore_due(&self) -> Option<bool> {
+         let since = self.started?.elapsed();
+-        if self.previous.is_none() || since < Duration::from_secs(4) {
++        if (self.previous.is_none() && self.after_reboot.is_none()) || since < Duration::from_secs(4) {
+             return None;
+         }
+         Some(since >= Duration::from_secs(10))
+@@ -154,6 +213,12 @@ impl SessionApps {
+         }
+         let text = render(&records, std::process::id() as i32, unix_ms(), ended);
+         let part = path.with_extension("part");
++        // DESK9: the copy a reboot keeps, with this boot's start
++        if let Some(last) = &self.last_path {
++            let kept = text.replacen('\n', &format!(" boot={}\n", boot_unix_ms()), 1);
++            let part = last.with_extension("part");
++            let _ = std::fs::write(&part, kept).and_then(|()| std::fs::rename(&part, last));
++        }
+         if std::fs::write(&part, text).and_then(|()| std::fs::rename(&part, path)).is_ok() {
+             if records != self.written {
+                 eprintln!("WMRESTORE applications with windows now: {:?}", records.iter().map(|r| format!("{}({}){}", r.app_id, r.pid, if r.desk { "" } else { " not desk-opened" })).collect::<Vec<_>>());
+@@ -207,6 +272,25 @@ impl crate::server::Server {
+     }
+     /// Once a frame (cheap: every 2 s): the file, and the restore when it is due.
+     pub(crate) fn session_tick(&mut self) {
++        // DESK9: the first compositor of a boot: the applications of the boot before (policy restore_after_reboot)
++        if self.session_apps.restore_due() == Some(true) {
++            if let Some(text) = self.session_apps.after_reboot.take() {
++                if self.policy.now.restore && self.policy.now.restore_after_reboot {
++                    let (open, skipped) = plan_after_reboot(&text, unix_ms(), boot_unix_ms());
++                    for r in open {
++                        if self.session_apps.restored.insert(r.app_id.to_ascii_lowercase()) {
++                            eprintln!("WMRESTORE {}({} in the boot before) had {} window(s) when the machine went down: opened again", r.app_id, r.pid, r.windows);
++                            self.open_application(&r.app_id, None);
++                        }
++                    }
++                    for (r, why) in skipped {
++                        eprintln!("WMRESTORE {}({} in the boot before) not opened again: {why}", r.app_id, r.pid);
++                    }
++                } else {
++                    eprintln!("WMRESTORE after a reboot: off (policy restore_after_reboot=off): nothing of the boot before opened again");
++                }
++            }
++        }
+         if let Some(last) = self.session_apps.restore_due() {
+             if let Some(text) = self.session_apps.take_previous(last) {
+                 if self.policy.now.restore {
+@@ -288,6 +372,38 @@ mod tests {
+         assert_eq!(plan(&crashed, now, |_| false).0.len(), 2);
+         assert!(plan("not a session file", now, |_| false).0.is_empty());
+     }
++    /// DESK9: in a new boot the desk-opened applications of the boot before open again; not in the same boot,
++    /// not after a power-off, not when it is old, not an agent's instance.
++    #[test]
++    fn after_a_reboot_the_desk_opened_applications_of_the_boot_before_open_again() {
++        let now = 1_000_000_000u128;
++        let records = vec![rec(10, "org.mozilla.firefox", 1, true), rec(11, "com.apple.Terminal", 2, true), rec(12, "org.mozilla.firefox", 1, false), rec(13, "com.apple.ActivityMonitor", 0, true)];
++        let kept = |updated: u128, ended: Option<&str>, boot: u128| render(&records, 99, updated, ended).replacen('\n', &format!(" boot={boot}\n"), 1);
++        let ids = |(open, _): (Vec<Record>, Vec<(Record, &'static str)>)| open.into_iter().map(|r| r.app_id).collect::<Vec<_>>();
++        // went down 3 minutes ago (a kernel reboot: no end line, or "reboot"), new boot 2 minutes ago
++        let boot_now = now - 120_000;
++        assert_eq!(ids(plan_after_reboot(&kept(now - 180_000, None, now - 3_600_000), now, boot_now)), ["org.mozilla.firefox", "com.apple.Terminal"]);
++        assert_eq!(ids(plan_after_reboot(&kept(now - 180_000, Some("reboot"), now - 3_600_000), now, boot_now)).len(), 2);
++        // the same boot, a power-off, too old: nothing
++        assert!(ids(plan_after_reboot(&kept(now - 5_000, None, boot_now + 20), now, boot_now)).is_empty());
++        assert!(ids(plan_after_reboot(&kept(now - 180_000, Some("poweroff"), now - 3_600_000), now, boot_now)).is_empty());
++        assert!(ids(plan_after_reboot(&kept(now - 40 * 60_000, None, now - 3_600_000), now, boot_now)).is_empty());
++        // the copy is written beside the runtime file, read at the start of a boot without a runtime file
++        let dir = std::env::temp_dir().join(format!("desk9-reboot-{}", std::process::id()));
++        let (run, state) = (dir.join("run"), dir.join("state"));
++        std::fs::create_dir_all(&run).unwrap();
++        std::fs::create_dir_all(&state).unwrap();
++        let mut s = SessionApps::start_with(Some(run.clone()), Some(state.clone()));
++        assert!(s.after_reboot.is_none(), "nothing kept yet");
++        s.update(vec![rec(10, "org.mozilla.firefox", 1, true)], None);
++        let last = std::fs::read_to_string(state.join(LAST)).unwrap();
++        assert!(last.lines().next().unwrap().contains(" boot="), "{last}");
++        std::fs::remove_dir_all(&run).unwrap(); // a reboot clears the runtime directory
++        std::fs::create_dir_all(&run).unwrap();
++        let s = SessionApps::start_with(Some(run), Some(state));
++        assert!(s.after_reboot.is_some() && s.previous.is_none());
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
+     #[test]
+     fn the_file_is_moved_aside_at_start_and_rewritten_on_change() {
+         let dir = std::env::temp_dir().join(format!("desk8-restore-{}", std::process::id()));

@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SOURCE_REVIEW_NO_HARDWARE",
+  "reviewed": "integrations/puredarwin/chonkstep-darwin/client-terminal-native-startup, source set ae9bd9759cd6f2ad (14 files; recomputed sorted by path; all files match; no unbound files)",
+  "verdict": "APPROVE as a distinct startup-only mode. The classification is honest: every label and record says physical_input_proven=false / STARTUP_ONLY_NO_INPUT_PROOF, and exit 0 means only 'readiness observed and owned child reaped'. The genuine PTY I/O, XKB-only input path and owned cleanup are byte-identical to the qualified revision-2 terminal. Q1 and Q2 are qualification rules, not code defects.",
+  "diff_vs_qualified_rev2": {
+    "files": "Only Cargo.toml (package name), Cargo.lock (root package name only; every other line identical), README.md and src/main.rs differ from the revision-2 set (79c6c89f). grid.rs, keys.rs, negotiation.rs, protocol.rs, pty.rs (9edf5cb8), render.rs and the font are identical. The original client-terminal source is unchanged.",
+    "main_rs": [
+      "Title 'Chonkstep — native keyboard startup (input unverified)' (the app_id org.darwinlab.terminal is unchanged).",
+      "READY becomes 'DL12_NATIVE_STARTUP_READY <n> origin=native_input_unverified pty=ready keymap=xkb_v1 focus=own_surface frame=ready physical_input_proven=false'.",
+      "The strict-response announcement becomes the diagnostic-only 'DL12_NATIVE_STARTUP_REPLY_OBSERVED <n> source=pty_shell physical_input_proven=false'. The recognizer is unchanged and can only fire on real post-READY PTY bytes.",
+      "result.json origin becomes native_input_unverified and adds qualification STARTUP_ONLY_NO_INPUT_PROOF and native_physical_typing_proven false; the cleanup and session fields are unchanged.",
+      "Exit gate: after cleanup.complete, it requires session.ready instead of session.response; then 'DL12_NATIVE_STARTUP_DONE <n> readiness=observed physical_input_proven=false cleanup=reaped'. The error prefix is renamed."
+    ]
+  },
+  "verified": [
+    "Classification: READY derives from the compositor's seat (keymap, focus, neutral modifiers), the PTY exec boundary plus output, SSD and a completed frame. A compositor sends keymap and focus whether or not any physical keyboard ever reports, so READY says nothing about native keyboard function, and the labels say exactly that.",
+    "Genuine I/O preserved: only master reads feed the grid, records and recognizer; only XKB-translated wl_keyboard presses feed TX, written only after READY and while the shell owns the foreground. No host command or text is inserted (no injection path exists in the diff).",
+    "Keyboard-only seat compatibility: the wl_seat handler requests a keyboard when capabilities contain Keyboard and never needs a pointer (main.rs:171), so it suits Grok's keyboard-only seat. Window creation still requires an advertised seat.",
+    "Cleanup unchanged: owned TERM/KILL with bounded reap, idempotent, always before result.json; exit 0 requires cleanup.complete.",
+    "Tests re-run here: 26/26 OK (cargo test --offline --locked, scratch target)."
+  ],
+  "qualification_rules": [
+    {"id": "Q1", "text": "Exit 0 also happens if the shell dies after READY (session ends on pty_eof, cleanup reaps an already-exited child). A startup qualification must additionally require from result.json session.pty_eof false, window_closed false, term_signal false (or a supervisor-sent TERM recorded as such), and the raw child wait status recorded. DONE alone is not enough."},
+    {"id": "Q2", "text": "Text before READY and duplicate presses are hard failures, carried over from revision 2. With a physical keyboard, a key pressed during boot turns the startup run into a failure; that is fail-closed and acceptable for unattended runs, but say so in the packet. A press during the run is real input going to the PTY, and the transcript records it; it must not be confused with host-origin input (the TX ledger must end at the launcher command, with no PDSerialHID lines)."},
+    {"id": "Q3", "text": "Nothing in this mode is physical-typing evidence, including REPLY_OBSERVED. The window does not display the nonce, so a human cannot produce the strict reply without a separately reviewed physical-typing procedure."}
+  ],
+  "notes": [
+    {"id": "N1", "severity": "nit", "text": "Consider a distinct app_id (for example org.darwinlab.terminal-native-startup) so compositor logs and pixels distinguish it from the host-qualified terminal; the title already distinguishes them."}
+  ],
+  "not_claimed": ["native keyboard function", "physical typing", "runtime"],
+  "scope": "Read-only source review plus host tests in a scratch target. No hardware or edits."
+}

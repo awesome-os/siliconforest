@@ -1,0 +1,30 @@
+--- a/src/Frameworks/AppKit/NSLayoutConstraint.m
++++ b/src/Frameworks/AppKit/NSLayoutConstraint.m
+@@ -431,6 +431,11 @@
+     if ([constraints count] == 0)
+         return fitting ? NSZeroSize : result;
+ 
++    // (cocoa 0112) SF_SOLVE_TIME=1: the time of each whole-tree solve and the sum so far, on standard error
++    static int timing = -1;
++    if (timing < 0)
++        timing = getenv("SF_SOLVE_TIME") != NULL;
++    CFAbsoluteTime solveStart = timing ? CFAbsoluteTimeGetCurrent() : 0;
+     SFLayout layout = { SFSolverCreate(), NULL, 0, 0, CFDictionaryCreateMutable(NULL, 0, NULL, NULL) };
+     int root = layoutAddItem(&layout, self);
+ 
+@@ -607,6 +612,15 @@
+     }
+ 
+     SFSolverFree(layout.solver);
++    if (timing) {
++        static double total;
++        static long solves;
++        double ms = (CFAbsoluteTimeGetCurrent() - solveStart) * 1000;
++        total += ms;
++        solves++;
++        fprintf(stderr, "SF_SOLVE_TIME %ld solves, this %.1f ms (%lu constraints), sum %.1f ms\n", solves, ms,
++                (unsigned long)[constraints count], total);
++    }
+     CFRelease(layout.index);
+     free(layout.items);
+     return result;

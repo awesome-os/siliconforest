@@ -1,0 +1,49 @@
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -1397,6 +1397,12 @@
+ 
+ // with the lock held: show the current image if the pointer is over one of our surfaces
+ static void cursorApplyLocked(void) {
++    static int trace = -1;  // SF_CURSOR_TRACE=1: each cursor the compositor is given, on standard error
++    if (trace < 0)
++        trace = getenv("SF_CURSOR_TRACE") != NULL;
++    if (trace)
++        fprintf(stderr, "SF_CURSOR %s inside=%d hidden=%d buffer=%p serial=%u\n", ws.pointer == NULL || !cursor.inside ? "skip" :
++                (cursor.hidden || cursor.buffer == NULL) ? "none" : "shown", cursor.inside, cursor.hidden, (void *)cursor.buffer, cursor.enterSerial);
+     if (ws.pointer == NULL || !cursor.inside)
+         return;
+     if (cursor.hidden || cursor.buffer == NULL) {
+@@ -1508,6 +1514,9 @@
+     pthread_mutex_unlock(&cursor.lock);
+ }
+ 
++/* hidden: 0 shown, 1 hidden (NSCursor +hide), 2 hidden until the pointer moves (+setHiddenUntilMouseMoves:):
++ * the pointer's next motion or entry over one of our surfaces shows it again here, on the input thread,
++ * whatever AppKit does with the event, so that a pointer never stays invisible over our windows. */
+ void _windowServerSetCursorHidden(int hidden) {
+     if (!ensureConnected())
+         return;
+@@ -1550,6 +1559,8 @@
+     pthread_mutex_lock(&cursor.lock);
+     cursor.enterSerial = serial;
+     cursor.inside = 1;
++    if (cursor.hidden == 2)
++        cursor.hidden = 0;
+     if (cursor.buffer == NULL)
+         cursorUseLocked(cursorLookup("arrowCursor"));
+     cursorApplyLocked();
+@@ -1598,6 +1609,14 @@
+ static void pointerMotion(void *data, struct wl_pointer *pointer, uint32_t time,
+                           wl_fixed_t x, wl_fixed_t y) {
+     noteInput();
++    if (cursor.hidden == 2) {  // hidden until the pointer moves: it moved
++        pthread_mutex_lock(&cursor.lock);
++        if (cursor.hidden == 2) {
++            cursor.hidden = 0;
++            cursorApplyLocked();
++        }
++        pthread_mutex_unlock(&cursor.lock);
++    }
+     struct mach_event event = {0};
+     struct wsWindow *window = windowForID(ws.pointerWindowID);
+     double newX = wl_fixed_to_double(x);

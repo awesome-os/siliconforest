@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "INDEPENDENT_SOURCE_AND_ADT_REVIEW_NO_HARDWARE_NO_BUILD",
+  "scope": "J293/T8103 built-in keyboard transport: PMGR power, pinmux/GPIO, Apple SPI controller PIO, Apple SPI-HID protocol, m1n1 HV interaction, and the Darwin HID-to-console path. Read-only. No hardware, SSH, build, boot or goal API. ADT facts are topology only; no serial/ECID/identity values are recorded.",
+  "inputs": {
+    "reference": "sources/linux-aurora-keyboard-reference (omacom/linux-aurora 6a08a08e). All 6 files rehashed: sha256 and git blob equal reports/sprint-010/native-keyboard-source-acquisition.json.",
+    "native_adt": "private runs/m1-display-010/attempt-002/guest/original-adt.bin, parsed by a scratch reader (not copied into the repo).",
+    "secondary_dt_reference": "An Asahi-derived t8103.dtsi/t8103-j293.dts outside this lab; used only to cross-check, superseded by root's private Linux FDT capture (SPI clock 120 MHz, spien AP GPIO 195, IRQ NUB GPIO 13, CS 65 us, 8 MHz).",
+    "hv_source": "sources/m1n1-baseline/proxyclient/m1n1/hv/__init__.py"
+  },
+  "verdict": "No contradiction between the native ADT, root's Linux FDT capture and the pinned reference. A native transport is feasible under the current HV without HV changes. Do not port five reference defects listed below. A transport that works is not yet a shell keyboard: the HID event path must also deliver keyboard-page usages to PDHIDPushKeyboardEvent.",
+  "ground_truth": {
+    "controller": {
+      "adt": "/arm-io/spi3 compatible 'spi-1,spimc', reg 0x23510c000 size 0x4000, AIC interrupt 0x269 (617), clock-gates 0x34, clock-ids 0x17b, dma-channels via sio-dma",
+      "linux": "apple,t8103-spi at 0x23510c000, AIC 617, clk 120 MHz, power-domain ps_spi3, pins AP 46-49 function 1",
+      "agree": true
+    },
+    "device": {
+      "adt": "/arm-io/spi3/ipd compatible 'hid-transport,spi'; interrupt-parent nub-gpio; interrupts <13 0x06000001>; reg words <0 0x7d 0x08010000 0 0x4e20 ...>; function-spi_en <AP gpio 195 0x00010101>; function-enable_cs <AP gpio 49 0x101>; spi3 function-spi_cs0 <AP gpio 49 1>; reset-sequence names function-spi_en",
+      "linux": "apple,spi-hid-transport cs 0, 8 MHz, cs setup/hold 65 us, cs inactive 250 us, spien AP 195, IRQ NUB 13 level-low",
+      "decoding_inferences": [
+        "0x7d = 125 ns clock period = 8 MHz.",
+        "0x4e20 = 20000 ns = Apple's 20 us CS delay; Linux's 65 us is 20 + 45 us.",
+        "Top byte 0x06 of the interrupt flags probably selects GPIO interrupt group 6. nub-gpio lists supported-int-groups 4,5,6. Linux instead forces group 0 (pinctrl-apple-gpio.c:316-317) and works. Unverified."
+      ],
+      "agree": true
+    }
+  },
+  "power": {
+    "pmgr_chain_from_adt": [
+      {
+        "name": "SPI3",
+        "id": "0x34",
+        "ps_register": "0x23b700258",
+        "adt_default_on": false,
+        "hv_hooked": false
+      },
+      {
+        "name": "SPI_P",
+        "id": "0x2c",
+        "ps_register": "0x23b700218",
+        "adt_default_on": true,
+        "hv_hooked": false
+      },
+      {
+        "name": "SIO",
+        "id": "0x22",
+        "ps_register": "0x23b7001c8",
+        "adt_default_on": true,
+        "critical": true,
+        "hv_hooked": true
+      },
+      {
+        "name": "SIO_BUSIF",
+        "id": "0x21",
+        "ps_register": "0x23b7001c0",
+        "adt_default_on": true,
+        "hv_hooked": true
+      },
+      {
+        "name": "GPIO",
+        "id": "0xf",
+        "ps_register": "0x23b700130",
+        "adt_default_on": true,
+        "hv_hooked": false
+      },
+      {
+        "name": "NUB_GPIO",
+        "id": "0x93",
+        "ps_register": "0x23d280080",
+        "adt_default_on": true,
+        "critical": true,
+        "hv_hooked": false
+      }
+    ],
+    "hv_interaction": "m1n1 map_essential hooks the PMGR registers of UART0, ATCn_USB and ATCn_USB_AON and their parents (hv/__init__.py:1473-1514). That chain includes SIO and SIO_BUSIF but not SPI3 or SPI_P. Guest writes to SIO/SIO_BUSIF are forced to target 0xf and later reads are shadowed (actual = target). Guest writes to SPI3 reach hardware.",
+    "procedure": "Per pmgr-pwrstate.c:62-130: read the PS word; clear DEV_DISABLE(10), PS_RESET(12), AUTO_ENABLE(28), the write-1-to-clear WAS_CLKGATED/WAS_PWRGATED (8,9), BUSY(11) and TARGET(3:0); set TARGET=0xf; write; poll ACTUAL(7:4)==0xf, 1 us steps, 100 us budget. AUTO_ENABLE is optional; omit it for first bring-up.",
+    "safety": [
+      "Never touch SPI3 MMIO until SPI3 ACTUAL reads 0xf. Accessing a gated block can take an SError or hang.",
+      "Record bit 31 (RESET) and do not change it. Linux has no reset for spi3 and works, so it is expected clear (inference).",
+      "SPI3 is not default-on in the ADT, so a native driver that skips the power step should be expected to fail, not to work by luck."
+    ]
+  },
+  "pins_and_gpio": {
+    "register_layout": "pinctrl-apple-gpio.c:46-68. Pin word at base + 4*pin: DATA bit0, MODE 3:1 (1 out, 3 IRQ low, 7 input/IRQ off), PERIPH 6:5, INPUT_ENABLE 9, GRP 18:16, LOCK 21. IRQ status at base + 0x800 + 0x40*group + 4*(pin/32).",
+    "spi_pins": "AP pins 46-49 (0x23c1000b8..0x23c1000c4) must be PERIPH=1 so the controller's CS bit drives pin 49 (CS) along with SCK/MOSI/MISO. ADT's enable_cs suggests Apple may drive CS as a GPIO; Linux's controller CS is proven.",
+    "spien": "AP pin 195 word at 0x23c10030c. Output. Sequence per spi-hid-apple-of.c:22-37: 1, 5 ms, 0, 5 ms, 1, 50 ms.",
+    "irq_pin": "NUB pin 13 word at 0x23d1f0034. Input. DATA reflects the pin level in input modes (apple_gpio_get, :214-226), so first bring-up can poll the level (active low) with no AIC/GPIO interrupt plumbing.",
+    "recommendation": "Read back every pin word before and after the change, including LOCK and GRP. If LOCK is set, stop; never force it."
+  },
+  "spi_controller_pio": {
+    "clock": "120 MHz input. CLKDIV = ceil(120e6/8e6) = 15 gives exactly 8 MHz. Assuming the 24 MHz refclk would give divider 3, i.e. a 40 MHz bus.",
+    "format": "Mode 0 (no CPHA/CPOL in Linux DT), MSB first, 8-bit words. FIFO depth 16. PIO only; do not use the SIO DMA channels in the ADT (they need the SIO coprocessor).",
+    "sequence": "spi-apple.c init :161-187 then transfer :460-566. Reset FIFOs, clear IF_XFER/IF_FIFO, set TXCNT/RXCNT, prime TX, RUN, then service the FIFOs until the TXCOMPLETE/RXCOMPLETE flags are set, with a 200 ms budget, drain RX, then CTRL=0.",
+    "chip_select": "Software CS through APPLE_SPI_PIN bit1, active low: assert, 65 us, transfers, 65 us, deassert, then at least 250 us before the next assert. The aurora hardware-CS-delay path is Mesa-only (:610-618) and must not be used for the keyboard.",
+    "messages": "Write = one CS window: 256-byte TX, 200 us gap (SPI_RW_CHG_DELAY_US), 4-byte RX that must read ac 27 68 d5. Read = one CS window with a 256-byte RX.",
+    "interrupt": "AIC 617 (controller) is optional: polling is fine at 8 MHz for 256 bytes. Under the HV, guest MMIO to SPI3, GPIO and nub-gpio is not trapped by the current m1n1 configuration."
+  },
+  "protocol_for_grok": {
+    "packet": "256 bytes, little-endian: flags u8 (0x40 write/response, 0x20 device read), device u8 (0xd0 info, 0 mgmt, 1 kbd, 2 tp, 3 aux), offset le16, remain le16, length le16, data[246], crc16 le16 over bytes 0..253 (core.c:195-204).",
+    "crc": "Linux crc16(0, ...) is CRC-16/ARC: reflected poly 0x8005 (0xA001), init 0, no final xor. Use it for both the packet CRC and the message CRC. It is not CCITT.",
+    "message": "Header {u0, u1, u2, id, rsplen le16, length le16} (8 bytes), payload, then message crc16 over header+payload. Packet length = 8 + payload + 2.",
+    "boot": "After spien, while the IRQ pin is low, read a packet with length 4 and data a0 80 00 00 (packet CRC must be valid). Wait up to 1 s.",
+    "requests": "device info (target 0xd0: 0x20,0x01,0xd0, rsplen 0); interface info i=0..n-1 (0x20,0x02,i, rsplen 512); HID descriptor i=1..n-1 (0x20,0x10,i, rsplen 512). Responses come back with flags 0x40 and the same u0/u1; u2 selects device/interface.",
+    "input": "flags 0x20, device 1, u0 0x10, payload = HID input report. Device 0 with u1 0xe0 is a 5-byte status report.",
+    "reassembly": "offset==0 and remain==0 is a single packet. Otherwise concatenate while offset equals bytes so far, and total = offset + length + remain stays constant.",
+    "do_not_port": [
+      {
+        "where": "spi-hid-apple-core.c:422",
+        "defect": "GET_REPORT copies max(len, reply_len) into a len-byte caller buffer. Use min."
+      },
+      {
+        "where": "spi-hid-apple-core.c:605",
+        "defect": "The device-info serial string is copied into the vendor buffer. Copy into serial, and redact it in logs and receipts."
+      },
+      {
+        "where": "spi-hid-apple-core.c:814,842",
+        "defect": "Reassembly bounds the total by U16_MAX, but the buffer is 0x800 (:1073), so a CRC-valid malformed sequence overflows. Bound total <= buffer size, and length <= 246."
+      },
+      {
+        "where": "spi-apple.c:432-437",
+        "defect": "RX reads the whole FIFO level even when it exceeds the words remaining (only WARN_ON), overflowing the 4-byte status buffer (:1066) on stale FIFO data. Clamp reads to the words remaining, or discard the excess."
+      },
+      {
+        "where": "spi-hid-apple-core.c:330-336",
+        "defect": "A status mismatch only warns and the write is still reported as success. A diagnostic should record it as a failed write, not a success."
+      }
+    ]
+  },
+  "console_path": {
+    "existing_bridge": "IOHIDEventService.cpp:1794-1795 calls PDHIDPushKeyboardEvent for keyboard-page usages <= 0xE7. PDHIDEventQueue.cpp:536-560 queues the usage, and :475-477 feeds the bytes to cons_cinput. The same path serves IOUSBHIDKeyboard and ApplePS2Keyboard.",
+    "implication": "A native SPI-HID IOHIDDevice that publishes the device's real descriptor and reports must get an IOHIDEventService/IOHIDEventDriver match before typing reaches the shell. Proving the transport (logged raw reports) and proving shell typing are separate milestones."
+  },
+  "recommended_diagnostic_stages": [
+    "S0 read-only: SPI3/SPI_P/SIO/GPIO/NUB_GPIO PS words; AP 46-49 and 195 and NUB 13 pin words. No SPI3 MMIO if SPI3 ACTUAL != 0xf.",
+    "S1 power and pinmux with read-back; stop on LOCK or on a timeout reaching 0xf.",
+    "S2 spien sequence; poll NUB 13 low; read and verify the boot packet.",
+    "S3 device info, with the serial string redacted; S4 interface info and descriptors, logging lengths and CRC results.",
+    "S5 log raw keyboard input reports for a bounded window. No console injection, no success stubs, no retry loops beyond the per-transfer budgets.",
+    "S6 IOHIDDevice publication and the event path; only then claim typing."
+  ],
+  "inventory_tool_review": {
+    "path": "integrations/puredarwin/m1-keyboard/inventory/keyboard_inventory.c",
+    "verdict": "APPROVE. Read-only registry matching, names and class names only; no service open, no HID queue. Uses the tiny PDIOKitLib surface consistently (char* IOServiceMatching, 3-argument IOServiceGetMatchingServices, IOObjectGetClass). Absent classes produce an empty iterator, not an error, so the expected-absent PDM1SPIHID/AppleEmbeddedKeyboard do not set query_errors.",
+    "correction_2026_11_07": "The earlier verdict's last sentence was wrong. In XNU, is_io_service_get_matching_services returns kIOReturnSuccess with a NULL iterator for no matches (copyExistingServices returns NULL and IOUserIterator::withIterator(NULL) returns NULL; IOUserClient.cpp:437-443, 2767-2768), so the original code's 'else failed = 1' set query_errors for the absent AppleEmbeddedKeyboard/PDM1SPIHID classes. Root's fix (keyboard_inventory.c 48cad701, original preserved as inventory/attempts/005 2a57ecfc) changes it to 'else if (kr != KERN_SUCCESS) failed = 1'. Reviewed: correct and minimal. Inventory output is diagnostic only, never input proof."
+  },
+  "not_established": [
+    "Runtime register values at handoff (power states, pin words, LOCK/GRP) on this machine.",
+    "Whether group 0 or group 6 is the right interrupt group for NUB 13 under Darwin; polling avoids depending on either.",
+    "IOHIDEventDriver matching for an Apple SPI descriptor in this IOHIDFamily build."
+  ]
+}

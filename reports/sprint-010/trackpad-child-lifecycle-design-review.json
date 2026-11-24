@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude (author of the parent PDM1SPIHID adapter; independent of this design)",
+  "status": "READ_ONLY_DESIGN_REVIEW_NO_CODE_NO_BUILD_NO_HARDWARE",
+  "reviewed": {
+    "design": "integrations/puredarwin/m1-trackpad-child/DESIGN.md 2926b6df (Astra, lifecycle design 001)",
+    "registry_gate": "REGISTRY_GATE_DESIGN.md c0179a20 (root, revised after my G2-G4)",
+    "host_contract": "HOST_CONTRACT.md 27bcb33b",
+    "against": "parent adapter 74a22b56 + core002, the pinned PureDarwin e7aa00a IOHIDFamily/xnu in sources/puredarwin-m1-desktop, my preliminary review (C1-C2, F1-F6) and registry notes (G2-G5)"
+  },
+  "verdict": "APPROVE THE DESIGN DIRECTION, WITH REQUIRED CHANGE L1 AND RECONCILIATION L2 BEFORE IMPLEMENTATION. The child half of the prepare/commit/publish model is correct: no child registration or route before the gated commit, single-stop rollback, an inherited loop and gated sink clearing. As written, though, the parent is already registered when its only false-return branch runs. Root's T2-only RegisterService=false parent stage closes that gap and is the change I recommend. Boot-lifetime cohort retention is acceptable for this first candidate under the guarded paths in L3. No code or hardware is authorized by this review.",
+  "source_facts_verified": [
+    "IOService::getWorkLoop returns the provider's loop (IOService.cpp:1381-1389), so an attached child inherits PDM1SPIHID::getWorkLoop() = transportLoop (F1).",
+    "IOHIDDevice::start installs a first-match notifier for its own registry ID, then calls registerService() unless the 'RegisterService' property is kOSBooleanFalse (IOHIDDevice.cpp:468-479). pd_hid_compat.h:58-60 defines the key as 'RegisterService'. createInterface runs from that first-match callback (L499-508), so interface nubs, event drivers and PDHID publication requests all follow registration.",
+    "On failure IOHIDDevice::start calls stop(provider) itself (L482-486) but does not detach.",
+    "IOService::startCandidate, on start() == false, only calls service->detach(this). It does not terminate clients already attached to the service.",
+    "The parent adapter returns false after super::start only if the timer arm fails (PDM1SPIHID.cpp:117-121: super::stop, disposeTransport). terminate() always returns false and the module stop returns KERN_FAILURE (L20, L406-411). disposeTransport releases transportLoop, removes the gate and timer (L397-404), and free() calls it.",
+    "The device-1 filter is device 1, flags 0x20, command 0x10 (m1kbd_hid.c:64-71). The design's device-2 filter mirrors it exactly with device 2, and replaces the advertised-maximum bound with exact per-ID lengths (F5)."
+  ],
+  "L1_precommit_vs_publication": {
+    "severity": "required change (root's question)",
+    "finding": "DESIGN step 6 says the parent 'may return false only on this pre-publication path', and line 143 says the first-match callback may run early 'because all failure rollback ended before registerService'. Both statements hold for the child but not for the parent. super::start has already called the parent's registerService before PDM1SPIHID::start resumes. During child allocation, attach, start and descriptor parse, the parent's first-match callback can create and start keyboard interface nubs, the keyboard event driver can start, and a kind-1 publication request can be issued. If the timer arm (or the gated verify) then fails, rollback stops and disposes the parent and returns false. startCandidate only detaches, so those keyboard clients stay attached to a stopped, detached parent whose transport and timer are gone, and a /dev/usb_hid_kbd request may already be queued. The supervisor would still fail closed (the inventory finds no registered PDM1SPIHID, so 77), but it leaves orphaned clients and a stale endpoint.",
+    "pre_existing": "The same branch exists today in the frozen T1/keyboard005 adapter (timer-arm failure after registration). The child design adds no new false-return condition. It lengthens the window by placing child preparation inside it and adds child rollback to it. Frozen builds are not changed retroactively.",
+    "recommendation": "Adopt the T2-only parent RegisterService=false stage, so that one commit point really precedes publication of both parent and child.",
+    "requirements": [
+      "Active only under the closed triple (pdm1kbd=1 pdm1trackpadenum=1 pdm1trackpadchild=1). T1 and native-only builds and behaviour are unchanged.",
+      "Set the parent's 'RegisterService' to kOSBooleanFalse and verify it before super::start(provider). IOHIDDevice::start then installs its first-match notifier but skips registerService, so no interface nub, event driver or PDHID request exists before commit.",
+      "No false-return path calls registerService. These are base-start failure, child-start failure followed by a timer or verify failure, and any gated-verify failure. IOHIDDevice::stop removes the parent's notifier (L522-525) and startCandidate's detach then leaves no client.",
+      "Final commit: in one gated action verify no stop/fault, arm the 2 ms timer and set route/published state. Then, outside the gate: remove the parent's RegisterService property, call parent registerService(), then, only if the child committed, child registerService(). Each happens exactly once. Nothing fallible follows.",
+      "On the step-5 path (T2 preparation failed, keyboard usable) the parent still reaches this commit and registers once, and the T2 result stays failed. Every true return registers the parent exactly once and every false return registers nothing.",
+      "Order is parent before child, matching today's keyboard-first publication."
+    ],
+    "consequences": "Keyboard handleStart work (the T1 enumeration, the keyboard descriptor line, the persistent V1 record) is unchanged. Parent registration and the PDHID kind-1 request move a few milliseconds later, after the timer arm, inside the 60 s IORTC/BSD wait that already dominates. As today, poll can deliver device-1 reports before keyboard interfaces exist; IOHIDDevice then processes elements without an interface consumer. This run has no typing, so it is benign and of the same kind as now. My T5-T7 qualifiers' ordering checks still apply.",
+    "tests_to_add": "Count parent and child registerService calls on every injected path: zero before commit, zero on any false return, exactly one parent call on every true return (with or without the child), parent before child. Assert the RegisterService property is absent after commit. Assert the parent's first-match handler fires only after commit. Assert the T1-only build path never sets the property."
+  },
+  "L2_registry_gate_reconciliation": {
+    "severity": "required before implementation",
+    "finding": "DESIGN 'Registry readiness' requires interface 2 and the published descriptor bytes/hash to match the 110-byte record. The child's IOHIDDevice publishes 'ReportDescriptor' (IOHIDDevice.cpp:376). REGISTRY_GATE_DESIGN's MIG list covers only class, ID, parent iterator, is_valid and release, with no property read. Either add io_registry_entry_get_property_bytes (already in collector002's reviewed surface) with exact bounds, or drop those two checks from DESIGN's host readiness and rely on the kernel identity guard plus the separate T2 result property.",
+    "recommended": "Add the bounded property reads: child 'ReportDescriptor' exactly 110 bytes, compared byte-for-byte or by SHA-256 to the acquired descriptor, and a single settled numeric interface key equal to 2. Any other size, a missing key or a MIG error is exit 1. An absent child is still 77. G2-G4 are incorporated in c0179a20."
+  },
+  "L3_cohort_retention": {
+    "severity": "approve in principle, with these guards",
+    "conditions": [
+      "At commit, take one explicit extra retain on the parent and on the child, with no release path in this candidate. The CAS probe latch refuses later probes, so there is at most one cohort per boot. The parent's free() (and its disposeTransport) is then unreachable after commit; before commit it keeps today's behaviour.",
+      "Child willTerminate/handleStop clear the parent's sink only by expected-pointer comparison inside transportGate->runAction. The gate exists on every path that can reach that call: before commit, rollback stops the child before parent disposal; after commit the parent never disposes. Same-thread re-entry inside a poll dispatch is safe because the gate is recursive.",
+      "Parent stop after commit is reachable only abnormally (terminate() is refused and module stop fails). Make the TEARDOWN_DEFERRED decision in PDM1SPIHID::stop before super::stop, as DESIGN says, and never call disposeTransport while the child or any dispatch can still use the loop, gate or timer.",
+      "Mark the child stop-completed only after IOHIDDevice::stop returns. A duplicate stop must not repeat base cleanup. The child never closes SPI, stops the keyboard, detaches the parent or releases the parent's loop.",
+      "Report this retention as retention, never as reclamation, and keep refusing module unload."
+    ]
+  },
+  "confirmed": [
+    "C2: closed triple parsed as exact 1 before the CAS; no child for T1 or ordinary native packets.",
+    "F2: child allocation, attach, start and registration happen outside handleStart/startGated, after parent base start and before the timer arm.",
+    "F3/F4: child-start self-stop is not doubled; detach and release happen outside the gate; the sink is separate from the owned reference; no child survives a false return; a postcommit fault keeps the cohort and disables routing.",
+    "F5: device 2, flags 0x20, command 0x10, ID = payload[0], exact (02,8), (3f,17), (44,1752); everything else consumed and counted, nothing synthesized; copy before the next dlsp_push; 8-message budget unchanged.",
+    "F6: both report-operation overloads and raw user-client creation return Unsupported locally; no feature/output/haptic/dimension path; descriptor from an owned copy, and only after an exact identity match with the ENUM_OK record.",
+    "C1: two IOHIDDevice instances, parent registry ID, kind-2 line after BSD readiness, no node-only attribution; the T1 supervisor is unchanged."
+  ],
+  "notes": [
+    {"id": "N1", "text": "Report 0x44 (1752 bytes) is parsed by IOHIDDevice during child start, outside the gate. Its element count depends on the descriptor's usage layout. Record the actual element and interface allocation outcome in the T2 result rather than assuming it is small."},
+    {"id": "N2", "text": "A future T2 lifecycle qualifier must not reuse my T1 'keyboard descriptor before trackpad lines' expectation (the attempt-002 Q1 defect). Derive ordering checks from the implemented source."},
+    {"id": "N3", "text": "Pre-existing, from G5: the shipped keyboard_inventory.c iterates with the tiny IOIteratorNext. The new T2 gate must use the raw io_iterator_next status as designed."}
+  ],
+  "not_claimed": ["implementation safety (no code exists)", "runtime", "pointer input", "physical panel", "MT mode"],
+  "scope": "Read-only design and source review against the pinned trees and the parent adapter. No edits, builds, SSH or hardware."
+}

@@ -1,0 +1,1430 @@
+diff -ruN desk9-next-003/source/crates/wm-darwin/src/desktop_entry.rs desk10-next-001/source/crates/wm-darwin/src/desktop_entry.rs
+--- desk9-next-003/source/crates/wm-darwin/src/desktop_entry.rs	2026-11-15 15:44:44.806856814 -0800
++++ desk10-next-001/source/crates/wm-darwin/src/desktop_entry.rs	2026-11-15 21:51:59.638158930 -0800
+@@ -180,6 +180,8 @@
+     fn deliver_input(&mut self, ms: u32) {
+         use crate::hid::{Event, Motion, Source};
+         for stamped in self.input.take() {
++            // DESK10: the trackpad's scrolling is timed by when its records were read
++            self.server.event_at = Some(stamped.at);
+             if stamped.source == Source::InjectVirtual {
+                 if let Err(error) = self.server.virtual_event(stamped.event, ms) {
+                     eprintln!("WMINJECT virtual pointer: {error}");
+@@ -210,6 +212,7 @@
+                 self.server.note_input_refused(&error);
+             }
+         }
++        self.server.event_at = None;
+         if let Err(error) = self.server.flush_deferred_virtual(ms) {
+             eprintln!("WMINJECT virtual pointer: {error}");
+         }
+@@ -260,6 +263,7 @@
+         // use is said in the log and dropped (DESK4, after the 00:53Z drop of 15 November).
+         self.deliver_input(ms);
+         self.server.trackpad_swipes(ms);
++        self.server.scroll_tick(ms);
+         let scale = self.server.scale();
+         let changes = self.outputs.tick(crate::kms::read_hotplug_seq, || {
+             let libs = crate::gpu::Libraries::load()?;
+diff -ruN desk9-next-003/source/crates/wm-darwin/src/hid.rs desk10-next-001/source/crates/wm-darwin/src/hid.rs
+--- desk9-next-003/source/crates/wm-darwin/src/hid.rs	2026-11-15 15:30:49.507533406 -0800
++++ desk10-next-001/source/crates/wm-darwin/src/hid.rs	2026-11-15 21:54:49.641059136 -0800
+@@ -23,6 +23,23 @@
+     /// the client under the pointer through zwp_pointer_gestures_v1 (DESK6, for Firefox's and
+     /// AppKit's magnify/rotate). Not a SFHID pointer record either.
+     Pinch { phase:SwipePhase, fingers:u8, dx:i16, dy:i16, scale_q16:u32, rotation_cdeg:i32 },
++    /// DESK10: a wheel record of the built-in trackpad (device `TRACKPAD_DEVICE` of the pointer
++    /// queue): its two-finger scrolling as the driver gives it, wheel steps of the size the
++    /// kernel's boot arguments imply (`scroll.rs`), positive up as the HID wheel byte, with the
++    /// record's buttons. The desk makes finger scrolling of it (policy `trackpad_scroll`).
++    TouchWheel { steps:i8, buttons:u8 },
++    /// DESK10: finger scrolling the desk sends on its own time (a coarse step's travel handed out,
++    /// the lift after a pause), 1/256 logical units; not a device record.
++    FingerAxis { dy_q8:i32, stop:bool },
++}
++/// DESK10: the pointer queue's device index of the built-in trackpad (SFHIDAllocateMouseIndex: the
++/// trackpad child is the first pointing device of a boot); -1: none (its wheel stays a wheel).
++/// `CHONKSTEP_DARWIN_TRACKPAD_DEVICE=<n>` sets it.
++pub static TRACKPAD_DEVICE: std::sync::atomic::AtomicI16 = std::sync::atomic::AtomicI16::new(0);
++pub fn trackpad_device_from_env() {
++    if let Some(n) = std::env::var("CHONKSTEP_DARWIN_TRACKPAD_DEVICE").ok().and_then(|v| v.trim().parse::<i16>().ok()) {
++        TRACKPAD_DEVICE.store(n, std::sync::atomic::Ordering::Relaxed);
++    }
+ }
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+ pub enum SwipePhase { Begin, Update, End, Cancel }
+@@ -83,9 +100,18 @@
+         if bytes[5]&!7!=0 || bytes[9]&!1!=0 || (bytes[9]==0 && bytes[10..]!=[0,0]) {faults.push(Fault::Malformed{queue:Queue::Mouse});return;}
+         let motion=if bytes[9]==1 {Motion::Absolute(u16::from_le_bytes(bytes[6..8].try_into().unwrap()),u16::from_le_bytes(bytes[10..12].try_into().unwrap()))}
+             else {Motion::Relative(bytes[6] as i8,bytes[7] as i8)};
++        let before=self.mouse_buttons.get(&bytes[4]).copied();
+         self.mouse_buttons.insert(bytes[4],bytes[5]);
+         let buttons=self.mouse_buttons.values().fold(0,|all,mask|all|mask);
+-        out.push(Event::Pointer{motion,buttons,wheel:bytes[8] as i8});
++        let wheel=bytes[8] as i8;
++        // DESK10: the trackpad's wheel is its two-finger scrolling: a record of its own (the motion and
++        // buttons of the same record, if any, first, as the pointer record they are)
++        if wheel!=0 && i16::from(bytes[4])==TRACKPAD_DEVICE.load(std::sync::atomic::Ordering::Relaxed) {
++            if motion!=Motion::Relative(0,0) || before!=Some(bytes[5]) {out.push(Event::Pointer{motion,buttons,wheel:0});}
++            out.push(Event::TouchWheel{steps:wheel,buttons});
++            return;
++        }
++        out.push(Event::Pointer{motion,buttons,wheel});
+     }
+     /// Key releases for every key held, lowest usage first.
+     pub fn release_keys(&mut self,out:&mut Vec<Event>){
+@@ -206,6 +232,7 @@
+         Event::Key { .. } if !caps.keyboard => Err("keyboard event rejected; seat has no keyboard".into()),
+         Event::Pointer { .. } if !caps.pointer => Err("pointer event rejected; seat has no pointer".into()),
+         Event::Pointer { buttons, .. } if *buttons & !7 != 0 => Err("invalid decoded input event".into()),
++        Event::TouchWheel { .. } | Event::FingerAxis { .. } if !caps.pointer => Err("pointer event rejected; seat has no pointer".into()),
+         _ => Ok(()),
+     }
+ }
+@@ -809,7 +836,7 @@
+                     let started = std::time::Instant::now();
+                     hid.poll(&mut out);
+                     let now = std::time::Instant::now();
+-                    let mouse = out.iter().filter(|e| matches!(e, Event::Pointer { .. })).count();
++                    let mouse = out.iter().filter(|e| matches!(e, Event::Pointer { .. } | Event::TouchWheel { .. })).count();
+                     if let Ok(mut t) = thread_shared.timing.lock() {
+                         t.poll(planned.map_or(0, |p| started.saturating_duration_since(p).as_micros() as u64), mouse, now);
+                     }
+@@ -944,6 +971,28 @@
+         b[..4].copy_from_slice(&2u32.to_le_bytes());b[9]=0x80;assert!(d.mouse(&b).is_err());
+     }
+ 
++    // DESK10: the trackpad's wheel (device 0) is its two-finger scrolling, another device's a wheel
++    #[test]
++    fn the_trackpads_wheel_is_its_scrolling_and_another_devices_wheel_a_wheel() {
++        let mut d = Decoder::default();
++        let (mut out, mut faults) = (Vec::new(), Vec::new());
++        let rec = |seq: u32, device: u8, buttons: u8, dx: i8, wheel: i8| { let mut b = [0u8; 12]; b[..4].copy_from_slice(&seq.to_le_bytes()); b[4] = device; b[5] = buttons; b[6] = dx as u8; b[8] = wheel as u8; b };
++        d.mouse_into(&rec(1, 0, 0, 0, -2), &mut out, &mut faults);
++        d.mouse_into(&rec(2, 0, 0, 0, 1), &mut out, &mut faults);
++        d.mouse_into(&rec(3, 1, 0, 0, -1), &mut out, &mut faults);
++        d.mouse_into(&rec(4, 0, 0, 5, -1), &mut out, &mut faults);
++        assert!(faults.is_empty());
++        assert_eq!(out, vec![
++            // the first record of device 0 says its buttons (none) before the scroll
++            Event::Pointer { motion: Motion::Relative(0, 0), buttons: 0, wheel: 0 },
++            Event::TouchWheel { steps: -2, buttons: 0 },
++            Event::TouchWheel { steps: 1, buttons: 0 },
++            Event::Pointer { motion: Motion::Relative(0, 0), buttons: 0, wheel: -1 },
++            Event::Pointer { motion: Motion::Relative(5, 0), buttons: 0, wheel: 0 },
++            Event::TouchWheel { steps: -1, buttons: 0 },
++        ]);
++    }
++
+     // DESK4: what the owner's hands did at 00:53Z on 15 November (menus, a window closed) ended
+     // the desktop with "SFHID sequence discontinuity". Real input must never do that.
+     #[test]
+diff -ruN desk9-next-003/source/crates/wm-darwin/src/inject.rs desk10-next-001/source/crates/wm-darwin/src/inject.rs
+--- desk9-next-003/source/crates/wm-darwin/src/inject.rs	2026-11-15 15:42:30.637795552 -0800
++++ desk10-next-001/source/crates/wm-darwin/src/inject.rs	2026-11-15 21:59:17.245318402 -0800
+@@ -14,6 +14,15 @@
+ //! hwheel <n>                       a horizontal wheel step, -127..127 (positive: right)
+ //! scroll <dx> <dy>                 finger scrolling (axis source finger), logical units, -32768..32767
+ //!                                  (positive: down, right); `scroll stop` lifts the fingers
++//! touchwheel <n>                   a wheel record of the built-in trackpad (its two-finger scrolling as the
++//!                                  driver gives it: <n> steps of the running kernel's step size, positive up);
++//!                                  the desk makes finger scrolling of it (DESK10, scroll.rs)
++//! stream touchwheel <n> <count> <ms>
++//!                                  <count> such records, one every <ms>, from a thread (as the driver's reports)
++//! stream touchswipe <mm> <ms> <every> flat|ease
++//!                                  a two-finger swipe of <mm> millimetres in <ms> as the driver's records, one
++//!                                  every <every> ms, at a constant speed or rising and falling; positive <mm>
++//!                                  reads on (the content moves up)
+ //! swipe begin|update|end|cancel <fingers> <dx> <dy>
+ //!                                  a multi-finger swipe as a multitouch surface would report it
+ //!                                  (2..5 fingers, dx dy in panel pixels); synthetic like the rest
+@@ -220,6 +229,34 @@
+                         _ => None,
+                     }
+                 }
++                // DESK10: the built-in trackpad's two-finger scrolling as its driver gives it (wheel steps of
++                // the size the running kernel's boot arguments imply), on the request's seat
++                ["touchwheel", n] => n.parse::<i8>().ok().filter(|n| *n != 0).map(|steps| Step::Event(Event::TouchWheel { steps, buttons: self.buttons })),
++                ["stream", "touchwheel", n, count, every] => n.parse::<i8>().ok().filter(|n| *n != 0).zip(count.parse::<usize>().ok().filter(|c| (1..=20_000).contains(c))).zip(every.parse::<u64>().ok().filter(|e| (1..=100).contains(e))).map(|((steps, count), every)| {
++                    let buttons = self.buttons;
++                    Step::Stream { events: vec![Event::TouchWheel { steps, buttons }; count], every: Duration::from_millis(every) }
++                }),
++                // a two-finger swipe of <mm> millimetres in <ms>, a record every <every> ms (8: the driver's
++                // reports), the speed constant (`flat`, a drag that lifts while moving) or rising and falling
++                // (`ease`, half a sine: a drag that slows to a stop); positive <mm> reads on (the content
++                // moves up, the fingers up the trackpad with natural scrolling)
++                ["stream", "touchswipe", mm, ms, every, shape @ ("flat" | "ease")] => mm.parse::<f64>().ok().filter(|m| m.is_finite() && *m != 0.0 && m.abs() <= 1000.0)
++                    .zip(ms.parse::<u64>().ok().filter(|ms| (8..=10_000).contains(ms))).zip(every.parse::<u64>().ok().filter(|e| (1..=100).contains(e)))
++                    .map(|((mm, ms), every)| {
++                        let step = crate::scroll::KernelScroll::running().mm_per_step;
++                        let slots = (ms / every).max(1);
++                        let travel = |f: f64| if *shape == "flat" { f } else { (1.0 - (std::f64::consts::PI * f).cos()) / 2.0 };
++                        let mut done = 0i64;
++                        let buttons = self.buttons;
++                        let events = (1..=slots).map(|i| {
++                            let total = (mm.abs() * travel(i as f64 / slots as f64) / step).floor() as i64;
++                            let n = (total - done).clamp(0, 127);
++                            done += n;
++                            // reading on with natural scrolling: the driver's wheel goes down (negative)
++                            Event::TouchWheel { steps: if mm > 0.0 { -(n as i8) } else { n as i8 }, buttons }
++                        }).collect::<Vec<_>>();
++                        Step::Stream { events, every: Duration::from_millis(every) }
++                    }),
+                 ["stall", ms] => ms.parse::<u64>().ok().filter(|ms| *ms <= 5_000).map(|ms| Step::Stall(Duration::from_millis(ms))),
+                 ["fail"] => Some(Step::Fail),
+                 ["stats"] => Some(Step::Stats),
+@@ -518,6 +555,8 @@
+                 eprintln!("{}", server.latency.flush_line(&server.pacer));
+                 eprintln!("WMPACE {} cursor_on_plane={}", server.pacer.take_leads(), server.wm.backend().cursor_on_plane);
+                 eprintln!("WMPOLICY now {}", server.policy.now.text());
++                let k = server.touch_scroll.kernel;
++                eprintln!("WMSCROLL stats gestures={} finger_frames_dropped={} step_mm={:.3}({}) active={:?}", server.touch_scroll.gestures, server.finger_dropped, k.mm_per_step, k.source, server.touch_scroll.active());
+                 eprintln!("{} | {}", server.loop_probe.take_line(), self.injector.as_ref().map_or_else(|| "no input thread".into(), |i| i.timing_line()));
+                 if let Some(line) = server.renderer_pointer_thread_line() {
+                     eprintln!("{line}");
+diff -ruN desk9-next-003/source/crates/wm-darwin/src/input.rs desk10-next-001/source/crates/wm-darwin/src/input.rs
+--- desk9-next-003/source/crates/wm-darwin/src/input.rs	2026-11-15 16:29:55.845789274 -0800
++++ desk10-next-001/source/crates/wm-darwin/src/input.rs	2026-11-15 21:53:31.084129040 -0800
+@@ -2,7 +2,7 @@
+ use std::collections::HashSet;
+ use smithay::{input::{Seat,keyboard::{KeyboardHandle,FilterResult,ModifiersState,XkbConfig},
+     pointer::{PointerHandle,MotionEvent,ButtonEvent,AxisFrame,CursorImageStatus,CursorImageSurfaceData}},
+-    backend::input::{KeyState,ButtonState,Axis,AxisSource},utils::SERIAL_COUNTER,
++    backend::input::{KeyState,ButtonState,Axis,AxisSource,AxisRelativeDirection},utils::SERIAL_COUNTER,
+     reexports::wayland_server::{DisplayHandle,protocol::{wl_surface::WlSurface,wl_output,wl_seat::WlSeat}},
+     wayland::compositor::{with_states,SurfaceAttributes,BufferAssignment}};
+ use wm_core::{Backend,BackendEvent,SurfaceRef,Point,MouseButton,Modifiers,KeyCombo};
+@@ -158,6 +158,12 @@
+     pub fn enable_sfhid_seat_caps(&mut self,dh:&DisplayHandle,caps:SeatCaps)->Result<(),String>{
+         if self.input.is_some(){return Err("SFHID seat already enabled".into());}
+         if !caps.keyboard{return Err("SFHID seat requires keyboard capability".into());}
++        // DESK10: which pointing device is the trackpad, and the size of its driver's scroll steps
++        crate::hid::trackpad_device_from_env();
++        let k=self.touch_scroll.kernel;
++        eprintln!("WMSCROLL trackpad device={} step_mm={:.3} ({}) kernel_natural={} slow_gain_panel_px_per_mm={:.1}; policy {} scroll_speed={} natural_scroll={}",
++            crate::hid::TRACKPAD_DEVICE.load(std::sync::atomic::Ordering::Relaxed),k.mm_per_step,k.source,k.natural,crate::scroll::SLOW_GAIN,
++            if self.policy.now.trackpad_scroll {"trackpad_scroll=on (finger scrolling)"} else {"trackpad_scroll=off (wheel notches)"},self.policy.now.scroll_speed,self.policy.now.natural_scroll);
+         let mut seat=self.seats.new_wl_seat(dh,"siliconforest-hid");
+         let keyboard=seat.add_keyboard(XkbConfig{rules:"evdev",model:"pc105",layout:"us",variant:"",options:None},500,25)
+             .map_err(|e|format!("XKB keymap initialization failed: {e:?}"))?;
+@@ -335,6 +341,17 @@
+             }
+             Event::Pointer{motion,buttons,wheel}=>{
+                 let pointer=self.input.as_ref().unwrap().pointer.clone().ok_or("pointer event rejected; seat has no pointer")?;
++                // DESK10: the trackpad's pointer moving or a button: the two-finger scrolling of this seat
++                // ended (its lift goes to the surface it scrolled, before the motion)
++                if self.touch_scroll.active()==Some(virt) {
++                    let input=self.input.as_ref().unwrap();
++                    let why=if motion!=Motion::Relative(0,0) {Some(crate::scroll::End::Pointer)} else if buttons&7!=input.physical_buttons&7 {Some(crate::scroll::End::Button)} else {None};
++                    if let Some(why)=why {
++                        let ended=self.touch_scroll.end(why,std::time::Instant::now());
++                        self.flush_scroll_log();
++                        for out in ended {self.deliver_finger(out,time)?;}
++                    }
++                }
+                 let size=self.wm.backend().screen_size();
+                 // the owner's speed setting on the trackpad's relative motion (DESK7; not on the instrument's)
+                 let speed=if virt{1.0}else{self.pointer_speed.factor()};
+@@ -404,7 +421,7 @@
+                             let forwarded=&mut self.input.as_mut().unwrap().forwarded;
+                             if pressed{*forwarded|=mask;}else{*forwarded&=!mask;}
+                         }
+-                        if wheel!=0 {pointer.axis(self,AxisFrame::new(time).source(AxisSource::Wheel).value(Axis::Vertical,-f64::from(wheel)*10.).v120(Axis::Vertical,-i32::from(wheel)*120));}
++                        self.send_wheel(&pointer,wheel,time);
+                         self.input.as_mut().unwrap().buttons=buttons;
+                         pointer.frame(self);
+                         return Ok(());
+@@ -439,7 +456,7 @@
+                         pointer.button(self,&ButtonEvent{serial:SERIAL_COUNTER.next_serial(),time,button:0x110+bit,state:if pressed{ButtonState::Pressed}else{ButtonState::Released}});
+                     }
+                     if buttons&7==0 {self.layer_grab=None;}
+-                    if wheel!=0 {pointer.axis(self,AxisFrame::new(time).source(AxisSource::Wheel).value(Axis::Vertical,-f64::from(wheel)*10.).v120(Axis::Vertical,-i32::from(wheel)*120));}
++                    self.send_wheel(&pointer,wheel,time);
+                     self.input.as_mut().unwrap().buttons=buttons;
+                     pointer.frame(self);
+                     return Ok(());
+@@ -501,7 +518,7 @@
+                     let (location,focus)=self.pointer_for_clients(x.clamp(0.,f64::from(size.w-1)),y.clamp(0.,f64::from(size.h-1)),under);
+                     self.pointer_motion_to(&pointer,focus,location,time);
+                 }
+-                if wheel!=0 && !self.wm.interactive_drag_active(){pointer.axis(self,AxisFrame::new(time).source(AxisSource::Wheel).value(Axis::Vertical,-f64::from(wheel)*10.).v120(Axis::Vertical,-i32::from(wheel)*120));}
++                if !self.wm.interactive_drag_active(){self.send_wheel(&pointer,wheel,time);}
+                 pointer.frame(self);
+             }
+             // Scrolling goes where the pointer is (the surface that has the pointer's focus).
+@@ -512,6 +529,46 @@
+                     pointer.frame(self);
+                 }
+             }
++            // DESK10: the built-in trackpad's two-finger scrolling (scroll.rs)
++            Event::TouchWheel{steps,buttons}=>{
++                if steps==0 {return Ok(());}
++                let p=self.policy.now;
++                if !p.trackpad_scroll {
++                    // as before DESK10: a wheel notch per driver step
++                    let ended=self.touch_scroll.end(crate::scroll::End::Off,std::time::Instant::now());
++                    self.flush_scroll_log();
++                    for out in ended {self.finger_later.push(out);}
++                    return self.deliver_hid(Event::Pointer{motion:Motion::Relative(0,0),buttons,wheel:steps},time);
++                }
++                // Control-Command with a two-finger scroll: between Spaces (gesture.rs), in the old step's units
++                let mods=self.input.as_ref().unwrap().modifiers;
++                if !quiet && mods==Modifiers::CONTROL|Modifiers::SUPER && !self.wm.interactive_drag_active() {
++                    self.touch_swipe_mm+=f64::from(steps)*self.touch_scroll.kernel.mm_per_step;
++                    let n=(self.touch_swipe_mm/crate::scroll::OLD_STEP_MM).trunc();
++                    if n!=0.0 {
++                        self.touch_swipe_mm-=n*crate::scroll::OLD_STEP_MM;
++                        self.wheel_swipe(n.clamp(-127.,127.) as i8,time);
++                    }
++                    return Ok(());
++                }
++                let at=self.event_at.unwrap_or_else(std::time::Instant::now);
++                let size=self.wm.backend().screen_size();
++                let gain=crate::scroll::logical_gain(f64::from(size.h),self.scale().factor());
++                let settings=crate::scroll::Settings{speed_percent:p.scroll_speed,natural:p.natural_scroll,trace:p.scroll_trace};
++                let device=if virt {None} else {u8::try_from(crate::hid::TRACKPAD_DEVICE.load(std::sync::atomic::Ordering::Relaxed)).ok()};
++                let outs=self.touch_scroll.record(steps,at,virt,device,gain,&settings);
++                self.flush_scroll_log();
++                for out in outs {self.deliver_finger(out,time)?;}
++            }
++            Event::FingerAxis{dy_q8,stop}=>{
++                // the pointer's delivery, which finds the surface under it as a wheel record's would, takes
++                // the finger frame where it would put a wheel notch
++                let buttons=self.input.as_ref().unwrap().physical_buttons&7;
++                self.finger_pending=Some((f64::from(dy_q8)/256.,stop));
++                let result=self.deliver_hid(Event::Pointer{motion:Motion::Relative(0,0),buttons,wheel:0},time);
++                if self.finger_pending.take().is_some(){self.finger_dropped+=1;}
++                return result;
++            }
+             Event::Scroll{dx,dy,stop}=>{
+                 let pointer=self.input.as_ref().unwrap().pointer.clone().ok_or("scroll event rejected; seat has no pointer")?;
+                 if !self.wm.interactive_drag_active(){
+@@ -787,7 +844,7 @@
+         let Some(input)=self.input.as_mut() else{return;};
+         match *event {
+             Event::Key{evdev,down}=>{if down{input.owner_keys.insert(evdev);}else{input.owner_keys.remove(&evdev);}}
+-            Event::Pointer{buttons,..}=>input.owner_buttons=buttons&7,
++            Event::Pointer{buttons,..}|Event::TouchWheel{buttons,..}=>input.owner_buttons=buttons&7,
+             _=>{}
+         }
+         let held:Vec<u32>=input.virt_keys.iter().copied().collect();
+@@ -907,6 +964,41 @@
+         self.input.as_mut().ok_or("no seat")?.key_target=Some(surface);
+         Ok(())
+     }
++    /// Where a pointer delivery would send a wheel notch (DESK10): the finger frame waiting
++    /// (`finger_pending`) or the notch.
++    fn send_wheel(&mut self,pointer:&PointerHandle<Server>,wheel:i8,time:u32){
++        if let Some((dy,stop))=self.finger_pending.take(){
++            let mut frame=AxisFrame::new(time).source(AxisSource::Finger);
++            if dy!=0. {
++                let direction=if self.policy.now.natural_scroll {AxisRelativeDirection::Inverted} else {AxisRelativeDirection::Identical};
++                frame=frame.value(Axis::Vertical,dy).relative_direction(Axis::Vertical,direction);
++            }
++            if stop {frame=frame.stop(Axis::Vertical);}
++            if dy!=0. || stop {pointer.axis(self,frame);}
++        }
++        if wheel!=0 {pointer.axis(self,AxisFrame::new(time).source(AxisSource::Wheel).value(Axis::Vertical,-f64::from(wheel)*10.).v120(Axis::Vertical,-i32::from(wheel)*120));}
++    }
++    /// One finger frame of the trackpad's scrolling, on its seat: at once when that is the seat being
++    /// delivered now, else at the loop's next turn (`scroll_tick`).
++    pub(crate) fn deliver_finger(&mut self,out:crate::scroll::Out,time:u32)->Result<(),String>{
++        let now_virtual=self.input.as_ref().is_some_and(|i|i.virtual_active);
++        if out.virt!=now_virtual {self.finger_later.push(out);return Ok(());}
++        self.deliver_hid(Event::FingerAxis{dy_q8:(out.dy*256.).round() as i32,stop:out.stop},time)
++    }
++    /// Every turn of the loop (DESK10): a coarse step's travel as it falls due, the lift after a pause.
++    pub fn scroll_tick(&mut self,time:u32){
++        let mut outs=std::mem::take(&mut self.finger_later);
++        outs.extend(self.touch_scroll.tick(std::time::Instant::now()));
++        self.flush_scroll_log();
++        for out in outs {
++            let event=Event::FingerAxis{dy_q8:(out.dy*256.).round() as i32,stop:out.stop};
++            let result=if out.virt {self.deliver_virtual(event,time)} else {self.deliver_hid(event,time)};
++            if let Err(error)=result {eprintln!("WMSCROLL finger frame not delivered: {error}");}
++        }
++    }
++    pub(crate) fn flush_scroll_log(&mut self){
++        for line in self.touch_scroll.log.drain(..) {eprintln!("{line}");}
++    }
+     /// The instrument's pointer while the owner is active: to the client surface under it only (a
+     /// client's popup, a layer surface such as the dock, a window's surface); no desk binding, no window
+     /// raised or focused, no frame, menu or switcher of the desk, no popup of the owner's dismissed.
+@@ -938,7 +1030,7 @@
+                 self.input.as_mut().unwrap().key_target=surface;
+             }
+         }
+-        if wheel!=0 {pointer.axis(self,AxisFrame::new(time).source(AxisSource::Wheel).value(Axis::Vertical,-f64::from(wheel)*10.).v120(Axis::Vertical,-i32::from(wheel)*120));}
++        self.send_wheel(&pointer,wheel,time);
+         self.input.as_mut().unwrap().buttons=buttons;
+         pointer.frame(self);
+         Ok(())
+diff -ruN desk9-next-003/source/crates/wm-darwin/src/layers.rs desk10-next-001/source/crates/wm-darwin/src/layers.rs
+--- desk9-next-003/source/crates/wm-darwin/src/layers.rs	2026-11-15 15:30:49.508533390 -0800
++++ desk10-next-001/source/crates/wm-darwin/src/layers.rs	2026-11-15 21:56:18.755381646 -0800
+@@ -235,7 +235,7 @@
+         self.layers[index].above = above;
+         match buffer {
+             Some(BufferAssignment::NewBuffer(buffer)) => {
+-                let copied = self.import_shm(&buffer);
++                let copied = self.import_cpu_picture(&buffer);
+                 buffer.release();
+                 let image = match copied {
+                     Ok(image) => image,
+diff -ruN desk9-next-003/source/crates/wm-darwin/src/lib.rs desk10-next-001/source/crates/wm-darwin/src/lib.rs
+--- desk9-next-003/source/crates/wm-darwin/src/lib.rs	2026-11-15 16:01:27.435635778 -0800
++++ desk10-next-001/source/crates/wm-darwin/src/lib.rs	2026-11-15 21:49:52.609455408 -0800
+@@ -65,6 +65,7 @@
+ pub mod render;
+ pub mod scale;
+ pub mod scene;
++pub mod scroll;
+ pub mod server;
+ #[cfg(feature = "desktop-shell")]
+ pub mod session_entry;
+diff -ruN desk9-next-003/source/crates/wm-darwin/src/policy.rs desk10-next-001/source/crates/wm-darwin/src/policy.rs
+--- desk9-next-003/source/crates/wm-darwin/src/policy.rs	2026-11-15 20:46:49.790111977 -0800
++++ desk10-next-001/source/crates/wm-darwin/src/policy.rs	2026-11-15 21:49:52.609620923 -0800
+@@ -17,6 +17,10 @@
+ //! | `late_latch` | on | frames are made as late as they can be and still make their blank (DESK5's late latching); off: a frame is drawn as soon as something changed and the display is free, and committed at once (DESK9: Firefox's commits came 10-11 ms after a flip and waited a whole refresh more for the latched frame) |
+ //! | `restore_after_reboot` | off | DESK9: the first compositor of a boot opens again the applications the desk had opened that had windows when the machine went down (a reboot, a kernel install), as a Mac does after a restart (`session_restore.rs`) |
+ //! | `framehash` | off | DESK9: every committed buffer's content is hashed (sampled) to count distinct frames (`WMPACING ... content:`); a test's switch, it reads client memory |
++//! | `trackpad_scroll` | on | DESK10: the built-in trackpad's two-finger scrolling goes to clients as finger scrolling in points, accelerated, with `axis_stop` at the lift (`scroll.rs`); off: as wheel notches, one per driver step (before DESK10) |
++//! | `scroll_speed` | 100 | DESK10: the trackpad's scrolling speed in percent (25..400), as macOS's scrolling speed slider: a factor on the whole curve |
++//! | `natural_scroll` | on | DESK10: the content follows the fingers (macOS's default); off: the other way |
++//! | `scroll_trace` | off | DESK10: one `WMSCROLLRAW` line per trackpad scroll record (its steps, time, speed, what was sent): the owner's own scrolling as evidence |
+ use std::path::PathBuf;
+ use std::time::{Duration, Instant, SystemTime};
+ 
+@@ -33,10 +37,15 @@
+     pub framehash: bool,
+     pub late_latch: bool,
+     pub restore_after_reboot: bool,
++    pub trackpad_scroll: bool,
++    pub natural_scroll: bool,
++    pub scroll_trace: bool,
++    /// percent, 25..400 (not a switch: `scroll_speed=<n>`)
++    pub scroll_speed: u16,
+ }
+ 
+ impl Switches {
+-    const KEYS: [&'static str; 11] = ["fifo", "fifo_shm", "client_wake", "flip_time_callbacks", "flip_stamps", "restore", "skip_unchanged", "partial_repaint", "framehash", "late_latch", "restore_after_reboot"];
++    const KEYS: [&'static str; 14] = ["fifo", "fifo_shm", "client_wake", "flip_time_callbacks", "flip_stamps", "restore", "skip_unchanged", "partial_repaint", "framehash", "late_latch", "restore_after_reboot", "trackpad_scroll", "natural_scroll", "scroll_trace"];
+     fn defaults() -> Self {
+         let env = |key: &str| std::env::var(format!("CHONKSTEP_DARWIN_{}", key.to_ascii_uppercase())).ok().and_then(|v| parse_bool(&v));
+         Self {
+@@ -51,6 +60,10 @@
+             framehash: env("framehash").unwrap_or(false),
+             late_latch: env("late_latch").unwrap_or(true),
+             restore_after_reboot: env("restore_after_reboot").unwrap_or(false),
++            trackpad_scroll: env("trackpad_scroll").unwrap_or(true),
++            natural_scroll: env("natural_scroll").unwrap_or(true),
++            scroll_trace: env("scroll_trace").unwrap_or(false),
++            scroll_speed: std::env::var("CHONKSTEP_DARWIN_SCROLL_SPEED").ok().and_then(|v| parse_speed(&v)).unwrap_or(100),
+         }
+     }
+     fn slot(&mut self, key: &str) -> Option<&mut bool> {
+@@ -66,6 +79,9 @@
+             "framehash" => &mut self.framehash,
+             "late_latch" => &mut self.late_latch,
+             "restore_after_reboot" => &mut self.restore_after_reboot,
++            "trackpad_scroll" => &mut self.trackpad_scroll,
++            "natural_scroll" => &mut self.natural_scroll,
++            "scroll_trace" => &mut self.scroll_trace,
+             _ => return None,
+         })
+     }
+@@ -86,6 +102,13 @@
+                 refused.push(line.to_string());
+                 continue;
+             };
++            if key.trim() == "scroll_speed" {
++                match parse_speed(value) {
++                    Some(v) => out.scroll_speed = v,
++                    None => refused.push(line.to_string()),
++                }
++                continue;
++            }
+             match (out.slot(key.trim()), parse_bool(value)) {
+                 (Some(slot), Some(v)) => *slot = v,
+                 _ => refused.push(line.to_string()),
+@@ -94,10 +117,17 @@
+         (out, refused)
+     }
+     pub fn text(&self) -> String {
+-        Self::KEYS.iter().map(|k| format!("{k}={}", if self.get(k) { "on" } else { "off" })).collect::<Vec<_>>().join(" ")
++        let mut text = Self::KEYS.iter().map(|k| format!("{k}={}", if self.get(k) { "on" } else { "off" })).collect::<Vec<_>>().join(" ");
++        text.push_str(&format!(" scroll_speed={}", self.scroll_speed));
++        text
+     }
+ }
+ 
++/// `scroll_speed`: a percentage, 25..400 (DESK10).
++fn parse_speed(v: &str) -> Option<u16> {
++    v.trim().trim_end_matches('%').parse::<u16>().ok().filter(|v| (25..=400).contains(v))
++}
++
+ fn parse_bool(v: &str) -> Option<bool> {
+     match v.trim().to_ascii_lowercase().as_str() {
+         "1" | "on" | "yes" | "true" => Some(true),
+@@ -163,7 +193,7 @@
+     pub fn pin(&mut self, text: &str) -> Result<String, String> {
+         let (next, refused) = Switches::parse(text, self.pinned.unwrap_or(self.now));
+         if !refused.is_empty() {
+-            return Err(format!("not understood: {refused:?} (keys: {})", Switches::KEYS.join(", ")));
++            return Err(format!("not understood: {refused:?} (keys: {}, scroll_speed=25..400)", Switches::KEYS.join(", ")));
+         }
+         self.pinned = Some(next);
+         self.now = next;
+@@ -187,7 +217,14 @@
+     use super::*;
+     #[test]
+     fn the_policy_file_changes_switches_without_a_relaunch_and_a_test_pin_wins_until_released() {
+-        let base = Switches { fifo: true, fifo_shm: true, client_wake: true, flip_time_callbacks: true, flip_stamps: true, restore: true, skip_unchanged: true, partial_repaint: true, framehash: false, late_latch: true, restore_after_reboot: false };
++        let base = Switches { fifo: true, fifo_shm: true, client_wake: true, flip_time_callbacks: true, flip_stamps: true, restore: true, skip_unchanged: true, partial_repaint: true, framehash: false, late_latch: true, restore_after_reboot: false, trackpad_scroll: true, natural_scroll: true, scroll_trace: false, scroll_speed: 100 };
++        // DESK10: the trackpad's scrolling speed is a number, the rest switches
++        let (sp, refused) = Switches::parse("scroll_speed=140\nscroll_trace=on\ntrackpad_scroll=off\n", base);
++        assert!(refused.is_empty() && sp.scroll_speed == 140 && sp.scroll_trace && !sp.trackpad_scroll && sp.natural_scroll);
++        let (sp, refused) = Switches::parse("scroll_speed=1000\nscroll_speed=fast\n", base);
++        assert_eq!(sp.scroll_speed, 100);
++        assert_eq!(refused.len(), 2);
++        assert!(sp.text().ends_with("scroll_trace=off scroll_speed=100"));
+         let (s, refused) = Switches::parse("# comment\nfifo=off\nrestore = 0\nbogus=1\nclient_wake=maybe\n", base);
+         assert!(!s.fifo && !s.restore && s.client_wake && s.flip_time_callbacks);
+         assert_eq!(refused, vec!["bogus=1".to_string(), "client_wake=maybe".to_string()]);
+diff -ruN desk9-next-003/source/crates/wm-darwin/src/popups.rs desk10-next-001/source/crates/wm-darwin/src/popups.rs
+--- desk9-next-003/source/crates/wm-darwin/src/popups.rs	2026-11-15 15:30:49.508533390 -0800
++++ desk10-next-001/source/crates/wm-darwin/src/popups.rs	2026-11-15 21:56:18.755871956 -0800
+@@ -172,7 +172,9 @@
+         self.cursor_callbacks.extend(callbacks);
+         match buffer {
+             Some(BufferAssignment::NewBuffer(buffer)) => {
+-                let copied = self.import_shm(&buffer);
++                // DESK10 (FX-022): shared memory or a dma-buf, as on a toplevel (Firefox's menu panel is a
++                // popup with GPU layers: its dma-bufs were refused, "SHM access failed: NotManaged")
++                let copied = self.import_cpu_picture(&buffer);
+                 buffer.release();
+                 let image = match copied {
+                     Ok(image) => image,
+diff -ruN desk9-next-003/source/crates/wm-darwin/src/power.rs desk10-next-001/source/crates/wm-darwin/src/power.rs
+--- desk9-next-003/source/crates/wm-darwin/src/power.rs	2026-11-15 15:30:49.508533390 -0800
++++ desk10-next-001/source/crates/wm-darwin/src/power.rs	2026-11-15 21:49:30.149432721 -0800
+@@ -255,7 +255,9 @@
+                 }
+                 Filtered::Pass
+             }
+-            Event::HWheel(_) | Event::Scroll { .. } | Event::Swipe { .. } | Event::Pinch { .. } => {
++            // the desk's own finger scrolling (DESK10) is never a wake: its record was
++            Event::FingerAxis { .. } => Filtered::Pass,
++            Event::HWheel(_) | Event::Scroll { .. } | Event::Swipe { .. } | Event::Pinch { .. } | Event::TouchWheel { .. } => {
+                 if self.off {
+                     self.wake_requested = true;
+                     self.counts.swallowed += 1;
+diff -ruN desk9-next-003/source/crates/wm-darwin/src/scene.rs desk10-next-001/source/crates/wm-darwin/src/scene.rs
+--- desk9-next-003/source/crates/wm-darwin/src/scene.rs	2026-11-15 18:19:33.112100512 -0800
++++ desk10-next-001/source/crates/wm-darwin/src/scene.rs	2026-11-15 21:56:41.164651083 -0800
+@@ -1159,7 +1159,9 @@
+                     s.states.unset(xdg_toplevel::State::Activated);
+                 }
+             });
+-            if !self.hold_configures {
++            // DESK10: not a role between an unmap and its initial commit again (its configure comes
++            // then, with this state): a configure sent while it unmaps cannot be relied on by its client
++            if !self.hold_configures && w.surface.is_initial_configure_sent() {
+                 w.surface.send_pending_configure();
+             }
+         }
+diff -ruN desk9-next-003/source/crates/wm-darwin/src/scroll.rs desk10-next-001/source/crates/wm-darwin/src/scroll.rs
+--- desk9-next-003/source/crates/wm-darwin/src/scroll.rs	1969-12-31 16:00:00.000000000 -0800
++++ desk10-next-001/source/crates/wm-darwin/src/scroll.rs	2026-11-15 21:55:34.694228978 -0800
+@@ -0,0 +1,476 @@
++//! DESK10: the built-in trackpad's two-finger scrolling as a Mac's, not as wheel steps.
++//!
++//! The owner (16 November): "I have to scroll a lot just to make the page move". The trackpad driver
++//! (`m1-trackpad-child/multitouch/m1tp_mt.c`, libinput's two-finger scroll with Omarchy's scroll factor
++//! 0.4) gives one wheel step for every 3.57 mm of two-finger travel, vertical only, with no lift-off
++//! record. Before DESK10 each step went to clients as one wheel notch (`AxisSource::Wheel`, 10 units,
++//! v120 120): AppKit made one line of it, Firefox moved 19 points for 3.57 mm of finger travel.
++//!
++//! On macOS a trackpad scrolls in points, as a gesture (began, changed, ended), and goes on by itself
++//! after the fingers lift (momentum, made by the system from the speed at the lift). At slow speed the
++//! content moves with the fingers in screen terms; faster swipes are accelerated. Here the desk turns
++//! the trackpad's steps into finger scrolling (`AxisSource::Finger`, no v120): every record's travel in
++//! logical pixels (the client's points), on this curve:
++//!
++//! - `SLOW_GAIN`: at slow speed one trackpad height of finger travel moves the content one screen height
++//!   (78.4 mm against the panel's 1600 pixels: 20.4 panel pixels a millimetre, 13.6 points at the
++//!   owner's 150 %), which is also what the pointer moves at slow speed (DESK7: 21 px/mm);
++//! - `accel`: flat (1.0) up to 50 mm/s, 1.6 at 150 mm/s, 2.6 at 300 mm/s, 3.5 from 600 mm/s on;
++//! - times the owner's scroll speed (policy `scroll_speed`, percent, 25..400, default 100);
++//! - natural direction (content follows the fingers, macOS's default; policy `natural_scroll`);
++//! - `axis_stop` when the fingers are taken as lifted: the driver has no lift record, so after a pause of
++//!   2.5 times the time the next step would have taken at the speed the fingers had (40..300 ms), or at
++//!   once when the trackpad's pointer moves, a button goes down, or another seat scrolls;
++//! - with the driver's coarse steps (1 mm or more) each step's travel is handed out over the next
++//!   16..48 ms (the time the step took), so a slow drag glides instead of jumping 49 points a step.
++//!
++//! The client makes the phases and the momentum (libWindowServer, TERM10: requests-for-TERM5.md
++//! "From DESK10"), as every Wayland client does its own kinetic scrolling after `axis_stop`.
++//! A mouse wheel (any other device of the pointer queue) stays a wheel.
++use std::time::{Duration, Instant};
++
++/// The trackpad's height in millimetres (m1tp_mt.h: Y -164..7439 at 97 units/mm).
++pub const TRACKPAD_HEIGHT_MM: f64 = 7603.0 / 97.0;
++/// Panel pixels per millimetre of finger travel at slow speed (one trackpad height = one screen height
++/// of the 1600-pixel panel); `logical_gain` turns it into the client's units for a screen and scale.
++pub const SLOW_GAIN: f64 = 1600.0 / TRACKPAD_HEIGHT_MM;
++/// The step size the old desk's Spaces stand-in (Control-Command + two-finger scroll) counts in.
++pub const OLD_STEP_MM: f64 = 3.566;
++
++/// What the driver does with two-finger travel, from the kernel's boot arguments (m1tp_mt.c
++/// `m1tp_mt_init`, SFM1SPIHIDMultitouch.inc): millimetres of travel per wheel step and whether it
++/// already inverted the direction (natural scrolling).
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct KernelScroll {
++    pub mm_per_step: f64,
++    pub natural: bool,
++    /// `default` or the boot argument that set the step (`sfm1tpscroll`, `sfm1tpscrollfactor`).
++    pub source: &'static str,
++}
++
++impl KernelScroll {
++    /// The driver's own integer arithmetic: libinput's touchpad scroll (1000-dpi normalisation, baseline
++    /// 0.9, TP_MAGIC_SLOWDOWN 0.2968 = 26712/100000) times the scroll factor, 15 units a step; or
++    /// `sfm1tpscroll=N` contact units a step.
++    pub fn from_bootargs(args: &str) -> Self {
++        let arg = |name: &str| -> Option<i64> {
++            args.split_whitespace().find_map(|w| w.strip_prefix(name).and_then(|r| r.strip_prefix('='))).and_then(|v| v.parse::<i64>().ok())
++        };
++        let res_y = arg("sfm1tpresy").filter(|v| *v > 0 && *v < 1000).unwrap_or(97);
++        let step_px: i64 = 15;
++        let natural = arg("sfm1tpnatural").map_or(true, |v| v == 1);
++        if let Some(units) = arg("sfm1tpscroll").filter(|v| *v > 0).map(|v| v.min(100_000)) {
++            let per_unit = (step_px << 16) / units;
++            let units_per_step = (step_px << 16) as f64 / per_unit.max(1) as f64;
++            return Self { mm_per_step: units_per_step / res_y as f64, natural, source: "sfm1tpscroll" };
++        }
++        let factor = arg("sfm1tpscrollfactor").filter(|v| *v > 0).map_or(400, |v| v.min(100_000));
++        let per_unit = ((10_000i64 << 16) / (254 * res_y)) * 26_712 / 100_000 * factor / 1000;
++        let units_per_step = (step_px << 16) as f64 / per_unit.max(1) as f64;
++        Self { mm_per_step: units_per_step / res_y as f64, natural, source: if arg("sfm1tpscrollfactor").is_some() { "sfm1tpscrollfactor" } else { "default" } }
++    }
++    /// This kernel's (`sysctl kern.bootargs`), read once.
++    pub fn running() -> Self {
++        static RUNNING: std::sync::OnceLock<KernelScroll> = std::sync::OnceLock::new();
++        *RUNNING.get_or_init(|| Self::from_bootargs(&bootargs().unwrap_or_default()))
++    }
++    /// Steps of 1 mm or more are handed out over time (see the module's notes).
++    pub fn coarse(&self) -> bool {
++        self.mm_per_step >= 1.0
++    }
++}
++
++#[cfg(target_os = "macos")]
++fn bootargs() -> Option<String> {
++    let name = std::ffi::CString::new("kern.bootargs").ok()?;
++    let mut len: libc::size_t = 0;
++    if unsafe { libc::sysctlbyname(name.as_ptr(), std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0) } != 0 || len == 0 {
++        return None;
++    }
++    let mut buf = vec![0u8; len];
++    if unsafe { libc::sysctlbyname(name.as_ptr(), buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) } != 0 {
++        return None;
++    }
++    buf.truncate(len);
++    Some(String::from_utf8_lossy(&buf).trim_end_matches('\0').to_string())
++}
++#[cfg(not(target_os = "macos"))]
++fn bootargs() -> Option<String> {
++    None
++}
++
++/// The acceleration of scrolling with the fingers' speed (mm/s): flat while slow, so a slow drag
++/// tracks the fingers; piecewise linear through (50, 1.0), (150, 1.6), (300, 2.6), (600, 3.5).
++pub fn accel(mm_per_s: f64) -> f64 {
++    const POINTS: [(f64, f64); 4] = [(50.0, 1.0), (150.0, 1.6), (300.0, 2.6), (600.0, 3.5)];
++    let v = if mm_per_s.is_finite() { mm_per_s.max(0.0) } else { 0.0 };
++    if v <= POINTS[0].0 {
++        return POINTS[0].1;
++    }
++    for pair in POINTS.windows(2) {
++        let ((v0, f0), (v1, f1)) = (pair[0], pair[1]);
++        if v <= v1 {
++            return f0 + (f1 - f0) * (v - v0) / (v1 - v0);
++        }
++    }
++    POINTS[3].1
++}
++
++/// Logical pixels (the client's points) per millimetre at slow speed, for a screen `height` panel
++/// pixels tall shown at `scale` (1.5 at 150 %).
++pub fn logical_gain(screen_height_px: f64, scale: f64) -> f64 {
++    let panel = if screen_height_px > 0.0 { screen_height_px / TRACKPAD_HEIGHT_MM } else { SLOW_GAIN };
++    panel / if scale > 0.0 { scale } else { 1.0 }
++}
++
++/// The owner's settings, from the policy file.
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct Settings {
++    pub speed_percent: u16,
++    pub natural: bool,
++    pub trace: bool,
++}
++impl Default for Settings {
++    fn default() -> Self {
++        Self { speed_percent: 100, natural: true, trace: false }
++    }
++}
++
++/// One thing to send: finger travel on the vertical axis in logical units (wl_pointer.axis: positive
++/// scrolls down, i.e. moves the content up), and whether the fingers lifted with it (`axis_stop`).
++#[derive(Clone, Copy, Debug, PartialEq)]
++pub struct Out {
++    pub dy: f64,
++    pub stop: bool,
++    /// The test instrument's pointer (`seat virtual`) rather than the owner's.
++    pub virt: bool,
++}
++
++/// Why a gesture ended (the `WMSCROLL` line).
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum End {
++    Pause,
++    Pointer,
++    Button,
++    OtherSeat,
++    Off,
++}
++impl End {
++    fn name(self) -> &'static str {
++        match self {
++            End::Pause => "pause",
++            End::Pointer => "pointer-moved",
++            End::Button => "button",
++            End::OtherSeat => "other-seat",
++            End::Off => "policy-off",
++        }
++    }
++}
++
++struct Gesture {
++    virt: bool,
++    device: Option<u8>,
++    start: Instant,
++    last: Instant,
++    /// smoothed finger speed, mm/s
++    speed: f64,
++    /// travel not handed out yet (logical units, signed) and how fast it goes out (units per ms)
++    pending: f64,
++    rate: f64,
++    emitted_at: Instant,
++    deadline: Instant,
++    records: u32,
++    steps: i64,
++    mm: f64,
++    sent: f64,
++    frames: u32,
++    peak: f64,
++    factor_sum: f64,
++}
++
++/// The trackpad's scrolling, record by record (`record`), and in time (`tick`: handing out a coarse
++/// step's travel, the lift after a pause).
++pub struct TouchScroll {
++    pub kernel: KernelScroll,
++    gesture: Option<Gesture>,
++    /// gestures ended, for `stats`
++    pub gestures: u64,
++    /// Lines for the log (`WMSCROLL`, and `WMSCROLLRAW` per record with `scroll_trace`), taken by the server.
++    pub log: Vec<String>,
++}
++
++impl TouchScroll {
++    pub fn new(kernel: KernelScroll) -> Self {
++        Self { kernel, gesture: None, gestures: 0, log: Vec::new() }
++    }
++    pub fn active(&self) -> Option<bool> {
++        self.gesture.as_ref().map(|g| g.virt)
++    }
++
++    /// A wheel record of the trackpad: `steps` as the driver counts them (positive: the HID wheel's up),
++    /// read at `at`; `gain` logical units per millimetre at slow speed.
++    pub fn record(&mut self, steps: i8, at: Instant, virt: bool, device: Option<u8>, gain: f64, s: &Settings) -> Vec<Out> {
++        let mut out = Vec::new();
++        if steps == 0 {
++            return out;
++        }
++        if self.gesture.as_ref().is_some_and(|g| g.virt != virt) {
++            out.extend(self.end(End::OtherSeat, at));
++        }
++        // what is due from the step before goes out first
++        out.extend(self.hand_out(at));
++        let mm_step = self.kernel.mm_per_step;
++        let mm = f64::from(steps) * mm_step;
++        let (dt, first) = match &self.gesture {
++            Some(g) => (at.saturating_duration_since(g.last), false),
++            None => (Duration::ZERO, true),
++        };
++        // the speed this record shows: its travel over the time since the record before (at least 4 ms:
++        // records come every 8 ms and are read within 1); a gesture's first record counts as slow unless
++        // it brings several steps at once (its travel over one report, 8.3 ms)
++        let secs = dt.as_secs_f64().clamp(0.004, 0.2);
++        let instant = if !first { mm.abs() / secs } else if steps.unsigned_abs() > 1 { mm.abs() / 0.0083 } else { 25.0 };
++        let g = self.gesture.get_or_insert_with(|| Gesture {
++            virt, device, start: at, last: at, speed: instant, pending: 0.0, rate: 0.0, emitted_at: at, deadline: at,
++            records: 0, steps: 0, mm: 0.0, sent: 0.0, frames: 0, peak: 0.0, factor_sum: 0.0,
++        });
++        g.speed = if first { instant } else { 0.5 * g.speed + 0.5 * instant };
++        g.peak = g.peak.max(g.speed);
++        let factor = accel(g.speed);
++        // the kernel already inverted the direction when its natural scrolling is on
++        let direction = if s.natural == self.kernel.natural { 1.0 } else { -1.0 };
++        let speed = f64::from(s.speed_percent.clamp(25, 400)) / 100.0;
++        // a wheel step up (positive) scrolls up: wl_pointer's value is negative
++        let units = -mm * gain * factor * speed * direction;
++        g.records += 1;
++        g.steps += i64::from(steps);
++        g.mm += mm.abs();
++        g.factor_sum += factor;
++        g.last = at;
++        // the fingers are taken as lifted after 2.5 times the time the next step would take at this
++        // speed, plus a refresh (40..300 ms); with fine steps at least a record interval (8 ms)
++        let next = (mm_step / g.speed.max(1.0)).max(if self.kernel.coarse() { 0.0 } else { 0.0083 });
++        g.deadline = at + Duration::from_secs_f64((2.5 * next + 0.016).clamp(0.040, 0.300));
++        if s.trace {
++            self.log.push(format!(
++                "WMSCROLLRAW seat={} device={} t_ms={:.1} dt_ms={:.1} steps={steps} mm={:.2} speed_mm_s={:.0} factor={:.2} value={:.1}",
++                if virt { "virtual" } else { "owner" }, device.map_or("-".into(), |d| d.to_string()),
++                at.saturating_duration_since(g.start).as_secs_f64() * 1000.0, dt.as_secs_f64() * 1000.0, mm, g.speed, factor, units
++            ));
++        }
++        if self.kernel.coarse() {
++            // a coarse step glides over the time it took (16..48 ms; a first step over 32)
++            let spread = if first { 0.032 } else { dt.as_secs_f64().clamp(0.016, 0.048) };
++            g.pending += units;
++            g.rate = g.pending.abs() / (spread * 1000.0);
++            g.emitted_at = at;
++            // the first part at once: the content starts moving with the record
++            out.extend(self.hand_out_part(at, 0.25));
++        } else {
++            g.sent += units;
++            g.frames += 1;
++            out.push(Out { dy: units, stop: false, virt });
++        }
++        out
++    }
++
++    /// Hands out a quarter (`share`) of what a coarse step left, now.
++    fn hand_out_part(&mut self, now: Instant, share: f64) -> Vec<Out> {
++        let Some(g) = self.gesture.as_mut() else { return Vec::new() };
++        let part = g.pending * share;
++        if part == 0.0 {
++            return Vec::new();
++        }
++        g.pending -= part;
++        g.sent += part;
++        g.frames += 1;
++        g.emitted_at = now;
++        vec![Out { dy: part, stop: false, virt: g.virt }]
++    }
++
++    /// What a coarse step left that is due by `now`.
++    fn hand_out(&mut self, now: Instant) -> Vec<Out> {
++        let Some(g) = self.gesture.as_mut() else { return Vec::new() };
++        if g.pending == 0.0 {
++            return Vec::new();
++        }
++        let ms = now.saturating_duration_since(g.emitted_at).as_secs_f64() * 1000.0;
++        // at most one hand-out every 7 ms (two a refresh): the client draws once a refresh anyway
++        if ms < 7.0 && g.pending.abs() > 1e-6 && now < g.deadline {
++            return Vec::new();
++        }
++        let amount = (g.rate * ms).min(g.pending.abs());
++        if amount <= 0.0 {
++            return Vec::new();
++        }
++        let part = amount.copysign(g.pending);
++        g.pending -= part;
++        if g.pending.abs() < 1e-6 {
++            g.pending = 0.0;
++        }
++        g.sent += part;
++        g.frames += 1;
++        g.emitted_at = now;
++        vec![Out { dy: part, stop: false, virt: g.virt }]
++    }
++
++    /// Every turn of the desktop's loop: the travel that is due, and the lift once the pause is over.
++    pub fn tick(&mut self, now: Instant) -> Vec<Out> {
++        let mut out = self.hand_out(now);
++        if self.gesture.as_ref().is_some_and(|g| now >= g.deadline) {
++            out.extend(self.end(End::Pause, now));
++        }
++        out
++    }
++
++    /// The gesture ends (at `now`): what it had not handed out goes with the lift.
++    pub fn end(&mut self, why: End, now: Instant) -> Vec<Out> {
++        let Some(g) = self.gesture.take() else { return Vec::new() };
++        self.gestures += 1;
++        let ms = g.last.saturating_duration_since(g.start).as_secs_f64() * 1000.0;
++        let sent = g.sent + g.pending;
++        self.log.push(format!(
++            "WMSCROLL gesture seat={} device={} records={} steps={} travel_mm={:.1} ms={:.0} speed_mm_s(mean,peak)=({:.0},{:.0}) factor_mean={:.2} units={:.0} units_per_mm={:.1} frames={} end={} lift_after_ms={:.0} step_mm={:.3}({})",
++            if g.virt { "virtual" } else { "owner" }, g.device.map_or("-".into(), |d| d.to_string()), g.records, g.steps, g.mm, ms,
++            if ms > 0.0 { g.mm / (ms / 1000.0) } else { 0.0 }, g.peak, g.factor_sum / f64::from(g.records.max(1)), sent.abs(),
++            if g.mm > 0.0 { sent.abs() / g.mm } else { 0.0 }, g.frames + 1, why.name(),
++            now.saturating_duration_since(g.last).as_secs_f64() * 1000.0, self.kernel.mm_per_step, self.kernel.source
++        ));
++        vec![Out { dy: g.pending, stop: true, virt: g.virt }]
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn the_drivers_step_from_its_boot_arguments() {
++        // the driver's default: 3.57 mm a step (the owner's "scroll a lot": 14 steps for 5 cm)
++        let d = KernelScroll::from_bootargs("-v debug=0x14e sfm1trackpadchild=1");
++        assert!((d.mm_per_step - 3.566).abs() < 0.01, "{d:?}");
++        assert!(d.natural && d.coarse() && d.source == "default");
++        let fine = KernelScroll::from_bootargs("sfm1tpscroll=20 sfm1tpnatural=2");
++        assert!((fine.mm_per_step - 20.0 / 97.0).abs() < 0.002, "{fine:?}");
++        assert!(!fine.natural && !fine.coarse());
++        let factor = KernelScroll::from_bootargs("sfm1tpscrollfactor=1000");
++        assert!((factor.mm_per_step - 3.566 * 0.4).abs() < 0.01, "{factor:?}");
++    }
++
++    #[test]
++    fn slow_drags_track_the_fingers_and_fast_ones_are_accelerated() {
++        assert_eq!(accel(10.0), 1.0);
++        assert_eq!(accel(50.0), 1.0);
++        assert!((accel(150.0) - 1.6).abs() < 1e-9);
++        assert!((accel(300.0) - 2.6).abs() < 1e-9);
++        assert_eq!(accel(5000.0), 3.5);
++        assert_eq!(accel(f64::NAN), 1.0);
++        // 150 %: 13.6 points a millimetre at slow speed
++        assert!((logical_gain(1600.0, 1.5) - 13.61).abs() < 0.02);
++    }
++
++    /// A swipe of `mm` millimetres at a constant speed, as the driver gives it: steps of its size, one
++    /// record every 8 ms (as many steps as the travel so far completes), the loop's turns every 8 ms.
++    fn swipe(kernel: KernelScroll, mm: f64, speed_mm_s: f64, s: Settings) -> (f64, Vec<Out>, TouchScroll) {
++        let mut t = TouchScroll::new(kernel);
++        let gain = logical_gain(1600.0, 1.5);
++        let start = Instant::now();
++        let mut outs = Vec::new();
++        let mut done_steps = 0i64;
++        let ms = (mm / speed_mm_s * 1000.0).ceil() as u64;
++        for k in 0..=(ms / 8 + 1) {
++            let at = start + Duration::from_millis(k * 8);
++            let travelled = (speed_mm_s * (k * 8) as f64 / 1000.0).min(mm);
++            let total = (travelled / kernel.mm_per_step).floor() as i64;
++            let n = (total - done_steps).clamp(0, 127);
++            done_steps += n;
++            // fingers moving towards the user with natural scrolling: the driver's wheel goes up
++            if n > 0 {
++                outs.extend(t.record(n as i8, at, false, Some(0), gain, &s));
++            }
++            outs.extend(t.tick(at));
++        }
++        // the loop goes on turning every 8 ms after the fingers stopped
++        for k in 1..=50 {
++            outs.extend(t.tick(start + Duration::from_millis((ms / 8 + 1) * 8 + k * 8)));
++        }
++        (outs.iter().map(|o| o.dy).sum(), outs, t)
++    }
++
++    #[test]
++    fn a_five_centimetre_swipe_scrolls_as_a_macs_does_and_ends_with_a_lift() {
++        let k = KernelScroll::from_bootargs("");
++        let s = Settings::default();
++        // slow (30 mm/s): one trackpad height per screen height: 5 cm = 680 points at 150 % (+- one step)
++        let (slow, outs, t) = swipe(k, 50.0, 30.0, s);
++        assert!((slow.abs() - 680.0).abs() < 50.0, "slow {slow}");
++        assert!(slow < 0.0, "natural: fingers towards the user move the content down (scroll up)");
++        assert_eq!(outs.iter().filter(|o| o.stop).count(), 1);
++        assert!(outs.last().unwrap().stop);
++        assert!(t.log.iter().any(|l| l.starts_with("WMSCROLL gesture") && l.contains("end=pause")));
++        // medium (150 mm/s) and fast (400 mm/s): accelerated
++        let (medium, _, _) = swipe(k, 50.0, 150.0, s);
++        let (fast, _, _) = swipe(k, 50.0, 400.0, s);
++        assert!(medium.abs() > 1.4 * 680.0 && medium.abs() < 1.7 * 680.0, "medium {medium}");
++        assert!(fast.abs() > 2.6 * 680.0 && fast.abs() < 3.1 * 680.0, "fast {fast}");
++        // the owner's speed and direction settings
++        let (slower, _, _) = swipe(k, 50.0, 30.0, Settings { speed_percent: 50, ..s });
++        assert!((slower - slow / 2.0).abs() < 1.0);
++        let (unnatural, _, _) = swipe(k, 50.0, 30.0, Settings { natural: false, ..s });
++        assert!((unnatural + slow).abs() < 1e-6);
++        // with fine steps (sfm1tpscroll=20) the same swipe gives the same travel, record by record
++        let fine = KernelScroll::from_bootargs("sfm1tpscroll=20");
++        let (f, fouts, _) = swipe(fine, 50.0, 30.0, s);
++        assert!((f.abs() - 680.0).abs() < 15.0, "fine {f}");
++        assert!(fouts.len() > 100);
++    }
++
++    /// The numbers for the hand-over (`cargo test ... scroll::tests::the_curve_in_numbers -- --nocapture`).
++    #[test]
++    fn the_curve_in_numbers() {
++        for (name, k) in [("driver default 3.57 mm/step", KernelScroll::from_bootargs("")), ("sfm1tpscroll=20, 0.21 mm/step", KernelScroll::from_bootargs("sfm1tpscroll=20"))] {
++            for v in [20.0, 50.0, 100.0, 150.0, 200.0, 300.0, 400.0, 600.0] {
++                let (total, outs, t) = swipe(k, 50.0, v, Settings::default());
++                let frames = outs.iter().filter(|o| !o.stop).count();
++                let lift = t.log.iter().find(|l| l.starts_with("WMSCROLL gesture")).and_then(|l| l.split("lift_after_ms=").nth(1)).and_then(|r| r.split(' ').next()).unwrap_or("?").to_string();
++                eprintln!("SCROLLNUM {name}: 5 cm at {v:>3} mm/s -> {:>5.0} points at 150 % ({:.2} screen heights of 1067), {frames} frames, lift seen {lift} ms after the last record", total.abs(), total.abs() / 1066.7);
++            }
++        }
++    }
++
++    #[test]
++    fn a_coarse_step_glides_and_a_slow_drag_is_not_ended_between_its_steps() {
++        let k = KernelScroll::from_bootargs("");
++        let mut t = TouchScroll::new(k);
++        let s = Settings::default();
++        let t0 = Instant::now();
++        let first = t.record(1, t0, false, Some(0), 13.6, &s);
++        // a quarter at once, the rest over 32 ms
++        assert_eq!(first.len(), 1);
++        let step = 3.566 * 13.6;
++        assert!((first[0].dy + step / 4.0).abs() < 0.01);
++        let mid = t.tick(t0 + Duration::from_millis(16));
++        assert!(mid.iter().map(|o| o.dy).sum::<f64>() < 0.0);
++        // at 20 mm/s the next step comes 178 ms later: the gesture is still on
++        assert!(t.tick(t0 + Duration::from_millis(170)).iter().all(|o| !o.stop));
++        let second = t.record(1, t0 + Duration::from_millis(178), false, Some(0), 13.6, &s);
++        assert!(!second.is_empty());
++        // the pause after it ends the gesture, with all of its travel handed out
++        let rest = t.tick(t0 + Duration::from_millis(178 + 320));
++        assert!(rest.last().unwrap().stop);
++        assert!(t.active().is_none());
++    }
++
++    #[test]
++    fn the_other_seat_ends_the_gesture_first() {
++        let mut t = TouchScroll::new(KernelScroll::from_bootargs("sfm1tpscroll=20"));
++        let s = Settings::default();
++        let t0 = Instant::now();
++        t.record(3, t0, true, None, 13.6, &s);
++        let outs = t.record(2, t0 + Duration::from_millis(8), false, Some(0), 13.6, &s);
++        assert!(outs[0].stop && outs[0].virt);
++        assert!(!outs[1].stop && !outs[1].virt);
++        assert_eq!(t.active(), Some(false));
++        assert!(t.end(End::Pointer, t0 + Duration::from_millis(9))[0].stop);
++    }
++}
+diff -ruN desk9-next-003/source/crates/wm-darwin/src/server.rs desk10-next-001/source/crates/wm-darwin/src/server.rs
+--- desk9-next-003/source/crates/wm-darwin/src/server.rs	2026-11-15 18:35:07.031067569 -0800
++++ desk10-next-001/source/crates/wm-darwin/src/server.rs	2026-11-15 21:57:24.198464280 -0800
+@@ -109,6 +109,49 @@
+     Some(wm_theme_api::DecorationBuffer { width: w, height: h, pixels })
+ }
+ 
++/// DESK10 (FX-022): a whole dma-buf picture through a CPU mapping, for the surfaces the desk shows from
++/// pictures (popups, layer surfaces): 32-bit XRGB or ARGB, linear (the formats and modifier the renderer
++/// takes), converted as a shared-memory buffer is (`pixels::shm_row_to_rgba`). The client's GPU writes
++/// are waited for (the dma-buf polls readable once its fences signalled), at most 50 ms.
++pub(crate) fn dmabuf_picture(dmabuf: &Dmabuf, width: u32, height: u32) -> Result<wm_theme_api::DecorationBuffer, String> {
++    let format = dmabuf.format();
++    let xrgb = match format.code {
++        Fourcc::Xrgb8888 => true,
++        Fourcc::Argb8888 => false,
++        other => return Err(format!("dma-buf format {other:?} is not read on the CPU (XRGB/ARGB8888 only)")),
++    };
++    if !matches!(format.modifier, Modifier::Linear | Modifier::Invalid) {
++        return Err(format!("dma-buf modifier {:#x} is not linear: not read on the CPU", u64::from(format.modifier)));
++    }
++    let (Some(fd), Some(offset), Some(stride)) = (dmabuf.handles().next(), dmabuf.offsets().next(), dmabuf.strides().next()) else {
++        return Err("dma-buf without a plane".into());
++    };
++    crate::pixels::image_len(width, height)?;
++    if (stride as u64) < u64::from(width) * 4 {
++        return Err("dma-buf stride smaller than its width".into());
++    }
++    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
++    if !crate::kms::poll_readable(raw, Some(std::time::Duration::from_millis(50))).unwrap_or(true) {
++        eprintln!("WMDMABUF a popup/layer dma-buf's writes were not done after 50 ms: read as it is");
++    }
++    let length = offset as usize + stride as usize * height as usize;
++    let map = unsafe { libc::mmap(std::ptr::null_mut(), length, libc::PROT_READ, libc::MAP_SHARED, raw, 0) };
++    if map == libc::MAP_FAILED {
++        return Err(format!("dma-buf CPU mapping failed: {}", std::io::Error::last_os_error()));
++    }
++    let mut pixels = vec![0u8; width as usize * height as usize * 4];
++    let row_bytes = width as usize * 4;
++    for y in 0..height as usize {
++        let src = offset as usize + y * stride as usize;
++        let row = &mut pixels[y * row_bytes..(y + 1) * row_bytes];
++        // copied out of the mapping first, then interpreted (as from a client's shared memory)
++        unsafe { std::ptr::copy_nonoverlapping((map as *const u8).add(src), row.as_mut_ptr(), row_bytes) };
++        crate::pixels::shm_row_to_rgba(row, xrgb);
++    }
++    unsafe { libc::munmap(map, length) };
++    Ok(wm_theme_api::DecorationBuffer { width, height, pixels })
++}
++
+ pub(crate) fn peer_of(surface: &WlSurface) -> Option<Arc<Peer>> {
+     let client = surface.client()?;
+     let id = client.id();
+@@ -277,6 +320,18 @@
+     pub(crate) pointer_thread_covers: bool,
+     /// The pointer's speed setting (owner.rs, DESK7).
+     pub(crate) pointer_speed: crate::owner::PointerSpeed,
++    /// DESK10: the trackpad's two-finger scrolling made into finger scrolling (scroll.rs).
++    pub(crate) touch_scroll: crate::scroll::TouchScroll,
++    /// DESK10: the finger frame (travel, lift) the next pointer delivery sends where a wheel notch would go.
++    pub(crate) finger_pending: Option<(f64, bool)>,
++    /// DESK10: when the record being delivered was read (the input thread's stamp).
++    pub(crate) event_at: Option<std::time::Instant>,
++    /// DESK10: trackpad scrolling with Control-Command held (the Spaces stand-in), millimetres not yet a step.
++    pub(crate) touch_swipe_mm: f64,
++    /// DESK10: finger frames that had nowhere to go (a desk surface under the pointer, a grab).
++    pub(crate) finger_dropped: u64,
++    /// DESK10: finger frames for the other seat than the one being delivered, sent at the loop's next turn.
++    pub(crate) finger_later: Vec<crate::scroll::Out>,
+     /// The test instrument's events held back while the owner holds a key or a button (input.rs).
+     pub(crate) deferred_virtual: std::collections::VecDeque<(crate::hid::Event, std::time::Instant)>,
+     /// Popups made without a parent, waiting for a layer surface to adopt them (`get_popup`).
+@@ -338,6 +393,8 @@
+     /// Buffers still not ready after `FENCE_WAIT`; the frame was rendered anyway.
+     pub fence_timeouts: u64,
+     pub fence_poll_errors: u64,
++    /// DESK10: popup and layer-surface dma-bufs read through a CPU mapping.
++    pub cpu_pictures: u64,
+ }
+ impl Server {
+     pub fn new(dh: &DisplayHandle, size: Size) -> Result<Self, String> {
+@@ -466,6 +523,12 @@
+             layer_grab: None,
+             owner: crate::owner::OwnerActivity::default(),
+             pointer_speed: Default::default(),
++            touch_scroll: crate::scroll::TouchScroll::new(crate::scroll::KernelScroll::running()),
++            finger_pending: None,
++            event_at: None,
++            touch_swipe_mm: 0.0,
++            finger_dropped: 0,
++            finger_later: Vec::new(),
+             pointer_shared: None,
+             pointer_thread_covers: false,
+             loop_probe: Default::default(),
+@@ -1785,6 +1848,22 @@
+         self.frames.last
+     }
+     /// Whole-buffer import; the selected renderer decides which copy loop.
++    /// DESK10 (FX-022): a buffer of a surface the desk shows from a picture of its own (a popup, a layer
++    /// surface): shared memory as before, or a client's dma-buf (linear XRGB/ARGB8888, what the renderer
++    /// imports for windows) read through a CPU mapping once its GPU writes are done (its implicit fence,
++    /// at most 50 ms waited for). `WMPOPUP`/`WMLAYER` say a refusal.
++    pub(crate) fn import_cpu_picture(&mut self, buffer: &wl_buffer::WlBuffer) -> Result<wm_theme_api::DecorationBuffer, String> {
++        let Some(external) = self.external_by_buffer.get(&buffer.id()).copied() else {
++            return self.import_shm(buffer);
++        };
++        let dmabuf = self.external_dmabufs.get(&external.id).ok_or("a dma-buf whose import is gone")?;
++        let picture = dmabuf_picture(dmabuf, external.width, external.height)?;
++        self.dmabuf_stats.cpu_pictures += 1;
++        if self.dmabuf_stats.cpu_pictures <= 4 {
++            eprintln!("WMDMABUF a popup/layer surface's dma-buf {}x{} read through a CPU mapping (FX-022: dma-bufs are taken there too)", external.width, external.height);
++        }
++        Ok(picture)
++    }
+     pub(crate) fn import_shm(&self, buffer: &wl_buffer::WlBuffer) -> Result<wm_theme_api::DecorationBuffer, String> {
+         match self.renderer.kind() {
+             RendererKind::Legacy => crate::pixels::copy_shm(buffer),
+@@ -1811,6 +1890,32 @@
+             self.output.leave(surface);
+         }
+     }
++    /// DESK10: an unmapped toplevel's role as right after get_toplevel (xdg-shell: its attributes are
++    /// discarded, it maps again after a commit without a buffer and a configure), except what makes the
++    /// configures already sent valid: Smithay's list of sent, unacknowledged configures and the
++    /// `configured` flag are kept (Smithay's own unmap resets only the initial-configure flags). The
++    /// next configure starts from a fresh state (`server_pending`), not from the last one sent.
++    fn reset_unmapped_role(surface: &WlSurface, decoration: Option<DecorationMode>) {
++        with_states(surface, |s| {
++            let mut role = s.data_map.get::<XdgToplevelSurfaceData>().unwrap().lock().unwrap();
++            let mut fresh = smithay::wayland::shell::xdg::ToplevelState::default();
++            fresh.decoration_mode = decoration;
++            fresh.capabilities = Vec::new().into();
++            role.initial_configure_sent = false;
++            role.initial_decoration_configure_sent = false;
++            role.parent = None;
++            role.modal = false;
++            role.title = None;
++            role.app_id = None;
++            role.last_acked = None;
++            role.current = fresh.clone();
++            role.current_serial = None;
++            role.server_pending = Some(fresh);
++            let mut cached = s.cached_state.get::<SurfaceCachedState>();
++            *cached.current() = Default::default();
++            *cached.pending() = Default::default();
++        });
++    }
+     pub(crate) fn refuse(surface: &WlSurface, why: &str) {
+         surface.post_error(
+             wl_surface::Error::InvalidSize,
+@@ -2282,6 +2387,16 @@
+             }
+             Some(BufferAssignment::Removed) => {
+                 let was_mapped = self.wm.backend().windows[&id].committed;
++                // DESK10 (FX-022, CODEX-FX's 04:04Z lead): the role goes back to its state of before its first
++                // configure FIRST, so nothing the unmap sets off (the focus moving to another window, which
++                // configured every window) configures it on the way, and the configures it was already sent
++                // stay valid: an ack of one of them, sent before the unmap and acked after it, is not an
++                // error (only a serial never sent is). Smithay's own unmap does the same (it keeps the
++                // pending configures); before, the whole role was reset after the dispatch and Firefox's
++                // ack of a configure sent during that dispatch was refused ("wrong configure serial").
++                if was_mapped {
++                    Self::reset_unmapped_role(surface, self.wm.backend().windows[&id].surface.current_state().decoration_mode);
++                }
+                 // DESK6: a window the desk has put away (minimised) whose client then takes its
+                 // picture away (an AppKit window ordered out as it miniaturises) stays minimised:
+                 // its tile, its picture and its place are kept, and the client's next buffer shows
+@@ -2306,23 +2421,7 @@
+                 self.callbacks.remove(&id);
+                 self.output.leave(surface);
+                 if was_mapped {
+-                    // We do not use Smithay renderer utilities, so reset this role
+-                    // ourselves. Old acknowledgements cannot authorize a remap.
+-                    let decoration = w.surface.current_state().decoration_mode;
+-                    with_states(surface, |s| {
+-                        let mut role = s
+-                            .data_map
+-                            .get::<XdgToplevelSurfaceData>()
+-                            .unwrap()
+-                            .lock()
+-                            .unwrap();
+-                        *role = Default::default();
+-                        role.current.decoration_mode = decoration;
+-                        role.current.capabilities = Vec::new().into();
+-                        let mut cached = s.cached_state.get::<SurfaceCachedState>();
+-                        *cached.current() = Default::default();
+-                        *cached.pending() = Default::default();
+-                    });
++                    // (the role was reset before the dispatch above)
+                     w.title = None;
+                     w.app_id = None;
+                 } else {
+@@ -2331,9 +2430,14 @@
+             }
+             None => {
+                 if !self.wm.backend().windows[&id].committed {
+-                    self.wm.backend().windows[&id]
+-                        .surface
+-                        .send_pending_configure();
++                    // DESK10: an initial commit (a new role, or one that unmapped) is always answered with a
++                    // configure, whether or not its state changed since the last one sent
++                    let toplevel = &self.wm.backend().windows[&id].surface;
++                    if toplevel.is_initial_configure_sent() {
++                        toplevel.send_pending_configure();
++                    } else {
++                        toplevel.send_configure();
++                    }
+                 } else {
+                     let mut fitted = false;
+                     if !self.wm.interactive_drag_active() && !Self::client_behind(surface) {
+diff -ruN desk9-next-003/source/crates/wm-darwin/tests/wayland_dmabuf.rs desk10-next-001/source/crates/wm-darwin/tests/wayland_dmabuf.rs
+--- desk9-next-003/source/crates/wm-darwin/tests/wayland_dmabuf.rs	2026-11-15 18:21:06.403542413 -0800
++++ desk10-next-001/source/crates/wm-darwin/tests/wayland_dmabuf.rs	2026-11-15 21:58:50.891893959 -0800
+@@ -19,7 +19,7 @@
+     Connection, Dispatch, QueueHandle,
+ };
+ use wayland_protocols::wp::linux_dmabuf::zv1::client::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1};
+-use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
++use wayland_protocols::xdg::shell::client::{xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base};
+ use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
+ use wm_core::Size;
+ use wm_darwin::presenter::Presenter;
+@@ -209,6 +209,8 @@
+ delegate_noop!(Client: ignore wl_compositor::WlCompositor);
+ delegate_noop!(Client: ignore wl_surface::WlSurface);
+ delegate_noop!(Client: ignore xdg_toplevel::XdgToplevel);
++delegate_noop!(Client: ignore xdg_positioner::XdgPositioner);
++delegate_noop!(Client: ignore xdg_popup::XdgPopup);
+ 
+ struct Harness {
+     stop: Arc<AtomicBool>,
+@@ -740,3 +742,57 @@
+         drop(h);
+     }
+ }
++
++/// DESK10 (FX-022, the first click on Firefox's menu button showed no menu): a popup whose client draws
++/// it on the GPU (a dma-buf, as Firefox's menu panel with its GPU layers) is shown like a toplevel's
++/// buffer - read through a CPU mapping into the popup's picture - not refused ("SHM access failed").
++#[test]
++fn a_popups_dmabuf_is_shown_not_refused() {
++    let (h, connection) = Harness::start(true);
++    let mut queue = connection.new_event_queue();
++    let qh = queue.handle();
++    let mut client = Client::default();
++    connection.display().get_registry(&qh, ());
++    queue.roundtrip(&mut client).unwrap();
++    let (dmabuf, _) = client.dmabuf.clone().unwrap();
++    let shell = client.shell.clone().unwrap();
++    let surface = client.compositor.as_ref().unwrap().create_surface(&qh, ());
++    let xdg = shell.get_xdg_surface(&surface, &qh, ());
++    let _top = xdg.get_toplevel(&qh, ());
++    surface.commit();
++    queue.roundtrip(&mut client).unwrap();
++    let buffer = |w: i32, hgt: i32, pixel: [u8; 4], tag: u32| {
++        use std::io::Write;
++        let mut file = fake_dmabuf(0);
++        file.write_all(&pixel.repeat((w * hgt) as usize)).unwrap();
++        let params = dmabuf.create_params(&qh, ());
++        params.add(file.as_fd(), 0, 0, (w * 4) as u32, 0, 0);
++        let b = params.create_immed(w, hgt, AR24, zwp_linux_buffer_params_v1::Flags::empty(), &qh, tag);
++        params.destroy();
++        (b, file)
++    };
++    let (window, _wf) = buffer(200, 120, [0, 0, 0, 255], 1);
++    surface.attach(Some(&window), 0, 0);
++    surface.commit();
++    queue.roundtrip(&mut client).unwrap();
++    h.wait("the window to map", || h.state.lock().unwrap().0 == 1);
++    // the menu: a popup under the window's top-left corner, drawn by the GPU
++    let positioner = shell.create_positioner(&qh, ());
++    positioner.set_size(80, 40);
++    positioner.set_anchor_rect(10, 10, 1, 1);
++    let menu = client.compositor.as_ref().unwrap().create_surface(&qh, ());
++    let menu_xdg = shell.get_xdg_surface(&menu, &qh, ());
++    let _popup = menu_xdg.get_popup(Some(&xdg), &positioner, &qh, ());
++    menu.commit();
++    queue.roundtrip(&mut client).unwrap();
++    let before = h.checks.lock().unwrap().1.cpu_pictures;
++    let (panel, _pf) = buffer(80, 40, [0x20, 0x40, 0xc0, 0xff], 2);
++    menu.attach(Some(&panel), 0, 0);
++    menu.commit();
++    queue.roundtrip(&mut client).unwrap();
++    h.wait("the popup's dma-buf to be read", || h.checks.lock().unwrap().1.cpu_pictures > before);
++    queue.roundtrip(&mut client).unwrap();
++    // read once and given back at once: the desk keeps its own copy, as for shared memory
++    assert!(client.released.contains(&2), "the popup's buffer is released after the copy: {:?}", client.released);
++    assert!(connection.protocol_error().is_none());
++}
+diff -ruN desk9-next-003/source/crates/wm-darwin/tests/wayland_shm.rs desk10-next-001/source/crates/wm-darwin/tests/wayland_shm.rs
+--- desk9-next-003/source/crates/wm-darwin/tests/wayland_shm.rs	2026-11-15 16:29:55.846601427 -0800
++++ desk10-next-001/source/crates/wm-darwin/tests/wayland_shm.rs	2026-11-15 21:57:56.072586208 -0800
+@@ -50,6 +50,8 @@
+     configured_sizes:Vec<(i32,i32)>,
+     /// wl_pointer.axis events received (wheel steps).
+     axis_events:u32,
++    /// DESK10: every scroll event of the pointer, in order (source, axis value, value120, stop, frame).
++    axis_log:Vec<String>,
+     /// Clipboard: the device, the offer that is the current selection with
+     /// its types, and requests to send what this client offered.
+     data_manager:Option<wl_data_device_manager::WlDataDeviceManager>,
+@@ -248,7 +250,13 @@
+ }
+ impl Dispatch<wl_pointer::WlPointer,()> for Client {
+     fn event(s:&mut Self,_:&wl_pointer::WlPointer,e:wl_pointer::Event,_:&(),_:&Connection,_:&QueueHandle<Self>){
+-        match e{wl_pointer::Event::Enter{serial,..}=>{s.pointer_serial=Some(serial);s.pointer_enters+=1;},wl_pointer::Event::Button{button,state,serial,..}=>{s.button_serial=Some(serial);s.buttons.push((button,state));},wl_pointer::Event::Axis{..}=>s.axis_events+=1,_=>{}}
++        match e{wl_pointer::Event::Enter{serial,..}=>{s.pointer_serial=Some(serial);s.pointer_enters+=1;},wl_pointer::Event::Button{button,state,serial,..}=>{s.button_serial=Some(serial);s.buttons.push((button,state));},
++            wl_pointer::Event::Axis{value,..}=>{s.axis_events+=1;s.axis_log.push(format!("axis {value:.3}"));},
++            wl_pointer::Event::AxisSource{axis_source}=>s.axis_log.push(match axis_source{wayland_client::WEnum::Value(v)=>format!("source {v:?}"),other=>format!("source {other:?}")}),
++            wl_pointer::Event::AxisStop{..}=>s.axis_log.push("stop".into()),
++            wl_pointer::Event::AxisValue120{value120,..}=>s.axis_log.push(format!("v120 {value120}")),
++            wl_pointer::Event::Frame=>{if s.axis_log.last().is_some_and(|l|l!="frame"){s.axis_log.push("frame".into());}},
++            _=>{}}
+     }
+ }
+ delegate_noop!(Client: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
+@@ -381,6 +389,7 @@
+                     pilot.step(&mut state, started.elapsed().as_millis() as u32).unwrap();
+                 }
+                 let _ = state.repaint(&mut out, started.elapsed().as_millis() as u32);
++                state.scroll_tick(started.elapsed().as_millis() as u32);
+                 if let Some((pilot, reply, lines)) = &mut autopilot {
+                     pilot.after_repaint(&mut state).unwrap();
+                     lines.extend(pilot.take_lines());
+@@ -1922,3 +1931,89 @@
+     assert_eq!(cb.keys.len(),kb,"no key of the request reached B (the focused window now): {:?}",&cb.keys[kb..]);
+     assert_eq!(refused,6,"every remaining key is refused (reported to the instrument)");
+ }
++
++/// DESK10 (the owner: "I have to scroll a lot just to make the page move"): the built-in trackpad's
++/// two-finger scrolling reaches the window under the pointer as finger scrolling - axis source finger,
++/// travel in logical units, no wheel notch and no value120 - and ends with one axis_stop after a
++/// pause (the driver has no lift record); a mouse wheel stays a wheel (source wheel, value120 per
++/// notch); `trackpad_scroll=off` gives the notches of before.
++#[test]
++#[cfg(feature = "desktop-shell")]
++fn the_trackpads_scrolling_reaches_the_client_as_finger_scrolling_and_a_wheel_stays_a_wheel() {
++    let (h, a) = Harness::with_input(true);
++    let (tx, rx) = mpsc::channel();
++    h.tx.send(Request::Desktop(tx)).unwrap();
++    rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
++    let (mut q, mut c, _s, _x, _t) = map_client(&a, "scrolled");
++    let content = h.snapshot().content.unwrap();
++    use wm_darwin::hid::{Event, Motion};
++    let at = |v: i32, of: f64| ((f64::from(v) + 0.25) / of * 65535.).round().clamp(0., 65535.) as u16;
++    h.tx.send(Request::Hid(Event::Pointer { motion: Motion::Absolute(at(content.pos.x + 30, 319.), at(content.pos.y + 30, 239.)), buttons: 0, wheel: 0 })).unwrap();
++    h.snapshot();
++    q.roundtrip(&mut c).unwrap();
++    c.axis_log.clear();
++    // three of the driver's steps down (wheel -1 each: fingers up the trackpad, reading on), 20 ms apart
++    for _ in 0..3 {
++        h.tx.send(Request::Hid(Event::TouchWheel { steps: -1, buttons: 0 })).unwrap();
++        thread::sleep(Duration::from_millis(20));
++    }
++    // the pause that ends the gesture (at most 300 ms)
++    thread::sleep(Duration::from_millis(450));
++    h.snapshot();
++    for _ in 0..3 { q.roundtrip(&mut c).unwrap(); }
++    let log = c.axis_log.clone();
++    assert!(log.iter().all(|l| l == "source Finger" || l.starts_with("axis ") || l == "stop" || l == "frame"), "finger frames only: {log:?}");
++    assert!(!log.iter().any(|l| l.starts_with("v120")), "no value120 for a trackpad: {log:?}");
++    assert_eq!(log.iter().filter(|l| *l == "stop").count(), 1, "one lift: {log:?}");
++    let travel: f64 = log.iter().filter_map(|l| l.strip_prefix("axis ")).map(|v| v.parse::<f64>().unwrap()).sum();
++    // 3 steps of 3.566 mm at this 240-pixel screen's gain (240 / 78.4 mm, scale 1), accelerated by their speed
++    let slow = 3.0 * 3.566 * 240.0 / (7603.0 / 97.0);
++    assert!(travel > slow * 0.99 && travel < slow * 3.6, "travel {travel:.1} for the slow gain's {slow:.1}: {log:?}");
++    // a mouse wheel notch (any other device) stays a wheel notch
++    c.axis_log.clear();
++    h.tx.send(Request::Hid(Event::Pointer { motion: Motion::Relative(0, 0), buttons: 0, wheel: -1 })).unwrap();
++    h.snapshot();
++    q.roundtrip(&mut c).unwrap();
++    assert_eq!(c.axis_log, ["source Wheel", "v120 120", "axis 10.000", "frame"], "{:?}", c.axis_log);
++}
++
++/// DESK10 (FX-022, the second click on Firefox's menu button killed its window: "wrong configure
++/// serial"): a client that unmaps a toplevel (null buffer) while it has the focus gets no protocol
++/// error for acking what it was sent - the desk moved the focus to another window and configured every
++/// window on the way, then reset the role and forgot the serial it had just sent - and the toplevel
++/// maps again after a commit without a buffer, which is answered with a configure.
++#[test]
++#[cfg(feature = "desktop-shell")]
++fn a_toplevel_unmapped_by_its_client_acks_what_it_was_sent_and_maps_again() {
++    let (h, a) = Harness::with_input(true);
++    let (tx, rx) = mpsc::channel();
++    h.tx.send(Request::Desktop(tx)).unwrap();
++    rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
++    let (mut qb, mut cb, _sb, _xb, _tb) = map_client(&a, "stays");
++    let (mut q, mut c, s, _x, _t) = map_client(&a, "unmaps");
++    assert_eq!(h.snapshot().managed, 2);
++    // the focused window unmaps (as AppKit hides a window): its client acks every configure it gets
++    s.attach(None, 0, 0);
++    s.commit();
++    for _ in 0..4 {
++        h.snapshot();
++        q.roundtrip(&mut c).expect("no protocol error for acking a configure the desk sent");
++        qb.roundtrip(&mut cb).expect("the other window's client is fine");
++    }
++    assert!(a.protocol_error().is_none(), "{:?}", a.protocol_error());
++    // shown again: the initial commit is answered with a configure, then a buffer maps it
++    let before = c.configures;
++    s.commit();
++    for _ in 0..3 { h.snapshot(); q.roundtrip(&mut c).unwrap(); }
++    assert!(c.configures > before, "a configure answers the initial commit after the unmap");
++    let qh = q.handle();
++    let mut file = tempfile::tempfile().unwrap();
++    file.write_all(&[10, 20, 240, 255].repeat(100 * 60)).unwrap();
++    let pool = c.shm.as_ref().unwrap().create_pool(file.as_fd(), 100 * 60 * 4, &qh, ());
++    let buffer = pool.create_buffer(0, 100, 60, 400, wl_shm::Format::Argb8888, &qh, ());
++    s.attach(Some(&buffer), 0, 0);
++    s.commit();
++    for _ in 0..3 { h.snapshot(); q.roundtrip(&mut c).unwrap(); }
++    assert!(a.protocol_error().is_none(), "{:?}", a.protocol_error());
++    assert_eq!(h.snapshot().visible, 2, "both windows shown again");
++}

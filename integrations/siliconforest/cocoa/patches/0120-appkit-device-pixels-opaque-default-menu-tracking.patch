@@ -1,0 +1,1098 @@
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -84,6 +84,11 @@
+ -(void)_setContentsWithoutRender:(id)value;
+ @end
+ 
++// the backing store's pixels per point along each axis (NSWindow.m)
++@interface NSWindow(SFBackingPixels)
++-(NSSize)_backingPixelsPerPoint;
++@end
++
+ @implementation NSView
+ 
+ static BOOL NSViewLayersEnabled=NO;
+@@ -830,13 +835,93 @@
+    return NSMakeRect(point1.x,point1.y,point2.x-point1.x,point2.y-point1.y);
+ }
+ 
+--(NSRect)centerScanRect:(NSRect)rect {
+-   float minx=floor(NSMinX(rect)+0.5);
+-   float miny=floor(NSMinY(rect)+0.5);
+-   float maxx=floor(NSMaxX(rect)+0.5);
+-   float maxy=floor(NSMaxY(rect)+0.5);
++/* Edges on device pixels (macOS's -backingAlignedRect:options:, of which -centerScanRect: is the
++ * case "every edge to the nearest pixel"). Pixels are window coordinates times the backing store's
++ * pixels per point along each axis (the window's base CTM), from the store's corner. An edge within a millionth of a pixel of a boundary
++ * is on it, and nearest rounds halves up whichever edge it is, so the bottom of one rectangle and
++ * the top of the next, computed differently, come to the same pixel: at 150 % a terminal's rows of
++ * whole points (whole points were all the old -centerScanRect: aligned to) each ended half way
++ * through a pixel that the next row covered again. */
++static CGFloat sfAlignEdge(CGFloat v,BOOL isMin,NSUInteger bits){
++   const CGFloat e=1e-6;
++
++   if(bits&4)
++    return floor(v+0.5+e);
++   if(bits&1)
++    return isMin ? ceil(v-e) : floor(v+e);
++   if(bits&2)
++    return isMin ? floor(v+e) : ceil(v-e);
++   return v;
++}
++
++// one axis in pixels: bits of its min edge, max edge and size, each 1 inward, 2 outward, 4 nearest
++static void sfAlignAxis(CGFloat *lo,CGFloat *hi,NSUInteger minBits,NSUInteger maxBits,NSUInteger sizeBits){
++   const CGFloat e=1e-6;
++   CGFloat a=*lo,b=*hi,size=b-a;
++
++   if(sizeBits&4)
++    size=floor(size+0.5+e);
++   else if(sizeBits&1)
++    size=floor(size+e);
++   else if(sizeBits&2)
++    size=ceil(size-e);
++   if(minBits)
++    a=sfAlignEdge(a,YES,minBits);
++   if(maxBits)
++    b=sfAlignEdge(b,NO,maxBits);
++   if(sizeBits && minBits && !maxBits)
++    b=a+size;
++   else if(sizeBits && maxBits && !minBits)
++    a=b-size;
++   if(b<a)
++    b=a;
++   *lo=a;
++   *hi=b;
++}
++
++// a rectangle in window coordinates aligned to the pixels of a backing store of that scale; yFlipped
++// when the options' min and max y are the window's max and min (they were given for a flipped view)
++NSRect _NSBackingAlignedWindowRect(NSRect rect,CGFloat sx,CGFloat sy,NSAlignmentOptions options,BOOL yFlipped){
++   uint64_t o=options;
++   CGFloat x0=NSMinX(rect)*sx,x1=NSMaxX(rect)*sx,y0=NSMinY(rect)*sy,y1=NSMaxY(rect)*sy;
++   // NSAlignMinXInward is bit 0, the Outward options start at bit 8, the Nearest ones at bit 16
++#define SF_ALIGN_BITS(shift) ((((o>>(shift))&1)?1:0)|(((o>>((shift)+8))&1)?2:0)|(((o>>((shift)+16))&1)?4:0))
++   NSUInteger minX=SF_ALIGN_BITS(0),minY=SF_ALIGN_BITS(1),maxX=SF_ALIGN_BITS(2),maxY=SF_ALIGN_BITS(3);
++   NSUInteger width=SF_ALIGN_BITS(4),height=SF_ALIGN_BITS(5);
++#undef SF_ALIGN_BITS
++
++   if(sx<=0 || sy<=0)
++    return rect;
++   if(yFlipped){
++    NSUInteger t=minY;
++    minY=maxY;
++    maxY=t;
++   }
++   sfAlignAxis(&x0,&x1,minX,maxX,width);
++   sfAlignAxis(&y0,&y1,minY,maxY,height);
++   return NSMakeRect(x0/sx,y0/sy,(x1-x0)/sx,(y1-y0)/sy);
++}
++
++
++-(NSRect)backingAlignedRect:(NSRect)rect options:(NSAlignmentOptions)options {
++   NSWindow *window=[self window];
+ 
+-   return NSMakeRect(minx,miny,maxx-minx,maxy-miny);
++   if(window==nil){
++    // no backing store: points are the pixels
++    return _NSBackingAlignedWindowRect(rect,1.0,1.0,options,[self isFlipped]);
++   }
++   NSRect inWindow=[self convertRect:rect toView:nil];
++   NSPoint a=[self convertPoint:NSMakePoint(0,0) toView:nil],b=[self convertPoint:NSMakePoint(0,1) toView:nil];
++   // the backing store's own pixels: its size is whole pixels, so at 150 % a window of an odd number
++   // of points is drawn a little more than 1.5 pixels per point along that axis (NSWindow's base CTM)
++   NSSize pixels=[window _backingPixelsPerPoint];
++
++   inWindow=_NSBackingAlignedWindowRect(inWindow,pixels.width,pixels.height,options,b.y<a.y);
++   return [self convertRect:inWindow fromView:nil];
++}
++
++-(NSRect)centerScanRect:(NSRect)rect {
++   return [self backingAlignedRect:rect options:NSAlignAllEdgesNearest];
+ }
+ 
+ // as on macOS, a frame change goes through -setFrameOrigin: and -setFrameSize:, so a
+@@ -1374,6 +1459,9 @@
+    [[self subviews] makeObjectsPerformSelector:_cmd];
+ }
+ 
++// the constraints above that refer to a view taken out (NSLayoutConstraint.m)
++extern void _NSViewRemoveConstraintsReferringTo(NSView *above, NSView *removed);
++
+ -(void)removeFromSuperview {
+    [_superview setNeedsDisplayInRect:[self frame]];
+    [self removeFromSuperviewWithoutNeedingDisplay];
+@@ -1388,6 +1476,7 @@
+    NSWindow *window=[self window];
+ 
+    [removeFrom willRemoveSubview:self];
++   _NSViewRemoveConstraintsReferringTo(removeFrom,self);
+    [self _deepResignFirstResponder];
+    [self _setSuperview:nil];
+    [self _setWindow:nil];
+@@ -2083,12 +2172,14 @@
+            // here else we might get some artifact on clipping borders
+            // in device pixels: at a scale of 1.5 a rect of whole points ends inside a pixel, which the
+            // views behind fill (the clip is rounded out) and the view itself only partly covers
+-           CGFloat s=backingScale(self);
+-
+            rect = [self convertRect:rect toView:nil];
+-           rect = NSMakeRect(rect.origin.x*s,rect.origin.y*s,rect.size.width*s,rect.size.height*s);
+-           rect = NSIntegralRect(rect);
+-           rect = NSMakeRect(rect.origin.x/s,rect.origin.y/s,rect.size.width/s,rect.size.height/s);
++           if([self window]!=nil){
++            NSSize s=[[self window] _backingPixelsPerPoint];
++
++            rect = NSMakeRect(rect.origin.x*s.width,rect.origin.y*s.height,rect.size.width*s.width,rect.size.height*s.height);
++            rect = NSIntegralRect(rect);
++            rect = NSMakeRect(rect.origin.x/s.width,rect.origin.y/s.height,rect.size.width/s.width,rect.size.height/s.height);
++           }
+            rect = [self convertRect:rect fromView:nil];
+            _invalidRectCount++;
+            _invalidRects=NSZoneRealloc(NULL,_invalidRects,sizeof(NSRect)*_invalidRectCount);
+--- a/src/Frameworks/AppKit/NSView.h
++++ b/src/Frameworks/AppKit/NSView.h
+@@ -194,6 +194,7 @@
+ - (NSRect)convertRect:(NSRect)rect fromView:(NSView *)viewOrNil;
+ - (NSRect)convertRect:(NSRect)rect toView:(NSView *)viewOrNil;
+ - (NSRect)centerScanRect:(NSRect)rect;
++- (NSRect)backingAlignedRect:(NSRect)rect options:(NSAlignmentOptions)options;
+ 
+ - (void)setFrame:(NSRect)frame;
+ - (void)setFrameSize:(NSSize)size;
+--- a/src/Frameworks/AppKit/NSWindow.m
++++ b/src/Frameworks/AppKit/NSWindow.m
+@@ -207,6 +207,8 @@
+ -(BOOL)_sfTabCommandEnabled:(SEL)action;
+ @end
+ 
++static void sfSendOpaque(NSWindow *self,BOOL value);
++
+ @implementation NSWindow
+ 
+ +(NSWindowDepth)defaultDepthLimit {
+@@ -363,6 +365,7 @@
+    // as on macOS a window starts opaque (Terminal makes a window with a translucent profile
+    // clear only when -setOpaque:NO changes that)
+    _isOpaque=YES;
++   sfSendOpaque(self,YES);
+ 
+    _delegate=nil;
+    _firstResponder=self;
+@@ -1485,8 +1488,19 @@
+    _collectionBehavior=behavior;
+ }
+ 
++// the window server tells the compositor that an opaque window covers what is behind it everywhere
++static void sfSendOpaque(NSWindow *self,BOOL value){
++   struct wsRPCSimple data = {
++       { kWSWindowSetOpaque, sizeof(struct wsRPCSimple) - sizeof(struct wsRPCBase) },
++       (int)[self windowNumber], value ? 1 : 0
++   };
++
++   _windowServerRPC(&data, sizeof(data), NULL, NULL);
++}
++
+ -(void)setOpaque:(BOOL)value {
+    _isOpaque=value;
++   sfSendOpaque(self,value);
+ }
+ 
+ -(void)setParentWindow:(NSWindow *)value {
+@@ -1821,6 +1835,27 @@
+    return point;
+ }
+ 
++// window coordinates with their edges on the backing store's pixels (NSView.m)
++extern NSRect _NSBackingAlignedWindowRect(NSRect rect,CGFloat sx,CGFloat sy,NSAlignmentOptions options,BOOL yFlipped);
++
++/* Device pixels per point of the backing store along each axis, the factors of its base CTM
++ * (-createCGContextIfNeeded): the store is whole pixels, wsPixelsForPoints() of the frame's size */
++-(NSSize)_backingPixelsPerPoint {
++   int scale120=_backingScale120>0 ? _backingScale120 : _windowServerBackingScale120();
++   CGFloat s=scale120/120.0;
++
++   if(scale120==120 || _frame.size.width<1 || _frame.size.height<1)
++    return NSMakeSize(s,s);
++   return NSMakeSize(wsPixelsForPoints(_frame.size.width,scale120)/floor(_frame.size.width),
++                     wsPixelsForPoints(_frame.size.height,scale120)/floor(_frame.size.height));
++}
++
++-(NSRect)backingAlignedRect:(NSRect)rect options:(NSAlignmentOptions)options {
++   NSSize pixels=[self _backingPixelsPerPoint];
++
++   return _NSBackingAlignedWindowRect(rect,pixels.width,pixels.height,options,NO);
++}
++
+ -(NSRect)convertRectToScreen:(NSRect)rect {
+    rect.origin=[self convertBaseToScreen:rect.origin];
+    return rect;
+@@ -2661,12 +2696,47 @@
+      if (![self isKindOfClass:[NSPanel class]]) {
+        [NSApp removeWindowsItem:self];
+      }
++     [self _sfGiveUpKeyAndMain];
+      break;
+    }
+ 
+    [self postNotificationName:NSWindowDidMoveNotification];
+ }
+ 
++/* As on macOS a window taken off the screen is no longer key or main: the frontmost visible window that can
++ * be takes its place (the compositor's activation of the window it focuses then confirms it). It stayed key
++ * after its -close: Activity Monitor's process inspector, closed, kept being asked for menu actions through
++ * its freed delegate, and the application ended with SIGSEGV. */
++-(void)_sfGiveUpKeyAndMain {
++   BOOL wasKey=([NSApp keyWindow]==self), wasMain=([NSApp mainWindow]==self);
++
++   if(!wasKey && !wasMain)
++    return;
++   [[self retain] autorelease];
++   if(wasKey){
++    [NSApp _setKeyWindow:nil];
++    [self resignKeyWindow];
++   }
++   if(wasMain){
++    [NSApp _setMainWindow:nil];
++    [self resignMainWindow];
++   }
++   for(NSWindow *window in [NSApp orderedWindows]){
++    if(window==self || ![window isVisible] || [window isMiniaturized])
++     continue;
++    if(wasMain && [window canBecomeMainWindow]){
++     [window becomeMainWindow];
++     wasMain=NO;
++    }
++    if(wasKey && [window canBecomeKeyWindow]){
++     [window makeKeyWindow];
++     wasKey=NO;
++    }
++    if(!wasKey && !wasMain)
++     break;
++   }
++}
++
+ -(void)orderFrontRegardless {
+    [self orderFront:nil];
+ }
+--- a/src/Frameworks/AppKit/NSWindow.h
++++ b/src/Frameworks/AppKit/NSWindow.h
+@@ -501,6 +501,7 @@
+ - (NSPoint)convertBaseToScreen:(NSPoint)point;
+ - (NSPoint)convertScreenToBase:(NSPoint)point;
+ - (NSRect)convertRectToScreen:(NSRect)rect;
++- (NSRect)backingAlignedRect:(NSRect)rect options:(NSAlignmentOptions)options;
+ - (NSRect)convertRectFromScreen:(NSRect)rect;
+ - (NSPoint)convertPointToScreen:(NSPoint)point;
+ - (NSPoint)convertPointFromScreen:(NSPoint)point;
+--- a/src/Frameworks/AppKit/NSPathControl.m
++++ b/src/Frameworks/AppKit/NSPathControl.m
+@@ -1,6 +1,7 @@
+ #import <AppKit/NSPathControl.h>
+ 
+ #import "AppKit/NSRaise.h"
++#import <AppKit/NSViewLayout.h>
+ #import <objc/runtime.h>
+ 
+ @implementation NSPathControl
+@@ -9,6 +10,15 @@
+    return YES;
+ }
+ 
++/* The path takes the width the layout gives it, at the height of a control of its size (22, 19, 16 points).
++ * It answered its cell's size, NSCell's 10000 points each way: in Terminal's Profiles > Text the box round
++ * the background image's path grew 10000 points wide to the left, a black bar over "Background". */
++-(NSSize)intrinsicContentSize {
++   NSControlSize size=[[self cell] controlSize];
++
++   return NSMakeSize(NSViewNoIntrinsicMetric,size==NSSmallControlSize ? 19 : size==NSMiniControlSize ? 16 : 22);
++}
++
+ - (NSPathStyle)pathStyle;
+ {
+ 	NSPathCell *cell = [self cell];
+--- a/src/Frameworks/AppKit/NSImage.m
++++ b/src/Frameworks/AppKit/NSImage.m
+@@ -165,6 +165,12 @@
+     image=[NSApp applicationIconImage];
+ 
+   // Cocoa AppKit always returns the same shared cached image
++   // SF_IMAGE_TRACE=1: each image asked for by name and what was found (a diagnostic)
++   static int trace=-1;
++   if(trace<0)
++    trace=getenv("SF_IMAGE_TRACE")!=NULL;
++   if(trace)
++    fprintf(stderr,"SFIMAGE named %s -> %p\n",[name UTF8String],image);
+    return image;
+ }
+ 
+--- a/src/Frameworks/AppKit/NSColorPanel.m
++++ b/src/Frameworks/AppKit/NSColorPanel.m
+@@ -12,6 +12,7 @@
+ #import <AppKit/NSColorPickerSliders.h>
+ #import <AppKit/NSColorPickerWheel.h>
+ #import <AppKit/NSRaise.h>
++#import <objc/runtime.h>
+ 
+ NSString * const NSColorPanelColorDidChangeNotification=@"NSColorPanelColorDidChangeNotification";
+ 
+@@ -170,9 +171,10 @@
+    return _continuous;
+ }
+ 
++static char sfAccessoryKey;
++
+ -(NSView *)accessoryView {
+-   NSUnimplementedMethod();
+-   return nil;
++   return objc_getAssociatedObject(self,&sfAccessoryKey);
+ }
+ 
+ -(void)setColorButtonClicked:sender {
+@@ -228,8 +230,49 @@
+    _continuous=flag;
+ }
+ 
++/* The accessory goes under what the panel shows (Terminal's background well puts its Color & Effects controls
++ * there): the panel grows by its height, and by its width when it is wider, and what was there moves up. */
+ -(void)setAccessoryView:(NSView *)view {
+-   NSUnimplementedMethod();
++   NSView *old=[self accessoryView];
++   NSView *content=[self contentView];
++
++   if(old==view)
++    return;
++   // an accessory laid out from a nib without its window can come with no size or an absurd one (a layout's
++   // 10000-point stand-ins): it is given its fitting size, within what a panel can show
++   if(view!=nil){
++    NSSize size=[view frame].size;
++
++    if(getenv("SF_COLORPANEL_TRACE")!=NULL)
++     fprintf(stderr,"NSColorPanel: accessory %s %gx%g\n",object_getClassName(view),size.width,size.height);
++    if(size.width<=1 || size.height<=1 || size.width>600 || size.height>500){
++     NSSize fit=[view fittingSize];
++
++     [view setFrameSize:NSMakeSize(MIN(MAX(fit.width,200),600),MIN(MAX(fit.height,40),500))];
++    }
++   }
++   CGFloat delta=(view!=nil ? NSHeight([view frame]) : 0)-(old!=nil ? NSHeight([old frame]) : 0);
++   NSRect frame=[self frame];
++
++   [[old retain] autorelease];
++   [old removeFromSuperview];
++   objc_setAssociatedObject(self,&sfAccessoryKey,view,OBJC_ASSOCIATION_RETAIN);
++   frame.size.height+=delta;
++   frame.origin.y-=delta;
++   if(view!=nil && NSWidth([view frame])>NSWidth([content frame]))
++    frame.size.width+=NSWidth([view frame])-NSWidth([content frame]);
++   [self setFrame:frame display:NO];
++   for(NSView *sub in [[[content subviews] copy] autorelease]){
++    NSPoint origin=[sub frame].origin;
++
++    origin.y+=delta;
++    [sub setFrameOrigin:origin];
++   }
++   if(view!=nil){
++    [view setFrameOrigin:NSMakePoint(floor((NSWidth([content frame])-NSWidth([view frame]))/2),0)];
++    [content addSubview:view];
++   }
++   [content setNeedsDisplay:YES];
+ }
+ 
+ -(void)setAction:(SEL)action {
+--- a/src/Frameworks/AppKit/NSViewLayout.m
++++ b/src/Frameworks/AppKit/NSViewLayout.m
+@@ -20,6 +20,7 @@
+ #import <AppKit/NSSlider.h>
+ #import <AppKit/NSMatrix.h>
+ #import <AppKit/NSProgressIndicator.h>
++#import <AppKit/NSStringDrawing.h>
+ #import <AppKit/NSFont.h>
+ #import <AppKit/NSWindow.h>
+ #import <AppKit/NSScreen.h>
+@@ -160,6 +161,11 @@
+ 
+ @end
+ 
++// laid out in a container of that size (NSAttributedString.m)
++@interface NSAttributedString (SFBoundingRect)
++- (NSRect)boundingRectWithSize:(NSSize)size options:(NSStringDrawingOptions)options;
++@end
++
+ @implementation NSControl (NSViewLayout)
+ 
+ // a label: text only, nothing drawn around it and nothing to type into
+@@ -194,6 +200,20 @@
+     size.height = raised(self, size.height - insets.top - insets.bottom);
+     if ([self isKindOfClass:[NSTextField class]] && ![self _sfIsLabel] && [cell isEditable])
+         size.width = NSViewNoIntrinsicMetric;
++    /* A wrapping label longer than the width it was given (a nib's explanatory text, whose preferred
++     * width is "automatic": the width it is laid out at) is as tall as its lines at that width, as on
++     * macOS; it answered one line, and the rest of the text was cut off (Terminal's Profiles > Tab). */
++    if ([self _sfIsLabel] && [cell wraps]) {
++        CGFloat width = [self frame].size.width - insets.left - insets.right;
++
++        if (width > 8 && size.width > width + 1) {
++            NSRect lines = [[cell attributedStringValue] boundingRectWithSize:NSMakeSize(width - 4, 100000)
++                                                                       options:NSStringDrawingUsesLineFragmentOrigin];
++
++            size.width = raised(self, width);
++            size.height = MAX(size.height, raised(self, NSHeight(lines)));
++        }
++    }
+     return size;
+ }
+ 
+--- a/src/Frameworks/AppKit/NSTableView.m
++++ b/src/Frameworks/AppKit/NSTableView.m
+@@ -15,6 +15,7 @@
+ #import "NSKeyValueBinding/NSMultipleValueBinder.h"
+ #import "NSKeyValueBinding/NSKVOBinder.h"
+ #import <AppKit/NSRaise.h>
++#import <objc/runtime.h>
+ 
+ NSString * const NSTableViewSelectionIsChangingNotification=@"NSTableViewSelectionIsChangingNotification";
+ NSString * const NSTableViewSelectionDidChangeNotification=@"NSTableViewSelectionDidChangeNotification";
+@@ -55,6 +56,9 @@
+ -(NSInteger)columnAutoresizingStyle;
+ @end
+ 
++// the row the click sequence began on (a double action needs both clicks on one row)
++static char sfFirstClickRowKey;
++
+ @implementation NSTableView
+ 
+ -(id)_replacementKeyPathForBinding:(id)binding
+@@ -1735,8 +1739,12 @@
+     }
+ 
+     // NSLog(@"click in col %d row %d", _clickedColumn, _clickedRow);
+-    // single click behavior
+-    if ([event clickCount] < 2) {
++    // single click behavior; a second click on another row is a click of its own (it selects that row), as
++    // on macOS, which sends the double action only when both clicks are on the same row
++    NSNumber *firstRow = objc_getAssociatedObject(self, &sfFirstClickRowKey);
++
++    if ([event clickCount] < 2 || firstRow == nil || [firstRow integerValue] != _clickedRow) {
++        objc_setAssociatedObject(self, &sfFirstClickRowKey, [NSNumber numberWithInteger:_clickedRow], OBJC_ASSOCIATION_RETAIN);
+         if ([self delegateSelectionShouldChange] == NO) // provide delegate opportunity
+             return;
+ 
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -21,6 +21,12 @@
+ #import <AppKit/NSApplication.h>
+ #include <objc/runtime.h>
+ #include <errno.h>
++#include <signal.h>
++#include <sys/ucontext.h>
++#include <dlfcn.h>
++#include <mach/arm/thread_status.h>
++#include <fcntl.h>
++#include <sys/stat.h>
+ #import <AppKit/NSWindow-Private.h>
+ #import <AppKit/NSPanel.h>
+ #import <AppKit/NSMenu.h>
+@@ -218,10 +224,18 @@
+     return nil;
+ }
+ 
++/* A second press continues a click sequence (a double click) only near the first, in the same window and within
++ * the double-click interval: two single clicks on two rows of a table were a double click (Activity Monitor
++ * opened the inspector where the owner selected another process). */
++#define SF_CLICK_SLOP 4.0
++
+ -(void)machServiceLoop:(id)object {
+     //NSLog(@"starting mach service loop");
+     NSTimeInterval lastClickTime = 0;
+     NSTimeInterval lastRightClickTime = 0;
++    // where and in which window the click sequence's last press was: a press elsewhere starts a new sequence
++    NSPoint lastClickAt = NSZeroPoint, lastRightClickAt = NSZeroPoint;
++    NSInteger lastClickWindow = 0, lastRightClickWindow = 0;
+     unsigned clickCount = 0;
+     unsigned rightClickCount = 0;
+     struct timespec ts;
+@@ -408,8 +422,12 @@
+                                     clock_gettime(CLOCK_MONOTONIC, &ts);
+                                     NSTimeInterval now = ts.tv_sec + ts.tv_nsec/1e9;
+                                     if(me.code == NSLeftMouseDown) {
+-                                        clickCount = (now - lastClickTime > [_display doubleClickInterval]) ? 1 : clickCount + 1;
++                                        BOOL near = me.windowID == lastClickWindow && fabs(me.x - lastClickAt.x) <= SF_CLICK_SLOP && fabs(me.y - lastClickAt.y) <= SF_CLICK_SLOP;
++
++                                        clickCount = (!near || now - lastClickTime > [_display doubleClickInterval]) ? 1 : clickCount + 1;
+                                         lastClickTime = now;
++                                        lastClickAt = NSMakePoint(me.x, me.y);
++                                        lastClickWindow = me.windowID;
+                                     }
+ 
+                                     NSEvent *e = [NSEvent mouseEventWithType:me.code
+@@ -439,8 +457,12 @@
+                                     clock_gettime(CLOCK_MONOTONIC, &ts);
+                                     NSTimeInterval now = ts.tv_sec + ts.tv_nsec/1e9;
+                                     if(me.code == NSRightMouseDown) {
+-                                        rightClickCount = (now - lastRightClickTime > [_display doubleClickInterval]) ? 1 : rightClickCount + 1;
++                                        BOOL near = me.windowID == lastRightClickWindow && fabs(me.x - lastRightClickAt.x) <= SF_CLICK_SLOP && fabs(me.y - lastRightClickAt.y) <= SF_CLICK_SLOP;
++
++                                        rightClickCount = (!near || now - lastRightClickTime > [_display doubleClickInterval]) ? 1 : rightClickCount + 1;
+                                         lastRightClickTime = now;
++                                        lastRightClickAt = NSMakePoint(me.x, me.y);
++                                        lastRightClickWindow = me.windowID;
+                                     }
+ 
+                                     NSEvent *e = [NSEvent mouseEventWithType:me.code
+@@ -666,10 +688,105 @@
+     return(write(_machEventPipe[1], "\n", 2));
+ }
+ 
++/* A Mac application that ends on a signal leaves a report where its user finds it, as macOS's crash reporter
++ * does: ~/Library/Logs/DiagnosticReports/<name>-<pid>.crash, the signal, the address and the stack of the
++ * thread that took it (addresses named by the image they lie in). The signal is then raised again as it
++ * was, so the program ends as before. Exceptions an event raises are reported on standard error, which
++ * `open` sends to ~/Library/Logs/<name>.log (-reportException:). */
++extern int backtrace(void **frames, int size);
++extern void backtrace_symbols_fd(void *const *frames, int size, int fd);
++static char sfCrashPath[1024];
++
++static void sfCrashHandler(int sig, siginfo_t *info, void *context) {
++   int fd = open(sfCrashPath, O_WRONLY | O_CREAT | O_APPEND, 0644);
++
++   if (fd >= 0) {
++      char line[256];
++      void *frames[64];
++      int n = snprintf(line, sizeof(line), "signal %d (%s) at address %p in pid %d\n", sig, sig == SIGSEGV ? "SIGSEGV" :
++                       sig == SIGBUS ? "SIGBUS" : sig == SIGILL ? "SIGILL" : sig == SIGABRT ? "SIGABRT" : sig == SIGFPE ? "SIGFPE" : "SIGTRAP",
++                       info != NULL ? info->si_addr : NULL, (int)getpid());
++
++      write(fd, line, n > 0 && n < (int)sizeof(line) ? n : 0);
++      // the thread that took the signal: its pc, lr and frame-pointer chain, each named by its image
++      if (context != NULL) {
++         ucontext_t *uc = context;
++         uintptr_t pc = (uintptr_t)arm_thread_state64_get_pc(uc->uc_mcontext->__ss), lr = (uintptr_t)arm_thread_state64_get_lr(uc->uc_mcontext->__ss);
++         uintptr_t *fp = (uintptr_t *)arm_thread_state64_get_fp(uc->uc_mcontext->__ss);
++         uintptr_t at[40];
++         int count = 0;
++
++         at[count++] = pc;
++         at[count++] = lr;
++         while (fp != NULL && count < 40 && ((uintptr_t)fp & 7) == 0) {
++            uintptr_t ret = fp[1] & 0x0000000fffffffffULL;
++
++            if (ret == 0)
++               break;
++            at[count++] = ret;
++            fp = (uintptr_t *)fp[0];
++         }
++         for (int i = 0; i < count; i++) {
++            Dl_info dl;
++            uintptr_t a = at[i] & 0x0000000fffffffffULL;
++
++            if (dladdr((void *)a, &dl) && dl.dli_fname != NULL) {
++               const char *image = strrchr(dl.dli_fname, '/') ? strrchr(dl.dli_fname, '/') + 1 : dl.dli_fname;
++
++               n = snprintf(line, sizeof(line), "%2d %016lx %s+0x%lx %s\n", i, (unsigned long)a, image, (unsigned long)(a - (uintptr_t)dl.dli_fbase),
++                            dl.dli_sname != NULL ? dl.dli_sname : "");
++            }
++            else
++               n = snprintf(line, sizeof(line), "%2d %016lx ?\n", i, (unsigned long)a);
++            write(fd, line, n > 0 && n < (int)sizeof(line) ? n : (int)sizeof(line) - 1);
++         }
++      }
++      else
++         backtrace_symbols_fd(frames, backtrace(frames, 64), fd);
++      close(fd);
++   }
++   signal(sig, SIG_DFL);
++   raise(sig);
++}
++
++static void sfInstallCrashReport(void) {
++   const char *home = getenv("HOME");
++   const char *name = getprogname();
++   static const int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGABRT, SIGFPE, SIGTRAP };
++   struct sigaction action;
++   stack_t stack;
++
++   if (home == NULL || name == NULL || getenv("SF_NO_CRASH_REPORT") != NULL)
++      return;
++   char dir[900];
++
++   snprintf(dir, sizeof(dir), "%s/Library/Logs/DiagnosticReports", home);
++   mkdir(dir, 0755);
++   snprintf(sfCrashPath, sizeof(sfCrashPath), "%s/%s-%d.crash", dir, name, (int)getpid());
++   // its own stack, so that a stack overflow can be reported
++   stack.ss_sp = malloc(64 * 1024);
++   stack.ss_size = 64 * 1024;
++   stack.ss_flags = 0;
++   if (stack.ss_sp != NULL)
++      sigaltstack(&stack, NULL);
++   memset(&action, 0, sizeof(action));
++   action.sa_sigaction = sfCrashHandler;
++   action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
++   sigemptyset(&action.sa_mask);
++   for (unsigned i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
++      struct sigaction old;
++
++      // a handler the program installed itself stays
++      if (sigaction(sigs[i], NULL, &old) == 0 && old.sa_handler == SIG_DFL)
++         sigaction(sigs[i], &action, NULL);
++   }
++}
++
+ -init {
+     if(NSApp)
+         NSAssert(!NSApp, @"NSApplication is a singleton");
+     NSApp=[self retain];
++    sfInstallCrashReport();
+ 
+     if(pipe(_machEventPipe) != 0) {
+         NSLog(@"pipe: %s", strerror(errno));
+--- a/src/Frameworks/AppKit/NSDisplay.m
++++ b/src/Frameworks/AppKit/NSDisplay.m
+@@ -434,8 +434,16 @@
+    return 15.0;
+ }
+ 
++// macOS's: the user's com.apple.mouse.doubleClickThreshold (Accessibility > Pointer Control), 0.5 s unless set
+ -(CGFloat)doubleClickInterval {
+-   return 1.0;
++   static double interval=-1;
++
++   if(interval<0){
++    id value=[[NSUserDefaults standardUserDefaults] objectForKey:@"com.apple.mouse.doubleClickThreshold"];
++
++    interval=([value respondsToSelector:@selector(doubleValue)] && [value doubleValue]>0.05 && [value doubleValue]<5) ? [value doubleValue] : 0.5;
++   }
++   return interval;
+ }
+ 
+ 
+--- a/src/Frameworks/AppKit/NSWindowTabbing.m
++++ b/src/Frameworks/AppKit/NSWindowTabbing.m
+@@ -17,6 +17,7 @@
+  * Show Previous Tab (Command-Shift-] and [), Move Tab to New Window and Merge All Windows work on it.
+  */
+ #import <AppKit/NSWindow.h>
++#import <AppKit/NSViewLayout.h>
+ #import <AppKit/NSWindow-Private.h>
+ #import <AppKit/NSWindowController.h>
+ #import <AppKit/NSApplication.h>
+@@ -125,8 +126,12 @@
+ - (NSView *)accessoryView { return _accessoryView; }
+ - (void)setAccessoryView:(NSView *)view
+ {
++    if (view == _accessoryView)
++        return;
++    [_accessoryView removeFromSuperview];
+     [_accessoryView autorelease];
+     _accessoryView = [view retain];
++    [objc_getAssociatedObject(_window, &SFTabGroupKey) _sfUpdateBars];
+ }
+ - (NSImage *)image { return nil; }
+ - (void)setImage:(NSImage *)image { }
+@@ -343,8 +348,44 @@
+     return NSMakeRect(NSMaxX(bounds) - SFTabPlusWidth, 0, SFTabPlusWidth, NSHeight(bounds));
+ }
+ 
++// each tab's accessory view (Terminal's bell and activity marks) at the right edge of its tab, centred,
++// hidden when the tab is too narrow for it and a title; views of tabs no longer here are taken out
++- (void)_sfLayoutAccessories
++{
++    NSArray *windows = [self _windows];
++    NSUInteger count = [windows count];
++    NSMutableArray *kept = [NSMutableArray array];
++
++    for (NSUInteger i = 0; i < count; i++) {
++        NSView *accessory = [[[windows objectAtIndex:i] tab] accessoryView];
++        NSRect tab = [self _tabRect:i of:count];
++
++        if (accessory == nil)
++            continue;
++        [kept addObject:accessory];
++        NSSize size = [accessory frame].size;
++
++        if (size.width <= 0 || size.height <= 0 || size.width > 24 || size.height > 24) {
++            NSSize fit = [accessory fittingSize];
++
++            size = NSMakeSize(MIN(MAX(fit.width, 1), 16), MIN(MAX(fit.height, 1), 16));
++        }
++        NSRect frame = NSMakeRect(floor(NSMaxX(tab) - 8 - size.width), floor(NSMidY(tab) - size.height / 2), size.width, size.height);
++
++        if ([accessory superview] != self)
++            [self addSubview:accessory];
++        if (!NSEqualRects([accessory frame], frame))
++            [accessory setFrame:frame];
++        [accessory setHidden:NSWidth(tab) < 30 + 2 * (8 + size.width + 6)];
++    }
++    for (NSView *view in [[[self subviews] copy] autorelease])
++        if (![kept containsObject:view])
++            [view removeFromSuperview];
++}
++
+ - (void)drawRect:(NSRect)rect
+ {
++    [self _sfLayoutAccessories];
+     BOOL dark = [[NSAppearance currentDrawingAppearance] _isDark];
+     NSRect bounds = [self bounds];
+     NSArray *windows = [self _windows];
+@@ -380,13 +421,25 @@
+             [line setFill];
+             NSRectFillUsingOperation(NSMakeRect(NSMinX(tab), NSMinY(tab) + 5, 1, NSHeight(tab) - 10), NSCompositeSourceOver);
+         }
+-        NSString *title = [[window tab] title];
++        /* Terminal's attributed tab titles may hold an attachment character; the tab's accessory view (its
++         * bell and activity marks) has a slot of its own at the tab's right edge, and the title is centred in
++         * what the close button on the left and that slot leave, truncated in the middle: the bell was drawn
++         * over the title once a few tabs were open */
++        NSString *title = [[[window tab] title] stringByReplacingOccurrencesOfString:@"\uFFFC" withString:@""];
+         NSDictionary *attributes = @{ NSFontAttributeName: [NSFont systemFontOfSize:12],
+                                       NSForegroundColorAttributeName: isSelected ? text : dim,
+                                       NSParagraphStyleAttributeName: style };
+-        NSRect titleRect = NSInsetRect(tab, 30, 0);
++        NSView *accessory = [[window tab] accessoryView];
++        CGFloat slot = 30;
++
++        if (accessory != nil && ![accessory isHidden])
++            slot = MAX(slot, 8 + NSWidth([accessory frame]) + 6);
++        NSRect titleRect = NSMakeRect(NSMinX(tab) + slot, NSMinY(tab), NSWidth(tab) - 2 * slot, NSHeight(tab));
+         NSSize size = [title sizeWithAttributes:attributes];
+ 
++        if (NSWidth(titleRect) < 12)
++            title = @"";
++
+         titleRect.origin.y = floor(NSMidY(tab) - size.height / 2);
+         titleRect.size.height = ceil(size.height);
+         [title drawInRect:titleRect withAttributes:attributes];
+--- a/src/Frameworks/AppKit/NSButtonCell.m
++++ b/src/Frameworks/AppKit/NSButtonCell.m
+@@ -1042,6 +1042,26 @@
+      }
+      break;
+ 
++    // the help button: a round button with a question mark (Terminal's Preferences showed an empty square)
++    case NSHelpButtonBezelStyle:{
++     BOOL dark=[[NSAppearance currentDrawingAppearance] _isDark];
++     CGFloat d=floor(MIN(NSWidth(frame),NSHeight(frame)))-1;
++     NSRect circle=NSMakeRect(floor(NSMidX(frame)-d/2)+0.5,floor(NSMidY(frame)-d/2)+0.5,d-1,d-1);
++     NSBezierPath *round=[NSBezierPath bezierPathWithOvalInRect:circle];
++     BOOL pressed=([self highlightsBy]&NSPushInCellMask) && [self isHighlighted];
++     NSDictionary *attrs=[NSDictionary dictionaryWithObjectsAndKeys:[NSFont boldSystemFontOfSize:floor(d*0.62)],NSFontAttributeName,
++                          dark ? [NSColor colorWithCalibratedWhite:0.92 alpha:1] : [NSColor colorWithCalibratedWhite:0.25 alpha:1],NSForegroundColorAttributeName,nil];
++     NSSize mark=[@"?" sizeWithAttributes:attrs];
++
++     [(dark ? [NSColor colorWithCalibratedWhite:pressed?0.42:0.33 alpha:1] : [NSColor colorWithCalibratedWhite:pressed?0.86:1 alpha:1]) setFill];
++     [round fill];
++     [[NSColor colorWithCalibratedWhite:0 alpha:dark?0.5:0.22] setStroke];
++     [round setLineWidth:1];
++     [round stroke];
++     [@"?" drawAtPoint:NSMakePoint(floor(NSMidX(circle)-mark.width/2),floor(NSMidY(circle)-mark.height/2)) withAttributes:attrs];
++     break;
++    }
++
+     default:
+      if(![self isBordered]){
+       [[_controlView graphicsStyle] drawUnborderedButtonInRect:frame defaulted:defaulted];
+--- a/src/Frameworks/AppKit/NSStringDrawing.m
++++ b/src/Frameworks/AppKit/NSStringDrawing.m
+@@ -11,6 +11,8 @@
+ #import <AppKit/NSStringDrawing.h>
+ #import <AppKit/NSStringDrawer.h>
+ #import <AppKit/NSRaise.h>
++#import <AppKit/NSParagraphStyle.h>
++#import <AppKit/NSAttributedString.h>
+ 
+ @implementation NSString(NSStringDrawing)
+ 
+@@ -18,7 +20,59 @@
+    [[NSStringDrawer sharedStringDrawer] drawString:self withAttributes:attributes atPoint:point inSize:NSZeroSize];
+ }
+ 
++/* A string that is wider than its rect and whose paragraph style truncates (head, middle or tail) is drawn with
++ * an ellipsis in place of what does not fit, on one line, as macOS draws it; the typesetter lays out these modes
++ * as clipping, and a centred title too long for its tab was drawn with its ends over each other. */
++static NSString *sfTruncated(NSString *string,NSDictionary *attributes,CGFloat width,NSLineBreakMode mode){
++   NSUInteger length=[string length];
++   NSString *ellipsis=@"\u2026";
++   NSUInteger low=0,high=length;
++
++   if([string sizeWithAttributes:attributes].width<=width)
++    return string;
++   // the most characters that fit with the ellipsis
++   while(low<high){
++    NSUInteger keep=(low+high+1)/2;
++    NSString *candidate;
++
++    if(mode==NSLineBreakByTruncatingHead)
++     candidate=[ellipsis stringByAppendingString:[string substringFromIndex:length-keep]];
++    else if(mode==NSLineBreakByTruncatingTail)
++     candidate=[[string substringToIndex:keep] stringByAppendingString:ellipsis];
++    else
++     candidate=[NSString stringWithFormat:@"%@%@%@",[string substringToIndex:(keep+1)/2],ellipsis,[string substringFromIndex:length-keep/2]];
++    if([candidate sizeWithAttributes:attributes].width<=width)
++     low=keep;
++    else
++     high=keep-1;
++   }
++   if(low==0)
++    return ellipsis;
++   if(mode==NSLineBreakByTruncatingHead)
++    return [ellipsis stringByAppendingString:[string substringFromIndex:length-low]];
++   if(mode==NSLineBreakByTruncatingTail)
++    return [[string substringToIndex:low] stringByAppendingString:ellipsis];
++   return [NSString stringWithFormat:@"%@%@%@",[string substringToIndex:(low+1)/2],ellipsis,[string substringFromIndex:length-low/2]];
++}
++
+ -(void)drawInRect:(NSRect)rect withAttributes:(NSDictionary *)attributes {
++   NSParagraphStyle *style=[attributes objectForKey:NSParagraphStyleAttributeName];
++   NSLineBreakMode mode=style!=nil ? [style lineBreakMode] : NSLineBreakByWordWrapping;
++
++   if((mode==NSLineBreakByTruncatingHead || mode==NSLineBreakByTruncatingMiddle || mode==NSLineBreakByTruncatingTail) &&
++      [self length]>1 && [self rangeOfString:@"\n"].location==NSNotFound && NSWidth(rect)>0){
++    NSString *fitted=sfTruncated(self,attributes,NSWidth(rect)-4,mode);
++
++    if(fitted!=self){
++     NSMutableDictionary *clipped=[[attributes mutableCopy] autorelease];
++     NSMutableParagraphStyle *one=[[style mutableCopy] autorelease];
++
++     [one setLineBreakMode:NSLineBreakByClipping];
++     [clipped setObject:one forKey:NSParagraphStyleAttributeName];
++     [[NSStringDrawer sharedStringDrawer] drawString:fitted withAttributes:clipped inRect:rect];
++     return;
++    }
++   }
+    [[NSStringDrawer sharedStringDrawer] drawString:self withAttributes:attributes inRect:rect];
+ }
+ 
+--- a/src/Frameworks/AppKit/NSColorWell.m
++++ b/src/Frameworks/AppKit/NSColorWell.m
+@@ -240,7 +240,9 @@
+                 return;
+         }
+ 
+-        if ([self isBordered]) {
++        // a well without a border (macOS 26's wells, Terminal's) is clicked the same way: a click activates it,
++        // a drag from it drags its colour; it only dragged, and Terminal's background well never opened the panel
++        {
+                 /*
+                  * Bordered color wells have interesting logic:
+ 
+@@ -256,7 +258,7 @@
+                  */
+                 BOOL    wasActive=[self isActive];
+                 NSPoint point=[self convertPoint:[event locationInWindow] fromView:nil];
+-                BOOL    mouseInBorder=!NSMouseInRect(point,NSInsetRect(_bounds,8,8),[self isFlipped]);
++                BOOL    mouseInBorder=[self isBordered] && !NSMouseInRect(point,NSInsetRect(_bounds,8,8),[self isFlipped]);
+                 BOOL canStartDrag = !mouseInBorder;
+                 if (mouseInBorder) {
+                         // Toggle the initial state
+@@ -292,8 +294,10 @@
+                                                 }
+                                         }
+                                 }
+-                        } else if (mouseInBounds) {
+-                                // Just toggle the state
++                        } else if (mouseInBounds && !mouseInBorder) {
++                                // Just toggle the state (a press on the border toggled it already: a second toggle
++                                // at its release put the well back, and Terminal's background well never opened
++                                // the colour panel)
+                                 if (wasActive) {
+                                         [self deactivate];
+                                 } else {
+--- a/src/Frameworks/AppKit/NSLayoutConstraint.m
++++ b/src/Frameworks/AppKit/NSLayoutConstraint.m
+@@ -240,6 +240,33 @@
+     return view;
+ }
+ 
++// an item of a constraint that is the view taken out or a view inside it
++static BOOL sfIsWithin(id item, NSView *removed) {
++    return item == removed || ([item isKindOfClass:[NSView class]] && [(NSView *)item isDescendantOf:removed]);
++}
++
++/* As on macOS, a view taken out of the hierarchy takes with it the constraints held above it that tie it, or a
++ * view inside it, to the rest: they stayed, holding the view unretained, and a later layout messaged it after it
++ * was freed (Activity Monitor ended with SIGSEGV switching its tabs, in -_sfLayoutTreeFitting:apply:). */
++void _NSViewRemoveConstraintsReferringTo(NSView *above, NSView *removed) {
++    for (; above != nil; above = [above superview]) {
++        NSArray *held = objc_getAssociatedObject(above, &constraintsKey);
++        NSMutableArray *gone = nil;
++
++        for (NSLayoutConstraint *c in held) {
++            id a = [c firstItem], b = [c secondItem];
++
++            if ((a != nil && sfIsWithin(a, removed)) || (b != nil && sfIsWithin(b, removed))) {
++                if (gone == nil)
++                    gone = [NSMutableArray array];
++                [gone addObject:c];
++            }
++        }
++        if (gone != nil)
++            [above removeConstraints:gone];
++    }
++}
++
+ static void collectConstraints(NSView *view, NSMutableArray *into) {
+     NSArray *held = objc_getAssociatedObject(view, &constraintsKey);
+ 
+--- a/src/Frameworks/AppKit/NSWorkspaceOpenConfiguration.m
++++ b/src/Frameworks/AppKit/NSWorkspaceOpenConfiguration.m
+@@ -144,9 +144,21 @@
+     return [self _universalAccessFlag:@"differentiateWithoutColor"];
+ }
+ 
++// libWindowServer: whether the compositor blurs behind translucent windows (weak: an older library has no answer)
++extern int _windowServerCanBlurBehind(void) __attribute__((weak_import));
++
++/* macOS draws a translucent window (Terminal's default profile, a sidebar, a popover) over a blur of
++ * what is behind it. A compositor that cannot blur would show what is behind sharp, as if the window had a
++ * hole: there transparency is reduced, as macOS reduces it when the user asks (Accessibility > Display),
++ * and applications draw their windows opaque. The user's own setting decides when there is one:
++ * `defaults write com.apple.universalaccess reduceTransparency -bool false` gives translucency back. */
+ - (BOOL)accessibilityDisplayShouldReduceTransparency
+ {
+-    return [self _universalAccessFlag:@"reduceTransparency"];
++    id value = [(id)CFPreferencesCopyAppValue(CFSTR("reduceTransparency"), CFSTR("com.apple.universalaccess")) autorelease];
++
++    if ([value respondsToSelector:@selector(boolValue)])
++        return [value boolValue];
++    return _windowServerCanBlurBehind == NULL || !_windowServerCanBlurBehind();
+ }
+ 
+ - (BOOL)accessibilityDisplayShouldReduceMotion
+--- a/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
++++ b/src/Frameworks/AppKit/NSMenu.subproj/NSMenuView.m
+@@ -32,6 +32,22 @@
+ // a clear margin round the panel holds its drop shadow, the demo's 0 10px 30px at a quarter black
+ #define SHADOW_M     16.0
+ #define MENU_MIN_W  210.0
++
++// SF_WS_TIMING: when the highlight follows the pointer, on the window server's clock (wall clock, ms)
++static int sfTiming(void) {
++    static int on = -1;
++
++    if (on < 0)
++        on = getenv("SF_WS_TIMING") != NULL;
++    return on;
++}
++
++static double sfNowMs(void) {
++    struct timespec ts;
++
++    clock_gettime(CLOCK_REALTIME, &ts);
++    return (double)ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
++}
+ // the room before the titles for check marks, in a menu that has a checked item
+ #define STATE_W      12.0
+ // how far the pointer goes from where the button went down before a release picks instead of leaving the menu open
+@@ -41,6 +57,9 @@
+ #define CLICK_TIME    [NSEvent doubleClickInterval]
+ // a submenu stays this long after the pointer went on to another item, so that a slanted move into it arrives
+ #define SUBMENU_LINGER 0.25
++// a submenu opens when the pointer has rested this long on its item (as on macOS): moving down a menu past
++// items with submenus builds none of them, and the highlight never waits for one to be built
++#define SUBMENU_DELAY  0.06
+ // typing selects by title prefix; a pause this long starts a new prefix
+ #define TYPE_SELECT_PAUSE 1.0
+ 
+@@ -759,6 +778,7 @@
+     }
+     [self closeSubmenu];
+ 
++    double sfOpenBegan = sfTiming() ? sfNowMs() : 0;
+     NSMenuItem *item = [[self presentedItems] objectAtIndex:index];
+     NSMenu *submenu = [item submenu];
+     NSArray *loose = (item == _macAppItem) ? _macAppItems : nil;
+@@ -858,6 +878,9 @@
+     _submenuWindow = [NSMenuView _sfWindowForView:view frame:frame anchor:anchor kind:kind parent:[self window]];
+     _submenuView = view;
+     _openSubmenuIndex = index;
++    if (sfTiming())
++        fprintf(stderr, "WSTIME %.1f menu-opened index=%ld window=%d began=%.1f\n", sfNowMs(), (long)index,
++                (int)[_submenuWindow windowNumber], sfOpenBegan);
+ }
+ 
+ - (void)closeSubmenu
+@@ -1069,6 +1092,10 @@
+     NSMenuView *lingerView = nil;
+     NSInteger lingerIndex = -1;
+     NSTimeInterval lingerSince = 0;
++    // the item with a submenu the pointer rests on, and since when (its submenu opens after SUBMENU_DELAY)
++    NSMenuView *openView = nil;
++    NSInteger openIndex = -1;
++    NSTimeInterval openSince = 0;
+     BOOL trace = getenv("SF_POPUP_TRACE") != NULL;
+ 
+     if (byButton) {
+@@ -1102,10 +1129,41 @@
+                           NSOtherMouseDraggedMask | NSMouseMovedMask | NSKeyDownMask | NSAppKitDefinedMask;
+ 
+         [self _sfDisplayChain];
++        /* wait for the next event, or until a submenu is due to open or to close: the loop wakes for those
++         * deadlines, not to look (0.1 s at most, for a cancel that reaches only the default mode) */
++        NSTimeInterval wait = 0.1, now_ = [NSDate timeIntervalSinceReferenceDate];
++
++        if (openView != nil)
++            wait = MIN(wait, MAX(0, openSince + SUBMENU_DELAY - now_));
++        if (lingerView != nil)
++            wait = MIN(wait, MAX(0, lingerSince + SUBMENU_LINGER - now_));
+         event = [NSApp nextEventMatchingMask:mask
+-                                   untilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]
++                                   untilDate:[NSDate dateWithTimeIntervalSinceNow:wait]
+                                       inMode:NSEventTrackingRunLoopMode
+                                      dequeue:YES];
++        /* Motion comes faster than a menu can be drawn when the pointer moves fast: only where it is now
++         * matters. Motion events of the same kind at the head of the queue are taken together and the last
++         * one stands for them (never one from behind a press or a release). */
++        if (event != nil && ([event type] == NSMouseMoved || [event type] == NSLeftMouseDragged ||
++                             [event type] == NSRightMouseDragged || [event type] == NSOtherMouseDragged)) {
++            NSEvent *next;
++
++            while ((next = [NSApp nextEventMatchingMask:mask untilDate:[NSDate distantPast] inMode:NSEventTrackingRunLoopMode dequeue:NO]) != nil &&
++                   [next type] == [event type] && [next window] == [event window]) {
++                event = [NSApp nextEventMatchingMask:mask untilDate:[NSDate distantPast] inMode:NSEventTrackingRunLoopMode dequeue:YES];
++            }
++        }
++        if (openView != nil && ![self _sfChainHas:openView])
++            openView = nil;
++        // the pointer rested on an item with a submenu: it opens now (its highlight is on the screen already)
++        if (openView != nil && [NSDate timeIntervalSinceReferenceDate] - openSince >= SUBMENU_DELAY) {
++            if ([openView highlightedItemIndex] == openIndex && openView->_openSubmenuIndex < 0 && [openView _sfItemOpensAtIndex:openIndex]) {
++                [openView openSubmenuAtIndex:openIndex];
++                if (sfTiming())
++                    fprintf(stderr, "WSTIME %.1f menu-submenu index=%ld window=%d\n", sfNowMs(), (long)openIndex, (int)[[openView window] windowNumber]);
++            }
++            openView = nil;
++        }
+         if (event == nil) {
+             // a click in another app reaches upstream's menu bar only through +_sfCancelTracking
+             [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate date]];
+@@ -1286,7 +1344,12 @@
+             else {
+                 NSMenuView *up_;
+ 
++                NSInteger was_ = [view highlightedItemIndex];
++
+                 [view setHighlightedItemIndex:[view _sfItemIsLiveAtIndex:index] ? index : -1];
++                if (sfTiming() && [view highlightedItemIndex] != was_)
++                    fprintf(stderr, "WSTIME %.1f menu-highlight index=%ld window=%d\n", sfNowMs(), (long)[view highlightedItemIndex],
++                            (int)[[view window] windowNumber]);
+                 for (up_ = view->_supermenuView; up_ != nil && view != self; up_ = (up_ == self) ? nil : up_->_supermenuView)
+                     [up_ setHighlightedItemIndex:up_->_openSubmenuIndex];
+                 if (view == self && _horizontal && _sfInWindow) {
+@@ -1308,8 +1371,15 @@
+                 else {
+                     if (lingerView == view || (lingerView != nil && view != lingerView))
+                         lingerView = nil;
+-                    if (view->_openSubmenuIndex < 0 && [view _sfItemOpensAtIndex:index])
+-                        [view openSubmenuAtIndex:index];
++                    if (view->_openSubmenuIndex < 0 && [view _sfItemOpensAtIndex:index]) {
++                        if (openView != view || openIndex != index) {
++                            openView = view;
++                            openIndex = index;
++                            openSince = [NSDate timeIntervalSinceReferenceDate];
++                        }
++                    }
++                    else if (openView == view)
++                        openView = nil;
+                 }
+                 keyView = view;
+             }

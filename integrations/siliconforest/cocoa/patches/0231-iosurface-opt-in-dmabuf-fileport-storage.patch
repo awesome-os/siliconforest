@@ -1,0 +1,215 @@
+--- a/src/Frameworks/IOSurface/IOSurface.c
++++ b/src/Frameworks/IOSurface/IOSurface.c
+@@ -14,6 +14,12 @@
+ #include <string.h>
+ #include <unistd.h>
+ #include "iosurfaced.h"
++#include <xf86drm.h>
++#include <sys/fileport.h>
++#include <sys/mman.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <stdio.h>
+ 
+ #define KEY(n) const CFStringRef kIOSurface##n = CFSTR("IOSurface" #n);
+ KEY(AllocSize) KEY(Width) KEY(Height) KEY(BytesPerRow) KEY(BytesPerElement) KEY(ElementWidth) KEY(ElementHeight)
+@@ -63,6 +69,7 @@
+     mach_port_t token;
+     // values too large for the shared header stay with this process
+     CFMutableDictionaryRef localValues;
++    int gpuFD;
+ };
+ 
+ static CFTypeID surfaceType;
+@@ -86,8 +93,14 @@
+     // dropping the token's receive right is what tells iosurfaced the global ID is gone
+     if (s->token != MACH_PORT_NULL)
+         mach_port_mod_refs(mach_task_self(), s->token, MACH_PORT_RIGHT_RECEIVE, -1);
+-    if (s->mapping)
+-        mach_vm_deallocate(mach_task_self(), s->mapping, s->mappedSize);
++    if (s->mapping) {
++        if (s->gpuFD >= 0)
++            munmap((void *)s->mapping, s->mappedSize);
++        else
++            mach_vm_deallocate(mach_task_self(), s->mapping, s->mappedSize);
++    }
++    if (s->gpuFD >= 0)
++        close(s->gpuFD);
+     if (s->entry != MACH_PORT_NULL)
+         mach_port_deallocate(mach_task_self(), s->entry);
+     if (s->localValues)
+@@ -111,6 +124,7 @@
+     IOSurfaceRef s = (IOSurfaceRef)_CFRuntimeCreateInstance(NULL, IOSurfaceGetTypeID(),
+                                                            sizeof(struct __IOSurface) - sizeof(CFRuntimeBase), NULL);
+ 
++    if (s) s->gpuFD = -1;
+     if (s)
+         s->localValues = CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+     return s;
+@@ -160,6 +174,119 @@
+     return (n + vm_page_size - 1) & ~(size_t)(vm_page_size - 1);
+ }
+ 
++// Opt-in GPU storage: the opaque IOSurface Mach port is a fileport for a
++// dma-buf. Existing iosurfaced already forwards opaque rights, so neither its
++// protocol nor the installed broker is changed. The first16KiB is shared
++// metadata; EGL imports pixels at dataOffset. CPU surfaces keep their VM entry.
++#define GPU_HEADER_SIZE 16384u
++#define GPU_HEADER_TAG 0x47505531u
++#define GPU_MAX_ALLOCATION (UINT64_C(1)<<30)
++static pthread_mutex_t gpuLock=PTHREAD_MUTEX_INITIALIZER;
++static int gpuRender=-2;
++static int gpuRenderLocked(void) {
++    if (gpuRender!=-2) return gpuRender;
++    gpuRender=-1;
++    for (int i=128;i<144;i++) {
++        char path[80];snprintf(path,sizeof(path),"/dev/dri/renderD%d",i);
++        int fd=open(path,O_RDWR|O_CLOEXEC);
++        if(fd<0)continue;
++        drmVersionPtr version=drmGetVersion(fd);
++        int asahi=version&&version->name&&!strcmp(version->name,"asahi");
++        if(version)drmFreeVersion(version);
++        if(asahi){gpuRender=fd;break;}
++        close(fd);
++    }
++    return gpuRender;
++}
++static void closeGPUHandleLocked(int fd,uint32_t handle) {
++    struct drm_gem_close close={.handle=handle};
++    drmIoctl(fd,DRM_IOCTL_GEM_CLOSE,&close);
++}
++static int gpuBufferFD(size_t size) {
++    // drm_asahi_gem_flags.DRM_ASAHI_GEM_WRITEBACK (bit0): shared header
++    // contains atomic counters; write-combined mappings do not support exclusives.
++    struct {uint64_t size;uint32_t flags,vm_id,handle,pad;} create={.size=size,.flags=1};
++    int result=-1;
++    pthread_mutex_lock(&gpuLock);
++    int render=gpuRenderLocked();
++    if(render>=0 && !drmIoctl(render,DRM_IOWR(DRM_COMMAND_BASE+5,create),&create)) {
++        if(drmPrimeHandleToFD(render,create.handle,DRM_CLOEXEC|DRM_RDWR,&result))result=-1;
++        // The exported descriptor owns its reference. No GEM handle is kept
++        // in our allocation file or shared with another CF object's lifetime.
++        closeGPUHandleLocked(render,create.handle);
++    }
++    pthread_mutex_unlock(&gpuLock);
++    return result;
++}
++static int isGPUBufferFD(int fd) {
++    uint32_t handle=0;int valid=0;
++    pthread_mutex_lock(&gpuLock);
++    int render=gpuRenderLocked();
++    if(render>=0&&!drmPrimeFDToHandle(render,fd,&handle)) {
++        valid=1;closeGPUHandleLocked(render,handle);
++    }
++    pthread_mutex_unlock(&gpuLock);
++    return valid;
++}
++static int validGPUHeader(const struct shared_header *h,uint64_t size) {
++    return h->magic==HEADER_MAGIC&&h->version==HEADER_VERSION&&
++        h->reserved==GPU_HEADER_TAG&&h->dataOffset==GPU_HEADER_SIZE&&
++        h->pixelFormat==0x42475241&&h->nplanes==0&&h->bytesPerElement==4&&
++        h->elementWidth==1&&h->elementHeight==1&&h->width>0&&h->width<=16384&&
++        h->height>0&&h->height<=16384&&h->bytesPerRow>=h->width*4&&
++        h->bytesPerRow<=1048576&&h->allocSize>=h->bytesPerRow*h->height&&
++        h->allocSize<=GPU_MAX_ALLOCATION&&h->allocSize<=size-GPU_HEADER_SIZE;
++}
++static int allocateGPU(IOSurfaceRef s,struct shared_header *h) {
++    const char *enabled=getenv("SFFX_IOSURFACE_GPU");
++    if(!enabled||strcmp(enabled,"1")||h->pixelFormat!=0x42475241||h->nplanes||
++       h->bytesPerElement!=4||h->elementWidth!=1||h->elementHeight!=1||
++       !h->width||h->width>16384||!h->height||h->height>16384||
++       h->bytesPerRow<h->width*4||h->bytesPerRow>1048576||
++       h->allocSize>GPU_MAX_ALLOCATION||h->allocSize<h->bytesPerRow*h->height)
++        return 0;
++    size_t size=(GPU_HEADER_SIZE+h->allocSize+GPU_HEADER_SIZE-1)&~(size_t)(GPU_HEADER_SIZE-1);
++    int fd=gpuBufferFD(size);
++    if(fd<0)return 0;
++    void *mapping=mmap(NULL,size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
++    if(mapping==MAP_FAILED){close(fd);return 0;}
++    fileport_t port=MACH_PORT_NULL;
++    if(fileport_makeport(fd,&port)){munmap(mapping,size);close(fd);return 0;}
++    memset(mapping,0,size);
++    s->gpuFD=fd;s->entry=port;s->mapping=(mach_vm_address_t)mapping;s->mappedSize=size;
++    h->dataOffset=GPU_HEADER_SIZE;h->reserved=GPU_HEADER_TAG;
++    s->header=mapping;s->memory=(uint8_t *)mapping+GPU_HEADER_SIZE;
++    return 1;
++}
++static IOSurfaceRef mapGPUEntry(int fd,mach_port_t entry) {
++    IOSurfaceRef s=NULL;
++    // Validate the descriptor before touching a mapping. In particular a
++    // fileport for an arbitrary small/truncated regular file is not a surface.
++    if(!isGPUBufferFD(fd)){close(fd);return NULL;}
++    off_t size=lseek(fd,0,SEEK_END);
++    if(size<GPU_HEADER_SIZE||size>GPU_HEADER_SIZE+GPU_MAX_ALLOCATION){close(fd);return NULL;}
++    void *peek=mmap(NULL,GPU_HEADER_SIZE,PROT_READ,MAP_SHARED,fd,0);
++    if(peek==MAP_FAILED){close(fd);return NULL;}
++    struct shared_header header;memcpy(&header,peek,sizeof(header));
++    munmap(peek,GPU_HEADER_SIZE);
++    if(!validGPUHeader(&header,size)){close(fd);return NULL;}
++    if((s=known(header.id))){close(fd);return s;}
++    void *mapping=mmap(NULL,size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
++    if(mapping==MAP_FAILED){close(fd);return NULL;}
++    if(!(s=newSurface())){munmap(mapping,size);close(fd);return NULL;}
++    if(mach_port_mod_refs(mach_task_self(),entry,MACH_PORT_RIGHT_SEND,1)!=KERN_SUCCESS){
++        munmap(mapping,size);close(fd);CFRelease(s);return NULL;
++    }
++    s->gpuFD=fd;s->entry=entry;s->mapping=(mach_vm_address_t)mapping;s->mappedSize=size;
++    s->header=mapping;s->memory=(uint8_t *)mapping+header.dataOffset;
++    remember(s);
++    return s;
++}
++// Private bridge API. The caller owns the returned descriptor; CPU-only
++// surfaces report -1 and retain the original upload/readback path.
++int IOSurfaceSFGPUCopyFD(IOSurfaceRef s) { return s&&s->gpuFD>=0?dup(s->gpuFD):-1; }
++size_t IOSurfaceSFGPUGetOffset(IOSurfaceRef s) { return s&&s->gpuFD>=0?s->header->dataOffset:0; }
++
+ static void findDaemon(void) {
+     const char *name = getenv("SFFX_IOSURFACE_SERVICE");
+     const char *prefix = "org.siliconforest.iosurfaced.sffx.";
+@@ -227,6 +354,8 @@
+ 
+ // maps a memory entry whose first page is a surface header, NULL if the port is not one
+ static IOSurfaceRef mapEntry(mach_port_t entry) {
++    int gpuFD=fileport_makefd(entry);
++    if(gpuFD>=0)return mapGPUEntry(gpuFD,entry);
+     mach_vm_address_t peek = 0, addr = 0;
+     struct shared_header *h;
+     mach_vm_size_t size;
+@@ -314,21 +443,23 @@
+ 
+     if (!(s = newSurface()))
+         return NULL;
+-    size = roundPage(HEADER_SIZE + h.allocSize);
+-    if (mach_make_memory_entry_64(mach_task_self(), &size, 0, MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE,
+-                                  &s->entry, MACH_PORT_NULL) != KERN_SUCCESS) {
+-        s->entry = MACH_PORT_NULL;
+-        CFRelease(s);
+-        return NULL;
+-    }
+-    if (mach_vm_map(mach_task_self(), &addr, size, 0, VM_FLAGS_ANYWHERE, s->entry, 0, FALSE,
+-                    VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE) != KERN_SUCCESS) {
+-        CFRelease(s);
+-        return NULL;
++    if(!allocateGPU(s,&h)) {
++        size = roundPage(HEADER_SIZE + h.allocSize);
++        if (mach_make_memory_entry_64(mach_task_self(), &size, 0, MAP_MEM_NAMED_CREATE | VM_PROT_READ | VM_PROT_WRITE,
++                                      &s->entry, MACH_PORT_NULL) != KERN_SUCCESS) {
++            s->entry = MACH_PORT_NULL;
++            CFRelease(s);
++            return NULL;
++        }
++        if (mach_vm_map(mach_task_self(), &addr, size, 0, VM_FLAGS_ANYWHERE, s->entry, 0, FALSE,
++                        VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, VM_INHERIT_NONE) != KERN_SUCCESS) {
++            CFRelease(s);
++            return NULL;
++        }
++        s->mapping = addr, s->mappedSize = size;
++        s->header = (struct shared_header *)addr;
++        s->memory = (uint8_t *)addr + HEADER_SIZE;
+     }
+-    s->mapping = addr, s->mappedSize = size;
+-    s->header = (struct shared_header *)addr;
+-    s->memory = (uint8_t *)addr + HEADER_SIZE;
+     memcpy(s->header, &h, sizeof(h));
+     if (!h.global || !(s->header->id = registerGlobal(s)))
+         s->header->id = localID();

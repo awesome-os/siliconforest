@@ -1,0 +1,68 @@
+--- a/src/Frameworks/Onyx2D/O2Font_ttf.m
++++ b/src/Frameworks/Onyx2D/O2Font_ttf.m
+@@ -4,6 +4,7 @@
+ #import <Onyx2D/O2Font_freetype.h>
+ 
+ #include <fontconfig/fontconfig.h>
++#include <pthread.h>
+ 
+ 
+ @implementation O2Font_ttf
+@@ -20,8 +21,45 @@
+    return (O2Glyph)(int)NSMapGet(_nameToGlyph,name);
+ }
+ 
++#ifdef FREETYPE_PRESENT
++static O2FontRef createWithFontName(NSString *name);
++#endif
++
++/* One font per name: each was a fontconfig substitution and match, the whole file read into memory
++ * and a FreeType face opened (AppKit makes an NSFont by name for each string it measures: a third
++ * of Terminal.app's launch went to its menu strip). A font is not drawn differently by the size
++ * it is used at (that is set on its face for each use), so one serves every user of the name.
++ * Names that find no font are not kept. */
+ O2FontRef O2FontCreateWithFontName_platform(NSString *name) {
+ #ifdef FREETYPE_PRESENT
++   static NSMutableDictionary *byName;
++   static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
++   O2FontRef result;
++
++   if(name==nil)
++    return nil;
++   pthread_mutex_lock(&lock);
++   result=[[byName objectForKey:name] retain];
++   pthread_mutex_unlock(&lock);
++   if(result!=nil)
++    return result;
++   result=createWithFontName(name);
++   if(result!=nil){
++    pthread_mutex_lock(&lock);
++    if(byName==nil)
++     byName=[[NSMutableDictionary alloc] init];
++    if([byName objectForKey:name]==nil)
++     [byName setObject:result forKey:name];
++    pthread_mutex_unlock(&lock);
++   }
++   return result;
++#else
++   return nil;
++#endif
++}
++
++#ifdef FREETYPE_PRESENT
++static O2FontRef createWithFontName(NSString *name) {
+    FcPattern *pattern=NULL;
+    FcPattern *match=nil;
+    FcChar8 *filename=nil;
+@@ -63,10 +101,8 @@
+    FcPatternDestroy(pattern);
+ 
+    return result;
+-#else
+-   return nil;
+-#endif
+ }
++#endif
+ 
+ O2FontRef O2FontCreateWithDataProvider_platform(O2DataProviderRef provider) {
+ #ifdef FREETYPE_PRESENT

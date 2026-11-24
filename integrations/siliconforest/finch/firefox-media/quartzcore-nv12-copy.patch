@@ -1,0 +1,56 @@
+--- a/CARenderer.m
++++ b/CARenderer.m
+@@ -460,6 +460,8 @@
+ #define SFCA_GL_RG16 0x822C
+ static int sfcaPlanesAsRG=-1;   // -1 unknown, 1 red/red-green work, 0 they failed once: luminance
+ 
++#include "quartzcore-nv12-copy.h"
++
+ static void uploadPlane(CFTypeRef surface,size_t plane,GLenum format,GLenum type,size_t sampleBytes) {
+    size_t width=surfaceAPI.planeWidth(surface,plane),height=surfaceAPI.planeHeight(surface,plane);
+    size_t rowBytes=surfaceAPI.planeRowBytes(surface,plane),channels=format==GL_LUMINANCE_ALPHA ? 2 : 1;
+@@ -472,14 +474,14 @@
+     GLint internal=channels==2 ? (wide ? SFCA_GL_RG16 : SFCA_GL_RG8) : (wide ? SFCA_GL_R16 : SFCA_GL_R8);
+ 
+     while(glGetError()!=GL_NO_ERROR){}
+-    glTexImage2D(GL_TEXTURE_2D,0,internal,(GLsizei)width,(GLsizei)height,0,rgFormat,type,surfaceAPI.planeBase(surface,plane));
++    glTexImage2D(GL_TEXTURE_2D,0,internal,(GLsizei)width,(GLsizei)height,0,rgFormat,type,sfcaCPUPlaneAddress(surface,plane,width,height,rowBytes,channels,sampleBytes));
+     if(glGetError()==GL_NO_ERROR)
+      sfcaPlanesAsRG=1;
+     else if(sfcaPlanesAsRG<0)
+      sfcaPlanesAsRG=0;
+    }
+    if(sfcaPlanesAsRG==0)
+-    glTexImage2D(GL_TEXTURE_2D,0,format,(GLsizei)width,(GLsizei)height,0,format,type,surfaceAPI.planeBase(surface,plane));
++    glTexImage2D(GL_TEXTURE_2D,0,format,(GLsizei)width,(GLsizei)height,0,format,type,sfcaCPUPlaneAddress(surface,plane,width,height,rowBytes,channels,sampleBytes));
+    glPixelStorei(GL_UNPACK_ROW_LENGTH,0);
+    glPixelStorei(GL_UNPACK_ALIGNMENT,4);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR);
+@@ -497,6 +499,18 @@
+     return;
+    if(kindIsYUV(kind) && (surfaceAPI.planeCount==NULL || surfaceAPI.planeCount(surface)!=2))
+     return;
++   GLint unpackState[6];
++   BOOL held=sfcaVideoHold(surface,kind);
++   if(kindIsYUV(kind))sfcaVideoCount(0,1);
++   if(held && sfcaVideoTryGPU(surface,texture,held)){
++    sfcaVideoGPU.decrement(surface);
++    return;
++   }
++   if(kindIsYUV(kind)){
++    sfcaVideoCount(3,1);
++    if(kind==CASurfaceYUV16Video || kind==CASurfaceYUV16Full)sfcaVideoCount(9,1);
++   }
++   if(kindIsYUV(kind))sfcaVideoSaveUnpack(unpackState);
+    surfaceAPI.lock(surface,1,NULL);
+    if(kind==CASurfaceBGRA){
+     glPixelStorei(GL_UNPACK_ROW_LENGTH,(GLint)(rowBytes/4));
+@@ -516,6 +530,8 @@
+     glBindTexture(GL_TEXTURE_2D,texture);
+    }
+    surfaceAPI.unlock(surface,1,NULL);
++   if(kindIsYUV(kind))sfcaVideoRestoreUnpack(unpackState);
++   if(held)sfcaVideoGPU.decrement(surface);
+ }
+ 
+ // luma from unit 0, CbCr from unit 1 (L and A of a luminance-alpha texture), out through the layer's opacity

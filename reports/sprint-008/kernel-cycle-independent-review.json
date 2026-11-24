@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "record": "kernel-cycle-independent-review",
+  "recorded_at": "2026-11-08T03:10:57Z",
+  "reviewer": "Claude (independent, read-only source review)",
+  "scope": {
+    "files_written": [
+      "reports/sprint-008/kernel-cycle-independent-review.json"
+    ],
+    "source_edits": false,
+    "tests_run_by_reviewer": false,
+    "ssh": false,
+    "hardware_accessed": false,
+    "maclab_server_contacted": false
+  },
+  "reviewed_sha256": {
+    "tools/m1_kernel_cycle.py": "3d274d1b699c0adfa1e38361d8348c3ee7567b854c5361ea80cbe23a18b7e3e6",
+    "tests/test_m1_kernel_cycle.py": "6f4441d95cb3fd9e801fa41fe141564e90609bd1d19702284da070a72a29f644",
+    "docs/M1_KERNEL_CYCLE.md": "9614f1a95c493ca129453d1feb056f5289c46f59d5189cdd306cde6429e8e110"
+  },
+  "pins_checked": "Bootstrap 350cd127..., frozen host_console a9f68695..., kernel d6c7ba75..., installed loader e4ead838..., macvdmtool db6da3ff... match the reviewed artifacts.",
+  "verdict": "K1_RESOLVED; NO_REMAINING_BLOCKER_FOR_BOUNDED_CYCLES",
+  "confirmed": [
+    "One-reset limit: at most one native 'reboot serial' per cycle, preceded by a durable reset-intent record; a failed reset or return is never retried; run_cycles stops at the first cycle that is not ENTRY_PARK_OBSERVED_LINUX_VERIFIED.",
+    "Durable global INCOMPLETE latch (O_EXCL, file and directory fsync) armed before the orderly reboot and cleared only after a verified Linux return; an existing latch refuses a new run. The target lock is the same path as the recovery controller and is passed to child CLIs, so an uncertain child keeps it.",
+    "Owned workers: child CLIs are never killed. A non-1 exit, missing host-result, an unexpected status or a null worker_returncode raises WorkerUnknown, which forbids any reset and any later hardware calls.",
+    "No-bootstrap path: if no proxy child was attempted, the controller only waits for the window's Linux fallback and never resets.",
+    "Classification: ENTRY_PARK_OBSERVED requires the exact full console line (bare or TTY> prefixed) in the guest worker.log AND the original context: expected equals the recomputed ELR/x0/x19/SPSR/CPU, interrupt write completed, event (3,3), raw context hash matches, observed values match under the 0x3df SPSR mask, and the packet/layout binding holds. Never a full-boot claim.",
+    "Return checks: same Linux kernel and installed loader, J293/T8103, changed boot UUID, /, /boot and /boot/efi rw (ESP vfat), watchdogs back to 30 s/2 min, old lab units inactive. A responding but unexpected Linux stops without reset.",
+    "A fresh IORegistry poll for the primary CDC (interface 1, exact VID/PID/location) is used after the vector rather than a fixed sleep; one bounded target-only ARP refresh is attempted during recovery."
+  ],
+  "blocker": {
+    "id": "K1",
+    "issue": "The reset decision rests on a single SSH probe. After an attempted child, if one ops.observe() fails (ConnectionError/TimeoutError), the controller immediately sends the PD reset (run_cycle recovery branch; docs step 7). A failed probe does not show that m1n1 still owns the target.",
+    "failure_scenarios": [
+      "The bootstrap child opened the port but did not claim the window (open failure, timing, accessory permission): the window expires and Linux is booting. The first probe fails, and the PD reset hits a Linux that is booting or about to mount rw filesystems.",
+      "After the guest capture closes the host stream, m1n1's exception-proxy read can fail and call flush_and_reboot (uartproxy.c:285-291, hv_exc.c:69-88). The target then falls back to Linux on its own. If the first probe lands during that boot, or Linux is up but hit by the observed stale-neighbor SSH refusal, the controller resets a returning or healthy Linux.",
+      "The existing autonomous-return test only covers Linux already reachable at the first probe."
+    ],
+    "fix": "Gate the reset on positive evidence that m1n1 still holds the target. Take a fresh discover(); reset immediately only if the primary 0x1209/0x316d CDC is still enumerated, meaning a claimed window or exact121/HV proxy that cannot fall back. If it is absent, treat it as a possible handoff or autonomous reboot: run recover_linux (bounded wait at least window + Linux boot, with the single neighbor refresh) and do not reset. If that also fails, stop with INCOMPLETE for review. Add tests for 'first probe fails, CDC absent, Linux returns later -> no reset' and 'first probe fails, CDC present -> exactly one reset'.",
+    "status": "RESOLVED_AT_3d274d1b",
+    "resolution": "After an attempted child, a failed Linux probe now triggers a fresh discover(), saved durably as recovery-cdc.json. If the primary 0x1209/0x316d CDC is present, a durable reset intent is saved and exactly one reboot serial is sent, then recover_linux. If it is absent, only recover_linux runs (150 s bounded wait with the single target-only ARP refresh) and no reset is sent; failure leaves INCOMPLETE for review. An ioreg failure or ambiguous topology raises into RECOVERY_INCOMPLETE_NO_RETRY without a reset. Tests cover CDC absent then later Linux (no reset), CDC present (exactly one reset), and missing post-vector CDC with no Linux (stops without reset).",
+    "residual": "A CDC still listed for milliseconds after an autonomous m1n1 reboot, or the next boot's unclaimed window device, can still cause one reset. That reset hits a pre-Linux m1n1 stage, not a running Linux with rw filesystems, so the storage concern behind K1 does not apply."
+  },
+  "non_blocking_notes": [
+    "RESOLVED: the post-vector wait_cdc requires a device-level (IORegistryEntryID, sessionID) different from the pre-vector enumeration; primary_cdc requires both as valid integers (tested).",
+    "Durability on the macOS controller: os.fsync is not F_FULLFSYNC, so the INCOMPLETE latch and intents may not survive an M5 power loss. Consider fcntl.F_FULLFSYNC for these records.",
+    "RESOLVED: a macvdmtool timeout raises NativeResetTimeout, saves native-reset-timeout.json with ace_state and target_reset_state unknown and retry_permitted false, and marks the result accordingly (tested)."
+  ],
+  "limits": [
+    "Source review only; the reviewer did not run the 25 host tests or any cycle.",
+    "Correct classification depends on the frozen host_console capture and on root's park_address derivation, which the reviewer independently matched for the first-entry evidence (first_entry + 0xCC).",
+    "Whether m1n1 reboots on host close after capture remains hardware-unproven; K1 covers both outcomes."
+  ],
+  "hardware_boot_observed": false,
+  "full_xnu_boot_claimed": false,
+  "revision": 2,
+  "superseded_review_sha256": {
+    "tools/m1_kernel_cycle.py": "72a4125e6428fdf3a5efa525f35276080e65ac414c864da2a19c85f5bfd60cfe",
+    "tests/test_m1_kernel_cycle.py": "4e1469e3bc24836ca09c1de34d0ca0ac1f1cdf38309adfa7689a31b5a5f5ffc3",
+    "docs/M1_KERNEL_CYCLE.md": "4f1f7fd39d739ff2696426e6a4319c63c7c367519a43e9c5a693fbdae4ef2275"
+  },
+  "runtime_follow_up": {
+    "recorded_at": "2026-11-08T03:21:00Z",
+    "scope": "Consistency review of root-sanitized public records only. The reviewer did NOT independently reparse the three raw exception contexts or read private run logs for these cycles.",
+    "records_sha256": {
+      "reports/sprint-008/three-unattended-cycles.json": "dafc43bda679651a9ebc0f2e061a884e3d1ea1c28dfdaf990ebfc8a6ba5c7348",
+      "reports/sprint-008/final-health.json": "6dc5e000c690c71199964afcecaeaa5fc7f3dc9c09379f64e48319ca41ab8f6a"
+    },
+    "consistency_checks": [
+      "Three cycles, each ENTRY_PARK_OBSERVED_LINUX_VERIFIED, with exactly one reset, entry_park_observed, linux_verified, all six context conditions true and interrupt requested/completed.",
+      "Every cycle binds the K1-resolved controller 3d274d1b... (unchanged on disk), kernel d6c7ba75..., installed loader e4ead838... and identical helper hashes (bootstrap 350cd127..., host_console a9f68695...).",
+      "Boot UUID hash chain is continuous (cycle 1 returned = cycle 2 baseline; cycle 2 returned = cycle 3 baseline), with three distinct returned boot hashes and three distinct context hashes.",
+      "Each return records all three mounts rw, watchdogs 30 s / 2 min and old units inactive; reset-intent-to-verified-return times 39.1 s, 60.3 s and 39.1 s are within the 150 s recovery bound.",
+      "final-health.json agrees: known kernel 7.2.11-6-1-ARCH, window-v1 stage2, loader e4ead838..., original backup 54fa07e4..., mounts rw, watchdogs restored, old units inactive, INCOMPLETE latch absent, controller 3d274d1b....",
+      "Scope fields are honest: full_kernel_initialization false, Darwin_userspace false, bare_metal_UART_verified_by_guest false, full_xnu_boot_claimed false per cycle, maclab_server_used false."
+    ],
+    "observations": [
+      "The public command field includes an M5 user home path; it is not a secret and the same path is already a controller constant, but it could be generalized if public records should avoid user paths."
+    ],
+    "conclusion": "The sanitized records are internally consistent with three unattended bounded entry/park cycles and verified Linux recovery under the reviewed K1-resolved controller. They support no claim beyond the pre-VM diagnostic checkpoint.",
+    "limits": [
+      "Relies on root-sanitized fields; the independent raw-context reparse covers only the earlier first-entry evidence (first-entry-independent-review.json)."
+    ]
+  }
+}

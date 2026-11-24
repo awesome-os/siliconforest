@@ -1,0 +1,104 @@
+# Original private provider OBJECT package only. No kext, KC, image or boot.
+let
+  pin = "e7aa00a60f0b56ef35aa24252e81467787bf71ea";
+  pd = (import ../../rebase/pd.nix).pd;
+  pkgs = import pd.inputs.nixpkgs { system = "x86_64-linux"; };
+  p = pd.packages.x86_64-linux;
+  nativeReceiptText = builtins.readFile ../native_backing/source-validation-001.json;
+  coreReceiptText = builtins.readFile ../private_lifecycle/source-validation-001.json;
+  native = builtins.fromJSON nativeReceiptText;
+  core = builtins.fromJSON coreReceiptText;
+  files = [
+    { name = "native_backing/backing.c"; path = ../native_backing/backing.c; sha = native.files_sha256."backing.c"; }
+    { name = "native_backing/backing.h"; path = ../native_backing/backing.h; sha = native.files_sha256."backing.h"; }
+    { name = "native_backing/lifecycle_bridge.h"; path = ../native_backing/lifecycle_bridge.h; sha = native.files_sha256."lifecycle_bridge.h"; }
+    { name = "native_backing/native_iokit.cpp"; path = ../native_backing/native_iokit.cpp; sha = native.files_sha256."native_iokit.cpp"; }
+    { name = "native_backing/native_iokit.h"; path = ../native_backing/native_iokit.h; sha = native.files_sha256."native_iokit.h"; }
+    { name = "private_lifecycle/lifecycle.c"; path = ../private_lifecycle/lifecycle.c; sha = core.files_sha256."lifecycle.c"; }
+    { name = "private_lifecycle/lifecycle.h"; path = ../private_lifecycle/lifecycle.h; sha = core.files_sha256."lifecycle.h"; }
+  ];
+  inputs = builtins.toJSON {
+    scope = "Original native backing ARM64 relocatable objects only, no target execution";
+    inherit pin;
+    native_source_set_sha256 = native.source_set_sha256;
+    core_source_set_sha256 = core.source_set_sha256;
+    production_files = map (f: { inherit (f) name sha; }) files;
+    toolchain = "${p.arm64-cross-toolchain}";
+    linker = "${p.native-ld}";
+    kernel_headers = "${p.xnu-headers-arm64}";
+    sdk = "${p.apple-sdk}";
+    test_sdk_included = false;
+    module_or_image_built = false;
+  };
+in
+assert pd.rev == pin;
+assert builtins.hashString "sha256" nativeReceiptText == "79b153f2de3c0899a1a59f42b2b2d24dd468588723ca9f75109d53d90269656b";
+assert builtins.hashString "sha256" coreReceiptText == "c585fd8b80479975a46ad19c83b7610a53f3a4a1a420241cbe0022a2d1fb82fb";
+assert native.source_set_sha256 == "f1778f4df6fd0dabcbd441a28b93157f30b7c16d005617a71ae8ab11da18129a";
+pkgs.runCommand "darwin-lab-bcm4378-native-backing-objects-001" {
+  nativeBuildInputs = [ p.arm64-cross-toolchain p.native-ld pkgs.python3 ];
+  preferLocalBuild = true;
+  allowSubstitutes = false;
+} ''
+  mkdir -p source/native_backing source/private_lifecycle
+  ${pkgs.lib.concatMapStringsSep "\n" (f: ''
+    cp ${f.path} source/${f.name}
+    echo '${f.sha}  source/${f.name}' | sha256sum -c -
+  '') files}
+  export DARWIN_SDK_ROOT=${p.apple-sdk}/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk
+  headers=${p.xnu-headers-arm64}/System/Library/Frameworks/Kernel.framework/Versions/A
+  availability=${pd.outPath}/src/Libraries/AvailabilityVersions/include
+  common=(-Wall -Wextra -Werror -Wpedantic -Wframe-larger-than=1024 -fstack-usage
+          -fno-stack-protector -fno-common -DKERNEL -DKERNEL_PRIVATE -DTARGET_OS_OSX
+          -isystem "$headers/Headers" -isystem "$headers/PrivateHeaders" -isystem "$availability" -O2)
+  ${p.arm64-cross-toolchain}/bin/arm64-apple-darwin20.4-clang -std=c11 -ffreestanding -fno-builtin "''${common[@]}" \
+    -MD -MF lifecycle.d -c source/private_lifecycle/lifecycle.c -o lifecycle.o
+  ${p.arm64-cross-toolchain}/bin/arm64-apple-darwin20.4-clang -std=c11 -ffreestanding -fno-builtin "''${common[@]}" \
+    -MD -MF backing.d -c source/native_backing/backing.c -o backing.o
+  ${p.arm64-cross-toolchain}/bin/arm64-apple-darwin20.4-clang++ -std=c++17 -fno-exceptions -fno-rtti -fapple-kext "''${common[@]}" \
+    -MD -MF native_iokit.d -c source/native_backing/native_iokit.cpp -o native_iokit.o
+  ${p.native-ld}/bin/ld -r -arch arm64 -Z -platform_version macos 26.5 26.5 \
+    -o native_backing.o lifecycle.o backing.o native_iokit.o
+  ${p.arm64-cross-toolchain}/bin/arm64-apple-darwin20.4-nm -u native_backing.o > undefined.txt
+  ${p.arm64-cross-toolchain}/bin/arm64-apple-darwin20.4-nm -g --defined-only native_backing.o > defined.txt
+  python3 - <<'PY'
+from pathlib import Path
+import struct
+raw=Path('native_backing.o').read_bytes()
+magic,cpu,sub,kind,ncmds,cmdbytes,flags,reserved=struct.unpack_from('<8I',raw)
+assert (magic,cpu,kind)==(0xfeedfacf,0x100000c,1), 'ARM64 MH_OBJECT required'
+actual={line.split()[-1] for line in Path('undefined.txt').read_text().splitlines() if line.strip()}
+expected={'_IOLockAlloc','_IOLockLock','_IOLockUnlock','_IOMallocZero','_PAGE_SHIFT_CONST',
+          '__ZN24IOBufferMemoryDescriptor22inTaskWithPhysicalMaskEP4taskjyy','_bzero',
+          '_kernel_task','_memcmp','_memcpy','_memmove','_page_size'}
+assert actual==expected,(actual,expected)
+defined={line.split()[-1] for line in Path('defined.txt').read_text().splitlines() if line.strip()}
+assert {'_bpl_init','_bpn_init','_bpn_native_pin_empty','_bpn_native_configure'}<=defined
+for dep in Path('.').glob('*.d'):
+    assert '/test_sdk/' not in dep.read_text(), 'stand-in headers must not enter native build'
+for su in Path('.').glob('*.su'):
+    for line in su.read_text().splitlines():
+        name,frame,mode=line.split('\t')
+        assert mode=='static' and int(frame)<=1024,(name,frame,mode)
+off=32
+for _ in range(ncmds):
+    cmd,size=struct.unpack_from('<II',raw,off)
+    assert size>=8 and off+size<=32+cmdbytes
+    if cmd==0x19:
+        sections=struct.unpack_from('<I',raw,off+64)[0]
+        for i in range(sections):
+            name=raw[off+72+i*80:off+88+i*80].split(b'\0',1)[0]
+            assert name not in (b'__mod_init_func',b'__mod_term_func'),name
+    off+=size
+assert off==32+cmdbytes
+PY
+  mkdir -p "$out/lib" "$out/share/objects" "$out/share/inputs" "$out/share/validation"
+  cp native_backing.o "$out/lib/"
+  cp lifecycle.o backing.o native_iokit.o "$out/share/objects/"
+  cp -R source/native_backing source/private_lifecycle "$out/share/inputs/"
+  cp *.d *.su undefined.txt defined.txt "$out/share/validation/"
+  cat > "$out/share/build-inputs.json" <<'JSON'
+${inputs}
+JSON
+  (cd "$out"; sha256sum lib/native_backing.o share/objects/*.o) > "$out/share/sha256.txt"
+''

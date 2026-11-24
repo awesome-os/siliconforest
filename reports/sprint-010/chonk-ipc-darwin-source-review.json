@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude (independent read-only code review; I authored the earlier contract and the B2 addendum, not this code)",
+  "status": "INTERIM_PAUSED_AT_CLEAN_BOUNDARY_FOR_PRIORITY_RUNTIME_FIXTURE_REVIEW",
+  "target": "integrations/puredarwin/chonkstep-darwin/darwin-ipc: lib.rs 6426f5b1, darwin_fd_tests.rs 4c2609ca, darwin-ipc.patch 934c4286, source-inputs.json adf13fa4",
+  "interim_verdict": "NO ADMISSION VERDICT YET. Paused at a clean boundary on root's instruction. Binding, descriptor creation, accept, credentials and the address rule are reviewed and consistent with contract C1-C6, apart from one confirmed Darwin stale-endpoint divergence (F1). The remaining items are listed under pending. IPC is still not admitted: B2 still needs the independently reviewed managed C shim plus Darwin runtime evidence.",
+  "binding": {
+    "base": "source-inputs base a2bf660d = runs/m1-desktop-010/keyboard-only-compositor-build-001/source/crates/chonk-ipc/src/lib.rs. That is the isolated source of the qualified chonkstep-darwin 717da106 build (keyboard-only-compositor-native-build-001.json), and it equals sources/chonkstep-darwin.",
+    "patch_reproduces_leaf": "On a scratch copy, patch -p1 of darwin-ipc.patch onto the base yields lib.rs byte-identical to the leaf (6426f5b1) and darwin_fd_tests.rs identical to the leaf (4c2609ca).",
+    "production_copy": "runs/m1-desktop-010/desktop-shell-build-001/source/crates/chonk-ipc/src/lib.rs is cmp-identical to the leaf."
+  },
+  "reviewed_consistent": {
+    "C1_creation": "On Darwin, new_nonblocking_socket uses socket(AF_UNIX, kind, 0), then configure_owned. configure_owned does F_GETFL, F_SETFL|O_NONBLOCK, F_GETFD, F_SETFD|FD_CLOEXEC, then reads both flags back and returns InvalidData if either is missing (lib.rs:121-147). Every syscall is checked with cvt. Any failure returns before publication, and dropping the OwnedFd closes the descriptor (Rust ignores close errors on that error path, which is standard). Host tests: all 6 fcntl failure points close the fd with no retry, and a no-op setter is caught by the readback (darwin_fd_tests.rs). The Linux branch keeps SOCK_CLOEXEC|SOCK_NONBLOCK.",
+    "C2_accept": "On Darwin: accept(listener, NULL, NULL), then the same configure_owned on the new fd. It does not rely on inheriting FNONBLOCK from the listener (lib.rs:243-265). WouldBlock and Interrupted give Ok(None), as on Linux. The Linux accept4 line is identical to the base.",
+    "C3_credentials": "uid and gid come only from libc getpeereid, a connect-time LOCAL_PEERCRED snapshot. pid comes from getsockopt(SOL_LOCAL, LOCAL_PEERPID) with a checked rc, exact length and pid > 0. Leftover uid_t::MAX or gid_t::MAX sentinels are rejected. Any failure is an error, with no getuid/getpid/0 substitution (lib.rs:280-299). The Linux SO_PEERCRED path is identical to the base.",
+    "C4_semantics": "The doc comment states that pid is XNU's peer-socket last_pid, unlike Linux's creator pid, and that the separate reads are not an atomic identity snapshot. No authorization uses pid. peer_is_this_user_on and peer_is_this_user_or_root_on / uid_is_this_user_or_root are unchanged: same uid, or same uid or root only for the command socket.",
+    "C5_address": "Darwin sockaddr_un: paths of 104 bytes or more and NUL bytes are refused. sun_len = offsetof(sun_path) + len + 1, using a checked u8, and the returned addrlen is that same value (lib.rs:26-53). Maximum 2+103+1 = 106, within XNU's SOCK_MAXADDRLEN of 255.",
+    "send_nosignal": "send_on uses MSG_DONTWAIT|MSG_NOSIGNAL. The pinned XNU defines MSG_NOSIGNAL as 0x80000 when __DARWIN_C_LEVEL >= 200809L (sys/socket.h:637), and sendit suppresses SIGPIPE for it (uipc_syscalls.c:1389-1391 and 1964).",
+    "socket_types": "This file creates only SOCK_STREAM sockets (SEQPACKET appears only in a comment). The pinned XNU local domain provides only SOCK_STREAM and SOCK_DGRAM (uipc_proto.c:85,94), so any future AF_UNIX SEQPACKET user would fail on Darwin."
+  },
+  "findings": {
+    "F1_darwin_stale_endpoint_ambiguity": {
+      "severity": "medium (policy divergence from the documented Linux behaviour; runtime impact needs a stalled live owner)",
+      "claim": "On Darwin, clear_stale_socket unlinks the path whenever the probe connect fails with ECONNREFUSED (lib.rs:236-239). In the pinned XNU, unp_connect also returns ECONNREFUSED when a live listener's accept queue is full: sonewconn returns NULL when so_qlen >= 3*so_qlimit/2, which is 24 for BACKLOG 16 (uipc_usrreq.c:1406-1408; uipc_socket2.c:360-362). It does the same when a socket is bound but not yet listening. Linux returns EAGAIN for the full-queue case, which the existing WouldBlock arm treats as a live owner. That arm cannot fire for this case on Darwin, so a second session can unlink a live but stalled owner's socket, which is the 'second shell steals the first' outcome the probe exists to prevent. Errno alone cannot tell the two apart. A Darwin-specific ownership proof, such as an flock'd sidecar lock held for the listener's lifetime, would be needed before unlinking. The bound-but-not-listening window also exists on Linux and is unchanged.",
+      "minor": "The comment 'Darwin AF_UNIX can return EINPROGRESS for a live listener' has no matching code in the pinned uipc_usrreq.c. It is harmless, because the Darwin arm refuses every error except ECONNREFUSED."
+    }
+  },
+  "pending_when_resumed": [
+    "Check that the libc 0.2.189 Apple values of SOL_LOCAL (0), LOCAL_PEERPID (2), MSG_NOSIGNAL and getpeereid's signature match the pinned headers.",
+    "Recheck the pinned uipc_ctloutput LOCAL_PEERPID line numbers for this exact tree (the semantics were already recorded in the contract review).",
+    "Do a complete token-level confirmation that every non-macOS path is byte-equivalent to the base, beyond the socket, accept4, SO_PEERCRED and stale-arm lines checked so far.",
+    "Review all 6 host tests in detail, including whether the EBADF-after-drop assertions can be confused by parallel test threads reusing descriptor numbers (a false failure, never a false pass).",
+    "Final verdict and recommendation for F1."
+  ],
+  "not_claimed": ["IPC admission", "Darwin runtime peer identity", "B2 closure (needs the reviewed C shim plus runtime)", "spawn behaviour"],
+  "scope": "Read-only: leaf files, base, patch reapplied on a scratch copy, production copy, pinned XNU sources. No edits, builds, SSH or hardware."
+}

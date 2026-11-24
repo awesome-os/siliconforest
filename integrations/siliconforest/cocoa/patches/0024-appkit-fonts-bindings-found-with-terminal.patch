@@ -1,0 +1,125 @@
+--- a/src/Frameworks/AppKit/NSFont.m
++++ b/src/Frameworks/AppKit/NSFont.m
+@@ -349,6 +349,11 @@
+        NSString *fontName = [keyed decodeObjectForKey:@"NSName"];
+     NSString          *name=[[NSFont nibFontTranslator] translateFromNibFontName: fontName];
+     CGFloat              size=[keyed decodeFloatForKey:@"NSSize"];
++
++    // current nibs archive the system font of a control without a size ("the size this control
++    // has by default"): drawn at size 0 a label is a row of dots
++    if(size<=0)
++     size=[NSFont systemFontSize];
+     // int                flags=[keyed decodeIntForKey:@"NSfFlags"]; // ?
+ 
+     [self dealloc];
+@@ -407,7 +412,26 @@
+     [NSException raise:NSInvalidArgumentException format:@"-[%@ %s] name==nil",self,sel_getName(_cmd)];
+ 
+         // Name can be PS name or a display name - internally we want a PS name - that's what Cocoa is doing
+-        name = [O2Font postscriptNameForFontName:name];
++        NSString *known = [O2Font postscriptNameForFontName:name];
++
++        // -postscriptNameForFontName: hands the name back when no installed face carries it
++        // (PostScript, full or family name). Such a name is a font of macOS this system has an
++        // open stand-in for, or has not at all: CoreText's registry decides which face (Menlo and
++        // the other fixed-pitch families get a fixed-pitch face). Left to fontconfig's loose
++        // pattern match, "Menlo-Regular" became the proportional default and a terminal measured
++        // its cells from it.
++        if(known==name){
++         CTFontRef substitute=CTFontCreateWithName((CFStringRef)name,size>0 ? size : 12.0,NULL);
++
++         if(substitute!=NULL){
++          NSString *actual=[(NSString *)CTFontCopyPostScriptName(substitute) autorelease];
++
++          if([actual length]>0)
++           known=actual;
++          CFRelease(substitute);
++         }
++        }
++        name = known;
+ 
+    result=[self cachedFontWithName:name size:size];
+ 
+--- a/src/Frameworks/AppKit/NSController/NSArrayController.m
++++ b/src/Frameworks/AppKit/NSController/NSArrayController.m
+@@ -399,9 +399,20 @@
+ 
+ -(NSArray *)selectedObjects
+ {
+-	id idxs=[self selectionIndexes];
++	NSIndexSet *idxs=[self selectionIndexes];
+ 	if(idxs) {
+-		return [[self arrangedObjects] objectsAtIndexes:idxs];
++		NSArray *arranged=[self arrangedObjects];
++		NSUInteger count=[arranged count];
++
++		// the selection may name rows the content does not have yet (a selection bound to a model
++		// arrives before the content does): those select nothing, they are not an error
++		if([idxs count]>0 && [idxs lastIndex]>=count){
++			NSMutableIndexSet *inside=[[idxs mutableCopy] autorelease];
++
++			[inside removeIndexesInRange:NSMakeRange(count,NSNotFound-count)];
++			idxs=inside;
++		}
++		return [arranged objectsAtIndexes:idxs];
+ 	}
+ 	return [NSArray array];
+ }
+--- a/src/Frameworks/AppKit/NSKeyValueBinding/NSKVOBinder.m
++++ b/src/Frameworks/AppKit/NSKeyValueBinding/NSKVOBinder.m
+@@ -300,12 +300,28 @@
+ // If this isn't how it's supposed to be, there must be some other logic which prevents writing back values
+ // which are read only
+    
+-   if(context==&NSKVOBinderChangeContext) {
++   // A binding whose key the view or the model does not have raises from key-value coding.
++   // This runs inside a change notification, under whatever made the change (a setter, a timer,
++   // a queue callout that an exception cannot cross): the fault is one binding's, it is reported
++   // once and the change that caused it goes on.
++   @try {
++    if(context==&NSKVOBinderChangeContext) {
+ 		[self writeDestinationToSource];
+ 	} else {
+ 		NSBindingDebugLog(kNSBindingDebugLogLevel3, @"punting to super");
+ 		[super observeValueForKeyPath:kp ofObject:object change:change context:context];
+     }
++   } @catch(NSException *exception) {
++    static NSMutableSet *reported=nil;
++    NSString *what=[NSString stringWithFormat:@"%@.%@ <-> %@.%@", [_source className], _binding, [_destination className], _keyPath];
++
++    if(reported==nil)
++     reported=[[NSMutableSet alloc] init];
++    if(![reported containsObject:what]){
++     [reported addObject:what];
++     NSLog(@"binding %@ failed: %@: %@", what, [exception name], [exception reason]);
++    }
++   }
+ }
+ 
+ -(void)bind
+--- a/src/Frameworks/AppKit/NSKeyValueBinding/NSBinder.m
++++ b/src/Frameworks/AppKit/NSKeyValueBinding/NSBinder.m
+@@ -229,13 +229,16 @@
+       NSBindingDebugLog(kNSBindingDebugLogLevel2, @"new value %@", [_source valueForKeyPath:_bindingPath]);
+ 		NSBindingDebugLog(kNSBindingDebugLogLevel2, @"DST setting %@, for %@",[_source valueForKeyPath:_bindingPath],_keyPath);
+       
+-       id value=[_source valueForKeyPath:_bindingPath];
+-       
+-       value=[self reverseTransformedObject:value];
+-       
+-       [_destination setValue:value forKeyPath:_keyPath];
+-      
+-       [self startObservingChanges];
++       // observing starts again whether or not the destination took the value
++       @try {
++        id value=[_source valueForKeyPath:_bindingPath];
++
++        value=[self reverseTransformedObject:value];
++
++        [_destination setValue:value forKeyPath:_keyPath];
++       } @finally {
++        [self startObservingChanges];
++       }
+     }
+    }
+ }

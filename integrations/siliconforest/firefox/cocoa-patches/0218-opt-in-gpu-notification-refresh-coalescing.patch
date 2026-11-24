@@ -1,0 +1,30 @@
+--- a/src/Frameworks/QuartzCore/CALayerContext.m
++++ b/src/Frameworks/QuartzCore/CALayerContext.m
+@@ -291,14 +291,25 @@
+    _renderScheduled=YES;
+    [self retain];
+    // runs inside a run loop wait, so it drains its own pool (a frame's contents and images)
+-   dispatch_async(dispatch_get_main_queue(),^{
++   void (^deliver)(void)=^{
+     @autoreleasepool {
+      _renderScheduled=NO;
+      if([_delegate respondsToSelector:@selector(layerContextNeedsDisplay:)])
+       [_delegate performSelector:@selector(layerContextNeedsDisplay:) withObject:self];
+     }
+     [self release];
+-   });
++   };
++   // Optional 60Hz batching for the private M1 GPU path. Keep the latest tree
++   // and its revisions, avoiding intermediate exports in the same refresh.
++   // Absolute tick boundaries avoid adding the render cost to every period.
++   if(getenv("SFFX_GPU_COALESCE_TICKS")){
++    double now=CACurrentMediaTime(),delay=(floor(now*60.0)+1.0)/60.0-now;
++    if(isfinite(delay)&&delay>0&&delay<.017){
++     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)ceil(delay*1e9)),dispatch_get_main_queue(),deliver);
++     return;
++    }
++   }
++   dispatch_async(dispatch_get_main_queue(),deliver);
+ }
+ 
+ // An opt-in GPU frame, never a CPU bitmap disguised as GPU storage.

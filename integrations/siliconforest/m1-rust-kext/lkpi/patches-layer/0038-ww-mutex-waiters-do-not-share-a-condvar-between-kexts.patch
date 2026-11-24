@@ -1,0 +1,56 @@
+ww_mutex: a contended lock is retried, not waited for on a per-kext condition variable
+
+Audit finding X1 (high). SFAgx and SFDcp each link their own copy of the layer and share
+dma_resv objects (a GPU buffer imported for scanout). The ww_mutex slow path slept on the
+lock's condition variable under the copy's own ww_mutex_global and wait lock, so a waiter
+in one kext and the unlock in the other were not serialised: lost wakeup with no timeout
+(the compositor hangs in PRIME import or the GPU client in submit), or two cpus editing
+the waiter list. The waiter now drops the global lock, sleeps one tick and retries the
+trylock. Deadlock detection is unchanged (and still only sees two-thread cycles within
+one kext; see the audit, open items).
+
+--- a/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/src/linux_lock.c
++++ b/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/src/linux_lock.c
+@@ -107,23 +107,27 @@
+ 					goto done;
+ 				}
+ 			}
+-			if (catch_signal) {
+-				retval = -cv_wait_sig(&lock->condvar, &ww_mutex_global);
+-				if (retval != 0) {
+-					linux_schedule_save_interrupt_value(task, retval);
+-					retval = -EINTR;
+-					goto done;
+-				}
+-			} else {
+-				cv_wait(&lock->condvar, &ww_mutex_global);
+-			}
++			/*
++			 * A ww_mutex (every dma_resv) can be shared by two kexts,
++			 * each with its own copy of this file: its own
++			 * ww_mutex_global and its own lock under the condition
++			 * variable's waiter list. A waiter of one copy and an
++			 * unlock in the other were not excluded from each other:
++			 * the wakeup could come before the waiter was on the list
++			 * (it then slept for ever) and the list could be changed by
++			 * two cpus at once. The waiter therefore does not use the
++			 * condition variable any more: it lets go of the global lock,
++			 * sleeps briefly and tries again. The unlock's cv_signal()
++			 * finds no waiters.
++			 */
++			(void)catch_signal;
++			(void)task;
++			linux_ww_unlock();
++			pause("wwmtx", 1);
++			linux_ww_lock();
+ 		} while (sx_try_xlock(&lock->base.sx) == 0);
+ done:
+ 		TAILQ_REMOVE(&ww_mutex_head, &entry, entry);
+-
+-		/* if the lock is free, wakeup next lock waiter, if any */
+-		if ((struct thread *)SX_OWNER(lock->base.sx.sx_lock) == NULL)
+-			cv_signal(&lock->condvar);
+ 	}
+ 
+ 	if (retval == 0)
+

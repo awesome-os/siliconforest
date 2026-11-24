@@ -1,0 +1,155 @@
+--- a/src/Frameworks/QuartzCore/CALayer.h
++++ b/src/Frameworks/QuartzCore/CALayer.h
+@@ -16,6 +16,7 @@
+     kCALayerHeightSizable = 0x10,
+     kCALayerMaxYMargin = 0x20,
+ };
++typedef unsigned int CAAutoresizingMask;
+ 
+ typedef NS_OPTIONS(unsigned int, CAEdgeAntialiasingMask) {
+     kCALayerLeftEdge = 1U << 0,
+@@ -85,6 +86,9 @@
+     BOOL _geometryFlipped;
+     BOOL _contentsOpaque;
+     BOOL _doubleSided;
++    BOOL _needsDisplayOnBoundsChange;   // (TERM8)
++    CAAutoresizingMask _autoresizingMask;   // (TERM8)
++    BOOL _needsLayout;                      // (TERM8)
+     CAEdgeAntialiasingMask _edgeAntialiasingMask;
+     CGFloat _cornerRadius;
+     CACornerMask _maskedCorners;
+@@ -159,6 +163,15 @@
+ - (void)displayIfNeeded;
+ - (void)drawInContext:(CGContextRef)context;
+ - (BOOL)needsDisplay;
++@property BOOL needsDisplayOnBoundsChange;
++@property CAAutoresizingMask autoresizingMask;
++- (CGRect)visibleRect;
++- (void)setNeedsLayout;
++- (BOOL)needsLayout;
++- (void)layoutIfNeeded;
++- (void)layoutSublayers;
++- (void)resizeSublayersWithOldSize:(CGSize)size;
++- (void)resizeWithOldSuperlayerSize:(CGSize)size;
+ - (void)removeFromSuperlayer;
+ - (void)setNeedsDisplay;
+ - (void)setNeedsDisplayInRect:(CGRect)rect;
+--- a/src/Frameworks/QuartzCore/CALayer.m
++++ b/src/Frameworks/QuartzCore/CALayer.m
+@@ -180,10 +180,116 @@
+      [self addAnimation:action forKey:@"bounds"];
+    }
+    
++   BOOL resized=!CGSizeEqualToSize(_bounds.size,value.size);
++   CGSize old=_bounds.size;
++
+    _bounds=value;
++   // (TERM8) a layer that asks for it is displayed again at its new size (VLC's CAOpenGLLayer)
++   if(resized && _needsDisplayOnBoundsChange)
++    _needsDisplay=YES;
++   // (TERM8) sublayers follow by their autoresizing masks, as with no layout manager on macOS, and the layer is laid
++   // out again (macOS does it at the commit; here at once, so a subclass's -layoutSublayers sees each new size)
++   if(resized){
++    [self resizeSublayersWithOldSize:old];
++    [self setNeedsLayout];
++    [self layoutIfNeeded];
++   }
+    [self _setNeedsRender];
+ }
+ 
++-(void)setNeedsLayout {
++   _needsLayout=YES;
++}
++
++-(BOOL)needsLayout {
++   return _needsLayout;
++}
++
++-(void)layoutIfNeeded {
++   if(!_needsLayout)
++    return;
++   _needsLayout=NO;
++   [self layoutSublayers];
++}
++
++// what macOS's does without a layout manager: the delegate's layout, if it has one
++-(void)layoutSublayers {
++   if([_delegate respondsToSelector:@selector(layoutSublayersOfLayer:)])
++    [_delegate layoutSublayersOfLayer:self];
++}
++
++// (TERM8) the part of the bounds no masking superlayer cuts away (layer transforms are not applied: none of this
++// tree's users rotate or scale a layer)
++-(CGRect)visibleRect {
++   CGRect   visible=_bounds;
++   CGPoint  offset=CGPointZero;
++   CALayer *layer=self;
++
++   while(layer->_superlayer!=nil){
++    CGRect frame=[layer frame];
++
++    offset.x+=frame.origin.x-layer->_bounds.origin.x;
++    offset.y+=frame.origin.y-layer->_bounds.origin.y;
++    layer=layer->_superlayer;
++    if([layer masksToBounds]){
++     CGRect clip=layer->_bounds;
++
++     clip.origin.x-=offset.x;
++     clip.origin.y-=offset.y;
++     visible=CGRectIntersection(visible,clip);
++    }
++   }
++   return visible;
++}
++
++-(CAAutoresizingMask)autoresizingMask {
++   return _autoresizingMask;
++}
++
++-(void)setAutoresizingMask:(CAAutoresizingMask)value {
++   _autoresizingMask=value;
++}
++
++-(void)resizeSublayersWithOldSize:(CGSize)size {
++   for(CALayer *layer in [self sublayers])
++    [layer resizeWithOldSuperlayerSize:size];
++}
++
++// NSView's autoresizing applied to a layer's frame in its superlayer: what grew is shared among the flexible parts
++-(void)resizeWithOldSuperlayerSize:(CGSize)size {
++   CAAutoresizingMask mask=_autoresizingMask;
++   CGSize now=[_superlayer bounds].size;
++   CGRect frame=[self frame];
++
++   if(mask==kCALayerNotSizable || _superlayer==nil)
++    return;
++   for(int axis=0;axis<2;axis++){
++    CGFloat delta=axis==0 ? now.width-size.width : now.height-size.height;
++    unsigned lo=axis==0 ? kCALayerMinXMargin : kCALayerMinYMargin;
++    unsigned mid=axis==0 ? kCALayerWidthSizable : kCALayerHeightSizable;
++    unsigned hi=axis==0 ? kCALayerMaxXMargin : kCALayerMaxYMargin;
++    int parts=((mask&lo)!=0)+((mask&mid)!=0)+((mask&hi)!=0);
++    CGFloat *origin=axis==0 ? &frame.origin.x : &frame.origin.y;
++    CGFloat *length=axis==0 ? &frame.size.width : &frame.size.height;
++
++    if(delta==0 || parts==0)
++     continue;
++    if(mask&lo)
++     *origin+=delta/parts;
++    if(mask&mid)
++     *length=MAX(0,*length+delta/parts);
++   }
++   [self setFrame:frame];
++}
++
++-(BOOL)needsDisplayOnBoundsChange {
++   return _needsDisplayOnBoundsChange;
++}
++
++-(void)setNeedsDisplayOnBoundsChange:(BOOL)value {
++   _needsDisplayOnBoundsChange=value;
++}
++
+ -(CGRect)frame {
+    CGRect result;
+    

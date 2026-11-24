@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude (not the collector author)",
+  "status": "INDEPENDENT_READ_ONLY_SOURCE_REVIEW_NO_BUILD_NO_HARDWARE",
+  "reviewed": {
+    "current": "integrations/puredarwin/m1-trackpad-enum/collector, source-validation.json revision 2, source set 6bde92d9",
+    "baseline": "collector/revisions/001 (read-only archive; its source-validation hashes match the files)",
+    "production_hashes": "trackpad_collector.c b9b4b73a -> cf9a3b4f; trackpad_collector.h c21c208e and collector_main.c 8c924f96 unchanged; dependency observation_layout.h a6990ec4 unchanged"
+  },
+  "verdict": "APPROVE revision 002 source as a single-predicate change. Its use is conditional on packet binding R1 below. The only production change removes '&& u16(header+6)<=2038' from valid_meta in tpec_validate, and decode_records.py drops the same bound. Every actual size bound, the per-stage state table, nonce, framing, digest, registry paths and exit codes are unchanged. Revision 002 deliberately refuses a stage-2 INFO_INVALID record whose only defect was input > 2038. That refusal is correct for revision 002 and must not be used to re-verdict attempt 001.",
+  "diff": {
+    "trackpad_collector.c": "One line (L38): 'valid_meta=m>=16 && header[1]==2 && u16(header+6)>=1 && u16(header+6)<=2038' becomes '... && u16(header+6)>=1'. Nothing else changed.",
+    "decode_records.py": "One line: 'valid=m>=16 and header[1]==2 and 1<=u16(6)<=2038' becomes '... and u16(6)>=1'.",
+    "non_production": "README adds a revision 002 paragraph. test_collector.c adds acceptance of advertised 2038/2048/65535 at the complete state. test_collector.py adds test_advertised_maximum_is_not_receive_capacity (1/2038/2048/65535 accepted at stage 5, 0 refused, the stage-2 INFO_INVALID shape at 2048 refused)."
+  },
+  "unchanged_bounds": "n == 556; version 1; stage <= 5; mask within 31; metadata payload m <= 2038; descriptor payload rx <= 2038; stored <= 512; zero descriptor tail after stored; zero header tail when m < 16; mask 15 for stages 1-2 and 31 for stages 3-5; per-stage result/rx/stored rules; emit_raw framing and SHA-256; collector_main registry getters.",
+  "semantics": {
+    "valid_meta_002": "m >= 16, interface byte (header[1]) == 2, and advertised input (LE u16 at header+6) >= 1. A zero input stays invalid.",
+    "effects": "Stage 2 (INFO_INVALID) requires !valid_meta, so revision 002 now treats an INFO_INVALID record with interface 2 and input 2039..65535 as malformed (exit 1, not REFUSED 77). Stages 3-5 require valid_meta and now accept input 2039..65535. Nothing else moves.",
+    "c_python_equivalence": "By reading: both use header offset 28, interface at byte 29, little-endian u16 at bytes 34-35, and the same state table. The C u32/int32 result decode equals the Python '<i' decode."
+  },
+  "independent_checks": {
+    "differential_decoder_test": "Scratch col002/diff_decoders.py loads both decoders read-only and runs 200,000 synthetic records across all stages, results, masks, lengths and header values. 199,825 decode identically. 175 differ, every one with m >= 16, interface 2 and input > 2038, and in the expected direction (stage 2: 001 accepts, 002 refuses; stages 3-5: 001 refuses, 002 accepts). Unexpected differences: 0.",
+    "directed": "Synthetic records using the header shape root quoted (not the saved record): stage-2 INFO_INVALID accepted by 001, refused by 002; stage-5 COMPLETE refused by 001, accepted by 002. Under 002: input 0 is refused at stage 5 (and is a valid INFO_INVALID at stage 2); 1/2038/2048/65535 are accepted at stage 5; interface 1 is refused at stage 5. Both refuse m 2039, rx 2039, stored 513, rx != stored at COMPLETE and a non-zero descriptor tail. A stage-4 rx of 513 (a legitimate DESC_INVALID) is accepted by both when the metadata is valid.",
+    "c_tests": "Not rebuilt (no builds). By reading, the C tests reject interface 1 and input 0 and accept 2038/2048/65535. Root's log runs/m1-desktop-010/trackpad-collector-root-check-002.log shows 5/5 OK, including the semantic mutants and NDEBUG refusal."
+  },
+  "notes": [
+    {"id": "R1", "severity": "packet-binding", "text": "The collector state table must mirror the producer's predicate. The current core m1tp_enum.c is still 1342be6b, which refuses input > 2038. Collector 002 with that producer (for example KC 376c6400) turns the device's real INFO_INVALID-at-2048 into a malformed record, so rc 1 and the supervisor exits 1. Collector 001 with a corrected producer would likewise reject a COMPLETE record at 2048. Both mismatches fail closed and can never produce a false ENUMERATION_CAPTURED, but they lose the honest classification. A revision 002 packet must bind collector 002 to a producer whose m1tp_interface_info accepts exactly n 16..2038, p[1] == 2 and input >= 1."},
+    {"id": "R2", "severity": "minor", "text": "The C tests do not directly assert the stage-2 refusal at 2048; the Python test and my differential cover the same predicate. Non-blocking."},
+    {"id": "R3", "severity": "author-fact", "text": "Producer side (my adapter, for Astra's review, not an approval): PDM1SPIHID.cpp uses trackpadInterface.max_input only in the IOLog at L266. The descriptor request is a fixed waitResponse(0x10,2,512), and m1tp_copy_descriptor is bounded by sizeof(descriptor) = 512. No buffer or loop is sized from the advertised maximum."}
+  ],
+  "audit_rule_respected": "Attempt 001 is audited only with revisions/001. I used no revision 002 decoder on the saved record.",
+  "not_claimed": ["producer approval", "runtime", "trackpad enumeration", "descriptor HID validity", "pointer input"],
+  "scope": "Read-only source diff, scratch differential test of the Python decoders, reading of the C tests and root's log. No edits, builds, SSH or hardware."
+}

@@ -1,0 +1,94 @@
+diff -ruN a/src/Libraries/libSystem/stub/CMakeLists.txt b/src/Libraries/libSystem/stub/CMakeLists.txt
+--- a/src/Libraries/libSystem/stub/CMakeLists.txt	2026-11-13 12:37:29.660101647 -0800
++++ b/src/Libraries/libSystem/stub/CMakeLists.txt	2026-11-13 12:38:14.537042144 -0800
+@@ -176,6 +176,17 @@
+         _tgammal _truncl _vfprintf_l _vm_read_overwrite _vm_region_recurse_64 _vsnprintf_l)
+         # further names of the same kind (GitHub issue 45, the gap scanner's list)
+         list(APPEND _libsystem_export_lines _timingsafe_bcmp _ualarm)
++        # what an application built against the macOS 26 SDK imports besides (GitHub issue 52,
++        # Terminal.app; sf_libSystem_compat.c says what each does here): typed allocation,
++        # feature flags, the process side of quarantine, two more of libc's own
++        list(APPEND _libsystem_export_lines _malloc_type_malloc _malloc_type_calloc _malloc_type_realloc
++            _malloc_type_free _malloc_type_valloc _malloc_type_aligned_alloc _malloc_type_posix_memalign
++            _malloc_type_zone_malloc _malloc_type_zone_calloc _malloc_type_zone_realloc _malloc_type_zone_free
++            _malloc_type_zone_valloc _malloc_type_zone_memalign
++            __os_feature_enabled_impl __os_feature_enabled_simple_impl
++            __qtn_proc_alloc __qtn_proc_free __qtn_proc_init __qtn_proc_init_with_self __qtn_proc_get_flags
++            __qtn_proc_set_flags __qtn_proc_set_tracking_data __qtn_proc_apply_to_self __qtn_proc_apply_to_pid
++            _os_variant_is_basesystem _strnvis)
+         list(REMOVE_DUPLICATES _libsystem_export_lines)
+     endif()
+     set(_libsystem_exports_for_link ${CMAKE_CURRENT_BINARY_DIR}/libSystem.arm64.exports)
+diff -ruN a/src/Libraries/libSystem/stub/sf_libSystem_compat.c b/src/Libraries/libSystem/stub/sf_libSystem_compat.c
+--- a/src/Libraries/libSystem/stub/sf_libSystem_compat.c	2026-11-13 12:37:29.660123527 -0800
++++ b/src/Libraries/libSystem/stub/sf_libSystem_compat.c	2026-11-13 12:38:14.538031812 -0800
+@@ -1407,3 +1407,69 @@
+ #endif
+ }
+ #endif
++
++/*
++ * What applications built against the macOS 26 SDK import from libSystem and this build
++ * did not have (GitHub issue 52). Each does what it can do truthfully on this system.
++ */
++#include <malloc/malloc.h>
++#include <string.h>
++
++/* Typed allocation (libmalloc's malloc_type_*): the type descriptor steers Apple's allocator
++ * to a bucket; this allocator has one kind of memory, so the descriptor is not used. */
++typedef unsigned long long sf_malloc_type_id_t;
++void *malloc_type_malloc(size_t size, sf_malloc_type_id_t type_id) { (void)type_id; return malloc(size); }
++void *malloc_type_calloc(size_t count, size_t size, sf_malloc_type_id_t type_id) { (void)type_id; return calloc(count, size); }
++void *malloc_type_realloc(void *ptr, size_t size, sf_malloc_type_id_t type_id) { (void)type_id; return realloc(ptr, size); }
++void malloc_type_free(void *ptr, sf_malloc_type_id_t type_id) { (void)type_id; free(ptr); }
++void *malloc_type_valloc(size_t size, sf_malloc_type_id_t type_id) { (void)type_id; return valloc(size); }
++void *malloc_type_aligned_alloc(size_t alignment, size_t size, sf_malloc_type_id_t type_id) { (void)type_id; return aligned_alloc(alignment, size); }
++int malloc_type_posix_memalign(void **memptr, size_t alignment, size_t size, sf_malloc_type_id_t type_id) { (void)type_id; return posix_memalign(memptr, alignment, size); }
++void *malloc_type_zone_malloc(malloc_zone_t *zone, size_t size, sf_malloc_type_id_t type_id) { (void)type_id; return malloc_zone_malloc(zone, size); }
++void *malloc_type_zone_calloc(malloc_zone_t *zone, size_t count, size_t size, sf_malloc_type_id_t type_id) { (void)type_id; return malloc_zone_calloc(zone, count, size); }
++void *malloc_type_zone_realloc(malloc_zone_t *zone, void *ptr, size_t size, sf_malloc_type_id_t type_id) { (void)type_id; return malloc_zone_realloc(zone, ptr, size); }
++void malloc_type_zone_free(malloc_zone_t *zone, void *ptr, sf_malloc_type_id_t type_id) { (void)type_id; malloc_zone_free(zone, ptr); }
++void *malloc_type_zone_valloc(malloc_zone_t *zone, size_t size, sf_malloc_type_id_t type_id) { (void)type_id; return malloc_zone_valloc(zone, size); }
++void *malloc_type_zone_memalign(malloc_zone_t *zone, size_t alignment, size_t size, sf_malloc_type_id_t type_id) { (void)type_id; return malloc_zone_memalign(zone, alignment, size); }
++
++/* Feature flags (<os/feature_private.h>): macOS reads them from property lists under
++ * /System/Library/FeatureFlags and /Library/Preferences/FeatureFlags. This system has no
++ * such files, and a feature nobody declared is off. */
++bool _os_feature_enabled_impl(const char *domain, const char *feature);
++bool _os_feature_enabled_impl(const char *domain, const char *feature) { (void)domain; (void)feature; return false; }
++bool _os_feature_enabled_simple_impl(const char *domain, const char *feature, bool default_value);
++bool _os_feature_enabled_simple_impl(const char *domain, const char *feature, bool default_value) { (void)domain; (void)feature; return default_value; }
++
++/* The process side of quarantine (<quarantine.h>, libquarantine in libSystem): a qtn_proc
++ * holds the flags a process would mark the files it creates with. The object is real; putting
++ * it on a process is the kernel's Quarantine policy, which does not mark files here, so
++ * applying says so (ENOTSUP) and reading a process's state finds none. */
++struct sf_qtn_proc { uint32_t flags; char *tracking; };
++struct sf_qtn_proc *_qtn_proc_alloc(void);
++struct sf_qtn_proc *_qtn_proc_alloc(void) { return calloc(1, sizeof(struct sf_qtn_proc)); }
++void _qtn_proc_free(struct sf_qtn_proc *qp);
++void _qtn_proc_free(struct sf_qtn_proc *qp) { if (qp != NULL) { free(qp->tracking); free(qp); } }
++int _qtn_proc_init(struct sf_qtn_proc *qp);
++int _qtn_proc_init(struct sf_qtn_proc *qp) { if (qp == NULL) return EINVAL; qp->flags = 0; free(qp->tracking); qp->tracking = NULL; return 0; }
++int _qtn_proc_init_with_self(struct sf_qtn_proc *qp);
++int _qtn_proc_init_with_self(struct sf_qtn_proc *qp) { if (qp == NULL) return EINVAL; (void)_qtn_proc_init(qp); return ENOENT; /* QTN_NOT_QUARANTINED: this process is not */ }
++uint32_t _qtn_proc_get_flags(struct sf_qtn_proc *qp);
++uint32_t _qtn_proc_get_flags(struct sf_qtn_proc *qp) { return qp != NULL ? qp->flags : 0; }
++int _qtn_proc_set_flags(struct sf_qtn_proc *qp, uint32_t flags);
++int _qtn_proc_set_flags(struct sf_qtn_proc *qp, uint32_t flags) { if (qp == NULL) return EINVAL; qp->flags = flags; return 0; }
++int _qtn_proc_set_tracking_data(struct sf_qtn_proc *qp, const void *data, size_t len);
++int _qtn_proc_set_tracking_data(struct sf_qtn_proc *qp, const void *data, size_t len)
++{
++    char *copy;
++    if (qp == NULL || (data == NULL && len != 0)) return EINVAL;
++    copy = len != 0 ? malloc(len) : NULL;
++    if (len != 0 && copy == NULL) return ENOMEM;
++    if (len != 0) memcpy(copy, data, len);
++    free(qp->tracking);
++    qp->tracking = copy;
++    return 0;
++}
++int _qtn_proc_apply_to_self(struct sf_qtn_proc *qp);
++int _qtn_proc_apply_to_self(struct sf_qtn_proc *qp) { (void)qp; return ENOTSUP; }
++int _qtn_proc_apply_to_pid(struct sf_qtn_proc *qp, pid_t pid);
++int _qtn_proc_apply_to_pid(struct sf_qtn_proc *qp, pid_t pid) { (void)qp; (void)pid; return ENOTSUP; }

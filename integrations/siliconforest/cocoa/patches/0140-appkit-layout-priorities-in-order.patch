@@ -1,0 +1,173 @@
+--- a/src/Frameworks/AppKit/SFLayoutSolver.m
++++ b/src/Frameworks/AppKit/SFLayoutSolver.m
+@@ -24,7 +24,15 @@
+     int symbolCount, symbolCapacity;
+     unsigned char *kinds;
+     Row **rows;            // by basic symbol: the row that defines it, or NULL when it is not basic
+-    Row objective;
++    /* (TERM8) the objective, one row per priority, highest first, compared in that order (lexicographically):
++     * a higher priority wins over any number of lower ones, as in Apple's engine. One weighted sum let five
++     * labels' hugging at 749 outweigh one label's compression resistance at 750 (Activity Monitor's inspector cut
++     * "Context Switches:" to the width of "Assertions:"). */
++    int levelCount, levelCapacity;
++    double *levelPriority;
++    Row *levels;
++    unsigned *seen;        // per symbol: the pass of optimize() that last looked at it
++    unsigned pass;
+     Row *artificial;
+ };
+ 
+@@ -151,6 +159,8 @@
+         int capacity = solver->symbolCapacity ? solver->symbolCapacity * 2 : 64;
+ 
+         solver->kinds = realloc(solver->kinds, capacity);
++        solver->seen = realloc(solver->seen, capacity * sizeof(unsigned));
++        memset(solver->seen + solver->symbolCapacity, 0, (capacity - solver->symbolCapacity) * sizeof(unsigned));
+         solver->rows = realloc(solver->rows, capacity * sizeof(Row *));
+         memset(solver->rows + solver->symbolCapacity, 0, (capacity - solver->symbolCapacity) * sizeof(Row *));
+         solver->symbolCapacity = capacity;
+@@ -176,7 +186,11 @@
+             free(solver->rows[i]);
+         }
+     }
+-    rowFree(&solver->objective);
++    for (int l = 0; l < solver->levelCount; l++)
++        rowFree(&solver->levels[l]);
++    free(solver->levels);
++    free(solver->levelPriority);
++    free(solver->seen);
+     if (solver->artificial != NULL) {
+         rowFree(solver->artificial);
+         free(solver->artificial);
+@@ -196,16 +210,6 @@
+     return solver->rows[variable]->constant;
+ }
+ 
+-/* An Auto Layout priority as a weight in the objective. Cassowary's strengths are strictly
+- * ordered; in one sum of doubles that is approximated by weights that grow a thousandfold every
+- * 250 priority points (1 at 250, 1e3 at 500, 1e6 at 750, just under 1e9 at 999). Between two
+- * conflicting constraints the higher priority always wins, whatever the difference; only many
+- * low ones against one high one can outweigh it. */
+-static double weightForPriority(double priority) {
+-    if (priority < 1)
+-        priority = 1;
+-    return pow(1000.0, priority / 250.0 - 1.0);
+-}
+ 
+ // a symbol becomes basic, defined by `row`: every other row and the objective lose it
+ static void substitute(SFSolver *solver, Symbol symbol, const Row *row) {
+@@ -213,24 +217,59 @@
+         if (solver->rows[i] != NULL && solver->rows[i] != row)
+             rowSubstitute(solver->rows[i], symbol, row);
+     }
+-    rowSubstitute(&solver->objective, symbol, row);
++    for (int l = 0; l < solver->levelCount; l++)
++        rowSubstitute(&solver->levels[l], symbol, row);
+     if (solver->artificial != NULL)
+         rowSubstitute(solver->artificial, symbol, row);
+ }
+ 
+-/* Minimises an objective by pivoting: a symbol with a negative coefficient in it enters the
+- * basis, in place of the basic symbol that reaches zero first as the entering one grows. */
+-static void optimize(SFSolver *solver, Row *objective) {
++// the objective row of a priority, made (in its place among the others) when it is first asked for
++static Row *objectiveFor(SFSolver *solver, double priority) {
++    int at = 0;
++
++    while (at < solver->levelCount && solver->levelPriority[at] > priority + 1e-9)
++        at++;
++    if (at < solver->levelCount && solver->levelPriority[at] < priority + 1e-9 && solver->levelPriority[at] > priority - 1e-9)
++        return &solver->levels[at];
++    if (solver->levelCount == solver->levelCapacity) {
++        solver->levelCapacity = solver->levelCapacity ? solver->levelCapacity * 2 : 8;
++        solver->levels = realloc(solver->levels, solver->levelCapacity * sizeof(Row));
++        solver->levelPriority = realloc(solver->levelPriority, solver->levelCapacity * sizeof(double));
++    }
++    memmove(solver->levels + at + 1, solver->levels + at, (solver->levelCount - at) * sizeof(Row));
++    memmove(solver->levelPriority + at + 1, solver->levelPriority + at, (solver->levelCount - at) * sizeof(double));
++    memset(&solver->levels[at], 0, sizeof(Row));
++    solver->levelPriority[at] = priority;
++    solver->levelCount++;
++    return &solver->levels[at];
++}
++
++/* Minimises an objective (rows compared in order: the first that is not zero for a symbol decides) by pivoting: a
++ * symbol whose deciding coefficient is negative enters the basis, in place of the basic symbol that reaches zero
++ * first as the entering one grows. */
++static void optimize(SFSolver *solver, Row *objectives, int count) {
+     for (int guard = 0; guard < 100000; guard++) {
+         Symbol entering = 0, leaving = 0;
+         double best = 0;
+ 
+-        // Bland's rule (lowest index) on both choices: no cycling
+-        for (int i = 0; i < objective->count; i++) {
+-            Symbol s = objective->symbols[i];
++        // Bland's rule (lowest index) on both choices: no cycling. A symbol's sign is that of its coefficient in the
++        // first row that has it (rows drop the terms that cancel out)
++        if (++solver->pass == 0) {
++            memset(solver->seen, 0, solver->symbolCapacity * sizeof(unsigned));
++            solver->pass = 1;
++        }
++        for (int l = 0; l < count; l++) {
++            const Row *objective = &objectives[l];
++
++            for (int i = 0; i < objective->count; i++) {
++                Symbol s = objective->symbols[i];
+ 
+-            if (solver->kinds[s] != SYM_DUMMY && objective->coefficients[i] < 0 && (entering == 0 || s < entering))
+-                entering = s;
++                if (solver->seen[s] == solver->pass)
++                    continue;
++                solver->seen[s] = solver->pass;
++                if (solver->kinds[s] != SYM_DUMMY && objective->coefficients[i] < 0 && (entering == 0 || s < entering))
++                    entering = s;
++            }
+         }
+         if (entering == 0)
+             return;
+@@ -271,7 +310,7 @@
+ 
+     solver->rows[art] = rowCopy(row);
+     solver->artificial = rowCopy(row);
+-    optimize(solver, solver->artificial);
++    optimize(solver, solver->artificial, 1);
+     success = nearZero(solver->artificial->constant);
+     rowFree(solver->artificial);
+     free(solver->artificial);
+@@ -310,7 +349,8 @@
+         if (solver->rows[i] != NULL)
+             rowRemove(solver->rows[i], art);
+     }
+-    rowRemove(&solver->objective, art);
++    for (int l = 0; l < solver->levelCount; l++)
++        rowRemove(&solver->levels[l], art);
+     return success;
+ }
+ 
+@@ -341,15 +381,15 @@
+         if (!required) {
+             other = newSymbol(solver, SYM_ERROR);
+             rowAdd(row, other, -coefficient);
+-            rowAdd(&solver->objective, other, weightForPriority(priority));
++            rowAdd(objectiveFor(solver, priority), other, 1.0);
+         }
+     } else if (!required) {
+         marker = newSymbol(solver, SYM_ERROR);
+         other = newSymbol(solver, SYM_ERROR);
+         rowAdd(row, marker, -1.0);
+         rowAdd(row, other, 1.0);
+-        rowAdd(&solver->objective, marker, weightForPriority(priority));
+-        rowAdd(&solver->objective, other, weightForPriority(priority));
++        rowAdd(objectiveFor(solver, priority), marker, 1.0);
++        rowAdd(objectiveFor(solver, priority), other, 1.0);
+     } else {
+         marker = newSymbol(solver, SYM_DUMMY);
+         rowAdd(row, marker, 1.0);
+@@ -398,6 +438,6 @@
+         substitute(solver, subject, row);
+         solver->rows[subject] = row;
+     }
+-    optimize(solver, &solver->objective);
++    optimize(solver, solver->levels, solver->levelCount);
+     return 1;
+ }

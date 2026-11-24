@@ -1,0 +1,29 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Guest script for a RAM-root bench boot (tools/agx_boot.sh, AGX_TEMPLATE): does the kernel
+# survive a process that leaves GPU work behind? The stage of ../stage.nix is in the RAM root at
+# /private/var/db/sfvk (AGX_EXTRA). A baseline triangle, then three variants, each followed by
+# 130 s (longer than the GPU scheduler's 100 s job timeout) of "alive" lines and new kernel log:
+#   a) _exit right after 200 submits (no wait)            b) the DRM files closed after 200 submits,
+#   c) kill -9 while frames are being rendered               process alive
+nonce=${1:-none}
+D=/private/var/db/sfvk
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:$D/bin; export PATH
+export VK_ICD_FILENAMES=$D/icd.d/asahi_icd.json DYLD_LIBRARY_PATH=$D/lib MESA_SHADER_CACHE_DISABLE=true
+printf '\nVKB_BEGIN_%s\n' "$nonce"
+n=$(dmesg | wc -l)
+klog() { m=$(dmesg | wc -l); [ "$m" -gt "$n" ] && dmesg | tail -n $((m - n)) | grep -a -v 'thermal: minute' | sed 's/^/VKB_KLOG /' | cut -c1-240; n=$m; }
+watch() { t=0; while [ $t -lt 130 ]; do sleep 10; t=$((t + 10)); klog; printf 'VKB_ALIVE %s t=%s\n' "$1" "$t"; done; }
+VKTRI_MODE=copy VKTRI_TIMEOUT_MS=3000 vk-tri 10 2>&1 | grep -a 'VKTRI \(fence\|flat\|PASS\|FAIL\)'
+printf 'VKB_BASELINE_RC=%s\n' "$?"; klog
+printf 'VKB_VARIANT a: _exit with work in flight\n'
+VKTRI_MODE=copy VKTRI_EXIT_AFTER_SUBMIT=200 vk-tri 2>&1 | grep -a VKTRI | tail -1
+klog; watch a
+printf 'VKB_VARIANT b: DRM files closed with work in flight, process alive\n'
+VKTRI_MODE=copy VKTRI_CLOSE_AFTER_SUBMIT=200 VKTRI_HOLD_S=140 vk-tri 2>&1 | grep -a VKTRI | tail -3 &
+sleep 2; klog; watch b; wait
+printf 'VKB_VARIANT c: kill -9 while rendering\n'
+VKTRI_MODE=copy VKTRI_TIMEOUT_MS=3000 vk-tri 100000 > /dev/null 2>&1 &
+p=$!; sleep 3; kill -9 $p; printf 'VKB_KILLED pid=%s\n' "$p"; klog; watch c
+printf 'VKB_END_%s survived all three\n' "$nonce"
+printf '\nPD_BENCH_DONE\n'

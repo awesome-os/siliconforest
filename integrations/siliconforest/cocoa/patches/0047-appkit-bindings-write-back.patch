@@ -1,0 +1,56 @@
+--- a/src/Frameworks/AppKit/NSControl.m
++++ b/src/Frameworks/AppKit/NSControl.m
+@@ -7,6 +7,8 @@
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+ 
+ #import <AppKit/NSControl.h>
++#import <AppKit/NSBinder.h>
++#import <AppKit/NSObject+BindingSupport.h>
+ #import <AppKit/NSFont.h>
+ #import <AppKit/NSCell.h>
+ #import <AppKit/NSEvent.h>
+@@ -388,7 +390,27 @@
+ //   NSUnimplementedMethod();
+ }
+ 
++/* A click changes the cell, not the control: the key-value observation through which a value
++ * binding writes back (_NSBinder observes the control's key) heard nothing, and a checkbox in
++ * Terminal's preferences changed nothing in the profile. As on macOS, the bound value goes to the
++ * model when the control sends its action. */
++-(void)_sfPushBoundValues {
++   static NSString *const names[]={@"value",@"selectedTag",@"selectedValue",@"selectedObject",@"selectedIndex"};
++   unsigned i;
++
++   for(i=0;i<sizeof(names)/sizeof(names[0]);i++){
++    _NSBinder *binder=[self _binderForBinding:names[i] create:NO];
++    NSString  *path=[binder bindingPath];
++
++    if(binder==nil || ![path isKindOfClass:[NSString class]])
++     continue;
++    [self willChangeValueForKey:path];
++    [self didChangeValueForKey:path];
++   }
++}
++
+ -(BOOL)sendAction:(SEL)action to:target {
++   [self _sfPushBoundValues];
+    return [NSApp sendAction:action to:target from:self];
+ }
+ 
+--- a/src/Frameworks/AppKit/NSController/NSControllerSelectionProxy.m
++++ b/src/Frameworks/AppKit/NSController/NSControllerSelectionProxy.m
+@@ -155,9 +155,13 @@
+ 	return [_cachedValues keyEnumerator];
+ }
+ 
++// each selected object takes the value, as Foundation's -[NSArray setValue:forKey:] does on macOS
++// (this Foundation's array raises NSUndefinedKeyException: a checkbox bound to selection.CursorBlink
++// in Terminal's preferences changed nothing)
+ -(void)setValue:(id)value forKey:(NSString *)key
+ {
+-	[[self observableSelection] setValue:value forKey:key];
++	for(id object in [_controller selectedObjects])
++		[object setValue:value forKey:key];
+ }
+ 
+ -(NSString*)description

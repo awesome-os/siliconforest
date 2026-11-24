@@ -1,0 +1,41 @@
+--- a/src/Frameworks/AppKit/NSPasteboardItem.m
++++ b/src/Frameworks/AppKit/NSPasteboardItem.m
+@@ -75,16 +75,23 @@
+     return [self setData:data forType:type];
+ }
+ 
+-- (NSData *)dataForType:(NSString *)type
++- (NSData *)_sfDataForType:(NSString *)type pasteboard:(NSPasteboard *)pasteboard
+ {
+     NSData *data = [_values objectForKey:type];
+     id provider;
+ 
+     if (data == nil && (provider = [_providers objectForKey:type]) != nil) {
+-        [provider pasteboard:nil item:self provideDataForType:type];
++        [provider pasteboard:pasteboard item:self provideDataForType:type];
+         data = [_values objectForKey:type];
++        if (data == nil && pasteboard != nil)
++            data = [pasteboard dataForType:type];
+     }
+     return data;
++}
++
++- (NSData *)dataForType:(NSString *)type
++{
++    return [self _sfDataForType:type pasteboard:nil];
+ }
+ 
+ - (NSString *)stringForType:(NSString *)type
+@@ -145,7 +152,11 @@
+         [values setObject:[object absoluteString] forKey:NSPasteboardTypeString];
+     } else if ([object conformsToProtocol:@protocol(NSPasteboardWriting)]) {
+         for (NSString *type in [object writableTypesForPasteboard:pasteboard]) {
+-            id value = [object pasteboardPropertyListForType:type];
++            // The provider receives the actual destination board. Firefox
++            // supplies legacy bytes there instead of filling the item.
++            id value = [object isKindOfClass:[NSPasteboardItem class]]
++                ? [object _sfDataForType:type pasteboard:pasteboard]
++                : [object pasteboardPropertyListForType:type];
+             if (value != nil)
+                 [values setObject:value forKey:type];
+         }

@@ -1,0 +1,303 @@
+--- a/integrations/puredarwin/m1-bringup/host_progress.py
++++ b/integrations/puredarwin/m1-bringup/host_progress.py
+@@ -190,6 +190,7 @@
+     desktop_enabled(inputs)
+     virtual_input_enabled(inputs)
+     terminal_input_enabled(inputs)
++    native_keyboard_desktop_enabled(inputs)
+     return inputs
+ 
+ 
+@@ -268,9 +269,11 @@
+ class ConsoleSession:
+     """One reader/writer for the secondary CDC, never the proxy transport."""
+     def __init__(self, port, directory, serial_factory=None, desktop=False, keyboard=False,
+-                 virtual_input=False, terminal_input=False):
++                 virtual_input=False, terminal_input=False, native_keyboard_desktop=False):
+         image.require(all(type(value) is bool for value in
+-                          (desktop, keyboard, virtual_input, terminal_input)), 'Experiment flags must be booleans')
++                          (desktop, keyboard, virtual_input, terminal_input, native_keyboard_desktop)), 'Experiment flags must be booleans')
++        image.require(not native_keyboard_desktop or (desktop and not keyboard and not virtual_input and not terminal_input),
++                      'Native keyboard desktop forbids host HID experiments')
+         image.require(not terminal_input or (desktop and not keyboard and not virtual_input),
+                       'Terminal input needs an exclusive desktop experiment')
+         image.require(not (desktop and keyboard), 'Only one guest experiment per attempt')
+@@ -281,6 +284,9 @@
+         self.dev = serial_factory(port, baudrate=115200, timeout=.1, write_timeout=2,
+                                   xonxoff=False, rtscts=False, dsrdtr=False, exclusive=True)
+         self.directory, self.proof = directory, ConsoleProof()
++        self.native_keyboard_desktop = native_keyboard_desktop
++        self.native_tx_phase = 'initial'
++        self.native_shell_path_sent = False
+         self.terminal_input = terminal_input
+         self.virtual = (TerminalInput(self.proof.nonce) if terminal_input else
+                         VirtualInput(self.proof.nonce) if virtual_input else None)
+@@ -356,6 +362,22 @@
+     def send(self, data):
+         image.require(not self.finish.is_set() and isinstance(data, bytes) and self.tx_log is not None and
+                       len(self.tx_data)+len(data) <= 16384, 'Invalid/unrecorded VUART write')
++        if self.native_keyboard_desktop:
++            # This mode permits only the existing bootstrap and fixed launcher.
++            # Seal the writer before attempting that launcher, including failure.
++            if self.native_tx_phase == 'initial':
++                if data == b'/bin/sh\r':
++                    image.require(not self.native_shell_path_sent, 'Repeated native-mode shell selection')
++                    self.native_shell_path_sent = True
++                else:
++                    image.require(data == self.proof.command(), 'Native mode rejects non-bootstrap VUART input')
++                    self.native_tx_phase = 'await_launcher'
++            elif self.native_tx_phase == 'await_launcher':
++                image.require(self.proof.complete and self.desktop_sent and data == desktop_command(self.proof.nonce),
++                              'Native mode requires its one fixed desktop launcher')
++                self.native_tx_phase = 'sealed'
++            else:
++                image.require(False, 'Native mode VUART writer is sealed after launcher')
+         # Record the exact attempted bytes durably before sending. A short or
+         # failed write sets error and prevents any successful evidence claim.
+         image.require(self.tx_log.write(data) == len(data), 'Short VUART transcript write')
+@@ -392,6 +414,8 @@
+             'desktop_command_sent': self.desktop_sent,
+             'keyboard_command_sent': self.keyboard_sent,
+             'terminal_input_enabled': self.terminal_input,
++            'native_keyboard_desktop_enabled': self.native_keyboard_desktop,
++            'native_mode_host_write_phase': self.native_tx_phase if self.native_keyboard_desktop else None,
+             'console_tx_bytes': len(self.tx_data),
+             'console_tx_sha256': image.sha(bytes(self.tx_data)),
+             'tx_scope': 'all attempted bytes to secondary VUART; exact successful writes only if error is null',
+@@ -463,14 +487,38 @@
+     return True
+ 
+ 
+-def validate_input_geometry(geometry, *, virtual_input=False, terminal_input=False):
+-    image.require(type(virtual_input) is bool and type(terminal_input) is bool and
+-                  not (virtual_input and terminal_input), 'Input geometry flags must be exclusive booleans')
+-    if virtual_input or terminal_input:
++def validate_input_geometry(geometry, *, virtual_input=False, terminal_input=False, native_keyboard_desktop=False):
++    image.require(all(type(x) is bool for x in (virtual_input, terminal_input, native_keyboard_desktop)) and
++                  sum((virtual_input, terminal_input, native_keyboard_desktop)) <= 1,
++                  'Input geometry flags must be exclusive booleans')
++    if virtual_input or terminal_input or native_keyboard_desktop:
+         image.require(all(type(geometry.get(key)) is int for key in ('width', 'height', 'stride', 'depth')) and
+                       (geometry['width'], geometry['height'], geometry['stride'], geometry['depth'] & 255) ==
+                       (2560, 1600, 10240, 30),
+                       'Input output geometry differs from qualified framebuffer')
++
++
++def native_keyboard_desktop_enabled(inputs):
++    record = json.loads(inputs.contents['build_record'], object_pairs_hook=image.unique)
++    image.require(type(record) is dict, 'Native desktop requires an object build record')
++    if 'native_keyboard_desktop_experiment' not in record:
++        return False
++    experiment = record['native_keyboard_desktop_experiment']
++    expected = {'version': 1, 'driver': 'PDM1SPIHID', 'input': 'pdhid-keyboard', 'host_hid_injection': False}
++    image.require(type(experiment) is dict and type(experiment.get('version')) is int and
++                  type(experiment.get('driver')) is str and type(experiment.get('input')) is str and
++                  type(experiment.get('host_hid_injection')) is bool and experiment == expected,
++                  'Unknown native keyboard desktop experiment')
++    image.require(all(k not in record for k in ('keyboard_experiment', 'virtual_input_experiment', 'terminal_input_experiment')) and
++                  desktop_enabled(inputs) and 'ramdisk' in inputs.contents,
++                  'Native keyboard desktop requires exclusive desktop opt-in and bound RAM')
++    members = inputs.report['kernel']['members']
++    image.require(all(n in members for n in ('org.puredarwin.driver.PDM1SPIHID',
++                  'com.apple.iokit.IOHIDFamily', 'com.ravynos.iokit.IOGOPFramebuffer')),
++                  'Native desktop requires the real SPI HID, HID family and framebuffer members')
++    image.require('org.puredarwin.driver.PDSerialHID' not in members,
++                  'Native keyboard desktop must omit the virtual serial HID driver')
++    return verify_spi_keyboard_member(inputs)
+ 
+ 
+ def keyboard_command(nonce):
+@@ -489,6 +537,10 @@
+                   experiment == {'version': 1, 'command': '/usr/bin/darwin-keyboard-test'}
+                   and 'ramdisk' in inputs.contents and not desktop_enabled(inputs),
+                   'Unknown keyboard experiment or conflicting/missing RAM root')
++    return verify_spi_keyboard_member(inputs)
++
++
++def verify_spi_keyboard_member(inputs):
+     raw = inputs.contents['kernel']
+     kind, _, commands = image.commands(raw)
+     image.require(kind == 12, 'Keyboard requires a native fileset collection')
+@@ -843,7 +895,8 @@
+     keyboard, desktop = keyboard_enabled(inputs), desktop_enabled(inputs)
+     virtual_input = virtual_input_enabled(inputs)
+     terminal_input = terminal_input_enabled(inputs)
+-    bootargs = BOOTARGS + (' pdm1kbd=1' if keyboard else '')
++    native_keyboard_desktop = native_keyboard_desktop_enabled(inputs)
++    bootargs = BOOTARGS + (' pdm1kbd=1' if keyboard or native_keyboard_desktop else '')
+     backend = ContinuingBackend(inputs, directory)
+     console = None
+     try:
+@@ -864,7 +917,7 @@
+         hv.set_bootargs(bootargs)
+         display_console = configure_display_console(hv, backend, carveouts)
+         validate_input_geometry(display_console['geometry'], virtual_input=virtual_input,
+-                                terminal_input=terminal_input)
++                                terminal_input=terminal_input, native_keyboard_desktop=native_keyboard_desktop)
+         backend.display_console = display_console
+         entropy = configure_entropy(hv)
+         kernel_text_policy = configure_kernel_text_policy(hv, inputs)
+@@ -892,7 +945,8 @@
+                                hardware_boot_observed=False, image_sha256=image.sha(inputs.contents['kernel']),
+                                prepared_image_sha256=image.sha(prepared), prepared_image_bytes=len(prepared)))
+         console = ConsoleSession(args.console_device, directory, desktop=desktop, keyboard=keyboard,
+-                                 virtual_input=virtual_input, terminal_input=terminal_input)
++                                 virtual_input=virtual_input, terminal_input=terminal_input,
++                                 native_keyboard_desktop=native_keyboard_desktop)
+         ProgressCapture(hv, backend, inputs, layout, directory, args.runtime,
+                         console=console, capture_framebuffer=not keyboard).run()
+     finally:
+--- /dev/null
++++ b/integrations/puredarwin/m1-bringup/test_native_desktop_progress.py
+@@ -0,0 +1,151 @@
++#!/usr/bin/env python3
++"""Host-only native desktop policy and real durable-writer tests; no device."""
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import Mock, patch
++import json
++import struct
++import tempfile
++import unittest
++
++import host_progress as host
++
++N = '0123456789abcdef' * 3
++EXPERIMENT = {'version': 1, 'driver': 'PDM1SPIHID', 'input': 'pdhid-keyboard', 'host_hid_injection': False}
++MEMBERS = ['org.puredarwin.driver.PDM1SPIHID', 'com.apple.iokit.IOHIDFamily', 'com.ravynos.iokit.IOGOPFramebuffer']
++
++
++def fileset(ids=(MEMBERS[0],)):
++    commands = bytearray()
++    for name in ids:
++        text = name.encode() + b'\0'
++        size = (32 + len(text) + 7) & ~7
++        commands += struct.pack('<IIQQII', 0x80000035, size, 0, 0, 32, 0) + text + bytes(size - 32 - len(text))
++    return struct.pack('<IiiIIIII', 0xfeedfacf, 0x100000c, 0, 12, len(ids), len(commands), 0, 0) + commands
++
++
++def inputs(record=None, ids=(MEMBERS[0],), members=MEMBERS, ram=True):
++    if record is None:
++        record = {'desktop_experiment': {'version': 1, 'command': '/usr/bin/darwin-desktop-test'},
++                  'native_keyboard_desktop_experiment': dict(EXPERIMENT)}
++    contents = {'kernel': fileset(ids), 'build_record': json.dumps(record).encode()}
++    if ram:
++        contents['ramdisk'] = b'POLICY_FIXTURE_NOT_A_RUNTIME_IMAGE'
++    return SimpleNamespace(contents=contents, report={'kernel': {'members': {x: {} for x in members}}})
++
++
++class NativePolicy(unittest.TestCase):
++    def test_default_off_and_exact_native_mode(self):
++        self.assertFalse(host.native_keyboard_desktop_enabled(inputs({})))
++        self.assertTrue(host.native_keyboard_desktop_enabled(inputs()))
++        with self.assertRaises(ValueError):
++            host.native_keyboard_desktop_enabled(inputs({'native_keyboard_desktop_experiment': None}))
++
++    def test_malformed_types_modes_and_source_requirements_rejected(self):
++        for key, values in [('version', [True, 0, '1']), ('host_hid_injection', [0, True, 'false']),
++                            ('driver', ['', 'PDSerialHID']), ('input', ['pdhid', None])]:
++            for value in values:
++                record = json.loads(inputs().contents['build_record'])
++                record['native_keyboard_desktop_experiment'][key] = value
++                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
++                    host.native_keyboard_desktop_enabled(inputs(record))
++        for member in MEMBERS:
++            with self.subTest(member=member), self.assertRaises(ValueError):
++                host.native_keyboard_desktop_enabled(inputs(members=[x for x in MEMBERS if x != member]))
++        with self.assertRaises(ValueError):
++            host.native_keyboard_desktop_enabled(inputs(members=MEMBERS + ['org.puredarwin.driver.PDSerialHID']))
++        for ids in [(), (MEMBERS[0], MEMBERS[0])]:
++            with self.subTest(ids=ids), self.assertRaises(ValueError):
++                host.native_keyboard_desktop_enabled(inputs(ids=ids))
++        with self.assertRaises(ValueError):
++            host.native_keyboard_desktop_enabled(inputs(ram=False))
++
++    def test_presence_conflicts_and_duplicate_json_keys_rejected(self):
++        for key in ['keyboard_experiment', 'virtual_input_experiment', 'terminal_input_experiment']:
++            record = json.loads(inputs().contents['build_record'])
++            record[key] = None
++            with self.subTest(key=key), self.assertRaises(ValueError):
++                host.native_keyboard_desktop_enabled(inputs(record))
++        i = inputs()
++        i.contents['build_record'] = b'{"x":1,"x":2}'
++        with self.assertRaises(ValueError):
++            host.native_keyboard_desktop_enabled(i)
++
++    def test_native_geometry_and_exclusive_flags(self):
++        geo = dict(width=2560, height=1600, stride=10240, depth=65566)
++        host.validate_input_geometry(geo, native_keyboard_desktop=True)
++        for kw in [dict(native_keyboard_desktop=1), dict(native_keyboard_desktop=True, terminal_input=True),
++                   dict(native_keyboard_desktop=True, virtual_input=True)]:
++            with self.subTest(kw=kw), self.assertRaises(ValueError):
++                host.validate_input_geometry(geo, **kw)
++        with self.assertRaises(ValueError):
++            host.validate_input_geometry({**geo, 'width': 1920}, native_keyboard_desktop=True)
++        factory = Mock()
++        with tempfile.TemporaryDirectory() as tmp:
++            for kw in [dict(native_keyboard_desktop=True),
++                       dict(native_keyboard_desktop=True, desktop=True, terminal_input=True)]:
++                with self.subTest(kw=kw), self.assertRaises(ValueError):
++                    host.ConsoleSession('FAKE', Path(tmp), serial_factory=factory, **kw)
++        factory.assert_not_called()
++
++
++class NativeWriter(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.directory = Path(self.temp.name)
++        self.dev = Mock()
++        self.dev.write.side_effect = len
++        with patch.object(host.threading, 'Thread'):
++            self.s = host.ConsoleSession('FAKE', self.directory, serial_factory=lambda *a, **kw: self.dev,
++                                         desktop=True, native_keyboard_desktop=True)
++        self.s.proof = host.ConsoleProof(N)
++        self.s.tx_log = (self.directory / 'tx.bin').open('wb', buffering=0)
++        self.addCleanup(self.s.tx_log.close)
++
++    def bootstrap(self):
++        self.s.send(b'/bin/sh\r')
++        self.s.proof.sent()
++        self.s.send(self.s.proof.command())
++        self.s.proof.feed(f'\nDL9_BEGIN_{N}\nDarwin\narm64\n25.5.0\nDL9_END_{N}\n'.encode())
++        self.assertTrue(self.s.proof.complete)
++        self.s.desktop_sent = True
++
++    def test_success_seals_transport_after_exact_launcher_and_instantiates_no_scheduler(self):
++        self.assertIsNone(self.s.virtual)
++        self.bootstrap()
++        launch = host.desktop_command(N)
++        self.s.send(launch)
++        self.assertEqual(self.s.native_tx_phase, 'sealed')
++        before = (self.directory / 'tx.bin').read_bytes()
++        for forbidden in [b'\x01k 0 4 0 0 0 0 0\n', launch, b'echo anything\r']:
++            with self.assertRaises(ValueError):
++                self.s.send(forbidden)
++        self.assertEqual((self.directory / 'tx.bin').read_bytes(), before)
++        self.assertEqual(self.dev.write.call_count, 3)
++        self.assertEqual(before, b'/bin/sh\r' + self.s.proof.command() + launch)
++
++    def test_hid_and_commands_never_permitted_before_bootstrap_or_readiness(self):
++        with self.assertRaises(ValueError):
++            self.s.send(b'\x01k 0 4 0 0 0 0 0\n')
++        self.s.send(self.s.proof.command())
++        with self.assertRaises(ValueError):
++            self.s.send(host.desktop_command(N))
++        self.assertEqual(self.s.native_tx_phase, 'await_launcher')
++        self.assertEqual(self.dev.write.call_count, 1)
++
++    def test_short_launcher_write_is_recorded_once_and_cannot_be_retried(self):
++        self.bootstrap()
++        self.dev.write.side_effect = lambda data: len(data) - 1
++        with self.assertRaises(ValueError):
++            self.s.send(host.desktop_command(N))
++        self.assertEqual(self.s.native_tx_phase, 'sealed')
++        count = self.dev.write.call_count
++        with self.assertRaises(ValueError):
++            self.s.send(host.desktop_command(N))
++        self.assertEqual(self.dev.write.call_count, count)
++        self.assertTrue((self.directory / 'tx.bin').read_bytes().endswith(host.desktop_command(N)))
++
++
++if __name__ == '__main__':
++    unittest.main()

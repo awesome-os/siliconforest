@@ -1,0 +1,154 @@
+{
+  "status": "PLAN_ONLY",
+  "built": false,
+  "booted": false,
+  "fetched": false,
+  "panel_scanout_claimed": false,
+  "scope": "Read-only plan for a real Chonkstep compositor on PureDarwin. Claude owns PDGOP and wlroots M1 scanout. Astra owns kernel console ownership. Omarchy configs and services are out of scope.",
+  "worktree": {
+    "path": "/home/chrisk/src/chonkstep",
+    "branch": "fix/polkit-layer-shell-parity",
+    "upstream": "origin/fix/polkit-layer-shell-parity",
+    "head": "f7a8edd1b6e111487c45070c8774c51ba7847628",
+    "head_subject": "Fix polkit dialog placement and hyprtoolkit layer-shell compatibility",
+    "tracked_changes": 0,
+    "untracked": [
+      "CLAUDE_ISSUE_WORKFLOW.txt",
+      "NEXT_SESSION_PROMPT.txt",
+      "X_CHANGELOG.md",
+      "X_CHANGELOG_2.md",
+      "X_CHANGELOG_5.md",
+      "docs/engineering/2026-10-04-hyprpolkitagent-teardown.md",
+      "docs/engineering/2026-10-04-polkit.md"
+    ],
+    "edited_by_this_plan": false,
+    "other_worktrees_present": true,
+    "other_worktrees_inspected": false
+  },
+  "registry": {
+    "repository": "chriskearney/chonkstep",
+    "branch": "main",
+    "commit": "e0fe3a000aec71b1db46b940e2a75670be4e0f31",
+    "commit_subject": "Merge pull request #342 from chriskearney/fix/flaky-mac-clipboard-order-test",
+    "role": "Desktop source; Linux-only Wayland backend needs port",
+    "local_ref": "origin/main and origin/HEAD both resolve to that commit",
+    "checked_out_head_equals_pin": false,
+    "isolated_tree_equals_pin": true,
+    "checked_out_head_is_ancestor_of_pin": true,
+    "commits_on_pin_not_in_HEAD": 26,
+    "commits_on_HEAD_not_in_pin": 0,
+    "local_branch_main": "e39c698, not the pin and not the checkout"
+  },
+  "identity": {
+    "what_chonkstep_is": "A Smithay 0.7 Wayland compositor. crates/wm-wayland implements wm_core::Backend and owns the display server, protocol globals, renderer, and calloop loop. crates/chonkstep-wayland is the binary and calls wm_wayland::run. wm-core is the protocol-agnostic window policy.",
+    "not_sway": "Sway is a wlroots compositor. Nothing in this plan renames it, wraps it, or substitutes it for wm-wayland.",
+    "linux_gate": "crates/wm-wayland/src/lib.rs is #![cfg(target_os = \"linux\")]. crates/chonkstep-wayland/src/main.rs exits 1 off Linux with the text that it only runs on Linux. Both Cargo.toml files put their compositor dependencies under cfg(target_os = \"linux\")."
+  },
+  "smithay_0_7": {
+    "source": "vendor/smithay-0.7.0, selected by [patch.crates-io] in the workspace Cargo.toml. vendor/README.md records crates.io SHA-256 740cea6927892bc182d5bf70c8f79806c8bc9f68f2fb96e55a30be171b63af98 and local patches for layer-shell version 5, the XWayland child pid, drag-start serial, and touch cancel. A Darwin build has to use this tree.",
+    "features_this_workspace_enables": [
+      "backend_winit",
+      "backend_drm",
+      "backend_gbm",
+      "backend_egl",
+      "backend_libinput",
+      "backend_udev",
+      "backend_session_libseat",
+      "renderer_gl",
+      "renderer_multi",
+      "desktop",
+      "wayland_frontend",
+      "xwayland"
+    ],
+    "usable_without_linux_session_apis": {
+      "wayland_frontend": "wayland-server 0.31 through the pure-Rust wayland-backend 0.3.17. use_system_lib stays off, so libwayland is not required. Cached wayland-backend has macOS socket and poll paths and, off Linux and Android, returns pid/uid/gid 0 from get_credentials instead of SO_PEERCRED.",
+      "desktop": "Empty feature. Popup and surface-tree helpers. wm-wayland already avoids Smithay Space because wm-core owns geometry.",
+      "calloop_0_14_4": "The compositor event loop. Cached calloop uses eventfd only for target_os=linux. Every other non-Windows host uses sources/ping/pipe.rs. Cached polling 3.11.0 selects kqueue when target_vendor=apple, epoll on Linux, and poll(2) for other Unix.",
+      "shm_fallback": "vendor smithay utils/sealed_file.rs uses memfd_create and seals on Linux, FreeBSD, and Android. Every other target uses rustix shm::open. XNU bsd/kern/posix_shm.c implements shm_open. Whether the booted libSystem exports that symbol was not checked."
+    },
+    "not_a_scanout_renderer": {
+      "renderer_test": "backend/renderer/test.rs DummyRenderer satisfies the Renderer trait and does not present to a framebuffer.",
+      "renderer_pixman": "Feature is not enabled. It links the C pixman library and still needs an output backend.",
+      "renderer_gl": "GLES2 via backend_egl. wm-wayland's Graphics::Winit and the DRM session are both typed on GlesRenderer.",
+      "session_backends": "backend_drm, backend_gbm, backend_libinput, backend_udev, and backend_session_libseat are the TTY login path. backend_winit is a nested client of an existing desktop, not a PDGOP scanout."
+    }
+  },
+  "chosen_route": {
+    "name": "minimal Darwin software backend on Chonkstep core",
+    "reuse": [
+      "wm-core (no target_os gate; Backend is the policy trait)",
+      "wm-theme and wm-theme-api",
+      "a reduced Smithay: wayland_frontend and desktop only",
+      "tiny-skia 0.11, already depended on by chonk-shell, as the CPU rasterizer"
+    ],
+    "new_code": "A Darwin presentation and input adapter beside wm-wayland, not inside the Linux cfg. It maps the PDGOP framebuffer, composites client SHM with tiny-skia, copies the frame into the mapped VRAM, and calls PDGOPPresent. Keyboard and pointer events come from the same device nodes the C backend already opens.",
+    "smithay_features_to_leave_off": [
+      "backend_drm",
+      "backend_gbm",
+      "backend_egl",
+      "backend_libinput",
+      "backend_udev",
+      "backend_session_libseat",
+      "renderer_gl",
+      "renderer_multi",
+      "backend_winit",
+      "xwayland"
+    ],
+    "first_milestone": "One output, SHM clients, keyboard and pointer, wm-core stacking. chonk-shell menus and any Hyprland IPC stay unwired until that output exists.",
+    "pdgop_contract": "src/Libraries/PDGOP/include/PDGOP.h: PDGOPOpen, PDGOPClose, PDGOPPresent(x, y, width, height). PDGOP.c maps kIOFBVRAMMemory and matches IOVirtIOGPU, then IOGOPFramebuffer, then IOFramebuffer. Matching a service is not M1 panel scanout."
+  },
+  "rejected_alternative": {
+    "name": "C wlroots compatibility bridge",
+    "evidence": "src/ThirdParty/wlroots/backend/puredarwin is a wlr_backend. output.c calls PDGOPOpen. backend.c sets buffer caps to WLR_BUFFER_CAP_DATA_PTR and WLR_BUFFER_CAP_SHM. input.c opens /dev/usb_hid_kbd and /dev/usb_hid_mouse. nix/pkgs/wayland/wlroots.nix builds -Dbackends=puredarwin for the virt Wayland image.",
+    "why_it_is_not_chonkstep": "That backend presents buffers for a wlroots compositor. Chonkstep's display server, delegate macros, and wm_core::Backend implementation are Smithay types in wm-wayland. Linking libwlroots would boot wlroots, which is the Sway path, and would leave chonkstep-wayland on its Linux stub."
+  },
+  "blocked_os_apis": [
+    "libdrm, libgbm, and the DRM/KMS session those Smithay features call",
+    "EGL and GLES2, required by renderer_gl and by both Graphics variants in wm-wayland",
+    "libinput, libudev, and libseat",
+    "memfd_create and file seals. rustix 1.1.4 compiles fs/memfd_create.rs only for the Linux kernel or FreeBSD. The non-Linux Smithay path needs shm_open instead",
+    "eventfd. calloop 0.14.4 uses it only for target_os=linux",
+    "SO_PEERCRED. wayland-backend 0.3.17 does not read Darwin LOCAL_PEERCRED; credentials are zeros",
+    "dma-buf and linux-dmabuf. renderer_multi requires backend_drm",
+    "libxkbcommon. smithay input/keyboard re-exports xkbcommon 0.8.0, whose ffi.rs has link(name = \"xkbcommon\"). The Linux compositor has no pure-Rust keymap",
+    "an XWayland child process and the X11 client libraries behind the xwayland feature",
+    "a user D-Bus session. wm-wayland depends on zbus for idle inhibition on Linux"
+  ],
+  "apis_present_in_source_but_not_proven_on_the_booted_image": [
+    "kqueue(2), declared in XNU bsd/sys/event.h. polling selects it only when the Rust target sets target_vendor=apple",
+    "poll(2), the polling fallback for other Unix targets",
+    "shm_open, implemented in XNU bsd/kern/posix_shm.c",
+    "PDGOP and IOKit user clients. They are libraries in the PureDarwin tree. They are not in the booted virt-minimal ramdisk",
+    "/dev/usb_hid_kbd and /dev/usb_hid_mouse, published from IOHIDFamily PDHIDEventQueue.cpp and opened by the wlroots puredarwin backend. Publication on the 13-inch M1 boot is not established"
+  ],
+  "isolated_source": {
+    "path": "/home/chrisk/src/darwin-lab/sources/chonkstep-darwin",
+    "head": "e0fe3a000aec71b1db46b940e2a75670be4e0f31",
+    "detached": true,
+    "commits_ahead_of_original_f7a8": 26,
+    "original_worktree_edited": false,
+    "wm_darwin_owner": "Astra owns the crate source and cargo checks. This plan did not edit or cargo-check it.",
+    "abi_receipt": "reports/sprint-010/darwin-backend-abi.json"
+  },
+  "rust_cross_sdk": {
+    "host_rustc": "1.98.1 (48a229cea 2026-09-01), host x86_64-unknown-linux-gnu",
+    "installed_targets": [
+      "aarch64-apple-darwin",
+      "aarch64-unknown-none-softfloat",
+      "x86_64-unknown-linux-gnu"
+    ],
+    "bare_metal_target_rejected": "aarch64-unknown-none-softfloat has no std and cannot link libSystem, IOKit, or PDGOP",
+    "c_toolchain_already_in_tree": "sources/puredarwin-baseline/nix/arm64.nix builds the arm64 package set with arm64-apple-darwin20.4 via mkArm64Build and arm64CrossToolchain",
+    "cfg_the_cached_crates_need": "target_vendor=apple selects kqueue in polling 3.11.0. target_os=linux selects the eventfd, memfd, epoll, and libdrm paths that this port must not compile. A target that is Unix but neither apple nor linux gets poll(2) and the shm_open fallback, and still needs a std sysroot",
+    "root_reported_std_probe": "Root reported a std probe (thread, Vec, getpagesize, println) crosslinked as a native Mach-O against the OS 26.5 SDK libSystem, linking only libSystem, libc, and libm. This plan did not rerun that link.",
+    "nox_target_deps": "/nix/store/zyf8bqlc4cs5g24r9ni5y9a5fkmzb7cb-puredarwin-chonkstep-target-deps contains usr/lib/libIOKitCF.dylib and lib/libxkbcommon.a. The presenter links tiny static libIOKit.a with PDGOP, not that CF dylib. Do not point the linker at Linux libdrm.",
+    "later_build_needs": "aarch64-apple-darwin is installed and is the rustc name that sets target_vendor=apple. The C linker remains arm64-apple-darwin20.4-clang with the PureDarwin libSystem, PDGOP, and the tiny static IOKit. xkeyboard-config-2.47 is staged by root to /usr/share/X11/xkb. The ABI receipt records the frozen 64-byte PDGOP struct, the tiny-static IOKit surface, and the HID input contract."
+  },
+  "ownership": {
+    "claude": "Whether PDGOPOpen's chosen service scans out the 13-inch panel, and the wlroots M1 backend. This plan does not decide that.",
+    "astra": "Kernel video-console ownership of the firmware framebuffer while the display stop is the text shell. A compositor must not be started on that buffer until that handoff exists.",
+    "this_plan": "Userspace compositor shape only. No kernel boot-arg, no framebuffer driver, no Omarchy unit or config."
+  },
+  "omarchy": "The checkout contains an omarchy tree and chonk-shell describes Omarchy menu and theme loading. Those files were not opened and are not part of the Darwin backend. Crash recovery in wm-wayland can demand a lock command associated with an Omarchy desktop; that path stays unwired.",
+  "conclusion": "The original checkout stays on f7a8edd and was not edited. Root's isolated tree sources/chonkstep-darwin is detached at the registry pin e0fe3a0, 26 commits ahead of f7a8edd, and Astra owns wm-darwin there. The Darwin compositor is wm-core plus a reduced Smithay wayland_frontend, software-composited with tiny-skia into a PDGOP mapping. The wlroots puredarwin backend documents the PDGOP and HID device contract and remains the Sway path. This plan fetched and built nothing. The user confirmed the M1 panel is showing the shell; this plan does not claim a Wayland desktop."
+}

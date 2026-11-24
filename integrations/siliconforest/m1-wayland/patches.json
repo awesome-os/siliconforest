@@ -1,0 +1,128 @@
+{
+ "summary": "m1-wayland groundwork patches (source only; host-tested; not SDK-compiled/staged/booted)",
+ "author_role": "Claude (implementer), source-only",
+ "date": "2026-11-07",
+ "pin": "e7aa00a60f0b56ef35aa24252e81467787bf71ea",
+ "frozen_first_display_patch": {
+  "path": "integrations/siliconforest/m1-display/framebuffer-30bit.patch",
+  "sha256": "91086c74d740991f6f98a117f9fa957b211fe071255e77a0d2abab26fbd90654",
+  "modified": false
+ },
+ "patches": {
+  "sfgop-fail-closed.patch": {
+   "sha256": "d11a4c93010d38e8a4e46962b7160f38bc5d4d456017cea41ce45bdadc1d801f",
+   "files": [
+    "src/Libraries/SFGOP/SFGOP.c",
+    "src/Libraries/SFGOP/include/SFGOP.h"
+   ],
+   "abi": "SFGOPFramebuffer unchanged: 64 bytes, align 8, offsets address 16, size 24, width 32, bpp 44, componentMasks 52 (_Static_assert + host test)",
+   "new_api": [
+    "SFGOPGetServiceKind(const SFGOPFramebuffer*)",
+    "SFGOPGetPixelFormat(const SFGOPFramebuffer*)",
+    "enum SFGOPServiceKind",
+    "enum SFGOPPixelFormat"
+   ],
+   "behaviour": [
+    "short GetCurrentDisplayMode / IOPixelInformation replies fail closed",
+    "geometry and mapping-size validation",
+    "SFGOPPresent only for IOVirtIOGPU, else KERN_NOT_SUPPORTED with no driver call",
+    "kind via IOObjectConformsTo in the form of the IOKit surface SFGOP is compiled against: tiny SFIOKitLib.h (_SF_IOKITLIB_H) 3-argument status with boolean_t*; CF iokituser IOKitLib.h (#else) 2-argument boolean; a failed or unknown query fails open()"
+   ],
+   "pinned_inputs_sha256": {
+    "SFGOP.c": "05f8c59c17cd9e2ea17d0c31e436f3e164d141d0ae95b9751b0fe39d573020a4",
+    "SFGOP.h": "c1b80e3bf0bd4ba640f503e8297749bc03ca3165c23e6e4c3478ff740449930a"
+   },
+   "result_sha256": {
+    "SFGOP.c": "ca5ec350e4ada4cb4c5d28333125ac33b8ba3408bac7ed3970a9a33ddf3ed292",
+    "SFGOP.h": "6f76f2069b77e23364ed14bc2a66e32a31fd595f3c37b49c66527901fae79d45"
+   },
+   "rebuild_dependents": [
+    "wlroots (copies SFGOP.c/h via wlroots.nix)",
+    "xf86-video-siliconforestgop",
+    "fbdoom"
+   ]
+  },
+  "iogop-vram-write-combine.patch": {
+   "sha256": "8337e974d6578049e689e4ad31ec1d6030ffa83900e86507d647d19d83165377",
+   "files": [
+    "src/Kernel/Extensions/IOGOPFramebuffer/IOGOPFramebuffer.cpp"
+   ],
+   "gate": "platform nub (not IOPCIDevice) AND device-tree root compatible contains AppleARM",
+   "effect": [
+    "sf-vram-write-combine=true -> IOFramebufferUserClient maps kIOFBVRAMMemory with kIOMapWriteCombineCache (Normal-NC on DRAM)",
+    "/dev/fb0 kernel map kIOMapWriteCombineCache"
+   ],
+   "unchanged": [
+    "non-Apple IOGOP modes",
+    "IOGraphicsFamily IOFramebuffer fVramMap (kIOMapInhibitCache, Device-GRE)"
+   ],
+   "stacks_on": "framebuffer-30bit.patch (verified)",
+   "pinned_input_sha256": "72bdea3925213de85ed7caeeba52ca38bac18dd6acc9807d4dde0571d0344773",
+   "result_sha256_on_top_of_30bit": "23bdea3bbce7ae8c47cb838fad73eb9e4ff318901e0efb3dbc98001ddc8aac69"
+  }
+ },
+ "cache_attribute_findings": {
+  "framebuffer": "0xbd5d5c000+0xfa0000; ADT /chosen dram-base 0x800000000 dram-size 0x400000000 => is_dram_addr; not pa_valid; no pmap-io-ranges cover (109 entries)",
+  "mapping_types": "default and kIOMapInhibitCache -> VM_WIMG_IO -> Device-GRE (MAIR 0x0D) on DRAM; kIOMapWriteCombineCache -> VM_WIMG_WCOMB -> Normal-NC (MAIR 0x40) on DRAM",
+  "correctness": "Device memory faults on unaligned access and DC ZVA, hazardous for direct-render compositors and /dev/fb0 unaligned writes (EFAULT via copyio recovery). Device vs Normal-NC aliases have no cacheable alias and no coherency loss, only cross-alias ordering; acceptable with one-owner hand-off.",
+  "w3": "IOFramebuffer fVramMap stays Device-GRE; kernel console uses aligned stores and 16-byte-multiple row bcopy (works, slow scroll); WC there would need a shared IOGraphics change, deferred"
+ },
+ "tests": {
+  "command": "python3 integrations/siliconforest/m1-wayland/test_m1_wayland.py -v",
+  "result": "15/15 OK",
+  "test_sha256": "f5bfcbcb3c99fbb2afaa3d38f869ee38500619bc423f66b4e52811d9ed05b903",
+  "harness_sha256": "70afbbec710f3c57c5928ad5cf9eb1a029ecca7d01c44996871d8d448696fd74",
+  "fake_headers_sha256": {
+   "IOKit/IOKitLib.h": "400ed101cbd4787af6a359de595637cebd2b0ccca2a8d1696bcf2b9d2314f43d",
+   "mach/kern_return.h": "36a5f54c4d1ef4f12c9b5e91f0c655f0df1c6e38e6dd428eb556bc84003839cc",
+   "mach/mach.h": "7af88bcc959b05501f305bce59dde03363d0a0400e3a00afb69ddabb78b0475c"
+  },
+  "mutants_caught": {
+   "sfgop": 7,
+   "iogop": 5
+  }
+ },
+ "deferred": [
+  "W1 wlroots 10-bit primary format (Sway baseline only)",
+  "fVramMap write-combine (shared IOGraphics code)"
+ ],
+ "not_claimed": [
+  "SDK compile",
+  "KC inclusion",
+  "boot",
+  "hardware cache attributes observed",
+  "compositor output"
+ ],
+ "hardware_or_build_actions": "none",
+ "iokit_surfaces": {
+  "A_tiny_static": {
+   "header": "src/Libraries/IOKit/include/SFIOKitLib.h (via tiny IOKit/IOKitLib.h, defines _SF_IOKITLIB_H)",
+   "library": "libIOKit.a from src/Libraries/IOKit/IOKitLib.c",
+   "IOObjectConformsTo": "kern_return_t (io_object_t, const char *, boolean_t *)",
+   "matching": "char* IOServiceMatching; IOServiceGetMatchingService(master, char*, io_service_t*) -> status",
+   "users": [
+    "fbdoom",
+    "xf86-video-siliconforestgop (local IOKit)",
+    "root's planned static presenter"
+   ]
+  },
+  "B_cf": {
+   "header": "src/Libraries/IOKit/iokituser/include/IOKit/IOKitLib.h (installed by iokitcf-static)",
+   "library": "libIOKitCF.a (+ libIOKitCF.dylib via -force_load) from iokituser/IOKitLib.c",
+   "IOObjectConformsTo": "boolean_t (io_object_t, const io_name_t), 2 arguments",
+   "matching": "CFDictionary IOServiceMatching; IOServiceGetMatchingService(master, CFDictionaryRef) -> io_service_t",
+   "users": [
+    "wlroots siliconforest backend (-I iokitcf-static headers, -lIOKitCF)"
+   ],
+   "binary_evidence": "built libIOKitCF.a (/nix/store/l580vwcvnmwqmgkyb8b4p524jk7bdc4d-..., /nix/store/nv25rfc8j6170wdwppvp09q4fir38iyh-...) contains only IOKitLib.c.o; _IOObjectConformsTo reads w0/x1, sets x2=0, calls __IOObjectConformsTo(obj, name, uint64_t options)"
+  },
+  "not_built": "src/Libraries/IOKit/IOKitLibCF.c:674 defines a 3-argument pointer-form IOObjectConformsTo but no CMake target compiles it at e7aa00a",
+  "correction": "statements that the CF library's IOObjectConformsTo is 3-argument are wrong for the built library",
+  "mispairing": {
+   "CF header + tiny library": "callee writes through garbage x2 (memory corruption)",
+   "tiny header + CF library": "callee ignores x2, returns boolean read as status -> SFGOPOpen fails closed (ServiceKind)",
+   "matching": "mismatches in either mis-pairing"
+  },
+  "optional_hardening_not_applied": "IOObjectGetClass(service, io_name_t) has the same kern_return_t signature on both surfaces; exact 'IOVirtIOGPU' compare (no subclasses at pin)"
+ }
+}

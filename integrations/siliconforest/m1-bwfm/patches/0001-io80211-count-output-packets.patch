@@ -1,0 +1,82 @@
+IO80211Controller: count packets out in the interface's driver statistics
+
+IONetworkInterface reports the bytes of every packet sent to the ifnet itself, but packets out
+and output errors only as the change of the driver's IONetworkStats (outputPackets,
+outputErrors), which no 802.11 driver maintained: en0 showed obytes counting and opackets 0
+(Activity Monitor's "Packets out"). The controller now keeps those two counters.
+
+Applied by integrations/siliconforest/m1-bwfm/build-kexts.nix to the SiliconForest tree's
+IO80211Family (MPL-2.0 OR BSD-2-Clause, like the files it changes).
+
+--- a/src/Kernel/Extensions/IO80211Family/IO80211Controller.h
++++ b/src/Kernel/Extensions/IO80211Family/IO80211Controller.h
+@@ -11,6 +11,7 @@
+ #define _IO80211CONTROLLER_H
+ 
+ #include <IOKit/network/IOEthernetController.h>
++#include <IOKit/network/IONetworkStats.h>
+ #include "apple80211_ioctl.h"
+ 
+ struct ieee80211com;
+@@ -37,6 +38,7 @@
+     virtual IOReturn setMulticastMode(bool active) APPLE_KEXT_OVERRIDE;
+     virtual IOReturn setMulticastList(IOEthernetAddress *addrs, UInt32 count) APPLE_KEXT_OVERRIDE;
+     virtual IONetworkInterface *createInterface() APPLE_KEXT_OVERRIDE;
++    virtual bool configureInterface(IONetworkInterface *netif) APPLE_KEXT_OVERRIDE;
+     virtual const OSString *newVendorString() const APPLE_KEXT_OVERRIDE;
+     virtual const OSString *newModelString() const APPLE_KEXT_OVERRIDE;
+ 
+@@ -47,6 +49,9 @@
+     struct ieee80211com *fIC;
+     IO80211Interface *fInterface;
+     bool fEnabled;
++    // the interface's driver statistics: IONetworkInterface reports packets out (and errors)
++    // to the ifnet from these counters only; bytes it counts itself
++    IONetworkStats *fNetStats;
+ 
+ private:
+     static void inputFrame(void *owner, mbuf_t m);
+--- a/src/Kernel/Extensions/IO80211Family/IO80211Controller.cpp
++++ b/src/Kernel/Extensions/IO80211Family/IO80211Controller.cpp
+@@ -24,6 +24,7 @@
+     fIC = NULL;
+     fInterface = NULL;
+     fEnabled = false;
++    fNetStats = NULL;
+     return true;
+ }
+ 
+@@ -117,13 +118,31 @@
+     return kIOReturnSuccess;
+ }
+ 
++bool IO80211Controller::configureInterface(IONetworkInterface *netif)
++{
++    if (!super::configureInterface(netif))
++        return false;
++    IONetworkData *data = netif->getParameter(kIONetworkStatsKey);
++    fNetStats = data ? (IONetworkStats *)data->getBuffer() : NULL;
++    return true;
++}
++
+ UInt32 IO80211Controller::outputPacket(mbuf_t m, void *param)
+ {
++    bool sent;
++
+     if (fIC == NULL) {
+         mbuf_freem(m);
+-        return kIOReturnOutputDropped;
++        sent = false;
++    } else
++        sent = sf80211_output(fIC, m) == 0;
++    if (fNetStats) {
++        if (sent)
++            fNetStats->outputPackets++;
++        else
++            fNetStats->outputErrors++;
+     }
+-    return sf80211_output(fIC, m) == 0 ? kIOReturnOutputSuccess : kIOReturnOutputDropped;
++    return sent ? kIOReturnOutputSuccess : kIOReturnOutputDropped;
+ }
+ 
+ IOReturn IO80211Controller::getHardwareAddress(IOEthernetAddress *addr)

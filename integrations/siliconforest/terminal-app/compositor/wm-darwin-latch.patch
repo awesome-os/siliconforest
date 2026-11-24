@@ -1,0 +1,561 @@
+diff -ruN '--exclude=.git' '--exclude=target' desk4-003/crates/wm-darwin/src/desktop_entry.rs desk4-007/crates/wm-darwin/src/desktop_entry.rs
+--- desk4-003/crates/wm-darwin/src/desktop_entry.rs	2026-11-14 18:59:13.109603307 -0800
++++ desk4-007/crates/wm-darwin/src/desktop_entry.rs	2026-11-14 19:16:19.022494589 -0800
+@@ -371,6 +371,7 @@
+     let mut server = Server::new_with_fonts(&display.handle(), selected.size, fonts.clone())?;
+     server.set_renderer_boxed(selected.renderer);
+     server.set_input_wake(input.wake_fd());
++    server.enable_frame_pacing();
+     if let Some(path) = &capture_socket {
+         if let Err(error) = server.captures.listen(path) {
+             eprintln!("WMCAPTURE no socket: {error}");
+diff -ruN '--exclude=.git' '--exclude=target' desk4-003/crates/wm-darwin/src/hid.rs desk4-007/crates/wm-darwin/src/hid.rs
+--- desk4-003/crates/wm-darwin/src/hid.rs	2026-11-14 18:38:57.415059155 -0800
++++ desk4-007/crates/wm-darwin/src/hid.rs	2026-11-14 19:11:55.539736685 -0800
+@@ -670,7 +670,7 @@
+ }
+ 
+ /// The queues read on a thread of their own: every 1 ms while input arrives (4 ms after a
+-/// quarter of a second without), whatever the desktop's frames are doing. The desktop takes
++/// quarter of a second without, 8 ms after two seconds), whatever the desktop's frames are doing. The desktop takes
+ /// what has accumulated once per loop turn (`take`), and its wait between frames ends when
+ /// something arrives (`wake_fd`).
+ pub struct InputThread {
+@@ -716,8 +716,12 @@
+                         }
+                         thread_shared.push(out.drain(..).map(|event| Stamped { event, at: now }), Some(hid.health));
+                     }
+-                    let quiet = now.duration_since(last_event) > std::time::Duration::from_millis(250);
+-                    std::thread::sleep(std::time::Duration::from_millis(if quiet { 4 } else { 1 }));
++                    // Every 1 ms while input arrives, 4 ms after a quarter of a second without,
++                    // 8 ms (the old once-a-frame rate) after two seconds: a ring of 64 records
++                    // lasts far longer than that, and an idle desktop costs little.
++                    let quiet = now.duration_since(last_event);
++                    let pause = if quiet > std::time::Duration::from_secs(2) { 8 } else if quiet > std::time::Duration::from_millis(250) { 4 } else { 1 };
++                    std::thread::sleep(std::time::Duration::from_millis(pause));
+                 }
+                 hid
+             })
+diff -ruN '--exclude=.git' '--exclude=target' desk4-003/crates/wm-darwin/src/inject.rs desk4-007/crates/wm-darwin/src/inject.rs
+--- desk4-003/crates/wm-darwin/src/inject.rs	2026-11-14 18:57:48.622933929 -0800
++++ desk4-007/crates/wm-darwin/src/inject.rs	2026-11-14 19:16:45.275835272 -0800
+@@ -26,6 +26,7 @@
+ //! stall <milliseconds>             the desktop's loop stops for that long (at most 5 s), as in a
+ //!                                  frame that waits for the GPU; the input thread goes on reading
+ //! fail                             the compositor ends with an error (the session's relaunch test)
++//! latch on|off                     late latching of frames on or off (before/after numbers)
+ //! stats                            one line: the input thread's counts (records, gaps, ...), the
+ //!                                  key events delivered, the motion-to-screen latency so far
+ //! capture <name>                   the frame as it was last rendered, to <name>.ppm in the directory
+@@ -58,6 +59,7 @@
+     Stall(Duration),
+     Fail,
+     Stats,
++    Latch(bool),
+     Wait(Duration),
+     Capture(String),
+     Dump(String),
+@@ -133,6 +135,7 @@
+                 ["stall", ms] => ms.parse::<u64>().ok().filter(|ms| *ms <= 5_000).map(|ms| Step::Stall(Duration::from_millis(ms))),
+                 ["fail"] => Some(Step::Fail),
+                 ["stats"] => Some(Step::Stats),
++                ["latch", on @ ("on" | "off")] => Some(Step::Latch(*on == "on")),
+                 ["wait", ms] => ms.parse::<u64>().ok().filter(|ms| *ms <= 10_000).map(|ms| Step::Wait(Duration::from_millis(ms))),
+                 ["capture", name] if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => Some(Step::Capture((*name).to_string())),
+                 ["dump", name] if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => Some(Step::Dump((*name).to_string())),
+@@ -220,7 +223,13 @@
+                 let hid = self.injector.as_ref().map_or_else(|| "no input thread".to_string(), |i| i.health().summary());
+                 let (keys, last) = server.hid_keys();
+                 eprintln!("WMINJECT stats hid: {hid} | key_events_delivered={keys} last_key={last:?} | {}", server.latency.final_line().unwrap_or_else(|| "no motion latency samples".into()));
+-                eprintln!("{}", server.latency.flush_line());
++                eprintln!("{}", server.latency.flush_line(&server.pacer));
++            }
++            Some(Step::Latch(on)) => {
++                let on = *on;
++                self.queue.pop_front();
++                self.done += 1;
++                server.set_frame_pacing(on);
+             }
+             Some(Step::Fail) => {
+                 self.queue.pop_front();
+diff -ruN '--exclude=.git' '--exclude=target' desk4-003/crates/wm-darwin/src/input_latency.rs desk4-007/crates/wm-darwin/src/input_latency.rs
+--- desk4-003/crates/wm-darwin/src/input_latency.rs	2026-11-14 18:59:46.642335981 -0800
++++ desk4-007/crates/wm-darwin/src/input_latency.rs	2026-11-14 19:47:13.487309431 -0800
+@@ -1,24 +1,60 @@
+-//! How long a pointer motion takes to reach the screen: from the moment the event was read
+-//! from the device node (or injected, for tests) to the page flip of the first frame that
+-//! draws the cursor there. The panel's own scan-out after the flip is not included.
++//! How long a pointer motion takes to reach the screen, and the frame timing that keeps it short.
++//!
++//! `MotionLatency`: from the moment a motion event was read from the device node (or injected,
++//! for tests) to the page flip of the first frame that draws the cursor there, for the OLDEST
++//! and the NEWEST motion each frame shows. The panel's own scan-out after the flip is not
++//! included.
++//!
++//! `FramePacer` (late latching, DESK4): a frame is rendered as late as it can be and still make
++//! the next vertical blank (its render time, measured, plus a margin), not right after the flip
++//! before it. The pointer position, client buffers and everything else are then as new as they
++//! can be when the frame is made. Before: a motion waited for the frame in flight, then for the
++//! next frame's whole refresh interval (about two frames); with it: about the render time to the
++//! newest motion, about one frame to the oldest.
+ use std::time::{Duration, Instant};
+ 
+ const BUCKETS: usize = 1001; // whole milliseconds, the last one is "1000 ms or more"
+ 
+-pub(crate) struct MotionLatency {
+-    /// The oldest motion not drawn yet.
+-    pending: Option<Instant>,
+-    /// The oldest motion in the frame on its way to the screen.
+-    in_flight: Option<Instant>,
++#[derive(Clone)]
++struct Series {
+     window: Vec<u32>,
+     histogram: Vec<u32>,
+     samples: u64,
+     max_us: u32,
+-    logged_at: Instant,
+ }
+-impl Default for MotionLatency {
++impl Default for Series {
+     fn default() -> Self {
+-        Self { pending: None, in_flight: None, window: Vec::new(), histogram: vec![0; BUCKETS], samples: 0, max_us: 0, logged_at: Instant::now() }
++        Self { window: Vec::new(), histogram: vec![0; BUCKETS], samples: 0, max_us: 0 }
++    }
++}
++impl Series {
++    fn sample(&mut self, d: Duration) {
++        let us = d.as_micros().min(u128::from(u32::MAX)) as u32;
++        if self.window.len() < 100_000 {
++            self.window.push(us);
++        }
++        self.histogram[((us / 1000) as usize).min(BUCKETS - 1)] += 1;
++        self.samples += 1;
++        self.max_us = self.max_us.max(us);
++    }
++    fn take_sorted(&mut self) -> Vec<u32> {
++        let mut sorted = std::mem::take(&mut self.window);
++        sorted.sort_unstable();
++        sorted
++    }
++    fn total(&self, what: &str) -> String {
++        let at = |p: f64| {
++            let target = ((self.samples as f64) * p).ceil().max(1.0) as u64;
++            let mut seen = 0u64;
++            for (ms, count) in self.histogram.iter().enumerate() {
++                seen += u64::from(*count);
++                if seen >= target {
++                    return ms;
++                }
++            }
++            BUCKETS - 1
++        };
++        format!("{what} n={} p50_ms<={} p90_ms<={} p99_ms<={} max_ms={:.1}", self.samples, at(0.5) + 1, at(0.9) + 1, at(0.99) + 1, f64::from(self.max_us) / 1000.0)
+     }
+ }
+ fn percentile(sorted: &[u32], p: f64) -> f64 {
+@@ -28,82 +64,200 @@
+     let index = ((sorted.len() - 1) as f64 * p).round() as usize;
+     f64::from(sorted[index]) / 1000.0
+ }
++fn window_text(sorted: &[u32], what: &str) -> String {
++    format!("{what} n={} p50_ms={:.1} p90_ms={:.1} p99_ms={:.1} max_ms={:.1}", sorted.len(), percentile(sorted, 0.5), percentile(sorted, 0.9), percentile(sorted, 0.99), sorted.last().map_or(0.0, |v| f64::from(*v) / 1000.0))
++}
++
++#[derive(Default)]
++pub(crate) struct MotionLatency {
++    /// The oldest and the newest motion not drawn yet.
++    pending: Option<(Instant, Instant)>,
++    /// The same for the frame on its way to the screen.
++    in_flight: Option<(Instant, Instant)>,
++    oldest: Series,
++    newest: Series,
++    logged_at: Option<Instant>,
++}
+ impl MotionLatency {
+     pub fn motion(&mut self, at: Instant) {
+-        self.pending = Some(self.pending.map_or(at, |p| p.min(at)));
++        self.pending = Some(self.pending.map_or((at, at), |(o, n)| (o.min(at), n.max(at))));
+     }
+     /// A frame was rendered; `in_flight`: it reaches the screen with a later flip.
+     pub fn rendered(&mut self, in_flight: bool) {
+-        let Some(t) = self.pending.take() else { return };
++        let Some((o, n)) = self.pending.take() else { return };
+         if in_flight {
+-            self.in_flight = Some(self.in_flight.map_or(t, |p| p.min(t)));
++            self.in_flight = Some(self.in_flight.map_or((o, n), |(po, pn)| (po.min(o), pn.max(n))));
+         } else {
+-            self.sample(t.elapsed());
++            self.oldest.sample(o.elapsed());
++            self.newest.sample(n.elapsed());
+         }
+     }
+     pub fn presented(&mut self) {
+-        if let Some(t) = self.in_flight.take() {
+-            self.sample(t.elapsed());
+-        }
+-    }
+-    fn sample(&mut self, d: Duration) {
+-        let us = d.as_micros().min(u128::from(u32::MAX)) as u32;
+-        if self.window.len() < 100_000 {
+-            self.window.push(us);
++        if let Some((o, n)) = self.in_flight.take() {
++            self.oldest.sample(o.elapsed());
++            self.newest.sample(n.elapsed());
+         }
+-        self.histogram[((us / 1000) as usize).min(BUCKETS - 1)] += 1;
+-        self.samples += 1;
+-        self.max_us = self.max_us.max(us);
+     }
+-    fn line(sorted: &[u32], what: &str) -> String {
+-        format!(
+-            "WMLATENCY pointer motion->flip {what} n={} p50_ms={:.1} p90_ms={:.1} p99_ms={:.1} max_ms={:.1} (read from the queue or injected -> page flip showing the cursor; scan-out not included)",
+-            sorted.len(), percentile(sorted, 0.5), percentile(sorted, 0.9), percentile(sorted, 0.99), sorted.last().map_or(0.0, |v| f64::from(*v) / 1000.0)
+-        )
++    fn line(&mut self, what: &str) -> String {
++        let since = self.logged_at.map_or(0.0, |t| t.elapsed().as_secs_f64());
++        let (o, n) = (self.oldest.take_sorted(), self.newest.take_sorted());
++        self.logged_at = Some(Instant::now());
++        format!("WMLATENCY pointer motion->flip {what} {} | {} window_s={since:.1} (read from the queue or injected -> page flip showing the cursor; scan-out not included)", window_text(&o, "oldest"), window_text(&n, "newest"))
+     }
+     /// A line every 10 s while the pointer moves.
+-    pub fn maybe_log(&mut self) {
+-        if self.window.is_empty() || self.logged_at.elapsed() < Duration::from_secs(10) {
++    pub fn maybe_log(&mut self, pacer: &FramePacer) {
++        if self.oldest.window.is_empty() {
+             return;
+         }
+-        let mut sorted = std::mem::take(&mut self.window);
+-        sorted.sort_unstable();
+-        eprintln!("{} window_s={:.1}", Self::line(&sorted, "last"), self.logged_at.elapsed().as_secs_f64());
+-        self.logged_at = Instant::now();
++        let at = *self.logged_at.get_or_insert_with(Instant::now);
++        if at.elapsed() < Duration::from_secs(10) {
++            return;
++        }
++        eprintln!("{} {}", self.line("last"), pacer.describe());
+     }
+     /// The samples since the last line, now (the inject `stats` step: one line per test phase).
+     #[cfg_attr(not(feature = "test-inject"), allow(dead_code))]
+-    pub fn flush_line(&mut self) -> String {
+-        let mut sorted = std::mem::take(&mut self.window);
+-        sorted.sort_unstable();
+-        let line = format!("{} window_s={:.1}", Self::line(&sorted, "since-last"), self.logged_at.elapsed().as_secs_f64());
+-        self.logged_at = Instant::now();
+-        line
++    pub fn flush_line(&mut self, pacer: &FramePacer) -> String {
++        format!("{} {}", self.line("since-last"), pacer.describe())
+     }
+     /// The whole run (whole milliseconds).
+     pub fn final_line(&self) -> Option<String> {
+-        if self.samples == 0 {
++        if self.oldest.samples == 0 {
+             return None;
+         }
+-        let at = |p: f64| {
+-            let target = ((self.samples as f64) * p).ceil().max(1.0) as u64;
+-            let mut seen = 0u64;
+-            for (ms, count) in self.histogram.iter().enumerate() {
+-                seen += u64::from(*count);
+-                if seen >= target {
+-                    return ms;
+-                }
+-            }
+-            BUCKETS - 1
+-        };
+-        Some(format!(
+-            "WMLATENCY pointer motion->flip total n={} p50_ms<={} p90_ms<={} p99_ms<={} max_ms={:.1}",
+-            self.samples, at(0.5) + 1, at(0.9) + 1, at(0.99) + 1, f64::from(self.max_us) / 1000.0
+-        ))
++        Some(format!("WMLATENCY pointer motion->flip total {} | {}", self.oldest.total("oldest"), self.newest.total("newest")))
+     }
+     #[cfg(test)]
+     pub fn samples(&self) -> u64 {
+-        self.samples
++        self.oldest.samples
++    }
++}
++
++/// When to render: late enough that the frame holds the newest input, early enough to make the
++/// vertical blank it aims at. Learns the blank's phase from flip-complete events, the refresh
++/// interval from their spacing, and the render time from the frames it times; a frame that
++/// arrived a refresh late widens the margin, good frames narrow it again.
++pub(crate) struct FramePacer {
++    enabled: bool,
++    /// A vertical blank (from the earliest-read flip events: the closest to the real blank).
++    phase: Option<Instant>,
++    interval: Duration,
++    /// Render times of the last frames (render start to commit returned), microseconds.
++    renders: std::collections::VecDeque<u32>,
++    margin_us: u32,
++    last_flip: Option<Instant>,
++    /// The blank the frame on its way is aimed at.
++    aim: Option<Instant>,
++    pub frames: u64,
++    pub late: u64,
++}
++// measured on the M1 (desk4-006): with 2.5 ms about 1 % of frames missed the blank they aimed at
++const MARGIN_MIN_US: u32 = 3_500;
++const MARGIN_MAX_US: u32 = 8_000;
++const BUDGET_MIN_US: u32 = 4_000;
++const BUDGET_MAX_US: u32 = 14_000;
++impl FramePacer {
++    pub fn new(enabled: bool) -> Self {
++        Self { enabled, phase: None, interval: Duration::from_micros(16_667), renders: Default::default(), margin_us: MARGIN_MIN_US, last_flip: None, aim: None, frames: 0, late: 0 }
++    }
++    /// How long a frame is given before its blank: the longest of the last 60 render times
++    /// plus the margin.
++    pub fn budget(&self) -> Duration {
++        let longest = self.renders.iter().copied().max().unwrap_or(BUDGET_MIN_US);
++        Duration::from_micros(u64::from((longest + self.margin_us).clamp(BUDGET_MIN_US, BUDGET_MAX_US)))
++    }
++    /// A frame took `render` from its start to the commit's return; `late`: how much after its
++    /// planned moment it started (a busy loop, e.g. a client flooding the desk with commits).
++    /// Both count against the budget, so a loop that wakes late plans earlier.
++    pub fn rendered(&mut self, render: Duration, late: Duration) {
++        let render = render + late;
++        if self.renders.len() == 60 {
++            self.renders.pop_front();
++        }
++        self.renders.push_back(render.as_micros().min(1_000_000) as u32);
++        self.frames += 1;
++    }
++    /// A flip completed (read) at `at`.
++    pub fn flipped(&mut self, at: Instant) {
++        // the spacing of consecutive flips, when it looks like one refresh, refines the interval
++        if let Some(last) = self.last_flip {
++            let d = at.saturating_duration_since(last);
++            if d > Duration::from_micros(15_000) && d < Duration::from_micros(18_500) {
++                let blended = (self.interval.as_micros() as u64 * 15 + d.as_micros() as u64) / 16;
++                self.interval = Duration::from_micros(blended);
++            }
++        }
++        self.last_flip = Some(at);
++        self.phase = Some(match self.phase {
++            None => at,
++            Some(phase) if at < phase => at,
++            Some(phase) => {
++                // the predicted blank nearest to `at`: an earlier event moves the phase there at
++                // once, a later one (read late) only by an eighth of the difference
++                let i = self.interval.as_micros();
++                let off = at.duration_since(phase).as_micros() % i;
++                let nearest_before = at - Duration::from_micros(off as u64);
++                if off > i / 2 {
++                    at
++                } else {
++                    nearest_before + Duration::from_micros((off / 8) as u64)
++                }
++            }
++        });
++        // a frame shown a refresh (or more) after the blank it was aimed at: more margin;
++        // otherwise slowly less
++        if let Some(aim) = self.aim.take() {
++            if at > aim + self.interval / 2 {
++                self.late += 1;
++                self.margin_us = (self.margin_us + 1_500).min(MARGIN_MAX_US);
++            } else {
++                // back by 1 ms over about 200 frames on time
++                self.margin_us = self.margin_us.saturating_sub(5).max(MARGIN_MIN_US);
++            }
++        }
++    }
++    /// Decide now: `Some(moment)` to render then, `None` at once; either way the blank aimed at
++    /// is remembered for the late count.
++    pub fn plan(&mut self, now: Instant) -> Option<Instant> {
++        let due = self.render_at(now);
++        if self.enabled {
++            if let Some(phase) = self.phase {
++                let i = self.interval.as_micros() as u64;
++                let start = due.unwrap_or(now) + self.budget();
++                let since = start.saturating_duration_since(phase).as_micros() as u64;
++                // the first blank at or after the frame's expected end
++                self.aim = Some(phase + Duration::from_micros(since.div_ceil(i) * i));
++            }
++        }
++        due
++    }
++    /// The moment to start the next frame (`None`: now). Without a flip in the last second (the
++    /// display woke, nothing moved for long) there is no reliable phase: render at once.
++    pub fn render_at(&self, now: Instant) -> Option<Instant> {
++        if !self.enabled || self.last_flip.is_none_or(|t| now.saturating_duration_since(t) > Duration::from_secs(1)) {
++            return None;
++        }
++        let phase = self.phase?;
++        let i = self.interval.as_micros() as u64;
++        let budget = self.budget();
++        // the first blank after now
++        let since = now.saturating_duration_since(phase).as_micros() as u64;
++        let next = phase + Duration::from_micros((since / i + 1) * i);
++        let left = next.saturating_duration_since(now);
++        if left >= budget {
++            return Some(next - budget);
++        }
++        // too close to make it with the full budget: at once if the typical render still fits,
++        // else aim at the blank after it
++        let typical = u64::from(self.renders.iter().copied().sum::<u32>()) / (self.renders.len().max(1) as u64);
++        if left >= Duration::from_micros(typical + 1_000) {
++            None
++        } else {
++            Some(next + Duration::from_micros(i) - budget)
++        }
++    }
++    pub fn describe(&self) -> String {
++        format!("pacer={} budget_ms={:.1} margin_ms={:.1} interval_ms={:.3} frames={} late={}", if self.enabled { "late-latch" } else { "off" }, self.budget().as_secs_f64() * 1000.0, f64::from(self.margin_us) / 1000.0, self.interval.as_secs_f64() * 1000.0, self.frames, self.late)
+     }
+ }
+ 
+@@ -121,11 +275,54 @@
+         assert_eq!(l.samples(), 0, "nothing on the screen before the flip");
+         std::thread::sleep(Duration::from_millis(5));
+         l.presented();
+-        assert_eq!(l.samples(), 1, "two motions in one frame are one sample, from the older");
+-        assert!(l.max_us >= 10_000);
++        assert_eq!(l.samples(), 1, "two motions in one frame: one sample each of the oldest and the newest");
++        assert!(l.oldest.max_us >= 10_000 && l.newest.max_us < l.oldest.max_us);
+         l.presented();
+         l.rendered(false);
+         assert_eq!(l.samples(), 1, "no motion, no sample");
+-        assert!(l.final_line().unwrap().contains("n=1"));
++        assert!(l.final_line().unwrap().contains("oldest n=1"));
++    }
++    #[test]
++    fn the_pacer_renders_late_enough_for_the_newest_input_and_early_enough_for_the_blank() {
++        let mut p = FramePacer::new(true);
++        let t0 = Instant::now();
++        assert_eq!(p.render_at(t0), None, "no flip seen yet: at once");
++        let i = Duration::from_micros(16_667);
++        for k in 0..10u32 {
++            p.rendered(Duration::from_micros(4_000), Duration::ZERO);
++            p.flipped(t0 + i * k);
++        }
++        let last = t0 + i * 9;
++        // just after a flip: wait until the next blank minus 4 ms of render and 3.5 ms of margin
++        let at = p.render_at(last + Duration::from_millis(1)).unwrap();
++        let expect = last + i - Duration::from_micros(7_500);
++        assert!(at.max(expect) - at.min(expect) < Duration::from_micros(300), "{:?}", at.max(expect) - at.min(expect));
++        // 5 ms before the blank: not the whole budget, but a 4 ms render fits: at once
++        assert_eq!(p.render_at(last + i - Duration::from_millis(5)), None);
++        // 2 ms before it: aim at the one after
++        let at = p.render_at(last + i - Duration::from_millis(2)).unwrap();
++        assert!(at > last + i);
++        // a frame planned for the next blank but shown a refresh later widens the margin
++        let before = p.budget();
++        assert!(p.plan(last + Duration::from_millis(1)).is_some());
++        p.flipped(last + i * 2);
++        assert!(p.budget() > before && p.late == 1);
++        // one shown on time narrows it a little
++        assert!(p.plan(last + i * 2 + Duration::from_millis(1)).is_some());
++        p.flipped(last + i * 3);
++        assert_eq!(p.late, 1);
++        // a render that started late counts its lateness against the budget
++        p.rendered(Duration::from_millis(3), Duration::from_millis(6));
++        assert!(p.budget() >= Duration::from_micros(9_000 + 3_500));
++        // a slow render raises the budget (to at most 14 ms)
++        p.rendered(Duration::from_millis(30), Duration::ZERO);
++        assert_eq!(p.budget(), Duration::from_millis(14));
++        // a flip read 3 ms late moves the phase by an eighth of that at most
++        p.flipped(last + i * 4 + Duration::from_millis(3));
++        let off = (p.phase.unwrap().duration_since(t0).as_micros() as u64) % 16_667;
++        assert!(off < 600 || off > 16_000, "phase moved by an eighth at most: {off}");
++        // stale: a second without flips renders at once; a pacer that is off always does
++        assert_eq!(p.render_at(last + Duration::from_secs(3)), None);
++        assert_eq!(FramePacer::new(false).render_at(last + Duration::from_millis(1)), None);
+     }
+ }
+diff -ruN '--exclude=.git' '--exclude=target' desk4-003/crates/wm-darwin/src/server.rs desk4-007/crates/wm-darwin/src/server.rs
+--- desk4-003/crates/wm-darwin/src/server.rs	2026-11-14 19:00:09.110121787 -0800
++++ desk4-007/crates/wm-darwin/src/server.rs	2026-11-14 19:39:32.143081882 -0800
+@@ -130,6 +130,10 @@
+     release_after_frame: Vec<wl_buffer::WlBuffer>,
+     /// Pointer motion to the flip that shows it (input_latency.rs).
+     pub(crate) latency: crate::input_latency::MotionLatency,
++    /// Late latching: when to render (input_latency.rs `FramePacer`); on with the KMS output.
++    pub(crate) pacer: crate::input_latency::FramePacer,
++    /// The moment the next frame is to be rendered, once decided.
++    render_due: Option<std::time::Instant>,
+     /// Readable when the input thread has events (hid.rs `InputThread::wake_fd`): ends the
+     /// wait between frames at once.
+     input_wake: Option<i32>,
+@@ -305,6 +309,8 @@
+             held: HashMap::new(),
+             release_after_frame: Vec::new(),
+             latency: Default::default(),
++            pacer: crate::input_latency::FramePacer::new(false),
++            render_due: None,
+             input_wake: None,
+             input_refused: 0,
+             external_dmabufs: HashMap::new(),
+@@ -558,10 +564,27 @@
+         if !self.fences_ready() {
+             return Ok(());
+         }
++        // Late latching: the frame is made as late as it can be and still make its blank, so
++        // that it shows the newest pointer position and client buffers (input_latency.rs).
++        let now = std::time::Instant::now();
++        let late = match self.render_due {
++            Some(due) if now < due => return Ok(()),
++            Some(due) => now - due,
++            None => {
++                if let Some(at) = self.pacer.plan(now).filter(|at| now < *at) {
++                    self.render_due = Some(at);
++                    return Ok(());
++                }
++                std::time::Duration::ZERO
++            }
++        };
++        self.render_due = None;
++        let started = std::time::Instant::now();
+         let stats = self.renderer.render_frame(self.wm.backend_mut(), presenter)?;
++        self.pacer.rendered(started.elapsed(), late);
+         self.wm.backend_mut().dirty = false;
+         self.latency.rendered(self.renderer.busy());
+-        self.latency.maybe_log();
++        self.latency.maybe_log(&self.pacer);
+         // The frame just rendered no longer samples these client buffers.
+         for buffer in self.release_after_frame.drain(..) {
+             buffer.release();
+@@ -679,6 +702,7 @@
+     }
+     fn presented(&mut self, presented: &crate::render::Presented, time_ms: u32) {
+         self.frames.record_presented(presented);
++        self.pacer.flipped(presented.at);
+         self.latency.presented();
+         for callback in self.awaiting_flip.drain(..) {
+             callback.done(time_ms);
+@@ -776,6 +800,17 @@
+             if let Some(fd) = self.input_wake {
+                 fds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
+             }
++            // A frame waiting for its moment (late latching): wake for it on time; the last
++            // two milliseconds are slept precisely (poll counts whole milliseconds).
++            let mut max = max;
++            if let Some(due) = self.render_due {
++                let left = due.saturating_duration_since(std::time::Instant::now());
++                if left <= std::time::Duration::from_millis(2) {
++                    std::thread::sleep(left);
++                    return Ok(());
++                }
++                max = max.min(left - std::time::Duration::from_millis(1));
++            }
+             if fds.is_empty() {
+                 std::thread::sleep(max);
+             } else {
+@@ -789,6 +824,19 @@
+         }
+         Ok(())
+     }
++    /// Late latching on (the KMS output: flips give the blank's phase). `CHONKSTEP_DARWIN_LATCH=0`
++    /// turns it off (frames are then rendered as soon as the frame before has flipped).
++    pub fn enable_frame_pacing(&mut self) {
++        let on = std::env::var("CHONKSTEP_DARWIN_LATCH").map_or(true, |v| v != "0");
++        self.set_frame_pacing(on);
++    }
++    /// Late latching on or off (the test instrument's `latch on|off`, for before/after numbers
++    /// in one run); only the KMS output can have it.
++    pub fn set_frame_pacing(&mut self, on: bool) {
++        self.pacer = crate::input_latency::FramePacer::new(on && self.renderer.output_name() == "kms");
++        self.render_due = None;
++        eprintln!("WMPACE {}", self.pacer.describe());
++    }
+     /// The input thread's wake descriptor (`InputThread::wake_fd`).
+     pub fn set_input_wake(&mut self, fd: i32) {
+         self.input_wake = Some(fd);

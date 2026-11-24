@@ -1,0 +1,145 @@
+--- a/src/Frameworks/QuartzCore/CALayerContext.h
++++ b/src/Frameworks/QuartzCore/CALayerContext.h
+@@ -18,6 +18,8 @@
+     id _delegate;
+     BOOL _renderScheduled;
+     CGFloat _backingScale;
++    uint64_t _lastContentsFingerprint;
++    BOOL _hasRenderedContents;
+ }
+ 
+ - initWithFrame:(CGRect)rect;
+--- a/src/Frameworks/QuartzCore/CALayerContext.m
++++ b/src/Frameworks/QuartzCore/CALayerContext.m
+@@ -10,13 +10,53 @@
+ #include <stdlib.h>
+ #include <dispatch/dispatch.h>
+ #include <os/lock.h>
++#include <dlfcn.h>
++#include <pthread.h>
++#include <objc/runtime.h>
+ 
+ @interface CALayer(private)
+ -(void)_setContext:(CALayerContext *)context;
+ -(NSNumber *)_textureId;
+ -(void)_setTextureId:(NSNumber *)value;
++-(uint32_t)_contentsSeed;
+ @end
+ 
++// Property changes already schedule their context directly. A bare transaction
++// only needs another composite when mutable IOSurface pixels changed. Rendering
++// itself reads transaction defaults, so unconditional broadcasts can redraw forever.
++static CFTypeID (*fingerprintSurfaceType)(void);
++static uint32_t (*fingerprintSurfaceSeed)(CFTypeRef);
++static Class fingerprintCFType;
++static pthread_once_t fingerprintOnce=PTHREAD_ONCE_INIT;
++static void loadFingerprintAPI(void) {
++   void *library=dlopen("/System/Library/Frameworks/IOSurface.framework/IOSurface",RTLD_LAZY|RTLD_GLOBAL);
++   if(library!=NULL){
++    fingerprintSurfaceType=dlsym(library,"IOSurfaceGetTypeID");
++    fingerprintSurfaceSeed=dlsym(library,"IOSurfaceGetSeed");
++   }
++   fingerprintCFType=objc_getClass("__NSCFType");
++}
++static uint64_t mixContents(uint64_t hash,uint64_t value) {
++   return (hash^value)*UINT64_C(1099511628211);
++}
++static uint64_t contentsFingerprint(CALayer *layer,BOOL *uncertain) {
++   if(layer==nil)return 0;
++   pthread_once(&fingerprintOnce,loadFingerprintAPI);
++   id contents=layer.contents;
++   uint64_t hash=mixContents(UINT64_C(14695981039346656037),(uintptr_t)layer);
++   hash=mixContents(hash,(uintptr_t)contents);
++   hash=mixContents(hash,[layer _contentsSeed]);
++   if(contents!=nil && fingerprintCFType!=Nil && [contents isKindOfClass:fingerprintCFType]){
++    if(fingerprintSurfaceType==NULL || fingerprintSurfaceSeed==NULL)
++     *uncertain=YES; // retain the old behavior if mutable-surface inspection is unavailable
++    else if(CFGetTypeID((CFTypeRef)contents)==fingerprintSurfaceType())
++     hash=mixContents(hash,fingerprintSurfaceSeed((CFTypeRef)contents));
++   }
++   for(CALayer *child in layer.sublayers)
++    hash=mixContents(hash,contentsFingerprint(child,uncertain));
++   return hash;
++}
++
+ // every live context, so a committed transaction reaches them all: an app can redraw an
+ // IOSurface it already set as contents and only commit, which changes no layer property
+ #define MAX_LIVE_CONTEXTS 64
+@@ -35,12 +75,24 @@
+      contexts[count++]=[liveContexts[i] retain];
+    os_unfair_lock_unlock(&liveContextsLock);
+    for(int i=0;i<count;i++){
+-    [contexts[i] _layerTreeChanged];
++    [contexts[i] _transactionContentsChanged];
+     [contexts[i] release];
+    }
+ }
+ 
+ 
++-(void)_transactionContentsChanged {
++   @autoreleasepool {
++    BOOL uncertain=NO;
++    uint64_t fingerprint=contentsFingerprint(_layer,&uncertain);
++    os_unfair_lock_lock(&liveContextsLock);
++    BOOL changed=uncertain || !_hasRenderedContents || fingerprint!=_lastContentsFingerprint;
++    os_unfair_lock_unlock(&liveContextsLock);
++    if(changed)[self _layerTreeChanged];
++   }
++}
++
++
+ -initWithFrame:(CGRect)rect {
+    CGLError error;
+    
+@@ -98,6 +150,11 @@
+ }
+ 
+ -(void)setFrame:(CGRect)rect {
++   if(!CGRectEqualToRect(_frame,rect)){
++    os_unfair_lock_lock(&liveContextsLock);
++    _hasRenderedContents=NO;
++    os_unfair_lock_unlock(&liveContextsLock);
++   }
+    _frame=rect;
+    
+    GLint width=(GLint)ceil(rect.size.width*_backingScale);
+@@ -114,6 +171,9 @@
+    if(!isfinite(value) || value<=0 || value>8 || value==_backingScale)
+     return;
+    _backingScale=value;
++   os_unfair_lock_lock(&liveContextsLock);
++   _hasRenderedContents=NO;
++   os_unfair_lock_unlock(&liveContextsLock);
+    [self setFrame:_frame];
+ }
+ 
+@@ -124,6 +184,9 @@
+ 
+    [_layer _setContext:self];
+    [_renderer setLayer:layer];
++   os_unfair_lock_lock(&liveContextsLock);
++   _hasRenderedContents=NO;
++   os_unfair_lock_unlock(&liveContextsLock);
+ }
+ 
+ -(void)invalidate {
+@@ -151,6 +214,8 @@
+ 
+ -(void)renderLayer:(CALayer *)layer {
+    @autoreleasepool {
++   BOOL uncertain=NO;
++   uint64_t fingerprint=contentsFingerprint(layer,&uncertain);
+    CGLSetCurrentContext(_glContext);
+ 
+    glEnable(GL_DEPTH_TEST);
+@@ -184,6 +249,10 @@
+    [self assignTextureIdsToLayerTree:layer];
+    
+    [_renderer render];
++   os_unfair_lock_lock(&liveContextsLock);
++   _lastContentsFingerprint=fingerprint;
++   _hasRenderedContents=!uncertain;
++   os_unfair_lock_unlock(&liveContextsLock);
+    }
+ }
+ 

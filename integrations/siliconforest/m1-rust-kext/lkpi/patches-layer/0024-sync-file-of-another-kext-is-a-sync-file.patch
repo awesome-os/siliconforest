@@ -1,0 +1,46 @@
+fbsdkpi: drm: a sync_file made by another DRM kext is recognised
+
+sync_file_get_fence() and the merge ioctl compared the file's f_op with this kext's own
+table, so a sync_file made by the GPU kext was "not a sync_file" to the display kext: a
+GPU fence could not be given to the display driver as IN_FENCE_FD, nor imported into one
+of its dma-bufs. As 0019 did for dma-bufs: sync_file_create() marks the linux_file
+(sf_kind = SF_LFILE_KIND_SYNC_FILE) and the check accepts the mark. The fence inside is
+used through its own ops (wait, callbacks, release), which is how the display driver
+already waits on the fences of an imported buffer's reservation object.
+
+Limit that stays while each DRM kext has its own copy of the layer: dma_fence_is_array()
+and dma_fence_is_chain() compare ops pointers, so the other kext's fence array is one
+opaque fence here (waited on as a whole, not unwrapped or merged element by element).
+UPSTREAM: yes.
+
+--- a/src/Kernel/fbsdkpi/drm/src/sf_sync_file.c
++++ b/src/Kernel/fbsdkpi/drm/src/sf_sync_file.c
+@@ -41,6 +41,11 @@
+ #define SF_SYNC_IOC_FILE_INFO	_IOWR('>', 4, struct sf_sync_file_info)
+ 
+ static const struct file_operations sf_sync_file_fops;
++// linux_file.sf_kind of a sync_file ("sync"), as SF_LFILE_KIND_DMA_BUF for a dma-buf: a
++// sf_kind match is a sync_file another drm kext made with its own copy of this file, and
++// its fence is used through its own ops (sf_kind is all that is compared)
++#define SF_LFILE_KIND_SYNC_FILE	0x73796e63
++#define sf_kind_is_sync_file(filp)	((filp)->sf_kind == SF_LFILE_KIND_SYNC_FILE)
+ 
+ static int
+ sf_sync_file_release(struct inode *inode, struct linux_file *filp)
+@@ -72,6 +72,7 @@
+ 		return NULL;
+ 	}
+ 	sf->file->private_data = sf;
++	sf->file->sf_kind = SF_LFILE_KIND_SYNC_FILE;
+ 	sf_sync_file_poll_init(sf);
+ 	sf->fence = dma_fence_get(fence);
+ 	return sf;
+@@ -85,7 +85,7 @@
+ 
+ 	if (filp == NULL)
+ 		return NULL;
+-	if (filp->f_op != &sf_sync_file_fops) {
++	if (filp->f_op != &sf_sync_file_fops && !sf_kind_is_sync_file(filp)) {
+ 		fput(filp);
+ 		return NULL;
+ 	}

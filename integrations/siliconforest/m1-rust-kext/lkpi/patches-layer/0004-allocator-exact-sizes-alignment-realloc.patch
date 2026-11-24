@@ -1,0 +1,178 @@
+fbsdkpi: allocator: exact ksize, malloc_aligned, realloc zeroing, contigmalloc fixes
+
+- heap blocks record the size that was asked for; malloc_usable_size()/ksize() return it
+  (they returned the padded size, so krealloc could hand out stale padding as data)
+- ksize()/realloc on contigmalloc memory (every kmalloc above a page) read the word in front
+  of the area as a heap header; they now ask the area table, and realloc frees with
+  _kernel_free
+- realloc with M_ZERO (__GFP_ZERO) zeroes the bytes past the old contents
+- malloc_aligned() honours its alignment (it was plain malloc)
+- kmalloc above a page with GFP_ATOMIC/GFP_NOWAIT fails instead of blocking in contigmalloc
+UPSTREAM: yes.
+
+--- a/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/src/linux_slab.c
++++ b/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/src/linux_slab.c
+@@ -231,8 +231,17 @@
+ 	/* sizeof(struct llist_node) is used for kfree_async(). */
+ 	_s = MAX(size, sizeof(struct llist_node));
+ 
++	/*
++	 * SiliconForest: up to a page this is the heap, aligned to the next power of two of
++	 * the size (linux's kmalloc alignment rule) and non-blocking with GFP_ATOMIC or
++	 * GFP_NOWAIT. Above a page linux promises physically contiguous memory, which here
++	 * only a blocking allocation can give: a request that may not wait fails instead
++	 * of sleeping (or of silently returning memory that is not contiguous).
++	 */
+ 	if (_s <= PAGE_SIZE)
+ 		return (malloc(_s, M_KMALLOC, linux_check_m_flags(flags)));
++	else if ((linux_check_m_flags(flags) & M_NOWAIT) != 0)
++		return (NULL);
+ 	else
+ 		return (contigmalloc(_s, M_KMALLOC, linux_check_m_flags(flags),
+ 		    0, -1UL, PAGE_SIZE, 0));
+--- a/src/Kernel/fbsdkpi/haiku/freebsd_network/compat/sys/malloc.h
++++ b/src/Kernel/fbsdkpi/haiku/freebsd_network/compat/sys/malloc.h
+@@ -33,6 +33,7 @@
+ 
+ 
+ void *_kernel_malloc(size_t size, int flags);
++void *_kernel_malloc_aligned(size_t size, size_t align, int flags);
+ void _kernel_free(void *ptr);
+ 
+ void *_kernel_contigmalloc(const char *file, int line, size_t size, int flags,
+@@ -79,7 +80,7 @@
+ #define malloc_usable_size(ptr) _kernel_malloc_usable_size(ptr)
+ #define mallocarray(n, size, tag, flags) kernel_malloc((n) * (size), tag, flags)
+ #define malloc_domainset(size, tag, ds, flags) kernel_malloc(size, tag, flags)
+-#define malloc_aligned(size, align, tag, flags) _kernel_malloc(size, flags)
++#define malloc_aligned(size, align, tag, flags) _kernel_malloc_aligned(size, align, flags)
+ #define zfree(ptr, tag) kernel_free(ptr, tag)
+ #endif
+ 
+--- a/src/Kernel/fbsdkpi/haiku/freebsd_network/malloc.cpp
++++ b/src/Kernel/fbsdkpi/haiku/freebsd_network/malloc.cpp
+@@ -53,6 +53,19 @@
+ }
+ 
+ 
++// an allocation aligned to more than its size would give it, FreeBSD's malloc_aligned
++void *
++_kernel_malloc_aligned(size_t size, size_t align, int flags)
++{
++	size_t natural = size >= PAGESIZE ? PAGESIZE : next_power_of_2(size);
++	void *ptr = memalign_etc(align > natural ? align : natural, size,
++		(flags & M_NOWAIT) ? HEAP_DONT_WAIT_FOR_MEMORY : 0);
++	if (ptr != NULL && (flags & M_ZERO) != 0)
++		memset(ptr, 0, size);
++	return ptr;
++}
++
++
+ void *
+ _kernel_realloc(void *ptr, size_t size, int flags)
+ {
+@@ -65,7 +78,12 @@
+ 
+ 	size_t old = _kernel_malloc_usable_size(ptr);
+ 	memcpy(fresh, ptr, old < size ? old : size);
+-	free(ptr);
++	// with M_ZERO the bytes past the old contents are zero, as FreeBSD's and linux's
++	// realloc have it
++	if ((flags & M_ZERO) != 0 && size > old)
++		memset((char *)fresh + old, 0, size - old);
++	// the old block may be contigmalloc memory
++	_kernel_free(ptr);
+ 	return fresh;
+ }
+ 
+@@ -75,6 +93,13 @@
+ size_t
+ _kernel_malloc_usable_size(const void *ptr)
+ {
++	// contigmalloc memory is an area and has no heap header in front of it
++	if (ptr != NULL && ((uintptr_t)ptr & (B_PAGE_SIZE - 1)) == 0) {
++		area_id area = area_for((void *)ptr);
++		area_info info;
++		if (area >= 0 && get_area_info(area, &info) == B_OK && info.address == ptr)
++			return info.size;
++	}
+ 	return malloc_usable_size((void *)ptr);
+ }
+ 
+@@ -86,6 +111,7 @@
+ {
+ 	const bool zero = (flags & M_ZERO) != 0, dontWait = (flags & M_NOWAIT) != 0;
+ 
++	const size_t asked = size;
+ 	size = ROUNDUP(size, B_PAGE_SIZE);
+ 
+ 	uint32 creationFlags = (zero ? 0 : CREATE_AREA_DONT_CLEAR)
+@@ -111,6 +137,11 @@
+ 	if (area < 0)
+ 		return NULL;
+ 
++	// the usable size is the rounded one (_kernel_malloc_usable_size): what lies past the
++	// request must not be stale memory when a later realloc hands it out as zeroed
++	if (!zero && size > asked)
++		memset((char *)address + asked, 0, size - asked);
++
+ 	return address;
+ }
+ 
+--- a/src/Kernel/fbsdkpi/sf/sf_haiku_kernel.cpp
++++ b/src/Kernel/fbsdkpi/sf/sf_haiku_kernel.cpp
+@@ -807,18 +851,29 @@
+ 	sfos_rw_downgrade(rw_impl(lock));
+ }
+ 
+-// heap, every block keeps its raw allocation just before it
++// heap, every block keeps its raw allocation and the size that was asked for just before it.
++// The size is exact on purpose: linux's ksize/krealloc/__GFP_ZERO rules are stated in terms
++// of it (bytes past it are not the caller's and are not zeroed).
++
++struct heap_header {
++	void	*raw;
++	size_t	size;
++};
+ 
+ static void *
+ heap_alloc(size_t size, size_t align, bool zero, bool canWait)
+ {
+-	if (align < sizeof(void *))
+-		align = sizeof(void *);
+-	void *raw = sfos_malloc(size + align + sizeof(void *), zero, canWait);
++	if (align < 16)
++		align = 16;
++	if (size + align + sizeof(heap_header) < size)
++		return NULL;
++	void *raw = sfos_malloc(size + align + sizeof(heap_header), zero, canWait);
+ 	if (raw == NULL)
+ 		return NULL;
+-	uintptr_t p = ((uintptr_t)raw + sizeof(void *) + align - 1) & ~(uintptr_t)(align - 1);
+-	((void **)p)[-1] = raw;
++	uintptr_t p = ((uintptr_t)raw + sizeof(heap_header) + align - 1) & ~(uintptr_t)(align - 1);
++	heap_header *header = (heap_header *)p - 1;
++	header->raw = raw;
++	header->size = size;
+ 	return (void *)p;
+ }
+ 
+@@ -838,7 +893,7 @@
+ free(void *ptr)
+ {
+ 	if (ptr != NULL)
+-		sfos_free(((void **)ptr)[-1]);
++		sfos_free(((heap_header *)ptr - 1)->raw);
+ }
+ 
+ size_t malloc_usable_size(void *ptr);
+@@ -864,8 +919,7 @@
+ 	if (ptr == NULL)
+ 		return 0;
+ 
+-	void *raw = ((void **)ptr)[-1];
+-	return sfos_malloc_size(raw) - ((uintptr_t)ptr - (uintptr_t)raw);
++	return ((heap_header *)ptr - 1)->size;
+ }
+ 
+ void *

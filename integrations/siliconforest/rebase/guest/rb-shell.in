@@ -1,0 +1,32 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# First boot of a rebase collection: a shell, what the kernel says it is, the processors, and
+# the registry entries of the devices our drivers map (their device memory is what upstream's
+# change to IODTResolveAddressCell could move). No Wi-Fi join, no GPU, no desktop.
+# tools/rb_boot.sh puts the NVMe-nub check (rb-prologue.sh) in front of this.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nRB_SHELL_BEGIN_%s\n' "$nonce"
+uname -a
+sysctl kern.version kern.osrelease kern.bootargs hw.model hw.machine hw.memsize hw.pagesize \
+    hw.ncpu hw.activecpu hw.physicalcpu hw.nperflevels hw.perflevel0.name hw.perflevel1.name 2>&1
+printf 'RB_SHELL_PROCESSES\n'
+ps ax 2>&1 | head -30
+printf 'RB_SHELL_MOUNT\n'
+mount 2>&1; df -h / 2>&1
+printf 'RB_SHELL_KEXTS\n'
+kextstat 2>&1 | wc -l
+printf 'RB_SHELL_REGISTRY\n'
+for n in ans apcie dart-apcie0 smc dcp sgx spi3 audio-spk1 dart-disp0 dart-sgx wlan; do
+    printf 'RB_NODE %s\n' "$n"
+    ioreg -p IODeviceTree -n "$n" -r -d 1 -l -w 0 2>&1 | grep -a -E '[+]-o |"reg"|IODeviceMemory|"compatible"' | head -6 | cut -c1-300
+done
+printf 'RB_SHELL_SERVICES\n'
+ioreg -p IOService -w 0 2>&1 | grep -a '+-o ' | wc -l
+ioreg -p IOService -w 0 2>&1 | grep -a -E 'SFApcie|SFBwfm|SFAgx|SFDcp|SFAppleSound|SFAppleTouchBar|SFM1SPI|SFCpuPower|SFGpuDT|SFAppleBootCPUPMGR|SFAppleAIC|AppleARMSMP|IO80211|en0' | cut -c1-160 | head -40
+printf 'RB_SHELL_SPAWN\n'
+i=0; while [ "$i" -lt 20 ]; do /bin/echo spawn-$i > /dev/null || printf 'RB_SPAWN_FAIL %s\n' "$i"; i=$((i+1)); done
+dd if=/dev/zero bs=1048576 count=16 2>/dev/null | sha256sum
+printf 'RB_SHELL_END_%s\n' "$nonce"
+printf '\nPD_BENCH_DONE\n'

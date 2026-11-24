@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "status": "SOURCE_CANDIDATE_HOST_CONTROL_TESTED_NOT_KERNEL_BUILT_OR_BOOTED",
+  "scope": "Future ARM64 T8103 console return around a framebuffer server/Wayland session. Not part of the first display boot. Only new files under integrations/puredarwin/m1-display were prepared; no native source tree, manifest, index or Nix file was changed. No hardware, SSH, Nix or goal API action.",
+  "baseline": "e7aa00a60f0b56ef35aa24252e81467787bf71ea",
+  "patch": {
+    "path": "integrations/puredarwin/m1-display/console-resume.patch",
+    "sha256": "e2eb053590402d905758bec4e9bc77014ccba64496c06fe3a9fcab1b3a2614bb",
+    "files": [
+      {"path": "src/Kernel/xnu/pexpert/arm/pe_init.c", "insertions": 16, "deletions": 6},
+      {"path": "src/Kernel/xnu/osfmk/console/video_console.c", "insertions": 18, "deletions": 3}
+    ],
+    "applies_check": "git apply --check succeeded in sources/puredarwin-m1-bringup without mutation. Tests separately apply the patch to disposable copies obtained through git show at the exact pin.",
+    "composition": "Disjoint source files from framebuffer-30bit.patch. This patch requires a future kernel rebuild; it does not alter IOGOP, IOFramebuffer, PDGOP or their ABI. Root owns staging/build timing after the first visible-shell milestone."
+  },
+  "original_failures": [
+    {
+      "finding": "ARM Disable selects serial and saves the old route. Enable calls initialize_screen before restoring that route. After an intervening Release clears gc_acquired, the text-reacquire test sees serial and skips painting, then PE restores VC too late.",
+      "evidence": ["src/Kernel/xnu/pexpert/arm/pe_init.c:228-243", "src/Kernel/xnu/osfmk/console/video_console.c:3014-3028,3051-3054"]
+    },
+    {
+      "finding": "Reordering alone is unsafe: the existing gc_text_boot branch treats any released screen as available on Enable. Release is also the server-open ownership transfer. A remap or enable during pending/live server ownership must not restart kernel painting.",
+      "evidence": ["src/Kernel/Extensions/IOGraphicsFamily/IOFramebuffer.cpp:4030-4041,10523-10534", "src/Kernel/xnu/osfmk/console/video_console.c:3014-3028"]
+    },
+    {
+      "finding": "Repeated Disable overwrites the saved VC route with serial, and the old route cookie is never consumed. Explicit Acquire on server close also needs to restore the pre-disable route if no intervening Enable did so.",
+      "evidence": ["src/Kernel/xnu/pexpert/arm/pe_init.c:228-243,264-266", "src/Kernel/Extensions/IOGraphicsFamily/IOFramebuffer.cpp:10342-10346"]
+    }
+  ],
+  "ownership_trace": {
+    "pdgop_open": "PDGOP.c:105-106 opens connection type 0, kIOFBServerConnectType. It then obtains pixel metadata and maps kIOFBVRAMMemory (111-144). It does not set the IOGraphics captured flag.",
+    "exclusive_server": "IOFramebuffer.cpp:4026-4041 holds the system gate, rejects an existing fServerConnect and calls setPlatformConsole(NULL, Release) BEFORE open(). IOFramebufferUserClient.cpp:136-147 installs fServerConnect only in start(), after open() returned. Therefore fServerConnect==NULL during opening is not evidence that the console may resume.",
+    "remap": "IOFramebuffer::findConsole passes &newConsole to Release and Enable (10523-10534). This is distinct from the NULL server-open Release. Across the pinned Kernel sources the other NULL releases are vcattach's paired release/acquire and PDRadeonFramebuffer's paired release/mode/acquire path; they do not require an automatic ownership grant on Enable.",
+    "capture_flag": "IOFramebuffer.cpp:6915-6924 derives captured from kIOCaptureDisableDisplayChange. setCaptured at 9988-10009 changes policy/property/notification state and does not release or acquire the kernel console. It is not a replacement for the exclusive-server ownership contract.",
+    "close": "PDGOPClose at PDGOP.c:160-165 unmaps its VRAM before IOServiceClose. IOFramebufferUserClient::stop calls extClose (223-229); extClose/closeWork serialize teardown through existing system/controller workloop gates (IOFramebuffer.cpp:10229-10256). The powered, console, non-accelerator-backed close path explicitly calls Acquire (10342-10346). fServerConnect stays set until close finishes (10369-10371). The patch preserves these conditions and adds no Acquire call.",
+    "lifetime_limit": "This follows the existing client/console ownership contract. It does not add map revocation, change memory quarantine, prove teardown quiescence, or review every generic IOUserClient mapping lifetime."
+  },
+  "implementation": {
+    "route": "Preserve the first pre-disable route across repeated Disable operations. Before Enable or explicit Acquire, restore it once and clear the saved cookie. Retain PE_state.video updating only for Enable with info, as before.",
+    "resume_latch": "gc_reacquire_text is set only for a non-NULL framebuffer remap when text boot is enabled, graphics mode is not selected, and the console was already acquired or had a pending console-owned remap. NULL Release cancels the latch. Later remaps while ownership remains released cannot recreate it.",
+    "enable": "Enable may unpause a still-acquired console, or consume a pending remap resume when VC is selected. It cannot turn an ownership Release into an Acquire. Mode changes and explicit Acquire clear any pending remap latch.",
+    "graphics_owner": "Pending server open and live server ownership remain released, including when captured is false. TextScreen while released only records desire; it does not paint. Only the existing caller's explicit Acquire returns ownership. Explicit graphics mode, serial-selected routing and pdtextboot=0 remain respected.",
+    "serial": "The current serial=3 UART mirror and serial keyboard polling are unchanged. Released/paused VC stays nonpainting while the existing serial-output guard preserves UART output.",
+    "synchronization": "No new concurrency mechanism or workloop is introduced. The latch follows the existing gc_acquired control state under the existing early-boot/IOGraphics call serialization. Rendering/mapping locks were not changed or dynamically qualified."
+  },
+  "tests": {
+    "path": "integrations/puredarwin/m1-display/test_console_resume.py",
+    "sha256": "675dbebed8e5dc32d22c4a6c90bb28d44f1a13e2100e3df8be37032c779478bd",
+    "command": "python3 -B integrations/puredarwin/m1-display/test_console_resume.py -v",
+    "exit_code": 0,
+    "test_groups_passed": 6,
+    "transition_sequences_passed": 17,
+    "ownership_mutants_rejected": 4,
+    "naive_reorder_only_failures_demonstrated": 5,
+    "original_failure_sequences_demonstrated": 6,
+    "method": "Read exact pinned C sources; apply the patch only in a temporary directory; compile/exercise the real ARM PE wrapper and the real initialize_screen control tail in a temporary host executable. Pixel/progress sinks and gc_enable/gc_pause side effects are stubs. The tests count painting-enabling transitions to catch even transient unauthorized resumes.",
+    "coverage": [
+      "Disable/remap/enable and release-with-info/enable restore acquired text.",
+      "Disable/enable without release remains a normal resume.",
+      "Pending server open, live owner, NULL-release cancellation and reopen do not auto-paint; explicit close/acquire returns text.",
+      "Repeated disables/remaps, one-use route cookie, serial-only selection, graphics boot, explicit graphics mode and pdtextboot=0.",
+      "Explicit Acquire restores the route even without an intervening Enable.",
+      "Pinned caller source binds NULL release to server opening, info-bearing release to remapping, and explicit acquire to the existing server-close path."
+    ],
+    "limits": "Host-only extracted-control validation. No SDK/kernel link, framebuffer mapping, scanout, scheduler/workloop race or real PDGOP/Wayland client was tested. Source applicability and host controls do not establish kernel or desktop runtime readiness."
+  },
+  "native_candidate_unchanged": {
+    "sources/puredarwin-m1-bringup/src/Kernel/xnu/pexpert/arm/pe_init.c": "24d3d56443a5eab79642e9ffd9e3f83296c4016bd6c1580e9ba8d50c0f5f5695",
+    "sources/puredarwin-m1-bringup/src/Kernel/xnu/osfmk/console/video_console.c": "36fc5fa57dd3cebe2161242d476b97c0c49b760110cabc861537431391be3ea7",
+    "verification": "Both files still equal the exact baseline console sources; neither contains this new patch. No existing manifest was rewritten."
+  },
+  "remaining_concrete_limits": [
+    "If IOFramebuffer::newUserClient fails after its initial NULL Release but before a user client exists, it has no explicit console-reacquire unwind at 4030-4098. PDGOP cannot close a connection it never received. This patch leaves that state released rather than guessing that the mapping/ownership is safe; UART remains available. A future ownership-aware failure unwind must verify the surviving console mapping before explicit Acquire.",
+    "The capture flag is not an ownership token; future changes must not use !captured or !fServerConnect during pending open to authorize painting.",
+    "The generic initializer still maps video information before its operation switch. This patch does not review or change that mapping lifetime/concurrency. Hardware validation must use the existing bounded controller and recovery path.",
+    "Only ARM PE routing and this pinned shared VC state machine are qualified by these tests. Applying the shared VC change to other architectures needs their PE/caller review."
+  ],
+  "next_steps": [
+    "Independent source review of this future patch, especially the pinned NULL-release versus remap ownership distinction.",
+    "After the first visible-shell milestone, root decides staging and runs a real XNU SDK build in a new bound candidate; the first display-test kernel remains kernel002.",
+    "Qualify successful PDGOP open, live remap with exclusive painting, unmap/close text return, and failed open separately before using the path for Wayland. Preserve serial and Linux recovery evidence."
+  ]
+}

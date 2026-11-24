@@ -1,0 +1,295 @@
+SFArmPlatformExpert: start the secondary cores of an Apple SoC
+
+SFAppleBootCPUPMGR was the boot-CPU-only IOPMGR: enableCPUCore() panicked, so the M1 ran
+on one efficiency core with cpus=1. It now releases a core from reset the way m1n1 does
+(src/smp.c, smp_start_cpu): after checking the core's reset vector register (the first
+word of cpu-impl-reg) against the address xnu passes, and writing it where it is not
+locked, it sets the core's bit in the CPU-start block of PMGR (+0x4, without which the
+core takes no IRQs) and the core's bit in its cluster's start word (+0x8 + 4 * cluster).
+The block's offset in /arm-io/pmgr is per SoC, from m1n1's table; only T8103 has been run.
+
+Every case it cannot handle (unknown SoC, a second die, a locked reset vector that is not
+xnu's, no reset vector at all) panics with the reason. Power-down still panics.
+
+--- a/src/Kernel/Extensions/SFArmPlatformExpert/SFAppleBootCPUPMGR.cpp
++++ b/src/Kernel/Extensions/SFArmPlatformExpert/SFAppleBootCPUPMGR.cpp
+@@ -1,20 +1,64 @@
++/*
++ * The secondary-core start sequence (sf_apple_cpu_start, sf_apple_cpu_prepare_rvbar,
++ * sf_apple_cpu_start_map and the tables they use) is ported from m1n1, src/smp.c
++ * (smp_start_cpu, smp_prepare_rvbar, cpu_start_bit, smp_init), which is
++ * SPDX-License-Identifier: MIT, Copyright The Asahi Linux Contributors.
++ */
+ #include "SFAppleBootCPUPMGR.h"
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOPMGR.h>
++#include <IOKit/IODeviceTreeSupport.h>
++#include <IOKit/IOMemoryDescriptor.h>
++#include <libkern/c++/OSData.h>
+ #include <arm/cpu_topology.h>
+ 
+ /*
+  * Power manager for Apple SoCs running xnu's AppleARMSMP, where Apple's
+- * ApplePMGR is not available. It manages the boot processor only and touches
+- * no PMGR registers:
++ * ApplePMGR is not available.
+  *
++ * - Secondary cores: enableCPUCore() releases a core from reset the way m1n1
++ *   does: the per-die CPU-start block in PMGR, after checking the core's reset
++ *   vector register. Only the SoCs in sf_apple_cpu_start_offsets are known;
++ *   on any other, or when the reset vector cannot be established, the request
++ *   panics with its reason instead of returning as if it had worked.
+  * - Idle: the platform offers no idle states. xnu's cpu_idle() executes the
+  *   WFI itself; each callback here disables xnu's idle timer (timeout 0).
+- * - Secondary cores and cluster power are not implemented. Every such request
+- *   panics with its reason instead of returning as if it had worked. Boot with
+- *   a topology holding only the boot CPU (cpus=1, or a tree that lists only
+- *   it) so that xnu never makes one.
++ * - Core and cluster power-down are not implemented and panic (xnu asks for
++ *   them on sleep and processor_exit).
++ */
++
++/* m1n1 src/smp.c: offset of the CPU-start block in the first PMGR register range */
++static const struct {
++	uint32_t chip_id;
++	uint32_t offset;
++} sf_apple_cpu_start_offsets[] = {
++	{ 0x8103, 0x54000 },    /* CPU_START_OFF_T8103; the only one that has been run */
++	{ 0x6000, 0x54000 },
++	{ 0x6001, 0x54000 },
++	{ 0x6002, 0x54000 },
++	{ 0x8112, 0x34000 },    /* CPU_START_OFF_T8112 */
++};
++#define SF_CPU_START_LEN        0x20
++
++/* m1n1 src/smp.c: the cpu node's "reg" */
++#define CPU_REG_CORE(reg)       ((reg) & 0xff)
++#define CPU_REG_CLUSTER(reg)    (((reg) >> 8) & 0x7)
++#define CPU_REG_DIE(reg)        (((reg) >> 11) & 0xf)
++
++/*
++ * m1n1 src/smp.c: the reset vector register, first in the core's "cpu-impl-reg".
++ * The address field is the one m1n1's hypervisor reads back (proxyclient/m1n1/hv,
++ * start_secondary: & 0xfffffffffff): on T8103 the register reads with further bits
++ * set from bit 44 up (0x0011100854946000 after 0x854946000 was written, boot sm02),
++ * which smp.c's GENMASK(47, 12) would take for address bits.
+  */
++#define RVBAR_LOCK              (1ULL << 0)
++#define RVBAR_ADDR              0x00000ffffffff000ULL
++
++static volatile uint8_t *sCpuStart;     /* the mapped CPU-start block of die 0 */
++static uint64_t          sCpuStartPhys;
++static uint32_t          sChipID;
++
+ class SFAppleBootCPUPMGR : public IOPMGR
+ {
+ 	OSDeclareDefaultStructors(SFAppleBootCPUPMGR);
+@@ -34,19 +78,109 @@
+ #define super IOPMGR
+ OSDefineMetaClassAndStructors(SFAppleBootCPUPMGR, IOPMGR);
+ 
++static const ml_topology_cpu_t *
++sf_apple_topology_cpu(unsigned int cpu_id)
++{
++	const ml_topology_info_t *topo = ml_get_topology_info();
++
++	for (unsigned int i = 0; topo != NULL && i < topo->num_cpus; i++) {
++		if (topo->cpus[i].cpu_id == cpu_id) {
++			return &topo->cpus[i];
++		}
++	}
++	return NULL;
++}
++
++/*
++ * m1n1 smp_prepare_rvbar() and the write in smp_start_cpu(): the core starts at the
++ * address in its RVBAR. Where the register is locked it must already name xnu's reset
++ * vector; where it is not, write it (which is also what m1n1's hypervisor reads when it
++ * starts the core for a guest). entry_pa is 0 on a kernel whose AppleARMSMP does not
++ * pass the reset vector: then the register can only be required to hold a vector.
++ */
++static void
++sf_apple_cpu_prepare_rvbar(const ml_topology_cpu_t *cpu, uint64_t entry_pa)
++{
++	volatile uint64_t *reg = (volatile uint64_t *)cpu->cpu_IMPL_regs;
++	uint64_t rvbar;
++
++	if (reg == NULL) {
++		panic("SFAppleBootCPUPMGR: cpu %u has no cpu-impl-reg; cannot check its reset vector",
++		    cpu->cpu_id);
++	}
++	rvbar = *reg;
++	if (entry_pa == 0) {
++		if ((rvbar & RVBAR_ADDR) == 0) {
++			panic("SFAppleBootCPUPMGR: cpu %u has no reset vector (RVBAR 0x%llx) "
++			    "and this kernel does not name one", cpu->cpu_id, rvbar);
++		}
++		return;
++	}
++	if ((entry_pa & ~RVBAR_ADDR) != 0) {
++		panic("SFAppleBootCPUPMGR: reset vector 0x%llx for cpu %u is not a page address",
++		    entry_pa, cpu->cpu_id);
++	}
++	if ((rvbar & RVBAR_ADDR) == entry_pa) {
++		return;
++	}
++	if (rvbar & RVBAR_LOCK) {
++		panic("SFAppleBootCPUPMGR: cpu %u reset vector is locked at 0x%llx, xnu's is 0x%llx",
++		    cpu->cpu_id, rvbar, entry_pa);
++	}
++	*reg = entry_pa;
++	__asm__ volatile ("dsb sy");
++	rvbar = *reg;
++	if ((rvbar & RVBAR_ADDR) != entry_pa) {
++		panic("SFAppleBootCPUPMGR: cpu %u reset vector reads 0x%llx after writing 0x%llx",
++		    cpu->cpu_id, rvbar, entry_pa);
++	}
++}
++
++/* m1n1 smp_start_cpu() */
++static void
++sf_apple_cpu_start(unsigned int cpu_id, uint64_t entry_pa)
++{
++	const ml_topology_cpu_t *cpu = sf_apple_topology_cpu(cpu_id);
++
++	if (cpu == NULL) {
++		panic("SFAppleBootCPUPMGR: start of cpu %u requested; not in the topology", cpu_id);
++	}
++
++	uint32_t core = CPU_REG_CORE(cpu->phys_id);
++	uint32_t cluster = CPU_REG_CLUSTER(cpu->phys_id);
++	uint32_t die = CPU_REG_DIE(cpu->phys_id);
++
++	if (sCpuStart == NULL) {
++		panic("SFAppleBootCPUPMGR: start of cpu %u requested; no known PMGR CPU-start "
++		    "block for chip 0x%x, boot with cpus=1", cpu_id, sChipID);
++	}
++	/* cpu_start_bit() is BIT(4 * cluster + core); the block has one word per cluster */
++	if (die != 0 || core >= 4 || 0x8 + 4 * cluster + 4 > SF_CPU_START_LEN) {
++		panic("SFAppleBootCPUPMGR: cpu %u is die %u cluster %u core %u; only die 0 with "
++		    "four-core clusters is implemented", cpu_id, die, cluster, core);
++	}
++
++	sf_apple_cpu_prepare_rvbar(cpu, entry_pa);
++
++	__asm__ volatile ("dsb sy");
++
++	/* Some kind of system level startup/status bit. Without this, IRQs don't work */
++	*(volatile uint32_t *)(sCpuStart + 0x4) = 1u << (4 * cluster + core);
++
++	/* Actually start the core */
++	*(volatile uint32_t *)(sCpuStart + 0x8 + 4 * cluster) = 1u << core;
++}
++
+ void
+ SFAppleBootCPUPMGR::enableCPUCore(unsigned int cpu_id, uint64_t entry_pa)
+ {
+-	panic("SFAppleBootCPUPMGR: start of cpu %u requested (entry 0x%llx); "
+-	    "secondary CPU bring-up is not implemented, boot with cpus=1",
+-	    cpu_id, (unsigned long long)entry_pa);
++	sf_apple_cpu_start(cpu_id, entry_pa);
+ }
+ 
+ void
+ SFAppleBootCPUPMGR::enableCPUCore(unsigned int cpu_id)
+ {
+-	panic("SFAppleBootCPUPMGR: start of cpu %u requested; "
+-	    "secondary CPU bring-up is not implemented, boot with cpus=1", cpu_id);
++	sf_apple_cpu_start(cpu_id, 0);
+ }
+ 
+ void
+@@ -103,6 +237,68 @@
+ 	}
+ }
+ 
++/*
++ * m1n1 smp_init(): the CPU-start block is at a per-SoC offset in the first register
++ * range of /arm-io/pmgr. Map it now; enableCPUCore() is not a place to map memory.
++ */
++static void
++sf_apple_cpu_start_map(void)
++{
++	IORegistryEntry *chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
++	IORegistryEntry *armio = IORegistryEntry::fromPath("/arm-io", gIODTPlane);
++	IORegistryEntry *pmgr = IORegistryEntry::fromPath("/arm-io/pmgr", gIODTPlane);
++	OSData *chip = chosen ? OSDynamicCast(OSData, chosen->getProperty("chip-id")) : NULL;
++	OSData *ranges = armio ? OSDynamicCast(OSData, armio->getProperty("ranges")) : NULL;
++	OSData *reg = pmgr ? OSDynamicCast(OSData, pmgr->getProperty("reg")) : NULL;
++	uint64_t phys = 0;
++	uint32_t offset = 0;
++
++	if (chip != NULL && chip->getLength() >= sizeof(uint32_t)) {
++		sChipID = *(const uint32_t *)chip->getBytesNoCopy();
++	}
++	for (unsigned i = 0; i < sizeof(sf_apple_cpu_start_offsets) / sizeof(sf_apple_cpu_start_offsets[0]); i++) {
++		if (sf_apple_cpu_start_offsets[i].chip_id == sChipID) {
++			offset = sf_apple_cpu_start_offsets[i].offset;
++		}
++	}
++	if (offset != 0 && ranges != NULL && reg != NULL && reg->getLength() >= 2 * sizeof(uint64_t)) {
++		/* /arm-io ranges: child address, parent (physical) address, size */
++		const uint64_t *r = (const uint64_t *)ranges->getBytesNoCopy();
++		const uint64_t *pr = (const uint64_t *)reg->getBytesNoCopy();
++
++		for (unsigned i = 0; i + 3 <= ranges->getLength() / sizeof(uint64_t); i += 3) {
++			if (pr[0] >= r[i] && pr[0] - r[i] < r[i + 2] &&
++			    (uint64_t)offset + SF_CPU_START_LEN <= pr[1]) {
++				phys = r[i + 1] + (pr[0] - r[i]) + offset;
++				break;
++			}
++		}
++	}
++	if (phys != 0) {
++		IOMemoryDescriptor *desc = IOMemoryDescriptor::withPhysicalAddress(
++			(IOPhysicalAddress)phys, SF_CPU_START_LEN, kIODirectionOutIn);
++		IOMemoryMap *map = desc ? desc->map(kIOMapAnywhere | kIOMapInhibitCache) : NULL;
++
++		if (desc != NULL) {
++			desc->release();
++		}
++		if (map != NULL) {
++			/* never unmapped: the power manager lives as long as the system */
++			sCpuStart = (volatile uint8_t *)map->getVirtualAddress();
++			sCpuStartPhys = phys;
++		}
++	}
++	if (chosen != NULL) {
++		chosen->release();
++	}
++	if (armio != NULL) {
++		armio->release();
++	}
++	if (pmgr != NULL) {
++		pmgr->release();
++	}
++}
++
+ bool
+ SFAppleBootCPUPMGR_publish(IOService *provider)
+ {
+@@ -113,15 +309,21 @@
+ 	if (pmgr == NULL) {
+ 		return false;
+ 	}
++	sf_apple_cpu_start_map();
+ 	ok = pmgr->init() && pmgr->attach(provider);
+ 	if (ok && !pmgr->start(provider)) {
+ 		pmgr->detach(provider);
+ 		ok = false;
+ 	}
+ 	if (ok) {
+-		if (topo != NULL && topo->num_cpus > 1) {
+-			IOLog("SFAppleBootCPUPMGR: topology has %u processors; starting any "
+-			    "but the boot CPU will panic (boot with cpus=1)\n", topo->num_cpus);
++		if (sCpuStart != NULL) {
++			IOLog("SFAppleBootCPUPMGR: chip 0x%x, CPU-start block at 0x%llx, "
++			    "%u processors in %u clusters\n", sChipID, sCpuStartPhys,
++			    topo ? topo->num_cpus : 0, topo ? topo->num_clusters : 0);
++		} else if (topo != NULL && topo->num_cpus > 1) {
++			IOLog("SFAppleBootCPUPMGR: topology has %u processors and chip 0x%x has no "
++			    "known CPU-start block; starting any but the boot CPU will panic "
++			    "(boot with cpus=1)\n", topo->num_cpus, sChipID);
+ 		}
+ 		pmgr->registerService();
+ 	}

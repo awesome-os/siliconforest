@@ -1,0 +1,490 @@
+diff --git a/flake.nix b/flake.nix
+index c9a99817..32810588 100644
+--- a/flake.nix
++++ b/flake.nix
+@@ -5174,6 +5174,10 @@
+             ;
+           # Investigative builds, not image contents.
+           probePackages = {
++            # Continuing native T8103 development kernel; KC/ramdisk assembled separately.
++            kernel-arm64-t8103-bringup = import ./nix/m1-bringup.nix {
++              inherit mkPureDarwinBuild kernelSource arm64CrossToolchain;
++            };
+             # Cross toolchain, exposed so out-of-tree flakes (e.g. checkm8-tools'
+             # PongoOS build) can link Mach-O with the real cctools ld64.
+             arm64-cross-toolchain = arm64CrossToolchain;
+diff --git a/nix/m1-bringup.nix b/nix/m1-bringup.nix
+new file mode 100644
+index 00000000..db0e74ca
+--- /dev/null
++++ b/nix/m1-bringup.nix
+@@ -0,0 +1,14 @@
++# Continuing native M1 HV development kernel. This is not a bootable image.
++{ mkPureDarwinBuild, kernelSource, arm64CrossToolchain }:
++mkPureDarwinBuild {
++  pname = "puredarwin-kernel-arm64-t8103-bringup";
++  src = kernelSource;
++  buildTargets = [ "xnu" ];
++  enableUserspace = false;
++  installUserland = false;
++  installKernel = true;
++  xnuKernelConfig = "DEBUG";
++  puredarwinArch = "arm64";
++  inherit arm64CrossToolchain;
++  extraCmakeFlags = [ "-DPUREDARWIN_ARM64_MACHINE_CONFIG=T8103" ];
++}
+diff --git a/src/Kernel/xnu/CMakeLists.txt b/src/Kernel/xnu/CMakeLists.txt
+index 04961d66..d10b12c2 100644
+--- a/src/Kernel/xnu/CMakeLists.txt
++++ b/src/Kernel/xnu/CMakeLists.txt
+@@ -147,6 +147,12 @@ if(NOT PUREDARWIN_XNU_KERNEL_CONFIG MATCHES "^(RELEASE|DEVELOPMENT|DEBUG|KASAN)$
+         "Unsupported PUREDARWIN_XNU_KERNEL_CONFIG='${PUREDARWIN_XNU_KERNEL_CONFIG}'")
+ endif()
+ 
++# The public non-PPL M1 development configuration is deliberately DEBUG-only.
++if(PUREDARWIN_ARM64_MACHINE_CONFIG STREQUAL "T8103" AND
++   NOT PUREDARWIN_XNU_KERNEL_CONFIG STREQUAL "DEBUG")
++    message(FATAL_ERROR "T8103 bringup requires DEBUG")
++endif()
++
+ file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/xnu_header_install)
+ # a prebuilt header install goes where the in-tree one would, so kexts see the same paths
+ set(PUREDARWIN_PREBUILT_XNU_HEADERS "" CACHE PATH "Prebuilt xnu header install to use instead of building it")
+diff --git a/src/Kernel/xnu/cmake/MakeInc.def.in b/src/Kernel/xnu/cmake/MakeInc.def.in
+index cf2bdc4c..1944c16f 100644
+--- a/src/Kernel/xnu/cmake/MakeInc.def.in
++++ b/src/Kernel/xnu/cmake/MakeInc.def.in
+@@ -34,7 +34,7 @@ SUPPORTED_ARM_MACHINE_CONFIGS = NONE
+ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else
+ SUPPORTED_ARM_MACHINE_CONFIGS = T8002 T8004 BCM2835
+-SUPPORTED_ARM64_MACHINE_CONFIGS = T7000 T7001 S8000 S8001 T8010 T8011 BCM2837 VIRT VIRT4K VIRTAMP SUN50I SC8280XP
++SUPPORTED_ARM64_MACHINE_CONFIGS = T7000 T7001 S8000 S8001 T8010 T8011 T8103 BCM2837 VIRT VIRT4K VIRTAMP SUN50I SC8280XP
+ 
+ endif
+ 
+@@ -71,6 +71,9 @@ MACHINE_FLAGS_ARM_T8004 = -DARM_BOARD_CONFIG_T8004
+ # Open-source LLVM spells the same core apple-a10.
+ MACHINE_FLAGS_ARM64_T8010 = -DARM64_BOARD_CONFIG_T8010 -mcpu=apple-a10 -DPUREDARWIN_NO_KERNEL_INTEGRITY -DPUREDARWIN_NO_APPLE_PMU -DPUREDARWIN_EARLY_FB_MARK -DPUREDARWIN_MASK_AIC_SOURCES
+ MACHINE_FLAGS_ARM64_T8011 = -DARM64_BOARD_CONFIG_T8011 -mcpu=apple-a10
++# Native M1 HV development: public non-PPL VM, real cache maintenance.
++# __ARM_ARCH_8_2__ selects LSE, which upstream clang does not advertise here.
++MACHINE_FLAGS_ARM64_T8103 = -DARM64_BOARD_CONFIG_T8103 -DCURRENT_MACHINE_CONFIG_LC=$(CURRENT_MACHINE_CONFIG_LC) -mcpu=apple-m1 -D__ARM_ARCH_8_2__=1 -DDARWIN_LAB_M1_BRINGUP=1
+ # Raspberry Pi Zero / Zero W: BCM2835, ARM1176JZF-S, ARMv6Z, single core.
+ # The peripheral block is the same IP as the BCM2837 the arm64 side already
+ # supports, at a different base (0x20000000 rather than 0x3F000000).
+@@ -413,7 +416,7 @@ ARM64_KC_BASE      =0xfffffff006000000
+ # is a separate KC-layout bug (kc-tools emits two __TEXT_EXEC segments), not a
+ # consequence of this.
+ # VIRTAMP is VIRT with an E and a P cluster: the same geometry
+-ifneq ($(filter VIRT VIRTAMP SC8280XP,$(CURRENT_MACHINE_CONFIG)),)
++ifneq ($(filter VIRT VIRTAMP SC8280XP T8103,$(CURRENT_MACHINE_CONFIG)),)
+ LARGE_MEMORY_DEFINE=-DARM_LARGE_MEMORY=1
+ ARM64_PLKSEG_ADDR  =0xfffffe0004004000
+ ARM64_LINK_ADDR    =0xfffffe0007004000
+diff --git a/src/Kernel/xnu/config/MASTER.arm64.t8103 b/src/Kernel/xnu/config/MASTER.arm64.t8103
+new file mode 100644
+index 00000000..56cb8feb
+--- /dev/null
++++ b/src/Kernel/xnu/config/MASTER.arm64.t8103
+@@ -0,0 +1,134 @@
++# Native T8103 HV development: public non-PPL VM, no production lockdown.
++# Derived from pinned MASTER.arm64.MacOSX; real AST path, optional debug omitted.
++#
++# Mach Operating System
++# Copyright (c) 1986 Carnegie-Mellon University
++# Copyright 2001-2024 Apple Inc.
++#
++# All rights reserved.  The CMU software License Agreement
++# specifies the terms and conditions for use and redistribution.
++######################################################################
++#
++#  Master Apple configuration file (see the master machine independent
++#  configuration file for a description of the file format).
++#
++######################################################################
++#  Standard Apple OS Configurations:
++#  -------- ----- -- ---------------
++#
++#if MASTER_CONFIG_ENABLE_EXCLAVES
++#  ARM_EXTRAS_BASE = [ config_sptm config_sptm_iommu config_exclaves ]
++#elif MASTER_CONFIG_ENABLE_SPTM
++#  ARM_EXTRAS_BASE = [ config_sptm config_sptm_iommu ]
++#else
++#  ARM_EXTRAS_BASE = [ nos_arm_pmap nos_arm_asm config_pmap_ppl ]
++#endif
++#  KERNEL_BASE =    [ arm64 medium msgb_large config_requires_u32_munging config_delay_idle_sleep config_proc_udata_storage config_uexc config_darkboot ARM_EXTRAS_BASE ]
++#  KERNEL_RELEASE = [ KERNEL_BASE release ]
++#  KERNEL_DEV =     [ KERNEL_BASE development mach_assert config_xnupost proc_ref_debug config_proc_resource_limits config_ext_paniclog ]
++#  KERNEL_DEBUG =   [ KERNEL_BASE debug mach_assert config_xnupost config_waitq_stats config_workloop_debug config_proc_resource_limits config_ext_paniclog ]
++#  BSD_BASE =       [ mach_bsd config_vfork sysv_sem sysv_msg sysv_shm config_netboot config_imageboot psynch config_proc_uuid_policy config_coredump config_ucoredump pgo config_personas ]
++#  BSD_RELEASE =    [ BSD_BASE ]
++#  BSD_DEV =        [ BSD_BASE config_vnguard ]
++#  BSD_DEBUG =      [ BSD_BASE config_vnguard ]
++#  FILESYS_BASE =   [ devfs fdesc fifo fs_compression config_protect config_mnt_rootsnap config_rosv_startup config_mount_vm config_mount_prebootrecovery config_basesystemroot config_fse quota namedstreams config_imgsrc_access config_triggers config_ext_resolver config_searchfs config_volfs config_appledouble nullfs config_mnt_suid config_firmlinks config_dataless_files config_union_mounts config_file_leases ]
++#  FILESYS_RELEASE= [ FILESYS_BASE ]
++#  FILESYS_DEV =    [ FILESYS_BASE config_iocount_trace ]
++#  FILESYS_DEBUG =  [ FILESYS_BASE config_iocount_trace ]
++#  NFS =            [ nfsserver ]
++#  SKYWALK_BASE =   [ skywalk config_nexus_user_pipe config_nexus_kernel_pipe config_nexus_flowswitch config_nexus_netif ]
++#  SKYWALK_RELEASE = [ SKYWALK_BASE ]
++#  SKYWALK_DEV =    [ SKYWALK_BASE ]
++#  SKYWALK_DEBUG =  [ SKYWALK_BASE ]
++#  NETWORKING =     [ inet bpfilter dummynet traffic_mgt sendfile ah_all_crypto bond vlan gif stf ifnet_input_chk if_bridge MULTIPATH if_fake if_redirect remote_vif ]
++#  NETWORKING_RELEASE = [ NETWORKING ]
++#  NETWORKING_DEV = [ NETWORKING_RELEASE packet_mangler if_headless kctl_test ]
++#  NETWORKING_DEBUG = [ NETWORKING_DEV ]
++#  VPN =            [ ipsec flow_divert necp content_filter ]
++#  PF =             [ pf pflog ]
++#  MULTIPATH =      [ multipath mptcp ]
++#if SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED
++#  HIBERNATION =    [ ]
++#else /*!(SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED)*/
++#  HIBERNATION =    [ ]
++#endif /*SOC_CONFIG_t8020 || SOC_IS_VIRTUALIZED*/
++#  IOKIT_BASE =     [ iokit iokitcpp no_kernel_hid config_sleep iokitstats HIBERNATION ]
++#  IOKIT_RELEASE =  [ IOKIT_BASE ]
++#  IOKIT_DEV =      [ IOKIT_BASE iotracking ]
++#  IOKIT_DEBUG =    [ IOKIT_BASE iotracking ]
++#  LIBKERN_BASE =   [ libkerncpp config_blocks config_kec_fips crypto_sha2 config_img4 ]
++#  LIBKERN_RELEASE =[ LIBKERN_BASE zlib ]
++#  LIBKERN_DEV =    [ LIBKERN_BASE zlib iotracking ]
++#  LIBKERN_DEBUG =  [ LIBKERN_BASE zlib iotracking ]
++#if SOC_IS_VIRTUALIZED
++#  CPU_COUNTERS_BASE = [ ]
++#else /*!SOC_IS_VIRTUALIZED*/
++#  CPU_COUNTERS_BASE = [ config_cpu_counters config_pervasive_cpi config_pervasive_energy ]
++#endif /*SOC_IS_VIRTUALIZED*/
++#  PERF_DBG_BASE =  [ config_dtrace mach_kdp config_serial_kdp kdp_interactive_debugging config_kdp_coredump_encryption CPU_COUNTERS_BASE kperf ]
++#  PERF_DBG_RELEASE=[ PERF_DBG_BASE ist_kdebug ]
++#  PERF_DBG_DEV =   [ PERF_DBG_BASE lock_stats zleaks alternate_debugger config_debug_syscall_rejection config_iotrace config_memory_microstackshot ]
++#  PERF_DBG_DEBUG = [ PERF_DBG_BASE lock_stats zleaks alternate_debugger config_debug_syscall_rejection config_iotrace config_memory_microstackshot ]
++#  PERF_DBG_KASAN = [ PERF_DBG_BASE lock_stats zleaks alternate_debugger config_debug_syscall_rejection config_iotrace config_memory_microstackshot ]
++#if SOC_IS_VIRTUALIZED
++#  PARAVIRT_BASE =  [ config_pv_ticket ]
++#else
++#  PARAVIRT_BASE =  [ ]
++#endif /*SOC_IS_VIRTUALIZED*/
++#  MACH_BASE =      [ mach config_ecc_logging vc_progress_white importance_inheritance config_atm config_coalitions config_iosched config_sysdiagnose config_telemetry config_mach_bridge_recv_time config_quiesce_counter config_arm_pfz config_user_notification phys_write_acct config_service_port_info config_voucher_deprecated PARAVIRT_BASE ]
++#  MACH_RELEASE =   [ MACH_BASE ]
++#  MACH_DEV =       [ MACH_BASE config_io_accounting importance_trace config_task_suspend_stats ]
++#  MACH_DEBUG =     [ MACH_BASE config_io_accounting importance_trace importance_debug config_task_suspend_stats ]
++#  SCHED_BASE =     [ config_sched_timeshare_core config_sched_deferred_ast config_clutch config_sched_sfi config_sched_auto_join config_preadopt_tg ]
++#  SCHED_RELEASE =  [ SCHED_BASE ]
++#  SCHED_DEV =      [ SCHED_BASE ]
++#  SCHED_DEBUG =    [ SCHED_BASE ]
++#if MASTER_CONFIG_ENABLE_KERNEL_TAG && MASTER_CONFIG_ENABLE_SPTM
++#  VM_EXTRA =       [ kernel_tagging ]
++#  VM_EXTRA_DEV =   [ ]
++#elif MASTER_CONFIG_ENABLE_SPTM
++#  VM_EXTRA =       [ ]
++#  VM_EXTRA_DEV =   [ ]
++#else
++#  VM_EXTRA =       [ ]
++#  VM_EXTRA_DEV =   [ ]
++#endif /* MASTER_CONFIG_ENABLE_KERNEL_TAG && MASTER_CONFIG_ENABLE_SPTM */
++#  VM_BASE =        [ vm_pressure_events memorystatus config_code_decryption encrypted_swap config_deferred_reclaim VM_EXTRA ]
++#  VM_RELEASE =     [ VM_BASE ]
++#  VM_DEV =         [ VM_BASE dynamic_codesigning VM_EXTRA_DEV ]
++#  VM_DEBUG =       [ VM_BASE dynamic_codesigning VM_EXTRA_DEV ]
++#  VM_KASAN =       [ VM_BASE dynamic_codesigning config_kasan config_ubsan config_kcov config_ksancov kernel_tagging kernel_tbi ]
++#  SECURITY_BASE  =   [ config_macf config_audit kernel_integrity config_csr config_csr_from_dt config_setuid config_kas_info config_secure_bsd_root config_arcade config_supplemental_signatures second_static_trust_cache reslide_shared_cache ]
++#  SECURITY_RELEASE = [ SECURITY_BASE ]
++#  SECURITY_DEV   =   [ SECURITY_BASE ]
++#  SECURITY_DEBUG =   [ SECURITY_BASE ]
++#  BASE =           [ PF VPN NFS ]
++#  RELEASE =        [ BASE KERNEL_RELEASE BSD_RELEASE FILESYS_RELEASE SKYWALK_RELEASE NETWORKING_RELEASE IOKIT_RELEASE LIBKERN_RELEASE    PERF_DBG_RELEASE MACH_RELEASE SCHED_RELEASE VM_RELEASE SECURITY_RELEASE ]
++#  DEVELOPMENT =    [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_DEV     SECURITY_DEV     ]
++#  DEBUG =          [ BASE KERNEL_DEBUG   BSD_DEBUG   FILESYS_DEBUG   SKYWALK_DEBUG   NETWORKING_DEBUG   IOKIT_DEBUG   LIBKERN_DEBUG      PERF_DBG_DEBUG   MACH_DEBUG   SCHED_DEBUG   VM_DEBUG   SECURITY_DEBUG   ]
++#  KASAN =          [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_KASAN   MACH_DEV     SCHED_DEV     VM_KASAN   SECURITY_DEV     ]
++#  SPTM =           [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV        PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_DEV     SECURITY_DEV     ]
++#
++######################################################################
++#
++machine		"arm64"						# <arm64>
++
++makeoptions	OSFMK_MACHINE = "arm64"				# <mach>
++
++options		COUNT_SYSCALLS		# count bsd system calls 	# <countcalls>
++options     TRASH_VFP_ON_SAVE   # <debug,trash_vfp>
++options		ALTERNATE_DEBUGGER	# <alternate_debugger>
++
++options   CONFIG_VNODES=1024		# <xsmall>
++
++options   CONFIG_FREEZE_SUSPENDED_MIN=4		# <xsmall>
++
++options	  CONFIG_MACH_APPROXIMATE_TIME
++
++options   CONFIG_KERNEL_INTEGRITY		# <kernel_integrity>
++
++options CONFIG_MACF_LAZY_VNODE_LABELS   # Turn on labels, don't preallocate
++
++options   CONFIG_RESLIDE_SHARED_CACHE		# <reslide_shared_cache>
++options   CONFIG_KERNEL_TBI		# <kernel_tbi>
++options   CONFIG_KERNEL_TAGGING		# <kernel_tagging>
+diff --git a/src/Kernel/xnu/osfmk/arm/arm_init.c b/src/Kernel/xnu/osfmk/arm/arm_init.c
+index ac8b8641..aab220f9 100644
+--- a/src/Kernel/xnu/osfmk/arm/arm_init.c
++++ b/src/Kernel/xnu/osfmk/arm/arm_init.c
+@@ -348,6 +348,15 @@ arm_auxkc_init(void *mh, void *base)
+  */
+ 
+ 
++#if DARWIN_LAB_M1_BRINGUP
++/* Monotonic reached-point breadcrumbs for a stopped-guest RAM inspection.
++ * These stores do not assert success and do not depend on a working console. */
++volatile uint64_t darwin_lab_m1_progress;
++#define M1_PROGRESS(value) (darwin_lab_m1_progress = (value))
++#else
++#define M1_PROGRESS(value) ((void)0)
++#endif
++
+ __startup_func
+ void
+ arm_init(
+@@ -360,7 +369,9 @@ arm_init(
+ 	DTEntry chosen = NULL;
+ 	unsigned int dt_entry_size = 0;
+ 
++	M1_PROGRESS(1); /* entered arm_init with stage-1 translation enabled */
+ 	arm_slide_rebase_and_sign_image();
++	M1_PROGRESS(2); /* image slide/fixup processing returned */
+ 
+ #if defined(SUN50I)
+ 	// start.s left VBAR on its early fault handler at a physical address, reachable only
+@@ -389,6 +400,7 @@ arm_init(
+ #endif /* defined(HAS_APPLE_PAC) */
+ 
+ 	PE_init_platform(FALSE, args); /* Get platform expert set up */
++	M1_PROGRESS(3);
+ 
+ #if __arm64__
+ 	configure_timer_apple_regs();
+@@ -588,7 +600,9 @@ arm_init(
+ 	gDramSize = *dram_size;
+ 	pmap_first_pnum = (ppnum_t)atop(gDramBase);
+ 
++	M1_PROGRESS(4);
+ 	arm_vm_init(xmaxmem, args);
++	M1_PROGRESS(5);
+ 
+ 	if (debug_boot_arg) {
+ 		patch_low_glo();
+@@ -604,6 +618,10 @@ arm_init(
+ 	const unsigned int serial_exists = serial_init();
+ 	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
+ 	kprintf("kprintf initialized\n");
++#if DARWIN_LAB_M1_BRINGUP
++	M1_PROGRESS(6);
++	kprintf("DARWIN_LAB_M1_BRINGUP checkpoint=arm_vm_init_returned next=kernel_init\n");
++#endif
+ 
+ 	serialmode = 0;
+ 	if (PE_parse_boot_argn("serial", &serialmode, sizeof(serialmode))) {
+diff --git a/src/Kernel/xnu/osfmk/arm64/arm_vm_init.c b/src/Kernel/xnu/osfmk/arm64/arm_vm_init.c
+index 73d1db13..0a771253 100644
+--- a/src/Kernel/xnu/osfmk/arm64/arm_vm_init.c
++++ b/src/Kernel/xnu/osfmk/arm64/arm_vm_init.c
+@@ -1385,6 +1385,20 @@ arm_vm_prot_init(__unused boot_args * args)
+ 	}
+ 	assert(auxKC_header_range_size == sizeof(DTMemoryMapRange));
+ 
++#if DARWIN_LAB_M1_BRINGUP
++	/* The observed native boot ADT represents absent collections as (-1,-1).
++	 * Accept only the complete pair of absent descriptors. Mixed/malformed
++	 * sentinels must fail, rather than becoming a successful empty mapping. */
++	if (auxKC_range->paddr == UINT64_MAX || auxKC_range->length == UINT64_MAX ||
++	    auxKC_header_range->paddr == UINT64_MAX || auxKC_header_range->length == UINT64_MAX) {
++		if (auxKC_range->paddr == UINT64_MAX && auxKC_range->length == UINT64_MAX &&
++		    auxKC_header_range->paddr == UINT64_MAX && auxKC_header_range->length == UINT64_MAX) {
++			goto noAuxKC;
++		}
++		panic("Malformed absent AuxKC descriptors");
++	}
++#endif
++
+ 	if (auxKC_header_range->paddr == 0 || auxKC_range->paddr == 0) {
+ 		goto noAuxKC;
+ 	}
+diff --git a/src/Kernel/xnu/osfmk/arm64/caches_asm.s b/src/Kernel/xnu/osfmk/arm64/caches_asm.s
+index 57fef5de..addafb02 100644
+--- a/src/Kernel/xnu/osfmk/arm64/caches_asm.s
++++ b/src/Kernel/xnu/osfmk/arm64/caches_asm.s
+@@ -356,6 +356,10 @@ LEXT(CleanPoC_DcacheRegion_Force)
+ 	b		EXT(CleanPoC_DcacheRegion_internal)
+ #endif /* APPLE_ARM64_ARCH_FAMILY */
+ 
++#if DARWIN_LAB_M1_BRINGUP
++#include "m1_cache_helpers.inc"
++#endif
++
+ #if !defined(APPLE_ARM64_ARCH_FAMILY)
+ /*
+  *	void CleanPoC_DcacheRegion_Force_nopreempt_nohid(vm_offset_t va, size_t length)
+diff --git a/src/Kernel/xnu/osfmk/arm64/m1_cache_helpers.inc b/src/Kernel/xnu/osfmk/arm64/m1_cache_helpers.inc
+new file mode 100644
+index 00000000..e5dd88ba
+--- /dev/null
++++ b/src/Kernel/xnu/osfmk/arm64/m1_cache_helpers.inc
+@@ -0,0 +1,66 @@
++/*
++ * Public-source M1 cache-maintenance wrappers. Included after the upstream
++ * CLEANPOC_DCACHEREGION and ENABLE/DISABLE_DC_MVA_OPS macros in caches_asm.s.
++ * Preemption is caller-owned and must already be disabled. The batch API
++ * explicitly enables/disables maintenance; the single-range API restores the
++ * exact prior HID4/EHID4 value, including when called inside an enabled batch.
++ * No allocation, call, stack use, callee-saved GPR clobber or success stub.
++ * Ranges must be valid kernel VAs with non-wrapping end addresses.
++ */
++#if !defined(ARM64_BOARD_CONFIG_T8103) || !DARWIN_LAB_M1_BRINGUP || !DEBUG
++#error "M1 cache wrappers require the explicit native DEBUG bringup configuration"
++#endif
++
++	.text
++	.align 2
++	.globl EXT(enable_dc_mva_ops)
++LEXT(enable_dc_mva_ops)
++	ARM64_PROLOG
++	mrs x10, DAIF
++	msr DAIFSet, #0xf
++	ENABLE_DC_MVA_OPS x0, x1
++	msr DAIF, x10
++	ret
++
++	.globl EXT(disable_dc_mva_ops)
++LEXT(disable_dc_mva_ops)
++	ARM64_PROLOG
++	mrs x10, DAIF
++	msr DAIFSet, #0xf
++	dsb sy
++	DISABLE_DC_MVA_OPS x0, x1
++	msr DAIF, x10
++	ret
++
++	.globl EXT(CleanPoC_DcacheRegion_Force_nopreempt)
++LEXT(CleanPoC_DcacheRegion_Force_nopreempt)
++	ARM64_PROLOG
++	cbz x1, Ldl_m1_cache_empty
++	/* Mask asynchronous nesting while the saved per-core HID value is live.
++	 * The upstream clean macro clobbers only x0/x1/x2/x9 and condition flags. */
++	mrs x10, DAIF
++	msr DAIFSet, #0xf
++	isb sy
++	ARM64_IS_ECORE x11
++	ARM64_READ_CORE_SYSREG x11, x12, EHID4, HID4
++	bic x13, x12, #ARM64_REG_HID4_DisDcMVAOps
++	ARM64_WRITE_CORE_SYSREG x11, x13, EHID4, HID4
++	isb sy
++	dsb sy
++	CLEANPOC_DCACHEREGION
++	dsb sy
++	ARM64_WRITE_CORE_SYSREG x11, x12, EHID4, HID4
++	isb sy
++	msr DAIF, x10
++	ret
++
++	.globl EXT(CleanPoC_DcacheRegion_Force_nopreempt_nohid)
++LEXT(CleanPoC_DcacheRegion_Force_nopreempt_nohid)
++	ARM64_PROLOG
++	/* The pmap batch caller already enabled maintenance on this same CPU. */
++	cbz x1, Ldl_m1_cache_empty
++	b EXT(CleanPoC_DcacheRegion_internal)
++Ldl_m1_cache_empty:
++	/* Do not underflow the upstream length-1 loop on an empty range. */
++	dsb sy
++	ret
+diff --git a/src/Kernel/xnu/osfmk/arm64/m1_progress_entry.inc b/src/Kernel/xnu/osfmk/arm64/m1_progress_entry.inc
+new file mode 100644
+index 00000000..43da3076
+--- /dev/null
++++ b/src/Kernel/xnu/osfmk/arm64/m1_progress_entry.inc
+@@ -0,0 +1,40 @@
++/* Inline cold-entry progress, after x20 saves BootArgs and VBAR is installed.
++ * No calls, stack, persistent state, changes to x20, or parking. The host must
++ * validate EL1/MMU-off, M1 identity and uart0=0x235200000 before entering XNU.
++ * Every poll is bounded. Unavailable UART loses this optional line and startup
++ * still continues through the original page-table/MMU/arm_init path.
++ * The physical UART is valid only here, before the stage-1 MMU is enabled.
++ */
++#if !defined(ARM64_BOARD_CONFIG_T8103) || !DARWIN_LAB_M1_BRINGUP || !DEBUG
++#error "M1 progress requires the explicit native DEBUG bringup configuration"
++#endif
++
++	movz x1, #0x3520, lsl #16
++	movk x1, #2, lsl #32
++	adr x2, Ldl_m1_progress_message
++Ldl_m1_progress_next:
++	ldrb w3, [x2], #1
++	cbz w3, Ldl_m1_progress_drain
++	mov x4, #0x100000
++Ldl_m1_progress_wait:
++	ldr w5, [x1, #0x10]
++	tbnz w5, #1, Ldl_m1_progress_tx
++	subs x4, x4, #1
++	b.ne Ldl_m1_progress_wait
++	b Ldl_m1_progress_done
++Ldl_m1_progress_tx:
++	str w3, [x1, #0x20]
++	dsb sy
++	b Ldl_m1_progress_next
++Ldl_m1_progress_drain:
++	mov x4, #0x100000
++Ldl_m1_progress_drain_wait:
++	ldr w5, [x1, #0x10]
++	tbnz w5, #2, Ldl_m1_progress_done
++	subs x4, x4, #1
++	b.ne Ldl_m1_progress_drain_wait
++	b Ldl_m1_progress_done
++Ldl_m1_progress_message:
++	.asciz "DARWIN_LAB_M1_BRINGUP checkpoint=start_first_cpu next=bootstrap_tables\r\n"
++	.align 2
++Ldl_m1_progress_done:
+diff --git a/src/Kernel/xnu/osfmk/arm64/start.s b/src/Kernel/xnu/osfmk/arm64/start.s
+index 7669ce74..cf760866 100644
+--- a/src/Kernel/xnu/osfmk/arm64/start.s
++++ b/src/Kernel/xnu/osfmk/arm64/start.s
+@@ -489,6 +489,9 @@ LEXT(start_first_cpu)
+ 
+ 
+ 	// Get the kernel memory parameters from the boot args
++#if DARWIN_LAB_M1_BRINGUP
++#include "m1_progress_entry.inc"
++#endif
+ 	ldr		x22, [x20, BA_VIRT_BASE]			// Get the kernel virt base
+ 	ldr		x23, [x20, BA_PHYS_BASE]			// Get the kernel phys base
+ 	ldr		x24, [x20, BA_MEM_SIZE]				// Get the physical memory size
+diff --git a/src/Kernel/xnu/pexpert/pexpert/arm64/board_config.h b/src/Kernel/xnu/pexpert/pexpert/arm64/board_config.h
+index 7cc9846e..c3fe61c9 100644
+--- a/src/Kernel/xnu/pexpert/pexpert/arm64/board_config.h
++++ b/src/Kernel/xnu/pexpert/pexpert/arm64/board_config.h
+@@ -138,11 +138,29 @@
+ #ifdef ARM64_BOARD_CONFIG_T8103
+ #include <pexpert/arm64/H13.h>
+ 
++#if DARWIN_LAB_M1_BRINGUP
++/* Public-source HV development configuration. HAS_CTRR remains a hardware
++ * fact; this image does not implement CTRR/PPL protection or claim it does.
++ * The omitted private backends require memmap_types.h/CoreEntitlements V2. */
++#undef KERNEL_INTEGRITY_CTRR
++#if defined(__ASSEMBLER__)
++/* Pinned m1n1 cpu_regs.h encodings, with matching XNU field definitions.
++ * CPU_OVRD/CPU_CFG names are inferred aliases for CYC_OVRD/ACC_CFG. */
++#define CPU_OVRD S3_5_C15_C5_0
++#define CPU_CFG S3_5_C15_C4_0
++#define ACC_OVRD S3_5_C15_C6_0
++/* Both core classes use bit 11 to disable DC maintenance by VA. */
++#define HID4 S3_0_C15_C4_0
++#define EHID4 S3_0_C15_C4_1
++#define ARM64_REG_HID4_DisDcMVAOps (1 << 11)
++#endif
++#endif
++
+ #define MAX_L2_CLINE                   7
+ #define MAX_CPUS                       8
+ #define MAX_CPU_CLUSTERS               2
+ 
+-#ifndef CONFIG_SPTM
++#if !defined(CONFIG_SPTM) && !DARWIN_LAB_M1_BRINGUP
+ #define PMAP_CS                        1
+ #define PMAP_CS_ENABLE                 1
+ #define XNU_MONITOR                    1 /* Secure pmap runtime */

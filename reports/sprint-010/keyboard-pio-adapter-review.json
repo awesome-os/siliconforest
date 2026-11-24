@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "HOST_REVIEW_NO_HARDWARE_NO_BUILD",
+  "reviewed_snapshot_stable_since": "22:14:09 (unchanged through 22:18:49)",
+  "files": {
+    "integrations/puredarwin/m1-keyboard/m1kbd_hw.h": "2f2f1fa9560d3d12",
+    "integrations/puredarwin/m1-keyboard/m1kbd_board.c": "d02e4a86f01a10a3",
+    "integrations/puredarwin/m1-keyboard/m1kbd_pio.c": "5dff005d2bbdd789",
+    "integrations/puredarwin/m1-keyboard/test_adapter.py": "64cee5adb511eb56"
+  },
+  "verdict": "APPROVE the bounded PIO/power ownership layer for host and fake-MMIO stages. No blockers. Seven non-blocking items below; R1-R3 are worth fixing before the first hardware run.",
+  "tests": {
+    "astra": "test_adapter.py: 17/17 pass here (cc -Wall -Wextra -Werror, UBSan). Includes validation of the board guard against the real saved ADT.",
+    "independent": "Scratch harness (not in repo) with its own fake PMGR/GPIO/SPI model: happy path, read gated on NUB13, write plus status, bad status, SPI3 never on, SPI3 DEV_DISABLE, SIO off, pin LOCK, WORD_DELAY nonzero, and an MMIO-fault injection at each of 400 access indices. 0 SPI accesses before SPI3 reads 0xf, 0 parent writes, and every error left the adapter faulted."
+  },
+  "verified": [
+    "No SPI3 read or write before SPI3 reads target=actual=0xf: power() succeeds only through (v&0xff)==0xff or a polled actual 0xf with BUSY clear (pio.c:54-87). spi_access and controller() come after.",
+    "SIO_BUSIF, SIO and NUB_GPIO are only read and verified, never written, reset or powered down on any path. This fits m1n1, which hooks and shadows SIO and SIO_BUSIF (hv/__init__.py:1473-1514).",
+    "All six pins are read and LOCK-checked before any GPIO write (pio.c:93-97). The writes match the pinned Linux ops: pinmux_set :187-188, direction_input :243-246, direction_output :256-258.",
+    "Controller setup equals spi-apple.c init/prep_transfer: CFG=0x20, PIN CS high, OVERRIDE_CS clear, PINCFG KEEP_CS, FIFO reset, delays 0, CLKDIV 15, BITS 8. Every offset and bit matches the pinned header.",
+    "The FIFO level is bounded before each RXDATA read (pio.c:193), which avoids the reference overflow at spi-apple.c:432-437. One 200 ms deadline plus an iteration cap per transaction. CS timing is 65 us setup, 200 us write/status gap, 65 us hold, 250 us idle.",
+    "Reads happen only while NUB13 is low (pio.c:235-242). A status mismatch fails the write. Faults idle the controller, raise CS, drive spien low and latch faulted. Stop is idempotent and records cleanup failures.",
+    "m1n1 maps all arm-io ranges as passthrough (hv/__init__.py:1400-1403). Only the UART/USB PMGR chains, the vuart and two PMGR overrides are hooked, so SPI3, GPIO and nub-gpio accesses are not trapped."
+  ],
+  "items": [
+    {"id": "R1", "where": "m1kbd_pio.c:193", "issue": "(!rx && rl) fails every write if the controller fills the RX FIFO while RXCNT=0. Linux never reads RX in TX-only transfers and only resets the FIFO before the next one, so this hardware behavior is unproven either way. It fails closed, but reports the same M1KBD_FIFO code as real FIFO errors.", "fix": "Use a distinct result code, or drain and discard up to 16 bytes, so the first hardware run can tell the two apart."},
+    {"id": "R2", "where": "m1kbd_pio.c:82", "issue": "A single BUSY sample refuses start. BUSY is a transient hardware bit, especially on auto-PM domains such as GPIO.", "fix": "Re-sample for up to 100 us before refusing."},
+    {"id": "R3", "where": "m1kbd_pio.c:85-87", "issue": "SPI3 is written read-modify-write from power_before[3], which was sampled before SPI_P and GPIO were activated.", "fix": "Re-read SPI3 immediately before writing it."},
+    {"id": "R4", "where": "m1kbd_pio.c:59-60", "issue": "A shared domain found with target 0xf, AUTO set and actual clock-gated gets AUTO cleared and is held fully on. Functionally harmless, but it is not 'kept as found'.", "fix": "Accept target 0xf with AUTO set as usable without writing, or document the change."},
+    {"id": "R5", "where": "m1kbd_pio.c:149", "issue": "spi_access is set before pins(), so a pin-lock refusal still writes SPI CTRL/IE/PIN during cleanup (4 writes in the harness). Safe, because power is on.", "fix": "Set spi_access when controller() starts."},
+    {"id": "R6", "where": "m1kbd_pio.c:224-231", "issue": "One status mismatch powers the keyboard off and faults the adapter. Right for the diagnostic stages; a long-running driver may want to report the failed write and keep power, still with no broad retry.", "fix": "Design note only."},
+    {"id": "R7", "where": "native adapter callbacks", "issue": "The 5, 5 and 50 ms waits must sleep (IOSleep on a workloop), not spin with IODelay. now_us must be monotonic. ADAPTER.md is referenced by the headers but absent from this snapshot. Pins are changed and not restored on stop, and SPI3 is left powered on.", "fix": "Document these in ADAPTER.md."}
+  ]
+}

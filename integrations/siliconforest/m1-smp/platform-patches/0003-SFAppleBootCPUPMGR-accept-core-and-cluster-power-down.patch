@@ -1,0 +1,150 @@
+SFArmPlatformExpert: SFAppleBootCPUPMGR accepts core and cluster power-down
+
+disableCPUCore(), enableCPUCluster() and disableCPUCluster() panicked, so processor_exit
+(cpuctl offline) and the sleep path took the machine down. With xnu parking offline cores
+(kernel patch 0003, boot-arg sfcpupark, default on) the power manager has nothing to cut:
+IOPMGR's contract for disableCPUCore is "prepare a secondary CPU core for power down, and
+disable external IRQ delivery to the core ... doesn't actually cut power", and SFAppleAIC
+delivers every IRQ to the boot CPU. The three requests are now accepted and recorded.
+enableCPUCore() does not release a core twice: xnu restarts a parked core itself, and under
+m1n1's hypervisor a second write to the CPU-start block would try to start a core that is
+already in the guest.
+
+With sfcpupark=0 xnu expects real power-down; that is still not implemented and still
+panics, now saying so.
+
+--- a/src/Kernel/Extensions/SFArmPlatformExpert/SFAppleBootCPUPMGR.cpp	2026-11-10 21:17:59.330750040 -0800
++++ b/src/Kernel/Extensions/SFArmPlatformExpert/SFAppleBootCPUPMGR.cpp	2026-11-10 21:17:59.381883617 -0800
+@@ -6,6 +6,7 @@
+  */
+ #include "SFAppleBootCPUPMGR.h"
+ #include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
+ #include <IOKit/IOPMGR.h>
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+@@ -23,8 +24,15 @@
+  *   panics with its reason instead of returning as if it had worked.
+  * - Idle: the platform offers no idle states. xnu's cpu_idle() executes the
+  *   WFI itself; each callback here disables xnu's idle timer (timeout 0).
+- * - Core and cluster power-down are not implemented and panic (xnu asks for
+- *   them on sleep and processor_exit).
++ * - Taking a core offline: this power manager cannot cut a core's power. With
++ *   xnu's park mode (boot-arg sfcpupark, default 1; xnu osfmk/arm64/cpu.c) it
++ *   does not have to: disableCPUCore() is the contract's "prepare for power
++ *   down, disable external IRQ delivery" with nothing to do (SFAppleAIC routes
++ *   every IRQ to the boot CPU), the core then parks itself in WFI, and xnu
++ *   restarts it with an IPI, without enableCPUCore(). Cluster power requests
++ *   are accepted the same way: a cluster whose cores are all parked is as off
++ *   as it gets. With sfcpupark=0 xnu expects the core to lose power, which is
++ *   not implemented: those requests panic with the reason.
+  */
+ 
+ /* m1n1 src/smp.c: offset of the CPU-start block in the first PMGR register range */
+@@ -56,6 +64,10 @@
+ #define RVBAR_ADDR              0x00000ffffffff000ULL
+ 
+ static volatile uint8_t *sCpuStart;     /* the mapped CPU-start block of die 0 */
++static bool              sPark = true;  /* xnu parks offline cores (sfcpupark) */
++static volatile uint32_t sReleased;     /* cpu ids released from reset by enableCPUCore */
++static volatile uint32_t sOffline;      /* cpu ids xnu has asked to disable */
++static volatile uint32_t sClustersOff;  /* cluster ids xnu has asked to power down */
+ static uint64_t          sCpuStartPhys;
+ static uint32_t          sChipID;
+ 
+@@ -160,6 +172,16 @@
+ 		    "four-core clusters is implemented", cpu_id, die, cluster, core);
+ 	}
+ 
++	/*
++	 * A core this power manager has already released is not in reset. In park mode
++	 * xnu restarts such a core itself; a second release would, under m1n1's
++	 * hypervisor, try to start a core that is already running the guest.
++	 */
++	if (sPark && cpu_id < 32 && (sReleased & (1u << cpu_id)) != 0) {
++		__sync_fetch_and_and(&sOffline, ~(1u << cpu_id));
++		return;
++	}
++
+ 	sf_apple_cpu_prepare_rvbar(cpu, entry_pa);
+ 
+ 	__asm__ volatile ("dsb sy");
+@@ -169,6 +191,9 @@
+ 
+ 	/* Actually start the core */
+ 	*(volatile uint32_t *)(sCpuStart + 0x8 + 4 * cluster) = 1u << core;
++	if (cpu_id < 32) {
++		__sync_fetch_and_or(&sReleased, 1u << cpu_id);
++	}
+ }
+ 
+ void
+@@ -186,19 +211,38 @@
+ void
+ SFAppleBootCPUPMGR::disableCPUCore(unsigned int cpu_id)
+ {
+-	panic("SFAppleBootCPUPMGR: power-down of cpu %u requested; not implemented", cpu_id);
++	/* runs on the core itself, interrupts disabled, on its way into cpu_sleep() */
++	if (!sPark) {
++		panic("SFAppleBootCPUPMGR: power-down of cpu %u requested with sfcpupark=0; "
++		    "cutting a core's power is not implemented", cpu_id);
++	}
++	if (cpu_id < 32) {
++		__sync_fetch_and_or(&sOffline, 1u << cpu_id);
++	}
+ }
+ 
+ void
+ SFAppleBootCPUPMGR::enableCPUCluster(unsigned int cluster_id)
+ {
+-	panic("SFAppleBootCPUPMGR: power-up of cluster %u requested; not implemented", cluster_id);
++	if (!sPark) {
++		panic("SFAppleBootCPUPMGR: power-up of cluster %u requested with sfcpupark=0; "
++		    "cluster power is not implemented", cluster_id);
++	}
++	if (cluster_id < 32) {
++		__sync_fetch_and_and(&sClustersOff, ~(1u << cluster_id));
++	}
+ }
+ 
+ void
+ SFAppleBootCPUPMGR::disableCPUCluster(unsigned int cluster_id)
+ {
+-	panic("SFAppleBootCPUPMGR: power-down of cluster %u requested; not implemented", cluster_id);
++	if (!sPark) {
++		panic("SFAppleBootCPUPMGR: power-down of cluster %u requested with sfcpupark=0; "
++		    "cluster power is not implemented", cluster_id);
++	}
++	if (cluster_id < 32) {
++		__sync_fetch_and_or(&sClustersOff, 1u << cluster_id);
++	}
+ }
+ 
+ void
+@@ -310,6 +354,13 @@
+ 		return false;
+ 	}
+ 	sf_apple_cpu_start_map();
++	{
++		int park = 1;
++
++		if (PE_parse_boot_argn("sfcpupark", &park, sizeof(park))) {
++			sPark = park != 0;
++		}
++	}
+ 	ok = pmgr->init() && pmgr->attach(provider);
+ 	if (ok && !pmgr->start(provider)) {
+ 		pmgr->detach(provider);
+@@ -318,8 +369,10 @@
+ 	if (ok) {
+ 		if (sCpuStart != NULL) {
+ 			IOLog("SFAppleBootCPUPMGR: chip 0x%x, CPU-start block at 0x%llx, "
+-			    "%u processors in %u clusters\n", sChipID, sCpuStartPhys,
+-			    topo ? topo->num_cpus : 0, topo ? topo->num_clusters : 0);
++			    "%u processors in %u clusters; offline cores are %s\n", sChipID,
++			    sCpuStartPhys, topo ? topo->num_cpus : 0, topo ? topo->num_clusters : 0,
++			    sPark ? "parked in WFI by xnu (sfcpupark)" :
++			    "expected to lose power (sfcpupark=0): not implemented, will panic");
+ 		} else if (topo != NULL && topo->num_cpus > 1) {
+ 			IOLog("SFAppleBootCPUPMGR: topology has %u processors and chip 0x%x has no "
+ 			    "known CPU-start block; starting any but the boot CPU will panic "

@@ -1,0 +1,97 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# The baseline loops under several policy settings in one boot, to choose the defaults:
+# for each setting 20 s of the single loop, 20 s of one worker per processor, then 12 s
+# idle (state and system power at rest). Settings are kern.sf_cpufreq.mode, period_ms,
+# up_permille and down_hold. The list is @CONFIGS@ of tools/th_boot.sh (TH_CONFIGS), shell
+# commands separated by ";":
+#   run NAME MODE PERIOD UP HOLD     one setting, as above
+#   heat SECONDS                     one worker per processor with a TH_MON line every 5 s
+#                                    (temperatures, caps, fan), tagged heat1, heat2, ...
+#   stress N                         N checked transitions per cluster
+#   back                             after fan_control was switched off again: is the fan
+#                                    the SMC's (F0Md = 0)?
+#   any sysctl -w ...
+# tools/th_summary.py --tune tabulates.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nTH_BEGIN_%s\n' "$nonce"
+ncpu=$(sysctl -n hw.ncpu 2>/dev/null); ncpu=${ncpu:-1}
+t0=$(date +%s)
+now() { echo $(( $(date +%s) - t0 )); }
+get() { sysctl -n "$1" 2>/dev/null; }
+worker() {      # tag id seconds
+    i=0; start=$(date +%s); end=$(( start + $3 ))
+    while [ "$(date +%s)" -lt "$end" ]; do
+        dd if=/dev/zero bs=1048576 count=8 2>/dev/null | sha256sum > /dev/null
+        i=$((i+1))
+    done
+    printf 'TH_WORKER tag=%s id=%s megabytes=%s seconds=%s elapsed=%s\n' "$1" "$2" "$((i*8))" "$3" "$(( $(date +%s) - start ))"
+}
+group() {       # tag workers seconds
+    pids=; w=0; while [ "$w" -lt "$2" ]; do worker "$1" "$w" "$3" & pids="$pids $!"; w=$((w+1)); done
+    wait $pids
+}
+n=0
+while [ "$(get kern.sf_thermal.status)" != ok ] && [ "$n" -lt 60 ]; do sleep 1; n=$((n+1)); done
+printf 'TH_SENSOR_WAIT seconds=%s valid=%s\n' "$n" "$(get kern.sf_thermal.valid)"
+sysctl kern.sf_thermal.limit_c kern.sf_thermal.critical_c kern.sf_thermal.die_keys 2>&1
+
+mon() {
+    printf 'TH_MON t=%s die_mc=%s status=%s cap=E%s/P%s pstate=E%s/P%s util=E%s/P%s fan=%s target=%s asked=%s mode=%s mw=%s tr=%s\n' \
+        "$(now)" "$(get kern.sf_thermal.die_mc)" "$(get kern.sf_thermal.status)" \
+        "$(get kern.sf_cpufreq.e_cap)" "$(get kern.sf_cpufreq.p_cap)" \
+        "$(get kern.sf_cpufreq.e_pstate)" "$(get kern.sf_cpufreq.p_pstate)" \
+        "$(get kern.sf_cpufreq.e_util)" "$(get kern.sf_cpufreq.p_util)" \
+        "$(get kern.sf_thermal.fan_rpm)" "$(get kern.sf_thermal.fan_target_rpm)" \
+        "$(get kern.sf_thermal.fan_asked_rpm)" "$(get kern.sf_thermal.fan_mode)" \
+        "$(get kern.sf_thermal.system_mw)" "$(get kern.sf_cpufreq.transitions)"
+}
+heats=0
+heat() {        # seconds
+    heats=$((heats+1))
+    printf 'TH_PHASE heat%s t=%s\n' "$heats" "$(now)"
+    ( while :; do mon; sleep 5; done ) &
+    monitor=$!
+    group "heat$heats" "$ncpu" "$1"
+    kill "$monitor" 2>/dev/null
+    printf 'TH_PHASE after_heat%s t=%s\n' "$heats" "$(now)"
+}
+stress() {      # count
+    sysctl -w kern.sf_cpufreq.stress="$1" > /dev/null 2>&1
+    printf 'TH_STRESS asked=%s done=%s failures=%s max_us=%s busy_timeouts=%s\n' "$1" \
+        "$(get kern.sf_cpufreq.stress)" "$(get kern.sf_cpufreq.stress_failures)" "$(get kern.sf_cpufreq.stress_max_us)" \
+        "$(get kern.sf_cpufreq.busy_timeouts)"
+}
+sensors() {     # every die sensor now, and the SMC's own CPU maxima
+    printf 'TH_SENSORS t=%s die_mc=%s %s\n' "$(now)" "$(get kern.sf_thermal.die_mc)" "$(get kern.sf_thermal.sensors)"
+}
+back() {
+    sleep 6
+    printf 'TH_BACK die_mc=%s fan=%s target=%s asked=%s mode=%s writes=%s write_errors=%s\n' "$(get kern.sf_thermal.die_mc)" \
+        "$(get kern.sf_thermal.fan_rpm)" "$(get kern.sf_thermal.fan_target_rpm)" "$(get kern.sf_thermal.fan_asked_rpm)" \
+        "$(get kern.sf_thermal.fan_mode)" "$(get kern.sf_thermal.fan_writes)" "$(get kern.sf_thermal.fan_write_errors)"
+}
+run() {         # name mode period up hold
+    sysctl -w kern.sf_cpufreq.mode="$2" kern.sf_cpufreq.period_ms="$3" kern.sf_cpufreq.up_permille="$4" \
+        kern.sf_cpufreq.down_hold="$5" > /dev/null 2>&1
+    sysctl -w kern.sf_cpufreq.residency_reset=1 > /dev/null 2>&1
+    printf 'TH_PHASE %s t=%s\n' "$1" "$(now)"
+    tr0=$(get kern.sf_cpufreq.transitions)
+    group "single_$1" 1 20
+    printf 'TH_TUNE_SINGLE name=%s p_residency="%s" e_residency="%s" die_mc=%s\n' "$1" \
+        "$(get kern.sf_cpufreq.p_residency)" "$(get kern.sf_cpufreq.e_residency)" "$(get kern.sf_thermal.die_mc)"
+    group "par8_$1" "$ncpu" 20
+    sleep 12
+    printf 'TH_TUNE name=%s mode=%s period=%s up=%s hold=%s idle_pstate=E%s/P%s idle_mw=%s die_mc=%s status=%s transitions=%s\n' \
+        "$1" "$2" "$3" "$4" "$5" "$(get kern.sf_cpufreq.e_pstate)" "$(get kern.sf_cpufreq.p_pstate)" \
+        "$(get kern.sf_thermal.system_mw)" "$(get kern.sf_thermal.die_mc)" "$(get kern.sf_thermal.status)" \
+        "$(( $(get kern.sf_cpufreq.transitions) - tr0 ))"
+}
+@CONFIGS@
+printf 'TH_PHASE end t=%s\n' "$(now)"
+sysctl kern.sf_thermal kern.sf_cpufreq 2>&1
+printf 'TH_END_%s\n' "$nonce"
+# ends the capture at once (tools/pcie_iterate.sh PCIE_DONE)
+printf '\nPD_BENCH_DONE\n'

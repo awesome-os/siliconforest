@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_ANALYSIS_NO_HARDWARE_NO_EDITS",
+  "capture": "runs/m1-keyboard-010/attempt-003 (private, unmodified)",
+  "cli_verdict_preserved": "NO_COMMAND_LINE_OBSERVED_LINUX_VERIFIED; guest HOST_WORKER_TIMEOUT -9 at 240 s. This analysis does not reclassify it.",
+  "timeline": {
+    "guest_stage_start": "23:09:29",
+    "hv_start_before_start_json": "23:09:55",
+    "challenge_and_keyboard_command": "23:11:13 (+78 s, same as attempt-002)",
+    "console_last_write": "23:11:14 (DLKE_NOT_READY, then the shell prompt)",
+    "deadline_capture": "23:12:25 (+150 s): exception-context.bin written; worker.log's last line is 'HV: User interrupt'",
+    "worker_kill": "23:13:29 = 240 s after the guest stage started; no exception-context.json, framebuffer.* or console-result.json"
+  },
+  "stall_location": "ProgressCapture.stop wrote exception-context.bin and then entered diagnostics(): kernel diagnostic globals (proxy readmem), EL12 sysregs (proxy mrs), MCC carveouts and the 16 MB framebuffer readmem. It never reached exception-context.json. attempt-002, with the same host code, boot args and display_console, completed the same steps in 2 s. Python logs nothing per step, so which proxy call blocked is unknown.",
+  "guest_state_at_deadline": "ELR 0xfffffe0012e214a4 is linked 0xfffffe00077a54a4 = _arm64_retention_wfi+0x8; LR is _cpu_idle+0x45c; EL1t with DAIF masked; cpu 0. The guest was idle in the normal WFI path, not retrying a faulting access.",
+  "abort_storm": {
+    "what": "1576 'HV: Data abort on mapped page' lines from the pinned m1n1 hv_vm.c:1291-1298. m1n1 prints FAR and the walked entry ((ipa & ~3) | 1, which is HW), treats the abort as a race, rewinds ELR by 4 and retries.",
+    "where": "FAR 0xfffffe001221b200/b678/bac3/bd7e maps to linked 0xfffffe0006b9f2xx..fd7e, the last 16 KiB page of KC segment __PRELINK_INFO (0xfffffe0006b7c000..0xfffffe0006ba0000), physical 0x854218000 (guest RAM-HIGH, HW-mapped). The odd, byte-granular addresses fit the early-boot prelinked-kext XML parsing.",
+    "when": "Live guest execution, not snapshot reads. All 1576 target-console lines follow 'Jumping to entrypoint' and precede the driver's only two hooked PMGR reads (SIO_BUSIF, SIO from its power() step). The guest console places that before the shell (console line 266ff), and nothing but 'HV: User interrupt' follows. The diagnostics use proxy physical reads, which cannot raise guest stage-2 aborts and never touch __PRELINK_INFO.",
+    "new_vs_previous": "attempt-002 (KC003) had 0 such lines and the display-010 runs had 0. KC003 and KC004 place __PRELINK_INFO and the PDM1SPIHID member at identical addresses and sizes, so this is not a KC layout regression. The per-boot physical placement (phys_base/guest_base) differs, and its interaction with HV stage-2 tracking is unproven.",
+    "effect": "The guest kept progressing (boot-to-prompt time unchanged at +78 s; the driver ran; the shell answered). No evidence links it causally to the post-deadline stall, but it cannot be excluded.",
+    "unknown": "Read vs write, ESR and ELR per abort are not logged by m1n1, so the mechanism remains unresolved."
+  },
+  "driver_result": "Probe latch: one 'sole probe attempt claimed' and two 'probe refused'. Device info: count 5, 05ac:0341, version 0175, u0 0x1101, all spans valid, reason 0. The interface-info response (report 02, subdevice 01, id 0, rsplen 512, payload 31, single packet length 41) stopped at response-identity, because the request id was 1. That is fixed by rev005. No descriptor, input or typing claim.",
+  "host_fix_verdict": {
+    "proposal": "In ProgressCapture.stop, after the raw context is saved, write a pure-parse capture-core.json and call an optional console-close callback BEFORE the optional diagnostics. ConsoleSession.close becomes idempotent. exception-context.json is still written after the extras.",
+    "verdict": "SAFE and MINIMAL, with conditions.",
+    "why_safe": "The guest is paused in the owned callback at stop, so no further guest console output can be lost. The secondary CDC (data interface 3) is distinct from the proxy transport (interface 1), so closing it does not touch target I/O. close() only joins the reader thread (read timeout 0.1 s, 3 s join), closes the device and writes console-result.json. capture-core.json is pure parsing with no I/O. A stall inside the diagnostics then leaves the console proof and the TX ledger durable for the controller to check.",
+    "conditions": [
+      "Idempotent close: the second call is a no-op that never rewrites console-result.json (write_private is exclusive). A first failure (thread still alive, or a short write) must be recorded and must leave no console-result, rather than being retried silently.",
+      "Inside stop, catch and record a close-callback exception and still continue to the BoundedStop path. Neither the close nor capture-core may replace the stop message or skip diagnostics.",
+      "Do not mask the timeout: when the guest worker ends HOST_WORKER_TIMEOUT, the controller's result must keep that status visibly (for example host_worker_status plus diagnostics_complete=false) next to any command_line_observed, and must not present the attempt as a clean stop.",
+      "Tests: the close callback precedes diagnostics; a repeated close is harmless; a failed close blocks the receipt; a hanging diagnostics fixture still leaves capture-core.json plus console-result.json; constructors with the optional callback None behave as before.",
+      "Optional: for keyboard/enumeration test modes, consider skipping the 16 MB framebuffer read, which is not evidence there, to shrink the exposure. Per-step progress markers in diagnostics would identify the blocked call next time."
+    ]
+  },
+  "explicit_unknowns": {
+    "blocked_diagnostic_step": "unknown (one of globals readmem, EL12 mrs, MCC carveouts, framebuffer readmem); no per-step marker was logged",
+    "storm_mechanism": "unknown (read/write, ESR, ELR not logged)",
+    "causality_asserted": "none; the storm and the stall are reported side by side without a claimed causal link"
+  }
+}

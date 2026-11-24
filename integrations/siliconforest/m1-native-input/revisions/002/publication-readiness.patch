@@ -1,0 +1,244 @@
+--- a/src/Kernel/Extensions/IOHIDFamily/IOHIDSystem/PDHIDEventQueue.cpp
++++ b/src/Kernel/Extensions/IOHIDFamily/IOHIDSystem/PDHIDEventQueue.cpp
+@@ -6,6 +6,8 @@
+ #include "PDHIDEventQueue.h"
+ 
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <kern/clock.h>
+ #include <libkern/OSAtomic.h>
+ #include <kern/thread_call.h>
+ #include <miscfs/devfs/devfs.h>
+@@ -98,12 +100,25 @@
+ static volatile UInt32 gQueueReady;
+ static volatile UInt32 gKbdEarlyDrops, gMouseEarlyDrops;
+ static volatile UInt32 gPublishAllocationFailures;
+-struct PDHIDPublicationState { UInt32 attempts, lastError; };
++struct PDHIDPublicationState {
++    UInt32 attempts, lastError;
++    AbsoluteTime startedAt, nextAttempt;
++};
++/* The notifier and all non-atomic readiness state belong only to the ONCE
++ * worker. Its callback may run synchronously before registration returns. */
++static IONotifier *gBSDNotifier;
++static volatile UInt32 gBSDSeen;
++static bool gBSDWaitStarted, gBSDReady, gBSDWaitRefused;
++static AbsoluteTime gBSDWaitStart, gBSDWaitDeadline, gBSDRegisterAfter;
++static UInt32 gBSDRegistrationFailures;
++static const UInt32 kBSDWaitSeconds = 180;
++static const UInt32 kBSDRegistrationLimit = 60;
+ static PDHIDPublicationState gKbdPublication, gMousePublication;
+ enum {
+     kPublishAttemptLimit = 60,
+     kPublishOK = 0, kPublishStorage = 1, kPublishMajor = 2,
+-    kPublishDevfs = 3, kPublishNode = 4
++    kPublishDevfs = 3, kPublishNode = 4,
++    kPublishNotification = 5, kPublishReadinessTimeout = 6
+ };
+ enum {
+     kPublishKeyboard = 1, kPublishMouse = 2,
+@@ -252,6 +267,135 @@
+         IOLog("PDHIDEventQueue: publication call allocation failed; endpoint absent\n");
+ }
+ 
++static unsigned long long
++pd_hid_milliseconds(AbsoluteTime value)
++{
++    uint64_t ns = 0;
++    absolutetime_to_nanoseconds(value, &ns);
++    return (unsigned long long)(ns / 1000000);
++}
++
++/* Never inspect/remove the returned notifier here: addMatchingNotification
++ * invokes this callback for an existing IOBSD before it returns that pointer.
++ * An event marks readiness-to-recheck, not devfs success. Duplicate callbacks
++ * do not accelerate deadlines or spend publication attempts. */
++static bool
++pd_hid_iobsd_published(void *, void *, IOService *, IONotifier *)
++{
++    if (!(OSBitOrAtomic(1, &gBSDSeen) & 1)) {
++        thread_call_t call = pd_hid_load(&gPublishCall);
++        if (call) thread_call_enter(call);
++    }
++    return true;
++}
++
++static void
++pd_hid_remove_notifier(void)
++{
++    IONotifier *notifier = gBSDNotifier;
++    gBSDNotifier = NULL;
++    if (notifier) notifier->remove();
++}
++
++static void
++pd_hid_schedule_readiness(AbsoluteTime deadline, UInt32 observedSeen)
++{
++    thread_call_enter_delayed(pd_hid_load(&gPublishCall), deadline);
++    /* Close the event-before-delayed-arm race. If the event arrives after
++     * this check, its callback is instead the last writer and queues us. */
++    if (OSBitOrAtomic(0, &gBSDSeen) != observedSeen)
++        thread_call_enter(pd_hid_load(&gPublishCall));
++}
++
++static bool
++pd_hid_refuse_readiness(UInt32 error, AbsoluteTime now)
++{
++    gBSDWaitRefused = true;
++    OSBitOrAtomic(kPublishKeyboard | kPublishMouse | kPublishPS2Keyboard |
++                  kPublishPS2Mouse, &gPublishStopped);
++    pd_hid_remove_notifier();
++    IOLog("PDHIDEventQueue: BSD wait refused error=%u registration_failures=%u seen=%u uptime_ms=%llu elapsed_ms=%llu\n",
++        (unsigned)error, (unsigned)gBSDRegistrationFailures,
++        (unsigned)OSBitOrAtomic(0, &gBSDSeen), pd_hid_milliseconds(now),
++        pd_hid_milliseconds(now - gBSDWaitStart));
++    return false;
++}
++
++/* Registration failure has its own bounded one-second retry policy. Once a
++ * notifier is installed we sleep until IOBSD or the finite readiness watchdog.
++ * IOBSD is published after vfsinit/devfs_sinit in pinned bsd_init; still check
++ * devfs_is_ready itself and fail closed if that contract is not fulfilled. */
++static bool
++pd_hid_devfs_gate(void)
++{
++    AbsoluteTime now;
++    clock_get_uptime(&now);
++    const UInt32 observedSeen = OSBitOrAtomic(0, &gBSDSeen);
++    if (gBSDWaitRefused) return false;
++    if (gBSDReady) return true;
++    if (gBSDWaitStarted && now >= gBSDWaitDeadline)
++        return pd_hid_refuse_readiness(kPublishReadinessTimeout, now);
++    if (devfs_is_ready()) {
++        gBSDReady = true;
++        pd_hid_remove_notifier();
++        IOLog("PDHIDEventQueue: BSD ready seen=%u uptime_ms=%llu elapsed_ms=%llu\n",
++            (unsigned)observedSeen, pd_hid_milliseconds(now),
++            gBSDWaitStarted ? pd_hid_milliseconds(now - gBSDWaitStart) : 0ULL);
++        return true;
++    }
++    if (!gBSDWaitStarted) {
++        gBSDWaitStarted = true;
++        gBSDWaitStart = now;
++        clock_interval_to_deadline(kBSDWaitSeconds, kSecondScale, &gBSDWaitDeadline);
++        IOLog("PDHIDEventQueue: BSD wait error=3 uptime_ms=%llu timeout_ms=%u\n",
++            pd_hid_milliseconds(now), (unsigned)(kBSDWaitSeconds * 1000));
++    }
++    if (!observedSeen && !gBSDNotifier && now >= gBSDRegisterAfter) {
++        OSDictionary *matching = IOService::resourceMatching("IOBSD");
++        IONotifier *notifier = NULL;
++        if (matching) {
++            notifier = IOService::addMatchingNotification(gIOPublishNotification,
++                matching, pd_hid_iobsd_published, NULL, NULL);
++            matching->release();
++        }
++        /* Only the owner stores this, after any synchronous callback returned. */
++        gBSDNotifier = notifier;
++        if (!notifier) {
++            ++gBSDRegistrationFailures;
++            if (gBSDRegistrationFailures >= kBSDRegistrationLimit)
++                return pd_hid_refuse_readiness(kPublishNotification, now);
++            clock_interval_to_deadline(1, kSecondScale, &gBSDRegisterAfter);
++            if (gBSDRegistrationFailures == 1)
++                IOLog("PDHIDEventQueue: BSD notification deferred error=5 uptime_ms=%llu\n",
++                    pd_hid_milliseconds(now));
++        }
++    }
++    /* Recheck after registration, including the synchronous-existing case.
++     * Registration itself may have consumed time; do not use a stale sample. */
++    clock_get_uptime(&now);
++    if (now >= gBSDWaitDeadline)
++        return pd_hid_refuse_readiness(kPublishReadinessTimeout, now);
++    if (devfs_is_ready()) {
++        gBSDReady = true;
++        pd_hid_remove_notifier();
++        IOLog("PDHIDEventQueue: BSD ready seen=%u uptime_ms=%llu elapsed_ms=%llu\n",
++            (unsigned)OSBitOrAtomic(0, &gBSDSeen), pd_hid_milliseconds(now),
++            pd_hid_milliseconds(now - gBSDWaitStart));
++        return true;
++    }
++    AbsoluteTime next = gBSDWaitDeadline;
++    if (OSBitOrAtomic(0, &gBSDSeen)) {
++        /* An IOBSD event is not permission to fabricate a ready devfs. */
++        pd_hid_remove_notifier();
++        clock_interval_to_deadline(1, kSecondScale, &next);
++    } else if (!gBSDNotifier) {
++        next = gBSDRegisterAfter;
++    }
++    if (next > gBSDWaitDeadline) next = gBSDWaitDeadline;
++    pd_hid_schedule_readiness(next, observedSeen);
++    return false;
++}
++
+ /* Worker-only: no lock is held across cdevsw/devfs calls. Even if one of them
+  * re-enters a public publisher, it can only schedule another ONCE invocation. */
+ static UInt32
+@@ -286,6 +430,10 @@
+     if (!(wanted & primary) || (OSBitOrAtomic(0, &gPublishStopped) & primary) ||
+         !(wanted & ~OSBitOrAtomic(0, &gPublishReady))) return true;
+     PDHIDPublicationState &state = keyboard ? gKbdPublication : gMousePublication;
++    AbsoluteTime now;
++    clock_get_uptime(&now);
++    if (state.attempts && now < state.nextAttempt) return false;
++    if (!state.attempts) state.startedAt = now;
+     state.attempts++;
+     state.lastError = kPublishStorage;
+     if (keyboard ? pd_hid_kbd_setup() : pd_hid_setup_lock(&gMouseLock)) {
+@@ -300,20 +448,23 @@
+     }
+     if (state.lastError == kPublishOK) {
+         OSBitOrAtomic(wanted, &gPublishReady);
+-        IOLog("PDHIDEventQueue: ready kind=%u attempts=%u early_drops=%u (endpoint, not input proof)\n",
++        IOLog("PDHIDEventQueue: ready kind=%u attempts=%u early_drops=%u uptime_ms=%llu elapsed_ms=%llu (endpoint, not input proof)\n",
+             (unsigned)primary, (unsigned)state.attempts,
+-            (unsigned)__atomic_load_n(keyboard ? &gKbdEarlyDrops : &gMouseEarlyDrops, __ATOMIC_RELAXED));
++            (unsigned)__atomic_load_n(keyboard ? &gKbdEarlyDrops : &gMouseEarlyDrops, __ATOMIC_RELAXED),
++            pd_hid_milliseconds(now), pd_hid_milliseconds(now - state.startedAt));
+         return true;
+     }
+     if (state.attempts >= kPublishAttemptLimit) {
+         OSBitOrAtomic(primary | alias, &gPublishStopped);
+-        IOLog("PDHIDEventQueue: publication refused kind=%u attempts=%u error=%u\n",
+-            (unsigned)primary, (unsigned)state.attempts, (unsigned)state.lastError);
++        IOLog("PDHIDEventQueue: publication refused kind=%u attempts=%u error=%u uptime_ms=%llu elapsed_ms=%llu\n",
++            (unsigned)primary, (unsigned)state.attempts, (unsigned)state.lastError,
++            pd_hid_milliseconds(now), pd_hid_milliseconds(now - state.startedAt));
+         return true; // refused, not ready; no retry after the bound
+     }
+     if (state.attempts == 1)
+-        IOLog("PDHIDEventQueue: publication deferred kind=%u attempt=1 error=%u\n",
+-            (unsigned)primary, (unsigned)state.lastError);
++        IOLog("PDHIDEventQueue: publication deferred kind=%u attempt=1 error=%u uptime_ms=%llu elapsed_ms=0\n",
++            (unsigned)primary, (unsigned)state.lastError, pd_hid_milliseconds(now));
++    clock_interval_to_deadline(1, kSecondScale, &state.nextAttempt);
+     return false;
+ }
+ 
+@@ -321,13 +472,23 @@
+ pd_hid_publish_work(thread_call_param_t, thread_call_param_t)
+ {
+     const UInt32 requested = OSBitOrAtomic(0, &gPublishRequests);
++    if (!(requested & ~(OSBitOrAtomic(0, &gPublishReady) |
++                        OSBitOrAtomic(0, &gPublishStopped)))) return;
++    /* Prepare real storage so arriving reports can enqueue while BSD starts.
++     * No major/node allocation and no publication-failure budget before BSD. */
++    if (!devfs_is_ready()) {
++        if ((requested & kPublishKeyboard) && pd_hid_kbd_setup())
++            OSBitOrAtomic(kPublishKeyboard, &gQueueReady);
++        if ((requested & kPublishMouse) && pd_hid_setup_lock(&gMouseLock))
++            OSBitOrAtomic(kPublishMouse, &gQueueReady);
++    }
++    if (!pd_hid_devfs_gate()) return;
+     const bool keyboardDone = pd_hid_publish_one(true, requested);
+     const bool mouseDone = pd_hid_publish_one(false, requested);
+     if (!keyboardDone || !mouseDone) {
+-        AbsoluteTime deadline;
+-        clock_interval_to_deadline(1, kSecondScale, &deadline);
+-        /* ONCE defers self-resubmission. No IOBSD notifier, recursive callback
+-         * or second readiness source survives to race the one owner. */
++        AbsoluteTime deadline = !keyboardDone ? gKbdPublication.nextAttempt : gMousePublication.nextAttempt;
++        if (!mouseDone && gMousePublication.nextAttempt < deadline)
++            deadline = gMousePublication.nextAttempt;
+         thread_call_enter_delayed(pd_hid_load(&gPublishCall), deadline);
+     }
+ }

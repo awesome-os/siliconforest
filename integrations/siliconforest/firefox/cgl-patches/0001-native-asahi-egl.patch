@@ -1,0 +1,45 @@
+--- a/src/Frameworks/OpenGL/CGL.c
++++ b/src/Frameworks/OpenGL/CGL.c
+@@ -34,7 +34,10 @@
+ 
+ static void sf_egl_open(void)
+ {
+-	void *egl = dlopen("/usr/lib/libEGL.1.dylib", RTLD_NOW | RTLD_LOCAL);
++	/* Keep the GL dispatch and EGL context in the same Asahi Mesa instance. */
++	const char *path = getenv("SF_CGL_EGL_LIBRARY");
++	void *egl = dlopen(path ? path : "/usr/local/lib/mesa-asahi/libEGL.1.dylib",
++	                  RTLD_NOW | RTLD_LOCAL);
+ 
+ 	if (egl == NULL) {
+ 		fprintf(stderr, "CGL: cannot open libEGL: %s\n", dlerror());
+@@ -206,6 +209,11 @@
+ {
+ 	const char *r = getenv("SF_CGL_RENDERER");
+ 
++	/* Asahi is native here. Do not probe Vulkan or select the unqualified zink
++	 * path merely because a Vulkan device is present. Auto stays opt-in. */
++	if (r == NULL)
++		return 0;
++
+ 	if (getenv("GALLIUM_DRIVER") != NULL || getenv("LIBGL_ALWAYS_SOFTWARE") != NULL)
+ 		return 0;
+ 	if (r != NULL && strcmp(r, "default") == 0)
+@@ -231,6 +239,18 @@
+ {
+ #ifdef SF_CGL_USE_EGL
+ 	int zink = sf_cgl_pick_renderer();
++
++	pthread_once(&sf_egl_once, sf_egl_open);
++	/* A missing EGL library is an unavailable CGL renderer, never a call
++	 * through a null function pointer. Check every entry this backend uses. */
++	int complete = 1;
++#define SF_EGL_CHECK(f) complete = complete && sf_##f != NULL;
++	SF_EGL_FUNCS(SF_EGL_CHECK)
++#undef SF_EGL_CHECK
++	if (!complete) {
++		sf_cgl_display = EGL_NO_DISPLAY;
++		return;
++	}
+ 
+ 	/* Surfaceless first: it is the only platform that is guaranteed to exist
+ 	 * with no display server running at all. eglGetDisplay is the fallback for

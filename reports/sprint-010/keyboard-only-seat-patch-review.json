@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_ADVERSARIAL_PATCH_REVIEW_NO_HARDWARE",
+  "reviewed": {
+    "patch": "integrations/puredarwin/chonkstep-darwin/keyboard-only/pdhid-keyboard.patch, sha256 15fe95560489decf",
+    "files": "wm-darwin hid.rs eace5888 -> 8eb4b540, input.rs 26bbb863 -> 2584605b, main.rs 99ffbeaa -> 3365f52e, README 7ac2b7e6 -> 51b87902. The before hashes equal the live sources/chonkstep-darwin; my scratch replay reproduces all four after hashes. The live tree was not modified (its hashes are unchanged after the host test). Cargo.lock is unchanged."
+  },
+  "verdict": "APPROVE the keyboard-only compositor mode for the native packet. The CLI is exact, the legacy modes are unchanged, a keyboard-only seat advertises only a keyboard and opens only /dev/usb_hid_kbd, real fd read/close semantics and the console grab lifetime are preserved, and the backlog discard is unchanged for the opened queue.",
+  "verified": {
+    "cli": "parse_cli: no arguments or exactly '--help' gives help. Otherwise '--run --socket PATH' (3 args) is input off; '--run --socket PATH --input pdhid' is both queues; '--run --socket PATH --input pdhid-keyboard' is keyboard only. Every other form or value is refused with the usage error. main.rs still requires an absolute socket path and the private 0700 parent. The usage text says 'A seat capability is not native input.'",
+    "modes": "Off: no HID open and no seat. Both: NativeHid::open() opens the keyboard then the mouse (same paths and flags as before) and calls enable_pdhid_seat_caps(keyboard, pointer); the legacy enable_pdhid_seat delegates to exactly that, giving the same keyboard, pointer and cursor as before. KeyboardOnly: open_keyboard() opens only /dev/usb_hid_kbd; the mouse opener is never called and a missing mouse node is not an error.",
+    "caps": "The seat caps come from the files actually opened (pointer only if the mouse fd exists). enable_pdhid_seat_caps refuses a seat with no keyboard, always add_keyboard()s with the same XKB evdev/pc105/us config and 500/25 repeat, and add_pointer()s plus sets the cursor only when caps.pointer. deliver_hid rejects through accept_for_seat any event type the seat did not advertise and any malformed event. In keyboard-only mode pointer events are unreachable (no mouse fd) and the rejection is defensive. Every other use of the now-optional pointer is guarded (drag authorisation returns None without a pointer, and the cursor is set only with a pointer).",
+    "fd_read_close": "Opens use O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC and require a character device. The keyboard opens first; in Both mode a mouse-open failure returns early and drops the keyboard File, which closes it and releases the PDHIDEventQueue console grab (gKbdGrabbed is cleared on the last close). NativeHid drop closes both. read_record still requires exact 8-byte (keyboard) and 12-byte (mouse) records, treats EAGAIN as idle and short reads as errors.",
+    "backlog": "discard_until_idle keeps the bounded 128-round drain to an idle boundary for whichever queues are open, then hands over. drain() keeps its at most 64 rounds per call, with the mouse optional. Decoder sequencing and duplicate-press suppression are unchanged.",
+    "tests": "test_host.py re-run here: failures 0 (patch applied to a temp copy, after hashes confirmed, hid.rs unit tests including CLI modes, seat caps and keyboard-only no-mouse acquisition; no device opened)."
+  },
+  "packet_notes": [
+    "The native KC omits PDSerialHID, so no producer exists for the mouse queue. With the patched IOHIDFamily the mouse node is then never published, and '--input pdhid' would fail at the mouse open. The native packet must launch the compositor with '--input pdhid-keyboard'.",
+    "Compatibility: the native-startup observer (ae9bd975) requests a keyboard when the seat advertises Keyboard and never needs a pointer, so it matches this seat.",
+    "A keyboard-only seat, an open keyboard node, keymap and focus are not native input. Native evidence still needs real PDM1SPIHID reports in the queue, consumed by the compositor, with no host SOH bytes after the launcher. Physical typing additionally needs the separate human-observation rule."
+  ],
+  "not_claimed": ["native keyboard input", "physical typing", "runtime"],
+  "scope": "Read-only patch review, scratch replay and host test. The production tree was not modified and no hardware was used."
+}

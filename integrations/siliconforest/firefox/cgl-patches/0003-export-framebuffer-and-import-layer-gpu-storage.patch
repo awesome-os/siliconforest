@@ -1,0 +1,87 @@
+--- a/src/Frameworks/OpenGL/CGL.c
++++ b/src/Frameworks/OpenGL/CGL.c
+@@ -980,6 +980,8 @@
+ 	size_t (*elementBytes)(IOSurfaceRef, size_t);
+ 	int (*gpuCopyFD)(IOSurfaceRef);
+ 	size_t (*gpuOffset)(IOSurfaceRef);
++	size_t (*width)(IOSurfaceRef),(*height)(IOSurfaceRef);
++	uint32_t (*pixelFormat)(IOSurfaceRef);
+ } sf_iosurface;
+ 
+ static void sf_cgl_load_iosurface(void)
+@@ -996,6 +998,9 @@
+ 	sf_iosurface.elementBytes = dlsym(lib, "IOSurfaceGetBytesPerElementOfPlane");
+ 	sf_iosurface.gpuCopyFD = dlsym(lib, "IOSurfaceSFGPUCopyFD");
+ 	sf_iosurface.gpuOffset = dlsym(lib, "IOSurfaceSFGPUGetOffset");
++	sf_iosurface.width=dlsym(lib,"IOSurfaceGetWidth");
++	sf_iosurface.height=dlsym(lib,"IOSurfaceGetHeight");
++	sf_iosurface.pixelFormat=dlsym(lib,"IOSurfaceGetPixelFormat");
+ }
+ 
+ #ifdef SF_CGL_USE_EGL
+@@ -1252,8 +1257,18 @@
+ {
+ 	int i, found = 0;
+ 
+-	if (surface == NULL || sf_cgl_drawable_count == 0)
+-		return 0;
++    if(surface==NULL)return 0;
++    pthread_once(&sf_cgl_present_once,sf_cgl_load_present);
++    if(sf_iosurface.gpuOffset&&sf_iosurface.gpuOffset(surface)&&
++       sf_iosurface.pixelFormat&&sf_iosurface.pixelFormat(surface)==0x42475241&&
++       sf_iosurface.width&&sf_iosurface.height){
++        if(!bind)return 1;
++        if(sf_cgl_current&&CGLTexImageIOSurface2D(sf_cgl_current,GL_TEXTURE_2D,GL_RGBA,
++           (GLsizei)sf_iosurface.width(surface),(GLsizei)sf_iosurface.height(surface),
++           GL_BGRA,GL_UNSIGNED_INT_8_8_8_8_REV,surface,0)==kCGLNoError)return 1;
++        return 0;
++    }
++    if(sf_cgl_drawable_count==0)return 0;
+ 	pthread_mutex_lock(&sf_cgl_drawable_lock);
+ 	for (i = 0; i < sf_cgl_drawable_count; i++) {
+ 		if (sf_cgl_drawables[i].surface != surface)
+@@ -2185,3 +2200,44 @@
+ 	if (fn)
+ 		fn(target, index, data);
+ }
++
++#ifdef SF_CGL_USE_EGL
++// Copy the current offscreen framebuffer to actual exportable IOSurface GPU
++// storage. Failure leaves the existing CPU renderer available to the caller.
++int CGLSFFXCopyFramebuffer(IOSurfaceRef surface,int flip) {
++    CGLContextObj ctx=sf_cgl_current;
++    pthread_once(&sf_cgl_present_once,sf_cgl_load_present);
++    if(!ctx||!surface||!sf_iosurface.gpuOffset||!sf_iosurface.gpuOffset(surface)||
++       !sf_iosurface.width||!sf_iosurface.height||sf_iosurface.width(surface)!=(size_t)ctx->width||
++       sf_iosurface.height(surface)!=(size_t)ctx->height)return 0;
++    GLint texture=0,read_fbo=0,draw_fbo=0;
++    glGetIntegerv(GL_TEXTURE_BINDING_2D,&texture);
++    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING,&read_fbo);
++    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING,&draw_fbo);
++    GLboolean scissor=glIsEnabled(GL_SCISSOR_TEST),srgb=glIsEnabled(GL_FRAMEBUFFER_SRGB);
++    GLuint copy_texture=0,copy_fbo=0;int good=0;
++    int verify=getenv("SFFX_GPU_VERIFY")!=NULL;unsigned char source_pixel[4]={0},dest_pixel[4]={0};
++    if(verify)glReadPixels(ctx->width/4,ctx->height/2,1,1,GL_RGBA,GL_UNSIGNED_BYTE,source_pixel);
++    glGenTextures(1,&copy_texture);glBindTexture(GL_TEXTURE_2D,copy_texture);
++    if(CGLTexImageIOSurface2D(ctx,GL_TEXTURE_2D,GL_RGBA,ctx->width,ctx->height,
++       GL_BGRA,GL_UNSIGNED_INT_8_8_8_8_REV,surface,0)==kCGLNoError){
++        glGenFramebuffers(1,&copy_fbo);glBindFramebuffer(GL_DRAW_FRAMEBUFFER,copy_fbo);
++        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,copy_texture,0);
++        if(glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE){
++            glBindFramebuffer(GL_READ_FRAMEBUFFER,0);glDisable(GL_SCISSOR_TEST);glDisable(GL_FRAMEBUFFER_SRGB);
++            glBlitFramebuffer(0,0,ctx->width,ctx->height,0,flip?ctx->height:0,ctx->width,
++                flip?0:ctx->height,GL_COLOR_BUFFER_BIT,GL_NEAREST);
++            glFinish();good=glGetError()==GL_NO_ERROR;
++            if(verify){glBindFramebuffer(GL_READ_FRAMEBUFFER,copy_fbo);glReadPixels(ctx->width/4,ctx->height/2,1,1,GL_RGBA,GL_UNSIGNED_BYTE,dest_pixel);}
++        }
++    }
++    if(scissor)glEnable(GL_SCISSOR_TEST);if(srgb)glEnable(GL_FRAMEBUFFER_SRGB);
++    glBindFramebuffer(GL_READ_FRAMEBUFFER,(GLuint)read_fbo);
++    glBindFramebuffer(GL_DRAW_FRAMEBUFFER,(GLuint)draw_fbo);
++    glBindTexture(GL_TEXTURE_2D,(GLuint)texture);
++    if(verify)fprintf(stderr,"FXCOPYVERIFY pid=%d size=%dx%d read_fbo=%d draw_fbo=%d sourceRGBA=%u,%u,%u,%u destRGBA=%u,%u,%u,%u success=%d verification_pixels_only=1\n",getpid(),ctx->width,ctx->height,read_fbo,draw_fbo,source_pixel[0],source_pixel[1],source_pixel[2],source_pixel[3],dest_pixel[0],dest_pixel[1],dest_pixel[2],dest_pixel[3],good);
++    if(copy_fbo)glDeleteFramebuffers(1,&copy_fbo);
++    if(copy_texture)glDeleteTextures(1,&copy_texture);
++    return good;
++}
++#endif

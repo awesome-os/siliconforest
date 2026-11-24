@@ -1,0 +1,27 @@
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -2122,6 +2122,24 @@
+     }
+     lastPointerX = wl_fixed_to_double(x);
+     lastPointerY = wl_fixed_to_double(y);
++    /* (TERM11, FX-022) the pointer arriving over a window is a move to that place, as on macOS, where the cursor
++     * crossing onto a window moves over it: a pointer put onto Firefox's open menu panel (a jump, or the compositor
++     * routing it there) brought no move with it, and the item under it did not highlight */
++    {
++        struct wsWindow *entered = windowForID(ws.pointerWindowID);
++        if (entered != NULL && entered->surface == surface && !leftButtonDown && !rightButtonDown && !otherButtonDown) {
++            struct mach_event moved = {0};
++
++            moved.windowID = entered->windowID;
++            moved.code = WS_MOUSE_MOVED;
++            moved.x = lastPointerX;
++            moved.y = entered->h - lastPointerY;
++            moved.mods = currentModifiers;
++            queuePush(&moved);
++        }
++    }
++    if (getenv("SF_WS_TRACE") != NULL)
++        fprintf(stderr, "WindowServer: pointer enter window %d at %.1f,%.1f\n", ws.pointerWindowID, lastPointerX, lastPointerY);
+     /* Buttons pressed before enter belong to whoever had the pointer - except while a popup of ours
+      * is up: the button that opened a menu is still down when the pointer goes from the window onto
+      * the menu, and its release there is what picks the item. */

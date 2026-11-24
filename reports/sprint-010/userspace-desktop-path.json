@@ -1,0 +1,68 @@
+{
+  "status": "VISIBLE_SHELL_IS_THE_EXISTING_CONSOLE_TTY",
+  "panel_shell_observed_by_this_review": false,
+  "serial_shell_reverified_here": false,
+  "command_line_observed_by_this_review": false,
+  "rootfs_edit_required": false,
+  "scope": "Read-only userspace terminal and display binding, plus later Wayland and Chonkstep sources. Kernel video-console boot-args are Astra's. Framebuffer and IOGOP matching are Claude's. This file does not read raw test 009 and does not boot anything.",
+  "booted_userspace": {
+    "ramdisk_sha256": "b1154b2854c9771445a9b1b631d3d48837b35f655a4747665b94c72da10e4d05",
+    "image_attribute": "imageArm64VirtMinimalBuild",
+    "programs_on_that_attribute": ["zsh", "libiconv", "toybox", "asmjit test", "virt-minimal basesystem"],
+    "not_on_that_image": ["sway", "foot", "wlroots", "neuswc", "pd-wayland-session", "Terminal.app"],
+    "single_user_shell": "/bin/sh rewrites argv0 to sh and execs /private/var/select/sh, which this image links to /bin/zsh",
+    "tty": "/dev/console",
+    "tty_owner": "devfs node major 0 is cnopen, which forwards to km_tty[0]"
+  },
+  "console_binding": {
+    "single_user": "launchctl do_single_user_mode2 opens /dev/console and execl /bin/sh. Source: src/Libraries/XPC/launchctl/launchctl.c.",
+    "after_single_user_exits_0": "org.puredarwin.console-login RunAtLoad starts /usr/libexec/pd-console-login, which also opens /dev/console and execs /bin/zsh -l. Source: pd_console_login.c and org.puredarwin.console-login.plist.",
+    "etc_ttys": "image.nix writes /dev/console /bin/zsh -l. The -s path does not consult it.",
+    "same_device": "Neither login path opens a framebuffer. Both write the kernel km tty."
+  },
+  "why_the_panel_can_stay_on_an_old_frame": {
+    "launcher_bootargs": "-v -s debug=0x14e keepsyms=1 serial=3 serial-device-name=uart0 disable-uart-irq=1 cpus=1 rd=md0 serial_video_mirror=1 pdtextboot=1",
+    "bootargs_source": "integrations/puredarwin/m1-bringup/host_progress.py BOOTARGS. gopconsole is not in that string. This review did not boot it.",
+    "hv_set_bootargs_display": "sources/m1n1-baseline/proxyclient/m1n1/hv/__init__.py set_bootargs sets video.display=0 when -v is present. configure_display_console then sets video.display=2 after the geometry checks and records physical_panel_observed=false.",
+    "arm_pe_create_console": "sources/puredarwin-baseline/src/Kernel/xnu/pexpert/arm/pe_init.c: serial=3 has already selected the UART. A nonzero v_display initializes text mode unless display==1, which is graphics mode. switch_to_video_console runs only when serial_video_mirror or gopconsole is also set. v_display 0 does not take that branch, so the active console stays the UART.",
+    "pdtextboot": "sources/puredarwin-m1-bringup/src/Kernel/xnu/osfmk/console/video_console.c defaults pdtextboot to 1 and, when the boot is text mode, keeps text after IOGraphics takes the console. The helper passes pdtextboot=1. That flag is not a panel observation.",
+    "userspace_change_that_does_not_paint_the_panel": "Leaving -s so pd-console-login runs still opens /dev/console."
+  },
+  "route_to_a_visible_interactive_shell": {
+    "next_stop": "The accepted shell's existing /dev/console bytes painted by the kernel video console onto the firmware framebuffer, then scanned out on the 13-inch panel.",
+    "userspace_program_required": false,
+    "helper_source_already_requests_video_text": true,
+    "booted_by_this_review": false,
+    "depends_on": [
+      "Astra: video console actually selected. On this source that is nonzero v_display plus serial_video_mirror or gopconsole. The helper sets display=2 after set_bootargs and passes serial_video_mirror=1.",
+      "Claude: a framebuffer whose scanout is the 13-inch panel. Firmware framebuffer bytes, including a later host PNG of a paused capture, are not that proof."
+    ],
+    "not_acceptance": "A kernel debug frame already on the panel is not a userland shell. A QEMU or Linux shell is not this display. A decoded capture is not physical panel proof."
+  },
+  "later_wayland_in_the_pin": {
+    "present_as_nix_attributes": true,
+    "built_or_booted_here": false,
+    "arm64_virt_wayland_image": "image-arm64-virt-wayland uses imageExtraPackagesArm64Nox, which includes swayArm64NoxBuild and wlrootsArm64NoxBuild, on the virt KC rather than the T8103 bring-up collection",
+    "wlroots_backend": "nix/pkgs/wayland/wlroots.nix configures -Dbackends=puredarwin and empty renderers and allocators",
+    "autocreate_gap": "wlroots backend.c selects puredarwin only when WLR_BACKENDS names it. With that variable unset, autocreate still attempts a DRM session and fails closed when DRM is compiled out",
+    "framebuffer_client": "backend/puredarwin/output.c calls PDGOPOpen. src/Libraries/PDGOP/PDGOP.c matches IOVirtIOGPU, then IOGOPFramebuffer, then IOFramebuffer",
+    "foot": "footArm64Build is a Wayland client attribute, copied into the sg2002 stick bundle. It does not open a framebuffer and it is not in the booted ramdisk or in imageExtraPackagesArm64Nox",
+    "other_session": "pd-wayland-session starts /bin/neuswc and Terminal.app. That is the image-wayland / neuswc path, not the M1 ramdisk and not Chonkstep",
+    "m1_panel_scanout": "not established. IOGOPFramebuffer being a KC member does not mean it drives this panel"
+  },
+  "chonkstep": {
+    "registry_pin": "chriskearney/chonkstep e0fe3a000aec71b1db46b940e2a75670be4e0f31",
+    "registry_role": "Desktop source; Linux-only Wayland backend needs port",
+    "local_checkout": "/home/chrisk/src/chonkstep",
+    "local_head": "f7a8edd1b6e111487c45070c8774c51ba7847628",
+    "local_head_equals_registry_pin": false,
+    "darwin_backend": false,
+    "evidence": [
+      "crates/wm-wayland/src/lib.rs is #![cfg(target_os = \"linux\")] and is empty on any other host",
+      "crates/chonkstep-wayland/src/main.rs exits 1 off Linux with the text that it only runs on Linux",
+      "crates/wm-wayland/Cargo.toml and crates/chonkstep-wayland/Cargo.toml put their compositor dependencies under cfg(target_os = \"linux\")"
+    ],
+    "not_the_next_shell": "No Chonkstep backend in this workspace can present a Darwin framebuffer. Do not substitute its Linux compositor for the M1 panel."
+  },
+  "conclusion": "The genuine visible shell is the current /bin/zsh on /dev/console. Current helper source asks the kernel video console to paint that tty (display=2 and serial_video_mirror=1) while serial=3 stays. This review did not boot that helper and did not see the panel. Scanout onto the 13-inch panel remains Claude's. No ramdisk program change paints the panel. Wayland sway/foot and Chonkstep are later sources; neither is a proven M1 display path."
+}

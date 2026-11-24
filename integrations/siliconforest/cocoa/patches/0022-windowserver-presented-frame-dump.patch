@@ -1,0 +1,59 @@
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -1067,7 +1067,47 @@
+ /* Puts a frame on the surface. The surface's size is the frame's size in points whatever the
+  * buffer's size in pixels: the viewport says so, and a compositor at the same scale shows the
+  * buffer pixel for pixel. Without a viewport only whole scales are possible (buffer scale). */
++/* SF_WS_DUMP_DIR=<directory>: the picture a window hands to the compositor, written there as
++ * window-<number>.ppm (at most twenty times a second per window; the newest replaces the last). This
++ * is what the application presented, pixel for pixel, not what the compositor showed: a
++ * diagnostic for systems whose compositor has no screen capture. */
++static void windowDumpFrame(struct wsWindow *window, struct wsFrame *frame) {
++    static const char *dir;
++    static int asked;
++    static int64_t last[64];
++    if (!asked) { dir = getenv("SF_WS_DUMP_DIR"); asked = 1; }
++    if (dir == NULL || frame->pixels == NULL || frame->w <= 0 || frame->h <= 0)
++        return;
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    int64_t now = (int64_t)ts.tv_sec * 20 + ts.tv_nsec / 50000000;      /* twentieths of a second */
++    unsigned slot = (unsigned)window->windowID % 64;
++    if (last[slot] == now)
++        return;
++    last[slot] = now;
++    char path[512], tmp[540];
++    snprintf(path, sizeof(path), "%s/window-%d.ppm", dir, window->windowID);
++    snprintf(tmp, sizeof(tmp), "%s.part", path);
++    FILE *out = fopen(tmp, "wb");
++    if (out == NULL)
++        return;
++    fprintf(out, "P6\n%d %d\n255\n", frame->w, frame->h);
++    const uint32_t *argb = frame->pixels;
++    unsigned char *row = malloc((size_t)frame->w * 3);
++    for (int y = 0; row != NULL && y < frame->h; y++) {
++        for (int x = 0; x < frame->w; x++) {
++            uint32_t p = argb[(size_t)y * frame->w + x];
++            row[x * 3] = p >> 16; row[x * 3 + 1] = p >> 8; row[x * 3 + 2] = p;
++        }
++        fwrite(row, 3, (size_t)frame->w, out);
++    }
++    free(row);
++    fclose(out);
++    rename(tmp, path);
++}
++
+ static void windowAttachFrame(struct wsWindow *window, struct wsFrame *frame) {
++    windowDumpFrame(window, frame);
+     wl_surface_attach(window->surface, frame->buffer, 0, 0);
+     window->attached = 1;
+     if (window->viewport != NULL && frame->pointsW > 0 && frame->pointsH > 0) {
+@@ -2156,6 +2196,8 @@
+         return;
+     xdg_toplevel_set_min_size(window->toplevel, window->minW, window->minH);
+     xdg_toplevel_set_max_size(window->toplevel, window->maxW, window->maxH);
++    if (getenv("SF_WS_TRACE") != NULL)
++        fprintf(stderr, "WindowServer: toplevel %d size limits min %dx%d max %dx%d (0: none)\n", window->windowID, window->minW, window->minH, window->maxW, window->maxH);
+ }
+ 
+ // the bounds a compositor suggests and the window operations it has: nothing here depends on either

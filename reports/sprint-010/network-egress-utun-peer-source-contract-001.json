@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "prepared_utc": "2026-11-09T00:34:49.660889+00:00",
+  "reviewer": "Codex gpu_uat_source",
+  "status": "SOURCE_CONDITIONAL_VIABLE_NEW_OWNED_INTERFACE_PER_PHASE_PREFERRED_NOT_RUNTIME_ADMITTED",
+  "pin": "e7aa00a60f0b56ef35aa24252e81467787bf71ea",
+  "sources": {
+    "sources/puredarwin-m1-bringup/src/Kernel/xnu/bsd/netinet/in.c": {
+      "sha256": "8896618d404cc8462a6db08ad0809f331bd8aa9c8adcb361e5c6df4e3c9513bb",
+      "matches_exact_pinned_git_object": true
+    },
+    "sources/puredarwin-m1-bringup/src/Kernel/xnu/bsd/net/route.c": {
+      "sha256": "0363e6b636592132728365a4f7e8aaf2fe9442cf40be4d1c781722c88334eddc",
+      "matches_exact_pinned_git_object": true
+    },
+    "sources/puredarwin-m1-bringup/src/Kernel/xnu/bsd/net/if_utun.c": {
+      "sha256": "9f0756f4353e186270bbe26353031f056cb775213e64240a1a487ae175b1a6b8",
+      "matches_exact_pinned_git_object": true
+    }
+  },
+  "conclusion": "Point-to-point interface-owned routes avoid the raw AF_ROUTE GET/DELETE ownership race. Prefer two sequential fresh owned utuns, DNS then HTTP, after verifying complete first-interface cleanup. In-place retarget is possible only with explicit route readback and failure handling; ioctl success alone cannot qualify it. Neither route creation nor close is a transactional success guarantee.",
+  "facts": [
+    {
+      "source": "netinet/in.c:829-943; net/route.c:3511-3688",
+      "fact": "SIOCSIFDSTADDR updates the peer field, then holds rnh_lock across old-peer rtinit_locked DELETE and new-peer ADD when IFA_ROUTE is set. rtinit_locked checks rt_ifa pointer identity and refuses deletion of static routes under the same rnh_lock. Another route writer cannot replace a route between that identity check and deletion."
+    },
+    {
+      "source": "netinet/in.c:920-936",
+      "fact": "Retarget ignores both rtinit_locked return values, preserves IFA_ROUTE, and does no route operation at all if IFA_ROUTE was clear. SIOCGIFDSTADDR may report the new peer even if the new route is missing; the metadata update is earlier than the locked route operations and the operation is not rollback-atomic."
+    },
+    {
+      "source": "netinet/in.c:590-644,1648-1814",
+      "fact": "SIOCAIFADDR can configure local, peer and mask together. in_ifinit creates the point-to-point RTF_HOST route, sets IFA_ROUTE only on successful ADD, but converts EEXIST to success. A fresh interface still needs actual route readback."
+    },
+    {
+      "source": "net/route.c:2357-2390",
+      "fact": "Generic ADD on an existing cloned destination can delete that clone and retry. Existing noncloned routes normally cause EEXIST. This is not blanket protection of every foreign route: candidate admission needs a fresh/exclusive guest routing context and absence of a conflicting exact destination, including clones, before configuration."
+    },
+    {
+      "source": "net/if_utun.c:2073-2205,2219-2320; netinet/in.c:748-759,1530-1556",
+      "fact": "Closing the owned utun control socket invokes family cleanup: remove its IPv4 addresses with SIOCDIFADDR then detach protocol and interface. Address deletion scrubs the route through the same rtinit_locked identity/static checks. Cleanup failures are logged; disconnect returns0; final interface detach is asynchronous. close success is not evidence that interface/route cleanup completed."
+    },
+    {
+      "source": "netinet/in.c:565-579,849-856,1050-1058",
+      "fact": "SIOCGIFADDR, SIOCGIFDSTADDR and SIOCGIFNETMASK read back address metadata only. None proves the corresponding destination route exists."
+    }
+  ],
+  "proposed_bounded_contract": [
+    "Use only a newly allocated owned utun, exactly one IPv4 address local10.0.2.15/32 and exactly one unicast peer. No explicit RTM_ADD/DELETE, default route, host-controller route, firewall or resolver configuration mutation.",
+    "Before either interface configuration, establish the exclusive guest network-management context and inspect routing state for conflicting local/peer addresses and exact destination routes, including cloned entries. A preflight query alone is not a race-proof ownership lease; no other guest route/configuration actor may operate during the finite test.",
+    "Configure DNS phase peer10.0.2.3; read back interface name/index, POINTTOPOINT/UP state, local/peer/mask and actual active exact host route on that index using a separately qualified read-only observer. Use PF_ROUTE protocol0 if choosing routing-socket GET; the held mutating prototype remains excluded.",
+    "Use real Darwin UDP socket DNS with bounded input, query/response correlation and validated A selection. Close/reap every DNS socket/worker before interface teardown or retarget. Readback or offline packet bytes are not DNS runtime proof.",
+    "Preferred: close the DNS utun, verify disappearance of its name/index and associated address/route, then create a fresh owned HTTP utun with the selected public A as peer and the same local /32. Revalidate actual route/metadata; start a new Darwin TCP socket only afterward. Carry correct hostname in the HTTP request; changing A requires a new explicitly bounded phase.",
+    "If reusing an interface instead, verify old-route absence and new exact route/interface after SIOCSIFDSTADDR, including failures; old/new operations are serialized but their errors are suppressed. Do not repair failure with raw AF_ROUTE deletion.",
+    "Close application sockets before owned control fd. Bound and record actual interface and route disappearance, compare unrelated guest routing/default state to baseline, preserve any cleanup uncertainty as failure and use existing root-owned verified-Linux recovery. No public boot or success claim follows from this source note."
+  ],
+  "limits": [
+    "No in_scrubprefix symbol exists in this acquired IPv4 netinet source; actual path is in_ifscrub.",
+    "Interface lifetime cannot defend against privileged actors mutating the same owned interface; exclusivity remains a concrete candidate requirement.",
+    "Two-interface phases avoid silent retarget/IFA_ROUTE state reuse but do not eliminate initial ADD collision or asynchronous close verification requirements.",
+    "Source inspection only: no implementation, build, socket/ioctl execution, hardware/SSH, packet staging or runtime qualification. GPU leaf and controllednetwork004 untouched."
+  ]
+}

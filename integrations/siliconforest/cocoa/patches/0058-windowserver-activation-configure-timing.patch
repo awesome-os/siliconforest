@@ -1,0 +1,195 @@
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -20,6 +20,7 @@
+ #include "xdg-decoration-unstable-v1-client-protocol.h"
+ #include "fractional-scale-v1-client-protocol.h"
+ #include "viewporter-client-protocol.h"
++#include "xdg-activation-v1-client-protocol.h"
+ #include <CoreGraphics/CGDirectDisplay_siliconforest.h>
+ #include <CoreGraphics/CGWindowLevel.h>
+ #include <CoreFoundation/CFBundle.h>
+@@ -71,6 +72,7 @@
+     int minW, minH, maxW, maxH;
+     // WS_STATE_* as the compositor last sent them
+     int stateBits;
++    int minimizedByCompositor;   // set_minimized sent: an activation brings it back
+     int level;
+     // the backing store AppKit maps by path and draws into, never attached to the surface itself
+     void *pixels;
+@@ -123,6 +125,7 @@
+     // NULL when the compositor cannot blur, windows that ask for it then just stay translucent
+     struct ext_background_effect_manager_v1 *blurManager;
+     struct wl_seat *seat;
++    struct xdg_activation_v1 *activation;   // to bring a window forward (kWSWindowOrder)
+     struct wl_output *output;
+     struct wl_shm *shm;
+     // metal's CAMetalLayer presents into subsurfaces of AppKit windows.
+@@ -517,6 +520,8 @@
+         ws.fractionalManager = wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1);
+     } else if (strcmp(interface, wp_viewporter_interface.name) == 0) {
+         ws.viewporter = wl_registry_bind(registry, name, &wp_viewporter_interface, 1);
++    } else if (strcmp(interface, xdg_activation_v1_interface.name) == 0) {
++        ws.activation = wl_registry_bind(registry, name, &xdg_activation_v1_interface, 1);
+     } else if (strcmp(interface, zwlr_output_manager_v1_interface.name) == 0) {
+         ws.outputManager = wl_registry_bind(registry, name, &zwlr_output_manager_v1_interface,
+                                             version < 2 ? version : 2);
+@@ -580,8 +585,21 @@
+ 
+ static int ensureConnected(void);
+ 
++/* Layer-shell surfaces are for upstream's own desktop processes (its menu bar, dock, desktop), which
++ * place them themselves: SF_WS_LAYER_SHELL=1. An application's windows are xdg toplevels and its
++ * menus and tool tips xdg popups of them, placed by the compositor, also where the compositor offers
++ * layer shell for its own dock (SiliconForest's does since 14 November: with it every menu became an
++ * overlay at a fixed place that no press outside dismissed, and a modal panel lost its parent). */
++static int wsUsesLayerShell(void) {
++    static int asked = -1;
++
++    if (asked < 0)
++        asked = getenv("SF_WS_LAYER_SHELL") != NULL && atoi(getenv("SF_WS_LAYER_SHELL")) != 0;
++    return asked && ws.layerShell != NULL;
++}
++
+ int _windowServerPlacesPopups(void) {
+-    return ensureConnected() && ws.layerShell == NULL;
++    return ensureConnected() && !wsUsesLayerShell();
+ }
+ 
+ static int ensureConnected(void) {
+@@ -760,8 +778,10 @@
+ 
+ /* Desktop sorts below normal and the dock/menu levels above it. Anything that
+  * maps to a layer is given a layer-shell role instead of an xdg_toplevel. */
++static int wsUsesLayerShell(void);
++
+ static int layerForWindowLevel(int level, uint32_t *layerOut) {
+-    if (ws.layerShell == NULL) {
++    if (!wsUsesLayerShell()) {
+         return 0;
+     }
+     if (level <= kWSDesktopIconLevel) {
+@@ -982,6 +1002,44 @@
+ 
+ static int windowPresent(struct wsWindow *window);
+ 
++/* AppKit ordered a window to the front (-makeKeyAndOrderFront:, Command-`, the Window menu): the
++ * compositor is asked through xdg_activation_v1, with the serial of the last input event and the
++ * window that has the keyboard, which its rule against stealing focus wants to see. */
++static void activationDone(void *data, struct xdg_activation_token_v1 *token, const char *string) {
++    int windowID = (int)(intptr_t)data;
++    struct wsWindow *window;
++
++    for (window = ws.windows; window != NULL && window->windowID != windowID; window = window->next) {}
++    if (window != NULL && window->surface != NULL && ws.activation != NULL) {
++        xdg_activation_v1_activate(ws.activation, string, window->surface);
++        wl_display_flush(ws.display);
++        if (getenv("SF_WS_TRACE") != NULL)
++            fprintf(stderr, "WindowServer: window %d asked to come forward\n", windowID);
++    }
++    xdg_activation_token_v1_destroy(token);
++}
++
++static const struct xdg_activation_token_v1_listener activationTokenListener = {
++    .done = activationDone,
++};
++
++static void windowActivate(struct wsWindow *window) {
++    struct wsWindow *focused;
++    struct xdg_activation_token_v1 *token;
++
++    if (ws.activation == NULL || window == NULL || window->surface == NULL || window->toplevel == NULL)
++        return;
++    token = xdg_activation_v1_get_activation_token(ws.activation);
++    xdg_activation_token_v1_add_listener(token, &activationTokenListener, (void *)(intptr_t)window->windowID);
++    if (ws.seat != NULL && ws.inputSerial != 0)
++        xdg_activation_token_v1_set_serial(token, ws.inputSerial, ws.seat);
++    for (focused = ws.windows; focused != NULL && focused->windowID != ws.focusWindowID; focused = focused->next) {}
++    if (focused != NULL && focused->surface != NULL)
++        xdg_activation_token_v1_set_surface(token, focused->surface);
++    xdg_activation_token_v1_commit(token);
++    wl_display_flush(ws.display);
++}
++
+ /* A flush that found every frame on the compositor's side is presented when one comes back,
+  * from here (the thread that reads the connection), under the lock the flush takes too. The
+  * backing store may be in the middle of the next drawing then; that drawing ends in a flush of
+@@ -2148,6 +2206,8 @@
+     if (getenv("SF_WS_TRACE") != NULL)
+         fprintf(stderr, "WindowServer: toplevel %d configure %dx%d (now %gx%g)\n",
+                 window->windowID, width, height, window->w, window->h);
++    if (wsTiming())
++        fprintf(stderr, "WSTIME %.1f configure surface=%d size=%dx%d\n", wsNowMs(), window->windowID, width, height);
+     /* Maximised, put away (suspended) or made full screen by the compositor, from its frame's
+      * buttons or its own shortcuts: AppKit keeps the window's zoomed and miniaturised state
+      * and the notifications applications wait for. */
+@@ -2862,13 +2922,18 @@
+     if (msg->state != window->state) {
+         switch (msg->state) {
+             case MINIMIZED:
+-                /* Deliberately not xdg_toplevel_set_minimized(): that request
+-                 * is a one-way hint. xdg-shell has no unset_minimized, so a
+-                 * client cannot un-minimize itself - only the compositor can,
+-                 * through a taskbar protocol - and a window minimized that way
+-                 * can never be restored. Unmapping looks the same and is
+-                 * reversible, which is what -deminiaturize: needs. */
+-                windowUnmap(window);
++                /* Where the compositor offers xdg_activation_v1 a toplevel is minimised by the
++                 * compositor (xdg_toplevel_set_minimized: it shows the window's tile, and a click
++                 * there brings it back) and comes back by an activation (-deminiaturize:, the Window
++                 * menu). Elsewhere it is unmapped: xdg-shell has no unset_minimized, so a client
++                 * could not bring back a window it minimised itself. */
++                if (window->toplevel != NULL && ws.activation != NULL && window->attached) {
++                    xdg_toplevel_set_minimized(window->toplevel);
++                    window->minimizedByCompositor = 1;
++                    wl_display_flush(ws.display);
++                }
++                else
++                    windowUnmap(window);
+                 break;
+             case MAXIMIZED:
+                 if (window->toplevel != NULL && window->state == FULLSCREEN)
+@@ -2880,6 +2945,12 @@
+                     xdg_toplevel_set_fullscreen(window->toplevel, NULL);
+                 break;
+             case NORMAL:
++                if (window->state == MINIMIZED && window->minimizedByCompositor) {
++                    window->minimizedByCompositor = 0;
++                    window->state = NORMAL;
++                    windowActivate(window);
++                    break;
++                }
+                 if (window->toplevel != NULL && window->state == FULLSCREEN)
+                     xdg_toplevel_unset_fullscreen(window->toplevel);
+                 else if (window->toplevel != NULL) { xdg_toplevel_unset_maximized(window->toplevel); }
+@@ -3077,7 +3148,12 @@
+             window->minW = (int)msg->x, window->minH = (int)msg->y;
+             window->maxW = (int)msg->w, window->maxH = (int)msg->h;
+             windowSendSizeLimits(window);
+-            if (window->toplevel != NULL) {
++            /* On a window that is on screen the limits (double-buffered state) go with the next frame,
++             * which AppKit draws at the size that goes with them: committed now, they applied to the
++             * frame of the old size, and the compositor answered with a configure that held the old
++             * size within the new limits, undoing the application's own resize (Terminal's Bigger and
++             * Smaller changed one side of the window and its rows and columns). */
++            if (window->toplevel != NULL && !window->attached) {
+                 wl_surface_commit(window->surface);
+                 wl_display_flush(ws.display);
+             }
+@@ -3141,6 +3217,17 @@
+             return KERN_SUCCESS;
+         }
+ 
++        case kWSWindowOrder: {
++            struct wsRPCSimple *msg = (struct wsRPCSimple *)data;
++            struct wsWindow *window = windowForID(msg->val1);
++
++            // only a window on screen that does not have the keyboard already
++            if (window == NULL || window->windowID == ws.focusWindowID || !window->attached)
++                return KERN_SUCCESS;
++            windowActivate(window);
++            return KERN_SUCCESS;
++        }
++
+         case kWSWindowMove: {
+             struct wsRPCSimple *msg = (struct wsRPCSimple *)data;
+             struct wsWindow *window = windowForID(msg->val1);

@@ -1,0 +1,774 @@
+diff -ruN '--exclude=.git' '--exclude=target' desk4-002/crates/wm-darwin/src/desktop_entry.rs desk4-003/crates/wm-darwin/src/desktop_entry.rs
+--- desk4-002/crates/wm-darwin/src/desktop_entry.rs	2026-11-14 18:38:57.394295014 -0800
++++ desk4-003/crates/wm-darwin/src/desktop_entry.rs	2026-11-14 18:59:13.109603307 -0800
+@@ -169,6 +169,8 @@
+     result: &'a mut File,
+     started: Instant,
+     shutdown: bool,
++    /// An external display's arrival and departure (outputs.rs; the kernel's half is asked of CODEX-TB).
++    outputs: crate::outputs::Watch,
+ }
+ impl SessionIo for NativeIo<'_> {
+     fn elapsed(&self) -> Duration {
+@@ -206,6 +208,14 @@
+             }
+         }
+         self.server.trackpad_swipes(ms);
++        let scale = self.server.scale();
++        self.outputs.tick(crate::kms::read_hotplug_seq, || {
++            let libs = crate::gpu::Libraries::load()?;
++            let (card, _) = crate::kms::open_by_driver(&libs.drm, "card", "apple")?;
++            let list = crate::kms::list_connectors(&libs.drm, card);
++            unsafe { libc::close(card) };
++            Ok(list?.iter().filter_map(|c| c.output_info()).collect())
++        }, scale);
+         if let Some(autopilot) = &mut self.autopilot {
+             autopilot.step(self.server, ms)?;
+         }
+@@ -425,6 +435,7 @@
+             result: &mut result,
+             started: Instant::now(),
+             shutdown: false,
++            outputs: Default::default(),
+         };
+         session_entry::drive(&mut io, Duration::from_secs(options.seconds))
+     };
+diff -ruN '--exclude=.git' '--exclude=target' desk4-002/crates/wm-darwin/src/desktop_main.rs desk4-003/crates/wm-darwin/src/desktop_main.rs
+--- desk4-002/crates/wm-darwin/src/desktop_main.rs	2026-11-14 02:00:18.338257132 -0800
++++ desk4-003/crates/wm-darwin/src/desktop_main.rs	2026-11-14 18:58:47.656238092 -0800
+@@ -14,6 +14,9 @@
+     // Rendering benchmark: no session, no clients, no input devices.
+     let result = if args[0] == "--bench" {
+         wm_darwin::desktop_entry::bench(&args[1..])
++    } else if args[0] == "--outputs" {
++        // Every connector/CRTC/plane of the display driver, read only (external display work).
++        wm_darwin::kms::outputs_cli()
+     } else if args[0] == "--gl-probe" {
+         // First GPU step: clear and page-flip through the KMS backend.
+         wm_darwin::kms::probe(&args[1..])
+diff -ruN '--exclude=.git' '--exclude=target' desk4-002/crates/wm-darwin/src/inject.rs desk4-003/crates/wm-darwin/src/inject.rs
+--- desk4-002/crates/wm-darwin/src/inject.rs	2026-11-14 18:38:57.411491348 -0800
++++ desk4-003/crates/wm-darwin/src/inject.rs	2026-11-14 18:57:48.622933929 -0800
+@@ -220,6 +220,7 @@
+                 let hid = self.injector.as_ref().map_or_else(|| "no input thread".to_string(), |i| i.health().summary());
+                 let (keys, last) = server.hid_keys();
+                 eprintln!("WMINJECT stats hid: {hid} | key_events_delivered={keys} last_key={last:?} | {}", server.latency.final_line().unwrap_or_else(|| "no motion latency samples".into()));
++                eprintln!("{}", server.latency.flush_line());
+             }
+             Some(Step::Fail) => {
+                 self.queue.pop_front();
+diff -ruN '--exclude=.git' '--exclude=target' desk4-002/crates/wm-darwin/src/input_latency.rs desk4-003/crates/wm-darwin/src/input_latency.rs
+--- desk4-002/crates/wm-darwin/src/input_latency.rs	2026-11-14 18:32:28.815857838 -0800
++++ desk4-003/crates/wm-darwin/src/input_latency.rs	2026-11-14 18:59:46.642335981 -0800
+@@ -71,6 +71,15 @@
+         eprintln!("{} window_s={:.1}", Self::line(&sorted, "last"), self.logged_at.elapsed().as_secs_f64());
+         self.logged_at = Instant::now();
+     }
++    /// The samples since the last line, now (the inject `stats` step: one line per test phase).
++    #[cfg_attr(not(feature = "test-inject"), allow(dead_code))]
++    pub fn flush_line(&mut self) -> String {
++        let mut sorted = std::mem::take(&mut self.window);
++        sorted.sort_unstable();
++        let line = format!("{} window_s={:.1}", Self::line(&sorted, "since-last"), self.logged_at.elapsed().as_secs_f64());
++        self.logged_at = Instant::now();
++        line
++    }
+     /// The whole run (whole milliseconds).
+     pub fn final_line(&self) -> Option<String> {
+         if self.samples == 0 {
+diff -ruN '--exclude=.git' '--exclude=target' desk4-002/crates/wm-darwin/src/kms.rs desk4-003/crates/wm-darwin/src/kms.rs
+--- desk4-002/crates/wm-darwin/src/kms.rs	2026-11-10 21:53:16.596905635 -0800
++++ desk4-003/crates/wm-darwin/src/kms.rs	2026-11-14 18:58:47.655701555 -0800
+@@ -297,6 +297,154 @@
+     offset: u64,
+ }
+ 
++/// drm_mode.h's connector type names.
++pub fn connector_type_name(kind: u32) -> &'static str {
++    match kind {
++        1 => "VGA", 2 => "DVI-I", 3 => "DVI-D", 4 => "DVI-A", 5 => "Composite", 6 => "SVIDEO", 7 => "LVDS", 8 => "Component",
++        9 => "9PinDIN", 10 => "DP", 11 => "HDMI-A", 12 => "HDMI-B", 13 => "TV", 14 => "eDP", 15 => "Virtual", 16 => "DSI",
++        17 => "DPI", 18 => "Writeback", 19 => "SPI", 20 => "USB", _ => "Unknown",
++    }
++}
++/// A built-in panel's connector type (eDP, LVDS, DSI).
++pub fn is_internal_type(kind: u32) -> bool {
++    matches!(kind, 7 | 14 | 16)
++}
++/// A connector as the card node lists it.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct ConnectorInfo {
++    pub id: u32,
++    /// `<type>-<type id>`, as Linux names them (eDP-1, DP-1).
++    pub name: String,
++    pub kind: u32,
++    pub connected: bool,
++    /// width, height, refresh, preferred
++    pub modes: Vec<(u16, u16, u32, bool)>,
++    pub mm: (u32, u32),
++    pub has_edid: bool,
++    pub possible_crtcs: u32,
++}
++impl ConnectorInfo {
++    pub fn describe(&self) -> String {
++        let preferred = self.modes.iter().find(|m| m.3).or(self.modes.first()).map_or("-".to_string(), |m| format!("{}x{}@{}", m.0, m.1, m.2));
++        format!("id={} name={} type={} {} modes={} preferred={preferred} mm={}x{} edid={} possible_crtcs={:#x} {}",
++            self.id, self.name, connector_type_name(self.kind), if self.connected { "connected" } else { "disconnected" }, self.modes.len(),
++            self.mm.0, self.mm.1, if self.has_edid { "yes" } else { "no" }, self.possible_crtcs, if is_internal_type(self.kind) { "internal" } else { "external" })
++    }
++    /// The output policy's view of it (outputs.rs), when it is connected with a mode.
++    pub fn output_info(&self) -> Option<crate::outputs::OutputInfo> {
++        if !self.connected {
++            return None;
++        }
++        let mode = self.modes.iter().find(|m| m.3).or(self.modes.first())?;
++        let kind = if is_internal_type(self.kind) { crate::outputs::OutputKind::Internal } else { crate::outputs::OutputKind::External };
++        Some(crate::outputs::OutputInfo { name: self.name.clone(), kind, pixels: (u32::from(mode.0), u32::from(mode.1)), mm: self.mm, id: format!("{}-{}x{}", self.name, self.mm.0, self.mm.1) })
++    }
++}
++/// Every connector of the card node, read only: no DRM master, no commit.
++pub fn list_connectors(drm: &Drm, card: c_int) -> Result<Vec<ConnectorInfo>, String> {
++    let mut list = Vec::new();
++    unsafe {
++        let res = (drm.drmModeGetResources)(card);
++        if res.is_null() {
++            return Err(os_error("drmModeGetResources"));
++        }
++        for i in 0..(*res).count_connectors.max(0) as usize {
++            let c = (drm.drmModeGetConnector)(card, *(*res).connectors.add(i));
++            if c.is_null() {
++                continue;
++            }
++            let mut modes = Vec::new();
++            for m in 0..(*c).count_modes.max(0) as usize {
++                let mode = *(*c).modes.add(m);
++                modes.push((mode.hdisplay, mode.vdisplay, mode.vrefresh, mode.kind & DRM_MODE_TYPE_PREFERRED != 0));
++            }
++            let mut possible_crtcs = 0;
++            for e in 0..(*c).count_encoders.max(0) as usize {
++                let encoder = (drm.drmModeGetEncoder)(card, *(*c).encoders.add(e));
++                if !encoder.is_null() {
++                    possible_crtcs |= (*encoder).possible_crtcs;
++                    (drm.drmModeFreeEncoder)(encoder);
++                }
++            }
++            let id = (*c).connector_id;
++            let has_edid = Kms::property(drm, card, id, DRM_MODE_OBJECT_CONNECTOR, "EDID").is_some_and(|p| p.1 != 0);
++            list.push(ConnectorInfo {
++                id,
++                name: format!("{}-{}", connector_type_name((*c).connector_type), (*c).connector_type_id),
++                kind: (*c).connector_type,
++                connected: (*c).connection == DRM_MODE_CONNECTED,
++                modes,
++                mm: ((*c).mm_width, (*c).mm_height),
++                has_edid,
++                possible_crtcs,
++            });
++            (drm.drmModeFreeConnector)(c);
++        }
++        (drm.drmModeFreeResources)(res);
++    }
++    Ok(list)
++}
++/// `--outputs`: what the display driver offers, for the external-display work (CODEX-TB): every
++/// connector, CRTC and plane with its state, read only (no DRM master is taken, nothing is
++/// committed, the running desktop is not disturbed). Lines `WMOUTPUT ...`.
++pub fn outputs_cli() -> Result<(), String> {
++    let libs = Libraries::load()?;
++    let drm = &libs.drm;
++    let (card, path) = open_by_driver(drm, "card", "apple")?;
++    println!("WMOUTPUT card={path}");
++    unsafe {
++        let _ = (drm.drmSetClientCap)(card, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
++        let res = (drm.drmModeGetResources)(card);
++        if !res.is_null() {
++            println!("WMOUTPUT resources crtcs={} connectors={} encoders={} fb_max={}x{}", (*res).count_crtcs, (*res).count_connectors, (*res).count_encoders, (*res).max_width, (*res).max_height);
++            for i in 0..(*res).count_crtcs.max(0) as usize {
++                let id = *(*res).crtcs.add(i);
++                let active = Kms::property(drm, card, id, DRM_MODE_OBJECT_CRTC, "ACTIVE").map(|p| p.1);
++                println!("WMOUTPUT crtc index={i} id={id} active={active:?}");
++            }
++            (drm.drmModeFreeResources)(res);
++        }
++        for c in list_connectors(drm, card)? {
++            println!("WMOUTPUT connector {}", c.describe());
++            if let Some(info) = c.output_info() {
++                println!("WMOUTPUT policy {} kind={:?} default_scale={}", info.name, info.kind, crate::outputs::default_scale(&info).label());
++            }
++        }
++        let planes = (drm.drmModeGetPlaneResources)(card);
++        if !planes.is_null() {
++            for i in 0..(*planes).count_planes as usize {
++                let plane = (drm.drmModeGetPlane)(card, *(*planes).planes.add(i));
++                if plane.is_null() {
++                    continue;
++                }
++                let id = (*plane).plane_id;
++                let kind = Kms::property(drm, card, id, DRM_MODE_OBJECT_PLANE, "type").map(|p| p.1);
++                println!("WMOUTPUT plane id={id} type={} possible_crtcs={:#x} crtc={} fb={} formats={}", match kind { Some(0) => "overlay", Some(1) => "primary", Some(2) => "cursor", _ => "?" }, (*plane).possible_crtcs, (*plane).crtc_id, (*plane).fb_id, (*plane).count_formats);
++                (drm.drmModeFreePlane)(plane);
++            }
++            (drm.drmModeFreePlaneResources)(planes);
++        }
++        libc::close(card);
++    }
++    match read_hotplug_seq() {
++        Some(seq) => println!("WMOUTPUT kern.sf_dcp.hotplug_seq={seq}"),
++        None => println!("WMOUTPUT kern.sf_dcp.hotplug_seq absent (no hotplug signal from this kernel yet)"),
++    }
++    Ok(())
++}
++/// The display driver's hotplug counter (asked of CODEX-TB, K4), when the kernel has it.
++#[cfg(target_os = "macos")]
++pub fn read_hotplug_seq() -> Option<u64> {
++    let mut value: u64 = 0;
++    let mut size = std::mem::size_of::<u64>();
++    let rc = unsafe { libc::sysctlbyname(c"kern.sf_dcp.hotplug_seq".as_ptr(), (&mut value as *mut u64).cast(), &mut size, std::ptr::null_mut(), 0) };
++    (rc == 0 && (size == 8 || size == 4)).then_some(if size == 4 { value & 0xffff_ffff } else { value })
++}
++#[cfg(not(target_os = "macos"))]
++pub fn read_hotplug_seq() -> Option<u64> {
++    None
++}
++
+ /// The display: card node, connector/CRTC/primary plane and their property ids.
+ pub struct Kms {
+     card: c_int,
+@@ -382,15 +530,29 @@
+             if res.is_null() {
+                 return Err(os_error("drmModeGetResources"));
+             }
++            // Every connector is said in the log; the panel (eDP/LVDS/DSI) is taken when it is
++            // connected, else the first connected one (DESK4: with dcpext an external connector may
++            // come first in the list, and the panel must keep the desktop until a second scanout
++            // exists; see outputs.rs and runs/m1-coord/requests-for-CODEX-TB.md).
++            if let Ok(list) = list_connectors(drm, card) {
++                for c in &list {
++                    eprintln!("WMOUTPUT connector {}", c.describe());
++                }
++            }
+             let mut connector = std::ptr::null_mut::<DrmModeConnector>();
+-            for i in 0..(*res).count_connectors.max(0) as usize {
+-                let c = (drm.drmModeGetConnector)(card, *(*res).connectors.add(i));
+-                if !c.is_null() && (*c).connection == DRM_MODE_CONNECTED && (*c).count_modes > 0 {
+-                    connector = c;
+-                    break;
++            for internal_only in [true, false] {
++                for i in 0..(*res).count_connectors.max(0) as usize {
++                    let c = (drm.drmModeGetConnector)(card, *(*res).connectors.add(i));
++                    if !c.is_null() && (*c).connection == DRM_MODE_CONNECTED && (*c).count_modes > 0 && (!internal_only || is_internal_type((*c).connector_type)) {
++                        connector = c;
++                        break;
++                    }
++                    if !c.is_null() {
++                        (drm.drmModeFreeConnector)(c);
++                    }
+                 }
+-                if !c.is_null() {
+-                    (drm.drmModeFreeConnector)(c);
++                if !connector.is_null() {
++                    break;
+                 }
+             }
+             if connector.is_null() {
+diff -ruN '--exclude=.git' '--exclude=target' desk4-002/crates/wm-darwin/src/layers.rs desk4-003/crates/wm-darwin/src/layers.rs
+--- desk4-002/crates/wm-darwin/src/layers.rs	2026-11-14 14:16:00.534710565 -0800
++++ desk4-003/crates/wm-darwin/src/layers.rs	2026-11-14 19:00:09.108284872 -0800
+@@ -246,6 +246,18 @@
+                 self.layers[index].shell = shell;
+                 self.layers[index].rect.size = image_size;
+                 self.layers_workarea();
++                // The session's startup terminals map before the dock starts: when the launcher
++                // strip appears for the first time, the windows already there are moved clear
++                // of it, as a window mapped after it is (DESK4; not later, when the user may have
++                // put one there).
++                if old.is_none() && shell.is_some() && !self.launcher_seen && self.layers[index].namespace == "chonk-dock-launcher" {
++                    self.launcher_seen = true;
++                    let mut mapped: Vec<u64> = self.wm.backend().windows.iter().filter(|(_, w)| w.mapped).map(|(id, _)| *id).collect();
++                    mapped.sort_unstable();
++                    for id in mapped {
++                        self.place_clear_of_launchers(id);
++                    }
++                }
+                 if old != shell {
+                     self.refresh_pointer();
+                 }
+diff -ruN '--exclude=.git' '--exclude=target' desk4-002/crates/wm-darwin/src/lib.rs desk4-003/crates/wm-darwin/src/lib.rs
+--- desk4-002/crates/wm-darwin/src/lib.rs	2026-11-14 18:32:44.739736475 -0800
++++ desk4-003/crates/wm-darwin/src/lib.rs	2026-11-14 18:48:21.014594894 -0800
+@@ -49,6 +49,7 @@
+ mod layers;
+ pub mod launch_audit;
+ pub mod output;
++pub mod outputs;
+ pub mod pixels;
+ mod popups;
+ pub mod power;
+diff -ruN '--exclude=.git' '--exclude=target' desk4-002/crates/wm-darwin/src/outputs.rs desk4-003/crates/wm-darwin/src/outputs.rs
+--- desk4-002/crates/wm-darwin/src/outputs.rs	1969-12-31 16:00:00.000000000 -0800
++++ desk4-003/crates/wm-darwin/src/outputs.rs	2026-11-14 18:59:46.641912690 -0800
+@@ -0,0 +1,444 @@
++//! Outputs: the panel and an external display (J293 drives at most one, through dcpext), their
++//! arrangement, scale and what happens when one comes or goes. Pure policy, no device: the
++//! KMS side (kms.rs `connectors`) says what is connected, the scene and the renderer follow
++//! what this decides. Host-tested with a virtual second output (no kernel has a dcpext yet;
++//! see runs/m1-coord/requests-for-CODEX-TB.md for the kernel's half).
++//!
++//! macOS's defaults, which the owner expects ("plug in an external monitor and expect it to
++//! work … hotswap", the Samsung on the dock as the primary when present):
++//! - extended desktop, separate Spaces per display; the external is the primary (the dock
++//!   column, the launcher strip and new windows go there), the panel to its left, tops aligned;
++//! - the pointer crosses where the two touch and stops at edges where they do not;
++//! - each output has its own scale: the panel keeps the owner's file (`scale`), an external gets
++//!   its own (`scale-<output id>`), by default from its density, never the panel's file;
++//! - unplugged: its windows come to the panel at the same relative place, its Spaces' windows
++//!   join the panel's Spaces of the same number; plugged again: primary again;
++//! - mirroring on request: one picture at the primary's logical size, shown on both.
++use crate::scale::Scale;
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum OutputKind {
++    /// The built-in panel (connector type eDP).
++    Internal,
++    /// Anything plugged in (DisplayPort, HDMI-A, USB-C).
++    External,
++}
++
++/// What the kernel says of a connected connector.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct OutputInfo {
++    /// The connector's name (`eDP-1`, `DP-1`): the key while it stays plugged.
++    pub name: String,
++    pub kind: OutputKind,
++    /// The mode in pixels.
++    pub pixels: (u32, u32),
++    /// The physical size in millimetres (0 when the EDID gives none).
++    pub mm: (u32, u32),
++    /// A stable key for remembering its scale across plugs: the EDID's manufacturer, product
++    /// and size, without a serial number (`SAM-7381-597x336`), or the connector name.
++    pub id: String,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Arrangement {
++    Extended,
++    Mirrored,
++}
++
++#[derive(Debug, Clone, PartialEq)]
++pub struct Placed {
++    pub info: OutputInfo,
++    pub scale: Scale,
++    /// Top left in the global logical space (the primary's top left is 0,0).
++    pub origin: (i32, i32),
++    /// The size in logical units at its scale.
++    pub logical: (i32, i32),
++    pub primary: bool,
++}
++impl Placed {
++    pub fn rect(&self) -> Rect {
++        Rect { x: self.origin.0, y: self.origin.1, w: self.logical.0, h: self.logical.1 }
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct Rect {
++    pub x: i32,
++    pub y: i32,
++    pub w: i32,
++    pub h: i32,
++}
++impl Rect {
++    pub fn contains(&self, x: f64, y: f64) -> bool {
++        x >= f64::from(self.x) && y >= f64::from(self.y) && x < f64::from(self.x + self.w) && y < f64::from(self.y + self.h)
++    }
++    fn clamp(&self, x: f64, y: f64) -> (f64, f64) {
++        (x.clamp(f64::from(self.x), f64::from(self.x + self.w) - 1.0), y.clamp(f64::from(self.y), f64::from(self.y + self.h) - 1.0))
++    }
++}
++
++/// What a change of the connected outputs did.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum Change {
++    Added(String),
++    Removed(String),
++    /// The primary is now this output (the dock and the launchers move there).
++    Primary(String),
++}
++
++/// The scale an output gets when nobody chose one: the step nearest to a density of about
++/// 110 logical dots per inch, never under 100 %. The J293 panel (2560 px over 286 mm, 227 dpi)
++/// gets 200 %, a 27" 4K (597 mm, 163 dpi) 150 %, a 32" 4K (698 mm) 125 %, a 24" 1080p 100 %.
++/// Without a physical size: the width over 2560 (a 4K: 150 %).
++pub fn default_scale(info: &OutputInfo) -> Scale {
++    let factor = if info.mm.0 >= 100 {
++        let dpi = f64::from(info.pixels.0) / (f64::from(info.mm.0) / 25.4);
++        dpi / 110.0
++    } else if info.kind == OutputKind::Internal {
++        f64::from(info.pixels.0) / 1280.0
++    } else {
++        f64::from(info.pixels.0) / 2560.0
++    };
++    Scale::nearest(factor.max(1.0))
++}
++
++/// The arrangement of the outputs connected now.
++#[derive(Debug, Clone)]
++pub struct Layout {
++    outputs: Vec<Placed>,
++    arrangement: Arrangement,
++}
++impl Layout {
++    /// The panel alone (the state at start without an external).
++    pub fn single(info: OutputInfo, scale: Scale) -> Self {
++        let mut layout = Self { outputs: Vec::new(), arrangement: Arrangement::Extended };
++        layout.outputs.push(Placed { logical: logical(info.pixels, scale), info, scale, origin: (0, 0), primary: true });
++        layout
++    }
++    pub fn outputs(&self) -> &[Placed] {
++        &self.outputs
++    }
++    pub fn arrangement(&self) -> Arrangement {
++        self.arrangement
++    }
++    pub fn primary(&self) -> &Placed {
++        self.outputs.iter().find(|o| o.primary).unwrap_or(&self.outputs[0])
++    }
++    pub fn get(&self, name: &str) -> Option<&Placed> {
++        self.outputs.iter().find(|o| o.info.name == name)
++    }
++    /// Make the connected set `connected` (one per connector, from the kernel after a hotplug
++    /// signal). `scale_of` gives an output's scale (persisted, else `default_scale`). The panel
++    /// is never removed by this (a kernel that briefly lists it disconnected keeps it).
++    pub fn sync(&mut self, connected: &[OutputInfo], mut scale_of: impl FnMut(&OutputInfo) -> Scale) -> Vec<Change> {
++        let mut changes = Vec::new();
++        let before = self.primary().info.name.clone();
++        let gone: Vec<String> = self.outputs.iter()
++            .filter(|o| o.info.kind == OutputKind::External && !connected.iter().any(|c| c.name == o.info.name && c.pixels == o.info.pixels))
++            .map(|o| o.info.name.clone()).collect();
++        for name in gone {
++            self.outputs.retain(|o| o.info.name != name);
++            changes.push(Change::Removed(name));
++        }
++        for info in connected {
++            if self.get(&info.name).is_some() {
++                continue;
++            }
++            if info.kind == OutputKind::Internal && self.outputs.iter().any(|o| o.info.kind == OutputKind::Internal) {
++                continue;
++            }
++            let scale = scale_of(info);
++            self.outputs.push(Placed { logical: logical(info.pixels, scale), info: info.clone(), scale, origin: (0, 0), primary: false });
++            changes.push(Change::Added(info.name.clone()));
++        }
++        self.arrange();
++        let after = self.primary().info.name.clone();
++        if after != before {
++            changes.push(Change::Primary(after));
++        }
++        changes
++    }
++    /// A new scale for one output (the menu's Display > Scale applies to the output the pointer
++    /// is on); the arrangement follows.
++    pub fn set_scale(&mut self, name: &str, scale: Scale) -> bool {
++        let Some(output) = self.outputs.iter_mut().find(|o| o.info.name == name) else { return false };
++        output.scale = scale;
++        output.logical = logical(output.info.pixels, scale);
++        self.arrange();
++        true
++    }
++    pub fn set_arrangement(&mut self, arrangement: Arrangement) {
++        self.arrangement = arrangement;
++        self.arrange();
++    }
++    /// The external (the first one) is the primary when present; the others go to its left,
++    /// tops aligned (mirrored: all at 0,0 with the primary's logical size).
++    fn arrange(&mut self) {
++        for o in self.outputs.iter_mut() {
++            o.logical = logical(o.info.pixels, o.scale);
++        }
++        let primary = self.outputs.iter().position(|o| o.info.kind == OutputKind::External).unwrap_or(0);
++        for (i, o) in self.outputs.iter_mut().enumerate() {
++            o.primary = i == primary;
++        }
++        let size = self.outputs[primary].logical;
++        self.outputs[primary].origin = (0, 0);
++        let mut left = 0;
++        for i in 0..self.outputs.len() {
++            if i == primary {
++                continue;
++            }
++            match self.arrangement {
++                Arrangement::Mirrored => self.outputs[i].origin = (0, 0),
++                Arrangement::Extended => {
++                    left -= self.outputs[i].logical.0;
++                    self.outputs[i].origin = (left, 0);
++                }
++            }
++        }
++        if self.arrangement == Arrangement::Mirrored {
++            for o in self.outputs.iter_mut() {
++                o.logical = size;
++            }
++        }
++    }
++    /// The output under a global logical point.
++    pub fn output_at(&self, x: f64, y: f64) -> Option<&Placed> {
++        self.outputs.iter().find(|o| o.rect().contains(x, y))
++    }
++    /// The pointer moved from `from` to `to` (global logical units): where it ends. Into an
++    /// output: there. Into the space beside the outputs: it stops at the edge of the output it
++    /// was on (no jump over a gap), as on macOS.
++    pub fn move_pointer(&self, from: (f64, f64), to: (f64, f64)) -> (f64, f64) {
++        if self.output_at(to.0, to.1).is_some() {
++            return to;
++        }
++        let home = self.output_at(from.0, from.1).unwrap_or_else(|| self.primary());
++        home.rect().clamp(to.0, to.1)
++    }
++    /// Where a window that was on `removed` goes when it is unplugged: onto the primary, its
++    /// centre at the same place relative to the output's size, wholly inside (the title bar
++    /// reachable), its size kept when it fits, else shrunk to the output.
++    pub fn rehome(removed: Rect, target: Rect, window: Rect) -> Rect {
++        let w = window.w.min(target.w);
++        let h = window.h.min(target.h);
++        let fx = if removed.w > 0 { (f64::from(window.x - removed.x) + f64::from(window.w) / 2.0) / f64::from(removed.w) } else { 0.5 };
++        let fy = if removed.h > 0 { (f64::from(window.y - removed.y) + f64::from(window.h) / 2.0) / f64::from(removed.h) } else { 0.5 };
++        let x = target.x + (fx * f64::from(target.w) - f64::from(w) / 2.0).round() as i32;
++        let y = target.y + (fy * f64::from(target.h) - f64::from(h) / 2.0).round() as i32;
++        Rect { x: x.clamp(target.x, target.x + target.w - w), y: y.clamp(target.y, target.y + target.h - h), w, h }
++    }
++    /// The bounding box of every output (logical units).
++    pub fn bounds(&self) -> Rect {
++        let x0 = self.outputs.iter().map(|o| o.origin.0).min().unwrap_or(0);
++        let y0 = self.outputs.iter().map(|o| o.origin.1).min().unwrap_or(0);
++        let x1 = self.outputs.iter().map(|o| o.origin.0 + o.logical.0).max().unwrap_or(0);
++        let y1 = self.outputs.iter().map(|o| o.origin.1 + o.logical.1).max().unwrap_or(0);
++        Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
++    }
++    /// One line for the log.
++    pub fn describe(&self) -> String {
++        self.outputs.iter().map(|o| format!("{}{} {:?} {}x{}px {} at {},{} logical {}x{}", o.info.name, if o.primary { "*" } else { "" }, o.info.kind, o.info.pixels.0, o.info.pixels.1, o.scale.label(), o.origin.0, o.origin.1, o.logical.0, o.logical.1))
++            .collect::<Vec<_>>().join("; ")
++    }
++}
++fn logical(pixels: (u32, u32), scale: Scale) -> (i32, i32) {
++    (scale.to_logical(pixels.0 as i32), scale.to_logical(pixels.1 as i32))
++}
++
++/// Spaces per display (macOS's default): each output keeps its own list and its current one.
++/// When an output goes, its Spaces' windows join the remaining primary's Spaces of the same
++/// number (made when missing); the result is the space index each window lands on.
++pub fn spaces_after_unplug(removed_window_spaces: &[(u64, usize)], remaining_spaces: usize) -> (Vec<(u64, usize)>, usize) {
++    let needed = removed_window_spaces.iter().map(|(_, s)| s + 1).max().unwrap_or(0).max(remaining_spaces);
++    (removed_window_spaces.to_vec(), needed)
++}
++
++/// Watches the display driver's hotplug counter (`kern.sf_dcp.hotplug_seq`, asked of the kernel)
++/// twice a second; when it moves, the connected outputs are read again and the layout decides.
++/// Today the decision is said in the log (`WMOUTPUT hotplug ...`) and the desktop stays on the
++/// panel: the second scanout (kms.rs per CRTC, the renderer per output) comes with dcpext.
++pub struct Watch {
++    seq: Option<u64>,
++    said_absent: bool,
++    layout: Option<Layout>,
++    next: std::time::Instant,
++}
++impl Default for Watch {
++    fn default() -> Self {
++        Self { seq: None, said_absent: false, layout: None, next: std::time::Instant::now() }
++    }
++}
++impl Watch {
++    pub fn layout(&self) -> Option<&Layout> {
++        self.layout.as_ref()
++    }
++    pub fn tick(
++        &mut self,
++        read_seq: impl FnOnce() -> Option<u64>,
++        list: impl FnOnce() -> Result<Vec<OutputInfo>, String>,
++        panel_scale: Scale,
++    ) -> Vec<Change> {
++        let now = std::time::Instant::now();
++        if self.said_absent || now < self.next {
++            return Vec::new();
++        }
++        self.next = now + std::time::Duration::from_millis(500);
++        let Some(seq) = read_seq() else {
++            self.said_absent = true;
++            eprintln!("WMOUTPUT hotplug: kern.sf_dcp.hotplug_seq absent (this kernel has no external display yet); the panel only");
++            return Vec::new();
++        };
++        if self.seq == Some(seq) {
++            return Vec::new();
++        }
++        self.seq = Some(seq);
++        let connected = match list() {
++            Ok(list) => list,
++            Err(error) => {
++                eprintln!("WMOUTPUT hotplug seq={seq}: connectors not readable: {error}");
++                return Vec::new();
++            }
++        };
++        let layout = match self.layout.as_mut() {
++            Some(layout) => layout,
++            None => {
++                let Some(panel) = connected.iter().find(|o| o.kind == OutputKind::Internal).cloned() else {
++                    eprintln!("WMOUTPUT hotplug seq={seq}: no panel among the connectors");
++                    return Vec::new();
++                };
++                self.layout.insert(Layout::single(panel, panel_scale))
++            }
++        };
++        let changes = layout.sync(&connected, |info| persisted_scale(&info.id).unwrap_or_else(|| default_scale(info)));
++        if !changes.is_empty() {
++            eprintln!("WMOUTPUT hotplug seq={seq} changes={changes:?} layout: {} (the desktop stays on the panel: no second scanout yet)", layout.describe());
++        }
++        changes
++    }
++}
++
++/// The persisted scale of an external output (`scale-<id>` in the desktop's state directory,
++/// 120ths), when one was chosen; the panel's is `scale` (chonk_shell::scale_select).
++pub fn persisted_scale(id: &str) -> Option<Scale> {
++    if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'x') {
++        return None;
++    }
++    let path = std::path::PathBuf::from(std::env::var_os("XDG_STATE_HOME")?).join("chonkstep").join(format!("scale-{id}"));
++    std::fs::read_to_string(path).ok()?.trim().parse::<u32>().ok().and_then(Scale::from_120)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    fn panel() -> OutputInfo {
++        OutputInfo { name: "eDP-1".into(), kind: OutputKind::Internal, pixels: (2560, 1600), mm: (286, 179), id: "eDP-1".into() }
++    }
++    fn samsung() -> OutputInfo {
++        OutputInfo { name: "DP-1".into(), kind: OutputKind::External, pixels: (3840, 2160), mm: (597, 336), id: "SAM-0f00-597x336".into() }
++    }
++    fn s(v: u32) -> Scale {
++        Scale::from_120(v).unwrap()
++    }
++    #[test]
++    fn default_scales_follow_density_not_the_panel_file() {
++        assert_eq!(default_scale(&panel()).label(), "200%");
++        assert_eq!(default_scale(&samsung()).label(), "150%");
++        let mut big = samsung();
++        big.mm = (698, 393);
++        assert_eq!(default_scale(&big).label(), "125%");
++        let hd = OutputInfo { pixels: (1920, 1080), mm: (531, 299), ..samsung() };
++        assert_eq!(default_scale(&hd).label(), "100%");
++        let unknown = OutputInfo { mm: (0, 0), ..samsung() };
++        assert_eq!(default_scale(&unknown).label(), "150%");
++    }
++    #[test]
++    fn hot_add_makes_the_external_primary_and_puts_the_panel_left_and_unplug_undoes_it() {
++        // the owner's panel scale (150 %, file 180) stays the panel's
++        let mut layout = Layout::single(panel(), s(180));
++        assert_eq!(layout.primary().info.name, "eDP-1");
++        let changes = layout.sync(&[panel(), samsung()], default_scale);
++        assert_eq!(changes, vec![Change::Added("DP-1".into()), Change::Primary("DP-1".into())]);
++        let ext = layout.get("DP-1").unwrap();
++        assert!(ext.primary);
++        assert_eq!((ext.origin, ext.logical, ext.scale.label()), ((0, 0), (2560, 1440), "150%".to_string()));
++        let int = layout.get("eDP-1").unwrap();
++        assert_eq!((int.origin, int.logical, int.scale.v120()), ((-1707, 0), (1707, 1067), 180), "panel left of it, tops aligned, its own scale");
++        assert_eq!(layout.bounds(), Rect { x: -1707, y: 0, w: 4267, h: 1440 });
++        // the same set again: nothing happens
++        assert!(layout.sync(&[panel(), samsung()], default_scale).is_empty());
++        // unplugged: the panel is primary again
++        let changes = layout.sync(&[panel()], default_scale);
++        assert_eq!(changes, vec![Change::Removed("DP-1".into()), Change::Primary("eDP-1".into())]);
++        assert_eq!(layout.primary().origin, (0, 0));
++        // a kernel that lists the panel disconnected for a moment does not remove it
++        assert!(layout.sync(&[], default_scale).is_empty());
++        assert_eq!(layout.outputs().len(), 1);
++        // a mode change of the external is a remove and an add
++        layout.sync(&[panel(), samsung()], |_| s(180));
++        let mut hd = samsung();
++        hd.pixels = (1920, 1080);
++        let changes = layout.sync(&[panel(), hd], default_scale);
++        assert_eq!(changes, vec![Change::Removed("DP-1".into()), Change::Added("DP-1".into())]);
++    }
++    #[test]
++    fn the_pointer_crosses_where_outputs_touch_and_stops_elsewhere() {
++        let mut layout = Layout::single(panel(), s(180));
++        layout.sync(&[panel(), samsung()], default_scale);
++        // from the external's left edge into the panel, at a height both have
++        assert_eq!(layout.move_pointer((2.0, 500.0), (-10.0, 500.0)), (-10.0, 500.0));
++        // below the panel's bottom (1067) there is no panel: it stops at the external's edge
++        assert_eq!(layout.move_pointer((2.0, 1200.0), (-10.0, 1200.0)), (0.0, 1200.0));
++        // off the far right: clamped to the external
++        assert_eq!(layout.move_pointer((2550.0, 10.0), (2600.0, 10.0)), (2559.0, 10.0));
++        // from the panel back into the external
++        assert_eq!(layout.move_pointer((-5.0, 100.0), (3.0, 100.0)), (3.0, 100.0));
++    }
++    #[test]
++    fn windows_of_an_unplugged_output_come_to_the_panel_at_the_same_relative_place() {
++        let ext = Rect { x: 0, y: 0, w: 2560, h: 1440 };
++        let panel = Rect { x: 0, y: 0, w: 1707, h: 1067 };
++        // in the middle: stays in the middle (its centre at the same fraction)
++        let w = Layout::rehome(ext, panel, Rect { x: 1280 - 300, y: 720 - 200, w: 600, h: 400 });
++        assert_eq!(w, Rect { x: 554, y: 334, w: 600, h: 400 });
++        // larger than the panel: shrunk to it, at its top left
++        let w = Layout::rehome(ext, panel, Rect { x: 100, y: 50, w: 2400, h: 1300 });
++        assert_eq!(w, Rect { x: 0, y: 0, w: 1707, h: 1067 });
++        // at the far right edge: kept inside
++        let w = Layout::rehome(ext, panel, Rect { x: 2400, y: 1300, w: 300, h: 200 });
++        assert_eq!((w.x + w.w, w.y + w.h), (1707, 1067));
++        // Spaces: a window on the external's Space 3 lands on the panel's Space 3 (made)
++        let (moved, spaces) = spaces_after_unplug(&[(7, 2), (8, 0)], 1);
++        assert_eq!((moved, spaces), (vec![(7, 2), (8, 0)], 3));
++    }
++    #[test]
++    fn the_watch_follows_a_virtual_second_output_through_plug_and_unplug() {
++        let mut watch = Watch::default();
++        let mut tick = |watch: &mut Watch, seq: Option<u64>, list: Vec<OutputInfo>| {
++            watch.next = std::time::Instant::now();
++            watch.tick(|| seq, || Ok(list), s(180))
++        };
++        assert!(tick(&mut watch, Some(1), vec![panel()]).is_empty(), "the panel alone: nothing changes");
++        assert_eq!(watch.layout().unwrap().primary().info.name, "eDP-1");
++        assert_eq!(tick(&mut watch, Some(2), vec![panel(), samsung()]), vec![Change::Added("DP-1".into()), Change::Primary("DP-1".into())]);
++        assert_eq!(watch.layout().unwrap().get("eDP-1").unwrap().scale.v120(), 180, "the panel keeps the owner's scale");
++        assert!(tick(&mut watch, Some(2), vec![]).is_empty(), "the same counter: not read again");
++        assert_eq!(tick(&mut watch, Some(3), vec![panel()]), vec![Change::Removed("DP-1".into()), Change::Primary("eDP-1".into())]);
++        // a kernel without the counter: said once, then left alone
++        let mut old = Watch::default();
++        assert!(tick(&mut old, None, vec![panel(), samsung()]).is_empty());
++        assert!(old.said_absent && old.layout().is_none());
++    }
++    #[test]
++    fn mirroring_shows_the_primary_picture_on_both() {
++        let mut layout = Layout::single(panel(), s(180));
++        layout.sync(&[panel(), samsung()], default_scale);
++        layout.set_arrangement(Arrangement::Mirrored);
++        assert!(layout.outputs().iter().all(|o| o.origin == (0, 0) && o.logical == (2560, 1440)));
++        layout.set_arrangement(Arrangement::Extended);
++        assert_eq!(layout.get("eDP-1").unwrap().origin, (-1707, 0));
++        // a scale change on the panel moves it
++        assert!(layout.set_scale("eDP-1", s(240)));
++        assert_eq!(layout.get("eDP-1").unwrap().origin, (-1280, 0));
++    }
++}
+diff -ruN '--exclude=.git' '--exclude=target' desk4-002/crates/wm-darwin/src/server.rs desk4-003/crates/wm-darwin/src/server.rs
+--- desk4-002/crates/wm-darwin/src/server.rs	2026-11-14 18:32:44.748091209 -0800
++++ desk4-003/crates/wm-darwin/src/server.rs	2026-11-14 19:00:09.110121787 -0800
+@@ -165,6 +165,8 @@
+     pub gesture: crate::gesture::Gesture,
+     /// Layer-shell surfaces (the dock), see `layers.rs`.
+     pub(crate) layers: Vec<crate::layers::LayerEntry>,
++    /// The launcher strip has been mapped once in this run (layers.rs).
++    pub(crate) launcher_seen: bool,
+     pub(crate) layer_shell: smithay::wayland::shell::wlr_layer::WlrLayerShellState,
+     pub(crate) layer_workarea: Option<wm_core::Rect>,
+     /// The layer surface a held button went down on: it gets the pointer until the release.
+@@ -323,6 +325,7 @@
+             captures: Default::default(),
+             gesture: Default::default(),
+             layers: Vec::new(),
++            launcher_seen: false,
+             layer_shell: smithay::wayland::shell::wlr_layer::WlrLayerShellState::new::<Self>(dh),
+             layer_workarea: None,
+             layer_grab: None,

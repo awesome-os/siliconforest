@@ -1,0 +1,488 @@
+--- a/src/Frameworks/QuartzCore/CALayer.m
++++ b/src/Frameworks/QuartzCore/CALayer.m
+@@ -63,25 +63,30 @@
+    return _context;
+ }
+ 
++// clients change sublayers and contents from their compositor threads while the renderer walks
++// the tree on the main thread, so swaps are locked and readers get their own reference
++static os_unfair_lock treeLock=OS_UNFAIR_LOCK_INIT;
++
++static id lockedSwap(id *slot,id value);
++
+ -(void)_setContext:(CALayerContext *)context {
+    if(_context!=context){
+-    [_context deleteTextureId:_textureId];
+-    [_textureId release];
+-    _textureId=nil;
++    // (TERM10) the renderer gives the layer a texture on the main thread while a client thread moves it between
++    // trees: the name is taken under the tree lock, so neither side releases or keeps the other's
++    NSNumber *old=lockedSwap(&_textureId,nil);
++
++    [_context deleteTextureId:old];
++    [old release];
+    }
+-   
++
+    _context=context;
+-   [_sublayers makeObjectsPerformSelector:@selector(_setContext:) withObject:context];
++   [[self sublayers] makeObjectsPerformSelector:@selector(_setContext:) withObject:context];
+ }
+ 
+ -(CALayer *)superlayer {
+    return _superlayer;
+ }
+ 
+-// clients change sublayers and contents from their compositor threads while the renderer walks
+-// the tree on the main thread, so swaps are locked and readers get their own reference
+-static os_unfair_lock treeLock=OS_UNFAIR_LOCK_INIT;
+-
+ static id lockedSwap(id *slot,id value) {
+    id old;
+ 
+@@ -872,7 +877,20 @@
+ }
+ 
+ -(NSNumber *)_textureId {
+-   return _textureId;
++   return lockedRead(&_textureId);
++}
++
++// (TERM10) the renderer's name for a layer it meets without one (the layer joined the tree after the pass that names
++// textures): set only if the layer still has none, the name in place returned
++-(NSNumber *)_textureIdSettingIfNone:(NSNumber *)value {
++   NSNumber *result;
++
++   os_unfair_lock_lock(&treeLock);
++   if(_textureId==nil)
++    _textureId=[value copy];
++   result=[_textureId retain];
++   os_unfair_lock_unlock(&treeLock);
++   return [result autorelease];
+ }
+ 
+ -(uint32_t)_contentsSeed {
+@@ -880,9 +898,7 @@
+ }
+ 
+ -(void)_setTextureId:(NSNumber *)value {
+-   value=[value copy];
+-   [_textureId release];
+-   _textureId=value;
++   [lockedSwap(&_textureId,[value copy]) release];
+ }
+ 
+ @end
+--- a/src/Frameworks/QuartzCore/CALayerContext.m
++++ b/src/Frameworks/QuartzCore/CALayerContext.m
+@@ -53,6 +53,13 @@
+  return YES;
+ }
+ 
++// (TERM10) SF_CA_OLD=1: the renderer's texture naming and the render flag as before 0157, for A/B
++static int sfcaOld(void){
++ static int old=-1;
++ if(old<0)old=getenv("SF_CA_OLD")!=NULL;
++ return old;
++}
++
+ // every live context, so a committed transaction reaches them all: an app can redraw an
+ // IOSurface it already set as contents and only commit, which changes no layer property
+ #define MAX_LIVE_CONTEXTS 64
+@@ -295,16 +302,31 @@
+ }
+ 
+ // coalesced so a burst of property changes costs one display
++// (TERM10) the flag is set by whichever thread changed the tree and cleared by the main thread before it reads the
++// tree, both as full barriers: a change the main thread's render may have missed always schedules another one. As a
++// plain BOOL, a client thread's change could see the flag still set while the main thread, having cleared it, read
++// the tree from before the change: that last change was never drawn (SF_CA_OLD=1 keeps the old way, for A/B)
+ -(void)_layerTreeChanged {
+    [self _sffxMarkMutation];
+-   if(_renderScheduled || _delegate==nil)
++   if(_delegate==nil)
++    return;
++   if(sfcaOld()){
++    if(_renderScheduled)
++     return;
++    _renderScheduled=YES;
++   }
++   else if(__atomic_exchange_n(&_renderScheduled,YES,__ATOMIC_SEQ_CST))
+     return;
+-   _renderScheduled=YES;
+    [self retain];
+    // runs inside a run loop wait, so it drains its own pool (a frame's contents and images)
+    dispatch_async(dispatch_get_main_queue(),^{
+     @autoreleasepool {
+-     _renderScheduled=NO;
++     if(sfcaOld())
++      _renderScheduled=NO;
++     else {
++      __atomic_store_n(&_renderScheduled,NO,__ATOMIC_SEQ_CST);
++      __atomic_thread_fence(__ATOMIC_SEQ_CST);
++     }
+      if([_delegate respondsToSelector:@selector(layerContextNeedsDisplay:)])
+       [_delegate performSelector:@selector(layerContextNeedsDisplay:) withObject:self];
+     }
+--- a/src/Frameworks/QuartzCore/CARenderer.m
++++ b/src/Frameworks/QuartzCore/CARenderer.m
+@@ -14,12 +14,15 @@
+ #include <stdlib.h>
+ #include <math.h>
+ #include <pthread.h>
++#include <stdio.h>
++#include <unistd.h>
+ 
+ @interface CALayer(private)
+ -(void)_setContext:(CALayerContext *)context;
+ -(void)_setTextureId:(NSNumber *)value;
+ -(NSNumber *)_textureId;
+ -(uint32_t)_contentsSeed;
++-(NSNumber *)_textureIdSettingIfNone:(NSNumber *)value;
+ @end
+ 
+ @implementation CARenderer
+@@ -320,6 +323,7 @@
+    void *(*planeBase)(CFTypeRef, size_t);
+    size_t (*planeWidth)(CFTypeRef, size_t), (*planeHeight)(CFTypeRef, size_t), (*planeRowBytes)(CFTypeRef, size_t);
+    CFTypeRef (*copyValue)(CFTypeRef, CFStringRef);
++   uint32_t (*surfaceID)(CFTypeRef);
+ } surfaceAPI;
+ 
+ static void loadSurfaceAPI(void) {
+@@ -342,6 +346,7 @@
+    surfaceAPI.planeHeight=dlsym(lib,"IOSurfaceGetHeightOfPlane");
+    surfaceAPI.planeRowBytes=dlsym(lib,"IOSurfaceGetBytesPerRowOfPlane");
+    surfaceAPI.copyValue=dlsym(lib,"IOSurfaceCopyValue");
++   surfaceAPI.surfaceID=dlsym(lib,"IOSurfaceGetID");
+ }
+ 
+ // contents may be an IOSurfaceRef, a CF instance, which only CF's own class can answer CFGetTypeID for
+@@ -883,6 +888,57 @@
+    glPopMatrix();
+ }
+ 
++// (TERM10) SF_CA_OLD=1: a layer met without a texture name binds none (as before 0157), for A/B
++static int sfcaOld(void){
++   static int old=-1;
++
++   if(old<0)
++    old=getenv("SF_CA_OLD")!=NULL;
++   return old;
++}
++
++// (TERM10) SF_CA_DIAG=1: what each frame drew, on standard error: layers met without a texture name, and layers whose
++// texture holds other contents than the layer's own (what they show is not theirs). SF_CA_DUMP_DIR=<dir>: when
++// <dir>/dump exists, the next frame writes <dir>/tree-<pid>-<frame>.txt (every layer as drawn: window pixel box,
++// bottom-up, contents and its surface ID, texture and what that texture holds) and removes <dir>/dump
++static struct {
++   int on;
++   const char *dumpDir;
++   unsigned long frame;
++   unsigned layers,withContents,unnamed,mismatched;
++   FILE *dump;
++   NSMapTable *held,*heldID;
++} sfcaDiag={ -1 };
++
++static void sfcaDiagLoad(void){
++   if(sfcaDiag.on>=0)
++    return;
++   sfcaDiag.dumpDir=getenv("SF_CA_DUMP_DIR");
++   sfcaDiag.on=getenv("SF_CA_DIAG")!=NULL || sfcaDiag.dumpDir!=NULL;
++   if(sfcaDiag.on)
++    sfcaDiag.held=NSCreateMapTable(NSNonOwnedPointerMapKeyCallBacks,NSNonOwnedPointerMapValueCallBacks,0),
++    sfcaDiag.heldID=NSCreateMapTable(NSNonOwnedPointerMapKeyCallBacks,NSNonOwnedPointerMapValueCallBacks,0);
++}
++
++static uint32_t sfcaSurfaceID(id contents){
++   return (contents!=nil && contentsIsSurface(contents) && surfaceAPI.surfaceID!=NULL) ? surfaceAPI.surfaceID((CFTypeRef)contents) : 0;
++}
++
++// the texture now bound holds these contents (kept as a pointer to compare, never followed, and the surface's ID)
++static void sfcaNoteHeld(id contents){
++   GLint bound=0;
++
++   glGetIntegerv(GL_TEXTURE_BINDING_2D,&bound);
++   NSMapInsert(sfcaDiag.held,(void *)(uintptr_t)bound,(void *)contents);
++   NSMapInsert(sfcaDiag.heldID,(void *)(uintptr_t)bound,(void *)(uintptr_t)sfcaSurfaceID(contents));
++}
++
++static uint32_t sfcaHeldID(GLuint texture){
++   return (uint32_t)(uintptr_t)NSMapGet(sfcaDiag.heldID,(void *)(uintptr_t)texture);
++}
++
++static int sfcaDepth;
++
+ -(void)_renderLayer:(CALayer *)layer z:(float)z currentTime:(CFTimeInterval)currentTime {
+    if(layer.isHidden)
+     return;
+@@ -892,6 +948,22 @@
+    GLuint    texture=[textureId unsignedIntValue];
+    GLboolean loadPixelData=GL_FALSE;
+    
++   // (TERM10) a layer that joined the tree after the pass that names textures (a client thread added it while this
++   // frame was being drawn) gets its own name here. It used to bind none, so its contents went into the texture of
++   // the layer drawn before it, which showed them from then on, until its own contents changed (FX-011/012: foreign
++   // or stale tiles over Firefox's chrome and page)
++   if(contents!=nil && texture==0){
++    if(sfcaDiag.on>0)
++     sfcaDiag.unnamed++;
++    if(!sfcaOld()){
++     GLuint fresh=0;
++
++     glGenTextures(1,&fresh);
++     texture=[[layer _textureIdSettingIfNone:[NSNumber numberWithUnsignedInt:fresh]] unsignedIntValue];
++     if(texture!=fresh)
++      glDeleteTextures(1,&fresh);
++    }
++   }
+    if(contents!=nil){
+     // a generated name is no texture until first bound, so bind before asking or uploading
+     if(texture==0 || glIsTexture(texture)==GL_FALSE)
+@@ -913,6 +985,8 @@
+         else if(!bindDrawableSurface((CFTypeRef)contents))
+             CATexImage2DSurface((CFTypeRef)contents,texture);
+         noteTexture(texture,contents,seed);
++        if(sfcaDiag.on>0)
++         sfcaNoteHeld(contents);
+ 
+         GLint minFilter=interpolationFromName(layer.minificationFilter);
+         GLint magFilter=interpolationFromName(layer.magnificationFilter);
+@@ -1023,6 +1097,32 @@
+    if(clipping)
+     stencil=pushClip(width,height,radius,corners,z,savedScissor);
+ 
++   if(sfcaDiag.on>0){
++    id held=contents!=nil && texture!=0 ? (id)NSMapGet(sfcaDiag.held,(void *)(uintptr_t)texture) : nil;
++    BOOL wrong=contents!=nil && held!=contents;
++
++    sfcaDiag.layers++;
++    if(contents!=nil)
++     sfcaDiag.withContents++;
++    if(wrong && sfcaDiag.mismatched++<4){
++     GLint box[4];
++
++     windowRect(width,height,box);
++     fprintf(stderr,"PD-CA-DIAG frame=%lu layer=%p texture=%u box=%d,%d,%dx%d shows surface %u, not its own %u\n",sfcaDiag.frame,layer,
++             texture,box[0],box[1],box[2],box[3],sfcaHeldID(texture),sfcaSurfaceID(contents));
++    }
++    if(sfcaDiag.dump!=NULL){
++     GLint box[4];
++
++     windowRect(width,height,box);
++     fprintf(sfcaDiag.dump,"%*s%p %s box=%d,%d,%dx%d pos=%g,%g bounds=%g,%g,%gx%g anchor=%g,%g masks=%d hidden=%d opacity=%g crect=%g,%g,%gx%g contents=%p surface=%u texture=%u holds=%u%s\n",
++             2*sfcaDepth,"",layer,object_getClassName(layer),box[0],box[1],box[2],box[3],position.x,position.y,bounds.origin.x,bounds.origin.y,
++             bounds.size.width,bounds.size.height,anchorPoint.x,anchorPoint.y,layer.masksToBounds,layer.isHidden,opacity,
++             layer.contentsRect.origin.x,layer.contentsRect.origin.y,layer.contentsRect.size.width,layer.contentsRect.size.height,
++             contents,sfcaSurfaceID(contents),texture,sfcaHeldID(texture),wrong?" WRONG":"");
++    }
++   }
++
+    if(contents!=nil){
+     BOOL yuv=surface && kindIsYUV(surfaceKind((CFTypeRef)contents));
+ 
+@@ -1053,8 +1153,10 @@
+     glTranslatef(0,height,0);
+     glScalef(1,-1,1);
+    }
++   sfcaDepth++;
+    for(CALayer *child in layer.sublayers)
+     [self _renderLayer:child z:z+1 currentTime:currentTime];
++   sfcaDepth--;
+    if(layer.isGeometryFlipped){
+     flipDepth--;
+     glPopMatrix();
+@@ -1112,7 +1214,31 @@
+    glAlphaFunc ( GL_GREATER, 0 ) ;
+    //glEnable ( GL_ALPHA_TEST ) ;
+   
++   sfcaDiagLoad();
++   if(sfcaDiag.on>0){
++    sfcaDiag.frame++;
++    sfcaDiag.layers=sfcaDiag.withContents=sfcaDiag.unnamed=sfcaDiag.mismatched=0;
++    if(sfcaDiag.dumpDir!=NULL){
++     char path[1024];
++
++     snprintf(path,sizeof(path),"%s/dump",sfcaDiag.dumpDir);
++     if(unlink(path)==0){
++      snprintf(path,sizeof(path),"%s/tree-%d-%lu.txt",sfcaDiag.dumpDir,(int)getpid(),sfcaDiag.frame);
++      sfcaDiag.dump=fopen(path,"w");
++     }
++    }
++   }
++   sfcaDepth=0;
+    [self _renderLayer:_rootLayer z:0 currentTime:CACurrentMediaTime()];
++   if(sfcaDiag.on>0){
++    if(sfcaDiag.unnamed>0 || sfcaDiag.mismatched>0 || sfcaDiag.frame%300==1)
++     fprintf(stderr,"PD-CA-DIAG frame=%lu layers=%u with-contents=%u unnamed=%u mismatched=%u%s\n",sfcaDiag.frame,sfcaDiag.layers,
++             sfcaDiag.withContents,sfcaDiag.unnamed,sfcaDiag.mismatched,sfcaOld()?" (old naming)":"");
++    if(sfcaDiag.dump!=NULL){
++     fclose(sfcaDiag.dump);
++     sfcaDiag.dump=NULL;
++    }
++   }
+ 
+    glFlush();
+ }
+--- a/src/Frameworks/QuartzCore/CATransaction.m
++++ b/src/Frameworks/QuartzCore/CATransaction.m
+@@ -1,5 +1,6 @@
+ #import <QuartzCore/CATransaction.h>
+ #include <dispatch/dispatch.h>
++#include <pthread.h>
+ #import <QuartzCore/CALayerContext.h>
+ #import <Foundation/NSString.h>
+ #import <Foundation/NSNumber.h>
+@@ -12,6 +13,10 @@
+ NSString * const kCATransactionAnimationTimingFunction=@"kCATransactionAnimationTimingFunction";
+ NSString * const kCATransactionCompletionBlock=@"kCATransactionCompletionBlock";
+ 
++@interface CATransaction(implicit)
+++(void)_commitImplicit;
++@end
++
+ @implementation CATransaction
+ 
+ static NSMutableArray *transactionStack(){
+@@ -34,21 +39,38 @@
+    return result;
+ }
+ 
++// (TERM10) an implicit transaction belongs to the thread that opened it. On the main thread the run loop commits it
++// (the block below takes that very group off the main thread's stack, if it is still there); on another thread it
++// is committed with the next explicit transaction there, as CoreAnimation does for threads without a run loop. Its
++// commit used to run on the main thread and take the main thread's transaction instead, and the other thread's
++// stack never emptied
+ static CATransactionGroup *createImplicitTransactionGroupIfNeeded(){
+    CATransactionGroup *check=currentTransactionGroup();
+    
+    if(check==nil){
+-    check=[[CATransactionGroup alloc] init];
+-   
++    check=[[CATransactionGroup alloc] initWithOuterGroup:nil];
++    [check setImplicit:YES];
+     [transactionStack() addObject:check];
+-    dispatch_async(dispatch_get_main_queue(), ^{
+-     [CATransaction commit];
+-    });
++    [check release];
++    if(pthread_main_np()){
++     [check retain];
++     dispatch_async(dispatch_get_main_queue(), ^{
++      NSMutableArray *stack=transactionStack();
++
++      if([stack count]>0 && [stack objectAtIndex:0]==check)
++       [CATransaction _commitImplicit];
++      [check release];
++     });
++    }
+    }
+    
+    return check;
+ }
+ 
++static void transactionsCommitted(void){
++   [NSClassFromString(@"CALayerContext") performSelector:@selector(_transactionCommitted)];
++}
++
+ 
+ +(BOOL)disableActions {
+    return [[self valueForKey:kCATransactionDisableActions] boolValue];
+@@ -95,7 +117,7 @@
+ }
+ 
+ +(void)begin {
+-   CATransactionGroup *group=[[CATransactionGroup alloc] init];
++   CATransactionGroup *group=[[CATransactionGroup alloc] initWithOuterGroup:currentTransactionGroup()];
+    
+    [transactionStack() addObject:group];
+    [group release];
+@@ -103,14 +125,19 @@
+ 
+ // nothing animates for long here, so the completion block runs once the changes are in
+ +(void)commit {
+-   CATransactionGroup *group=[[transactionStack() lastObject] retain];
++   NSMutableArray *stack=transactionStack();
++   CATransactionGroup *group=[[stack lastObject] retain];
+    void (^completion)(void)=[[group valueForKey:kCATransactionCompletionBlock] retain];
+ 
+-   [transactionStack() removeLastObject];
++   if(group!=nil)
++    [stack removeLastObject];
+    [group release];
++   // (TERM10) an implicit transaction left under the outermost explicit one is committed with it
++   while([stack count]>0 && [[stack lastObject] isImplicit] && !pthread_main_np())
++    [stack removeLastObject];
+    // the outermost commit is when the changes go to whoever presents them
+-   if([transactionStack() count]==0)
+-    [NSClassFromString(@"CALayerContext") performSelector:@selector(_transactionCommitted)];
++   if([stack count]==0)
++    transactionsCommitted();
+    if(completion!=nil){
+     dispatch_async(dispatch_get_main_queue(),^{
+      completion();
+@@ -119,6 +146,15 @@
+    }
+ }
+ 
+++(void)_commitImplicit {
++   NSMutableArray *stack=transactionStack();
++
++   while([stack count]>0 && [[stack lastObject] isImplicit])
++    [stack removeLastObject];
++   if([stack count]==0)
++    transactionsCommitted();
++}
++
+ +(void)flush {
+ }
+ 
+--- a/src/Frameworks/QuartzCore/CATransactionGroup.h
++++ b/src/Frameworks/QuartzCore/CATransactionGroup.h
+@@ -4,8 +4,14 @@
+ 
+ @interface CATransactionGroup : NSObject {
+     NSMutableDictionary *_values;
++    BOOL _implicit;
+ }
+ 
++// (TERM10) a nested transaction starts with the values of the one around it, as on macOS
++- initWithOuterGroup:(CATransactionGroup *)outer;
++- (BOOL)isImplicit;
++- (void)setImplicit:(BOOL)value;
++
+ - valueForKey:(NSString *)key;
+ - (void)setValue:value forKey:(NSString *)key;
+ 
+--- a/src/Frameworks/QuartzCore/CATransactionGroup.m
++++ b/src/Frameworks/QuartzCore/CATransactionGroup.m
+@@ -14,6 +14,29 @@
+    return self;
+ }
+ 
++-initWithOuterGroup:(CATransactionGroup *)outer {
++   [self init];
++   if(outer!=nil){
++    [_values addEntriesFromDictionary:outer->_values];
++    // the completion block belongs to the transaction that set it
++    [_values removeObjectForKey:kCATransactionCompletionBlock];
++   }
++   return self;
++}
++
++-(void)dealloc {
++   [_values release];
++   [super dealloc];
++}
++
++-(BOOL)isImplicit {
++   return _implicit;
++}
++
++-(void)setImplicit:(BOOL)value {
++   _implicit=value;
++}
++
+ -valueForKey:(NSString *)key {
+    return [_values objectForKey:key];
+ }

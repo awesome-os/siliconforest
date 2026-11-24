@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_DIFF_REVIEW_NO_HARDWARE",
+  "diff": "integrations/puredarwin/chonkstep-darwin/stage_ramdisk.py c2d2557e -> 55329c027a2b381fd91a6eb293e220c180833f7b185cfbebadf188ac2e57606f. Diff base: my reconstruction of c2d2557e from the earlier full read, which hashes exactly to c2d2557e.",
+  "verdict": "APPROVE S1 and S2 as implemented. The diff contains only the declared changes. Root's positive and negative evidence shows each new refusal working, and the implicit-replacement negative is a case dump-back alone could not have caught. Still no new libSystem is approved; 8ff49e0c needs its own review, a clean stage and a runtime run.",
+  "verified": [
+    "S1: before dumping old bytes, each replacement target is debugfs-stat'ed and must be 'Type: regular' with parsable Mode, User/Group and Links == 1; otherwise it is refused before any mutation. The old mode, uid and gid are recorded as replaces_metadata and reapplied after write: mode as 0100000|mode, plus uid and gid. The recorded executable flag is derived from the old mode, not the caller's hint. New (non-replacement) files keep the mode-from-hint with explicit uid/gid 0.",
+    "S2: run() flushes the Python log before every child. The batch output offset is taken after a flush (tell() reaches the raw lseek). After debugfs the batch slice is parsed: the 'debugfs: ' echoes must equal the command list exactly and in order, 'Allocated inode: N' must appear exactly once per written file, and any other non-blank line (except the 'debugfs ' version header) refuses with the failure log preserved. A 'debugfs:'-prefixed error line is also caught, because it would break the exact echo sequence. stderr is merged, so com_err lines such as 'write: ...' are seen.",
+    "Unchanged: baseline hash gate, private copy, old-bytes hash check before rm, the parent-directory stat fix, dump-back sha256, final e2fsck -fn, exclusive os.link publication, 0444 image.",
+    "Positive (same-runtime-metadata-guard): the image sha bfda1730 matches its record. The log shows rm, write (Allocated inode 8039), set mode 0100755, uid 0, gid 0, dump, then a clean e2fsck (9694 inodes unchanged). debugfs stat on the published image: regular, 0755, uid/gid 0, Links 1, 4202062 bytes. The record holds replaces_metadata {mode 493, uid 0, gid 0, nlink 1}.",
+    "Negatives (root's report): symlink target refused (exit 1, not published); hard-link fixture with nlink 2 refused before mutation; implicit replacement (an existing destination without replaces_sha256) refused. That log shows 'write: Ext2 file already exists' caught by S2, where dump-back would have matched because the bytes were identical. Wrong old hash refused, as before."
+  ],
+  "notes": [
+    {"id": "N1", "severity": "nit", "text": "batch_lines decodes the slice as strict UTF-8. Non-UTF-8 debugfs output would raise UnicodeDecodeError before preserve_failure(), so it still fails closed but without the failure log. Suggest decode('utf-8', 'replace')."},
+    {"id": "N2", "severity": "nit", "text": "The header exemption accepts any line starting with 'debugfs ' (space). Matching the exact version banner (for example ^debugfs \\d+\\.\\d+(\\.\\d+)? \\() would remove the only remaining unchecked prefix. In practice debugfs errors are prefixed with the command name or 'debugfs:', so both are caught today."}
+  ],
+  "not_claimed": ["any new libSystem", "runtime"],
+  "scope": "Read-only diff and evidence review; debugfs stat reads only. No builds, hardware or image writes."
+}

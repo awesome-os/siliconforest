@@ -1,0 +1,204 @@
+diff --git a/crates/wm-darwin/src/pacing.rs b/crates/wm-darwin/src/pacing.rs
+index ec206ad..6ef5d2c 100644
+--- a/crates/wm-darwin/src/pacing.rs
++++ b/crates/wm-darwin/src/pacing.rs
+@@ -42,6 +42,14 @@ struct Window {
+     same: u64,
+     unhashed: u64,
+     last_hash: Option<u64>,
++    /// DESK9 (002): the newest commit's content differs from the one before it (`framehash`), for the pending and
++    /// the drawn commit; replaced commits that were distinct (a frame really lost, not a repeat); commits whose
++    /// content is one of the last 8 but not the one before (two pictures taking turns: a stale buffer shown again)
++    pending_distinct: Option<bool>,
++    drawn_distinct: Option<bool>,
++    replaced_distinct: u64,
++    revisits: u64,
++    recent: std::collections::VecDeque<u64>,
+     /// time in the desk's commit handler for this window's buffer commits (copies, imports, bookkeeping)
+     handler: Series,
+ }
+@@ -81,7 +89,11 @@ impl PacingTrace {
+         }
+         if w.pending.replace(now).is_some() {
+             w.replaced += 1;
++            if w.pending_distinct == Some(true) {
++                w.replaced_distinct += 1;
++            }
+         }
++        w.pending_distinct = None;
+         if let Some(flip) = last_flip {
+             let ms = now.saturating_duration_since(flip).as_millis().min(17) as usize;
+             w.phase[ms] += 1;
+@@ -110,10 +122,21 @@ impl PacingTrace {
+         let w = self.windows.entry(id).or_default();
+         match hash {
+             None => w.unhashed += 1,
+-            Some(h) if w.last_hash == Some(h) => w.same += 1,
++            Some(h) if w.last_hash == Some(h) => {
++                w.same += 1;
++                w.pending_distinct = Some(false);
++            }
+             Some(h) => {
+                 w.distinct += 1;
+                 w.last_hash = Some(h);
++                w.pending_distinct = Some(true);
++                if w.recent.contains(&h) {
++                    w.revisits += 1;
++                }
++                if w.recent.len() == 8 {
++                    w.recent.pop_front();
++                }
++                w.recent.push_back(h);
+             }
+         }
+     }
+@@ -153,7 +176,11 @@ impl PacingTrace {
+                 // a buffer drawn before but not flipped yet is replaced by this one on the screen
+                 if w.drawn.replace((at, seq)).is_some() {
+                     w.replaced += 1;
++                    if w.drawn_distinct == Some(true) {
++                        w.replaced_distinct += 1;
++                    }
+                 }
++                w.drawn_distinct = w.pending_distinct.take();
+             }
+         }
+     }
+@@ -198,7 +225,7 @@ impl PacingTrace {
+             let iv = w.intervals.take_sorted();
+             let cb = w.callback_to_commit.take_sorted();
+             let handler = w.handler.take_sorted();
+-            let hashes = if w.distinct + w.same + w.unhashed > 0 { format!(" | content: distinct={} same_as_before={} unread={}", w.distinct, w.same, w.unhashed) } else { String::new() };
++            let hashes = if w.distinct + w.same + w.unhashed > 0 { format!(" | content: distinct={} same_as_before={} unread={} replaced_distinct={} revisits={}", w.distinct, w.same, w.unhashed, w.replaced_distinct, w.revisits) } else { String::new() };
+             lines.push(format!(
+                 "WMPACING over_ms={window_ms} window={id} app={:?} commits={} shown={} replaced_before_shown={} fifo_held={} fifo_timeouts={} unchanged_commits={} | {} | {} | {} | {} | commits by ms after the last flip {:?} | frames held for a fence={fence}{hashes}",
+                 w.app_id, w.commits, w.shown, w.replaced, w.fifo_held, w.fifo_timeouts, w.unchanged, text95(&ctf, "commit->flip"), window_text(&iv, "commit interval"), text95(&cb, "callback->commit"), text95(&handler, "commit handler"), w.phase
+@@ -212,6 +239,8 @@ impl PacingTrace {
+             w.distinct = 0;
+             w.same = 0;
+             w.unhashed = 0;
++            w.replaced_distinct = 0;
++            w.revisits = 0;
+             w.phase = [0; 18];
+         }
+         if !lines.is_empty() {
+@@ -271,4 +300,35 @@ mod tests {
+         assert!(lines.iter().any(|l| l.contains("flip stamps:")), "{lines:?}");
+         assert!(lines.last().unwrap().starts_with("WMCOST "), "{lines:?}");
+     }
++    #[test]
++    fn content_hashes_tell_repeats_lost_frames_and_pictures_taking_turns() {
++        let mut p = PacingTrace::default();
++        let frame = |p: &mut PacingTrace| {
++            p.drawn();
++            p.frame_committed();
++            p.flipped(Instant::now());
++        };
++        // A, then A again (a repeat) replacing it before a frame: nothing distinct lost
++        p.commit(1, Some("x"));
++        p.content(1, Some(10));
++        frame(&mut p);
++        p.commit(1, None);
++        p.content(1, Some(10));
++        p.commit(1, None);
++        p.content(1, Some(11)); // B replaces the repeat
++        frame(&mut p);
++        // C replaced by D before a frame: C is lost
++        p.commit(1, None);
++        p.content(1, Some(12));
++        p.commit(1, None);
++        p.content(1, Some(13));
++        frame(&mut p);
++        // B again (a picture shown before, not the one before): a revisit
++        p.commit(1, None);
++        p.content(1, Some(11));
++        frame(&mut p);
++        let lines = p.take_lines();
++        let line = lines.iter().find(|l| l.contains("window=1")).unwrap();
++        assert!(line.contains("content: distinct=5 same_as_before=1 unread=0 replaced_distinct=1 revisits=1"), "{line}");
++    }
+ }
+diff --git a/crates/wm-darwin/src/policy.rs b/crates/wm-darwin/src/policy.rs
+index c00bbe8..46d48c7 100644
+--- a/crates/wm-darwin/src/policy.rs
++++ b/crates/wm-darwin/src/policy.rs
+@@ -14,6 +14,7 @@
+ //! | `restore` | on | applications the desk opened that had windows when the compositor before this one ended are opened again (`session_restore.rs`) |
+ //! | `skip_unchanged` | off (desk9-001) | DESK9: a commit that brings nothing new (no buffer, or the same buffer without damage) repaints nothing; its frame callbacks go out at the next refresh |
+ //! | `partial_repaint` | off (desk9-001) | DESK9: the GPU renderer repaints only what changed since the buffer it draws into was last drawn (scissor), not the whole screen |
++//! | `late_latch` | on | frames are made as late as they can be and still make their blank (DESK5's late latching); off: a frame is drawn as soon as something changed and the display is free, and committed at once (DESK9: Firefox's commits came 10-11 ms after a flip and waited a whole refresh more for the latched frame) |
+ //! | `framehash` | off | DESK9: every committed buffer's content is hashed (sampled) to count distinct frames (`WMPACING ... content:`); a test's switch, it reads client memory |
+ use std::path::PathBuf;
+ use std::time::{Duration, Instant, SystemTime};
+@@ -29,10 +30,11 @@ pub struct Switches {
+     pub skip_unchanged: bool,
+     pub partial_repaint: bool,
+     pub framehash: bool,
++    pub late_latch: bool,
+ }
+ 
+ impl Switches {
+-    const KEYS: [&'static str; 9] = ["fifo", "fifo_shm", "client_wake", "flip_time_callbacks", "flip_stamps", "restore", "skip_unchanged", "partial_repaint", "framehash"];
++    const KEYS: [&'static str; 10] = ["fifo", "fifo_shm", "client_wake", "flip_time_callbacks", "flip_stamps", "restore", "skip_unchanged", "partial_repaint", "framehash", "late_latch"];
+     fn defaults() -> Self {
+         let env = |key: &str| std::env::var(format!("CHONKSTEP_DARWIN_{}", key.to_ascii_uppercase())).ok().and_then(|v| parse_bool(&v));
+         Self {
+@@ -45,6 +47,7 @@ impl Switches {
+             skip_unchanged: env("skip_unchanged").unwrap_or(false),
+             partial_repaint: env("partial_repaint").unwrap_or(false),
+             framehash: env("framehash").unwrap_or(false),
++            late_latch: env("late_latch").unwrap_or(true),
+         }
+     }
+     fn slot(&mut self, key: &str) -> Option<&mut bool> {
+@@ -58,6 +61,7 @@ impl Switches {
+             "skip_unchanged" => &mut self.skip_unchanged,
+             "partial_repaint" => &mut self.partial_repaint,
+             "framehash" => &mut self.framehash,
++            "late_latch" => &mut self.late_latch,
+             _ => return None,
+         })
+     }
+@@ -179,7 +183,7 @@ mod tests {
+     use super::*;
+     #[test]
+     fn the_policy_file_changes_switches_without_a_relaunch_and_a_test_pin_wins_until_released() {
+-        let base = Switches { fifo: true, fifo_shm: true, client_wake: true, flip_time_callbacks: true, flip_stamps: true, restore: true, skip_unchanged: true, partial_repaint: true, framehash: false };
++        let base = Switches { fifo: true, fifo_shm: true, client_wake: true, flip_time_callbacks: true, flip_stamps: true, restore: true, skip_unchanged: true, partial_repaint: true, framehash: false, late_latch: true };
+         let (s, refused) = Switches::parse("# comment\nfifo=off\nrestore = 0\nbogus=1\nclient_wake=maybe\n", base);
+         assert!(!s.fifo && !s.restore && s.client_wake && s.flip_time_callbacks);
+         assert_eq!(refused, vec!["bogus=1".to_string(), "client_wake=maybe".to_string()]);
+diff --git a/crates/wm-darwin/src/server.rs b/crates/wm-darwin/src/server.rs
+index ed8de80..83d16a4 100644
+--- a/crates/wm-darwin/src/server.rs
++++ b/crates/wm-darwin/src/server.rs
+@@ -180,6 +180,9 @@ pub struct Server {
+     last_flip: Option<(std::time::Instant, u32)>,
+     /// DESK9 `framehash`: client dma-bufs mapped for reading (import id -> address, length), until released.
+     frame_maps: HashMap<u64, (usize, usize)>,
++    /// DESK9: the policy's `late_latch` as last applied (a change of the policy sets the pacer; the test
++    /// instrument's `latch` sets it directly and is not undone until the policy itself changes).
++    late_latch_applied: Option<bool>,
+     dmabuf: DmabufState,
+     dmabuf_global: Option<DmabufGlobal>,
+     /// wl_buffer -> the texture the renderer made of its dma-buf.
+@@ -418,6 +421,7 @@ impl Server {
+             callback_only_due: None,
+             last_flip: None,
+             frame_maps: HashMap::new(),
++            late_latch_applied: None,
+             dmabuf: DmabufState::new(),
+             dmabuf_global: None,
+             external_by_buffer: HashMap::new(),
+@@ -781,6 +785,11 @@ impl Server {
+             self.release_unchanged_callbacks(time_ms);
+         }
+         self.renderer.set_partial_repaint(self.policy.now.partial_repaint);
++        let latch = self.policy.now.late_latch;
++        if self.late_latch_applied != Some(latch) && (self.late_latch_applied.is_some() || !latch) {
++            self.set_frame_pacing(latch);
++        }
++        self.late_latch_applied = Some(latch);
+         let now = std::time::Instant::now();
+         // A frame that is ready (staged, or only the pointer's plane moved) is committed at the
+         // last safe moment before its blank, with the pointer where the newest input put it.

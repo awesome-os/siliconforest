@@ -1,0 +1,352 @@
+diff -ruN a/src/Libraries/libSystem/libc/CMakeLists.txt b/src/Libraries/libSystem/libc/CMakeLists.txt
+--- a/src/Libraries/libSystem/libc/CMakeLists.txt	2026-11-11 21:02:44.699838050 -0800
++++ b/src/Libraries/libSystem/libc/CMakeLists.txt	2026-11-11 21:04:09.766752877 -0800
+@@ -263,6 +263,11 @@
+     stdio/FreeBSD/setbuf.c       # _setbuf (calls setvbuf)
+     stdio/FreeBSD/setbuffer.c    # _setbuffer / _setlinebuf (calls setvbuf)
+     stdio/FreeBSD/setvbuf.c      # _setvbuf
++    stdio/FreeBSD/tempnam.c      # _tempnam (gcc, llvm)
++    stdlib/FreeBSD/strtonum.c    # _strtonum (tmux)
++    stdtime/FreeBSD/ftime.c      # _ftime
++    gen/getttyent.c              # _getttynam / _getttyent (ncurses, tmux, zsh)
++    compat-43/sigcompat.c        # _sigblock / _sigsetmask / _sigvec
+     string/FreeBSD/rindex.c      # _rindex
+     stdtime/FreeBSD/localtime.c  # _localtime / _mktime / _tzset (tzfile reader)
+     stdtime/FreeBSD/strftime.c   # _strftime
+diff -ruN a/src/Libraries/libSystem/libc/libm/openlibm/src/sf_arm64.c b/src/Libraries/libSystem/libc/libm/openlibm/src/sf_arm64.c
+--- a/src/Libraries/libSystem/libc/libm/openlibm/src/sf_arm64.c	2026-11-11 20:56:27.743467080 -0800
++++ b/src/Libraries/libSystem/libc/libm/openlibm/src/sf_arm64.c	2026-11-11 21:06:16.396932405 -0800
+@@ -1,22 +1,71 @@
+ #include <stdint.h>
+ 
+-/* ARM64 has a 32-bit FPSR and uses IEEE double for C long double. */
++/*
++ * arm64 pieces of libm that openlibm does not build here.
++ *
++ * 1. <fenv.h> with the layout and values of the macOS arm64 ABI, which is what
++ *    every program compiled against the macOS SDK passes in:
++ *        fenv_t   { uint64 fpsr; uint64 fpcr; }        (16 bytes)
++ *        fexcept_t  uint16
++ *        FE_INVALID 1, FE_DIVBYZERO 2, FE_OVERFLOW 4, FE_UNDERFLOW 8,
++ *        FE_INEXACT 0x10, FE_FLT_DENORMAL 0x80          (the FPSR bits)
++ *        FE_TONEAREST 0, FE_UPWARD 0x400000, FE_DOWNWARD 0x800000,
++ *        FE_TOWARDZERO 0xC00000                         (FPCR.RMode in place)
++ *        FE_DFL_ENV  &_FE_DFL_ENV
++ *    The two functions that stood here before stored and loaded 4 bytes of
++ *    FPSR only; the rounding mode in FPCR was neither saved nor restored.
++ *
++ * 2. The long double entry points. On arm64 long double is IEEE double, so
++ *    each is its double counterpart; a caller built against the macOS SDK
++ *    passes and receives the same 64-bit values in the same registers.
++ */
+ const uint32_t __fe_dfl_env = 0;
+ 
+-int
+-fegetenv(uint32_t *envp)
++typedef struct { uint64_t fpsr; uint64_t fpcr; } sf_fenv_t;
++#define SF_FE_ALL_EXCEPT 0x009fu
++#define SF_FE_ROUND_MASK 0x00c00000u
++#define SF_FPCR_TRAP_ENABLES 0x00009f00ull   /* IOE DZE OFE UFE IXE IDE */
++
++const sf_fenv_t _FE_DFL_ENV = { 0, 0 };
++const sf_fenv_t _FE_DFL_DISABLE_DENORMS_ENV = { 0, 1ull << 24 };   /* FPCR.FZ */
++
++static inline uint64_t get_fpsr(void) { uint64_t v; __asm__ volatile("mrs %0, fpsr" : "=r"(v)); return v; }
++static inline void set_fpsr(uint64_t v) { __asm__ volatile("msr fpsr, %0" : : "r"(v)); }
++static inline uint64_t get_fpcr(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
++static inline void set_fpcr(uint64_t v) { __asm__ volatile("msr fpcr, %0" : : "r"(v)); }
++
++int feclearexcept(int excepts) { set_fpsr(get_fpsr() & ~(uint64_t)(excepts & SF_FE_ALL_EXCEPT)); return 0; }
++int fegetexceptflag(uint16_t *flagp, int excepts) { *flagp = (uint16_t)(get_fpsr() & excepts & SF_FE_ALL_EXCEPT); return 0; }
++int feraiseexcept(int excepts) { set_fpsr(get_fpsr() | (uint64_t)(excepts & SF_FE_ALL_EXCEPT)); return 0; }
++int fesetexceptflag(const uint16_t *flagp, int excepts)
+ {
+-    uint64_t fpsr;
+-    __asm__ volatile("mrs %0, fpsr" : "=r"(fpsr));
+-    *envp = (uint32_t)fpsr;
++    uint64_t mask = excepts & SF_FE_ALL_EXCEPT;
++    set_fpsr((get_fpsr() & ~mask) | (*flagp & mask));
+     return 0;
+ }
+-
+-int
+-fesetenv(const uint32_t *envp)
++int fetestexcept(int excepts) { return (int)(get_fpsr() & excepts & SF_FE_ALL_EXCEPT); }
++int fegetround(void) { return (int)(get_fpcr() & SF_FE_ROUND_MASK); }
++int fesetround(int round)
+ {
+-    uint64_t fpsr = *envp;
+-    __asm__ volatile("msr fpsr, %0" : : "r"(fpsr));
++    if (round & ~SF_FE_ROUND_MASK)
++        return -1;
++    set_fpcr((get_fpcr() & ~(uint64_t)SF_FE_ROUND_MASK) | (uint64_t)round);
++    return 0;
++}
++int fegetenv(sf_fenv_t *envp) { envp->fpsr = get_fpsr(); envp->fpcr = get_fpcr(); return 0; }
++int feholdexcept(sf_fenv_t *envp)
++{
++    fegetenv(envp);
++    set_fpsr(envp->fpsr & ~(uint64_t)SF_FE_ALL_EXCEPT);
++    set_fpcr(envp->fpcr & ~SF_FPCR_TRAP_ENABLES);
++    return 0;
++}
++int fesetenv(const sf_fenv_t *envp) { set_fpsr(envp->fpsr); set_fpcr(envp->fpcr); return 0; }
++int feupdateenv(const sf_fenv_t *envp)
++{
++    uint64_t raised = get_fpsr() & SF_FE_ALL_EXCEPT;
++    fesetenv(envp);
++    set_fpsr(get_fpsr() | raised);
+     return 0;
+ }
+ 
+@@ -26,3 +75,85 @@
+     (void)tagp;
+     return __builtin_nan("");
+ }
++
++_Static_assert(__LDBL_MANT_DIG__ == __DBL_MANT_DIG__, "long double must be double here");
++double acosh(double); double acoshl(double x) { return acosh(x); }
++double acos(double); double acosl(double x) { return acos(x); }
++double asinh(double); double asinhl(double x) { return asinh(x); }
++double asin(double); double asinl(double x) { return asin(x); }
++double atanh(double); double atanhl(double x) { return atanh(x); }
++double atan(double); double atanl(double x) { return atan(x); }
++double cbrt(double); double cbrtl(double x) { return cbrt(x); }
++double ceil(double); double ceill(double x) { return ceil(x); }
++double cosh(double); double coshl(double x) { return cosh(x); }
++double cos(double); double cosl(double x) { return cos(x); }
++double erfc(double); double erfcl(double x) { return erfc(x); }
++double erf(double); double erfl(double x) { return erf(x); }
++double exp2(double); double exp2l(double x) { return exp2(x); }
++double exp(double); double expl(double x) { return exp(x); }
++double expm1(double); double expm1l(double x) { return expm1(x); }
++double fabs(double); double fabsl(double x) { return fabs(x); }
++double floor(double); double floorl(double x) { return floor(x); }
++double lgamma(double); double lgammal(double x) { return lgamma(x); }
++double log10(double); double log10l(double x) { return log10(x); }
++double log1p(double); double log1pl(double x) { return log1p(x); }
++double log2(double); double log2l(double x) { return log2(x); }
++double logb(double); double logbl(double x) { return logb(x); }
++double log(double); double logl(double x) { return log(x); }
++double nearbyint(double); double nearbyintl(double x) { return nearbyint(x); }
++double rint(double); double rintl(double x) { return rint(x); }
++double round(double); double roundl(double x) { return round(x); }
++double sinh(double); double sinhl(double x) { return sinh(x); }
++double sin(double); double sinl(double x) { return sin(x); }
++double sqrt(double); double sqrtl(double x) { return sqrt(x); }
++double tanh(double); double tanhl(double x) { return tanh(x); }
++double tan(double); double tanl(double x) { return tan(x); }
++double tgamma(double); double tgammal(double x) { return tgamma(x); }
++double trunc(double); double truncl(double x) { return trunc(x); }
++double atan2(double, double); double atan2l(double x, double y) { return atan2(x, y); }
++double copysign(double, double); double copysignl(double x, double y) { return copysign(x, y); }
++double fmax(double, double); double fmaxl(double x, double y) { return fmax(x, y); }
++double fmin(double, double); double fminl(double x, double y) { return fmin(x, y); }
++double fmod(double, double); double fmodl(double x, double y) { return fmod(x, y); }
++double hypot(double, double); double hypotl(double x, double y) { return hypot(x, y); }
++double nextafter(double, double); double nextafterl(double x, double y) { return nextafter(x, y); }
++double pow(double, double); double powl(double x, double y) { return pow(x, y); }
++double remainder(double, double); double remainderl(double x, double y) { return remainder(x, y); }
++double _Complex cacosh(double _Complex); double _Complex cacoshl(double _Complex z) { return cacosh(z); }
++double _Complex cacos(double _Complex); double _Complex cacosl(double _Complex z) { return cacos(z); }
++double _Complex casinh(double _Complex); double _Complex casinhl(double _Complex z) { return casinh(z); }
++double _Complex casin(double _Complex); double _Complex casinl(double _Complex z) { return casin(z); }
++double _Complex catanh(double _Complex); double _Complex catanhl(double _Complex z) { return catanh(z); }
++double _Complex catan(double _Complex); double _Complex catanl(double _Complex z) { return catan(z); }
++double _Complex ccosh(double _Complex); double _Complex ccoshl(double _Complex z) { return ccosh(z); }
++double _Complex ccos(double _Complex); double _Complex ccosl(double _Complex z) { return ccos(z); }
++double _Complex cexp(double _Complex); double _Complex cexpl(double _Complex z) { return cexp(z); }
++double _Complex clog(double _Complex); double _Complex clogl(double _Complex z) { return clog(z); }
++double _Complex conj(double _Complex); double _Complex conjl(double _Complex z) { return conj(z); }
++double _Complex cproj(double _Complex); double _Complex cprojl(double _Complex z) { return cproj(z); }
++double _Complex csinh(double _Complex); double _Complex csinhl(double _Complex z) { return csinh(z); }
++double _Complex csin(double _Complex); double _Complex csinl(double _Complex z) { return csin(z); }
++double _Complex csqrt(double _Complex); double _Complex csqrtl(double _Complex z) { return csqrt(z); }
++double _Complex ctanh(double _Complex); double _Complex ctanhl(double _Complex z) { return ctanh(z); }
++double _Complex ctan(double _Complex); double _Complex ctanl(double _Complex z) { return ctan(z); }
++double cabs(double _Complex); double cabsl(double _Complex z) { return cabs(z); }
++double carg(double _Complex); double cargl(double _Complex z) { return carg(z); }
++double cimag(double _Complex); double cimagl(double _Complex z) { return cimag(z); }
++double creal(double _Complex); double creall(double _Complex z) { return creal(z); }
++double fma(double, double, double); double fmal(double x, double y, double z) { return fma(x, y, z); }
++double frexp(double, int *); double frexpl(double x, int *e) { return frexp(x, e); }
++double scalbn(double, int); double scalbnl(double x, int n) { return scalbn(x, n); }
++int ilogb(double); int ilogbl(double x) { return ilogb(x); }
++long lrint(double); long lrintl(double x) { return lrint(x); }
++long long llrint(double); long long llrintl(double x) { return llrint(x); }
++long lround(double); long lroundl(double x) { return lround(x); }
++long long llround(double); long long llroundl(double x) { return llround(x); }
++double modf(double, double *); double modfl(double x, double *i) { return modf(x, i); }
++double remquo(double, double, int *); double remquol(double x, double y, int *q) { return remquo(x, y, q); }
++double lgamma_r(double, int *); double lgammal_r(double x, int *s) { return lgamma_r(x, s); }
++double _Complex cpow(double _Complex, double _Complex); double _Complex cpowl(double _Complex a, double _Complex b) { return cpow(a, b); }
++double nextafter(double, double); double nexttoward(double x, double y) { return nextafter(x, y); }
++int __isfinited(double x) { return __builtin_isfinite(x); }
++int __isinfd(double x) { return __builtin_isinf(x); }
++int __isnand(double x) { return x != x; }
++int __isnormald(double x) { return __builtin_isnormal(x); }
+diff -ruN a/src/Libraries/libSystem/libplatform/CMakeLists.txt b/src/Libraries/libSystem/libplatform/CMakeLists.txt
+--- a/src/Libraries/libSystem/libplatform/CMakeLists.txt	2026-11-11 20:56:27.750506110 -0800
++++ b/src/Libraries/libSystem/libplatform/CMakeLists.txt	2026-11-11 21:00:27.604709497 -0800
+@@ -28,7 +28,19 @@
+     # there is a no-op and nothing needs it. compiler-rt's __clear_cache calls
+     # sys_icache_invalidate, which is what any JIT needs after writing code.
+     set(_libplatform_cachecontrol src/cachecontrol/arm64/cache.s)
+-    set(_libplatform_ucontext)
++    # getcontext/setcontext/makecontext/swapcontext: Apple's arm64 implementation,
++    # in the tree all along and not built. OpenSSL's async jobs (libcrypto imports
++    # the first three, so every program that loads libcrypto needs them), GNU
++    # coroutines and Ruby fibers use them.
++    set(_libplatform_ucontext
++        src/ucontext/arm64/_ctx_start.s
++        src/ucontext/arm64/getcontext.s
++        src/ucontext/arm64/_setcontext.s
++        src/ucontext/arm64/mcontext.c
++        src/ucontext/generic/getmcontext.c
++        src/ucontext/generic/makecontext.c
++        src/ucontext/generic/setcontext.c
++        src/ucontext/generic/swapcontext.c)
+ elseif(SILICONFOREST_RISCV64)
+     # the OSAtomic C file is shared with arm, the fifo queue locks since there
+     # is no commpage preemption free zone on riscv
+@@ -186,7 +198,12 @@
+ )
+ if(SILICONFOREST_ARM64)
+     set_source_files_properties(src/cachecontrol/arm64/cache.s
++        src/ucontext/arm64/_ctx_start.s src/ucontext/arm64/getcontext.s
++        src/ucontext/arm64/_setcontext.s
+         PROPERTIES LANGUAGE ASM COMPILE_FLAGS "-x assembler-with-cpp")
++    # Apple's file as it is: two pointer-to-integer assignments of equal width.
++    set_source_files_properties(src/ucontext/generic/makecontext.c
++        PROPERTIES COMPILE_FLAGS "-Wno-int-conversion")
+ endif()
+ if(SILICONFOREST_RISCV64)
+     set_source_files_properties(src/cachecontrol/riscv/cache.s src/setjmp/riscv/setjmp.s
+diff -ruN a/src/Libraries/libSystem/stub/CMakeLists.txt b/src/Libraries/libSystem/stub/CMakeLists.txt
+--- a/src/Libraries/libSystem/stub/CMakeLists.txt	2026-11-11 20:56:27.726690215 -0800
++++ b/src/Libraries/libSystem/stub/CMakeLists.txt	2026-11-11 21:04:09.767025300 -0800
+@@ -130,6 +130,51 @@
+         list(APPEND _libsystem_export_lines ___clear_cache
+             _sys_icache_invalidate _sys_dcache_flush)
+     endif()
++    if(SILICONFOREST_ARM64)
++        # What programs built against the macOS SDK (Homebrew bottles) import from
++        # libSystem and this arm64 build did not export. Every name here has a real
++        # implementation in the archives linked below (the -u this list turns into
++        # is also what pulls an otherwise unreferenced archive member in):
++        #   long double entry points and the fenv   openlibm/src/sf_arm64.c
++        #   getcontext/setcontext/makecontext/swapcontext   libplatform ucontext/arm64
++        #   the rest   libc, libinfo, libplatform, libsystem_kernel, libresolv as built
++        # A name without an implementation fails the link; none is stubbed.
++        # Left out: OSAtomicFifoEnqueue/Dequeue (the arm64 versions need the
++        # commpage preemption-free zone, which nothing here sets up) and gets
++        # (its source needs libc-internal headers this list is built without).
++        list(APPEND _libsystem_export_lines
++        _CC_MD5_Final _CC_MD5_Init _CC_MD5_Update _CC_SHA1_Final _CC_SHA1_Init
++        _CC_SHA1_Update _CC_SHA384_Final _CC_SHA384_Init _CC_SHA384_Update _CC_SHA512_Final
++        _CC_SHA512_Init _CC_SHA512_Update _OSAtomicAdd64Barrier _OSAtomicAnd32
++        _OSAtomicAnd32Barrier _OSAtomicAnd32Orig _OSAtomicAnd32OrigBarrier
++        _OSAtomicCompareAndSwap32 _OSAtomicCompareAndSwap64 _OSAtomicCompareAndSwap64Barrier
++        _OSAtomicCompareAndSwapInt _OSAtomicCompareAndSwapLong _OSAtomicDecrement64
++        _OSAtomicDecrement64Barrier _OSAtomicDequeue _OSAtomicEnqueue
++        _OSAtomicIncrement64 _OSAtomicIncrement64Barrier _OSAtomicOr32
++        _OSAtomicOr32Barrier _OSAtomicOr32Orig _OSAtomicOr32OrigBarrier _OSAtomicTestAndClear
++        _OSAtomicTestAndClearBarrier _OSAtomicTestAndSet _OSAtomicXor32 _OSAtomicXor32Barrier
++        _OSAtomicXor32Orig _OSAtomicXor32OrigBarrier __FE_DFL_DISABLE_DENORMS_ENV
++        __FE_DFL_ENV ___isfinited ___isinfd ___isnand ___isnanf ___isnormald ___mulsc3
++        __mktemp __os_nospin_lock_lock __os_signpost_emit_with_name_impl _acoshl _acosl
++        _asinhl _asinl _atan2l _atanhl _atanl _bootstrap_get_root _bootstrap_look_up_per_user
++        _cabsl _cacoshl _cacosl _cargl _casinhl _casinl _catanhl _catanl _cbrtl _ccoshl
++        _ccosl _ceill _cexpl _cimagl _clogl _conjl _copysignl _coshl _cosl _cpowl _cprojl
++        _creall _csinhl _csinl _csqrtl _ctanhl _ctanl _ctermid_r _dispatch_queue_offsets
++        _erfcl _erfl _ether_hostton _ether_ntohost _exp2l _expl _expm1l _fabsl _feclearexcept
++        _fegetenv _fegetexceptflag _feholdexcept _feraiseexcept _fesetenv _fesetexceptflag
++        _fesetround _fetestexcept _feupdateenv _fgetattrlist _fileno_unlocked _floorl _fmal
++        _fmaxl _fminl _fmodl _forkpty _freadlink _frexpl _ftime _ftw _funopen _getcontext
++        _getfsfile _getfsspec _getitimer _getttynam _hypotl _ilogbl _lgammal _lgammal_r
++        _llrintl _llroundl _log10l _log1pl _log2l _logbl _login_tty _logl _lrintl _lroundl
++        _makecontext _malloc_num_zones _malloc_zones _modfl _nearbyintl _nextafterl
++        _nexttoward _nexttowardf _openpty _os_lock_lock _os_lock_trylock _os_lock_unlock
++        _os_signpost_enabled _powl _preadv _proc_regionfilename _pwritev _regcomp_l
++        _remainderl _remquol _res_9_b64_ntop _res_9_b64_pton _res_9_dn_skipname _rintl
++        _roundl _scalblnl _scalbnl _setbuffer _setcontext _sigblock _sigsetmask _sinhl _sinl
++        _sqrtl _strtonum _swapcontext _tanhl _tanl _task_swap_exception_ports _tempnam
++        _tgammal _truncl _vfprintf_l _vm_read_overwrite _vm_region_recurse_64 _vsnprintf_l)
++        list(REMOVE_DUPLICATES _libsystem_export_lines)
++    endif()
+     set(_libsystem_exports_for_link ${CMAKE_CURRENT_BINARY_DIR}/libSystem.arm64.exports)
+     file(WRITE ${_libsystem_exports_for_link} "")
+     foreach(_line ${_libsystem_export_lines})
+diff -ruN a/src/Libraries/libSystem/stub/sf_chkstk_darwin.s b/src/Libraries/libSystem/stub/sf_chkstk_darwin.s
+--- a/src/Libraries/libSystem/stub/sf_chkstk_darwin.s	2026-11-11 20:56:27.718999260 -0800
++++ b/src/Libraries/libSystem/stub/sf_chkstk_darwin.s	2026-11-11 20:56:39.868535015 -0800
+@@ -10,6 +10,22 @@
+  * size in %rax, every other register including flags preserved, no
+  * stack frame of its own) and return.
+  */
++#if defined(__arm64__)
++/*
++ * arm64: libpthread's real probe (pthread_asm.s) already defines
++ * ____chkstk_darwin. Defining that label a second time here left this file's
++ * one `ret` out of the link, and ___chkstk_darwin (the name every program
++ * calls: size in x9, every register preserved) ended up on the first
++ * instruction of the next function in the image, sandbox_check(), which
++ * returns 0 in x0. Every function with a frame over a page then lost its
++ * first argument. Enter the real probe instead.
++ */
++    .text
++    .align 2
++    .globl ___chkstk_darwin
++___chkstk_darwin:
++    b ____chkstk_darwin
++#else
+     .text
+     .globl ___chkstk_darwin
+     .globl ____chkstk_darwin
+@@ -18,6 +34,6 @@
+ #if defined(__arm__)
+     bx lr
+ #else
+-    /* arm64 and x86 both return with ret; only arm32 uses bx lr. */
+     ret
+ #endif
++#endif
+diff -ruN a/src/Libraries/libSystem/stub/sf_libSystem_compat.c b/src/Libraries/libSystem/stub/sf_libSystem_compat.c
+--- a/src/Libraries/libSystem/stub/sf_libSystem_compat.c	2026-11-11 20:56:27.735631124 -0800
++++ b/src/Libraries/libSystem/stub/sf_libSystem_compat.c	2026-11-11 20:56:39.868699609 -0800
+@@ -1386,6 +1386,7 @@
+     }
+ }
+ 
++#if !defined(__aarch64__)   /* arm64: the whole fenv is in openlibm/src/sf_arm64.c */
+ // openlibm only has fegetround as an inline in its fenv header, so callers that bind it
+ // by name get it here: the rounding-mode bits of the x87 control word or of FPCR
+ int fegetround(void);
+@@ -1406,3 +1407,4 @@
+     return 0;
+ #endif
+ }
++#endif
+diff -ruN a/src/Libraries/libsystem_trace/signpost.c b/src/Libraries/libsystem_trace/signpost.c
+--- a/src/Libraries/libsystem_trace/signpost.c	2026-11-11 21:02:44.710921198 -0800
++++ b/src/Libraries/libsystem_trace/signpost.c	2026-11-11 21:02:44.741999926 -0800
+@@ -50,6 +50,19 @@
+ {
+ }
+ 
++/*
++ * The name and signature the macOS SDK's os_signpost_emit_with_name() macro
++ * expands to (one underscore in C). There is no trace backend here and
++ * os_signpost_enabled() below says so; a caller that emits anyway has its
++ * signpost dropped, which is what the API does whenever nothing is collecting.
++ */
++void _os_signpost_emit_with_name_impl(void *dso, os_log_t log,
++    os_signpost_type_t type, os_signpost_id_t spid, const char *name,
++    const char *format, uint8_t *buf, uint32_t size)
++{
++    (void)dso; (void)log; (void)type; (void)spid; (void)name; (void)format; (void)buf; (void)size;
++}
++
+ void __os_signpost_emit_unreliably_impl(os_log_t log,
+     os_signpost_type_t type,
+     os_signpost_id_t spid,

@@ -1,0 +1,49 @@
+fbsdkpi: platform bus: a hook between making the device and probing it
+
+sf_platform_pre_probe, when a kext sets it, is called with the platform_device right before
+the driver's probe; a nonzero return keeps the device from being probed. SFAgx uses it to name the GPU's mailbox (sf_apple_mbox_bind): Apple's
+device tree has no mboxes phandle from the GPU to gfx-asc, and the driver is unmodified.
+UPSTREAM: only until the published GPU node carries a mailbox reference the layer resolves.
+
+Also in this file (boot dp04): a device is entered in the bus's device table before its probe
+runs, as Linux registers a device first, so that a probe, or a component bind running
+inside it, finds its own device with of_find_device_by_node(); the entry is removed when the
+pre-probe hook or the probe fails. UPSTREAM for this part: yes.
+
+--- a/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_platform.c
++++ b/src/Kernel/fbsdkpi/sf/lkpi/sf_linux_platform.c
+@@ -42,6 +42,9 @@
+ 	return (&sf_platform_lock);
+ }
+ static struct platform_device *sDevices[16];
++// set by a kext before its driver registers; called with the device, before probe.
++// nonzero: the device is not probed.
++int (*sf_platform_pre_probe)(struct platform_device *pdev);
+ 
+ int
+ platform_driver_register(struct platform_driver *pdrv)
+@@ -172,13 +175,23 @@
+ 	linux_set_current(curthread);
+ 	printf("pd platform: probing %s with %s\n", np->full_name,
+ 	    pdrv->driver.name != NULL ? pdrv->driver.name : "?");
++	// a kext can finish the device before its driver sees it (what a Linux device tree
++	// would have described: SFAgx names the GPU's mailbox, which Apple's tree does not link)
++	// registered before its probe, as on linux: a probe (or a component bind running inside
++	// it) may look its own device up by node (of_find_device_by_node)
++	sDevices[slot] = pdev;
++	if (sf_platform_pre_probe != NULL && (error = sf_platform_pre_probe(pdev)) != 0) {
++		printf("pd platform: %s not probed, the kext's pre-probe returned %d\n", np->full_name, error);
++		sDevices[slot] = NULL;
++		return (NULL);
++	}
+ 	error = pdrv->probe(pdev);
+ 	if (error != 0) {
+ 		printf("pd platform: %s probe returned %d\n", np->full_name, error);
+ 		lkpi_devres_release_free_list(dev);
++		sDevices[slot] = NULL;
+ 		return (NULL);
+ 	}
+-	sDevices[slot] = pdev;
+ 	return (dev);
+ }
+ 

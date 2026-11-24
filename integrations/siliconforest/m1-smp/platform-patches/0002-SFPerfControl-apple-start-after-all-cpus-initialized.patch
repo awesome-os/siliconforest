@@ -1,0 +1,128 @@
+SFPerfControl: on Apple SoCs install the E/P policy after all processors are initialized
+
+sf_perfcontrol_start() ran from SFArmPlatformExpert::start(), which on the boards with a
+SFArmCPU per processor is after every processor has been registered and started. On Apple
+SoCs xnu's own cpu_boot_thread does that, later and on another thread, and finishes with
+ml_cpu_init_completed(), where the edge scheduler resets every edge to its default (E -> P
+closed). So the policy was overwritten, or, had it run before the P cluster's pset existed,
+would have tripped the pset-count assertion in sched_edge_matrix_set().
+
+Measured on the M1 with eight busy shell loops: 112 kiloiterations/s on eight processors
+(four cores' worth, boots sm04/sm05) against 28 for one loop; in sm03, where the order
+happened to be the other way round, all eight processors were used.
+
+The Apple platform expert now waits for the IOAllCPUInitialized resource, which the kernel
+publishes right after ml_cpu_init_completed(). Other platforms are unchanged.
+
+--- a/src/Kernel/Extensions/SFArmPlatformExpert/SFArmPlatformExpert.cpp
++++ b/src/Kernel/Extensions/SFArmPlatformExpert/SFArmPlatformExpert.cpp
+@@ -47,6 +47,7 @@
+ 	virtual bool initPlatformInterrupts(void);
+ 	virtual bool startProcessors(void);
+ 	virtual void initPlatformInterruptsLate(void);
++	virtual void startPerfControl(void);
+ 	virtual const char *platformModelName(void);
+ 	void publishBcm2835EMMC(void);
+ 	void publishBcm283xFramebuffer(void);
+@@ -104,7 +105,7 @@
+ 	startQemuRTC();
+ 
+ #if defined(__arm64__)
+-	sf_perfcontrol_start();
++	startPerfControl();
+ 	SFSun60iDVFS_start();
+ 	PE_halt_restart = sfArmHaltRestart;
+ 	if (SFSun50i_isPlatform()) {
+@@ -575,6 +576,15 @@
+ 	SFArmGICController_init();
+ }
+ 
++// startProcessors() has registered and started every processor by now
++void
++SFArmPlatformExpert::startPerfControl(void)
++{
++#if defined(__arm64__)
++	sf_perfcontrol_start();
++#endif
++}
++
+ const char *
+ SFArmPlatformExpert::platformModelName(void)
+ {
+@@ -594,6 +604,7 @@
+ 	bool initPlatformInterrupts(void) APPLE_KEXT_OVERRIDE;
+ 	bool startProcessors(void) APPLE_KEXT_OVERRIDE;
+ 	void initPlatformInterruptsLate(void) APPLE_KEXT_OVERRIDE;
++	void startPerfControl(void) APPLE_KEXT_OVERRIDE;
+ 	const char *platformModelName(void) APPLE_KEXT_OVERRIDE;
+ };
+ 
+@@ -657,6 +668,13 @@
+ 	}
+ }
+ 
++// xnu's cpu_boot_thread registers and starts the processors after this platform expert has started
++void
++SFAppleARMPlatformExpert::startPerfControl(void)
++{
++	sf_perfcontrol_start_when_cpus_ready();
++}
++
+ const char *
+ SFAppleARMPlatformExpert::platformModelName(void)
+ {
+--- a/src/Kernel/Extensions/SFArmPlatformExpert/SFPerfControl.cpp
++++ b/src/Kernel/Extensions/SFArmPlatformExpert/SFPerfControl.cpp
+@@ -2,6 +2,7 @@
+ // controller every thread group prefers the boot cluster and the edges stay closed, so the P cores sit idle
+ 
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
+ #include <kern/kern_types.h>
+ #include <arm/machine_routines.h>
+ #include "SFPerfControl.h"
+@@ -83,3 +84,33 @@
+ 	IOLog("SFPerfControl: E cluster %u, P cluster %u: interactive and initiated work prefers P, the rest E\n",
+ 	    sECluster, sPCluster);
+ }
++
++// AppleARMSMP's cpu_boot_thread registers the processors (which creates the P cluster's pset) and then
++// calls ml_cpu_init_completed(), where the edge scheduler writes its default edges over whatever is there:
++// E -> P closed. Run from the platform expert's start, the policy above either came before the second
++// pset existed (sched_edge_matrix_set asserts the pset count) or was overwritten moments later, and the
++// P cores then took no default-QoS work at all (boots sm04 and sm05: eight busy loops ran on four
++// cores; sm03, where the order happened to be the other way round, used all eight). The kernel
++// publishes IOAllCPUInitialized right after ml_cpu_init_completed(): start then.
++static bool
++sf_perfcontrol_cpus_ready(void *, void *, IOService *, IONotifier *notifier)
++{
++	if (notifier != NULL)
++		notifier->remove();
++	sf_perfcontrol_start();
++	return true;
++}
++
++void
++sf_perfcontrol_start_when_cpus_ready(void)
++{
++	OSDictionary *matching = IOService::resourceMatching(gIOAllCPUInitializedKey);
++
++	if (matching == NULL)
++		return;
++	// fires at once when the resource is already there
++	if (IOService::addMatchingNotification(gIOPublishNotification, matching,
++	    sf_perfcontrol_cpus_ready, NULL, NULL) == NULL)
++		IOLog("SFPerfControl: no notification for IOAllCPUInitialized; the E/P policy is not installed\n");
++	matching->release();
++}
+--- a/src/Kernel/Extensions/SFArmPlatformExpert/SFPerfControl.h
++++ b/src/Kernel/Extensions/SFArmPlatformExpert/SFPerfControl.h
+@@ -4,4 +4,8 @@
+ // registers the E/P placement policy when the topology has one E and one P cluster, otherwise does nothing
+ void sf_perfcontrol_start(void);
+ 
++// the same, once the kernel has published IOAllCPUInitialized: for platforms whose processors the kernel's
++// own cpu_boot_thread registers and starts, some time after the platform expert has started
++void sf_perfcontrol_start_when_cpus_ready(void);
++
+ #endif

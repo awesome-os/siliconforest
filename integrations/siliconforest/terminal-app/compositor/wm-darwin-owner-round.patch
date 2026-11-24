@@ -1,0 +1,2616 @@
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/chonk-shell/src/desktop.rs desk3-src/crates/chonk-shell/src/desktop.rs
+--- desk2-src/crates/chonk-shell/src/desktop.rs	2026-11-14 10:28:56.475021429 -0800
++++ desk3-src/crates/chonk-shell/src/desktop.rs	2026-11-14 13:17:35.344453690 -0800
+@@ -84,8 +84,15 @@
+     /// theme and wallpaper.
+     pub workspace: usize,
+     pub workspace_count: usize,
++    /// Rows the host adds below the window's own (the standalone desk: a Mac application's
++    /// "Show/Hide Menu Bar" and its main menu). Their actions are the host's ids plus
++    /// [`WINDOW_HOST_ACTION_BASE`]; a pick is handed back as `WindowMenuAction::Host`.
++    pub extra: Vec<MenuItem>,
+ }
+ 
++/// Window-menu rows above this id are the host's (`WindowMenuContext::extra`).
++pub const WINDOW_HOST_ACTION_BASE: u32 = 1_000_000;
++
+ /// A pick from the per-window commands menu. Every variant maps onto
+ /// an existing `WindowManager` method; the menu adds no behavior of
+ /// its own, it only names things the WM can already do.
+@@ -104,6 +111,8 @@
+     /// XKillClient — the last resort for a hung client that ignores
+     /// `Close`, which is exactly why the menu carries both entries.
+     Kill,
++    /// A row the host added (`WindowMenuContext::extra`), by the id it gave it.
++    Host(u32),
+ }
+ 
+ /// What a resolved menu click means, tagged by which kind of session
+@@ -505,8 +514,27 @@
+     ]
+ }
+ 
++/// The standalone (macOS-keyed) desk's window menu: the window's verbs in macOS's words, the
++/// Spaces to move it to, Close, then whatever the host adds (a Mac application's own menu).
++fn standalone_window_menu_items(ctx: &WindowMenuContext) -> Vec<MenuItem> {
++    let spaces = (0..ctx.workspace_count)
++        .map(|n| MenuItem::Action { label: bullet_label(n == ctx.workspace, &format!("Space {}", n + 1)), action: ACTION_MOVE_TO_BASE + n as u32 })
++        .chain(std::iter::once(MenuItem::Action { label: bullet_label(false, "New Space"), action: ACTION_MOVE_TO_BASE + ctx.workspace_count as u32 }))
++        .collect();
++    let mut items = vec![
++        MenuItem::Action { label: if ctx.maximized { "Restore" } else { "Maximize" }.to_string(), action: ACTION_WINDOW_MAXIMIZE },
++        MenuItem::Action { label: "Minimize".to_string(), action: ACTION_WINDOW_MINIATURIZE },
++        MenuItem::Action { label: if ctx.fullscreen { "Exit Full Screen" } else { "Enter Full Screen" }.to_string(), action: ACTION_WINDOW_FULLSCREEN },
++        MenuItem::Submenu { label: "Move to Space".to_string(), items: spaces },
++        MenuItem::Action { label: "Close".to_string(), action: ACTION_WINDOW_CLOSE },
++    ];
++    items.extend(ctx.extra.iter().cloned());
++    items
++}
++
+ fn resolve_window_action(action: u32, workspace_count: usize) -> Option<WindowMenuAction> {
+     match action {
++        action if action >= WINDOW_HOST_ACTION_BASE => Some(WindowMenuAction::Host(action - WINDOW_HOST_ACTION_BASE)),
+         ACTION_WINDOW_MAXIMIZE => Some(WindowMenuAction::ToggleMaximize),
+         ACTION_WINDOW_MINIATURIZE => Some(WindowMenuAction::Miniaturize),
+         ACTION_WINDOW_SHADE => Some(WindowMenuAction::ToggleShade),
+@@ -1123,7 +1151,7 @@
+         let bounds = self.screen_size();
+         if self.standalone {
+             self.menu.begin_session(backend, MenuSession::Window { client:ctx.client, workspace_count:ctx.workspace_count }, window_menu_title(&ctx.title));
+-            self.menu.menu.open(backend, theme, &mut self.fonts.system(), vec![MenuItem::Action { label:"Close".into(), action:ACTION_WINDOW_CLOSE }], at, bounds, false);
++            self.menu.menu.open(backend, theme, &mut self.fonts.system(), standalone_window_menu_items(&ctx), at, bounds, false);
+         } else {
+             self.menu.open_window(backend, theme, &mut self.fonts.system(), &ctx, at, bounds);
+         }
+@@ -1907,10 +1935,27 @@
+             fullscreen: false,
+             workspace,
+             workspace_count,
++            extra: Vec::new(),
+         }
+     }
+ 
+     #[test]
++    fn the_standalone_window_menu_has_the_window_verbs_and_the_hosts_rows() {
++        let mut ctx = window_ctx(1, 2);
++        ctx.extra = vec![MenuItem::Action { label: "Hide Menu Bar".into(), action: WINDOW_HOST_ACTION_BASE + 7 }];
++        let items = standalone_window_menu_items(&ctx);
++        let labels: Vec<&str> = items.iter().map(MenuItem::label).collect();
++        assert_eq!(labels, ["Maximize", "Minimize", "Enter Full Screen", "Move to Space", "Close", "Hide Menu Bar"]);
++        assert_eq!(resolve_window_action(ACTION_WINDOW_MAXIMIZE, 2), Some(WindowMenuAction::ToggleMaximize));
++        assert_eq!(resolve_window_action(ACTION_MOVE_TO_BASE + 2, 2), Some(WindowMenuAction::MoveToWorkspace(2)));
++        assert_eq!(resolve_window_action(WINDOW_HOST_ACTION_BASE + 7, 2), Some(WindowMenuAction::Host(7)));
++        ctx.maximized = true;
++        ctx.fullscreen = true;
++        let labels: Vec<String> = standalone_window_menu_items(&ctx).iter().map(|i| i.label().to_string()).collect();
++        assert_eq!(&labels[..3], ["Restore", "Minimize", "Exit Full Screen"]);
++    }
++
++    #[test]
+     fn window_menu_labels_flip_to_their_undo_forms() {
+         let plain = window_menu_items(&window_ctx(0, 1));
+         let labels: Vec<&str> = plain.iter().map(|item| item.label()).collect();
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/chonk-shell/src/shell.rs desk3-src/crates/chonk-shell/src/shell.rs
+--- desk2-src/crates/chonk-shell/src/shell.rs	2026-11-14 10:51:34.696350553 -0800
++++ desk3-src/crates/chonk-shell/src/shell.rs	2026-11-14 13:17:45.118487065 -0800
+@@ -977,6 +977,9 @@
+     ThemeChanged,
+     /// The wallpaper was changed from the menu (already applied).
+     WallpaperChanged,
++    /// A row the host added to a window's menu (`Shell::set_window_menu_extra`) was picked, for
++    /// this client, by the id the host gave it.
++    WindowAction(ClientId, u32),
+ }
+ 
+ pub enum KeyResolution {
+@@ -1000,6 +1003,8 @@
+     managed: Option<crate::managed::ManagedBridge>,
+     /// Requests of the standalone menu waiting for the host.
+     host_requests: std::collections::VecDeque<HostRequest>,
++    /// The host's rows for the next window menu (`set_window_menu_extra`), taken when it opens.
++    window_menu_extra: Vec<wm_theme::menu::MenuItem>,
+     /// Everything a live change can alter, as resolved — the source
+     /// `theme` below is derived from, and the base every later
+     /// [`Shell::apply_session_state`] diffs against.
+@@ -1330,6 +1335,19 @@
+     /// See `Desktop::set_scale_steps` and `Desktop::set_host_menu`.
+     pub fn set_scale_steps(&mut self, steps: &[u32]) { self.desktop.set_scale_steps(steps); }
+     pub fn set_host_menu(&mut self, items: Vec<wm_theme::menu::MenuItem>) { self.desktop.set_host_menu(items); }
++    /// Rows for the window menu about to open (a Mac application's menu), action ids from 0; the
++    /// shell adds `desktop::WINDOW_HOST_ACTION_BASE` and hands a pick back as
++    /// `HostRequest::WindowAction`.
++    pub fn set_window_menu_extra(&mut self, items: Vec<wm_theme::menu::MenuItem>) {
++        fn offset(items: Vec<wm_theme::menu::MenuItem>) -> Vec<wm_theme::menu::MenuItem> {
++            use wm_theme::menu::MenuItem;
++            items.into_iter().map(|item| match item {
++                MenuItem::Action { label, action } => MenuItem::Action { label, action: action.saturating_add(crate::desktop::WINDOW_HOST_ACTION_BASE) },
++                MenuItem::Submenu { label, items } => MenuItem::Submenu { label, items: offset(items) },
++            }).collect()
++        }
++        self.window_menu_extra = offset(items);
++    }
+     pub fn menu_level_count(&self) -> usize { self.desktop.menu_level_count() }
+     pub fn menu_level_labels(&self, level: usize) -> Vec<String> { self.desktop.menu_level_labels(level) }
+     pub fn menu_level_item_centre(&self, level: usize, index: usize) -> Option<(B::ShellId, Point)> {
+@@ -1493,6 +1511,7 @@
+             app_rescan,
+             managed: standalone.then(crate::managed::ManagedBridge::default),
+             host_requests: std::collections::VecDeque::new(),
++            window_menu_extra: Vec::new(),
+             keymap: build_keymap(&state.keybindings),
+             release_keymap: state
+                 .bindings
+@@ -2525,6 +2544,13 @@
+                 MenuAction::Root(RootMenuAction::LaunchTerminal) => {if let Err(e)=b.request_terminal(){b.refuse(e);} ShellOutcome::Continue}
+                 MenuAction::Root(RootMenuAction::Exit) => {b.begin_shutdown();ShellOutcome::Exit}
+                 MenuAction::Window(client,WindowMenuAction::Close) => {wm.close_client(client);ShellOutcome::Continue}
++                // The window menu of the standalone desk (title bar right-click or Control-click):
++                // the same verbs as the frame's buttons and keys.
++                MenuAction::Window(client,WindowMenuAction::ToggleMaximize) => {wm.toggle_maximize_full(client);ShellOutcome::Continue}
++                MenuAction::Window(client,WindowMenuAction::Miniaturize) => {wm.miniaturize(client);ShellOutcome::Continue}
++                MenuAction::Window(client,WindowMenuAction::ToggleFullscreen) => {wm.toggle_fullscreen(client);ShellOutcome::Continue}
++                MenuAction::Window(client,WindowMenuAction::MoveToWorkspace(ws)) => {wm.move_client_to_workspace(client,ws);ShellOutcome::Continue}
++                MenuAction::Window(client,WindowMenuAction::Host(id)) => {self.host_requests.push_back(HostRequest::WindowAction(client,id));ShellOutcome::Continue}
+                 _ => {b.refuse("menu action unsupported in standalone");ShellOutcome::Continue}
+             };
+         }
+@@ -2549,6 +2575,7 @@
+                     }
+                     WindowMenuAction::Close => wm.close_client(client),
+                     WindowMenuAction::Kill => wm.kill_client(client),
++                    WindowMenuAction::Host(id) => self.host_requests.push_back(HostRequest::WindowAction(client, id)),
+                 }
+                 ShellOutcome::Continue
+             }
+@@ -2914,6 +2941,7 @@
+                                 fullscreen: client.flags.contains(ClientFlags::FULLSCREEN),
+                                 workspace: client.workspace,
+                                 workspace_count: wm.workspace_count(),
++                        extra: std::mem::take(&mut self.window_menu_extra),
+                             };
+                             let at = self.pointer_root;
+                             self.desktop.open_window_menu(wm.backend_mut(), &self.theme, at, ctx);
+@@ -3427,6 +3455,7 @@
+                         fullscreen: client.flags.contains(ClientFlags::FULLSCREEN),
+                         workspace: client.workspace,
+                         workspace_count: wm.workspace_count(),
++                        extra: std::mem::take(&mut self.window_menu_extra),
+                     };
+                     self.desktop.open_window_menu(wm.backend_mut(), &self.theme, at, ctx);
+                 }
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/wm-core/src/manager/mac.rs desk3-src/crates/wm-core/src/manager/mac.rs
+--- desk2-src/crates/wm-core/src/manager/mac.rs	2026-11-14 10:34:14.404326242 -0800
++++ desk3-src/crates/wm-core/src/manager/mac.rs	2026-11-14 13:39:42.502373535 -0800
+@@ -120,6 +120,24 @@
+         self.bump_protocol_state_revision();
+     }
+ 
++    /// Hide the application `member` belongs to (Command-Tab's H on the selected application):
++    /// as `hide_application(false)` for it, whether or not it has the focus.
++    pub fn hide_application_of(&mut self, member: ClientId) {
++        if !self.clients.contains_key(member) {
++            return;
++        }
++        let app = self.application_members(member);
++        let ids: Vec<_> = self.clients.keys().filter(|id| app.contains(id)).collect();
++        self.mac_hidden.extend(ids.iter().copied());
++        for id in ids {
++            self.hide_client_surface(id);
++        }
++        if let Some(focused) = self.focused.filter(|f| app.contains(f)) {
++            self.focus_successor_of(focused);
++        }
++        self.bump_protocol_state_revision();
++    }
++
+     /// Ask every application window to close. Never escalate an unsupported
+     /// close protocol into termination; applications retain their save prompts.
+     pub fn quit_application(&mut self) {
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/wm-core/src/manager.rs desk3-src/crates/wm-core/src/manager.rs
+--- desk2-src/crates/wm-core/src/manager.rs	2026-11-13 17:14:47.527440487 -0800
++++ desk3-src/crates/wm-core/src/manager.rs	2026-11-14 13:42:53.940926990 -0800
+@@ -1939,6 +1939,15 @@
+         self.notifications.pop_front()
+     }
+ 
++    /// The client whose window menu is about to be asked for (a queued
++    /// `Notification::WindowMenuRequested`), so a host can prepare its own rows first.
++    pub fn pending_window_menu(&self) -> Option<ClientId> {
++        self.notifications.iter().rev().find_map(|n| match n {
++            Notification::WindowMenuRequested { id, .. } => Some(*id),
++            _ => None,
++        })
++    }
++
+     pub fn backend(&self) -> &B {
+         &self.backend
+     }
+@@ -12146,6 +12155,20 @@
+         assert_eq!(wm.focused_client(), Some(first));
+     }
+ 
++    /// Command-Tab's H (the desk's switcher): the selected application is hidden whether or not
++    /// it has the focus; the focused one keeps it when another is hidden.
++    #[test]
++    fn hiding_an_application_that_is_not_focused_keeps_the_focus() {
++        let (mut wm, [first, browser, last]) = mac_windows();
++        assert_eq!(wm.focused_client(), Some(last));
++        wm.hide_application_of(browser);
++        assert!(wm.mac_client_hidden(browser) && !wm.mac_client_hidden(first));
++        assert_eq!(wm.focused_client(), Some(last));
++        wm.hide_application_of(first);
++        assert!(wm.mac_client_hidden(first) && wm.mac_client_hidden(last));
++        assert_ne!(wm.focused_client(), Some(last), "the focus left the hidden application");
++    }
++
+     #[test]
+     fn mac_show_desktop_hide_others_and_minimize_are_distinct() {
+         let (mut wm, [first, browser, last]) = mac_windows();
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/wm-darwin/src/appmenu.rs desk3-src/crates/wm-darwin/src/appmenu.rs
+--- desk2-src/crates/wm-darwin/src/appmenu.rs	1969-12-31 16:00:00.000000000 -0800
++++ desk3-src/crates/wm-darwin/src/appmenu.rs	2026-11-14 13:19:07.030154052 -0800
+@@ -0,0 +1,300 @@
++//! A Mac application's own menu in the window menu (the owner, 14 November: "right-click a
++//! window title and maximize, show/hide the Mac menu bar (access the menu bar in a flattened
++//! Chonkstep menu as well)").
++//!
++//! When the window menu of a Mac application's window is about to open, the compositor asks the
++//! application, over a socket the application listens on, for its main menu and whether its
++//! in-window menu strip is shown. Nothing is sent at any other time. The rows go below the
++//! window's own verbs: "Hide Menu Bar" / "Show Menu Bar", then one submenu per top-level menu
++//! (the application menu, File, Edit, ...) with the key equivalents right-aligned, disabled rows
++//! dimmed and checked rows marked. A pick is sent back as `invoke <id>` (or `menubar toggle`).
++//! An application that has no socket, or does not answer within `TIMEOUT`, gets the window
++//! verbs only.
++//!
++//! The protocol (proposed to the AppKit stream in runs/m1-coord/requests-for-CLAUDE.md):
++//! the socket `$XDG_RUNTIME_DIR/app-menu/<pid>`, owned by the session's user; lines of UTF-8
++//! ending in `\n`. `menubar` -> `shown` | `hidden`; `menubar show|hide|toggle` -> `ok shown|hidden`;
++//! `menu 1` -> `item <id> <depth> <flags> <key> <title>` lines then `end`; `invoke <id>` -> `ok`
++//! or `error <text>`. Flags: `s` submenu, `d` disabled, `c` checked, `m` mixed, `p` separator,
++//! `a` the application menu, `-` none. Key: `cmd+shift+opt+ctrl+<char>` or `-`.
++use std::io::{BufRead, BufReader, Write};
++use std::os::unix::fs::{FileTypeExt, MetadataExt};
++use std::os::unix::net::UnixStream;
++use std::path::{Path, PathBuf};
++use std::time::Duration;
++use wm_theme::menu::{MenuItem, DISABLED};
++
++/// How long the compositor waits for an application's answer (the menu is on its way to the screen).
++pub const TIMEOUT: Duration = Duration::from_millis(200);
++/// The host id of the "Hide/Show Menu Bar" row; an item's row is its index plus one.
++pub const MENUBAR_TOGGLE: u32 = 0;
++/// The host id of a row that cannot be picked (disabled): nothing has it.
++pub const NOTHING: u32 = u32::MAX - 2_000_000;
++const MAX_ITEMS: usize = 4000;
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct Item {
++    pub id: String,
++    pub depth: u32,
++    pub flags: String,
++    pub key: String,
++    pub title: String,
++}
++
++/// What an application answered: its menu bar's state (when it said) and its main menu.
++#[derive(Clone, Debug, Default)]
++pub struct AppMenu {
++    pub pid: i32,
++    pub menubar: Option<bool>,
++    pub items: Vec<Item>,
++}
++
++pub fn socket_path(runtime: &Path, pid: i32) -> PathBuf {
++    runtime.join("app-menu").join(pid.to_string())
++}
++
++/// One line `item <id> <depth> <flags> <key> <title>`.
++pub fn parse_item(line: &str) -> Option<Item> {
++    let mut words = line.splitn(6, ' ');
++    if words.next()? != "item" {
++        return None;
++    }
++    let id = words.next()?.to_string();
++    let depth = words.next()?.parse().ok()?;
++    let flags = words.next()?.to_string();
++    let key = words.next()?.to_string();
++    let title = words.next().unwrap_or("").replace(['\t', '\r'], " ");
++    (!id.is_empty() && depth < 16).then_some(Item { id, depth, flags, key, title })
++}
++
++fn connect(runtime: &Path, pid: i32) -> Result<UnixStream, String> {
++    let path = socket_path(runtime, pid);
++    let meta = std::fs::symlink_metadata(&path).map_err(|_| "no menu socket".to_string())?;
++    if !meta.file_type().is_socket() {
++        return Err("not a socket".into());
++    }
++    if meta.uid() != unsafe { libc::geteuid() } {
++        return Err("the socket is another user's".into());
++    }
++    let stream = UnixStream::connect(&path).map_err(|e| format!("connect: {e}"))?;
++    stream.set_read_timeout(Some(TIMEOUT)).map_err(|e| e.to_string())?;
++    stream.set_write_timeout(Some(TIMEOUT)).map_err(|e| e.to_string())?;
++    if let Some(peer) = crate::server::stream_pid(&stream) {
++        if peer != pid {
++            return Err(format!("the socket is served by pid {peer}, not {pid}"));
++        }
++    }
++    Ok(stream)
++}
++
++/// The application's menu and menu bar state; an error when it has no socket or did not answer.
++pub fn fetch(runtime: &Path, pid: i32) -> Result<AppMenu, String> {
++    let mut stream = connect(runtime, pid)?;
++    stream.write_all(b"menubar\nmenu 1\n").map_err(|e| format!("write: {e}"))?;
++    let mut reader = BufReader::new(stream);
++    let mut menu = AppMenu { pid, ..AppMenu::default() };
++    let mut line = String::new();
++    let mut first = true;
++    loop {
++        line.clear();
++        match reader.read_line(&mut line) {
++            Ok(0) => return Err("the application closed the socket before `end`".into()),
++            Ok(_) => {}
++            Err(e) => return Err(format!("no answer: {e}")),
++        }
++        let text = line.trim_end_matches(['\n', '\r']);
++        if first {
++            first = false;
++            match text {
++                "shown" => { menu.menubar = Some(true); continue }
++                "hidden" => { menu.menubar = Some(false); continue }
++                _ if text.starts_with("error") => continue,
++                _ => {}
++            }
++        }
++        if text == "end" {
++            return Ok(menu);
++        }
++        if let Some(item) = parse_item(text) {
++            if menu.items.len() < MAX_ITEMS {
++                menu.items.push(item);
++            }
++        }
++    }
++}
++
++/// One request, one line of answer (`invoke <id>`, `menubar toggle`).
++pub fn request(runtime: &Path, pid: i32, line: &str) -> Result<String, String> {
++    let mut stream = connect(runtime, pid)?;
++    stream.write_all(format!("{line}\n").as_bytes()).map_err(|e| format!("write: {e}"))?;
++    let mut answer = String::new();
++    BufReader::new(stream).read_line(&mut answer).map_err(|e| format!("no answer: {e}"))?;
++    Ok(answer.trim_end().to_string())
++}
++
++/// `cmd+shift+t` as macOS writes it: ⇧⌘T (Control, Option, Shift, Command, then the key).
++pub fn key_label(key: &str) -> String {
++    if key.is_empty() || key == "-" {
++        return String::new();
++    }
++    let parts: Vec<&str> = key.split('+').collect();
++    let (mods, name) = parts.split_at(parts.len().saturating_sub(1));
++    let mut out = String::new();
++    for (word, glyph) in [("ctrl", "\u{2303}"), ("opt", "\u{2325}"), ("shift", "\u{21e7}"), ("cmd", "\u{2318}")] {
++        if mods.contains(&word) {
++            out.push_str(glyph);
++        }
++    }
++    let name = name.first().copied().unwrap_or("");
++    let named = match name {
++        "return" => "\u{21a9}".to_string(),
++        "tab" => "\u{21e5}".to_string(),
++        "delete" => "\u{232b}".to_string(),
++        "esc" => "\u{238b}".to_string(),
++        "left" => "\u{2190}".to_string(),
++        "right" => "\u{2192}".to_string(),
++        "up" => "\u{2191}".to_string(),
++        "down" => "\u{2193}".to_string(),
++        "space" => "Space".to_string(),
++        n if n.len() > 1 && n.starts_with('f') && n[1..].chars().all(|c| c.is_ascii_digit()) => n.to_uppercase(),
++        n => n.to_uppercase(),
++    };
++    out.push_str(&named);
++    out
++}
++
++/// The rows for the window menu: the menu bar's row, then the application's menus as submenus.
++pub fn rows(menu: &AppMenu) -> Vec<MenuItem> {
++    let mut rows = Vec::new();
++    if let Some(shown) = menu.menubar {
++        rows.push(MenuItem::Action { label: if shown { "Hide Menu Bar" } else { "Show Menu Bar" }.into(), action: MENUBAR_TOGGLE });
++    }
++    let mut index = 0;
++    while index < menu.items.len() {
++        let item = &menu.items[index];
++        if item.depth == 0 {
++            let (children, next) = level(&menu.items, index + 1, 1);
++            if !children.is_empty() && !item.flags.contains('p') {
++                rows.push(MenuItem::Submenu { label: item.title.clone(), items: children });
++            }
++            index = next;
++        } else {
++            index += 1;
++        }
++    }
++    rows
++}
++
++/// The rows of one menu at `depth`, from `start`; returns them and where the menu ends.
++fn level(items: &[Item], start: usize, depth: u32) -> (Vec<MenuItem>, usize) {
++    let mut rows = Vec::new();
++    let mut i = start;
++    while i < items.len() && items[i].depth >= depth {
++        let item = &items[i];
++        if item.depth > depth {
++            i += 1;
++            continue;
++        }
++        let flags = item.flags.as_str();
++        if flags.contains('p') || item.title.trim().is_empty() {
++            i += 1;
++            continue;
++        }
++        let mark = if flags.contains('c') { "\u{2713} " } else if flags.contains('m') { "\u{2013} " } else { "" };
++        if flags.contains('s') {
++            let (children, next) = level(items, i + 1, depth + 1);
++            if !children.is_empty() {
++                rows.push(MenuItem::Submenu { label: format!("{mark}{}", item.title), items: children });
++            }
++            i = next;
++            continue;
++        }
++        let key = key_label(&item.key);
++        let disabled = flags.contains('d');
++        let label = format!("{}{mark}{}{}", if disabled { DISABLED.to_string() } else { String::new() }, item.title, if key.is_empty() { String::new() } else { format!("\t{key}") });
++        rows.push(MenuItem::Action { label, action: if disabled { NOTHING } else { i as u32 + 1 } });
++        i += 1;
++    }
++    (rows, i)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::os::unix::net::UnixListener;
++
++    const MENU: &str = "item 0 0 sa - Activity Monitor\n\
++        item 0.0 1 - - About Activity Monitor\n\
++        item 0.1 1 p - \n\
++        item 0.2 1 - cmd+q Quit Activity Monitor\n\
++        item 1 0 s - File\n\
++        item 1.0 1 - cmd+w Close\n\
++        item 1.1 1 d cmd+p Print\u{2026}\n\
++        item 2 0 s - View\n\
++        item 2.0 1 c - Show Toolbar\n\
++        item 2.1 1 s - Update Frequency\n\
++        item 2.1.0 2 c - Very often (1 sec)\n\
++        item 2.1.1 2 - - Often (2 sec)\n\
++        item 2.2 1 - cmd+opt+shift+ctrl+down Odd\n\
++        end\n";
++
++    #[test]
++    fn an_applications_menu_becomes_the_window_menus_rows() {
++        let items: Vec<Item> = MENU.lines().filter_map(parse_item).collect();
++        let menu = AppMenu { pid: 1, menubar: Some(true), items };
++        let rows = rows(&menu);
++        let labels: Vec<&str> = rows.iter().map(MenuItem::label).collect();
++        assert_eq!(labels, ["Hide Menu Bar", "Activity Monitor", "File", "View"]);
++        let MenuItem::Submenu { items: file, .. } = &rows[2] else { panic!("File is a submenu") };
++        assert_eq!(file[0].label(), "Close\t\u{2318}W");
++        assert!(matches!(file[0], MenuItem::Action { action: 6, .. }), "the item's index plus one");
++        assert_eq!(file[1].label(), "\u{1}Print\u{2026}\t\u{2318}P", "disabled and dimmed");
++        assert!(matches!(file[1], MenuItem::Action { action: NOTHING, .. }));
++        let MenuItem::Submenu { items: view, .. } = &rows[3] else { panic!() };
++        assert_eq!(view[0].label(), "\u{2713} Show Toolbar");
++        let MenuItem::Submenu { label, items: freq } = &view[1] else { panic!("a nested submenu") };
++        assert_eq!(label, "Update Frequency");
++        assert_eq!(freq.len(), 2);
++        assert_eq!(view[2].label(), "Odd\t\u{2303}\u{2325}\u{21e7}\u{2318}\u{2193}");
++        let MenuItem::Submenu { items: app, .. } = &rows[1] else { panic!() };
++        assert_eq!(app.len(), 2, "the separator is left out");
++    }
++
++    /// A fake application on a real socket: the menu is fetched, an item invoked, the menu bar
++    /// toggled; an application without a socket gives an error (the window verbs only).
++    #[test]
++    fn the_menu_is_fetched_and_an_item_invoked_over_the_applications_socket() {
++        let runtime = tempfile::tempdir().unwrap();
++        let pid = std::process::id() as i32;
++        std::fs::create_dir(runtime.path().join("app-menu")).unwrap();
++        let listener = UnixListener::bind(socket_path(runtime.path(), pid)).unwrap();
++        let app = std::thread::spawn(move || {
++            let mut seen = Vec::new();
++            for _ in 0..3 {
++                let (stream, _) = listener.accept().unwrap();
++                let mut reader = BufReader::new(stream.try_clone().unwrap());
++                let mut out = stream;
++                let mut line = String::new();
++                while reader.read_line(&mut line).unwrap() > 0 {
++                    let request = line.trim_end().to_string();
++                    line.clear();
++                    seen.push(request.clone());
++                    match request.as_str() {
++                        "menubar" => out.write_all(b"shown\n").unwrap(),
++                        "menu 1" => { out.write_all(MENU.as_bytes()).unwrap(); break }
++                        r if r.starts_with("invoke ") || r.starts_with("menubar ") => { out.write_all(b"ok\n").unwrap(); break }
++                        _ => out.write_all(b"error unknown\n").unwrap(),
++                    }
++                }
++            }
++            seen
++        });
++        let menu = fetch(runtime.path(), pid).unwrap();
++        assert_eq!(menu.menubar, Some(true));
++        assert_eq!(menu.items.len(), 13);
++        assert_eq!(request(runtime.path(), pid, &format!("invoke {}", menu.items[5].id)).unwrap(), "ok");
++        assert_eq!(request(runtime.path(), pid, "menubar toggle").unwrap(), "ok");
++        assert_eq!(app.join().unwrap(), ["menubar", "menu 1", "invoke 1.0", "menubar toggle"]);
++        assert!(fetch(runtime.path(), pid + 1).is_err(), "no socket: no rows");
++    }
++}
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/wm-darwin/src/capture.rs desk3-src/crates/wm-darwin/src/capture.rs
+--- desk2-src/crates/wm-darwin/src/capture.rs	2026-11-14 11:30:08.601021466 -0800
++++ desk3-src/crates/wm-darwin/src/capture.rs	2026-11-14 13:07:40.254862883 -0800
+@@ -516,6 +516,9 @@
+                 let _ = client.stream.set_nonblocking(false);
+                 // A new terminal window (the dock's Terminal tile): the desktop's own launcher.
+                 if text.trim() == "terminal" {
++                    #[cfg(feature = "desktop-shell")]
++                    let answer = self.request_terminal_once();
++                    #[cfg(not(feature = "desktop-shell"))]
+                     let answer = self.request_terminal();
+                     let _ = client.stream.write_all(answer.as_bytes());
+                     continue;
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/wm-darwin/src/desktop.rs desk3-src/crates/wm-darwin/src/desktop.rs
+--- desk2-src/crates/wm-darwin/src/desktop.rs	2026-11-14 10:55:31.182524528 -0800
++++ desk3-src/crates/wm-darwin/src/desktop.rs	2026-11-14 13:22:21.120889051 -0800
+@@ -31,6 +31,10 @@
+     /// desktop menu goes to the desktop, not to the menu that has just
+     /// appeared under the pointer.
+     press_target: [Option<PressTarget>; 3],
++    /// Where each button last went down (any target): the release of a click that opened a
++    /// menu under the pointer (a right click or Control-click on a title bar) lands on the new
++    /// menu, and is not a click on it unless the pointer moved.
++    press_point: [Option<Point>; 3],
+     /// The Wi-Fi interface behind the menu's Wi-Fi rows.
+     pub wifi: Box<dyn crate::settings::Wifi>,
+     /// Keep the menu's theme and scale choices for the next session (the
+@@ -288,6 +292,10 @@
+                     let wallpaper = self.desktop.as_ref().map_or("", |d| d.shell.wallpaper_id());
+                     (format!("theme={id} wallpaper={wallpaper} persisted={}", u8::from(persisted)), format!("Theme: {label}"))
+                 }
++                HostRequest::WindowAction(client, id) => {
++                    self.app_menu_pick(client, id);
++                    continue;
++                }
+                 HostRequest::WallpaperChanged => {
+                     let Some(desktop) = self.desktop.as_ref() else { continue };
+                     let id = desktop.shell.wallpaper_id();
+@@ -301,6 +309,15 @@
+                 }
+                 HostRequest::Action(id) => {
+                     let Some(action) = crate::settings::Action::from_id(id) else { continue };
++                    // An application row: brought forward when it runs, opened once (macdesk).
++                    if let crate::settings::Action::OpenApplication(n) = action {
++                        if let Some(path) = crate::settings::application_path(n) {
++                            if self.open_application_path(&path).is_some() {
++                                eprintln!("WMSET open_application={n} path={} (launcher rules)", path.display());
++                                continue;
++                            }
++                        }
++                    }
+                     let Some(desktop) = self.desktop.as_ref() else { continue };
+                     let notice = crate::settings::apply(action, &*desktop.wifi, self.power.mixer());
+                     let line = match action {
+@@ -352,7 +369,59 @@
+         );
+         Ok(())
+     }
++    /// The rows a Mac application's window menu gets from the application (none: it has no
++    /// menu socket or did not answer, or the window is not a Mac application's).
++    fn app_menu_rows(&mut self, id: wm_core::ClientId) -> Vec<wm_theme::menu::MenuItem> {
++        self.app_menu = None;
++        let Some(window) = self.wm.client(id).map(|c| c.window) else { return Vec::new() };
++        let Some(w) = self.wm.backend().windows.get(&window) else { return Vec::new() };
++        let app_id = w.app_id.clone().filter(|a| !a.is_empty()).or_else(|| w.last_app_id.clone()).unwrap_or_default();
++        if wm_theme::app_icon::bundle_for_identifier(&app_id).is_none() {
++            return Vec::new();
++        }
++        let Some(pid) = crate::server::peer_of(w.surface.wl_surface()).and_then(|p| p.pid) else { return Vec::new() };
++        let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else { return Vec::new() };
++        let started = std::time::Instant::now();
++        match crate::appmenu::fetch(std::path::Path::new(&runtime), pid) {
++            Ok(menu) => {
++                let rows = crate::appmenu::rows(&menu);
++                eprintln!("WMAPPMENU app={app_id} pid={pid} items={} menubar={:?} in {} ms", menu.items.len(), menu.menubar, started.elapsed().as_millis());
++                self.app_menu = Some((id, menu));
++                rows
++            }
++            Err(error) => {
++                eprintln!("WMAPPMENU app={app_id} pid={pid}: {error} (the window's own verbs only)");
++                Vec::new()
++            }
++        }
++    }
++    /// A row of a Mac application's menu was picked in the window menu: the application does it.
++    fn app_menu_pick(&mut self, client: wm_core::ClientId, id: u32) {
++        let Some((owner, menu)) = self.app_menu.as_ref().filter(|(owner, _)| *owner == client) else { return };
++        let _ = owner;
++        let line = if id == crate::appmenu::MENUBAR_TOGGLE {
++            "menubar toggle".to_string()
++        } else {
++            match menu.items.get(id as usize - 1) {
++                Some(item) => format!("invoke {}", item.id),
++                None => return,
++            }
++        };
++        let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else { return };
++        let answer = crate::appmenu::request(std::path::Path::new(&runtime), menu.pid, &line);
++        eprintln!("WMAPPMENU pid={} {line} -> {answer:?}", menu.pid);
++    }
+     pub(crate) fn service_desktop(&mut self) -> Result<(), String> {
++        if self.desktop.is_none() {
++            return Ok(());
++        }
++        // A window menu is about to open: a Mac application's own menu goes in it (appmenu.rs).
++        if let Some(id) = self.wm.pending_window_menu() {
++            let rows = self.app_menu_rows(id);
++            if let Some(desktop) = self.desktop.as_mut() {
++                desktop.shell.set_window_menu_extra(rows);
++            }
++        }
+         let Some(desktop) = self.desktop.as_mut() else {
+             return Ok(());
+         };
+@@ -459,6 +528,11 @@
+             }
+         }
+         let was_popup = self.wm.backend().popup_active();
++        for bit in 0..3 {
++            if buttons & !previous & (1 << bit) != 0 {
++                self.desktop.as_mut().unwrap().press_point[bit] = Some(root);
++            }
++        }
+         if self.wm.backend().keyboard_grabbed && !was_popup {
+             return Ok(true);
+         }
+@@ -492,7 +566,15 @@
+                 desktop.press_target[bit] = target;
+                 None
+             } else {
+-                desktop.press_target[bit].take()
++                let target = desktop.press_target[bit].take();
++                // The release of the click that opened this menu (its press was not on it): no
++                // pick and no dismissal while the pointer has not moved (macOS's contextual menu
++                // stays open after a click; pressing, dragging to a row and releasing picks it).
++                let still = desktop.press_point[bit].is_some_and(|p| (p.x - root.x).abs() <= 4 && (p.y - root.y).abs() <= 4);
++                if target.is_none() && was_popup && still && matches!(hit, DesktopHit::Shell(..)) {
++                    continue;
++                }
++                target
+             };
+             let hit = match target {
+                 Some(PressTarget::Shell(id)) => match self.wm.backend().shell_local(id, root) {
+@@ -564,6 +646,7 @@
+             launcher: None,
+             startup_requested: false,
+             press_target: [None; 3],
++            press_point: [None; 3],
+             space_seen: None,
+             wifi: Box::new(crate::settings::NativeWifi),
+             persist: false,
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/wm-darwin/src/inject.rs desk3-src/crates/wm-darwin/src/inject.rs
+--- desk2-src/crates/wm-darwin/src/inject.rs	2026-11-14 01:15:01.640058404 -0800
++++ desk3-src/crates/wm-darwin/src/inject.rs	2026-11-14 13:37:20.715324778 -0800
+@@ -20,6 +20,10 @@
+ //! wait <milliseconds>              nothing for that long (at most 10 s)
+ //! capture <name>                   the frame as it was last rendered, to <name>.ppm in the directory
+ //!                                  (an error after 2 s without one: the display sleeps until a key)
++//! dump <name>                      every window's own picture as the client gave it (no frame, nothing
++//!                                  over it) to <name>-<window>.ppm, and <name>.txt listing windows
++//!                                  (app id, content and frame rectangles, picture size) and the
++//!                                  desk's other surfaces (popups, layers, panels) with their rectangles
+ //! ```
+ //!
+ //! Events enter where the device nodes' events do (`Server::deliver_hid`), so a client sees
+@@ -41,6 +45,7 @@
+     Event(Event),
+     Wait(Duration),
+     Capture(String),
++    Dump(String),
+ }
+ 
+ pub struct Inject {
+@@ -88,6 +93,7 @@
+                 }),
+                 ["wait", ms] => ms.parse::<u64>().ok().filter(|ms| *ms <= 10_000).map(|ms| Step::Wait(Duration::from_millis(ms))),
+                 ["capture", name] if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => Some(Step::Capture((*name).to_string())),
++                ["dump", name] if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => Some(Step::Dump((*name).to_string())),
+                 _ => None,
+             };
+             match step {
+@@ -136,6 +142,14 @@
+             }
+             // a capture is of a rendered frame: after the repaint
+             Some(Step::Capture(_)) => {}
++            Some(Step::Dump(name)) => {
++                let name = name.clone();
++                if let Err(error) = self.dump(server, &name) {
++                    self.errors.push(format!("dump {name}: {error}"));
++                }
++                self.queue.pop_front();
++                self.done += 1;
++            }
+             None => self.finish(),
+         }
+         Ok(())
+@@ -182,6 +196,43 @@
+         self.done += 1;
+         Ok(())
+     }
++    /// The windows' own pictures and the scene's surfaces (`dump <name>`).
++    fn dump(&mut self, server: &Server, name: &str) -> Result<(), String> {
++        let backend = server.wm.backend();
++        let mut text = String::new();
++        let mut ids: Vec<u64> = backend.windows.keys().copied().collect();
++        ids.sort_unstable();
++        for id in ids {
++            let w = &backend.windows[&id];
++            let frame = backend.window_frame_rect(id);
++            let image = w.image.as_ref();
++            text.push_str(&format!(
++                "window {id} app_id={:?} title={:?} mapped={} content={:?} frame={:?} picture={:?} external={}\n",
++                w.app_id.as_deref().or(w.last_app_id.as_deref()).unwrap_or(""), w.title.as_deref().unwrap_or(""), w.mapped, w.content, frame,
++                image.map(|i| (i.width, i.height)), w.external.is_some()
++            ));
++            let Some(image) = image.filter(|i| i.pixels.len() == i.width as usize * i.height as usize * 4) else { continue };
++            // how opaque the client's picture is (premultiplied RGBA): a translucent window shows
++            // what is under it
++            let mut alphas = std::collections::BTreeMap::<u8, u64>::new();
++            for pixel in image.pixels.chunks_exact(4) {
++                *alphas.entry(pixel[3]).or_default() += 1;
++            }
++            let mut common: Vec<(u8, u64)> = alphas.into_iter().collect();
++            common.sort_by(|a, b| b.1.cmp(&a.1));
++            common.truncate(4);
++            text.push_str(&format!("  alpha (value, pixels), most common: {common:?}\n"));
++            let mut file = format!("P6\n{} {}\n255\n", image.width, image.height).into_bytes();
++            for pixel in image.pixels.chunks_exact(4) {
++                file.extend_from_slice(&pixel[..3]);
++            }
++            std::fs::write(self.dir.join(format!("{name}-{id}.ppm")), file).map_err(|e| e.to_string())?;
++        }
++        text.push_str(&backend.describe_shells());
++        std::fs::write(self.dir.join(format!("{name}.txt")), text).map_err(|e| e.to_string())?;
++        eprintln!("WMINJECT dump={name}");
++        Ok(())
++    }
+     fn finish(&mut self) {
+         self.active = false;
+         let line = format!("done steps={} errors={} {}\n", self.done, self.errors.len(), self.errors.join("; "));
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/wm-darwin/src/input.rs desk3-src/crates/wm-darwin/src/input.rs
+--- desk2-src/crates/wm-darwin/src/input.rs	2026-11-14 11:53:54.596365495 -0800
++++ desk3-src/crates/wm-darwin/src/input.rs	2026-11-14 13:00:45.794596158 -0800
+@@ -17,9 +17,22 @@
+     physical_buttons:u8,control_click:bool,
+     /// Key events delivered so far and the last one (evdev code, down).
+     hid_keys:u64,last_hid_key:Option<(u32,bool)>,
++    /// Where the pointer was when a client hid it (`set_cursor` without a surface, or a cursor
++    /// surface with no buffer). The hide lasts until the pointer moves `UNHIDE_DISTANCE` panel
++    /// pixels from there, as macOS's hide-while-typing does: the default arrow then comes back
++    /// unless the client gives another image. A hidden pointer is never left on screen forever.
++    hidden_at:Option<(f64,f64)>,
+     #[cfg(feature = "desktop-shell")]
+     deferred_focus:bool,
+ }
++/// How far (panel pixels) the pointer moves before a client's hide gives way to the arrow.
++pub(crate) const UNHIDE_DISTANCE:f64=6.0;
++/// The last image a client gave a cursor surface, kept with the surface: `wl_pointer.set_cursor`
++/// with a surface that already has content shows that content (the protocol's current state),
++/// whether or not a new buffer was committed since. Raw pixels and the buffer scale they were
++/// drawn at; fitted to the display scale when shown.
++#[derive(Default)]
++struct CursorImageCache(std::sync::Mutex<Option<(wm_theme_api::DecorationBuffer,i32)>>);
+ impl Server {
+     /// The focused toplevel belongs to a Mac application: its app id is the bundle identifier of an
+     /// application bundle in /Applications.
+@@ -110,7 +123,7 @@
+         let pointer=if caps.pointer{Some(seat.add_pointer())}else{None};
+         self.input=Some(InputState{seat,keyboard,pointer,position:(0.,0.),buttons:0,forwarded:0,
+             modifiers:Modifiers::empty(),last_time:0,suppressed_keys:HashSet::new(),cursor_surface:None,
+-            physical_buttons:0,control_click:false,hid_keys:0,last_hid_key:None,
++            physical_buttons:0,control_click:false,hid_keys:0,last_hid_key:None,hidden_at:None,
+             #[cfg(feature = "desktop-shell")]
+             deferred_focus:false});
+         let b=self.wm.backend_mut();b.input_enabled=true;
+@@ -278,6 +291,7 @@
+                 let buttons=secondary_click(buttons,input.physical_buttons,mods==Modifiers::CONTROL,&mut input.control_click);
+                 input.physical_buttons=(input.physical_buttons&!7)|(buttons_physical(&event)&7);
+                 let b=self.wm.backend_mut();b.pointer=root;b.dirty=true;
++                self.unhide_cursor_on_motion();
+                 // Control-Command with a two-finger scroll: between Spaces (gesture.rs, the stand-in).
+                 if wheel!=0 && mods==Modifiers::CONTROL|Modifiers::SUPER && !self.wm.interactive_drag_active() {
+                     self.wheel_swipe(wheel,time);
+@@ -373,7 +387,7 @@
+                 let under=if self.wm.interactive_drag_active(){None}else{
+                     self.wm.backend().hit_at(root).and_then(|(hit,_)|match hit{SurfaceRef::Client(id)=>Some(id),_=>None})};
+                 let (location,focus)=self.pointer_for_clients(x.clamp(0.,f64::from(size.w-1)),y.clamp(0.,f64::from(size.h-1)),under);
+-                pointer.motion(self,focus,&MotionEvent{location:location.into(),serial:SERIAL_COUNTER.next_serial(),time});
++                self.pointer_motion_to(&pointer,focus,location,time);
+                 for bit in 0..3 {
+                     let mask=1<<bit;if (previous^buttons)&mask==0{continue;}
+                     let pressed=buttons&mask!=0;
+@@ -396,6 +410,14 @@
+                 // An interactive resize just ended (or a click): adopt what
+                 // caught-up clients actually drew, as the Linux backend does.
+                 if previous!=buttons && !self.wm.interactive_drag_active(){self.fit_caught_up_windows();}
++                // A move or resize grab just ended: the window under the pointer gets `enter` (and
++                // so sets its cursor) now, not at the next movement; the pointer had left every
++                // client while the grab lasted.
++                if dragging && !self.wm.interactive_drag_active(){
++                    let under=self.wm.backend().hit_at(root).and_then(|(hit,_)|match hit{SurfaceRef::Client(id)=>Some(id),_=>None});
++                    let (location,focus)=self.pointer_for_clients(x.clamp(0.,f64::from(size.w-1)),y.clamp(0.,f64::from(size.h-1)),under);
++                    self.pointer_motion_to(&pointer,focus,location,time);
++                }
+                 if wheel!=0 && !self.wm.interactive_drag_active(){pointer.axis(self,AxisFrame::new(time).source(AxisSource::Wheel).value(Axis::Vertical,-f64::from(wheel)*10.).v120(Axis::Vertical,-i32::from(wheel)*120));}
+                 pointer.frame(self);
+             }
+@@ -437,11 +459,50 @@
+             eprintln!("WMPOPUP pointer refresh: {error}");
+         }
+     }
++    /// Pointer motion to `focus` (a client surface or nothing). Entering a client surface from
++    /// nothing starts with the default arrow, as a change from one surface to another does
++    /// (smithay resets it on leave and replace, not on a plain enter): whatever a client set
++    /// before is not carried onto another one.
++    pub(crate) fn pointer_motion_to(&mut self,pointer:&PointerHandle<Server>,focus:Option<(WlSurface,smithay::utils::Point<f64,smithay::utils::Logical>)>,location:(f64,f64),time:u32){
++        let entering=focus.is_some() && pointer.current_focus().is_none();
++        if entering{self.show_default_cursor();}
++        pointer.motion(self,focus,&MotionEvent{location:location.into(),serial:SERIAL_COUNTER.next_serial(),time});
++    }
++    /// The default arrow at the display's scale (also what a client that has set no valid image
++    /// since the pointer entered it shows).
++    pub(crate) fn show_default_cursor(&mut self){
++        let Some(input)=self.input.as_mut() else{return;};
++        if input.pointer.is_none(){return;}
++        input.cursor_surface=None;input.hidden_at=None;
++        let arrow=crate::scale::arrow(self.scale());
++        self.wm.backend_mut().set_cursor(Some((Point::new(0,0),arrow)));
++    }
++    /// A client hid the pointer: until the pointer moves (see `hidden_at`).
++    fn hide_cursor_for_client(&mut self,why:&str){
++        let Some(input)=self.input.as_mut() else{return;};
++        input.hidden_at=Some(input.position);
++        self.wm.backend_mut().set_cursor(None);
++        eprintln!("WMCURSOR hidden by the client ({why}); shown again when the pointer moves {UNHIDE_DISTANCE} px or enters another surface");
++    }
++    /// Pointer motion: a client's hide ends once the pointer has moved away from where it was.
++    pub(crate) fn unhide_cursor_on_motion(&mut self){
++        let Some(input)=self.input.as_ref() else{return;};
++        let Some((x,y))=input.hidden_at else{return;};
++        let (px,py)=input.position;
++        if (px-x).hypot(py-y)>=UNHIDE_DISTANCE{
++            eprintln!("WMCURSOR the pointer moved after a client hid it: the arrow is shown again");
++            self.show_default_cursor();
++        }
++    }
+     pub(crate) fn cursor_image_changed(&mut self,image:CursorImageStatus){
+         let Some(input)=&mut self.input else{return;};
+         input.cursor_surface=match &image {CursorImageStatus::Surface(surface)=>Some(surface.clone()),_=>None};
+-        if let Some(surface)=input.cursor_surface.clone(){self.announce_scale(&surface);self.import_cursor(&surface);}
+-        else{let arrow=crate::scale::arrow(self.scale());self.wm.backend_mut().set_cursor(match image{CursorImageStatus::Hidden=>None,_=>Some((Point::new(0,0),arrow))});}
++        input.hidden_at=None;
++        match image{
++            CursorImageStatus::Surface(surface)=>{self.announce_scale(&surface);self.import_cursor(&surface);}
++            CursorImageStatus::Hidden=>self.hide_cursor_for_client("set_cursor without a surface"),
++            _=>self.show_default_cursor(),
++        }
+     }
+     pub(crate) fn import_cursor(&mut self,surface:&WlSurface){
+         let (buffer,scale,transform,hotspot,callbacks)=with_states(surface,|s|{
+@@ -449,27 +510,56 @@
+             let mut a=s.cached_state.get::<SurfaceAttributes>();let a=a.current();a.damage.clear();
+             (a.buffer.take(),a.buffer_scale,a.buffer_transform,hotspot,std::mem::take(&mut a.frame_callbacks))
+         });
+-        if scale<1 || transform!=wl_output::Transform::Normal{Self::refuse(surface,"unsupported cursor transform/scale");return;}
++        self.cursor_callbacks.extend(callbacks);
++        self.wm.backend_mut().dirty=true;
++        if scale<1 || transform!=wl_output::Transform::Normal{
++            Self::refuse(surface,"unsupported cursor transform/scale");
++            self.show_default_cursor();
++            return;
++        }
+         // The hotspot is in the cursor surface's logical units; the image is
+         // shown at the display scale: as it is when the client drew it at
+         // that density, resampled when it did not.
+         let display=self.scale();
+         let hotspot=Point::new(display.to_physical(hotspot.x),display.to_physical(hotspot.y));
+-        match buffer{
++        // What the surface shows: a new buffer, or what it was given before (the surface keeps
++        // its content until the client changes it; a client may set the same surface again).
++        let raw=match buffer{
+             Some(BufferAssignment::NewBuffer(buffer))=>{
+                 let image=self.import_shm(&buffer);buffer.release();
+-                let image=image.and_then(|image|{
+-                    let fitted=crate::scale::fit(display,wm_core::Size::new(image.width,image.height),scale,None);
+-                    if fitted.logical.w>256 || fitted.logical.h>256{return Err("cursor exceeds 256x256".into());}
+-                    if fitted.exact{Ok(image)}else{crate::pixels::resample(&image,fitted.physical.w,fitted.physical.h)}
+-                });
+-                match image{Ok(image)=>self.wm.backend_mut().set_cursor(Some((hotspot,image))),Err(e)=>Self::refuse(surface,&e)}
++                match image{
++                    Ok(image)=>{
++                        with_states(surface,|s|{
++                            s.data_map.insert_if_missing_threadsafe(CursorImageCache::default);
++                            *s.data_map.get::<CursorImageCache>().unwrap().0.lock().unwrap()=Some((image.clone(),scale));
++                        });
++                        Some((image,scale))
++                    }
++                    Err(e)=>{Self::refuse(surface,&e);self.show_default_cursor();return;}
++                }
+             }
+-            Some(BufferAssignment::Removed)=>self.wm.backend_mut().set_cursor(None),
+-            None=>self.wm.backend_mut().set_cursor_hotspot(hotspot),
++            Some(BufferAssignment::Removed)=>{
++                with_states(surface,|s|{if let Some(c)=s.data_map.get::<CursorImageCache>(){*c.0.lock().unwrap()=None;}});
++                self.hide_cursor_for_client("cursor surface without a buffer");
++                return;
++            }
++            None=>with_states(surface,|s|s.data_map.get::<CursorImageCache>().and_then(|c|c.0.lock().unwrap().clone())),
++        };
++        let Some((image,buffer_scale))=raw else{
++            // set_cursor with a surface that never had an image: nothing valid to show, so the
++            // pointer stays visible as the arrow (never an invisible pointer by omission).
++            eprintln!("WMCURSOR a client set a cursor surface that has no image yet: the arrow is shown");
++            let arrow=crate::scale::arrow(display);
++            self.wm.backend_mut().set_cursor(Some((Point::new(0,0),arrow)));
++            return;
++        };
++        let fitted=crate::scale::fit(display,wm_core::Size::new(image.width,image.height),buffer_scale,None);
++        if fitted.logical.w>256 || fitted.logical.h>256{Self::refuse(surface,"cursor exceeds 256x256");self.show_default_cursor();return;}
++        let image=if fitted.exact{Ok(image)}else{crate::pixels::resample(&image,fitted.physical.w,fitted.physical.h)};
++        match image{
++            Ok(image)=>self.wm.backend_mut().set_cursor(Some((hotspot,image))),
++            Err(e)=>{Self::refuse(surface,&e);self.show_default_cursor();}
+         }
+-        self.wm.backend_mut().dirty=true;
+-        self.cursor_callbacks.extend(callbacks);
+     }
+ }
+ 
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/wm-darwin/src/layers.rs desk3-src/crates/wm-darwin/src/layers.rs
+--- desk2-src/crates/wm-darwin/src/layers.rs	2026-11-14 11:44:15.177150327 -0800
++++ desk3-src/crates/wm-darwin/src/layers.rs	2026-11-14 14:16:00.534710565 -0800
+@@ -35,6 +35,29 @@
+ }
+ 
+ impl Server {
++    /// A window placed for the first time is moved out from under the dock's launcher strip
++    /// (namespace `chonk-dock-launcher`, which reserves no space: maximise and dragging may still
++    /// cover it, as the owner wants), so its title bar's buttons are not born under a tile.
++    pub(crate) fn place_clear_of_launchers(&mut self, window: u64) {
++        let Some(frame) = self.wm.backend().window_frame_rect(window) else { return };
++        let overlaps = |r: &Rect| r.pos.x < frame.pos.x + frame.size.w as i32 && frame.pos.x < r.pos.x + r.size.w as i32
++            && r.pos.y < frame.pos.y + frame.size.h as i32 && frame.pos.y < r.pos.y + r.size.h as i32;
++        let Some(right) = self.layers.iter()
++            .filter(|l| l.namespace == "chonk-dock-launcher" && l.shell.is_some() && l.exclusive.is_none() && !l.hidden)
++            .filter(|l| overlaps(&l.rect))
++            .map(|l| l.rect.pos.x + l.rect.size.w as i32)
++            .max() else { return };
++        let dx = right - frame.pos.x;
++        let screen = self.wm.backend().screen_size();
++        let room = screen.w as i32 - (frame.pos.x + frame.size.w as i32 + dx);
++        if dx <= 0 || room < -(frame.size.w as i32) / 2 {
++            return; // no room beside the strip: left where wm-core placed it
++        }
++        let Some(id) = self.wm.client_for_window(window) else { return };
++        let Some(content) = self.wm.client(id).map(|c| c.geometry) else { return };
++        eprintln!("WMLAYER placed window={window} clear of the launcher strip: x {} -> {}", frame.pos.x, frame.pos.x + dx);
++        self.wm.set_client_content_geometry(id, Rect::new(Point::new(content.pos.x + dx, content.pos.y), content.size));
++    }
+     fn layer_index(&self, surface: &WlSurface) -> Option<usize> {
+         self.layers.iter().position(|l| l.surface.wl_surface() == surface)
+     }
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/wm-darwin/src/lib.rs desk3-src/crates/wm-darwin/src/lib.rs
+--- desk2-src/crates/wm-darwin/src/lib.rs	2026-11-14 10:38:00.034390760 -0800
++++ desk3-src/crates/wm-darwin/src/lib.rs	2026-11-14 13:19:33.933188661 -0800
+@@ -15,6 +15,8 @@
+ #[cfg(feature = "desktop-shell")]
+ pub mod macdesk;
+ #[cfg(feature = "desktop-shell")]
++pub mod appmenu;
++#[cfg(feature = "desktop-shell")]
+ pub mod record;
+ pub mod glrender;
+ mod foreign;
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/wm-darwin/src/macdesk.rs desk3-src/crates/wm-darwin/src/macdesk.rs
+--- desk2-src/crates/wm-darwin/src/macdesk.rs	2026-11-14 11:51:44.365698978 -0800
++++ desk3-src/crates/wm-darwin/src/macdesk.rs	2026-11-14 13:40:20.256300695 -0800
+@@ -99,6 +99,9 @@
+     fn bundle(&self, app_id: &str) -> Option<&Bundle> {
+         self.bundles.iter().find(|b| b.id.eq_ignore_ascii_case(app_id))
+     }
++    fn bundle_at(&self, path: &Path) -> Option<&Bundle> {
++        self.bundles.iter().find(|b| b.path == path)
++    }
+     fn name(&self, app_id: &str) -> String {
+         if let Some(b) = self.bundle(app_id) {
+             return b.name.clone();
+@@ -215,8 +218,12 @@
+     apps: Vec<App>,
+     selected: usize,
+     surfaces: Vec<u64>,
++    /// Each application's cell on the screen (the pointer picks one).
++    cells: Vec<Rect>,
+ }
+ 
++/// How long a launch request makes a repeat of it a no-op while no window of it has come.
++pub const OPEN_DEBOUNCE: Duration = Duration::from_secs(10);
+ #[derive(Default)]
+ pub struct MacDesk {
+     catalog: Catalog,
+@@ -228,6 +235,14 @@
+     /// An application just opened by the launcher or its dock tile: its first window gets the
+     /// focus when it comes (macOS brings a launched application forward).
+     launching: Option<(String, Instant)>,
++    /// Applications asked to open and not yet shown (by lower-case bundle id), and when: a second
++    /// request for one of them (a double click on its dock tile, the launcher or the Applications
++    /// menu while it starts) is not a second launch. Forgotten when a window of it comes, or
++    /// after `OPEN_DEBOUNCE`.
++    opening: HashMap<String, Instant>,
++    /// A new desk terminal asked for by the dock's tile or the launcher, with the number of
++    /// managed windows then: the same request again before a window came is not a second one.
++    terminal_requested: Option<(Instant, usize)>,
+     pub switcher: Option<Switcher>,
+     pub list: Option<ListPanel>,
+ }
+@@ -304,8 +319,49 @@
+         let app = w.app_id.clone().or_else(|| w.last_app_id.clone()).filter(|a| !a.is_empty());
+         Some(app.map(|a| a.to_ascii_lowercase()).unwrap_or_else(|| format!("window-{window}")))
+     }
++    /// A launch request that repeats one still under way: true when it is to be ignored.
++    fn open_pending(&mut self, key: &str) -> bool {
++        match self.macdesk.opening.get(key) {
++            Some(since) if since.elapsed() < OPEN_DEBOUNCE => {
++                eprintln!("WMMAC open {key} ignored: already opening ({} ms ago, its window has not come yet)", since.elapsed().as_millis());
++                true
++            }
++            _ => false,
++        }
++    }
++    /// The desk's terminal for the dock's tile and the launcher: one new window per request,
++    /// a repeat while the last one has not appeared yet is ignored (a double click).
++    pub(crate) fn request_terminal_once(&mut self) -> String {
++        let windows = self.wm.client_count();
++        if let Some((since, before)) = self.macdesk.terminal_requested {
++            if since.elapsed() < OPEN_DEBOUNCE && windows <= before {
++                eprintln!("WMMAC terminal request ignored: one is starting ({} ms ago)", since.elapsed().as_millis());
++                return "ok starting\n".into();
++            }
++        }
++        self.macdesk.terminal_requested = Some((Instant::now(), windows));
++        self.request_terminal()
++    }
++    /// The desktop menu's Applications row: as the launcher does (brought forward when it runs,
++    /// else opened once). Returns the notice, or None when the bundle is not one the desk knows
++    /// (the caller then opens the path as before).
++    pub(crate) fn open_application_path(&mut self, path: &Path) -> Option<()> {
++        self.macdesk.catalog.refresh();
++        let id = self.macdesk.catalog.bundle_at(path)?.id.clone();
++        self.open_application(&id, Some(path));
++        Some(())
++    }
+     /// Once a frame: the order in which applications were used (Command-Tab's order).
+     pub fn macdesk_tick(&mut self) {
++        if !self.macdesk.opening.is_empty() {
++            let shown: Vec<String> = self.wm.iter_clients().filter(|(_, c)| c.lifecycle == wm_core::Lifecycle::Normal).filter_map(|(id, _)| self.app_key_of(id)).collect();
++            self.macdesk.opening.retain(|key, since| since.elapsed() < OPEN_DEBOUNCE && !shown.contains(key));
++        }
++        if let Some((_, before)) = self.macdesk.terminal_requested {
++            if self.wm.client_count() > before {
++                self.macdesk.terminal_requested = None;
++            }
++        }
+         if let Some((key, since)) = self.macdesk.launching.clone() {
+             if since.elapsed() > Duration::from_secs(20) {
+                 self.macdesk.launching = None;
+@@ -476,7 +532,7 @@
+         let n = apps.len();
+         let selected = if direction > 0 { 1 % n } else { n - 1 };
+         eprintln!("WMMAC switcher open apps={:?} selected={selected}", apps.iter().map(|a| a.name.as_str()).collect::<Vec<_>>());
+-        self.macdesk.switcher = Some(Switcher { apps, selected, surfaces: Vec::new() });
++        self.macdesk.switcher = Some(Switcher { apps, selected, surfaces: Vec::new(), cells: Vec::new() });
+         self.switcher_draw();
+     }
+     fn switcher_draw(&mut self) {
+@@ -516,6 +572,7 @@
+                 fill_rounded(&mut p, Rect::new(Point::new((x + cell / 2) as i32 - (3.0 * s) as i32, (pad + cell) as i32 - (5.0 * s) as i32), Size::new((6.0 * s) as u32, (6.0 * s) as u32)), 3.0 * s, [235, 235, 235, 200]);
+             }
+         }
++        let cells: Vec<Rect> = (0..apps.len()).map(|i| Rect::new(Point::new(at.x + (lead + i as u32 * cell) as i32, at.y + pad as i32), Size::new(cell, cell))).collect();
+         let mut surfaces = Vec::new();
+         surfaces.extend(self.shell_surface(Rect::new(at, Size::new(w, h)), &to_buffer(p)));
+         if let Some(label) = label {
+@@ -528,6 +585,7 @@
+         eprintln!("WMMAC switcher selected={selected} app={}", apps[selected].app_id);
+         if let Some(sw) = self.macdesk.switcher.as_mut() {
+             sw.surfaces = surfaces;
++            sw.cells = cells;
+         }
+     }
+     fn switcher_close(&mut self) -> Option<App> {
+@@ -688,7 +746,7 @@
+         eprintln!("WMMAC list choose name={:?}", entry.name);
+         match entry.target {
+             Target::Terminal => {
+-                let answer = self.request_terminal();
++                let answer = self.request_terminal_once();
+                 eprintln!("WMMAC launcher terminal answer={}", answer.trim());
+             }
+             Target::Bundle { path, id } => self.open_application(&id, Some(&path)),
+@@ -713,10 +771,15 @@
+             return;
+         };
+         let name = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
++        let key = id.to_ascii_lowercase();
++        if self.open_pending(&key) {
++            return;
++        }
+         match crate::settings::request_open(&path) {
+             Ok(()) => {
+                 eprintln!("WMMAC open {}", path.display());
+-                self.macdesk.launching = Some((id.to_ascii_lowercase(), Instant::now()));
++                self.macdesk.launching = Some((key.clone(), Instant::now()));
++                self.macdesk.opening.insert(key, Instant::now());
+             }
+             Err(e) => self.mac_notice(&format!("{name} could not be opened (error {e})")),
+         }
+@@ -729,7 +792,21 @@
+     /// A press of the pointer while a list panel is open: a row opens, outside closes.
+     /// Returns true when taken.
+     pub fn macdesk_pointer(&mut self, root: Point, buttons: u8, previous: u8) -> bool {
+-        if self.macdesk.switcher.is_some() {
++        if let Some(sw) = self.macdesk.switcher.as_ref() {
++            // The pointer over an application selects it; a click switches to it (macOS).
++            let inside = |r: &Rect| root.x >= r.pos.x && root.y >= r.pos.y && root.x < r.pos.x + r.size.w as i32 && root.y < r.pos.y + r.size.h as i32;
++            if let Some(i) = sw.cells.iter().position(inside) {
++                if i != sw.selected {
++                    self.macdesk.switcher.as_mut().unwrap().selected = i;
++                    self.switcher_draw();
++                }
++                if buttons & !previous & 1 != 0 {
++                    if let Some(app) = self.switcher_close() {
++                        eprintln!("WMMAC switcher click app={}", app.app_id);
++                        self.activate_app(&app);
++                    }
++                }
++            }
+             return true;
+         }
+         let Some(list) = self.macdesk.list.as_mut() else { return false };
+@@ -773,6 +850,16 @@
+                     self.switcher_close();
+                     eprintln!("WMMAC switcher cancelled");
+                 }
++                // H hides the selected application and the switcher stays (macOS)
++                0x68 | 0x48 => {
++                    let Some(sw) = self.macdesk.switcher.as_ref() else { return MacKey::Taken };
++                    let app = sw.apps[sw.selected].clone();
++                    eprintln!("WMMAC switcher hide app={}", app.app_id);
++                    if let Some(&id) = app.clients.first() {
++                        self.wm.hide_application_of(id);
++                    }
++                    self.switcher_draw();
++                }
+                 0x71 | 0x51 => {
+                     let Some(sw) = self.macdesk.switcher.as_ref() else { return MacKey::Taken };
+                     let app = sw.apps[sw.selected].clone();
+@@ -867,6 +954,29 @@
+ 
+ #[cfg(test)]
+ mod tests {
++    /// The owner's fourth finding: a double click on a launcher (dock tile, launcher, Applications
++    /// menu) opened the application twice. A repeat while the first has not shown a window is
++    /// ignored, for ten seconds at most.
++    #[test]
++    fn a_launch_repeated_before_its_window_comes_is_ignored() {
++        use smithay::reexports::wayland_server::Display;
++        let display = Display::<crate::server::Server>::new().unwrap();
++        let mut server = crate::server::Server::new(&display.handle(), wm_core::Size::new(1280, 800)).unwrap();
++        server.enable_sfhid_seat(&display.handle()).unwrap();
++        server.enable_desktop_shell_with(wm_theme::FontState::new(), Some("nextstep-classic")).unwrap();
++        let first = server.request_terminal_once();
++        assert_ne!(first, "ok starting\n", "the first request is carried out: {first}");
++        assert_eq!(server.request_terminal_once(), "ok starting\n", "a second click while the first terminal starts");
++        // An application asked to open: a repeat is ignored until a window of it comes or the time is up.
++        server.macdesk.opening.insert("com.apple.activitymonitor".into(), std::time::Instant::now());
++        assert!(server.open_pending("com.apple.activitymonitor"));
++        assert!(!server.open_pending("com.apple.terminal"));
++        server.macdesk.opening.insert("com.apple.terminal".into(), std::time::Instant::now() - super::OPEN_DEBOUNCE);
++        assert!(!server.open_pending("com.apple.terminal"), "after ten seconds a new request is a new launch");
++        server.macdesk_tick();
++        assert!(!server.macdesk.opening.contains_key("com.apple.terminal"));
++        assert!(server.macdesk.opening.contains_key("com.apple.activitymonitor"));
++    }
+     #[test]
+     fn launcher_matching_prefers_a_prefix_then_a_word_then_anything() {
+         assert_eq!(super::score("Activity Monitor", "act"), Some(0));
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/wm-darwin/src/popups.rs desk3-src/crates/wm-darwin/src/popups.rs
+--- desk2-src/crates/wm-darwin/src/popups.rs	2026-11-14 11:15:09.571307859 -0800
++++ desk3-src/crates/wm-darwin/src/popups.rs	2026-11-14 13:36:46.024756772 -0800
+@@ -25,6 +25,8 @@
+     /// The scene surface that shows it, once it has a buffer.
+     pub shell: Option<u64>,
+     pub grab: bool,
++    /// The toplevel window it belongs to (through its parents); none for a layer surface's.
++    pub owner: Option<u64>,
+ }
+ 
+ impl Server {
+@@ -44,6 +46,14 @@
+             .map(|p| (p.rect.pos, self.scale().factor()))
+     }
+ 
++    /// The toplevel window a popup with this parent belongs to.
++    fn popup_owner(&self, parent: &WlSurface) -> Option<u64> {
++        if let Some(id) = self.wm.backend().window_for_surface(parent) {
++            return Some(id);
++        }
++        self.client_popups.iter().find(|p| p.surface.wl_surface() == parent).and_then(|p| p.owner)
++    }
++
+     /// A layer surface took a popup made without a parent (`zwlr_layer_surface_v1.get_popup`).
+     pub(crate) fn popup_adopted(&mut self, surface: PopupSurface) {
+         if let Some(index) = self.parentless_popups.iter().position(|(p, _)| *p == surface) {
+@@ -92,7 +102,8 @@
+         });
+         self.announce_scale(surface.wl_surface());
+         eprintln!("WMPOPUP new at={},{} size={}x{}", rect.pos.x, rect.pos.y, rect.size.w, rect.size.h);
+-        self.client_popups.push(ClientPopup { surface, rect, shell: None, grab: false });
++        let owner = surface.get_parent_surface().and_then(|parent| self.popup_owner(&parent));
++        self.client_popups.push(ClientPopup { surface, rect, shell: None, grab: false, owner });
+     }
+ 
+     pub(crate) fn popup_repositioned(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
+@@ -184,7 +195,9 @@
+                         backend.create_shell_surface(Rect::new(pos, size), (0, 0, 0), true)
+                     }
+                 };
++                let owner = self.client_popups[index].owner;
+                 if let Some(shell) = shell {
++                    backend.set_shell_owner(shell, owner);
+                     backend.paint_shell_surface(shell, &image);
+                     backend.map_shell_surface(shell);
+                     if old != Some(shell) {
+@@ -213,7 +226,10 @@
+     pub(crate) fn popup_at(&self, root: Point) -> Option<(WlSurface, (f64, f64))> {
+         let density = self.scale().factor();
+         self.client_popups.iter().rev().find_map(|p| {
++            // a popup of a window that another window covers here is covered too
++            let shown = p.owner.is_none_or(|owner| self.wm.backend().window_uncovered_at(owner, root));
+             let inside = p.shell.is_some()
++                && shown
+                 && root.x >= p.rect.pos.x
+                 && root.y >= p.rect.pos.y
+                 && i64::from(root.x) < i64::from(p.rect.pos.x) + i64::from(p.rect.size.w)
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/wm-darwin/src/scene.rs desk3-src/crates/wm-darwin/src/scene.rs
+--- desk2-src/crates/wm-darwin/src/scene.rs	2026-11-14 10:53:50.785918374 -0800
++++ desk3-src/crates/wm-darwin/src/scene.rs	2026-11-14 13:36:46.024090780 -0800
+@@ -61,6 +61,28 @@
+     paint: Option<DecorationSurface>,
+     generation: u64,
+     layout: DecorationLayout,
++    /// During an interactive resize: the frames of the last few sizes asked of the client,
++    /// newest last, and which of them is drawn (`None`: the current one). The frame drawn is the
++    /// one made for the size the client's picture has, so frame and content change together:
++    /// no old edge left behind, no gap and no content under the frame while the client has
++    /// not yet drawn the newest size.
++    history: Vec<ShownFrame>,
++    shown: Option<usize>,
++}
++/// A frame as it was for one content size (see `Frame::history`).
++#[derive(Clone)]
++struct ShownFrame {
++    content_size: Size,
++    content_pos: Point,
++    geometry: Rect,
++    paint: Option<DecorationSurface>,
++    generation: u64,
++}
++/// Frames kept per window during an interactive resize.
++const FRAME_HISTORY: usize = 6;
++/// Sizes equal to a pixel (a client drawing at a fractional scale rounds).
++fn same_size(a: Size, b: Size) -> bool {
++    a.w.abs_diff(b.w) <= 1 && a.h.abs_diff(b.h) <= 1
+ }
+ struct Shell {
+     geometry: Rect,
+@@ -69,6 +91,9 @@
+     image: DecorationBuffer,
+     generation: u64,
+     partial: Option<Vec<DRect>>,
++    /// A client popup's window (its toplevel): drawn right above that window, so a window
++    /// stacked over it covers its menus and tool tips too (popups.rs).
++    owner: Option<u64>,
+ }
+ 
+ /// More partial rectangles than this and the whole image is damaged instead.
+@@ -212,6 +237,7 @@
+         self.cursor_generation = self.generation();
+         self.dirty = true;
+     }
++    #[cfg_attr(not(test), allow(dead_code))] // the render tests move a hotspot alone
+     pub(crate) fn set_cursor_hotspot(&mut self, hotspot: Point) {
+         if let Some((old, _)) = &mut self.cursor {
+             *old = hotspot;
+@@ -301,6 +327,50 @@
+         }
+         self.dirty = true;
+     }
++    /// Called before each frame (`Server::repaint`). While `resizing` (an interactive move or
++    /// resize is under way) every frame remembers its recent sizes and is drawn as it was for
++    /// the size of the picture its client has given (see `Frame::history`); otherwise the
++    /// current frame is drawn and nothing is kept.
++    pub(crate) fn sync_frame_history(&mut self, resizing: bool) {
++        let mut changed = false;
++        for f in self.frames.values_mut() {
++            let Some(w) = self.windows.get(&f.window) else { continue };
++            if !resizing || !f.mapped || f.paint.is_none() {
++                changed |= f.shown.take().is_some();
++                f.history.clear();
++                continue;
++            }
++            let fresh = f.history.last().is_none_or(|h| h.generation != f.generation || h.geometry != f.geometry || h.content_pos != w.content.pos || h.content_size != w.content.size);
++            if fresh {
++                f.history.push(ShownFrame { content_size: w.content.size, content_pos: w.content.pos, geometry: f.geometry, paint: f.paint.clone(), generation: f.generation });
++                if f.history.len() > FRAME_HISTORY {
++                    f.history.remove(0);
++                }
++            }
++            let drawn = w.image.as_ref().map(|i| Size::new(i.width, i.height));
++            let shown = match drawn {
++                Some(size) if !same_size(size, w.content.size) => {
++                    f.history.iter().rposition(|h| same_size(h.content_size, size))
++                }
++                _ => None,
++            };
++            changed |= shown != f.shown;
++            f.shown = shown;
++        }
++        if changed {
++            self.dirty = true;
++        }
++    }
++    /// Where a window's picture is drawn and its frame (position, paint, version) as drawn now:
++    /// the current frame, or the one held for the client's picture during a resize.
++    fn drawn_frame<'a>(&'a self, id: u64) -> (Point, Option<(Point, &'a DecorationSurface, u64)>) {
++        let w = &self.windows[&id];
++        let Some(f) = self.frames.values().find(|f| f.window == id) else { return (w.content.pos, None) };
++        match f.shown.and_then(|i| f.history.get(i)) {
++            Some(h) => (h.content_pos, h.paint.as_ref().map(|p| (h.geometry.pos, p, h.generation))),
++            None => (w.content.pos, f.paint.as_ref().map(|p| (f.geometry.pos, p, f.generation))),
++        }
++    }
+     /// The frame as an ordered list, bottom to top. This mirrors `render()`
+     /// item for item; `render::tests` holds the two to identical pixels.
+     pub(crate) fn display_list<'a>(&'a self) -> Vec<(ItemSig, DrawOp<'a>)> {
+@@ -314,9 +384,20 @@
+             },
+             DrawOp::Background { color: self.background, image: self.background_image.as_ref() },
+         ));
++        let owned = |list: &mut Vec<(ItemSig, DrawOp<'a>)>, window: u64, shift: i32| {
++            for id in &self.shell_stack {
++                if let Some(s) = self.shells.get(id).filter(|s| s.mapped && s.owner == Some(window)) {
++                    let pos = Point::new(s.geometry.pos.x + shift, s.geometry.pos.y);
++                    list.push((
++                        ItemSig { key: ItemKey::Shell(*id), rect: image_rect(pos, &s.image), generation: s.generation },
++                        DrawOp::Image { pos, image: &s.image },
++                    ));
++                }
++            }
++        };
+         let shells = |list: &mut Vec<(ItemSig, DrawOp<'a>)>, above: bool| {
+             for id in &self.shell_stack {
+-                if let Some(s) = self.shells.get(id).filter(|s| s.mapped && s.above == above) {
++                if let Some(s) = self.shells.get(id).filter(|s| s.mapped && s.above == above && s.owner.is_none()) {
+                     list.push((
+                         ItemSig {
+                             key: ItemKey::Shell(*id),
+@@ -342,8 +423,9 @@
+                 continue;
+             }
+             let w = &self.windows[id];
++            let (content_pos, drawn_frame) = self.drawn_frame(*id);
+             if let Some(image) = w.image.as_ref().filter(|_| w.mapped || neighbour) {
+-                let pos = Point::new(w.content.pos.x + shift, w.content.pos.y);
++                let pos = Point::new(content_pos.x + shift, content_pos.y);
+                 list.push((
+                     ItemSig {
+                         key: ItemKey::Window(*id),
+@@ -356,8 +438,8 @@
+                     },
+                 ));
+             }
+-            if let Some((frame, surface)) = frame.and_then(|f| Some((f, f.paint.as_ref()?))) {
+-                let pos = Point::new(frame.geometry.pos.x + shift, frame.geometry.pos.y);
++            if let Some((frame_pos, surface, frame_generation)) = drawn_frame {
++                let pos = Point::new(frame_pos.x + shift, frame_pos.y);
+                 let mut rect = DRect::EMPTY;
+                 for solid in &surface.solids {
+                     rect = rect.union(DRect::from_rect(solid.rect).translate(pos.x, pos.y));
+@@ -367,10 +449,13 @@
+                     rect = rect.union(image_rect(at, &part.buffer));
+                 }
+                 list.push((
+-                    ItemSig { key: ItemKey::Decoration(*id), rect, generation: frame.generation },
++                    ItemSig { key: ItemKey::Decoration(*id), rect, generation: frame_generation },
+                     DrawOp::Decoration { pos, surface },
+                 ));
+             }
++            if w.mapped && !neighbour {
++                owned(&mut list, *id, shift);
++            }
+         }
+         shells(&mut list, true);
+         if let Some((hotspot, image)) = &self.cursor {
+@@ -611,7 +696,14 @@
+         }
+         let shells = |pix: &mut tiny_skia::Pixmap, above: bool| {
+             for id in &self.shell_stack {
+-                if let Some(s) = self.shells.get(id).filter(|s| s.mapped && s.above == above) {
++                if let Some(s) = self.shells.get(id).filter(|s| s.mapped && s.above == above && s.owner.is_none()) {
++                    draw(pix, s.geometry.pos, &s.image);
++                }
++            }
++        };
++        let owned = |pix: &mut tiny_skia::Pixmap, window: u64| {
++            for id in &self.shell_stack {
++                if let Some(s) = self.shells.get(id).filter(|s| s.mapped && s.owner == Some(window)) {
+                     draw(pix, s.geometry.pos, &s.image);
+                 }
+             }
+@@ -623,34 +715,33 @@
+                 continue;
+             }
+             let w = &self.windows[id];
++            let (content_pos, drawn_frame) = self.drawn_frame(*id);
+             if let Some(image) = w.image.as_ref().filter(|_|w.mapped) {
+-                draw(&mut pix, w.content.pos, image);
++                draw(&mut pix, content_pos, image);
+             }
+-            if let Some(frame) = self.frames.values().find(|f| f.window == *id) {
+-                if let Some(surface) = &frame.paint {
+-                    for solid in &surface.solids {
+-                        let mut paint = tiny_skia::Paint::default();
+-                        paint.set_color_rgba8(solid.rgb[0], solid.rgb[1], solid.rgb[2], 255);
+-                        if let Some(rect) = tiny_skia::Rect::from_xywh(
+-                            (frame.geometry.pos.x + solid.rect.pos.x) as f32,
+-                            (frame.geometry.pos.y + solid.rect.pos.y) as f32,
+-                            solid.rect.size.w as f32,
+-                            solid.rect.size.h as f32,
+-                        ) {
+-                            pix.fill_rect(rect, &paint, tiny_skia::Transform::identity(), None);
+-                        }
+-                    }
+-                    for part in &surface.parts {
+-                        draw(
+-                            &mut pix,
+-                            Point::new(
+-                                frame.geometry.pos.x + part.offset.x,
+-                                frame.geometry.pos.y + part.offset.y,
+-                            ),
+-                            &part.buffer,
+-                        );
++            if let Some((frame_pos, surface, _)) = drawn_frame {
++                for solid in &surface.solids {
++                    let mut paint = tiny_skia::Paint::default();
++                    paint.set_color_rgba8(solid.rgb[0], solid.rgb[1], solid.rgb[2], 255);
++                    if let Some(rect) = tiny_skia::Rect::from_xywh(
++                        (frame_pos.x + solid.rect.pos.x) as f32,
++                        (frame_pos.y + solid.rect.pos.y) as f32,
++                        solid.rect.size.w as f32,
++                        solid.rect.size.h as f32,
++                    ) {
++                        pix.fill_rect(rect, &paint, tiny_skia::Transform::identity(), None);
+                     }
+                 }
++                for part in &surface.parts {
++                    draw(
++                        &mut pix,
++                        Point::new(frame_pos.x + part.offset.x, frame_pos.y + part.offset.y),
++                        &part.buffer,
++                    );
++                }
++            }
++            if w.mapped {
++                owned(&mut pix, *id);
+             }
+         }
+         shells(&mut pix, true);
+@@ -690,6 +781,34 @@
+         }
+         Ok((pix, area))
+     }
++    /// A client popup's surface belongs to this window (drawn just above it; see `Shell::owner`).
++    pub(crate) fn set_shell_owner(&mut self, id: u64, owner: Option<u64>) {
++        if let Some(s) = self.shells.get_mut(&id) {
++            s.owner = owner;
++            s.above = owner.is_none() && s.above;
++        }
++        self.dirty = true;
++    }
++    /// Whether `point` shows `window` (or something stacked below it): no other shown window
++    /// above it in the stacking covers the point.
++    pub(crate) fn window_uncovered_at(&self, window: u64, point: Point) -> bool {
++        let inside = |r: Rect| point.x >= r.pos.x && point.y >= r.pos.y && point.x < r.pos.x + r.size.w as i32 && point.y < r.pos.y + r.size.h as i32;
++        let Some(index) = self.stack.iter().position(|id| *id == window) else { return true };
++        !self.stack[index + 1..].iter().any(|id| self.visible(*id) && self.window_frame_rect(*id).is_some_and(inside))
++    }
++    /// The desk's own surfaces (popups, layer surfaces, panels) bottom to top, one line each
++    /// (the inject module's `dump`).
++    #[cfg(feature = "test-inject")]
++    pub(crate) fn describe_shells(&self) -> String {
++        let mut text = String::new();
++        for id in &self.shell_stack {
++            if let Some(s) = self.shells.get(id) {
++                text.push_str(&format!("shell {id} mapped={} above={} owner={:?} rect={:?} picture={}x{}\n", s.mapped, s.above, s.owner, s.geometry, s.image.width, s.image.height));
++            }
++        }
++        text.push_str(&format!("stack {:?}\n", self.stack));
++        text
++    }
+     /// The topmost shown window under a point (the window pick of a screenshot).
+     pub fn window_at(&self, point: Point) -> Option<u64> {
+         let inside = |r: Rect| point.x >= r.pos.x && point.y >= r.pos.y && point.x < r.pos.x + r.size.w as i32 && point.y < r.pos.y + r.size.h as i32;
+@@ -779,6 +898,8 @@
+                 paint: None,
+                 generation,
+                 layout: l.clone(),
++                history: Vec::new(),
++                shown: None,
+             },
+         );
+         self.dirty = true;
+@@ -960,8 +1081,14 @@
+             w.surface.send_pending_configure();
+         }
+     }
++    /// The close button, Command-W on a desk window, the window menu's Close: `xdg_toplevel.close`
++    /// to this one window. Nothing else: the client decides (an application with other windows,
++    /// or one that outlives its last window, keeps running); no process is signalled.
+     fn send_close(&mut self, id: u64) {
+         if let Some(w) = self.windows.get(&id) {
++            let pid = crate::server::peer_of(w.surface.wl_surface()).and_then(|p| p.pid);
++            eprintln!("WMCLOSE window={id} app_id={:?} title={:?} pid={pid:?}: close request to this window only",
++                w.app_id.as_deref().or(w.last_app_id.as_deref()).unwrap_or(""), w.title.as_deref().unwrap_or(""));
+             w.surface.send_close();
+         }
+     }
+@@ -1025,6 +1152,7 @@
+                 above,
+                 generation,
+                 partial: None,
++                owner: None,
+                 image: DecorationBuffer {
+                     width: g.size.w,
+                     height: g.size.h,
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/wm-darwin/src/server.rs desk3-src/crates/wm-darwin/src/server.rs
+--- desk2-src/crates/wm-darwin/src/server.rs	2026-11-14 11:30:08.599764779 -0800
++++ desk3-src/crates/wm-darwin/src/server.rs	2026-11-14 14:16:00.536047871 -0800
+@@ -71,7 +71,7 @@
+     live_peers().into_iter().find(|p| p.client.lock().ok().and_then(|c| c.clone()) == Some(id.clone()))
+ }
+ #[cfg(not(target_os = "linux"))]
+-fn stream_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
++pub(crate) fn stream_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
+     use std::os::unix::io::AsRawFd;
+     let mut pid: libc::pid_t = 0;
+     let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+@@ -79,7 +79,7 @@
+     (unsafe { libc::getsockopt(stream.as_raw_fd(), 0, 2, (&mut pid as *mut libc::pid_t).cast(), &mut len) } == 0 && pid > 0).then_some(pid)
+ }
+ #[cfg(target_os = "linux")]
+-fn stream_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
++pub(crate) fn stream_pid(stream: &std::os::unix::net::UnixStream) -> Option<i32> {
+     use std::os::unix::io::AsRawFd;
+     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+@@ -92,6 +92,9 @@
+     /// macOS's switcher, launcher and Force Quit (`macdesk.rs`).
+     #[cfg(feature = "desktop-shell")]
+     pub macdesk: crate::macdesk::MacDesk,
++    /// The Mac application's menu shown in the open window menu, for its picks (`appmenu.rs`).
++    #[cfg(feature = "desktop-shell")]
++    pub(crate) app_menu: Option<(wm_core::ClientId, crate::appmenu::AppMenu)>,
+     /// Screen recording (`record.rs`).
+     #[cfg(feature = "desktop-shell")]
+     pub recorder: crate::record::Recorder,
+@@ -264,6 +267,8 @@
+             #[cfg(feature = "desktop-shell")]
+             macdesk: Default::default(),
+             #[cfg(feature = "desktop-shell")]
++            app_menu: None,
++            #[cfg(feature = "desktop-shell")]
+             recorder: Default::default(),
+             compositor,
+             shell: XdgShellState::new_with_capabilities::<Self>(dh, [WmCapabilities::Maximize, WmCapabilities::Fullscreen, WmCapabilities::Minimize]),
+@@ -525,6 +530,11 @@
+         if self.power.off {
+             return Ok(());
+         }
++        // Chrome that wm-core deferred during an interactive move or resize (one raster per
++        // window per frame) is painted now, so the frame's edges follow the window every frame
++        // (without this the old bottom edge stayed where the resize began until it ended).
++        self.wm.flush_decorations();
++        self.hold_frames_for_resizing_clients();
+         // While a frame is in flight the scene stays dirty and is rendered
+         // once, with everything that accumulated, after the flip.
+         if !self.wm.backend().dirty || self.renderer.busy() {
+@@ -570,6 +580,12 @@
+         }
+         Ok(())
+     }
++    /// During an interactive move or resize each window's frame is drawn as it was for the size
++    /// of the picture its client has given (scene `sync_frame_history`).
++    fn hold_frames_for_resizing_clients(&mut self) {
++        let resizing = self.wm.interactive_drag_active();
++        self.wm.backend_mut().sync_frame_history(resizing);
++    }
+     /// Blank the display after the idle time; power it up when input asked for it.
+     fn power_tick(&mut self) -> Result<(), String> {
+         if self.power.off {
+@@ -1163,7 +1179,8 @@
+     }
+     fn destroyed(&mut self, surface: &WlSurface) {
+         if self.input.as_ref().and_then(|i|i.cursor_surface.as_ref())==Some(surface){
+-            self.input.as_mut().unwrap().cursor_surface=None;self.wm.backend_mut().set_cursor(None);
++            // The client's image went with its surface: the pointer stays visible as the arrow.
++            self.show_default_cursor();
+             self.cursor_callbacks.clear();
+         }
+         self.remove(surface);
+@@ -1405,6 +1422,7 @@
+                     }
+                     w.content.size = size;
+                     self.wm.dispatch(BackendEvent::MapRequest(id));
++                    self.place_clear_of_launchers(id);
+                     self.output.enter(surface);
+                     self.apply_early_states(id);
+                 } else {
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/wm-darwin/src/settings.rs desk3-src/crates/wm-darwin/src/settings.rs
+--- desk2-src/crates/wm-darwin/src/settings.rs	2026-11-14 02:17:53.012835881 -0800
++++ desk3-src/crates/wm-darwin/src/settings.rs	2026-11-14 13:07:40.256100717 -0800
+@@ -223,6 +223,10 @@
+ /// session's pipe. The compositor starts no program for this; without a
+ /// listener on the pipe (`ENXIO`, `ENOENT`) nothing is opened and the notice
+ /// says so.
++/// The application a row of the Applications submenu shows.
++pub fn application_path(n: u8) -> Option<std::path::PathBuf> {
++    APPLICATIONS.lock().ok().and_then(|shown| shown.get(usize::from(n)).cloned())
++}
+ pub fn request_open(path: &std::path::Path) -> Result<(), i32> {
+     use std::io::Write;
+     use std::os::unix::fs::OpenOptionsExt;
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/wm-darwin/tests/wayland_shm.rs desk3-src/crates/wm-darwin/tests/wayland_shm.rs
+--- desk2-src/crates/wm-darwin/tests/wayland_shm.rs	2026-11-14 11:53:51.196601685 -0800
++++ desk3-src/crates/wm-darwin/tests/wayland_shm.rs	2026-11-14 13:21:29.665134914 -0800
+@@ -44,6 +44,8 @@
+     buttons:Vec<(u32,wayland_client::WEnum<wl_pointer::ButtonState>)>,
+     keymap:String,keyboard_enters:u32,pointer_serial:Option<u32>,button_serial:Option<u32>,modifier_masks:Vec<u32>,closes:u32,
+     held_on_enter:Vec<Vec<u32>>,keyboard_leaves:u32,
++    /// wl_pointer.enter events received.
++    pointer_enters:u32,
+     /// Sizes from xdg_toplevel.configure, in arrival order (0,0 = client's choice).
+     configured_sizes:Vec<(i32,i32)>,
+     /// wl_pointer.axis events received (wheel steps).
+@@ -226,7 +228,7 @@
+ }
+ impl Dispatch<wl_pointer::WlPointer,()> for Client {
+     fn event(s:&mut Self,_:&wl_pointer::WlPointer,e:wl_pointer::Event,_:&(),_:&Connection,_:&QueueHandle<Self>){
+-        match e{wl_pointer::Event::Enter{serial,..}=>s.pointer_serial=Some(serial),wl_pointer::Event::Button{button,state,serial,..}=>{s.button_serial=Some(serial);s.buttons.push((button,state));},wl_pointer::Event::Axis{..}=>s.axis_events+=1,_=>{}}
++        match e{wl_pointer::Event::Enter{serial,..}=>{s.pointer_serial=Some(serial);s.pointer_enters+=1;},wl_pointer::Event::Button{button,state,serial,..}=>{s.button_serial=Some(serial);s.buttons.push((button,state));},wl_pointer::Event::Axis{..}=>s.axis_events+=1,_=>{}}
+     }
+ }
+ delegate_noop!(Client: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
+@@ -274,6 +276,8 @@
+     titlebar:Option<wm_core::Point>,close_button:Option<wm_core::Point>,
+     /// A point inside the bottom-right resize handle of the focused window.
+     resize_corner:Option<wm_core::Point>,
++    /// The pointer image's size, `None` when no pointer is drawn.
++    cursor:Option<(u32,u32)>,
+ }
+ enum Request {
+     #[cfg(feature = "desktop-shell")]
+@@ -416,6 +420,7 @@
+                                 pixels,
+                                 theme_pixels,
+                                 titlebar,close_button,resize_corner,
++                                cursor:state.cursor_size(),
+                             })
+                             .unwrap();
+                     }
+@@ -1309,3 +1314,183 @@
+     assert!(ca.keyboard_enters >= 2, "the client got the keyboard back");
+     assert!(ca.held_on_enter.iter().all(|held| !held.contains(&125)), "held on enter: {:?}", ca.held_on_enter);
+ }
++
++fn abs_mouse(seq:u32,p:wm_core::Point,buttons:u8)->Request{
++    let mut b=[0;12];b[..4].copy_from_slice(&seq.to_le_bytes());b[5]=buttons;b[9]=1;
++    let x=((f64::from(p.x)+0.25)/319.*65535.).round().clamp(0.,65535.) as u16;
++    let y=((f64::from(p.y)+0.25)/239.*65535.).round().clamp(0.,65535.) as u16;
++    b[6..8].copy_from_slice(&x.to_le_bytes());b[10..12].copy_from_slice(&y.to_le_bytes());Request::Mouse(b)
++}
++/// One mapped window (160x80, server-side frame) with the pointer and keyboard; returns its content rectangle.
++fn map_with_seat(connection:&Connection)->(wayland_client::EventQueue<Client>,Client,wl_surface::WlSurface,xdg_toplevel::XdgToplevel){
++    let mut queue=connection.new_event_queue();let qh=queue.handle();let mut c=Client::default();
++    connection.display().get_registry(&qh,());for _ in 0..3{queue.roundtrip(&mut c).unwrap();}
++    let surface=c.compositor.as_ref().unwrap().create_surface(&qh,());let xdg=c.shell.as_ref().unwrap().get_xdg_surface(&surface,&qh,());let top=xdg.get_toplevel(&qh,());
++    let decor=c.decoration.as_ref().unwrap().get_toplevel_decoration(&top,&qh,());decor.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
++    top.set_title("Cursor".into());surface.commit();queue.roundtrip(&mut c).unwrap();
++    let mut file=tempfile::tempfile().unwrap();file.write_all(&[10,20,240,255].repeat(160*80)).unwrap();
++    let pool=c.shm.as_ref().unwrap().create_pool(file.as_fd(),160*80*4,&qh,());let buffer=pool.create_buffer(0,160,80,640,wl_shm::Format::Xrgb8888,&qh,());
++    surface.attach(Some(&buffer),0,0);surface.commit();queue.roundtrip(&mut c).unwrap();queue.roundtrip(&mut c).unwrap();
++    (queue,c,surface,top)
++}
++
++/// The owner's first finding (14 November): the pointer vanished over a terminal window. A client
++/// may set the same cursor surface again without committing a new buffer (the surface keeps its
++/// content), and a client's hide (set_cursor without a surface, as a terminal does while one types)
++/// must not leave the pointer invisible once it moves. Both left no pointer on the screen before.
++#[test]
++fn a_cursor_surface_set_again_and_a_hidden_pointer_that_moves_stay_visible(){
++    let(h,connection)=Harness::with_input(true);
++    let(mut queue,mut c,_surface,_top)=map_with_seat(&connection);let qh=queue.handle();
++    let content=h.snapshot().content.unwrap();let inside=wm_core::Point::new(content.pos.x+20,content.pos.y+20);
++    h.tx.send(abs_mouse(1,inside,0)).unwrap();h.snapshot();queue.roundtrip(&mut c).unwrap();
++    let serial=c.pointer_serial.expect("the pointer entered the window");
++    assert!(h.snapshot().cursor.is_some(),"the arrow over a window that set no cursor");
++    let cursor=c.compositor.as_ref().unwrap().create_surface(&qh,());
++    let mut cursor_file=tempfile::tempfile().unwrap();cursor_file.write_all(&[0,255,0,255].repeat(4*4)).unwrap();
++    let cursor_pool=c.shm.as_ref().unwrap().create_pool(cursor_file.as_fd(),64,&qh,());let cursor_buffer=cursor_pool.create_buffer(0,4,4,16,wl_shm::Format::Argb8888,&qh,());
++    cursor.attach(Some(&cursor_buffer),0,0);cursor.commit();
++    let pointer=c.pointer.clone().unwrap();
++    pointer.set_cursor(serial,Some(&cursor),0,0);queue.roundtrip(&mut c).unwrap();queue.roundtrip(&mut c).unwrap();
++    let shot=h.snapshot();assert_eq!(shot.cursor,Some((4,4)),"the client's image");
++    let at=(inside.y as usize*320+inside.x as usize)*4;assert_eq!(&shot.pixels[at..at+4],&[0,255,0,255]);
++    // Hidden, then the same surface again with no new buffer: its image comes back.
++    pointer.set_cursor(serial,None,0,0);queue.roundtrip(&mut c).unwrap();
++    assert_eq!(h.snapshot().cursor,None,"the client hid the pointer");
++    pointer.set_cursor(serial,Some(&cursor),0,0);queue.roundtrip(&mut c).unwrap();queue.roundtrip(&mut c).unwrap();
++    let shot=h.snapshot();
++    assert_eq!(shot.cursor,Some((4,4)),"the same cursor surface set again shows its image (it was left invisible)");
++    assert_eq!(&shot.pixels[at..at+4],&[0,255,0,255]);
++    // Hidden by the client (typing), then the pointer moves: the pointer is shown again.
++    pointer.set_cursor(serial,None,0,0);queue.roundtrip(&mut c).unwrap();
++    assert_eq!(h.snapshot().cursor,None);
++    h.tx.send(abs_mouse(2,wm_core::Point::new(inside.x+1,inside.y),0)).unwrap();
++    assert_eq!(h.snapshot().cursor,None,"a one-pixel jitter keeps the hide");
++    h.tx.send(abs_mouse(3,wm_core::Point::new(inside.x+12,inside.y+5),0)).unwrap();
++    assert!(h.snapshot().cursor.is_some(),"the pointer moved over the window after the client hid it: it is visible again");
++    // A cursor surface the client destroys while it is shown: the arrow, not nothing.
++    pointer.set_cursor(serial,Some(&cursor),0,0);queue.roundtrip(&mut c).unwrap();queue.roundtrip(&mut c).unwrap();
++    assert_eq!(h.snapshot().cursor,Some((4,4)));
++    cursor.destroy();queue.roundtrip(&mut c).unwrap();
++    assert!(h.snapshot().cursor.is_some(),"the client's cursor surface went: the arrow");
++}
++
++/// When a move or resize grab ends with the pointer over a window, that window is entered at
++/// once (it sets its cursor then), not at the next movement of the pointer.
++#[test]
++fn a_window_under_the_pointer_is_entered_when_a_grab_ends(){
++    let(h,connection)=Harness::with_input(true);
++    let(mut queue,mut c,_surface,top)=map_with_seat(&connection);
++    let content=h.snapshot().content.unwrap();let inside=wm_core::Point::new(content.pos.x+20,content.pos.y+20);
++    h.tx.send(abs_mouse(1,inside,0)).unwrap();h.tx.send(abs_mouse(2,inside,1)).unwrap();h.snapshot();queue.roundtrip(&mut c).unwrap();
++    // The client asks to be moved (its own title bar), with the press's serial.
++    top._move(c.seat.as_ref().unwrap(),c.button_serial.unwrap());queue.roundtrip(&mut c).unwrap();h.snapshot();
++    let destination=wm_core::Point::new(inside.x+15,inside.y+10);
++    h.tx.send(abs_mouse(3,destination,1)).unwrap();h.snapshot();queue.roundtrip(&mut c).unwrap();
++    let enters=c.pointer_enters;
++    h.tx.send(abs_mouse(4,destination,0)).unwrap();h.snapshot();queue.roundtrip(&mut c).unwrap();
++    assert_ne!(h.snapshot().content.unwrap().pos,content.pos,"the window moved");
++    assert_eq!(c.pointer_enters,enters+1,"the window under the pointer is entered when the grab ends, without another movement");
++    assert!(h.snapshot().cursor.is_some());
++}
++
++/// The owner's second finding: during an interactive resize the frame's old bottom edge stayed
++/// where the resize began until it ended. The frame now follows every frame, drawn for the size
++/// the client's picture has: no old edge across the content, no gap while the client catches up.
++#[test]
++fn the_frame_follows_an_interactive_resize_and_matches_the_clients_picture(){
++    let (h, connection) = Harness::with_input(true);
++    let mut queue = connection.new_event_queue();
++    let qh = queue.handle();
++    let mut c = Client::default();
++    connection.display().get_registry(&qh, ());
++    for _ in 0..3 { queue.roundtrip(&mut c).unwrap(); }
++    let surface = c.compositor.as_ref().unwrap().create_surface(&qh, ());
++    let xdg = c.shell.as_ref().unwrap().get_xdg_surface(&surface, &qh, ());
++    let top = xdg.get_toplevel(&qh, ());
++    let decor = c.decoration.as_ref().unwrap().get_toplevel_decoration(&top, &qh, ());
++    decor.set_mode(zxdg_toplevel_decoration_v1::Mode::ServerSide);
++    top.set_title("Resize".into());
++    surface.commit();
++    queue.roundtrip(&mut c).unwrap();
++    let mut file = tempfile::tempfile().unwrap();
++    file.write_all(&[0, 0, 255, 255].repeat(320 * 240)).unwrap(); // red, XRGB little endian
++    let pool = c.shm.as_ref().unwrap().create_pool(file.as_fd(), 320 * 240 * 4, &qh, ());
++    let present = |c: &mut Client, queue: &mut wayland_client::EventQueue<Client>, size: (i32, i32)| {
++        let buffer = pool.create_buffer(0, size.0, size.1, size.0 * 4, wl_shm::Format::Xrgb8888, &qh, ());
++        surface.attach(Some(&buffer), 0, 0);
++        surface.damage_buffer(0, 0, size.0, size.1);
++        surface.commit();
++        queue.roundtrip(c).unwrap();
++        queue.roundtrip(c).unwrap();
++    };
++    present(&mut c, &mut queue, (100, 60));
++    let before = h.snapshot();
++    let c0 = before.content.unwrap();
++    assert_eq!((c0.size.w, c0.size.h), (100, 60));
++    let px = |shot: &Snapshot, x: i32, y: i32| -> [u8; 4] { let at = (y as usize * 320 + x as usize) * 4; shot.pixels[at..at + 4].try_into().unwrap() };
++    let red = [255, 0, 0, 255];
++    let x = c0.pos.x + 50;
++    let old_bottom = c0.pos.y + 60;
++    assert_ne!(px(&before, x, old_bottom), red, "a frame edge below the content before the resize");
++    let grip = before.resize_corner.expect("a south-east resize handle");
++    let mut seq = 0;
++    let mut send = |p: wm_core::Point, buttons: u8| { seq += 1; h.tx.send(abs_mouse(seq, p, buttons)).unwrap(); };
++    send(grip, 0);
++    send(grip, 1);
++    send(wm_core::Point::new(grip.x + 40, grip.y + 30), 1);
++    h.snapshot();
++    queue.roundtrip(&mut c).unwrap();
++    let asked = *c.configured_sizes.last().unwrap();
++    assert!(asked.0 > 110 && asked.1 > 70, "the client is asked for a larger size: {asked:?}");
++    // Still held: the client draws the new size.
++    present(&mut c, &mut queue, asked);
++    let during = h.snapshot();
++    for y in [old_bottom, old_bottom + 1, old_bottom + 3] {
++        assert_eq!(px(&during, x, y), red, "row {y}: the old bottom edge must not stay across the content during the resize");
++    }
++    let new_bottom = c0.pos.y + asked.1;
++    assert_ne!(px(&during, x, new_bottom), red, "the frame's bottom edge is below the new content");
++    let edge_row: Vec<[u8; 4]> = (c0.pos.x..c0.pos.x + asked.0).map(|x| px(&during, x, new_bottom)).collect();
++    // The pointer goes further; the client has not drawn that size yet: the frame drawn stays the
++    // one around its picture, not a frame of the new size around a smaller picture.
++    send(wm_core::Point::new(grip.x + 40, grip.y + 45), 1);
++    h.snapshot();
++    let held = h.snapshot();
++    let policy = held.content.unwrap().size;
++    assert!(policy.h as i32 > asked.1 + 5, "the policy's size moved on: {policy:?}");
++    let held_row: Vec<[u8; 4]> = (c0.pos.x..c0.pos.x + asked.0).map(|x| px(&held, x, new_bottom)).collect();
++    assert_eq!(held_row, edge_row, "the frame drawn is the one for the client's picture until the client catches up");
++    queue.roundtrip(&mut c).unwrap();
++    let newest = *c.configured_sizes.last().unwrap();
++    present(&mut c, &mut queue, newest);
++    let caught = h.snapshot();
++    assert_eq!(px(&caught, x, new_bottom), red, "caught up: the content covers the old edge row");
++    assert_ne!(px(&caught, x, c0.pos.y + newest.1), red, "and the frame's edge is below the newest content");
++    send(wm_core::Point::new(grip.x + 40, grip.y + 45), 0);
++    h.snapshot();
++}
++
++/// The owner's fifth finding: a right click (or Control-click) on a window's title bar opens its
++/// menu with the window's verbs (on the standalone desk it offered only Close); Maximize from it
++/// maximises the window.
++#[test]
++#[cfg(feature="desktop-shell")]
++fn a_right_click_on_the_title_opens_the_window_menu_and_maximize_works(){
++    let(h,a)=Harness::with_input(true);let(tx,rx)=mpsc::channel();h.tx.send(Request::Desktop(tx)).unwrap();rx.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
++    let(mut q,mut c,_s,_x,_t)=map_client(&a,"menu-test");
++    let before=h.snapshot();let title=before.titlebar.expect("a title bar");let size=before.content.unwrap().size;
++    h.tx.send(abs_mouse(1,title,0)).unwrap();h.tx.send(abs_mouse(2,title,2)).unwrap();
++    let pressed=h.snapshot();
++    h.tx.send(abs_mouse(3,title,0)).unwrap();
++    let open=h.snapshot();q.roundtrip(&mut c).unwrap();
++    assert!(pressed.shells>before.shells,"the press opened the window menu: shells {} -> {}",before.shells,pressed.shells);
++    assert!(open.shells>before.shells,"the window menu opened: shells {} -> {}",before.shells,open.shells);
++    // Down to its first row (Maximize), Return.
++    for (seq,usage,down) in [(1,0x51,true),(2,0x51,false),(3,0x28,true),(4,0x28,false)]{h.tx.send(key_record(seq,usage,down)).unwrap();}
++    h.snapshot();q.roundtrip(&mut c).unwrap();q.roundtrip(&mut c).unwrap();
++    let after=h.snapshot();
++    let maximized=c.configured_sizes.iter().any(|&(w,hh)|w as u32>size.w && hh as u32>size.h);
++    assert!(maximized,"Maximize from the window menu asked the client for a larger size: {:?} (was {size:?})",c.configured_sizes);
++    assert_eq!(after.shells,before.shells,"the menu closed");
++}
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/wm-theme/src/menu.rs desk3-src/crates/wm-theme/src/menu.rs
+--- desk2-src/crates/wm-theme/src/menu.rs	2026-11-07 21:25:57.383366014 -0800
++++ desk3-src/crates/wm-theme/src/menu.rs	2026-11-14 13:18:02.335118502 -0800
+@@ -52,6 +52,23 @@
+     Submenu { label: String, items: Vec<MenuItem> },
+ }
+ 
++/// A row label that starts with this is drawn dimmed: the row is shown but cannot be picked
++/// (its action id is one nothing resolves). Text after a tab in a label is drawn right-aligned
++/// (a key equivalent, "⌘W").
++pub const DISABLED: char = '\u{1}';
++
++/// A label's parts: whether it is dimmed, its text and its right-aligned text.
++pub fn label_parts(label: &str) -> (bool, &str, Option<&str>) {
++    let (disabled, rest) = match label.strip_prefix(DISABLED) {
++        Some(rest) => (true, rest),
++        None => (false, label),
++    };
++    match rest.split_once('\t') {
++        Some((text, key)) => (disabled, text, Some(key)),
++        None => (disabled, rest, None),
++    }
++}
++
+ impl MenuItem {
+     pub fn label(&self) -> &str {
+         match self {
+@@ -130,7 +147,11 @@
+     let gutter = if any_submenu { px(16) } else { px(4) } as u32;
+     let widest_label = items
+         .iter()
+-        .map(|i| paint::text_width(font_system, &menu.item_font, i.label()))
++        .map(|i| {
++            let (_, text, key) = label_parts(i.label());
++            paint::text_width(font_system, &menu.item_font, text)
++                + key.map_or(0, |k| paint::text_width(font_system, &menu.item_font, k) + px(24) as u32)
++        })
+         .max()
+         .unwrap_or(0);
+     // A closable title's width floor adds the close box on top of the
+@@ -211,7 +232,8 @@
+     let mut item_rects = Vec::with_capacity(items.len());
+     for (i, item) in items.iter().enumerate() {
+         let y0 = (bw + title_h + i as u32 * item_h) as i32;
+-        let is_highlighted = highlighted == Some(i);
++        let (disabled, text, key) = label_parts(item.label());
++        let is_highlighted = highlighted == Some(i) && !disabled;
+ 
+         // Entry face, then its own WREL_MENUENTRY relief: every row is
+         // a shallow raised strip, and the stack of strips *is* the menu
+@@ -240,12 +262,19 @@
+         } else {
+             menu.text_color
+         };
++        // A row that cannot be picked: its text halfway to the face.
++        let text_color = if disabled {
++            let mix = |a: u8, b: u8| ((a as u16 + b as u16) / 2) as u8;
++            Color::rgb(mix(text_color.r, face.r), mix(text_color.g, face.g), mix(text_color.b, face.b))
++        } else {
++            text_color
++        };
+ 
+         paint::draw_text(
+             &mut pixmap,
+             font_system,
+             &mut swash_cache,
+-            item.label(),
++            text,
+             &menu.item_font,
+             text_color,
+             x0 + px(5),
+@@ -254,6 +283,21 @@
+             item_h,
+             TextAlign::Left,
+         );
++        if let Some(key) = key {
++            paint::draw_text(
++                &mut pixmap,
++                font_system,
++                &mut swash_cache,
++                key,
++                &menu.item_font,
++                text_color,
++                x0 + px(5),
++                y0,
++                content_w.saturating_sub(px(5) as u32 + gutter),
++                item_h,
++                TextAlign::Right,
++            );
++        }
+ 
+         if item.is_submenu() {
+             // `paintEntry`'s engraved chevron, in entry-local stock
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/crates/wm-theme/src/raster.rs desk3-src/crates/wm-theme/src/raster.rs
+--- desk2-src/crates/wm-theme/src/raster.rs	2026-11-08 07:59:11.426066626 -0800
++++ desk3-src/crates/wm-theme/src/raster.rs	2026-11-14 13:25:17.848786780 -0800
+@@ -183,6 +183,14 @@
+         }
+     }
+ 
++    /// Put the faces this crate carries (IBM Plex Mono, IBM Plex Sans, Space Grotesk) into the
++    /// shared database as well, so a theme that names them gets them on a system that has
++    /// none of them installed (SiliconForest's dock: its labels' digits came from another face,
++    /// widely spaced, "SAT 1 4").
++    pub fn load_resident_faces(&self) {
++        self.prepare_modern();
++    }
++
+     /// Modern rendering only sees resident sources, including cold Unicode
+     /// fallback. Constructors prepare this before any live render call.
+     pub(crate) fn modern_system(&self) -> std::cell::RefMut<'_, cosmic_text::FontSystem> {
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/dock/crates/chonk-dock/src/launchdock.rs desk3-src/dock/crates/chonk-dock/src/launchdock.rs
+--- desk2-src/dock/crates/chonk-dock/src/launchdock.rs	2026-11-14 10:50:02.552298260 -0800
++++ desk3-src/dock/crates/chonk-dock/src/launchdock.rs	2026-11-14 14:12:41.725853733 -0800
+@@ -33,6 +33,9 @@
+ 
+ use crate::apps::{match_window_class, AppEntry};
+ 
++/// How long a launched pin waits for its application before a click launches it again.
++pub const LAUNCH_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
++
+ /// What a click on the strip resolved to — the shell dispatches:
+ /// `Launch` spawns the entry, `Focus` activates the running window.
+ /// Generic over the backend's client-window id (`W` =
+@@ -93,6 +96,12 @@
+     /// reconciles that pin against the already-running applications.
+     running_dirty: bool,
+     drag: Option<StripDrag>,
++    /// Pins clicked to launch whose application has not shown a window yet (desktop-file id,
++    /// when): the tile's dot pulses and a further click on it is not a second launch, until the
++    /// application runs or `LAUNCH_WAIT` has passed.
++    launching: std::collections::HashMap<String, std::time::Instant>,
++    /// The pulse phase last painted (tenths of a second since the earliest launch).
++    pulse: u64,
+     /// The session's one shared font database — see
+     /// `wm_theme::FontState` ("call it once per session"); the strip
+     /// used to scan its own.
+@@ -140,6 +149,8 @@
+             lit,
+             running_dirty: true,
+             drag: None,
++            launching: std::collections::HashMap::new(),
++            pulse: 0,
+             fonts,
+         };
+         dock.sync_window(backend, theme);
+@@ -248,12 +259,39 @@
+     ) {
+         let lit = running_lamps(&self.pins, running);
+         self.running_dirty = false;
++        // An application that runs now has finished launching.
++        let started: Vec<String> = self.pins.iter().zip(&lit).filter(|(_, on)| **on).map(|(pin, _)| pin.id.clone()).collect();
++        let before = self.launching.len();
++        self.launching.retain(|id, _| !started.contains(id));
++        if self.launching.len() != before {
++            self.lit = lit;
++            self.repaint(backend, theme);
++            return;
++        }
+         if lit != self.lit {
+             self.lit = lit;
+             self.repaint(backend, theme);
+         }
+     }
+ 
++    /// While a pinned application is starting: its dot pulses (a repaint every tenth of a
++    /// second) until it runs or `LAUNCH_WAIT` has passed. Call from the loop.
++    pub fn tick_launching(&mut self, backend: &mut B, theme: &Theme) {
++        if self.launching.is_empty() {
++            return;
++        }
++        let before = self.launching.len();
++        self.launching.retain(|_, since| since.elapsed() < LAUNCH_WAIT);
++        let pulse = self.launching.values().map(|since| since.elapsed().as_millis() as u64 / 100).max().unwrap_or(0);
++        if pulse != self.pulse || before != self.launching.len() {
++            self.pulse = pulse;
++            self.repaint(backend, theme);
++        }
++    }
++    /// When the loop should wake next for the pulse.
++    pub fn next_deadline(&self) -> Option<std::time::Instant> {
++        (!self.launching.is_empty()).then(|| std::time::Instant::now() + std::time::Duration::from_millis(100))
++    }
+     /// Whether the pin set changed since running lamps were last
+     /// reconciled. Kept separate from the shell's client cache because
+     /// pinning an application changes no client at all.
+@@ -315,10 +353,35 @@
+         backend.ungrab_pointer(drag.grab);
+ 
+         if !drag.moved {
+-            let pin = self.pins.get(drag.index)?;
+-            return Some(resolve_click(pin, running));
++            let pin = self.pins.get(drag.index)?.clone();
++            let action = resolve_click(&pin, running);
++            if let LaunchDockAction::Launch(_) = &action {
++                if let Some(since) = self.launching.get(&pin.id).filter(|since| since.elapsed() < LAUNCH_WAIT) {
++                    eprintln!("chonk-dock: {} is starting ({} ms ago): the click is not a second launch", pin.id, since.elapsed().as_millis());
++                    return None;
++                }
++                self.launching.insert(pin.id.clone(), std::time::Instant::now());
++                self.repaint(backend, theme);
++            }
++            return Some(action);
++        }
++        // A tile is unpinned only when it is dropped clearly away from the strip (half a tile
++        // or more off it): a click whose pointer drifted a few pixels past the strip's edge (a
++        // trackpad click at the bottom tile's edge) is a cancelled click, not an unpin.
++        let near = |v: i32, lo: i32, hi: i32| v >= lo - self.tile as i32 / 2 && v < hi + self.tile as i32 / 2;
++        let strip_bottom = origin.y + (self.pins.len() as i32) * self.tile as i32;
++        if slot_at(origin, self.tile, self.pins.len(), root).is_none()
++            && near(root.x, origin.x, origin.x + self.tile as i32)
++            && near(root.y, origin.y, strip_bottom)
++        {
++            self.repaint(backend, theme);
++            return None;
+         }
+         match slot_at(origin, self.tile, self.pins.len(), root) {
++            Some(slot) if slot == drag.index => {
++                // dropped where it was: nothing changes, nothing is written
++                self.repaint(backend, theme);
++            }
+             Some(slot) => {
+                 move_pin(&mut self.pins, drag.index, slot);
+                 move_pin(&mut self.lit, drag.index, slot);
+@@ -465,13 +528,15 @@
+         for (index, pin) in self.pins.iter().enumerate() {
+             let lit = self.lit.get(index).copied().unwrap_or(false);
+             let icon = crate::apps::entry_icon(pin, self.tile);
+-            let buffer = wm_theme::launcher::render_launcher_tile(
++            let launching = self.launching.get(&pin.id).map(|since| since.elapsed().as_secs_f32());
++            let buffer = wm_theme::launcher::render_launcher_tile_launching(
+                 theme,
+                 &mut self.fonts.system(),
+                 &mut self.fonts.swash(),
+                 self.tile,
+                 &pin.name,
+                 lit,
++                launching,
+                 icon.as_deref(),
+             );
+             if buffer.pixels.len() == slot_bytes {
+@@ -1040,6 +1105,69 @@
+         );
+     }
+ 
++    /// The owner's fourth finding: a second click on a tile whose application is still starting
++    /// opened it twice. The click is taken once; the tile pulses until the application runs
++    /// (then a click brings it forward) or ten seconds have passed (then a click launches again).
++    #[test]
++    fn a_tile_clicked_twice_while_its_application_starts_launches_once() {
++        use crate::surface::FakeBackend;
++        let theme = wm_theme::default_theme::nextstep_classic();
++        let mut backend = FakeBackend::new();
++        let primary = Rect { pos: Point::new(0, 0), size: Size::new(640, 480) };
++        let mut dock: LaunchDock<FakeBackend> = LaunchDock::new(&mut backend, &theme, primary, 56, &[], wm_theme::FontState::new());
++        dock.state_path = None;
++        dock.pins = vec![entry("app.a")];
++        dock.lit = vec![false];
++        dock.sync_window(&mut backend, &theme);
++        let tile = Point::new(20, 20);
++        let mut click = |dock: &mut LaunchDock<FakeBackend>, backend: &mut FakeBackend, running: &[(String, <FakeBackend as Backend>::WindowId)]| {
++            dock.handle_click(backend, &theme, tile, true, running);
++            dock.handle_click(backend, &theme, tile, false, running)
++        };
++        assert!(matches!(click(&mut dock, &mut backend, &[]), Some(LaunchDockAction::Launch(_))), "the first click launches");
++        assert!(click(&mut dock, &mut backend, &[]).is_none(), "a second click while it starts is not a second launch");
++        assert!(dock.next_deadline().is_some(), "the tile pulses while the application starts");
++        let window = backend.create_window();
++        let running = [("app.a".to_string(), window)];
++        dock.update_running(&mut backend, &theme, &running);
++        assert!(dock.next_deadline().is_none(), "running: no more pulse");
++        assert!(matches!(click(&mut dock, &mut backend, &running), Some(LaunchDockAction::Focus(_))), "a click on a running application brings it forward");
++        // Started but never showed a window: after the wait a click launches again.
++        dock.launching.insert("app.a".into(), std::time::Instant::now() - LAUNCH_WAIT);
++        assert!(matches!(click(&mut dock, &mut backend, &[]), Some(LaunchDockAction::Launch(_))));
++    }
++
++    /// The owner's strip lost its Terminal tiles (pins file rewritten with Activity Monitor only):
++    /// a press that drifted a little past the strip's edge before its release unpinned the tile.
++    /// Only a drop clearly away from the strip unpins; a drop where the tile was writes nothing.
++    #[test]
++    fn a_click_that_drifts_off_the_strips_edge_does_not_unpin() {
++        use crate::surface::FakeBackend;
++        let theme = wm_theme::default_theme::nextstep_classic();
++        let mut backend = FakeBackend::new();
++        let primary = Rect { pos: Point::new(0, 0), size: Size::new(640, 480) };
++        let mut dock: LaunchDock<FakeBackend> = LaunchDock::new(&mut backend, &theme, primary, 56, &[], wm_theme::FontState::new());
++        dock.state_path = None;
++        dock.pins = vec![entry("org.siliconforest.terminal"), entry("com.apple.Terminal"), entry("com.apple.ActivityMonitor")];
++        dock.lit = vec![false; 3];
++        dock.sync_window(&mut backend, &theme);
++        // press near the bottom of the last tile, drift 6 px down (past the threshold and the strip's end)
++        dock.handle_click(&mut backend, &theme, Point::new(28, 165), true, &[]);
++        dock.handle_motion(&mut backend, &theme, Point::new(28, 171));
++        assert!(dock.handle_release(&mut backend, &theme, Point::new(28, 171)));
++        assert_eq!(ids(&dock.pins), ["org.siliconforest.terminal", "com.apple.Terminal", "com.apple.ActivityMonitor"]);
++        // the same off the right edge
++        dock.handle_click(&mut backend, &theme, Point::new(50, 20), true, &[]);
++        dock.handle_motion(&mut backend, &theme, Point::new(60, 20));
++        assert!(dock.handle_release(&mut backend, &theme, Point::new(60, 20)));
++        assert_eq!(dock.pins.len(), 3);
++        // a deliberate drag well away unpins
++        dock.handle_click(&mut backend, &theme, Point::new(28, 80), true, &[]);
++        dock.handle_motion(&mut backend, &theme, Point::new(200, 80));
++        assert!(dock.handle_release(&mut backend, &theme, Point::new(200, 80)));
++        assert_eq!(ids(&dock.pins), ["org.siliconforest.terminal", "com.apple.ActivityMonitor"]);
++    }
++
+     #[test]
+     fn running_lamps_light_exactly_the_matched_pins() {
+         let mut firefox = entry("org.mozilla.firefox");
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/dock/crates/chonk-dock/src/runtime.rs desk3-src/dock/crates/chonk-dock/src/runtime.rs
+--- desk2-src/dock/crates/chonk-dock/src/runtime.rs	2026-11-14 11:38:02.044664364 -0800
++++ desk3-src/dock/crates/chonk-dock/src/runtime.rs	2026-11-14 13:59:10.567040382 -0800
+@@ -99,6 +99,8 @@
+     let mut scale = display.scale() * options.scale;
+     let mut theme = theme(&options, &control, scale);
+     let fonts = wm_theme::FontState::new();
++    // The themes' own faces, whatever the system has installed (the labels' figures).
++    fonts.load_resident_faces();
+     let applications = apps::scan_applications();
+     let mut dock = Desktop::new(&mut display, screen, scale, &theme, fonts.clone());
+     let mut launcher = LaunchDock::new(
+@@ -347,6 +349,7 @@
+         }
+         menu.tick(&mut display, &theme, &mut fonts.system());
+         dock.tick_items(&mut display, &theme);
++        launcher.tick_launching(&mut display, &theme);
+         display.sync_backdrop();
+         display.present()?;
+         for _ in 0..8 {
+@@ -429,6 +432,7 @@
+             .next_housekeeping_deadline(now)
+             .into_iter()
+             .chain(menu.next_deadline())
++            .chain(launcher.next_deadline())
+             .min();
+         let timeout = deadline.map_or(idle, |at| at.saturating_duration_since(now).min(idle));
+         display.wait(descriptors, timeout)?;
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/dock/crates/chonk-dock-theme/src/launcher.rs desk3-src/dock/crates/chonk-dock-theme/src/launcher.rs
+--- desk2-src/dock/crates/chonk-dock-theme/src/launcher.rs	2026-11-14 11:33:24.354463690 -0800
++++ desk3-src/dock/crates/chonk-dock-theme/src/launcher.rs	2026-11-14 13:43:57.422988693 -0800
+@@ -90,6 +90,23 @@
+     running: bool,
+     icon: Option<&tiny_skia::Pixmap>,
+ ) -> DecorationBuffer {
++    render_launcher_tile_launching(theme, font_system, swash_cache, size, name, running, None, icon)
++}
++
++/// `render_launcher_tile`, and while the application is starting (`launching`: seconds since
++/// the click) its running dot pulses, once a second: the click was taken and the application is
++/// on its way (a further click on the tile is not a second launch).
++#[allow(clippy::too_many_arguments)]
++pub fn render_launcher_tile_launching(
++    theme: &Theme,
++    font_system: &mut cosmic_text::FontSystem,
++    swash_cache: &mut cosmic_text::SwashCache,
++    size: u32,
++    name: &str,
++    running: bool,
++    launching: Option<f32>,
++    icon: Option<&tiny_skia::Pixmap>,
++) -> DecorationBuffer {
+     let size = size.max(1);
+     let Some(mut pixmap) = tiny_skia::Pixmap::new(size, size) else {
+         return DecorationBuffer {
+@@ -151,16 +168,18 @@
+     // a caption under the monogram, same role as the icon tile's
+     // title caption.
+     let label_h = (size as i32 - margin - label_y).max(0) as u32;
+-    let label_font = FontSpec {
++    let mut label_font = FontSpec {
+         size: (label_h as f32 * 0.60).max(6.0),
+         ..theme.titlebar.font.clone()
+     };
+-    let label = elide_to_width(
+-        font_system,
+-        &label_font,
+-        name,
+-        face_w.saturating_sub(2 * t as u32).max(1),
+-    );
++    // A name a little too long for the strip ("Activity Monitor") is set smaller, down to three
++    // quarters of the size, before anything is cut; only a longer one is elided.
++    let room = face_w.saturating_sub(2 * t as u32).max(1);
++    let full = label_font.size;
++    while paint::text_width(font_system, &label_font, name) > room && label_font.size > (full * 0.75).max(6.0) {
++        label_font.size = (label_font.size - 0.5).max((full * 0.75).max(6.0));
++    }
++    let label = elide_to_width(font_system, &label_font, name, room);
+     paint::draw_text(
+         &mut pixmap,
+         font_system,
+@@ -178,20 +197,25 @@
+     // Running: a small soft round dot on the tile's outer (left) edge, centred on the face, as
+     // macOS's Dock marks a running application — in the tile's own ink, with a faint glow, in the
+     // room the square icon leaves beside it; nothing when not running.
+-    if running {
++    // While launching: the same dot, its strength rising and falling once a second.
++    let strength = match launching {
++        Some(t) => 0.25 + 0.75 * (0.5 + 0.5 * (t * std::f32::consts::TAU).cos()),
++        None => 1.0,
++    };
++    if running || launching.is_some() {
+         let r = (size as f32 * 0.04).max(1.6);
+         let spare = (face_w as f32 - face_w.min(face_h) as f32) / 2.0;
+         let cx = (margin as f32 + spare / 2.0).max(t as f32 + r + 1.0);
+         let cy = margin as f32 + face_h as f32 / 2.0;
+         let ink = tile::tile_ink(theme);
+         let mut glow = tiny_skia::Paint::default();
+-        glow.set_color_rgba8(ink.r, ink.g, ink.b, 60);
++        glow.set_color_rgba8(ink.r, ink.g, ink.b, (60.0 * strength) as u8);
+         glow.anti_alias = true;
+         if let Some(halo) = tiny_skia::PathBuilder::from_circle(cx, cy, r * 1.9) {
+             pixmap.fill_path(&halo, &glow, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+         }
+         let mut dot = tiny_skia::Paint::default();
+-        dot.set_color_rgba8(ink.r, ink.g, ink.b, 235);
++        dot.set_color_rgba8(ink.r, ink.g, ink.b, (235.0 * strength) as u8);
+         dot.anti_alias = true;
+         if let Some(core) = tiny_skia::PathBuilder::from_circle(cx, cy, r) {
+             pixmap.fill_path(&core, &dot, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+@@ -210,6 +234,19 @@
+     use super::*;
+     use crate::default_theme::nextstep_classic;
+ 
++    /// `DOCK_PREVIEW_DIR=<dir> cargo test -p chonk-dock-theme launcher_label_preview -- --ignored`:
++    /// tiles with a long name at the dock's sizes (the label is set smaller before it is cut).
++    #[test]
++    #[ignore]
++    fn launcher_label_preview() {
++        let dir = std::path::PathBuf::from(std::env::var_os("DOCK_PREVIEW_DIR").expect("DOCK_PREVIEW_DIR"));
++        for size in [56u32, 84, 112] {
++            let tile = render(size, "Activity Monitor", true);
++            let image = tiny_skia::Pixmap::from_vec(tile.pixels, tiny_skia::IntSize::from_wh(size, size).unwrap()).unwrap();
++            image.save_png(dir.join(format!("activity-monitor-{size}.png"))).unwrap();
++        }
++    }
++
+     fn render(size: u32, name: &str, running: bool) -> DecorationBuffer {
+         let theme = nextstep_classic();
+         let mut font_system = cosmic_text::FontSystem::new();
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/dock/crates/chonk-dock-theme/src/panel.rs desk3-src/dock/crates/chonk-dock-theme/src/panel.rs
+--- desk2-src/dock/crates/chonk-dock-theme/src/panel.rs	2026-11-07 21:25:57.409023323 -0800
++++ desk3-src/dock/crates/chonk-dock-theme/src/panel.rs	2026-11-14 13:27:34.844125306 -0800
+@@ -38,7 +38,7 @@
+ use tiny_skia::{Paint, Pixmap, Rect as SkRect, Transform};
+ use wm_theme_api::DecorationBuffer;
+ 
+-use crate::digitalclock::{segment_rects, DIGIT_SEGMENTS};
++use crate::digitalclock::DIGIT_SEGMENTS;
+ use crate::model::{Color, FontSpec, FontStyle, FontWeight, TextAlign};
+ use crate::paint;
+ use crate::tile;
+@@ -211,9 +211,10 @@
+     }
+ }
+ 
+-/// A row of seven-segment digits spread across `(x, y, w, h)`, ghost-8
+-/// pattern under every position, lit segments in `pal.ink` over it.
+-/// `None` positions show the ghost only (a blanked leading digit).
++/// A row of seven-segment digits in `(x, y, w, h)`, right-aligned: solid, chamfered segments
++/// (thick enough to read at a glance on the dock), a faint ghost 8 under every position, lit
++/// segments in `pal.ink`. Digits keep a legible shape (between 0.5 and 0.62 of their height
++/// wide) whatever box they are given. `None` positions show the ghost only.
+ pub fn draw_led_digits(
+     pixmap: &mut Pixmap,
+     x: i32,
+@@ -227,30 +228,71 @@
+         return;
+     }
+     let n = digits.len() as f32;
+-    let pad = (w as f32 * 0.06).max(1.0);
++    let pad = (w as f32 * 0.04).max(1.0);
+     let inner_w = (w as f32 - pad * 2.0).max(3.0);
+-    let margin = (inner_w * 0.18 / n).max(1.0);
+-    let digit_w = (inner_w / n - margin).max(1.0);
+-    let digit_h = h as f32 * 0.80;
+-    let digit_y = y as f32 + (h as f32 - digit_h) / 2.0;
+-
+-    let ghost = solid(pal.ghost);
+-    let ink = solid(pal.ink);
+-    let mut dx = x as f32 + pad + margin / 2.0;
++    let (digit_w, digit_h, gap) = digit_shape(inner_w, h as f32 * 0.88, digits.len());
++    let total = n * digit_w + (n - 1.0) * gap;
++    let mut dx = x as f32 + w as f32 - pad - total;
++    let dy = y as f32 + (h as f32 - digit_h) / 2.0;
+     for digit in digits {
+-        let rects = segment_rects(dx, digit_y, digit_w, digit_h);
+-        for (rx, ry, rw, rh) in rects {
+-            frect(pixmap, rx, ry, rw, rh, &ghost);
++        draw_segment_digit(pixmap, dx, dy, digit_w, digit_h, *digit, pal, true);
++        dx += digit_w + gap;
++    }
++}
++
++/// The width, height and spacing of `count` seven-segment digits in a `w` by `h` box.
++pub fn digit_shape(w: f32, h: f32, count: usize) -> (f32, f32, f32) {
++    let n = count.max(1) as f32;
++    let gap_share = 0.22;
++    let mut digit_w = w / (n + (n - 1.0) * gap_share);
++    let mut digit_h = h;
++    if digit_w < digit_h * 0.5 {
++        digit_h = digit_w / 0.5;
++    } else if digit_w > digit_h * 0.62 {
++        digit_w = digit_h * 0.62;
++    }
++    (digit_w.max(1.0), digit_h.max(1.0), (digit_w * gap_share).max(1.0))
++}
++
++/// One seven-segment digit: chamfered segments with hairline gaps, the ghost 8 (`ghosts`) then
++/// the lit ones.
++#[allow(clippy::too_many_arguments)]
++pub fn draw_segment_digit(pixmap: &mut Pixmap, x: f32, y: f32, w: f32, h: f32, digit: Option<u8>, pal: &PanelPalette, ghosts: bool) {
++    let s = (w * 0.26).min(h * 0.13).max(1.5);
++    let g = (s * 0.14).max(0.5);
++    let (left, right) = (x + s / 2.0, x + w - s / 2.0);
++    let (top, middle, bottom) = (y + s / 2.0, y + h / 2.0, y + h - s / 2.0);
++    let horizontal = |yc: f32| [(left + g, yc), (left + g + s / 2.0, yc - s / 2.0), (right - g - s / 2.0, yc - s / 2.0), (right - g, yc), (right - g - s / 2.0, yc + s / 2.0), (left + g + s / 2.0, yc + s / 2.0)];
++    let vertical = |xc: f32, y0: f32, y1: f32| [(xc, y0 + g), (xc + s / 2.0, y0 + g + s / 2.0), (xc + s / 2.0, y1 - g - s / 2.0), (xc, y1 - g), (xc - s / 2.0, y1 - g - s / 2.0), (xc - s / 2.0, y0 + g + s / 2.0)];
++    let segments = [
++        horizontal(top),
++        vertical(right, top, middle),
++        vertical(right, middle, bottom),
++        horizontal(bottom),
++        vertical(left, middle, bottom),
++        vertical(left, top, middle),
++        horizontal(middle),
++    ];
++    let lit = digit.map(|d| DIGIT_SEGMENTS[d as usize % 10]).unwrap_or([false; 7]);
++    let ghost = pal.ghost;
++    // tiny-skia's anti-aliasing turns sub-pixel-thin shapes into hairlines (and asserts on
++    // some): small digits are drawn hard-edged.
++    let smooth = s >= 3.0 && w >= 6.0;
++    for (on, points) in lit.into_iter().zip(segments) {
++        if !on && !ghosts {
++            continue;
++        }
++        let mut b = tiny_skia::PathBuilder::new();
++        b.move_to(points[0].0, points[0].1);
++        for (px, py) in &points[1..] {
++            b.line_to(*px, *py);
+         }
+-        if let Some(d) = digit {
+-            let segs = DIGIT_SEGMENTS[*d as usize % 10];
+-            for (lit, (rx, ry, rw, rh)) in segs.into_iter().zip(rects) {
+-                if lit {
+-                    frect(pixmap, rx, ry, rw, rh, &ink);
+-                }
+-            }
++        b.close();
++        if let Some(path) = b.finish() {
++            let mut paint = Paint { anti_alias: smooth, ..Default::default() };
++            paint.set_color(paint::sk_color(if on { pal.ink } else { ghost }));
++            pixmap.fill_path(&path, &paint, tiny_skia::FillRule::Winding, Transform::identity(), None);
+         }
+-        dx += digit_w + margin;
+     }
+ }
+ 
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/dock/crates/chonk-dock-theme/src/techclock.rs desk3-src/dock/crates/chonk-dock-theme/src/techclock.rs
+--- desk2-src/dock/crates/chonk-dock-theme/src/techclock.rs	2026-11-14 11:32:16.561497446 -0800
++++ desk3-src/dock/crates/chonk-dock-theme/src/techclock.rs	2026-11-14 13:27:34.844613653 -0800
+@@ -36,20 +36,32 @@
+     let well_h = (size as i32 - margin * 2 - strip_h).max(0) as u32;
+     let (gx, gy, gw, gh) = panel::draw_panel_glass(&mut pixmap, margin, margin, well_w, well_h, theme);
+     let pal = panel::panel_palette(theme);
+-    // HH and MM, each a pair of digits across almost half the glass, the colon between
+-    let pad = ((gw.min(gh)) as f32 * 0.05).round().max(1.0) as i32;
+-    let colon_w = ((gw as f32) * 0.10).round().max(3.0) as i32;
+-    let half = ((gw as i32 - pad * 2 - colon_w) / 2).max(4);
+-    let digits_h = (gh as i32 - pad * 2).max(4);
+-    let digits_y = gy + pad + (gh as i32 - pad * 2 - digits_h) / 2;
+-    panel::draw_led_digits(&mut pixmap, gx + pad, digits_y, half as u32, digits_h as u32, &pal, &[Some((hour / 10 % 10) as u8), Some((hour % 10) as u8)]);
+-    panel::draw_led_digits(&mut pixmap, gx + pad + half + colon_w, digits_y, half as u32, digits_h as u32, &pal, &[Some((minute / 10 % 10) as u8), Some((minute % 10) as u8)]);
+-    let dot = ((colon_w as f32) * 0.42).round().max(2.0);
+-    let cx = (gx + pad + half) as f32 + (colon_w as f32 - dot) / 2.0;
++    // HH:MM across the glass in solid, chamfered segments (panel::draw_segment_digit), lit
++    // segments only (a clock always shows a reading: no ghost 8s to read through), the colon
++    // between the hours and the minutes: four digits as tall as the glass allows, centred.
++    let pad = ((gw.min(gh)) as f32 * 0.05).round().max(1.0);
++    let inner_w = gw as f32 - pad * 2.0;
++    let inner_h = gh as f32 - pad * 2.0;
++    let colon_share = 0.40; // the colon's room, in digit widths
++    let gap_share = 0.16;
++    let digit_w = inner_w / (4.0 + colon_share + 2.0 * gap_share);
++    let digit_h = inner_h.min(digit_w / 0.40);
++    let gap = digit_w * gap_share;
++    let colon_w = digit_w * colon_share;
++    let total = digit_w * 4.0 + gap * 2.0 + colon_w;
++    let x0 = gx as f32 + (gw as f32 - total) / 2.0;
++    let y0 = gy as f32 + (gh as f32 - digit_h) / 2.0;
++    let digits = [hour / 10 % 10, hour % 10, minute / 10 % 10, minute % 10];
++    let xs = [x0, x0 + digit_w + gap, x0 + digit_w * 2.0 + gap + colon_w, x0 + digit_w * 3.0 + gap * 2.0 + colon_w];
++    for (x, d) in xs.into_iter().zip(digits) {
++        panel::draw_segment_digit(&mut pixmap, x, y0, digit_w, digit_h, Some(d as u8), &pal, false);
++    }
++    let dot = (digit_w * 0.26).min(digit_h * 0.13).max(1.5);
++    let cx = x0 + digit_w * 2.0 + gap + (colon_w - dot) / 2.0;
+     let mut paint = Paint { anti_alias: false, ..Default::default() };
+-    paint.set_color(paint::sk_color(if second % 2 == 0 { pal.ink } else { pal.ghost }));
+-    for frac in [0.32f32, 0.64] {
+-        if let Some(r) = SkRect::from_xywh(cx, digits_y as f32 + digits_h as f32 * frac - dot / 2.0, dot, dot) {
++    paint.set_color(paint::sk_color(if second % 2 == 0 { pal.ink } else { pal.ink_dim }));
++    for frac in [0.30f32, 0.70] {
++        if let Some(r) = SkRect::from_xywh(cx.round(), (y0 + digit_h * frac - dot / 2.0).round(), dot.round(), dot.round()) {
+             pixmap.fill_rect(r, &paint, Transform::identity(), None);
+         }
+     }
+diff -ruN '--exclude=.git' '--exclude=target' desk2-src/dock/crates/chonk-instruments/src/net.rs desk3-src/dock/crates/chonk-instruments/src/net.rs
+--- desk2-src/dock/crates/chonk-instruments/src/net.rs	2026-11-07 21:25:57.416237132 -0800
++++ desk3-src/dock/crates/chonk-instruments/src/net.rs	2026-11-14 13:29:17.210399615 -0800
+@@ -69,9 +69,18 @@
+     /// Normalized `0.0..=1.0` history, oldest first.
+     pub rx_history: VecDeque<f32>,
+     pub tx_history: VecDeque<f32>,
++    /// The receive counter has been seen above zero, and the transmit counter has moved: an
++    /// interface whose driver counts what it sends but never what it receives (SiliconForest's
++    /// Wi-Fi today) shows no receive reading rather than a false "0 K".
++    pub rx_counted: bool,
++    pub tx_moved: bool,
+ }
+ 
+ impl InterfaceLoad {
++    /// Receiving is not counted by this interface's driver (see `rx_counted`).
++    pub fn rx_uncounted(&self) -> bool {
++        !self.rx_counted && self.tx_moved
++    }
+     fn new(name: String) -> Self {
+         Self {
+             name,
+@@ -81,6 +90,8 @@
+             tx_bps: 0.0,
+             rx_history: VecDeque::from(vec![0.0; HISTORY]),
+             tx_history: VecDeque::from(vec![0.0; HISTORY]),
++            rx_counted: false,
++            tx_moved: false,
+         }
+     }
+ }
+@@ -154,9 +165,11 @@
+         let readings = parse_interface_totals(samples.text(self.dev).unwrap_or_default());
+         for (name, rx_total, tx_total) in &readings {
+             if let Some(existing) = self.interfaces.iter_mut().find(|i| &i.name == name) {
++                existing.rx_counted |= *rx_total > 0;
+                 if let Some((prev_rx, prev_tx)) =
+                     existing.last_totals.replace((*rx_total, *tx_total))
+                 {
++                    existing.tx_moved |= *tx_total > prev_tx;
+                     let rx_bps = rx_total.saturating_sub(prev_rx) as f32 / elapsed.max(0.1);
+                     let tx_bps = tx_total.saturating_sub(prev_tx) as f32 / elapsed.max(0.1);
+                     existing.peak_bps = (existing.peak_bps * 0.98)
+@@ -177,6 +190,7 @@
+             } else {
+                 let mut fresh = InterfaceLoad::new(name.clone());
+                 fresh.last_totals = Some((*rx_total, *tx_total));
++                fresh.rx_counted = *rx_total > 0;
+                 self.interfaces.push(fresh);
+             }
+         }
+@@ -216,8 +230,13 @@
+         };
+         let rx_history = quantize(&iface.rx_history);
+         let tx_history = quantize(&iface.tx_history);
++        // No receive counter: the readout shows no figure (blank digits), not "0".
++        let mut rx_readout = nettraffic::format_rate(iface.rx_bps);
++        if iface.rx_uncounted() {
++            rx_readout.digits = [None; 3];
++        }
+         let down = TrafficLane {
+-            readout: nettraffic::format_rate(iface.rx_bps),
++            readout: rx_readout,
+             now: nettraffic::quantize_level(
+                 iface.rx_bps / iface.peak_bps,
+                 nettraffic::NET_TRAFFIC_HALF_ROWS,
+@@ -277,6 +296,24 @@
+         );
+     }
+ 
++    /// SiliconForest's Wi-Fi counts what it sends and never what it receives: the receive
++    /// readout then shows no figure instead of "0 K"; an interface that counts both reads both.
++    #[test]
++    fn an_interface_that_never_counts_receiving_shows_no_receive_figure() {
++        let theme = wm_theme::default_theme::nextstep_classic();
++        let (mut fonts, mut swash) = (cosmic_text::FontSystem::new(), cosmic_text::SwashCache::new());
++        let mut iface = InterfaceLoad::new("en0".to_string());
++        iface.tx_moved = true;
++        assert!(iface.rx_uncounted());
++        let mut widget = NetTrafficWidget::new();
++        widget.interfaces.push(iface);
++        let blank = widget.render(&theme, 112, &mut fonts, &mut swash);
++        widget.interfaces[0].rx_counted = true;
++        assert!(!widget.interfaces[0].rx_uncounted());
++        let zero = widget.render(&theme, 112, &mut fonts, &mut swash);
++        assert_ne!(blank.pixels, zero.pixels, "no figure differs from a 0");
++    }
++
+     #[test]
+     fn empty_interface_totals_do_not_panic() {
+         assert_eq!(parse_interface_totals(""), Vec::<(String, u64, u64)>::new());

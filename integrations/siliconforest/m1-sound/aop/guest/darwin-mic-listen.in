@@ -1,0 +1,66 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# ATTENDED check of the built-in microphones (SFAopAudio). A person has to be at the machine.
+#
+# State when this was written (boots sd41..sd47): the stream runs, but the three microphones
+# delivered no signal at all, not even a noise floor: their PDM data lines did not move.
+# Step 0 below is therefore the first thing to establish.
+#
+# What to do (boot with: MIC_GUEST=integrations/siliconforest/m1-sound/aop/guest/darwin-mic-listen.in
+# MIC_SECONDS=60 MIC_RUNTIME=300 integrations/siliconforest/m1-sound/aop/tools/mic_boot.sh sd4x;
+# read runs/m1-desktop-010/pcie-enum-attempt-<name>/guest/console.bin afterwards with
+# tools/mic_summary.sh; the lines appear while the guest runs):
+#   0. Before booting: the lid must be open (Apple silicon notebooks disconnect the
+#      microphones in hardware while it is closed). Keep it fully open during the boot.
+#   1. The script prints "MIC_LISTEN quiet" and measures 5 s: stay silent. The last line,
+#      "SFMIC verdict", must not say "numerically-silent": a microphone that works shows
+#      a noise floor (an rms far above 1e-20, the same order of magnitude in every 1 s
+#      line, and different numbers for mic0, mic1 and mic2). If it says numerically-silent,
+#      the microphones are still dead: stop here, the rest proves nothing. The kernel log
+#      line "aop-gpio activity (capturing)" then lists the pins that move: 30 and 31 are
+#      the PDM clocks; 36 and 37, the data lines, are missing from it when dead.
+#   2. It prints "MIC_LISTEN clap" and measures @SECONDS@ s, one line per microphone every
+#      250 ms. During that time, in this order, leaving two seconds between the steps:
+#        a. clap your hands once, about half a metre above the keyboard;
+#        b. tap with a fingernail on the palm rest next to the LEFT speaker grille, near
+#           its end closest to the display, then its middle, then its end closest to you
+#           (the three microphones of this model are believed to sit in a row along that
+#           grille; the driver does not know their order);
+#        c. tap on the palm rest next to the RIGHT speaker grille;
+#        d. say a few words at normal volume.
+#   3. What must be seen in the "SFMIC int" lines (levels are relative to the quiet lines
+#      of step 1; absolute levels of this stream have not been measured yet, it is known
+#      to be very quiet: expect numbers around 1e-5 .. 1e-3, not near 1.0):
+#        - at the clap, peak= of all three microphones jumps by 20 dB or more in one line;
+#        - each tap on the left raises all three, most the microphone nearest the tap:
+#          which of mic0/mic1/mic2 that is for the three positions is the result to
+#          write down;
+#        - the tap on the right side is weaker in all three than the taps on the left;
+#        - speech raises rms= of all three for as long as it lasts.
+#      If one microphone never reacts, or two always show identical numbers (in the dead
+#      state mic0 and mic1 are bit-identical), that is a defect to report.
+# Nothing is played and nothing is stored: only levels are printed.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nMIC_BEGIN_%s\n' "$nonce"
+get() { sysctl -n "$1" 2>/dev/null; }
+n=0
+while [ "$n" -lt 60 ]; do
+    case "$(get kern.sf_aop.state)" in idle*|failed*|aop-only*|configured*) break;; esac
+    sleep 1; n=$((n+1))
+done
+printf 'MIC_STATE %s\n' "$(get kern.sf_aop.state)"
+sleep 2
+case "$(get kern.sf_aop.state)" in
+idle*)
+    printf 'MIC_LISTEN quiet: stay silent for 5 seconds\n'
+    sfmic-stat -s 5 -i 1000 -k 1500 2>&1
+    printf 'MIC_LISTEN clap: @SECONDS@ seconds; clap, tap left grille (back, middle, front), tap right grille, speak\n'
+    sfmic-stat -s @SECONDS@ -i 250 2>&1
+    printf 'MIC_LISTEN done\n';;
+*)  printf 'MIC_FAIL the driver is not ready for capture\n';;
+esac
+sysctl kern.sf_aop 2>&1
+printf 'MIC_END_%s\n' "$nonce"
+printf '\nPD_BENCH_DONE\n'

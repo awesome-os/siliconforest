@@ -1,0 +1,158 @@
+--- a/src/Frameworks/CoreGraphics/CGColorSpace.h
++++ b/src/Frameworks/CoreGraphics/CGColorSpace.h
+@@ -8,6 +8,9 @@
+ 
+ #import <CoreGraphics/CGGeometry.h>
+ #import <CoreFoundation/CFString.h>
++#import <CoreFoundation/CFData.h>
++
++typedef struct O2DataProvider *CGDataProviderRef;
+ 
+ typedef struct O2ColorSpace *CGColorSpaceRef;
+ 
+@@ -66,5 +69,17 @@
+ // the name a space was made with (CGColorSpaceCreateWithName), NULL for the device spaces
+ COREGRAPHICS_EXPORT CFStringRef CGColorSpaceGetName(CGColorSpaceRef space);
+ 
++// ICC-based spaces (SiliconForest): the profile's bytes are kept and answered by CGColorSpaceCopyICCData; the
++// model and component count are the profile's. Onyx2D does not convert colours between profiles: such a space
++// draws as the device space of its model. NULL for data that is not an ICC profile of a Gray, RGB or CMYK space.
++COREGRAPHICS_EXPORT CGColorSpaceRef CGColorSpaceCreateWithICCData(CFTypeRef data);
++COREGRAPHICS_EXPORT CGColorSpaceRef CGColorSpaceCreateWithICCProfile(CFDataRef data);
++COREGRAPHICS_EXPORT CGColorSpaceRef CGColorSpaceCreateICCBased(size_t nComponents, const CGFloat *range, CGDataProviderRef profile, CGColorSpaceRef alternate);
++COREGRAPHICS_EXPORT CGColorSpaceRef CGColorSpaceCreateIndexed(CGColorSpaceRef baseSpace, size_t lastIndex, const unsigned char *colorTable);
++COREGRAPHICS_EXPORT CGColorSpaceRef CGColorSpaceGetBaseColorSpace(CGColorSpaceRef space);
++COREGRAPHICS_EXPORT size_t CGColorSpaceGetColorTableCount(CGColorSpaceRef space);
++COREGRAPHICS_EXPORT void CGColorSpaceGetColorTable(CGColorSpaceRef space, uint8_t *table);
++COREGRAPHICS_EXPORT const CFStringRef kCGColorSpaceCoreMedia709;
++
+ COREGRAPHICS_EXPORT CGColorSpaceModel CGColorSpaceGetModel(CGColorSpaceRef self);
+ COREGRAPHICS_EXPORT size_t CGColorSpaceGetNumberOfComponents(CGColorSpaceRef self);
+--- a/src/Frameworks/CoreGraphics/CGColorSpace.m
++++ b/src/Frameworks/CoreGraphics/CGColorSpace.m
+@@ -9,6 +9,8 @@
+ #import <CoreGraphics/CGColorSpace.h>
+ #import <objc/runtime.h>
+ #import <Onyx2D/O2ColorSpace.h>
++#import <CoreGraphics/CGDataProvider.h>
++#include <string.h>
+ 
+ CGColorSpaceRef CGColorSpaceRetain(CGColorSpaceRef colorSpace) {
+    return O2ColorSpaceRetain(colorSpace);
+@@ -51,6 +53,7 @@
+ const CFStringRef kCGColorSpaceExtendedLinearITUR_2020 = CFSTR("kCGColorSpaceExtendedLinearITUR_2020");
+ const CFStringRef kCGColorSpaceITUR_2100_HLG = CFSTR("kCGColorSpaceITUR_2100_HLG");
+ const CFStringRef kCGColorSpaceITUR_2100_PQ = CFSTR("kCGColorSpaceITUR_2100_PQ");
++const CFStringRef kCGColorSpaceCoreMedia709 = CFSTR("kCGColorSpaceCoreMedia709");
+ 
+ static char colorSpaceNameKey;
+ 
+@@ -64,7 +67,8 @@
+                                kCGColorSpaceLinearSRGB, kCGColorSpaceExtendedSRGB, kCGColorSpaceExtendedLinearSRGB,
+                                kCGColorSpaceDisplayP3, kCGColorSpaceExtendedLinearDisplayP3, kCGColorSpaceAdobeRGB1998,
+                                kCGColorSpaceDCIP3, kCGColorSpaceITUR_709, kCGColorSpaceITUR_2020,
+-                               kCGColorSpaceExtendedLinearITUR_2020, kCGColorSpaceITUR_2100_HLG, kCGColorSpaceITUR_2100_PQ };
++                               kCGColorSpaceExtendedLinearITUR_2020, kCGColorSpaceITUR_2100_HLG, kCGColorSpaceITUR_2100_PQ,
++                               kCGColorSpaceCoreMedia709 };
+ 
+    CGColorSpaceRef space = NULL;
+ 
+@@ -99,7 +103,96 @@
+    return O2ColorSpaceGetNumberOfComponents(self);
+ }
+ 
+-// Onyx2D's spaces are device spaces without an ICC profile, Apple answers NULL for those too
++static char colorSpaceICCKey;
++
++static uint32_t iccWord(const uint8_t *p) {
++   return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++}
++
++// a space of the profile's model that keeps the profile (an immutable copy of its bytes)
++static CGColorSpaceRef createWithProfileBytes(CFDataRef data) {
++   if(data == NULL || CFGetTypeID(data) != CFDataGetTypeID())
++      return NULL;
++   CFIndex length = CFDataGetLength(data);
++   const uint8_t *bytes = CFDataGetBytePtr(data);
++   if(length < 128 || bytes == NULL || iccWord(bytes + 36) != 0x61637370 /* 'acsp' */)
++      return NULL;
++   uint32_t declared = iccWord(bytes);
++   if(declared < 128 || declared > (uint32_t)length)
++      return NULL;
++   CGColorSpaceRef space = NULL;
++   switch(iccWord(bytes + 16)) {
++   case 0x47524159: /* 'GRAY' */ space = O2ColorSpaceCreateDeviceGray(); break;
++   case 0x52474220: /* 'RGB ' */ space = O2ColorSpaceCreateDeviceRGB(); break;
++   case 0x434D594B: /* 'CMYK' */ space = O2ColorSpaceCreateDeviceCMYK(); break;
++   default: return NULL; /* Lab, XYZ, n-colour: no such model in Onyx2D */
++   }
++   CFDataRef copy = CFDataCreate(NULL, bytes, (CFIndex)declared);
++   objc_setAssociatedObject((id)space, &colorSpaceICCKey, (id)copy, OBJC_ASSOCIATION_RETAIN);
++   CFRelease(copy);
++   return space;
++}
++
++CGColorSpaceRef CGColorSpaceCreateWithICCData(CFTypeRef data) {
++   if(data == NULL)
++      return NULL;
++   if(CFGetTypeID(data) == CFDataGetTypeID())
++      return createWithProfileBytes((CFDataRef)data);
++   // a CGDataProvider (the other type the call takes)
++   CFDataRef bytes = CGDataProviderCopyData((CGDataProviderRef)data);
++   CGColorSpaceRef space = createWithProfileBytes(bytes);
++   if(bytes)
++      CFRelease(bytes);
++   return space;
++}
++
++CGColorSpaceRef CGColorSpaceCreateWithICCProfile(CFDataRef data) {
++   return createWithProfileBytes(data);
++}
++
++CGColorSpaceRef CGColorSpaceCreateICCBased(size_t nComponents, const CGFloat *range, CGDataProviderRef profile, CGColorSpaceRef alternate) {
++   CGColorSpaceRef space = profile ? CGColorSpaceCreateWithICCData((CFTypeRef)profile) : NULL;
++   if(space && O2ColorSpaceGetNumberOfComponents(space) != nComponents) {
++      O2ColorSpaceRelease(space);
++      space = NULL;
++   }
++   if(space == NULL && alternate != NULL && O2ColorSpaceGetNumberOfComponents(alternate) == nComponents)
++      space = O2ColorSpaceRetain(alternate);
++   return space;
++}
++
++// the profile a space was made with; Onyx2D's device and named spaces have none (NULL, as Apple's device spaces)
+ CFDataRef CGColorSpaceCopyICCData(CGColorSpaceRef space) {
+-   return NULL;
++   CFDataRef data = space ? (CFDataRef)objc_getAssociatedObject((id)space, &colorSpaceICCKey) : NULL;
++   return data ? (CFDataRef)CFRetain(data) : NULL;
++}
++
++CGColorSpaceRef CGColorSpaceCreateIndexed(CGColorSpaceRef baseSpace, size_t lastIndex, const unsigned char *colorTable) {
++   if(baseSpace == NULL || colorTable == NULL || lastIndex > 255)
++      return NULL;
++   O2ColorSpaceModel model = O2ColorSpaceGetModel(baseSpace);
++   if(model == kO2ColorSpaceModelIndexed || model == kO2ColorSpaceModelPattern)
++      return NULL;
++   return [[O2ColorSpace_indexed alloc] initWithColorSpace:baseSpace hival:(unsigned)lastIndex bytes:colorTable];
++}
++
++// the indexed getters: Codex's bodies (runs/m1-coord/requests-for-CLAUDE.md, vImage); a pattern space keeps no base here
++CGColorSpaceRef CGColorSpaceGetBaseColorSpace(CGColorSpaceRef space) {
++   if(!space || O2ColorSpaceGetModel(space) != kO2ColorSpaceModelIndexed)
++      return NULL;
++   return [(O2ColorSpace_indexed *)space baseColorSpace];
++}
++
++size_t CGColorSpaceGetColorTableCount(CGColorSpaceRef space) {
++   if(!space || O2ColorSpaceGetModel(space) != kO2ColorSpaceModelIndexed)
++      return 0;
++   return (size_t)[(O2ColorSpace_indexed *)space hival] + 1;
++}
++
++void CGColorSpaceGetColorTable(CGColorSpaceRef space, uint8_t *table) {
++   if(!table || !space || O2ColorSpaceGetModel(space) != kO2ColorSpaceModelIndexed)
++      return;
++   O2ColorSpace_indexed *indexed = (O2ColorSpace_indexed *)space;
++   size_t bytes = ((size_t)[indexed hival] + 1) * O2ColorSpaceGetNumberOfComponents([indexed baseColorSpace]);
++   memcpy(table, [indexed paletteBytes], bytes);
+ }

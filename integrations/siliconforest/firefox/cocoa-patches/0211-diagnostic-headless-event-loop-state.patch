@@ -1,0 +1,25 @@
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -1916,6 +1916,10 @@
+        waitDate=retryDate;
+      }
+ 
++     static int sfTraceEvents=-1;static unsigned sfTraceCount;
++     if(sfTraceEvents<0)sfTraceEvents=getenv("SFFX_EVENT_TRACE")!=NULL;
++     BOOL sfTraceThis=sfTraceEvents&&sfTraceCount++<16;
++     if(sfTraceThis)fprintf(stderr,"FXEVENT pid=%d self=%p class=%s display=%p pipe=%d,%d flags=%d,%d wait=%.6f mode=%s mainCF=%d\n",getpid(),self,object_getClassName(self),_display,_machEventPipe[0],_machEventPipe[1],fcntl(_machEventPipe[0],F_GETFL),fcntl(_machEventPipe[1],F_GETFL),waitDate?[waitDate timeIntervalSinceNow]:-1.0,mode?[mode UTF8String]:"nil",CFRunLoopGetCurrent()==CFRunLoopGetMain());
+      if(_display!=nil)
+       nextEvent=[_display nextEventMatchingMask:mask untilDate:waitDate inMode:mode dequeue:dequeue];
+      else {
+@@ -1923,8 +1927,9 @@
+       // Messaging nil here spun and starved its CFRunLoop sources and timers.
+       NSRunLoop *loop=[NSRunLoop currentRunLoop];
+       [loop addInputSource:[self inputSource] forMode:mode];
+-      [loop runMode:mode beforeDate:waitDate];
+-      [self _drainPipe];
++      BOOL sfFired=[loop runMode:mode beforeDate:waitDate];
++      int sfDrained=[self _drainPipe];
++      if(sfTraceThis)fprintf(stderr,"FXEVENT headless_loop=%p fired=%d drained=%d\n",loop,sfFired,sfDrained);
+       [loop removeInputSource:[self inputSource] forMode:mode];
+      }
+ 

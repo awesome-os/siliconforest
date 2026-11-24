@@ -1,0 +1,245 @@
+drm/asahi: a build with the common code and the G13/G14 (legacy) backend only
+
+--cfg sf_g13 leaves out the G17 and M3 backends (61,000 of the driver's 111,000 lines) and
+the hw tables that exist only for them. Without the cfg nothing changes. The common code
+names a few G17 items unconditionally (Vm status, cumulative sync bundles, `is::<g17::Gpu>()`
+tests, two t8140 constants); for those the build keeps the real g17/status.rs, hw/t8140.rs
+minus its G17 configuration, and two types that cannot be constructed (`g17::Gpu`,
+`g17::sync_output::SignalBundle`), so every G17 branch of the common code is dead but
+type-checks. None of the driver's C (sysfs.c, g17/*.c) is needed by this build.
+UPSTREAM: optional (a Kconfig symbol per backend would be the Linux form).
+
+--- a/asahi_core.rs
++++ b/asahi_core.rs
+@@ -14,7 +14,30 @@
+ mod float;
+ mod fw;
+ mod gem;
++#[cfg(not(sf_g13))]
+ mod g17;
++// SiliconForest G13-only build (--cfg sf_g13): the G17 and M3 backends are not compiled. The
++// common code names a few G17 items; this keeps exactly those. `status` is the real file.
++// `Gpu` cannot be constructed, so every `is::<g17::Gpu>()` in the common code is false and no
++// VM gets `with_status()`. A cumulative-signal bundle (g17/sync_output.rs, with
++// sync_output.c and sync_scope.c) cannot be constructed either: the common code only asks
++// for one when the GPU accepts cumulative syncs (file.rs, `allow_cumulative`), which no GPU
++// of this build does, and `new` refuses.
++#[cfg(sf_g13)]
++mod g17 {
++    pub(crate) mod status;
++    pub(crate) mod sync_output {
++        use kernel::prelude::*;
++        pub(crate) const SYNC_CUMULATIVE: u32 = 2;
++        pub(crate) enum SignalBundle {}
++        impl SignalBundle {
++            pub(crate) fn new(_syncs: &[crate::file::SyncItem], _anchor: usize) -> Result<Self> {
++                Err(EINVAL)
++            }
++        }
++    }
++    pub(crate) enum Gpu {}
++}
+ #[cfg(CONFIG_DRM_ASAHI_G15)]
+ mod g15;
+ // Without the G15 backend, only the UAT adoption the T8122 runtime shares with it.
+@@ -26,6 +49,7 @@
+ mod initdata;
+ mod mem;
+ mod memacct;
++#[cfg(not(sf_g13))]
+ mod m3;
+ mod microseq;
+ mod mmu;
+--- a/driver.rs
++++ b/driver.rs
+@@ -150,7 +150,9 @@
+ /// Firmware interface selected by the hardware compatible.
+ pub(crate) enum ProbeConfig {
+     Legacy(&'static hw::HwConfig),
++    #[cfg(not(sf_g13))]
+     G17(&'static g17::Config),
++    #[cfg(not(sf_g13))]
+     M3(crate::m3::Chip),
+ }
+ 
+@@ -160,10 +162,12 @@
+     MODULE_OF_TABLE,
+     <AsahiPlatformDriver as platform::Driver>::IdInfo,
+     [
++        #[cfg(not(sf_g13))]
+         (
+             of::DeviceId::new(c"apple,agx-t8140"),
+             ProbeConfig::G17(&hw::t8140::CONFIG)
+         ),
++        #[cfg(not(sf_g13))]
+         (
+             of::DeviceId::new(c"apple,agx-t6040"),
+             ProbeConfig::G17(&hw::t6040::CONFIG)
+@@ -200,20 +204,24 @@
+             of::DeviceId::new(c"apple,agx-t6022"),
+             ProbeConfig::Legacy(&hw::t602x::HWCONFIG_T6022)
+         ),
++        #[cfg(not(sf_g13))]
+         (
+             of::DeviceId::new(c"apple,agx-t8122"),
+             ProbeConfig::M3(crate::m3::Chip::T8122)
+         ),
+         #[cfg(not(CONFIG_DRM_ASAHI_G15))]
++        #[cfg(not(sf_g13))]
+         (
+             of::DeviceId::new(c"apple,agx-t6030"),
+             ProbeConfig::M3(crate::m3::Chip::T6030)
+         ),
+         #[cfg(not(CONFIG_DRM_ASAHI_G15))]
++        #[cfg(not(sf_g13))]
+         (
+             of::DeviceId::new(c"apple,agx-t6031"),
+             ProbeConfig::M3(crate::m3::Chip::T6031)
+         ),
++        #[cfg(not(sf_g13))]
+         (
+             of::DeviceId::new(c"apple,agx-t6032"),
+             ProbeConfig::M3(crate::m3::Chip::T6032)
+@@ -231,6 +239,7 @@
+         _pdev: &'bound platform::Device<Core<'_>>,
+         this: Pin<&Self::Data<'bound>>,
+     ) {
++        #[cfg(not(sf_g13))]
+         if let Some(gpu) = this.g17.as_ref() {
+             // Driver data is dropped after devres, so CPU control must happen in unbind.
+             gpu.shutdown();
+@@ -253,9 +262,11 @@
+ 
+         let cfg = match info.ok_or(ENODEV)? {
+             ProbeConfig::Legacy(cfg) => *cfg,
++            #[cfg(not(sf_g13))]
+             ProbeConfig::G17(cfg) => return AsahiPlatformDriver::probe_g17(pdev, cfg),
+             #[cfg(CONFIG_DRM_ASAHI_M3_T8122)]
+             ProbeConfig::M3(crate::m3::Chip::T8122) => return AsahiPlatformDriver::probe_t8122(pdev),
++            #[cfg(not(sf_g13))]
+             ProbeConfig::M3(chip) => return Err(crate::m3::refuse_probe(pdev, *chip)),
+         };
+ 
+@@ -411,6 +422,7 @@
+         })
+     }
+ 
++    #[cfg(not(sf_g13))]
+     fn probe_g17<'bound>(
+         pdev: &'bound platform::Device<Core<'_>>,
+         cfg: &'static g17::Config,
+@@ -472,6 +484,7 @@
+             crate::sysfs_exports::unregister(self.raw_dev, self.raw_stats);
+         }
+         drop(self.stats.take());
++        #[cfg(not(sf_g13))]
+         if let Some(gpu) = self.g17.as_ref() {
+             // Also covers failure to allocate platform driver data after the probe body returned.
+             gpu.shutdown();
+--- a/hw/mod.rs
++++ b/hw/mod.rs
+@@ -13,6 +13,7 @@
+ 
+ pub(crate) mod t600x;
+ pub(crate) mod t602x;
++#[cfg(not(sf_g13))]
+ pub(crate) mod t6040;
+ pub(crate) mod t8103;
+ pub(crate) mod t8112;
+--- a/hw/t8140.rs
++++ b/hw/t8140.rs
+@@ -2,15 +2,18 @@
+ 
+ //! Hardware configuration for t8140 platforms (A18 Pro).
+ 
++#[cfg(not(sf_g13))]
+ use crate::g17::{
+     Config,
+     CrashBuffers,
+     FixedBuffer,
+     Identity, //
+ };
++#[cfg(not(sf_g13))]
+ use crate::hw::{GpuGen, GpuVariant};
+ 
+ /// Static configuration of the T8140 GPU.
++#[cfg(not(sf_g13))]
+ pub(crate) const CONFIG: Config = Config {
+     chip_id: CHIP_ID,
+     identity: Identity {
+@@ -62,6 +65,7 @@
+     },
+ };
+ 
++#[cfg(not(sf_g13))]
+ use crate::g17::fw::initdata::{PerfConfig, RegisterWindow, PERF_STATES};
+ 
+ /// Chip identifier written to the hardware data.
+@@ -70,6 +74,7 @@
+ /// Base of the firmware MMIO aperture in the kernel window.
+ const MMIO_APERTURE: u64 = 0xffff_fc21_8000_0000;
+ 
++#[cfg(not(sf_g13))]
+ const fn window(
+     slot: usize,
+     phys: u64,
+@@ -91,6 +96,7 @@
+ }
+ 
+ /// Register windows the firmware maps, by register-map slot.
++#[cfg(not(sf_g13))]
+ pub(crate) const REGISTER_WINDOWS: [RegisterWindow; 18] = [
+     window(0, 0x3_0101_4000, 0x0_0000, 0x4000, 0, 2),
+     window(3, 0x2_2010_4000, 0x0_8000, 0x1_8000, 0, 2),
+@@ -120,6 +126,7 @@
+ /// Performance-table configuration. The device tree lists the operating
+ /// points in performance-state order; table A uses the odd states above
+ /// state 5, table B the even ones.
++#[cfg(not(sf_g13))]
+ pub(crate) const PERF: PerfConfig = PerfConfig {
+     states_a: [0, 1, 2, 3, 4, 5, 7, 9, 11, 13, 15],
+     states_b: [0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14],
+@@ -131,6 +138,7 @@
+ /// Operating points the performance tables reference.
+ pub(crate) const OPPS: usize = 16;
+ 
++#[cfg(not(sf_g13))]
+ const _: () = {
+     let mut index = 0;
+     while index < PERF_STATES {
+@@ -401,6 +409,7 @@
+ 
+ /// Firmware scheduling profiles of the DRM queue priorities. Native user
+ /// queues use priority class 2 with policy 2.
++#[cfg(not(sf_g13))]
+ pub(crate) mod scheduling {
+     use crate::g17::fw::queue::Policy;
+ 
+--- a/mmu/shared.rs
++++ b/mmu/shared.rs
+@@ -7,6 +7,7 @@
+ //! order is GPUVM exec followed by bindings; footprint readers take only bindings.
+ 
+ use super::*;
++#[cfg(not(sf_g13))]
+ use crate::g17::{hazard::Footprint, Attachments};
+ 
+ struct Binding {
+@@ -105,6 +106,7 @@
+         shared.count.store(bindings.len() as u32, Ordering::Relaxed);
+     }
+ 
++    #[cfg(not(sf_g13))]
+     pub(crate) fn render_footprint(
+         &self,
+         attachments: &Attachments,
+--- a/regs.rs
++++ b/regs.rs
+@@ -585,6 +585,7 @@
+     /// Installs both render queues while the caller holds the device mutex.
+     /// No other port publisher may interleave between this power witness and
+     /// the final validity strobe. False means no write was attempted.
++    #[cfg(not(sf_g13))]
+     pub(crate) fn install_render_pair(
+         &self,
+         registration: &crate::g17::fw::kick::RenderRegistration,

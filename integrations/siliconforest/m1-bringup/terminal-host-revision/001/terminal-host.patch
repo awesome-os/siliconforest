@@ -1,0 +1,502 @@
+--- a/integrations/puredarwin/m1-bringup/host_progress.py
++++ b/integrations/puredarwin/m1-bringup/host_progress.py
+@@ -35,6 +35,10 @@
+ image.require(image.sha(image.bounded_file(HERE/'virtual_input_progress.py')) == VIRTUAL_INPUT_SHA,
+               'Virtual-input helper source changed')
+ from virtual_input_progress import VirtualInput
++TERMINAL_INPUT_SHA = '2b8901e7c29357a3440c40e1db14f5e2416f38beb71af0fee7674cb05233568c'
++image.require(image.sha(image.bounded_file(HERE/'terminal_input_progress.py')) == TERMINAL_INPUT_SHA,
++              'Terminal-input helper source changed')
++from terminal_input_progress import TerminalInput
+ 
+ FROZEN = LAB / 'integrations/puredarwin/m1-firstboot/host_console.py'
+ FROZEN_SHA = 'a9f68695c6465bc5a3c1a9df04f67da6a72f99265e899cf3b89ba671ab6d4417'
+@@ -185,6 +189,7 @@
+     keyboard_enabled(inputs)
+     desktop_enabled(inputs)
+     virtual_input_enabled(inputs)
++    terminal_input_enabled(inputs)
+     return inputs
+ 
+ 
+@@ -262,7 +267,12 @@
+ 
+ class ConsoleSession:
+     """One reader/writer for the secondary CDC, never the proxy transport."""
+-    def __init__(self, port, directory, serial_factory=None, desktop=False, keyboard=False, virtual_input=False):
++    def __init__(self, port, directory, serial_factory=None, desktop=False, keyboard=False,
++                 virtual_input=False, terminal_input=False):
++        image.require(all(type(value) is bool for value in
++                          (desktop, keyboard, virtual_input, terminal_input)), 'Experiment flags must be booleans')
++        image.require(not terminal_input or (desktop and not keyboard and not virtual_input),
++                      'Terminal input needs an exclusive desktop experiment')
+         image.require(not (desktop and keyboard), 'Only one guest experiment per attempt')
+         image.require(not virtual_input or (desktop and not keyboard), 'Virtual input needs the desktop experiment')
+         if serial_factory is None:
+@@ -271,7 +281,9 @@
+         self.dev = serial_factory(port, baudrate=115200, timeout=.1, write_timeout=2,
+                                   xonxoff=False, rtscts=False, dsrdtr=False, exclusive=True)
+         self.directory, self.proof = directory, ConsoleProof()
+-        self.virtual = VirtualInput(self.proof.nonce) if virtual_input else None
++        self.terminal_input = terminal_input
++        self.virtual = (TerminalInput(self.proof.nonce) if terminal_input else
++                        VirtualInput(self.proof.nonce) if virtual_input else None)
+         self.desktop, self.desktop_sent = desktop, False
+         self.keyboard, self.keyboard_sent = keyboard, False
+         self.tx_data, self.tx_log = bytearray(), None
+@@ -335,7 +347,8 @@
+             # Observation failures cancel input, while the same owner keeps
+             # draining raw diagnostics. A write/ledger failure still raises.
+             self.virtual.cancel()
+-            self.error = self.error or 'VirtualInputError: ' + self.virtual.error
++            kind = 'TerminalInputError: ' if self.terminal_input else 'VirtualInputError: '
++            self.error = self.error or kind + self.virtual.error
+             return
+         if payload is not None:
+             self.send(payload)
+@@ -367,7 +380,8 @@
+         image.require(not self.thread.is_alive(), 'VUART worker state unknown')
+         if self.virtual:
+             self.virtual.cancel()
+-            old.write_private(self.directory, 'virtual-input-result.json', self.virtual.report())
++            name = 'terminal-input-result.json' if self.terminal_input else 'virtual-input-result.json'
++            old.write_private(self.directory, name, self.virtual.report())
+         self.dev.close()
+         raw = bytes(self.proof.output)
+         old.write_private(self.directory, 'console-result.json', {
+@@ -377,6 +391,7 @@
+             'console_sha256': image.sha(raw), 'console_bytes': len(raw), 'error': self.error,
+             'desktop_command_sent': self.desktop_sent,
+             'keyboard_command_sent': self.keyboard_sent,
++            'terminal_input_enabled': self.terminal_input,
+             'console_tx_bytes': len(self.tx_data),
+             'console_tx_sha256': image.sha(bytes(self.tx_data)),
+             'tx_scope': 'all attempted bytes to secondary VUART; exact successful writes only if error is null',
+@@ -402,6 +417,8 @@
+ 
+ def virtual_input_enabled(inputs):
+     record = json.loads(inputs.contents['build_record'])
++    image.require(not ('terminal_input_experiment' in record and 'virtual_input_experiment' in record),
++                  'Conflicting terminal/virtual-input experiment fields')
+     experiment = record.get('virtual_input_experiment')
+     if experiment is None:
+         return False
+@@ -421,6 +438,41 @@
+     return True
+ 
+ 
++def terminal_input_enabled(inputs):
++    record = json.loads(inputs.contents['build_record'], object_pairs_hook=image.unique)
++    image.require(type(record) is dict, 'Terminal input requires an object build record')
++    if 'terminal_input_experiment' not in record:
++        return False
++    experiment = record['terminal_input_experiment']
++    expected = {'version': 1, 'origin': 'host_pdserialhid',
++                'command': 'split_nonce_uname_v1', 'output': [2560, 1600]}
++    image.require(type(experiment) is dict and type(experiment.get('version')) is int and
++                  type(experiment.get('origin')) is str and type(experiment.get('command')) is str and
++                  type(experiment.get('output')) is list and
++                  all(type(value) is int for value in experiment['output']) and experiment == expected,
++                  'Unknown terminal-input experiment')
++    # Field presence is a conflict even when its JSON value is null/false.
++    image.require('virtual_input_experiment' not in record and 'keyboard_experiment' not in record and
++                  desktop_enabled(inputs) and 'ramdisk' in inputs.contents,
++                  'Terminal input requires exclusive desktop opt-in and hash-bound RAM root')
++    members = inputs.report['kernel']['members']
++    image.require('org.puredarwin.driver.PDSerialHID' in members and
++                  'com.apple.iokit.IOHIDFamily' in members and
++                  'org.puredarwin.driver.PDM1SPIHID' not in members,
++                  'Terminal-input collection must contain the real serial HID path only')
++    return True
++
++
++def validate_input_geometry(geometry, *, virtual_input=False, terminal_input=False):
++    image.require(type(virtual_input) is bool and type(terminal_input) is bool and
++                  not (virtual_input and terminal_input), 'Input geometry flags must be exclusive booleans')
++    if virtual_input or terminal_input:
++        image.require(all(type(geometry.get(key)) is int for key in ('width', 'height', 'stride', 'depth')) and
++                      (geometry['width'], geometry['height'], geometry['stride'], geometry['depth'] & 255) ==
++                      (2560, 1600, 10240, 30),
++                      'Input output geometry differs from qualified framebuffer')
++
++
+ def keyboard_command(nonce):
+     image.require(bool(re.fullmatch('[0-9a-f]{48}', nonce)), 'Invalid keyboard nonce')
+     return ("/usr/bin/darwin-keyboard-test '" + nonce + "'\r").encode('ascii')
+@@ -428,6 +480,8 @@
+ 
+ def keyboard_enabled(inputs):
+     record = json.loads(inputs.contents['build_record'])
++    image.require(not ('terminal_input_experiment' in record and 'keyboard_experiment' in record),
++                  'Conflicting terminal/keyboard experiment fields')
+     experiment = record.get('keyboard_experiment')
+     if experiment is None:
+         return False
+@@ -788,6 +842,7 @@
+     old.write_private(directory, 'usb-pair.json', ports)
+     keyboard, desktop = keyboard_enabled(inputs), desktop_enabled(inputs)
+     virtual_input = virtual_input_enabled(inputs)
++    terminal_input = terminal_input_enabled(inputs)
+     bootargs = BOOTARGS + (' pdm1kbd=1' if keyboard else '')
+     backend = ContinuingBackend(inputs, directory)
+     console = None
+@@ -808,11 +863,8 @@
+         image.require(len(cpus) == 1 and cpus[0].state == 'running', 'Expected one running guest CPU')
+         hv.set_bootargs(bootargs)
+         display_console = configure_display_console(hv, backend, carveouts)
+-        if virtual_input:
+-            geometry = display_console['geometry']
+-            image.require((geometry['width'], geometry['height'], geometry['stride'],
+-                           geometry['depth'] & 255) == (2560, 1600, 10240, 30),
+-                          'Virtual-input output geometry differs from qualified SSD capture')
++        validate_input_geometry(display_console['geometry'], virtual_input=virtual_input,
++                                terminal_input=terminal_input)
+         backend.display_console = display_console
+         entropy = configure_entropy(hv)
+         kernel_text_policy = configure_kernel_text_policy(hv, inputs)
+@@ -840,7 +892,7 @@
+                                hardware_boot_observed=False, image_sha256=image.sha(inputs.contents['kernel']),
+                                prepared_image_sha256=image.sha(prepared), prepared_image_bytes=len(prepared)))
+         console = ConsoleSession(args.console_device, directory, desktop=desktop, keyboard=keyboard,
+-                                 virtual_input=virtual_input)
++                                 virtual_input=virtual_input, terminal_input=terminal_input)
+         ProgressCapture(hv, backend, inputs, layout, directory, args.runtime,
+                         console=console, capture_framebuffer=not keyboard).run()
+     finally:
+--- a/tools/m1_bringup_cycle.py
++++ b/tools/m1_bringup_cycle.py
+@@ -26,6 +26,8 @@
+ BOOTARGS_HELPER = 'integrations/puredarwin/m1-bringup/bootargs_progress.py'
+ INPUT_HELPER = 'integrations/puredarwin/m1-bringup/virtual_input_progress.py'
+ INPUT_HELPER_SHA = '689a8fb0fd7728d655d3baefbee18308cb2bce7333f1c0f4a76f37bc8e5673e1'
++TERMINAL_HELPER = 'integrations/puredarwin/m1-bringup/terminal_input_progress.py'
++TERMINAL_HELPER_SHA = '2b8901e7c29357a3440c40e1db14f5e2416f38beb71af0fee7674cb05233568c'
+ CONTINUING_SOURCES = {'integrations/puredarwin/m1-bringup/bootstrap_progress.py': '52fdd9045d0f2d14d08b38577cd3bfca512b9eb6e083afc82fa7c081350c56d8', 'integrations/puredarwin/m1-bringup/bootargs_progress.py': '8b131bd35dcfcd4097676c4d61f05c69b7115e609cdf07f49774a2f7846bb489'}
+ BASE_SHA = '3d274d1b699c0adfa1e38361d8348c3ee7567b854c5361ea80cbe23a18b7e3e6'
+ 
+@@ -42,6 +44,8 @@
+                  'Continuing bootstrap sources must be bound')
+     base.require(base.sha(base.read_file(LAB/INPUT_HELPER)) == INPUT_HELPER_SHA,
+                  'Virtual-input scheduler source changed')
++    base.require(base.sha(base.read_file(LAB/TERMINAL_HELPER)) == TERMINAL_HELPER_SHA,
++                 'Terminal-input scheduler source changed')
+     bootstrap = base.verify_local(args)
+     # Verify the continuing copy too, including its frozen trampoline path,
+     # before the target is rebooted or any serial device is opened.
+@@ -163,13 +167,18 @@
+         ops.save('verified-inputs.json', dict(bootstrap=bootstrap, candidate=candidate,
+                   controller_sha256=base.sha(base.read_file(Path(__file__))),
+                   launcher_sha256=ops.args.launcher_sha256, inspector_sha256=ops.args.inspector_sha256,
+-                  continuing_source_sha256=CONTINUING_SOURCES, virtual_input_source_sha256=INPUT_HELPER_SHA))
++                  continuing_source_sha256=CONTINUING_SOURCES, virtual_input_source_sha256=INPUT_HELPER_SHA,
++                  terminal_input_source_sha256=TERMINAL_HELPER_SHA))
+         # Keep exact helper bytes per attempt as well as hashes. Later loader
+         # revisions must not erase the source needed to review an older run.
+         for name in sorted(set(base.SOURCE_SHA) | {LAUNCHER, INSPECTOR,
+                                                   'tools/m1_kernel_cycle.py', 'tools/m1_bringup_cycle.py',
+-                                                  PROGRESS_BOOTSTRAP, BOOTARGS_HELPER, INPUT_HELPER}):
+-            ops.save('source-' + name.replace('/', '__'), base.read_file(LAB/name))
++                                                  PROGRESS_BOOTSTRAP, BOOTARGS_HELPER, INPUT_HELPER, TERMINAL_HELPER}):
++            raw_source = base.read_file(LAB/name)
++            helper_sha = {INPUT_HELPER: INPUT_HELPER_SHA, TERMINAL_HELPER: TERMINAL_HELPER_SHA}.get(name)
++            if helper_sha is not None:
++                base.require(base.sha(raw_source) == helper_sha, 'Input helper changed before source snapshot: ' + name)
++            ops.save('source-' + name.replace('/', '__'), raw_source)
+         baseline = base.check_linux(ops.observe())
+         ops.save('baseline.json', baseline)
+         ops.arm()
+--- a/integrations/puredarwin/m1-bringup/test_host_progress.py
++++ b/integrations/puredarwin/m1-bringup/test_host_progress.py
+@@ -869,5 +869,228 @@
+                     cap.original_cmd.assert_not_called()
+ 
+ 
++
++class TerminalInputIntegrationTests(unittest.TestCase):
++    EXPERIMENT = {'version': 1, 'origin': 'host_pdserialhid',
++                  'command': 'split_nonce_uname_v1', 'output': [2560, 1600]}
++    MEMBERS = {'org.puredarwin.driver.PDSerialHID': {}, 'com.apple.iokit.IOHIDFamily': {}}
++
++    def inputs(self, record=None, members=None, ram=True):
++        if record is None:
++            record = {'desktop_experiment': {'version': 1, 'command': '/usr/bin/darwin-desktop-test'},
++                      'terminal_input_experiment': dict(self.EXPERIMENT)}
++        contents = {'build_record': json.dumps(record).encode()}
++        if ram:
++            contents['ramdisk'] = b'HOST-ONLY RAM ROOT'
++        return SimpleNamespace(contents=contents,
++            report={'kernel': {'members': self.MEMBERS if members is None else members}})
++
++    def test_terminal_default_off_and_exact_optin(self):
++        self.assertFalse(host.terminal_input_enabled(self.inputs({})))
++        self.assertFalse(host.terminal_input_enabled(self.inputs({
++            'desktop_experiment': {'version': 1, 'command': '/usr/bin/darwin-desktop-test'}})))
++        self.assertTrue(host.terminal_input_enabled(self.inputs()))
++        for ram, record in [(False, None), (True, {'terminal_input_experiment': self.EXPERIMENT})]:
++            with self.subTest(ram=ram, record=record), self.assertRaises(ValueError):
++                host.terminal_input_enabled(self.inputs(record, ram=ram))
++
++    def test_terminal_null_presence_and_all_type_mutations_reject(self):
++        for value in (None, False, 1, [], 'terminal_input_experiment'):
++            with self.subTest(record=value), self.assertRaises(ValueError):
++                host.terminal_input_enabled(SimpleNamespace(contents={'build_record': json.dumps(value).encode()}))
++        good = json.loads(self.inputs().contents['build_record'])
++        bad_experiments = [None, False, True, [], {}, 1]
++        for key, value in [('version', True), ('version', 1.), ('version', '1'),
++                           ('version', 2), ('origin', None), ('origin', 'physical'),
++                           ('command', 'arbitrary'), ('command', False),
++                           ('output', None), ('output', '2560,1600'), ('output', {}),
++                           ('output', [2560., 1600]), ('output', [2560, True]),
++                           ('output', [2560]), ('output', [2560, 1600, 0]),
++                           ('extra', True)]:
++            bad_experiments.append({**self.EXPERIMENT, key: value})
++        for value in bad_experiments:
++            with self.subTest(experiment=value), self.assertRaises(ValueError):
++                host.terminal_input_enabled(self.inputs({**good, 'terminal_input_experiment': value}))
++        for field in ('virtual_input_experiment', 'keyboard_experiment'):
++            for value in (None, False, {}, {'version': 1}):
++                record = {**good, field: value}
++                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
++                    host.terminal_input_enabled(self.inputs(record))
++                other = host.virtual_input_enabled if field.startswith('virtual') else host.keyboard_enabled
++                with self.assertRaises(ValueError):
++                    other(self.inputs(record))
++        value = self.inputs()
++        value.contents['build_record'] = (b'{"terminal_input_experiment":null,'
++                                           b'"terminal_input_experiment":null}')
++        with self.assertRaisesRegex(ValueError, 'Duplicate JSON'):
++            host.terminal_input_enabled(value)
++
++    def test_terminal_requires_serial_hid_family_and_excludes_native_spi(self):
++        for names in ({}, {'org.puredarwin.driver.PDSerialHID': {}},
++                      {'com.apple.iokit.IOHIDFamily': {}},
++                      {**self.MEMBERS, 'org.puredarwin.driver.PDM1SPIHID': {}}):
++            with self.subTest(members=names), self.assertRaisesRegex(ValueError, 'serial HID'):
++                host.terminal_input_enabled(self.inputs(members=names))
++
++    def test_verify_inputs_executes_terminal_validation_before_backend(self):
++        candidate = self.inputs()
++        doc = json.loads(candidate.contents['build_record'])
++        doc['terminal_input_experiment']['version'] = True
++        candidate.contents['build_record'] = json.dumps(doc).encode()
++        proxy = SimpleNamespace(report={}, contents={}, host_files={}, inventory={}, inventory_sha256='0'*64)
++        args = SimpleNamespace(bootstrap_manifest='fake', host_source='fake', inventory='fake', manifest='fake')
++        with patch.object(host.old, 'verify_inputs', return_value=proxy), \
++                patch.object(host.image, 'verify_manifest', return_value=(candidate.report, candidate.contents)), \
++                patch.object(host, 'ContinuingBackend') as backend, self.assertRaisesRegex(ValueError, 'terminal-input'):
++            host.verify_inputs(args)
++        backend.assert_not_called()
++
++    def test_geometry_gate_preserves_default_off_and_applies_to_terminal(self):
++        fields = dict(width=2560, height=1600, stride=10240, depth=0x1001e)
++        host.validate_input_geometry({})
++        for kind in ('virtual_input', 'terminal_input'):
++            host.validate_input_geometry(fields, **{kind: True})
++            for key, value in [('width', 2560.), ('height', True), ('width', 2559),
++                               ('height', 1599), ('stride', 10244), ('depth', 32)]:
++                with self.subTest(kind=kind, key=key), self.assertRaises(ValueError):
++                    host.validate_input_geometry({**fields, key: value}, **{kind: True})
++        for flags in ({'terminal_input': 1}, {'terminal_input': None},
++                      {'terminal_input': True, 'virtual_input': True}):
++            with self.assertRaises(ValueError):
++                host.validate_input_geometry(fields, **flags)
++        # Source wiring: the actual worker uses the shared gate before image load,
++        # and passes the same opt-in into its sole ConsoleSession constructor.
++        import ast
++        tree = ast.parse(Path(host.__file__).read_text())
++        worker = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'run_worker')
++        calls = [node for node in ast.walk(worker) if isinstance(node, ast.Call)]
++        gate = next(node for node in calls if isinstance(node.func, ast.Name) and node.func.id == 'validate_input_geometry')
++        load = next(node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == 'load_raw')
++        self.assertLess(gate.lineno, load.lineno)
++        self.assertEqual(next(k.value.id for k in gate.keywords if k.arg == 'terminal_input'), 'terminal_input')
++        owner = next(node for node in calls if isinstance(node.func, ast.Name) and node.func.id == 'ConsoleSession')
++        self.assertEqual(next(k.value.id for k in owner.keywords if k.arg == 'terminal_input'), 'terminal_input')
++
++    def test_constructor_flags_reject_before_any_serial_open_and_select_once(self):
++        for flags in ({'terminal_input': True}, {'desktop': True, 'terminal_input': True, 'virtual_input': True},
++                      {'desktop': True, 'terminal_input': True, 'keyboard': True},
++                      {'desktop': True, 'terminal_input': 1}, {'terminal_input': None}, {'desktop': 1}):
++            factory = Mock()
++            with self.subTest(flags=flags), self.assertRaises(ValueError):
++                host.ConsoleSession('/fake', Path('/unused'), serial_factory=factory, **flags)
++            factory.assert_not_called()
++        for flags, kind in (({}, None), ({'desktop': True, 'virtual_input': True}, host.VirtualInput),
++                            ({'desktop': True, 'terminal_input': True}, host.TerminalInput)):
++            factory = Mock()
++            with patch.object(host.threading.Thread, 'start') as start:
++                owner = host.ConsoleSession('/fake', Path('/unused'), serial_factory=factory, **flags)
++            start.assert_called_once()
++            factory.assert_called_once()
++            if kind is None:
++                self.assertIsNone(owner.virtual)
++            else:
++                self.assertIs(type(owner.virtual), kind)
++
++    def exercise_cdc(self, mode):
++        nonce = 'a' * 48
++        actual_reports = host.TerminalInput(nonce).typed_reports
++        tail = b'\nTERMINAL_SUPERVISOR_TAIL_HOST_FIXTURE\n'
++        chunks, drained = [b'\n# '], threading.Event()
++        class Port:
++            def __init__(self):
++                self.writes, self.threads, self.now, self.closes = [], [], 0., 0
++            def read(self, _):
++                self.threads.append(threading.get_ident())
++                self.now += .11
++                if chunks:
++                    return chunks.pop(0)
++                if len(self.writes) >= 3 and mode == 'observation':
++                    drained.set()
++                if len(self.writes) == 7 + len(actual_reports):
++                    drained.set()
++                threading.Event().wait(.001)
++                return b''
++            def write(self, data):
++                self.threads.append(threading.get_ident())
++                self.writes.append(data)
++                if len(self.writes) == 1:
++                    chunks.append(b'\nDL9_BEGIN_' + nonce.encode() +
++                        b'\nDarwin\narm64\n25.5.0\nDL9_END_' + nonce.encode() + b'\n# ')
++                elif len(self.writes) == 2:
++                    chunks.append(b'\nDL11_TERMINAL_PRIME_' + nonce.encode() + b'\n')
++                elif len(self.writes) == 3 and mode != 'success':
++                    chunks.append(tail)
++                    if mode == 'observation':
++                        chunks.insert(0, b'\ndarwin-wayland-terminal: synthetic observer failure\n')
++                    else:
++                        drained.set()
++                        if mode == 'exception':
++                            raise OSError('synthetic terminal CDC write failure')
++                        return len(data) - 1
++                elif len(self.writes) == 7:
++                    chunks.append(f'\nDL11_TERMINAL_READY {nonce} {host.TerminalInput.READY}\n'.encode())
++                elif len(self.writes) == 7 + len(actual_reports) - 1:
++                    chunks.append(f'\nDL11_TERMINAL_RESPONSE {nonce} {host.TerminalInput.RESPONSE}\n'.encode())
++                elif len(self.writes) == 7 + len(actual_reports):
++                    chunks.append(tail)
++                return len(data)
++            def close(self):
++                self.closes += 1
++        with tempfile.TemporaryDirectory() as directory:
++            directory = Path(directory)
++            port = Port()
++            with patch.object(host.secrets, 'token_hex', return_value=nonce), \
++                    patch.object(host.time, 'monotonic', side_effect=lambda: port.now):
++                owner = host.ConsoleSession('/host-only-fake-cdc', directory,
++                    serial_factory=lambda *a, **kw: port, desktop=True, terminal_input=True)
++                try:
++                    self.assertTrue(drained.wait(3))
++                    if mode in ('short', 'exception'):
++                        owner.thread.join(2)
++                        self.assertFalse(owner.thread.is_alive())
++                    else:
++                        self.assertTrue(owner.thread.is_alive())
++                finally:
++                    owner.close()
++            writes = list(port.writes)
++            owner.close()
++            self.assertEqual(port.closes, 1)
++            self.assertEqual(port.writes, writes)
++            self.assertEqual(len(set(port.threads)), 1)  # Real threaded fake CDC, one I/O owner.
++            self.assertEqual(writes[:2], [owner.proof.command(), host.desktop_command(nonce)])
++            self.assertEqual((directory/'console-tx.bin').read_bytes(), b''.join(writes))
++            self.assertFalse((directory/'virtual-input-result.json').exists())
++            result = json.loads((directory/'terminal-input-result.json').read_text())
++            console = json.loads((directory/'console-result.json').read_text())
++            self.assertIs(console['terminal_input_enabled'], True)
++            if mode == 'success':
++                self.assertIs(type(owner.virtual), host.TerminalInput)
++                self.assertEqual(writes[7:], actual_reports)
++                self.assertEqual(writes[-1], b'\x01k 0 0 0 0 0 0 0\n')
++                self.assertTrue(result['schedule_completed'])
++                self.assertTrue(result['response_observed'])
++                self.assertIsNone(console['error'])
++            else:
++                self.assertEqual(len(writes), 3)  # Stop, no neutral suffix/retry/next key.
++                self.assertFalse(result['schedule_completed'])
++                self.assertFalse(console['command_line_observed'])
++                self.assertIsNotNone(console['error'])
++                if mode == 'observation':
++                    self.assertIn(tail, (directory/'console.bin').read_bytes())
++                    self.assertTrue(result['cancelled'])
++                else:
++                    self.assertNotIn(tail, (directory/'console.bin').read_bytes())
++
++    def test_terminal_schedule_and_final_release_use_same_cdc_owner_and_separate_receipt(self):
++        self.exercise_cdc('success')
++
++    def test_terminal_short_or_failed_write_stops_owner_and_never_retries(self):
++        for mode in ('short', 'exception'):
++            with self.subTest(mode=mode):
++                self.exercise_cdc(mode)
++
++    def test_terminal_observation_error_cancels_writes_but_preserves_raw_tail(self):
++        self.exercise_cdc('observation')
++
+ if __name__ == '__main__':
+     unittest.main()
+--- a/tests/test_m1_bringup_cycle.py
++++ b/tests/test_m1_bringup_cycle.py
+@@ -44,7 +44,8 @@
+ class BringupCycleTests(unittest.TestCase):
+     def test_continuing_sources_and_frozen_sources_have_the_bound_bytes(self):
+         for name, expected in {**c.base.SOURCE_SHA, **c.CONTINUING_SOURCES,
+-                               'tools/m1_kernel_cycle.py': c.BASE_SHA}.items():
++                               'tools/m1_kernel_cycle.py': c.BASE_SHA, c.INPUT_HELPER: c.INPUT_HELPER_SHA,
++                               c.TERMINAL_HELPER: c.TERMINAL_HELPER_SHA}.items():
+             with self.subTest(source=name):
+                 self.assertEqual(c.base.sha(c.base.read_file(c.LAB/name)), expected)
+ 
+@@ -54,7 +55,7 @@
+             inspector_sha256=c.base.sha(c.base.read_file(c.LAB/c.INSPECTOR)))
+         original_read = c.base.read_file
+         for source in (c.LAUNCHER, c.INSPECTOR, c.PROGRESS_BOOTSTRAP,
+-                       c.BOOTARGS_HELPER, 'tools/m1_kernel_cycle.py'):
++                       c.BOOTARGS_HELPER, c.INPUT_HELPER, c.TERMINAL_HELPER, 'tools/m1_kernel_cycle.py'):
+             def drift(path, *args):
+                 raw = original_read(path, *args)
+                 return raw + b'\n# HOST-ONLY DRIFT\n' if Path(path) == c.LAB/source else raw
+@@ -209,9 +210,41 @@
+             process.terminate.assert_not_called()
+             recorded = json.loads((ops.cycle/'verified-inputs.json').read_text())
+             self.assertEqual(recorded['continuing_source_sha256'], c.CONTINUING_SOURCES)
+-            for source in (c.PROGRESS_BOOTSTRAP, c.BOOTARGS_HELPER):
++            self.assertEqual(recorded['virtual_input_source_sha256'], c.INPUT_HELPER_SHA)
++            self.assertEqual(recorded['terminal_input_source_sha256'], c.TERMINAL_HELPER_SHA)
++            for helper in (c.INPUT_HELPER, c.TERMINAL_HELPER):
++                self.assertLess(ops.events.index('source-'+helper.replace('/', '__')), ops.events.index('reboot'))
++            for source in (c.PROGRESS_BOOTSTRAP, c.BOOTARGS_HELPER, c.INPUT_HELPER, c.TERMINAL_HELPER):
+                 self.assertEqual((ops.cycle/('source-'+source.replace('/', '__'))).read_bytes(),
+                                  (c.LAB/source).read_bytes())
++
++    def test_input_source_drift_after_verify_still_aborts_before_arm(self):
++        original = c.base.read_file
++        for helper in (c.INPUT_HELPER, c.TERMINAL_HELPER):
++            def changed(path, *args):
++                raw = original(path, *args)
++                return raw + b'\n# HOST-ONLY LATE DRIFT\n' if Path(path) == c.LAB/helper else raw
++            with self.subTest(helper=helper), tempfile.TemporaryDirectory() as root:
++                ops = Ops(root)
++                with patch.object(c.base, 'read_file', side_effect=changed):
++                    result = c.run_attempt(ops, {}, CANDIDATE)
++                self.assertEqual(result['status'], 'ABORTED_BEFORE_REBOOT')
++                self.assertIn('before source snapshot', result['experiment_error'])
++                self.assertFalse(ops.armed)
++                self.assertNotIn('reboot', ops.events)
++                self.assertFalse((ops.cycle/('source-'+helper.replace('/', '__'))).exists())
++
++    def test_terminal_source_snapshot_failure_aborts_before_arm_or_reboot(self):
++        name = 'source-' + c.TERMINAL_HELPER.replace('/', '__')
++        with tempfile.TemporaryDirectory() as root:
++            ops = Ops(root, fail=name)
++            result = c.run_attempt(ops, {}, CANDIDATE)
++            self.assertEqual(result['status'], 'ABORTED_BEFORE_REBOOT')
++            self.assertFalse(ops.armed)
++            self.assertEqual(ops.resets, 0)
++            self.assertNotIn('arm', ops.events)
++            self.assertNotIn('reboot', ops.events)
++            self.assertNotIn('bootstrap', ops.events)
+ 
+     def test_native_nonzero_still_observes_linux_without_second_reset(self):
+         class RebootedWithRoutingError(Ops):

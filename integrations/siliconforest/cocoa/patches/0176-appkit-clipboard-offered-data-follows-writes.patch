@@ -1,0 +1,33 @@
+--- a/src/Frameworks/AppKit/NSPasteboard.m
++++ b/src/Frameworks/AppKit/NSPasteboard.m
+@@ -583,6 +583,12 @@
+    [_systemMimeTypes removeAllObjects];
+    _owner=owner;
+    _changeCount++;
++   if([self _isGeneral]){
++    pthread_mutex_lock(&publishedLock);
++    [publishedItems release];
++    publishedItems=[[NSDictionary alloc] init];
++    pthread_mutex_unlock(&publishedLock);
++   }
+ 
+    return [self addTypes:types owner:owner];
+ }
+@@ -614,6 +620,17 @@
+ 
+    [_items setObject:data forKey:type];
+    [self _sfSchedulePublish];
++   /* (TERM11) data written after its type was offered (declareTypes:, then setData:) goes into what requests are
++    * answered from at once: the offer can be out before the data, and the publish after the data may come late */
++   if([self _isGeneral]){
++    pthread_mutex_lock(&publishedLock);
++    NSMutableDictionary *items=[[publishedItems mutableCopy] autorelease] ?: [NSMutableDictionary dictionary];
++    [items setObject:data forKey:type];
++    [publishedItems release];
++    publishedItems=[items copy];
++    publishedChangeCount=_changeCount;
++    pthread_mutex_unlock(&publishedLock);
++   }
+ 
+    return YES;
+ }

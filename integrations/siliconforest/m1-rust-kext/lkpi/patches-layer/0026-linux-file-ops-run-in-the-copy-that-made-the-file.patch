@@ -1,0 +1,148 @@
+fbsdkpi: drm: a linux file's descriptor ops run in the layer copy that made the file
+
+With two DRM kexts loaded, every ioctl on a dma-buf or sync_file descriptor of the kext
+that registered its sf_lfile ops first failed with EFAULT (boot mm01: DMA_BUF_IOCTL_SYNC
+and EXPORT_SYNC_FILE on the GPU driver's dma-buf; Mesa's IMPORT_SYNC_FILE at every swap).
+xnu's sf_lfile has one ops table, the last registrant's. Its ioctl op parks the argument
+buffer in its own copy's `current` task and calls the file's unlocked_ioctl, which is the
+other kext's code: that copy's copy_from_user() looks in its own `current`, where no
+buffer is parked.
+
+linux_file gains sf_lfile_owner, set when the file gets its first descriptor (always from
+the copy that made it), and every op (hold, release, poll, ioctl, seek, mmap_pages) hands
+a file of another copy to that copy's op. A file is then handled by one copy throughout.
+UPSTREAM: yes; unnecessary once the layer is shared between the DRM kexts.
+
+--- a/src/Kernel/fbsdkpi/drm/src/sf_lfile_lkpi.c
++++ b/src/Kernel/fbsdkpi/drm/src/sf_lfile_lkpi.c
+@@ -28,6 +28,11 @@
+ 	    unsigned int *wimg, void (**release)(void *), void **release_arg);
+ };
+ 
++// sf_lfile_owner: xnu keeps one ops table, the last DRM kext's, for every linux file. Each
++// sf_lfile_owner op below hands a file another copy of this layer made to that copy's op, so
++// sf_lfile_owner code runs with the `current` (ioctl argument buffer) of the right copy.
++static const struct sf_lfile_ops sf_lfile_lkpi_ops;	// sf_lfile_owner
++#define sf_lfile_owner(filp) ((filp)->sf_lfile_owner != NULL && (filp)->sf_lfile_owner != &sf_lfile_lkpi_ops ? (const struct sf_lfile_ops *)(filp)->sf_lfile_owner : NULL)
+ 
+ int sf_lfile_register(const struct sf_lfile_ops *ops);
+ int sf_lfile_reserve(int cloexec, int *fdp);
+@@ -62,6 +118,7 @@
+ void
+ sf_lkpi_fd_install(unsigned int fd, struct linux_file *filp)
+ {
++	if (filp->sf_lfile_owner == NULL) filp->sf_lfile_owner = &sf_lfile_lkpi_ops;	// sf_lfile_owner: a file gets its first descriptor from the copy that made it
+ 	sf_lfile_install((int)fd, filp);
+ }
+ 
+@@ -127,26 +127,29 @@
+ {
+ 	struct linux_file *filp = obj;
+ 
++	if (sf_lfile_owner(filp) != NULL) { sf_lfile_owner(filp)->hold(obj); return; }
+ 
+ 	refcount_acquire(&filp->f_count);
+ }
+ 
+ static void
+ sf_lfile_release(void *obj)
+ {
++	if (sf_lfile_owner((struct linux_file *)obj) != NULL) { sf_lfile_owner((struct linux_file *)obj)->release(obj); return; }
+ 	sf_lkpi_fput(obj);
+ }
+ 
+ // select's direction (also what kevent's read and write filters ask) as linux's select does
+ // it, fs/select.c POLLIN_SET, POLLOUT_SET and POLLEX_SET. The table makes the file's
+ // poll_wait() queue the file, so that a later wake_up reaches sf_lfile_wakeup().
+ static int
+ sf_lfile_poll(void *obj, int which)
+ {
+ 	struct linux_file *filp = obj;
+ 	poll_table pt;
+ 	unsigned int mask, want;
+ 
++	if (sf_lfile_owner(filp) != NULL) return sf_lfile_owner(filp)->poll(obj, which);
+ 
+ 	if (filp->f_op->poll == NULL)
+ 		return 1;
+@@ -175,6 +175,7 @@
+ 	struct task_struct *task;
+ 	long ret;
+ 
++	if (sf_lfile_owner(filp) != NULL) return (sf_lfile_owner(filp)->ioctl)(obj, cmd, data, len);	/* parenthesised: ioctl is a macro */
+ 
+ 	if (filp->f_op->unlocked_ioctl == NULL)
+ 		return ENOTTY;
+@@ -199,60 +199,62 @@
+ {
+ 	struct linux_file *filp = obj;
+ 
++	if (sf_lfile_owner(filp) != NULL) return sf_lfile_owner(filp)->seek(obj, offset, whence);
+ 
+ 	if (filp->f_op->llseek == NULL)
+ 		return -ESPIPE;
+ 	return filp->f_op->llseek(filp, offset, whence);
+ }
+ 
+ // mmap of a linux file. Only a dma-buf has one: dma_buf_mmap_internal() and, through the
+ // exporter's dma_buf_ops.mmap, the GEM object's mmap op, asked for its pages (struct
+ // sf_vma_pages in linux/mm.h). The vma is kept for the life of the mapping, with the file
+ // reference linux's mmap holds through vma->vm_file, and vm_ops->close() ends it.
+ int sf_dma_buf_mmap_internal(struct linux_file *file, struct vm_area_struct *vma);
+ 
+ struct sf_lfile_mapping {
+ 	struct vm_area_struct vma;
+ 	struct work_struct work;
+ };
+ 
+ static void
+ sf_lfile_mapping_end(struct sf_lfile_mapping *m)
+ {
+ 	if (m->vma.vm_ops != NULL && m->vma.vm_ops->close != NULL)
+ 		m->vma.vm_ops->close(&m->vma);
+ 	kfree(m);
+ }
+ 
+ // close takes sleeping locks and may free the object: not on the pager's teardown path
+ static void
+ sf_lfile_mapping_release_work(struct work_struct *work)
+ {
+ 	struct sf_lfile_mapping *m = container_of(work, struct sf_lfile_mapping, work);
+ 	struct linux_file *filp = m->vma.vm_file;
+ 
+ 	linux_set_current(curthread);
+ 	sf_lfile_mapping_end(m);
+ 	fput(filp);
+ }
+ 
+ static void
+ sf_lfile_mapping_release(void *arg)
+ {
+ 	struct sf_lfile_mapping *m = arg;
+ 
+ 	schedule_work(&m->work);
+ }
+ 
+ static int
+ sf_lfile_mmap_pages(void *obj, off_t offset, size_t size, int prot, uint32_t *pages,
+     unsigned int *wimg, void (**release)(void *), void **release_arg)
+ {
+ 	struct linux_file *filp = obj;
+ 	struct sf_lfile_mapping *m;
+ 	struct sf_vma_pages rq = { .pages = pages, .wimg = *wimg, .filled = false };
+ 	int ret;
+ 
++	if (sf_lfile_owner(filp) != NULL) return sf_lfile_owner(filp)->mmap_pages(obj, offset, size, prot, pages, wimg, release, release_arg);
+ 
+ 	if (size == 0 || (size & (PAGE_SIZE - 1)) != 0 || offset < 0 ||
+ 	    (offset & (PAGE_SIZE - 1)) != 0)
+--- a/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/include/linux/fs.h
++++ b/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/include/linux/fs.h
+@@ -105,6 +105,7 @@
+ 	 */
+ 	unsigned int	sf_kind;
+ #define	SF_LFILE_KIND_DMA_BUF	0x64627566	/* "dbuf" */
++	const void	*sf_lfile_owner;	/* sf_lfile_owner: the sf_lfile ops of the layer copy that made the file, see drm/src/sf_lfile_lkpi.c */
+ 
+ 	/* kqfilter support */
+ 	int		f_kqflags;

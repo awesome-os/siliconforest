@@ -1,0 +1,573 @@
+fbsdkpi: drm: select(), poll() and kevent on sync_file and dma-buf descriptors
+
+A sync_file's poll only reported whether the fence had signalled and a dma-buf had no
+poll at all (always ready), and nothing woke a waiter: xnu's sf_lfile select routine
+recorded nothing. Needs the kernel side (integrations/siliconforest/m1-dcp/kernel-patches/
+0002: sf_lfile_wakeup(), a selinfo, a kevent filter); with it:
+
+- linux/poll.h: poll_table carries linux's _key, with poll_requested_events().
+- sf_lfile_lkpi.c: linux_poll_wait() (it was an empty function in sf_drm_os.c) queues the
+  file on the wait queue its poll names, the first time a poll with a table names it, and
+  the queue's wake_up then calls sf_lfile_wakeup(); the file leaves the queue when its
+  last reference goes. sf_lfile's poll op passes a table and maps select's direction to
+  events the way linux's select does (POLLIN_SET, POLLOUT_SET, POLLEX_SET). A poll called
+  with a NULL table (the DRM device nodes, patch 0020) is unchanged.
+- sync_file (sf_sync_file_poll.c, sync_file.h): wq, flags and cb, and sync_file_poll(),
+  fence_check_cb_func() and the release/alloc parts of the pin's drivers/dma-buf/
+  sync_file.c: the first poll puts a callback on the fence that wakes the queue.
+- dma-buf (sf_dma_buf_poll.c, dma-buf.h): poll, cb_in and cb_out, and dma_buf_poll(),
+  dma_buf_poll_cb() and dma_buf_poll_add_cb() of the pin's dma-buf.c. One difference:
+  the callback's fput() of the reference dma_buf_poll() took is done by a work item,
+  because this layer's fput() runs the final release immediately, in the fence's
+  signalling context (linux's defers it).
+
+The two new files are ports of GPL-2.0-only code and carry that licence and the original
+notices; drm.cmake lists them apart.
+
+Not done: a sync_file made by another DRM kext is still not recognised by
+sync_file_get_fence() (it compares f_op, as is_dma_buf_file() did before 0019), so a GPU
+fence cannot be given to the display driver as IN_FENCE_FD or imported into its dma-buf.
+UPSTREAM: yes, with the kernel patch; same licence note as 0021.
+
+--- a/src/Kernel/fbsdkpi/drm/drm.cmake
++++ b/src/Kernel/fbsdkpi/drm/drm.cmake
+@@ -53,6 +56,10 @@
+     list(APPEND SF_DRM_KCONFIG X86 X86_64 DMI ACPI DRM_AMD_DC DRM_AMD_DC_FP)
+ endif()
+ 
++# From linux drivers/dma-buf/dma-buf.c and sync_file.c, GPL-2.0-only as above: poll on
++# dma-buf and sync_file descriptors
++list(APPEND SF_DRM_PD_SOURCES sf_dma_buf_poll.c sf_sync_file_poll.c)
++
+ # headers come first for every file in a drm kext, linuxkpi's own included,
+ # so all of them agree on the struct layouts
+ function(sf_drm_layout drmkmod incs defs opts)
+--- a/src/Kernel/fbsdkpi/drm/include/linux/dma-buf.h
++++ b/src/Kernel/fbsdkpi/drm/include/linux/dma-buf.h
+@@ -12,6 +12,8 @@
+ #include <linux/iosys-map.h>
+ #include <linux/dma-fence.h>
+ #include <linux/wait.h>
++#include <linux/workqueue.h>
++#include <linux/atomic.h>
+ 
+ struct device;
+ struct dma_buf;
+@@ -56,8 +58,25 @@
+ 	// SiliconForest: export id until dma-buf fds exist (devfs route)
+ 	int sf_id;
+ 	int sf_refs;
++	// poll, cb_in and cb_out as in the pin's include/linux/dma-buf.h. sf_fputs and
++	// sf_fput_work are SiliconForest's: the file references dma_buf_poll_cb() gives back
++	// are dropped by a work item (see sf_dma_buf.c)
++	wait_queue_head_t poll;
++	struct dma_buf_poll_cb_t {
++		struct dma_fence_cb cb;
++		wait_queue_head_t *poll;
++		unsigned int active;
++		atomic_t sf_fputs;
++		struct work_struct sf_fput_work;
++	} cb_in, cb_out;
+ };
+ 
++// SiliconForest: sf_dma_buf_poll.c, the poll of a dma-buf descriptor
++struct poll_table_struct;
++unsigned int sf_dma_buf_poll(struct file *filp, struct poll_table_struct *poll);
++void sf_dma_buf_poll_init(struct dma_buf *db);
++void sf_dma_buf_poll_fini(struct dma_buf *db);
++
+ struct dma_buf_attach_ops {
+ 	bool allow_peer2peer;
+ 	void (*move_notify)(struct dma_buf_attachment *);
+--- a/src/Kernel/fbsdkpi/drm/include/linux/sync_file.h
++++ b/src/Kernel/fbsdkpi/drm/include/linux/sync_file.h
+@@ -6,16 +6,30 @@
+ 
+ #include <linux/types.h>
+ #include <linux/dma-fence.h>
++#include <linux/wait.h>
+ // fs.h renames struct file, users and this struct must agree on the member name
+ #include <linux/fs.h>
+ 
+ struct file;
+ 
++// wq, flags and cb as in the pin's include/linux/sync_file.h: what poll waits on, and the
++// fence callback that wakes it
+ struct sync_file {
+ 	struct file *file;
++	wait_queue_head_t wq;
++	unsigned long flags;
+ 	struct dma_fence *fence;
++	struct dma_fence_cb cb;
+ };
+ 
++#define POLL_ENABLED 0
++
++// sf_sync_file_poll.c
++struct poll_table_struct;
++void sf_sync_file_poll_init(struct sync_file *sync_file);
++void sf_sync_file_poll_fini(struct sync_file *sync_file);
++unsigned int sf_sync_file_poll(struct file *file, struct poll_table_struct *wait);
++
+ struct sync_file *sync_file_create(struct dma_fence *fence);
+ struct dma_fence *sync_file_get_fence(int fd);
+ 
+--- a/src/Kernel/fbsdkpi/drm/src/sf_dma_buf.c
++++ b/src/Kernel/fbsdkpi/drm/src/sf_dma_buf.c
+@@ -54,6 +54,7 @@
+ 	mutex_init(&db->lock);
+ 	INIT_LIST_HEAD(&db->attachments);
+ 	db->sf_refs = 1;
++	sf_dma_buf_poll_init(db);
+ 	return db;
+ }
+ 
+@@ -64,6 +65,7 @@
+ 
+ 	WARN_ON(!list_empty(&db->attachments));
+ 	WARN_ON(db->vmapping_counter != 0);
++	sf_dma_buf_poll_fini(db);
+ 	db->ops->release(db);
+ 	if (db->resv == &pdb->resv)
+ 		dma_resv_fini(&pdb->resv);
+@@ -117,6 +124,7 @@
+ }
+ 
+ static const struct file_operations sf_dma_buf_fops = {
++	.poll = sf_dma_buf_poll,
+ 	.release = sf_dma_buf_file_release,
+ 	.llseek = sf_dma_buf_file_llseek,
+ 	.unlocked_ioctl = sf_dma_buf_file_ioctl,
+--- a/src/Kernel/fbsdkpi/drm/src/sf_dma_buf_poll.c
++++ b/src/Kernel/fbsdkpi/drm/src/sf_dma_buf_poll.c
+@@ -0,0 +1,174 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * poll on a dma-buf descriptor: dma_buf_poll_cb(), dma_buf_poll_add_cb() and dma_buf_poll()
++ * (lines 317-418 there).
++ *
++ * From drivers/dma-buf/dma-buf.c of linux-aurora (Omacom, integration/aurora) at 6a08a08e:
++ *
++ * Framework for buffer objects that can be shared across devices/subsystems.
++ *
++ * Copyright(C) 2011 Linaro Limited. All rights reserved.
++ * Author: Sumit Semwal <sumit.semwal@ti.com>
++ *
++ * Many thanks to linaro-mm-sig list, and specially
++ * Arnd Bergmann <arnd@arndb.de>, Rob Clark <rob@ti.com> and
++ * Daniel Vetter <daniel@ffwll.ch> for their support in creation and
++ * refining of this idea.
++ */
++#include <linux/uaccess.h>
++#include <linux/dma-fence.h>
++#include <linux/fs.h>
++#include <linux/file.h>
++#include <linux/dma-buf.h>
++#include <linux/dma-resv.h>
++#include <linux/kernel.h>
++#include <linux/poll.h>
++#include <linux/spinlock.h>
++#include <linux/wait.h>
++#include <linux/workqueue.h>
++
++// POLLIN: no write fence pending on the buffer; POLLOUT: no fence at all.
++//
++// One difference from the original. The callback gives back the file reference dma_buf_poll() took, and it
++// runs where the fence is signalled, under the fence's lock. linux's fput() only queues
++// the final release there; this layer's fput() runs it at once, which would free the
++// buffer (and with it this callback's own storage) inside the signalling driver. So the
++// callback counts the reference and a work item drops it.
++static void
++sf_dma_buf_poll_fput_work(struct work_struct *work)
++{
++	struct dma_buf_poll_cb_t *dcb = container_of(work, struct dma_buf_poll_cb_t,
++	    sf_fput_work);
++	struct dma_buf *db = container_of(dcb->poll, struct dma_buf, poll);
++	struct linux_file *filp = db->file;
++	int n = atomic_xchg(&dcb->sf_fputs, 0);
++
++	// each counted reference keeps db alive; nothing of it is touched after the last fput
++	while (n-- > 0)
++		fput(filp);
++}
++
++static void
++sf_dma_buf_poll_cb(struct dma_fence *fence, struct dma_fence_cb *cb)
++{
++	struct dma_buf_poll_cb_t *dcb = (struct dma_buf_poll_cb_t *)cb;
++	unsigned long flags;
++
++	spin_lock_irqsave(&dcb->poll->lock, flags);
++	wake_up_all_locked(dcb->poll);
++	dcb->active = 0;
++	spin_unlock_irqrestore(&dcb->poll->lock, flags);
++	dma_fence_put(fence);
++	/* Paired with get_file in dma_buf_poll */
++	atomic_inc(&dcb->sf_fputs);
++	schedule_work(&dcb->sf_fput_work);
++}
++
++static bool
++sf_dma_buf_poll_add_cb(struct dma_resv *resv, bool write, struct dma_buf_poll_cb_t *dcb)
++{
++	struct dma_resv_iter cursor;
++	struct dma_fence *fence;
++	int r;
++
++	dma_resv_for_each_fence(&cursor, resv, dma_resv_usage_rw(write), fence) {
++		dma_fence_get(fence);
++		r = dma_fence_add_callback(fence, &dcb->cb, sf_dma_buf_poll_cb);
++		if (!r)
++			return true;
++		dma_fence_put(fence);
++	}
++
++	return false;
++}
++
++unsigned int
++sf_dma_buf_poll(struct linux_file *filp, poll_table *poll)
++{
++	struct dma_buf *dmabuf;
++	struct dma_resv *resv;
++	unsigned int events;
++
++	dmabuf = filp->private_data;
++	if (!dmabuf || !dmabuf->resv)
++		return POLLERR;
++
++	resv = dmabuf->resv;
++
++	poll_wait(filp, &dmabuf->poll, poll);
++
++	events = poll_requested_events(poll) & (POLLIN | POLLOUT);
++	if (!events)
++		return 0;
++
++	dma_resv_lock(resv, NULL);
++
++	if (events & POLLOUT) {
++		struct dma_buf_poll_cb_t *dcb = &dmabuf->cb_out;
++
++		/* Check that callback isn't busy */
++		spin_lock_irq(&dmabuf->poll.lock);
++		if (dcb->active)
++			events &= ~POLLOUT;
++		else
++			dcb->active = POLLOUT;
++		spin_unlock_irq(&dmabuf->poll.lock);
++
++		if (events & POLLOUT) {
++			/* Paired with fput in dma_buf_poll_cb */
++			get_file(dmabuf->file);
++
++			if (!sf_dma_buf_poll_add_cb(resv, true, dcb))
++				/* No callback queued, wake up any other waiters */
++				sf_dma_buf_poll_cb(NULL, &dcb->cb);
++			else
++				events &= ~POLLOUT;
++		}
++	}
++
++	if (events & POLLIN) {
++		struct dma_buf_poll_cb_t *dcb = &dmabuf->cb_in;
++
++		/* Check that callback isn't busy */
++		spin_lock_irq(&dmabuf->poll.lock);
++		if (dcb->active)
++			events &= ~POLLIN;
++		else
++			dcb->active = POLLIN;
++		spin_unlock_irq(&dmabuf->poll.lock);
++
++		if (events & POLLIN) {
++			/* Paired with fput in dma_buf_poll_cb */
++			get_file(dmabuf->file);
++
++			if (!sf_dma_buf_poll_add_cb(resv, false, dcb))
++				/* No callback queued, wake up any other waiters */
++				sf_dma_buf_poll_cb(NULL, &dcb->cb);
++			else
++				events &= ~POLLIN;
++		}
++	}
++
++	dma_resv_unlock(resv);
++	return events;
++}
++
++void
++sf_dma_buf_poll_init(struct dma_buf *db)
++{
++	init_waitqueue_head(&db->poll);
++	db->cb_in.poll = db->cb_out.poll = &db->poll;
++	db->cb_in.active = db->cb_out.active = 0;
++	atomic_set(&db->cb_in.sf_fputs, 0);
++	atomic_set(&db->cb_out.sf_fputs, 0);
++	INIT_WORK(&db->cb_in.sf_fput_work, sf_dma_buf_poll_fput_work);
++	INIT_WORK(&db->cb_out.sf_fput_work, sf_dma_buf_poll_fput_work);
++}
++
++// the pin's dma_buf_release() has BUG_ON here: a pending poll callback holds a file
++// reference, so the buffer cannot be released with one armed
++void
++sf_dma_buf_poll_fini(struct dma_buf *db)
++{
++	WARN_ON(db->cb_in.active || db->cb_out.active);
++}
+--- a/src/Kernel/fbsdkpi/drm/src/sf_drm_os.c
++++ b/src/Kernel/fbsdkpi/drm/src/sf_drm_os.c
+@@ -279,11 +279,6 @@
+ }
+ 
+ void
+-linux_poll_wait(struct linux_file *filp, wait_queue_head_t *wqh, poll_table *p)
+-{
+-}
+-
+-void
+ __unregister_chrdev(unsigned int major, unsigned int baseminor,
+     unsigned int count, const char *name)
+ {
+--- a/src/Kernel/fbsdkpi/drm/src/sf_lfile_lkpi.c
++++ b/src/Kernel/fbsdkpi/drm/src/sf_lfile_lkpi.c
+@@ -4,6 +4,11 @@
+ #include <linux/file.h>
+ #include <linux/fs.h>
+ #include <linux/poll.h>
++#include <linux/wait.h>
++#include <linux/mm.h>
++#include <linux/dma-buf.h>
++#include <linux/workqueue.h>
++#include <asm/processor.h>
+ #include <linux/refcount.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
+@@ -32,11 +47,52 @@
+ 	if (filp == NULL || !refcount_release(&filp->f_count))
+ 		return;
+ 	linux_set_current(curthread);
++	// off the wait queue poll_wait() put the file on, before release frees the queue
++	if (atomic_read(&filp->f_wait_queue.state) == LINUX_FWQ_STATE_QUEUED)
++		remove_wait_queue(filp->f_wait_queue.wqh, &filp->f_wait_queue.wq);
+ 	if (filp->f_op != NULL && filp->f_op->release != NULL)
+ 		filp->f_op->release(NULL, filp);
+ 	linux_file_free(filp);
+ }
+ 
++// a wake_up on the wait queue the file's poll named: xnu's sf_lfile wakes its select and
++// kevent waiters, which poll again
++static int
++sf_lfile_wake_fn(wait_queue_t *wq, unsigned int mode, int flags, void *key)
++{
++	sf_lfile_wakeup(wq->private);
++	return 0;
++}
++
++// poll_wait(). linux queues the polling task on wqh for the duration of the poll; here the
++// file is queued, the first time a poll with a table names the queue, and stays queued until
++// its last reference goes (sf_lkpi_fput). One wait queue per file, as in linux_compat.c.
++void
++linux_poll_wait(struct linux_file *filp, wait_queue_head_t *wqh, poll_table *p)
++{
++	struct linux_file_wait_queue *fwq;
++
++	if (p == NULL || filp == NULL || wqh == NULL)
++		return;
++	fwq = &filp->f_wait_queue;
++	if (atomic_read(&fwq->state) == LINUX_FWQ_STATE_QUEUED)
++		return;
++	if (atomic_cmpxchg(&fwq->state, LINUX_FWQ_STATE_INIT, LINUX_FWQ_STATE_NOT_READY) !=
++	    LINUX_FWQ_STATE_INIT) {
++		// another thread is queueing the file: not ready may only be reported once the
++		// file is on the queue
++		while (atomic_read(&fwq->state) != LINUX_FWQ_STATE_QUEUED)
++			cpu_relax();
++		return;
++	}
++	fwq->wqh = wqh;
++	fwq->wq.private = filp;
++	fwq->wq.func = sf_lfile_wake_fn;
++	INIT_LIST_HEAD(&fwq->wq.entry);
++	add_wait_queue(wqh, &fwq->wq);
++	atomic_set(&fwq->state, LINUX_FWQ_STATE_QUEUED);
++}
++
+ struct linux_file *
+ sf_lkpi_fget(unsigned int fd)
+ {
+@@ -70,27 +70,42 @@
+ {
+ 	struct linux_file *filp = obj;
+ 
++
+ 	refcount_acquire(&filp->f_count);
+ }
+ 
+ static void
+ sf_lfile_release(void *obj)
+ {
+ 	sf_lkpi_fput(obj);
+ }
+ 
+-// readiness only, as for the dri nodes: a select without events polls again
++// select's direction (also what kevent's read and write filters ask) as linux's select does
++// it, fs/select.c POLLIN_SET, POLLOUT_SET and POLLEX_SET. The table makes the file's
++// poll_wait() queue the file, so that a later wake_up reaches sf_lfile_wakeup().
+ static int
+ sf_lfile_poll(void *obj, int which)
+ {
+ 	struct linux_file *filp = obj;
+-	unsigned int mask;
++	poll_table pt;
++	unsigned int mask, want;
++
+ 
+ 	if (filp->f_op->poll == NULL)
+ 		return 1;
++	if (which == FREAD) {
++		pt._key = POLLIN | POLLRDNORM;
++		want = POLLIN | POLLRDNORM | POLLRDBAND | POLLHUP | POLLERR;
++	} else if (which == FWRITE) {
++		pt._key = POLLOUT | POLLWRNORM;
++		want = POLLOUT | POLLWRNORM | POLLWRBAND | POLLERR;
++	} else {
++		pt._key = POLLPRI;
++		want = POLLPRI;
++	}
+ 	linux_set_current(curthread);
+-	mask = filp->f_op->poll(filp, NULL);
+-	return (mask & (POLLIN | POLLRDNORM | POLLOUT | POLLERR)) != 0;
++	mask = filp->f_op->poll(filp, &pt);
++	return (mask & want) != 0;
+ }
+ 
+ static int
+@@ -100,6 +100,7 @@
+ 	struct task_struct *task;
+ 	long ret;
+ 
++
+ 	if (filp->f_op->unlocked_ioctl == NULL)
+ 		return ENOTTY;
+ 	linux_set_current(curthread);
+--- a/src/Kernel/fbsdkpi/drm/src/sf_sync_file.c
++++ b/src/Kernel/fbsdkpi/drm/src/sf_sync_file.c
+@@ -47,19 +47,12 @@
+ {
+ 	struct sync_file *sf = filp->private_data;
+ 
++	sf_sync_file_poll_fini(sf);
+ 	dma_fence_put(sf->fence);
+ 	kfree(sf);
+ 	return 0;
+ }
+ 
+-static unsigned int
+-sf_sync_file_poll(struct linux_file *filp, poll_table *wait)
+-{
+-	struct sync_file *sf = filp->private_data;
+-
+-	return dma_fence_is_signaled(sf->fence) ? POLLIN : 0;
+-}
+-
+ // the descriptor's file and its fence reference, or NULL
+ struct sync_file *
+ sync_file_create(struct dma_fence *fence)
+@@ -74,6 +74,7 @@
+ 		return NULL;
+ 	}
+ 	sf->file->private_data = sf;
++	sf_sync_file_poll_init(sf);
+ 	sf->fence = dma_fence_get(fence);
+ 	return sf;
+ }
+--- a/src/Kernel/fbsdkpi/drm/src/sf_sync_file_poll.c
++++ b/src/Kernel/fbsdkpi/drm/src/sf_sync_file_poll.c
+@@ -0,0 +1,62 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * poll on a sync_file descriptor: what sync_file_alloc(), fence_check_cb_func(),
++ * sync_file_release() and sync_file_poll() do for it.
++ *
++ * From drivers/dma-buf/sync_file.c of linux-aurora (Omacom, integration/aurora) at 6a08a08e:
++ *
++ * Copyright (C) 2012 Google, Inc.
++ */
++#include <linux/bitops.h>
++#include <linux/dma-fence.h>
++#include <linux/fs.h>
++#include <linux/file.h>
++#include <linux/kernel.h>
++#include <linux/list.h>
++#include <linux/poll.h>
++#include <linux/sync_file.h>
++#include <linux/wait.h>
++
++// sync_file_alloc()
++void
++sf_sync_file_poll_init(struct sync_file *sync_file)
++{
++	init_waitqueue_head(&sync_file->wq);
++
++	INIT_LIST_HEAD(&sync_file->cb.node);
++}
++
++static void
++fence_check_cb_func(struct dma_fence *f, struct dma_fence_cb *cb)
++{
++	struct sync_file *sync_file;
++
++	sync_file = container_of(cb, struct sync_file, cb);
++
++	wake_up_all(&sync_file->wq);
++}
++
++// sync_file_release(), before the fence reference is dropped
++void
++sf_sync_file_poll_fini(struct sync_file *sync_file)
++{
++	if (test_bit(POLL_ENABLED, &sync_file->flags))
++		dma_fence_remove_callback(sync_file->fence, &sync_file->cb);
++}
++
++unsigned int
++sf_sync_file_poll(struct linux_file *file, poll_table *wait)
++{
++	struct sync_file *sync_file = file->private_data;
++
++	poll_wait(file, &sync_file->wq, wait);
++
++	if (list_empty(&sync_file->cb.node) &&
++	    !test_and_set_bit(POLL_ENABLED, &sync_file->flags)) {
++		if (dma_fence_add_callback(sync_file->fence, &sync_file->cb,
++					   fence_check_cb_func) < 0)
++			wake_up_all(&sync_file->wq);
++	}
++
++	return dma_fence_is_signaled(sync_file->fence) ? POLLIN : 0;
++}
+--- a/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/include/linux/poll.h
++++ b/src/Kernel/fbsdkpi/freebsd/linuxkpi/common/include/linux/poll.h
+@@ -36,9 +36,21 @@
+ #include <linux/wait.h>
+ #include <linux/file.h>
+ 
++/*
++ * SiliconForest: _key is linux's, the events the caller waits for. A poll called with a table
++ * (the sf_lfile descriptors, drm/src/sf_lfile_lkpi.c) has poll_wait() queue the file on the
++ * wait queue for wakeups; with NULL, as before, poll_wait() does nothing.
++ */
+ typedef struct poll_table_struct {
++	unsigned int _key;
+ } poll_table;
+ 
++static inline unsigned int
++poll_requested_events(const poll_table *p)
++{
++	return (p ? p->_key : ~0u);
++}
++
+ extern void linux_poll_wait(struct linux_file *, wait_queue_head_t *, poll_table *);
+ #define	poll_wait(...) linux_poll_wait(__VA_ARGS__)
+ 

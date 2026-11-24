@@ -1,0 +1,38 @@
+dma-fence: fence context numbers of two kexts do not collide
+
+Audit finding X3. Each DRM kext links its own copy of dma-fence.c and each copy counted
+contexts from 1, while fences cross between the copies (a display out-fence waited on by
+the GPU scheduler, a GPU fence in a buffer the display scans out). "Same context" means
+"same timeline, the later one replaces the earlier" in the scheduler's dependency
+handling, in dma_resv_add_fence() and in the fence merge: a display fence and a GPU fence
+with the same small context number were taken for one timeline and one of the waits was
+dropped. Each copy now numbers its contexts from a base made of the address of its own
+counter, which differs between kexts of one kernel collection.
+
+--- a/drivers/dma-buf/dma-fence.c
++++ b/drivers/dma-buf/dma-fence.c
+@@ -86,6 +86,14 @@
+ static atomic64_t dma_fence_context_counter = ATOMIC64_INIT(1);
+ 
+ /*
++ * SiliconForest: every kext that links this file has its own counter, and fences
++ * cross between kexts. The low 40 bits of the counter's own address, above 24
++ * bits of count, keep the numbers of two copies apart.
++ */
++#define	SF_DMA_FENCE_CONTEXT_BASE \
++	((u64)((uintptr_t)&dma_fence_context_counter & 0xffffffffffULL) << 24)
++
++/*
+  * allocate an array of fence contexts
+  */
+ u64
+@@ -92,7 +100,8 @@
+ dma_fence_context_alloc(unsigned num)
+ {
+ 
+-	return (atomic64_fetch_add(num, &dma_fence_context_counter));
++	return (SF_DMA_FENCE_CONTEXT_BASE +
++	    atomic64_fetch_add(num, &dma_fence_context_counter));
+ }
+ 
+ /*

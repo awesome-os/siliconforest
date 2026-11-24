@@ -1,0 +1,69 @@
+#!/bin/sh
+# Startup-only native keyboard seat observation. No synthetic input or prompt.
+set -eu
+nonce=${1-}
+case "$nonce" in ''|*[!0-9a-f]*) exit 2 ;; esac
+[ "${#nonce}" -eq 48 ] || exit 2
+# Preserve an enumeration refusal without claiming trackpad input.
+printf '\nDL14_TP_BEGIN_%s feature_writes=0 physical_input_proven=false\n' "$nonce"
+enum_rc=0
+if /usr/bin/darwin-trackpad-enum --nonce "$nonce"; then :; else enum_rc=$?; fi
+printf 'DL14_TP_COLLECTED_%s rc=%s physical_input_proven=false\n' "$nonce" "$enum_rc"
+case "$enum_rc" in 0|77) ;; *) exit 1 ;; esac
+printf '\nDL12_NATIVE_BEGIN_%s physical_input_proven=false\n' "$nonce"
+runtime=/private/var/run/darwin-desktop
+mkdir -p "$runtime"
+chmod 0700 "$runtime"
+export XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=wayland-0
+export XKB_CONFIG_ROOT=/usr/share/X11/xkb TMPDIR=/private/tmp
+compositor=
+client=
+cleanup() {
+    trap - EXIT HUP INT TERM
+    if [ -n "$client" ]; then kill -TERM "$client" 2>/dev/null || :; wait "$client" 2>/dev/null || :; fi
+    if [ -n "$compositor" ]; then kill -TERM "$compositor" 2>/dev/null || :; wait "$compositor" 2>/dev/null || :; fi
+}
+trap cleanup EXIT HUP INT TERM
+if /usr/bin/darwin-keyboard-inventory --require-native-keyboard; then :; else
+    rc=$?
+    printf 'DL12_NATIVE_NOT_READY_%s inventory_rc=%s physical_input_proven=false\n' "$nonce" "$rc"
+    exit 77
+fi
+count=0
+while [ ! -c /dev/usb_hid_kbd ]; do
+    count=$((count + 1))
+    [ "$count" -le 100 ] || exit 1
+    sleep 0.1
+done
+# A mouse node is not part of this experiment and has no native producer.
+[ ! -e /dev/usb_hid_mouse ] || exit 1
+/usr/bin/chonkstep-darwin --run --socket "$runtime/wayland-0" --input pdhid-keyboard &
+compositor=$!
+count=0
+while [ ! -S "$runtime/wayland-0" ]; do
+    kill -0 "$compositor"
+    count=$((count + 1))
+    [ "$count" -le 100 ] || exit 1
+    sleep 0.1
+done
+printf 'DL12_NATIVE_SERVER_SOCKET_%s physical_input_proven=false\n' "$nonce"
+/usr/bin/darwin-wayland-terminal-native-startup --socket "$runtime/wayland-0" --nonce "$nonce" --seconds 80 &
+client=$!
+client_rc=0
+if wait "$client"; then :; else client_rc=$?; fi
+client=
+records_rc=0
+if /usr/bin/darwin-terminal-records --directory "$runtime/terminal-$nonce" --nonce "$nonce" --phase closed; then :; else records_rc=$?; fi
+printf 'DL12_NATIVE_RECORDS_%s phase=closed rc=%s physical_input_proven=false\n' "$nonce" "$records_rc"
+kill -TERM "$compositor" 2>/dev/null || :
+compositor_rc=0
+if wait "$compositor"; then :; else compositor_rc=$?; fi
+compositor=
+printf 'DL12_NATIVE_STATUS_%s client=%s compositor=%s records=%s physical_input_proven=false\n' "$nonce" "$client_rc" "$compositor_rc" "$records_rc"
+[ "$client_rc" -eq 0 ] && [ "$compositor_rc" -eq 0 ] && [ "$records_rc" -eq 0 ]
+printf '\nCHONKSTEP NATIVE SEAT STARTUP ONLY - INPUT UNVERIFIED\n'
+printf 'DL12_NATIVE_RETURN_%s\n' "$nonce"
+/bin/uname -s
+/bin/uname -m
+/bin/uname -r
+printf 'DL12_NATIVE_END_%s physical_input_proven=false\n' "$nonce"

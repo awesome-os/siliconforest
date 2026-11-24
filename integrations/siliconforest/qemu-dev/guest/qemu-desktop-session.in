@@ -1,0 +1,75 @@
+#!/bin/sh
+# Guest side of the QEMU desktop loop (tools/qemu_desktop.sh). The session part of
+# chonkstep-darwin/darwin-gpu-desktop-interactive.in and m1-desktop-scale/guest/
+# darwin-desktop-scale.in, for the arm64 `virt` machine: the same compositor, terminal, audio
+# server and state directory, the CPU renderer on the firmware framebuffer (ramfb) and USB HID
+# through the SFHID device nodes. No Wi-Fi, Touch Bar, backlight, speakers or GPU here.
+#   by hand (@AUTOPILOT@ = 0): the desktop for @SECONDS@ seconds, input from the QEMU window.
+#   unattended (@AUTOPILOT@ = 1): the compositor drives itself (CHONKSTEP_DARWIN_AUTOPILOT).
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin; export PATH
+session=${1:-000000000000000000000000000000000000000000000001}
+runtime=/private/var/run/qemu-desktop
+mkdir -p "$runtime" && chmod 0700 "$runtime"
+# The menu's Theme and Display choices are kept here, as on the M1 (the root is a disk here,
+# but every run starts from a fresh copy of the image).
+state=/private/var/db/desktop-state
+mkdir -p "$state"
+export XDG_STATE_HOME="$state"
+export XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY=wayland-0
+export XKB_CONFIG_ROOT=/usr/share/X11/xkb TMPDIR=/private/tmp
+export CHONKSTEP_DARWIN_FRAME_STATS=@STATS@
+[ -d /usr/share/backgrounds/siliconforest ] && export CHONKSTEP_BACKGROUND_DIR=/usr/share/backgrounds/siliconforest
+exec < /dev/null
+printf '\nQDDESK_BEGIN seconds=@SECONDS@ autopilot=@AUTOPILOT@ scale=%s theme=%s only=%s\n' "@SCALE@" "@THEME@" "@ONLY@"
+get() { sysctl -n "$1" 2>/dev/null; }
+# Network: QEMU's user network on the virtio interface (10.0.2.15, gateway 10.0.2.2), when the
+# tools are staged; started 15 s in, so that it does not compete with the desktop coming up
+# (every process start is expensive under emulation). There is no Wi-Fi interface: the Wi-Fi rows
+# of the menu show that state.
+( [ -x /usr/bin/qemu-net-up ] && { sleep 15; /usr/bin/qemu-net-up en0 > /var/log/qemu-net-up.log 2>&1; printf 'QDDESK_NET_UP_RC=%s %s\n' "$?" "$(tail -1 /var/log/qemu-net-up.log)"; [ "@FETCH@" = 1 ] && printf 'QDDESK_HTTP %s\n' "$(printf 'GET / HTTP/1.0\r\nHost: example.com\r\n\r\n' | netcat example.com 80 | head -1 | tr -d '\r')"; } ) &
+net_job=$!
+if [ "@SOUND@" = 1 ] && [ -x /usr/sbin/coreaudiod ]; then
+    mkdir -p /var/log /var/run /Library/Preferences
+    /usr/sbin/coreaudiod > /var/log/coreaudiod.log 2>&1 &
+    printf 'QDDESK_COREAUDIOD pid=%s\n' "$!"
+fi
+# Upstream's USB HID driver makes each node with the first event of its kind; the host side
+# (qd_run.py) sends one key and one pointer step when it sees the line above. No `sleep` per
+# 0.1 s here: starting a process costs about half a second under emulation.
+count=0
+while [ ! -c /dev/usb_hid_kbd ] || [ ! -c /dev/usb_hid_mouse ]; do
+    count=$((count + 1)); [ "$count" -le 240 ] || break; sleep 0.25
+done
+printf 'QDDESK_INPUT kbd=%s mouse=%s\n' "$([ -c /dev/usb_hid_kbd ] && echo yes || echo no)" "$([ -c /dev/usb_hid_mouse ] && echo yes || echo no)"
+[ -n "@SCALE@" ] && export CHONKSTEP_SCALE="@SCALE@"
+[ -n "@THEME@" ] && export CHONKSTEP_THEME="@THEME@"
+if [ "@AUTOPILOT@" = 1 ]; then
+    export CHONKSTEP_DARWIN_AUTOPILOT=1 CHONKSTEP_DARWIN_MAX_TERMINALS=3 CHONKSTEP_DARWIN_AUTOPILOT_WIFI_TOGGLE=0
+    [ -n "@ONLY@" ] && export CHONKSTEP_DARWIN_AUTOPILOT_ONLY="@ONLY@"
+fi
+@ENV@
+# A persistent disk (tools/qemu_install.sh): what the session writes reaches the disk even
+# when the window is simply closed.
+[ "@PERSIST@" = 1 ] && ( while :; do sleep 5; sync; done ) &
+records=$runtime/session-$session
+rm -rf "$records"; mkdir -m 0700 "$records"
+rm -f "$runtime/desktop.rc"
+printf 'QDDESK_DESKTOP_START renderer=@RENDERER@ seconds=@SECONDS@ start=%s\n' "$(date +%s)"
+{
+    /usr/bin/chonkstep-darwin-desktop --run --socket "$runtime/wayland-0" --records "$records" --session "$session" --terminal /usr/bin/chonk-terminal-darwin --seconds @SECONDS@ --font-regular /usr/share/darwin-desktop/DejaVuSans.ttf --font-bold /usr/share/darwin-desktop/DejaVuSans-Bold.ttf --input sfhid --startup-terminals @TERMINALS@ --renderer @RENDERER@ 2>&1
+    echo "$?" > "$runtime/desktop.rc"
+} | grep -v 'chonkstep-gl: step:'
+rc=$(cat "$runtime/desktop.rc" 2>/dev/null || echo unknown)
+printf 'QDDESK_DESKTOP_RC=%s end=%s\n' "$rc" "$(date +%s)"
+[ -r "$records/session-result.txt" ] && grep -v ' gate=\| kernel_messages=\| cs_at_spawn=\| exit_reason=' "$records/session-result.txt" | cut -c1-260 | sed 's/^/QDDESK_RESULT /' | head -40
+for live in "$records"/*/term-live.txt; do
+    [ -r "$live" ] || continue
+    printf 'QDDESK_TERMINAL %s\n' "$(head -1 "$live" | cut -c1-400)"
+done
+printf 'QDDESK_STATE scale=%s theme=%s\n' "$(cat "$state/chonkstep/scale" 2>/dev/null || echo none)" "$(cat "$state/chonkstep/theme" 2>/dev/null || echo none)"
+[ -r /var/log/coreaudiod.log ] && printf 'QDDESK_COREAUDIOD_LOG %s\n' "$(tail -3 /var/log/coreaudiod.log | tr '\n' '|' | cut -c1-300)"
+# The network job may still be waiting for an interface: it does not hold up the end.
+kill "$net_job" 2>/dev/null
+[ "$rc" = 0 ] && printf 'QDDESK_PASS\n'
+[ "@PERSIST@" = 1 ] && sync
+printf 'QDDESK_END\n'

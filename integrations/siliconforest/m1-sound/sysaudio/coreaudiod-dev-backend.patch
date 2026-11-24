@@ -1,0 +1,642 @@
+--- a/src/Userspace/coreaudiod/coreaudiod.c
++++ b/src/Userspace/coreaudiod/coreaudiod.c
+@@ -1,15 +1,22 @@
+-// coreaudiod - SiliconForest's audio server: owns every IOAudioEngine output stream and mixes the clients into them
++// coreaudiod - SiliconForest's audio server: owns every output stream, an IOAudioEngine's or a sound driver's
++// character device, and mixes the clients into them
+ // Copyright (c) 2026 The PureDarwin Project, SPDX-License-Identifier: MPL-2.0 OR BSD-2-Clause
+ 
+ // IOAudioFamily only lets a process with com.apple.private.audio.driver-host drive an engine, so apps reach
+ // the hardware through here: each client fills a shared ring, an IO thread per engine mixes the rings one period
+ // ahead of that engine's playback head and hands the mix to the family through performClientIO
+ 
++// a machine whose sound driver is not an IOAudioEngine but a character device that takes 16-bit frames
++// (sDevTable) gets one engine per device node instead, when no IOAudioEngine is there: the same clients and
++// rings, the mix converted and written to the node by that engine's own thread
++
+ #include <CoreFoundation/CoreFoundation.h>
+ #include <IOKit/IOKitLib.h>
+ #include <mach/mach.h>
+ #include <mach/mach_time.h>
+ #include <mach/semaphore.h>
++#include <errno.h>
++#include <fcntl.h>
+ #include <pthread.h>
+ #include <servers/bootstrap.h>
+ #include <stdbool.h>
+@@ -17,7 +24,9 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/stat.h>
++#include <sys/sysctl.h>
+ #include <time.h>
++#include <unistd.h>
+ 
+ #include "SFAudioServer.h"
+ 
+@@ -84,6 +93,10 @@
+     io_registry_entry_t muteControl;
+     int32_t volumeMin;
+     int32_t volumeMax;
++    // a character device engine: its table entry, NULL for an IOAudioEngine
++    const struct dev_desc *dev;
++    // host time at which the period being mixed reaches the output
++    uint64_t devHostTime;
+ };
+ 
+ struct client {
+@@ -112,6 +125,10 @@
+ } sIds[MAX_IDS];
+ static uint32_t sNextId = FIRST_DEVICE_ID;
+ 
++static void devApplyVolume(struct engine *e);
++static void *devThread(void *arg);
++static void closeEngine(struct engine *e);
++
+ static uint32_t numberProperty(io_registry_entry_t entry, CFStringRef key, uint32_t fallback)
+ {
+     CFTypeRef v = IORegistryEntryCreateCFProperty(entry, key, kCFAllocatorDefault, 0);
+@@ -330,6 +347,8 @@
+ // hardware controls take the level and the mute, the mix does whatever the device has no control for
+ static void applyVolume(struct engine *e)
+ {
++    if (e->dev)
++        return devApplyVolume(e);
+     if (e->volumeControl) {
+         int32_t span = e->volumeMax - e->volumeMin;
+         setControlValue(e->volumeControl, e->volumeMin + (int32_t)(e->info.volume * span + 0.5f));
+@@ -551,6 +570,8 @@
+ {
+     uint64_t start, t;
+ 
++    if (e->dev)
++        return e->devHostTime;
+     enginePosition(e, &start, &t);
+     return frame >= start ? t + (uint64_t)((frame - start) * e->ticksPerFrame) : t;
+ }
+@@ -622,9 +643,9 @@
+ 
+     // a level without a hardware control is applied here, squared so the slider feels even
+     float gain = 1.0f;
+-    if (!e->volumeControl)
++    if (!(e->info.flags & kSFAudioDeviceHardwareVolume))
+         gain = e->info.volume * e->info.volume;
+-    if (!e->muteControl && e->info.mute)
++    if (!(e->info.flags & kSFAudioDeviceHardwareMute) && e->info.mute)
+         gain = 0.0f;
+     if (gain != 1.0f) {
+         for (uint32_t s = 0; s < PERIOD_FRAMES * ch; s++)
+@@ -705,13 +726,524 @@
+ {
+     pthread_attr_t attr;
+     struct sched_param sp = { .sched_priority = 47 };
++    void *(*run)(void *) = e->dev ? devThread : ioThread;
+ 
+     pthread_attr_init(&attr);
+     pthread_attr_setschedpolicy(&attr, SCHED_RR);
+     pthread_attr_setschedparam(&attr, &sp);
+-    e->threadUp = pthread_create(&e->thread, &attr, ioThread, e) == 0;
++    e->threadUp = pthread_create(&e->thread, &attr, run, e) == 0;
+     if (!e->threadUp)
+-        e->threadUp = pthread_create(&e->thread, NULL, ioThread, e) == 0;
++        e->threadUp = pthread_create(&e->thread, NULL, run, e) == 0;
++}
++
++// a sound driver that is a character device: 16-bit little-endian stereo frames written to path play at the
++// driver's rate. Its sysctls below the prefix, each used when it is there: rate; volume_db, the codec's
++// attenuation in dB with 63 its mute; fifo_frames, the frames written that the driver has not taken yet;
++// state, a text that starts with what the driver can do; jack, above zero while something is plugged
++enum { kDevJackPlugged = 1, kDevJackEmpty };
++
++struct dev_desc {
++    const char *name;
++    const char *uid;
++    const char *path;
++    // names another node in the environment, so a stand-in can take the place of a device that is not there
++    const char *pathEnv;
++    const char *sysctl;
++    // volume_db sets the level, else the mix is scaled
++    bool hardwareVolume;
++    // which state of the jack makes this the default output
++    int route;
++};
++
++static const struct dev_desc sDevTable[] = {
++    { "Headphones", "SFAudio:headphones", "/dev/sfaudio", NULL, "kern.sf_sound", true, kDevJackPlugged },
++    { "Speakers", "SFAudio:speakers", "/dev/sfspeaker", "COREAUDIOD_SPEAKER_DEVICE", "kern.sf_speaker", false, kDevJackEmpty },
++};
++
++#define DEV_RATE 48000
++// frames kept queued in the driver ahead of its playback
++#define DEV_QUEUE_FRAMES 3072
++// what the driver holds between its queue and the converter: SFAppleSound fills five DMA periods of 1024 ahead
++#define DEV_OUTPUT_FRAMES 5120
++// a queue that stays full this long means the driver plays no more
++#define DEV_STALL_MS 3000
++// after a failed open or write the node is left alone this long
++#define DEV_RETRY_SECONDS 5
++// the node stays open this long after the last client stopped, a start of the driver costs a second of silence
++#define DEV_LINGER_SECONDS 5
++#define DEV_STATS_SECONDS 5
++#define DEV_MUTE_DB 63
++#define DEV_RANGE_DB 62
++// the level of a device without a hardware volume until someone sets one
++#define DEV_SOFT_VOLUME 0.5f
++
++// one open of the node
++struct dev_run {
++    int fd;
++    // the driver tells how much is queued, so the writes follow its clock; else they follow the host's
++    bool paced;
++    int fifoMib[CTL_MAXNAME];
++    size_t fifoMibLen;
++    bool failed;
++    uint64_t opened, moved, nextTime;
++    uint32_t lastQueued;
++    // a period went out in the last turn, and how many frames since the clients last began
++    bool fed;
++    uint64_t run;
++    uint64_t periods;
++    uint32_t byClients[4];
++    uint32_t clients, mostClients;
++    uint32_t underruns;
++};
++
++static bool devGet(const struct dev_desc *d, const char *leaf, int *out)
++{
++    char name[96];
++    size_t size = sizeof(*out);
++
++    snprintf(name, sizeof(name), "%s.%s", d->sysctl, leaf);
++    return sysctlbyname(name, out, &size, NULL, 0) == 0 && size == sizeof(*out);
++}
++
++static bool devSet(const struct dev_desc *d, const char *leaf, int value)
++{
++    char name[96];
++
++    snprintf(name, sizeof(name), "%s.%s", d->sysctl, leaf);
++    return sysctlbyname(name, NULL, NULL, &value, sizeof(value)) == 0;
++}
++
++static const char *devPath(const struct dev_desc *d)
++{
++    const char *p = d->pathEnv ? getenv(d->pathEnv) : NULL;
++
++    return p && p[0] ? p : d->path;
++}
++
++// whether the node is there and its driver can play: a driver that failed or gave up is no device
++static bool devAvailable(const struct dev_desc *d)
++{
++    static const char *const kNot[] = { "off", "failed", "disabled", "codec-only" };
++    char name[96], state[128] = "";
++    size_t size = sizeof(state) - 1;
++    struct stat st;
++
++    if (stat(devPath(d), &st) != 0 || !S_ISCHR(st.st_mode))
++        return false;
++    snprintf(name, sizeof(name), "%s.state", d->sysctl);
++    if (sysctlbyname(name, state, &size, NULL, 0) != 0)
++        return true;
++    for (size_t i = 0; i < sizeof(kNot) / sizeof(kNot[0]); i++) {
++        if (!strncmp(state, kNot[i], strlen(kNot[i])))
++            return false;
++    }
++    return true;
++}
++
++static uint64_t devTicks(const struct engine *e, uint32_t ms)
++{
++    return (uint64_t)(e->ticksPerFrame * e->rate * ms / 1000.0);
++}
++
++// the level as the driver takes it, in dB below the codec's full scale: none at 1.0, 62 at 0.0, the mute apart
++static void devApplyVolume(struct engine *e)
++{
++    int db = e->info.mute ? DEV_MUTE_DB : (int)((1.0f - e->info.volume) * DEV_RANGE_DB + 0.5f);
++
++    if (!e->dev->hardwareVolume)
++        return;
++    if (devSet(e->dev, "volume_db", db))
++        fprintf(stderr, "coreaudiod: %s volume %.3f%s: %s.volume_db=%d\n", e->info.name, e->info.volume,
++                e->info.mute ? ", muted" : "", e->dev->sysctl, db);
++    else
++        fprintf(stderr, "coreaudiod: setting %s.volume_db=%d failed: %s\n", e->dev->sysctl, db, strerror(errno));
++}
++
++static uint32_t devPlayingClients(struct engine *e)
++{
++    uint32_t n = 0;
++
++    for (int i = 0; i < MAX_CLIENTS; i++) {
++        if (sClients[i].ring && sClients[i].ring->running && clientEngine(&sClients[i]) == e)
++            n++;
++    }
++    return n;
++}
++
++static void devSetRunning(struct engine *e, bool run)
++{
++    pthread_mutex_lock(&sLock);
++    if (run)
++        e->info.flags |= kSFAudioDeviceRunning;
++    else
++        e->info.flags &= ~kSFAudioDeviceRunning;
++    broadcastLocked(kSFAudioChangedRunning);
++    pthread_mutex_unlock(&sLock);
++}
++
++static bool devOpen(struct engine *e, struct dev_run *r)
++{
++    const struct dev_desc *d = e->dev;
++    char name[96];
++    int v;
++
++    memset(r, 0, sizeof(*r));
++    // the driver changes its rate only between sessions, and someone may have set another since
++    if (devGet(d, "rate", &v) && v != (int)e->rate && (!devSet(d, "rate", (int)e->rate)))
++        fprintf(stderr, "coreaudiod: %s runs at %d Hz and cannot be set to %u now\n", e->info.name, v, e->rate);
++    if ((r->fd = open(devPath(d), O_WRONLY)) < 0)
++        return false;
++    snprintf(name, sizeof(name), "%s.fifo_frames", d->sysctl);
++    r->fifoMibLen = CTL_MAXNAME;
++    r->paced = sysctlnametomib(name, r->fifoMib, &r->fifoMibLen) == 0;
++    r->opened = r->moved = mach_absolute_time();
++    devSetRunning(e, true);
++    fprintf(stderr, "coreaudiod: %s: opened %s at %u Hz, %s\n", e->info.name, devPath(d), e->rate,
++            r->paced ? "paced by the driver's queue" : "paced by the host clock");
++    return true;
++}
++
++static void devStats(struct engine *e, struct dev_run *r, const char *when)
++{
++    fprintf(stderr, "coreaudiod: %s: %s after %.1f s: %llu periods (%llu frames) written; periods by clients mixed "
++            "0:%u 1:%u 2:%u 3+:%u, most at once %u; %u underruns\n", e->info.name, when,
++            (mach_absolute_time() - r->opened) / (e->ticksPerFrame * e->rate), (unsigned long long)r->periods,
++            (unsigned long long)r->periods * PERIOD_FRAMES, r->byClients[0], r->byClients[1], r->byClients[2],
++            r->byClients[3], r->mostClients, r->underruns);
++}
++
++static void devClose(struct engine *e, struct dev_run *r)
++{
++    close(r->fd);
++    devSetRunning(e, false);
++    devStats(e, r, "closed");
++}
++
++// frames written that the driver has not taken yet
++static uint32_t devQueued(struct dev_run *r)
++{
++    int v = 0;
++    size_t size = sizeof(v);
++
++    sysctl(r->fifoMib, (u_int)r->fifoMibLen, &v, &size, NULL, 0);
++    return v > 0 ? (uint32_t)v : 0;
++}
++
++static bool devWrite(int fd, const void *data, size_t size)
++{
++    const uint8_t *p = data;
++
++    while (size > 0) {
++        ssize_t n = write(fd, p, size);
++        if (n < 0 && errno == EINTR)
++            continue;
++        if (n <= 0)
++            return false;
++        p += n;
++        size -= (size_t)n;
++    }
++    return true;
++}
++
++// mixes and writes periods while a client plays and for a while after the last one, then returns
++static void devRun(struct engine *e, struct dev_run *r)
++{
++    int16_t out[PERIOD_FRAMES * 2];
++    uint64_t idleSince = r->opened, statsAt = r->opened + devTicks(e, DEV_STATS_SECONDS * 1000);
++
++    for (;;) {
++        uint64_t now = mach_absolute_time();
++        uint32_t queued = 0;
++
++        pthread_mutex_lock(&sLock);
++        bool playing = anyPlaying(e), gone = e->gone;
++        pthread_mutex_unlock(&sLock);
++        if (gone)
++            return;
++        if (!playing) {
++            // the driver plays silence by itself while its queue is empty
++            if (r->fed)
++                idleSince = now;
++            r->fed = false;
++            r->run = 0;
++            r->nextTime = 0;
++            if (now - idleSince > devTicks(e, DEV_LINGER_SECONDS * 1000))
++                return;
++            usleep(10000);
++            continue;
++        }
++
++        if (r->paced) {
++            // a driver that is starting keeps its queue until it plays, which holds the clients meanwhile
++            queued = devQueued(r);
++            if (queued != r->lastQueued)
++                r->moved = now;
++            r->lastQueued = queued;
++            if (queued + PERIOD_FRAMES > DEV_QUEUE_FRAMES) {
++                if (now - r->moved > devTicks(e, DEV_STALL_MS)) {
++                    fprintf(stderr, "coreaudiod: %s stopped taking frames\n", e->info.name);
++                    r->failed = true;
++                    return;
++                }
++                usleep(2000);
++                continue;
++            }
++            // an empty queue once the start is behind: the driver played silence where frames were due
++            if (queued == 0 && r->fed && r->run > 4 * DEV_QUEUE_FRAMES && r->underruns++ < 8)
++                fprintf(stderr, "coreaudiod: %s ran out of frames\n", e->info.name);
++        } else {
++            if (r->nextTime == 0 || now > r->nextTime + devTicks(e, 100))
++                r->nextTime = now;
++            if (now < r->nextTime)
++                mach_wait_until(r->nextTime);
++            r->nextTime += (uint64_t)(e->ticksPerFrame * PERIOD_FRAMES);
++        }
++
++        pthread_mutex_lock(&sLock);
++        uint32_t clients = devPlayingClients(e);
++        e->devHostTime = mach_absolute_time() + (uint64_t)((queued + PERIOD_FRAMES + DEV_OUTPUT_FRAMES) * e->ticksPerFrame);
++        mixClients(e, 0);
++        pthread_mutex_unlock(&sLock);
++
++        const float *mix = e->mix->fData;
++        for (uint32_t i = 0; i < PERIOD_FRAMES * 2; i++) {
++            float x = mix[i] * 32767.0f;
++            x = x > 32767.0f ? 32767.0f : x < -32767.0f ? -32767.0f : x;
++            out[i] = (int16_t)(x < 0 ? x - 0.5f : x + 0.5f);
++        }
++        // the driver refuses frames once it has shut its output down
++        if (!devWrite(r->fd, out, sizeof(out))) {
++            fprintf(stderr, "coreaudiod: writing to %s failed: %s\n", devPath(e->dev), strerror(errno));
++            r->failed = true;
++            return;
++        }
++        r->fed = true;
++        r->run += PERIOD_FRAMES;
++        r->periods++;
++        r->byClients[clients < 3 ? clients : 3]++;
++        if (clients > r->mostClients)
++            r->mostClients = clients;
++        if (clients != r->clients) {
++            fprintf(stderr, "coreaudiod: %s: mixing %u client%s\n", e->info.name, clients, clients == 1 ? "" : "s");
++            r->clients = clients;
++        }
++        if (now >= statsAt) {
++            devStats(e, r, "open");
++            statsAt = now + devTicks(e, DEV_STATS_SECONDS * 1000);
++        }
++    }
++}
++
++// the node is open from the first client that plays until some seconds after the last. A node that cannot be
++// opened or written is left alone for a while: its driver may have shut the output down
++static void *devThread(void *arg)
++{
++    struct engine *e = arg;
++    struct dev_run r;
++    int lastError = 0;
++
++    for (;;) {
++        pthread_mutex_lock(&sLock);
++        bool playing = anyPlaying(e), gone = e->gone;
++        pthread_mutex_unlock(&sLock);
++        if (gone)
++            return NULL;
++        if (!playing) {
++            usleep(10000);
++            continue;
++        }
++        if (!devOpen(e, &r)) {
++            if (errno != lastError)
++                fprintf(stderr, "coreaudiod: opening %s failed: %s\n", devPath(e->dev), strerror(errno));
++            lastError = errno;
++            sleep(DEV_RETRY_SECONDS);
++            continue;
++        }
++        lastError = 0;
++        devRun(e, &r);
++        devClose(e, &r);
++        if (r.failed)
++            sleep(DEV_RETRY_SECONDS);
++    }
++    return NULL;
++}
++
++// an engine for every node of the table that is there, on a machine without an IOAudioEngine
++static bool devScanLocked(void)
++{
++    bool added = false;
++
++    for (int j = 0; j < kSFAudioMaxDevices; j++) {
++        if (sEngines[j].used && !sEngines[j].dev)
++            return false;
++    }
++    for (size_t i = 0; i < sizeof(sDevTable) / sizeof(sDevTable[0]); i++) {
++        const struct dev_desc *d = &sDevTable[i];
++        struct engine *e = NULL;
++        vm_address_t mix = 0;
++        bool have = false;
++        int v;
++
++        for (int j = 0; j < kSFAudioMaxDevices; j++) {
++            if (sEngines[j].used && sEngines[j].dev == d)
++                have = true;
++            if (!sEngines[j].used && !e)
++                e = &sEngines[j];
++        }
++        if (have || !e || !devAvailable(d))
++            continue;
++
++        memset(e, 0, sizeof(*e));
++        e->mixSize = round_page(sizeof(buffer_descriptor) + (size_t)PERIOD_FRAMES * 2 * sizeof(float));
++        if (vm_allocate(mach_task_self(), &mix, e->mixSize, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
++            continue;
++        e->mix = (buffer_descriptor *)mix;
++        e->dev = d;
++        e->channels = 2;
++        // the device runs at one rate, clients at another are converted
++        e->rate = DEV_RATE;
++        if (devGet(d, "rate", &v) && v != DEV_RATE && !devSet(d, "rate", DEV_RATE) && v > 0)
++            e->rate = (uint32_t)v;
++
++        mach_timebase_info_data_t tb;
++        mach_timebase_info(&tb);
++        e->ticksPerFrame = 1e9 / e->rate * tb.denom / tb.numer;
++
++        strlcpy(e->info.uid, d->uid, sizeof(e->info.uid));
++        strlcpy(e->info.name, d->name, sizeof(e->info.name));
++        strlcpy(e->info.manufacturer, "SiliconForest", sizeof(e->info.manufacturer));
++        e->info.flags = kSFAudioDeviceHasOutput;
++        e->info.sampleRate = e->rate;
++        e->info.outputChannels = e->channels;
++        e->info.latencyFrames = DEV_QUEUE_FRAMES + DEV_OUTPUT_FRAMES;
++        e->info.volume = DEV_SOFT_VOLUME;
++        if (d->hardwareVolume) {
++            e->info.flags |= kSFAudioDeviceHardwareVolume | kSFAudioDeviceHardwareMute;
++            // the level the driver has now, so starting the server changes nothing that can be heard
++            if (devGet(d, "volume_db", &v))
++                e->info.volume = 1.0f - (float)(v > DEV_RANGE_DB ? DEV_RANGE_DB : v) / DEV_RANGE_DB;
++        }
++        e->info.id = idForUID(e->info.uid);
++
++        CFMutableDictionaryRef p = devicePrefs(e->info.uid, false);
++        CFNumberRef vol = p ? CFDictionaryGetValue(p, CFSTR("Volume")) : NULL;
++        CFBooleanRef mute = p ? CFDictionaryGetValue(p, CFSTR("Mute")) : NULL;
++        if (vol && CFGetTypeID(vol) == CFNumberGetTypeID())
++            CFNumberGetValue(vol, kCFNumberFloat32Type, &e->info.volume);
++        if (mute && CFGetTypeID(mute) == CFBooleanGetTypeID())
++            e->info.mute = CFBooleanGetValue(mute);
++        e->used = true;
++        fprintf(stderr, "coreaudiod: %s (%s) on %s at %u Hz, 2 channels, %s volume\n", e->info.name, e->info.uid, devPath(d),
++                e->rate, d->hardwareVolume ? "hardware" : "software");
++        applyVolume(e);
++        startIOThread(e);
++        added = true;
++    }
++    if (added) {
++        uint32_t what = kSFAudioChangedDevices;
++        if (chooseDefaultsLocked())
++            what |= kSFAudioChangedDefaults;
++        broadcastLocked(what);
++        pthread_cond_broadcast(&sClientsChanged);
++    }
++    return added;
++}
++
++// what is in the jack: 0 nothing, above 0 a plug, below 0 not known
++static int devJack(void)
++{
++    // a file with the number stands in for the driver's sysctl, to try the switch without a plug
++    const char *file = getenv("COREAUDIOD_JACK_FILE");
++    int jack = -1;
++
++    if (file && file[0]) {
++        FILE *f = fopen(file, "r");
++        if (f) {
++            if (fscanf(f, "%d", &jack) != 1)
++                jack = -1;
++            fclose(f);
++        }
++        return jack;
++    }
++    for (size_t i = 0; i < sizeof(sDevTable) / sizeof(sDevTable[0]); i++) {
++        if (sDevTable[i].route == kDevJackPlugged && devGet(&sDevTable[i], "jack", &jack))
++            return jack;
++    }
++    return -1;
++}
++
++// the default output follows the jack: the device for a plug while one is in, the device for none otherwise, each
++// when it is there. Clients on the default move with it at their next period and keep their rings
++static void devRouteLocked(int jack)
++{
++    int want = jack > 0 ? kDevJackPlugged : kDevJackEmpty;
++    struct engine *target = NULL;
++
++    if (jack < 0)
++        return;
++    for (int i = 0; i < kSFAudioMaxDevices && !target; i++) {
++        if (sEngines[i].used && !sEngines[i].gone && sEngines[i].dev && sEngines[i].dev->route == want)
++            target = &sEngines[i];
++    }
++    if (!target || (sDefaultOutput == target->info.id && sDefaultSystemOutput == target->info.id))
++        return;
++    setPrefUID(CFSTR("DefaultOutput"), target->info.uid);
++    setPrefUID(CFSTR("DefaultSystemOutput"), target->info.uid);
++    if (chooseDefaultsLocked())
++        broadcastLocked(kSFAudioChangedDefaults);
++    pthread_cond_broadcast(&sClientsChanged);
++    fprintf(stderr, "coreaudiod: jack %d: the default output is %s\n", jack, target->info.name);
++}
++
++// a device whose node went away or whose driver gave up leaves the table; its clients on the default move on
++static bool devDropLocked(void)
++{
++    struct engine *dropped[kSFAudioMaxDevices];
++    int n = 0;
++
++    for (int i = 0; i < kSFAudioMaxDevices; i++) {
++        struct engine *e = &sEngines[i];
++        if (e->used && e->dev && !e->gone && !devAvailable(e->dev)) {
++            fprintf(stderr, "coreaudiod: %s went away\n", e->info.name);
++            e->gone = true;
++            dropped[n++] = e;
++        }
++    }
++    if (n == 0)
++        return false;
++    uint32_t what = kSFAudioChangedDevices;
++    if (chooseDefaultsLocked())
++        what |= kSFAudioChangedDefaults;
++    broadcastLocked(what);
++    pthread_cond_broadcast(&sClientsChanged);
++    pthread_mutex_unlock(&sLock);
++    for (int i = 0; i < n; i++) {
++        if (dropped[i]->threadUp)
++            pthread_join(dropped[i]->thread, NULL);
++    }
++    pthread_mutex_lock(&sLock);
++    for (int i = 0; i < n; i++)
++        closeEngine(dropped[i]);
++    return true;
++}
++
++static void *devPollThread(void *arg)
++{
++    int jack = -2;
++
++    (void)arg;
++    for (;;) {
++        pthread_mutex_lock(&sLock);
++        bool changed = devDropLocked();
++        changed |= devScanLocked();
++        int now = devJack();
++        if (changed || now != jack)
++            devRouteLocked(now);
++        jack = now;
++        pthread_mutex_unlock(&sLock);
++        usleep(200000);
++    }
++    return NULL;
+ }
+ 
+ static void closeEngine(struct engine *e)
+@@ -1029,6 +1561,8 @@
+ int main(void)
+ {
+     mach_port_t service;
++
++    setvbuf(stderr, NULL, _IOLBF, 0);
+     io_iterator_t arrived, terminated;
+     union {
+         mach_msg_header_t header;
+@@ -1054,8 +1588,16 @@
+     IOServiceAddMatchingNotification(ioPort, kIOFirstMatchNotification, IOServiceMatching("IOAudioEngine"), enginesMatched,
+                                      (void *)1, &arrived);
+     enginesMatched((void *)1, arrived);
++    // the device nodes of a driver outside IOAudioFamily are looked for from now on, and the jack followed
++    pthread_t poll;
++    pthread_mutex_lock(&sLock);
++    devScanLocked();
++    pthread_mutex_unlock(&sLock);
++    if (pthread_create(&poll, NULL, devPollThread, NULL) == 0)
++        pthread_detach(poll);
+     if (!sDefaultOutput)
+-        fprintf(stderr, "coreaudiod: no IOAudioEngine yet, waiting for one\n");
++        fprintf(stderr, "coreaudiod: no IOAudioEngine and no audio device node yet, waiting for one\n");
++    fprintf(stderr, "coreaudiod: serving %s\n", kSFAudioServerName);
+ 
+     for (;;) {
+         if (mach_msg(&msg.header, MACH_RCV_MSG, 0, sizeof(msg), sNotifyPort, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL) !=

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SOURCE_REVIEW_NO_HARDWARE",
+  "reviewed": {
+    "pty-smoke.c": "917e9a064189d1b8",
+    "transcript.c": "70b006a9caa7184b",
+    "transcript.h": "29cf05d0cab7499c",
+    "host-test.c": "e7c4b0275517d582",
+    "receipt": "reports/sprint-010/pty-smoke-source.json"
+  },
+  "verdict": "CHANGES REQUESTED before a guest run: F1 and F2 (both also raised by root) plus F3, a staging binding. The session/cleanup design and the parser are sound. Re-review the next freeze as a diff against 917e9a06.",
+  "verified": [
+    "PTY setup: openpty(m, s, NULL, NULL, NULL), so there is no unbounded name copy. Both fds are moved to >= 3 with FD_CLOEXEC. Checked tcsetattr(TCSANOW) sets ICRNL, OPOST|ONLCR, ISIG|ICANON|ECHO|ECHOE, VEOF/VERASE/VINTR, with ISIG|ICANON read back. 80x24 TIOCSWINSZ is read back with TIOCGWINSZ. Only the master is non-blocking. The status pipe is CLOEXEC with a non-blocking read end.",
+    "Child (async-signal-safe after fork: no stdio, no malloc): clears the signal mask and sets HUP/INT/QUIT/TERM/TSTP/TTIN/TTOU/WINCH/PIPE to SIG_DFL. Then setsid, TIOCSCTTY on the inherited O_NOCTTY slave, dup2 to 0/1/2 (dup2 clears CLOEXEC on the targets), and closes the original slave. Postconditions: isatty(0), getsid(0)==getpid, getpgrp==getpid, tcgetpgrp(0)==getpgrp. It writes 'SETUP 0 0 1', then execve('/bin/sh', {'sh','-c',script}) with env TERM=dumb, PATH, HOME=/var/empty, HISTFILE=/dev/null, SAVEHIST=0, LANG=C and no ENV, which suits zsh sh-emulation (T1). Every failure writes a staged errno record and _exit(126/127).",
+    "Ownership: before a record with setsid_ok, only kill(child) is used; after it, kill(-child). There is never kill(0) or kill(-1), and signal_owned refuses once reaped. Cleanup: SIGTERM, drain-and-reap for 1 s, SIGKILL, drain-and-reap for 1 s. 'child_still_live' sets failure 'cleanup'. Master close is not used as the shutdown path. PASS requires cleanup == 'reaped' (no signals sent), setup_ok, adjacency, a normal exit with code 0, and no joined nonce in TX or the script.",
+    "Echo resistance and parser: TX is half + LF + half + LF and is checked not to contain the joined 48 characters; the fixed script contains neither half. Canonical-mode echo of the halves appears when the input is written, before the shell runs, and never contains the joined 48. adjacent_uname needs four adjacent complete lines (joined nonce, 'Darwin', 'arm64', a release token of at most 64 [A-Za-z0-9._+-] characters containing a digit), strips one CR per line and ignores a partial tail. A host 'Linux' fails.",
+    "Host test re-run here (scratch build, cc -std=c11 -Wall -Wextra -Werror): HOST_ONLY, 0 failures. That covers the parser negatives (echo-only, gap, swapped, prompt, Linux, unterminated) and the Linux PTY control. It is not Darwin evidence."
+  ],
+  "findings": [
+    {"id": "F1", "severity": "required (evidence)", "text": "Only the in-guest verdict is printed, so a PASS cannot be audited independently. Emit the exact bounded RX (and TX) as hex after the JSON. Hex also keeps the joined ASCII nonce from appearing on the console through the dump itself, so host-side checks can still attribute it to the shell."},
+    {"id": "F2", "severity": "required (fail-safety)", "text": "drain_master reads until EAGAIN, and once at OUT_CAP it keeps reading and discarding ('continue'). A child writing continuously would keep the parent in that loop forever: the 10 s deadline is never re-checked, and inside reap_for the SIGTERM->SIGKILL escalation is never reached. Bound each drain call (by bytes or iterations) and fail immediately on cap (the cap always disqualifies), so control returns to the deadline/cleanup logic. The fixed script cannot flood, but the stated contract requires this."},
+    {"id": "F3", "severity": "required (staging binding)", "text": "On the old libSystem (432c7369), every uname printed two 'malloc: *** can't mvm_protect' lines to stderr, which is the PTY here. Those lines would sit between Darwin/arm64/release and break adjacency, giving a spurious FAIL. Stage the smoke only into a RAM derived from candidate-006 (038f14ae, libSystem 8ff49e0c, where attempt-006 shows 0 warnings), and bind that in the packet."},
+    {"id": "N1", "severity": "low", "text": "The child does not close inherited unrelated fds (a plan item). Non-CLOEXEC fds from the guest launcher above 2 reach the shell. Close 3..maxfd except status_w, using a bound computed before fork, or record why not."},
+    {"id": "N2", "severity": "low", "text": "If the launcher passes SIGCHLD as SIG_IGN, children are auto-reaped and waitpid gives ECHILD. reap_now then records 'reaped' without a status, which fails safe as child_status but is misleading. Set SIGCHLD to SIG_DFL in the parent before fork."},
+    {"id": "N3", "severity": "low (evidence)", "text": "setup_ok is set on 'SETUP 0', before exec. Record the exec boundary (status-pipe EOF with no stage-5 record) as its own JSON field, so exec success is shown directly rather than only implied by the shell output."}
+  ],
+  "not_claimed": ["PTY runtime on Darwin", "SDK build", "terminal", "input"],
+  "scope": "Read-only source review plus the host test built and run in scratch. No SDK build or hardware."
+}

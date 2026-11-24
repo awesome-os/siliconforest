@@ -1,0 +1,22 @@
+--- a/src/Kernel/Extensions/ext4/ext4_vnops.c
++++ b/src/Kernel/Extensions/ext4/ext4_vnops.c
+@@ -2241,6 +2241,19 @@
+ 	lblk = (uint32_t)(ap->a_foffset / bs);
+ 	boff = (uint32_t)(ap->a_foffset % bs);
+ 	bytes = ap->a_size ? ap->a_size : bs;
++	if (ap->a_flags & VNODE_WRITE) {
++		uint64_t limit = ext4_pageout_limit(ep);
++
++		if (ep->e_freed)
++			return ENOENT;
++		if ((uint64_t)ap->a_foffset >= limit)
++			return EINVAL;
++		/* cluster_io rounds the request to PAGE_SIZE. Allocate only
++		 * the fs blocks containing actual file data (or the active
++		 * extending write); a_run lets it stop after the valid tail. */
++		if ((uint64_t)bytes > limit - (uint64_t)ap->a_foffset)
++			bytes = (size_t)(limit - (uint64_t)ap->a_foffset);
++	}
+ 	want_blocks = (uint32_t)((boff + bytes + bs - 1) / bs);
+ 
+ 	error = ext4_bmap_run(emp, ep->e_ino, &ep->e_raw, lblk, want_blocks, &pblk, &run, &unwritten);

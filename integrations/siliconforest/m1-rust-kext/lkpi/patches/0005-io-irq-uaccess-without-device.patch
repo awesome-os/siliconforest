@@ -1,0 +1,84 @@
+kernel: io, irq and uaccess without the device model
+
+The device/devres modules are replaced separately (thin modules over the IOKit nub), so the
+parts of io, irq and uaccess that are written against them, or against dma and fs, are
+compiled only with those modules:
+  io::mem (IoMem/IoRequest are Devres-managed)      sf_mod_device
+  irq::request (registrations are Devres-managed)   sf_mod_device
+  UserSliceWriter::write_dma                        sf_mod_dma
+  UserSlice{Reader,Writer}::{read,write}_slice_file sf_mod_fs
+What remains is the register access (Io, Mmio, the io_read!/io_write! macros, polling),
+io::Resource/Region, irq::Flags and the user-copy types.
+
+--- a/kernel/io.rs
++++ b/kernel/io.rs
+@@ -18,7 +18,7 @@
+     }, //
+ };
+ 
+-#[cfg(CONFIG_HAS_IOMEM)]
++#[cfg(all(CONFIG_HAS_IOMEM, sf_mod_device))]
+ pub mod mem;
+ pub mod poll;
+ pub mod register;
+--- a/kernel/irq.rs
++++ b/kernel/irq.rs
+@@ -13,11 +13,13 @@
+ /// Flags to be used when registering IRQ handlers.
+ mod flags;
+ 
++#[cfg(sf_mod_device)]
+ /// IRQ allocation and handling.
+ mod request;
+ 
+ pub use flags::Flags;
+ 
++#[cfg(sf_mod_device)]
+ pub use request::{
+     Handler, IrqRequest, IrqReturn, Registration, ThreadedHandler, ThreadedIrqReturn,
+     ThreadedRegistration,
+--- a/kernel/uaccess.rs
++++ b/kernel/uaccess.rs
+@@ -7,14 +7,16 @@
+ use crate::{
+     alloc::{Allocator, Flags},
+     bindings,
+-    dma::Coherent,
+     error::Result,
+     ffi::{c_char, c_void},
+-    fs::file,
+     prelude::*,
+     ptr::KnownSize,
+     transmute::{AsBytes, FromBytes},
+ };
++#[cfg(sf_mod_fs)]
++use crate::fs::file;
++#[cfg(sf_mod_dma)]
++use crate::dma::Coherent;
+ use core::mem::{size_of, MaybeUninit};
+ 
+ /// A pointer into userspace.
+@@ -307,6 +309,7 @@
+         Ok(dst.len())
+     }
+ 
++    #[cfg(sf_mod_fs)]
+     /// Reads raw data from the user slice into a kernel buffer partially.
+     ///
+     /// This is the same as [`Self::read_slice_partial`] but updates the given [`file::Offset`] by
+@@ -493,6 +496,7 @@
+         unsafe { self.write_raw(data.as_ptr(), data.len()) }
+     }
+ 
++    #[cfg(sf_mod_dma)]
+     /// Writes raw data to this user pointer from a DMA coherent allocation.
+     ///
+     /// Copies `count` bytes from `alloc` starting from `offset` into this userspace slice.
+@@ -569,6 +573,7 @@
+         Ok(src.len())
+     }
+ 
++    #[cfg(sf_mod_fs)]
+     /// Writes raw data to this user pointer from a kernel buffer partially.
+     ///
+     /// This is the same as [`Self::write_slice_partial`] but updates the given [`file::Offset`] by

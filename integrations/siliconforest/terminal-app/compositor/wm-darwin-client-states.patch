@@ -1,0 +1,328 @@
+diff --git a/crates/wm-darwin/src/gesture.rs b/crates/wm-darwin/src/gesture.rs
+new file mode 100644
+index 0000000..350d916
+--- /dev/null
++++ b/crates/wm-darwin/src/gesture.rs
+@@ -0,0 +1,9 @@
++//! Multi-finger swipes on the desktop (see `crate::hid::Event::Swipe`).
++use crate::hid::SwipePhase;
++use crate::server::Server;
++
++impl Server {
++    pub(crate) fn swipe(&mut self, phase: SwipePhase, fingers: u8, dx: i16, dy: i16, _time: u32) {
++        eprintln!("WMGESTURE swipe phase={phase:?} fingers={fingers} dx={dx} dy={dy} handled=no");
++    }
++}
+diff --git a/crates/wm-darwin/src/hid.rs b/crates/wm-darwin/src/hid.rs
+index 7d1cf0a..5f1aee4 100644
+--- a/crates/wm-darwin/src/hid.rs
++++ b/crates/wm-darwin/src/hid.rs
+@@ -8,7 +8,18 @@ pub enum Motion { Relative(i8,i8), Absolute(u16,u16) }
+ pub enum Event {
+     Key { evdev:u32, down:bool },
+     Pointer { motion:Motion, buttons:u8, wheel:i8 },
++    /// A horizontal wheel step (positive: to the right), as a tilt wheel or AC Pan gives it.
++    HWheel(i8),
++    /// Continuous scrolling from fingers (a multitouch surface's two-finger scroll), in
++    /// logical units as wl_pointer.axis counts them (positive: down, right); `stop` when the
++    /// fingers leave. Not a SFHID pointer record: the record has one vertical wheel byte.
++    Scroll { dx:i16, dy:i16, stop:bool },
++    /// A multi-finger swipe (see `crate::gesture`): begin, update by (dx, dy) panel pixels, end
++    /// or cancel. Not a SFHID pointer record either.
++    Swipe { phase:SwipePhase, fingers:u8, dx:i16, dy:i16 },
+ }
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum SwipePhase { Begin, Update, End, Cancel }
+ #[derive(Default)]
+ pub struct Decoder {
+     keyboard_sequence:Option<u32>, mouse_sequence:Option<u32>,
+diff --git a/crates/wm-darwin/src/inject.rs b/crates/wm-darwin/src/inject.rs
+index 85c5157..6c0cf5b 100644
+--- a/crates/wm-darwin/src/inject.rs
++++ b/crates/wm-darwin/src/inject.rs
+@@ -10,7 +10,13 @@
+ //! abs <x> <y>                      the pointer to that place, 0..65535 of the screen each way
+ //! rel <dx> <dy>                    the pointer moved, -127..127
+ //! buttons <mask>                   the pointer's buttons (1 left, 2 right, 4 middle)
+-//! wheel <n>                        the wheel, -127..127
++//! wheel <n>                        the wheel, -127..127 (positive: up, as the HID wheel byte)
++//! hwheel <n>                       a horizontal wheel step, -127..127 (positive: right)
++//! scroll <dx> <dy>                 finger scrolling (axis source finger), logical units, -32768..32767
++//!                                  (positive: down, right); `scroll stop` lifts the fingers
++//! swipe begin|update|end|cancel <fingers> <dx> <dy>
++//!                                  a multi-finger swipe as a multitouch surface would report it
++//!                                  (2..5 fingers, dx dy in panel pixels); synthetic like the rest
+ //! wait <milliseconds>              nothing for that long (at most 10 s)
+ //! capture <name>                   the frame as it was last rendered, to <name>.ppm in the directory
+ //!                                  (an error after 2 s without one: the display sleeps until a key)
+@@ -22,7 +28,7 @@
+ //! Everything here is synthetic and labelled so (`WMINJECT ... input=synthetic-inject`);
+ //! nothing of it is evidence of a physical keyboard or trackpad. Without the variable the
+ //! compositor does none of this.
+-use crate::hid::{usage_to_evdev, Event, Motion};
++use crate::hid::{usage_to_evdev, Event, Motion, SwipePhase};
+ use crate::server::Server;
+ use std::collections::VecDeque;
+ use std::path::PathBuf;
+@@ -73,6 +79,13 @@ impl Inject {
+                     Step::Event(Event::Pointer { motion: Motion::Relative(0, 0), buttons: mask, wheel: 0 })
+                 }),
+                 ["wheel", n] => n.parse::<i8>().ok().map(|wheel| Step::Event(Event::Pointer { motion: Motion::Relative(0, 0), buttons: self.buttons, wheel })),
++                ["hwheel", n] => n.parse::<i8>().ok().map(|n| Step::Event(Event::HWheel(n))),
++                ["scroll", "stop"] => Some(Step::Event(Event::Scroll { dx: 0, dy: 0, stop: true })),
++                ["scroll", x, y] => x.parse::<i16>().ok().zip(y.parse::<i16>().ok()).map(|(dx, dy)| Step::Event(Event::Scroll { dx, dy, stop: false })),
++                ["swipe", phase @ ("begin" | "update" | "end" | "cancel"), fingers, x, y] => fingers.parse::<u8>().ok().filter(|f| (2..=5).contains(f)).zip(x.parse::<i16>().ok().zip(y.parse::<i16>().ok())).map(|(fingers, (dx, dy))| {
++                    let phase = match *phase { "begin" => SwipePhase::Begin, "update" => SwipePhase::Update, "end" => SwipePhase::End, _ => SwipePhase::Cancel };
++                    Step::Event(Event::Swipe { phase, fingers, dx, dy })
++                }),
+                 ["wait", ms] => ms.parse::<u64>().ok().filter(|ms| *ms <= 10_000).map(|ms| Step::Wait(Duration::from_millis(ms))),
+                 ["capture", name] if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_') => Some(Step::Capture((*name).to_string())),
+                 _ => None,
+diff --git a/crates/wm-darwin/src/input.rs b/crates/wm-darwin/src/input.rs
+index 5f3bc73..47aa06a 100644
+--- a/crates/wm-darwin/src/input.rs
++++ b/crates/wm-darwin/src/input.rs
+@@ -294,6 +294,28 @@ impl Server {
+                 if wheel!=0 && !self.wm.interactive_drag_active(){pointer.axis(self,AxisFrame::new(time).source(AxisSource::Wheel).value(Axis::Vertical,-f64::from(wheel)*10.).v120(Axis::Vertical,-i32::from(wheel)*120));}
+                 pointer.frame(self);
+             }
++            // Scrolling goes where the pointer is (the surface that has the pointer's focus).
++            Event::HWheel(steps)=>{
++                let pointer=self.input.as_ref().unwrap().pointer.clone().ok_or("scroll event rejected; seat has no pointer")?;
++                if steps!=0 && !self.wm.interactive_drag_active(){
++                    pointer.axis(self,AxisFrame::new(time).source(AxisSource::Wheel).value(Axis::Horizontal,f64::from(steps)*10.).v120(Axis::Horizontal,i32::from(steps)*120));
++                    pointer.frame(self);
++                }
++            }
++            Event::Scroll{dx,dy,stop}=>{
++                let pointer=self.input.as_ref().unwrap().pointer.clone().ok_or("scroll event rejected; seat has no pointer")?;
++                if !self.wm.interactive_drag_active(){
++                    let mut frame=AxisFrame::new(time).source(AxisSource::Finger);
++                    if dx!=0 {frame=frame.value(Axis::Horizontal,f64::from(dx));}
++                    if dy!=0 {frame=frame.value(Axis::Vertical,f64::from(dy));}
++                    if stop {frame=frame.stop(Axis::Horizontal).stop(Axis::Vertical);}
++                    pointer.axis(self,frame);
++                    pointer.frame(self);
++                }
++            }
++            Event::Swipe{phase,fingers,dx,dy}=>{
++                self.swipe(phase,fingers,dx,dy,time);
++            }
+         }
+         #[cfg(feature = "desktop-shell")]
+         self.service_desktop()?;
+diff --git a/crates/wm-darwin/src/lib.rs b/crates/wm-darwin/src/lib.rs
+index 94aaef8..2de0398 100644
+--- a/crates/wm-darwin/src/lib.rs
++++ b/crates/wm-darwin/src/lib.rs
+@@ -11,6 +11,7 @@ pub mod desktop;
+ #[cfg(feature = "desktop-shell")]
+ pub mod desktop_entry;
+ pub mod glrender;
++mod gesture;
+ pub mod gpu;
+ pub mod hid;
+ #[cfg(all(feature = "desktop-shell", feature = "test-inject"))]
+diff --git a/crates/wm-darwin/src/power.rs b/crates/wm-darwin/src/power.rs
+index d337105..3f9f421 100644
+--- a/crates/wm-darwin/src/power.rs
++++ b/crates/wm-darwin/src/power.rs
+@@ -255,6 +255,14 @@ impl Power {
+                 }
+                 Filtered::Pass
+             }
++            Event::HWheel(_) | Event::Scroll { .. } | Event::Swipe { .. } => {
++                if self.off {
++                    self.wake_requested = true;
++                    self.counts.swallowed += 1;
++                    return Filtered::Wake;
++                }
++                Filtered::Pass
++            }
+         }
+     }
+ }
+diff --git a/crates/wm-darwin/src/scene.rs b/crates/wm-darwin/src/scene.rs
+index e2281d3..d7e3794 100644
+--- a/crates/wm-darwin/src/scene.rs
++++ b/crates/wm-darwin/src/scene.rs
+@@ -42,6 +42,10 @@ pub struct Window {
+     /// going up and down the scales loses nothing. Both are forgotten when
+     /// a person resizes the window.
+     pub(crate) shrunk: bool,
++    /// Maximize/fullscreen requests a client made before its window was
++    /// mapped: carried out when it maps (the initial configure has no
++    /// policy behind it yet).
++    pub(crate) early_states: Vec<(wm_core::NetStateAction, wm_core::NetState, Option<wm_core::NetState>)>,
+ }
+ struct Frame {
+     window: u64,
+@@ -128,6 +132,10 @@ pub struct CpuBackend {
+     /// Windows are being given their size at a new display scale: the policy
+     /// sets sizes, and the scale change itself decides which clients to ask.
+     pub(crate) rescaling: bool,
++    /// A client's own state request is being decided: sizes and states the
++    /// policy gives are only made pending, and the server sends each touched
++    /// window one configure afterwards (the request's owed reply included).
++    pub(crate) hold_configures: bool,
+ }
+ impl CpuBackend {
+     pub fn new(size: Size) -> Result<Self, String> {
+@@ -151,6 +159,7 @@ impl CpuBackend {
+             scale: crate::scale::Scale::ONE,
+             interactive: false,
+             rescaling: false,
++            hold_configures: false,
+             monitors: vec![MonitorInfo {
+                 geometry: Rect::new(Point::new(0, 0), size),
+                 name: "SFGOP-0".into(),
+@@ -465,6 +474,7 @@ impl CpuBackend {
+                 unscaled: false,
+                 sizes_by_scale: Vec::new(),
+                 shrunk: false,
++                early_states: Vec::new(),
+             },
+         );
+         self.stack.push(id);
+@@ -749,7 +759,9 @@ impl Backend for CpuBackend {
+             }
+             w.surface
+                 .with_pending_state(|s| s.size = Some((logical.w as i32, logical.h as i32).into()));
+-            w.surface.send_pending_configure();
++            if !self.hold_configures {
++                w.surface.send_pending_configure();
++            }
+         }
+         self.dirty = true;
+     }
+@@ -823,7 +835,9 @@ impl Backend for CpuBackend {
+                     s.states.unset(xdg_toplevel::State::Activated);
+                 }
+             });
+-            w.surface.send_pending_configure();
++            if !self.hold_configures {
++                w.surface.send_pending_configure();
++            }
+         }
+         self.dirty = true;
+     }
+@@ -849,7 +863,7 @@ impl Backend for CpuBackend {
+                 }
+             }
+         });
+-        if w.surface.is_initial_configure_sent() {
++        if w.surface.is_initial_configure_sent() && !self.hold_configures {
+             w.surface.send_pending_configure();
+         }
+     }
+diff --git a/crates/wm-darwin/src/server.rs b/crates/wm-darwin/src/server.rs
+index b93cd6e..f7e05cd 100644
+--- a/crates/wm-darwin/src/server.rs
++++ b/crates/wm-darwin/src/server.rs
+@@ -5,6 +5,7 @@ use smithay::reexports::wayland_server::{Client,Display,DisplayHandle,Resource,
+     backend::{ClientData,ClientId,DisconnectReason},
+     protocol::{wl_surface::{self,WlSurface},wl_buffer,wl_callback,wl_seat,wl_output}};
+ use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
++use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::{WmCapabilities, State as xdg_state};
+ use smithay::input::{Seat,SeatState,SeatHandler,pointer::CursorImageStatus};
+ use smithay::output::{Output,PhysicalProperties,Subpixel,Mode,Scale};
+ use smithay::utils::{Serial,Transform};
+@@ -193,7 +194,7 @@ impl Server {
+             #[cfg(feature = "desktop-shell")]
+             desktop: None,
+             compositor,
+-            shell: XdgShellState::new_with_capabilities::<Self>(dh, []),
++            shell: XdgShellState::new_with_capabilities::<Self>(dh, [WmCapabilities::Maximize, WmCapabilities::Fullscreen, WmCapabilities::Minimize]),
+             shm: ShmState::new::<Self>(dh, vec![]),
+             _decoration: XdgDecorationState::new::<Self>(dh),
+             output,
+@@ -1305,6 +1306,7 @@ impl CompositorHandler for Server {
+                     w.content.size = size;
+                     self.wm.dispatch(BackendEvent::MapRequest(id));
+                     self.output.enter(surface);
++                    self.apply_early_states(id);
+                 } else {
+                     // Fit the frame to a client that has caught up with the
+                     // last configure and still drew another size (a terminal
+@@ -1420,22 +1422,74 @@ impl XdgShellHandler for Server {
+     fn popup_destroyed(&mut self, surface: PopupSurface) {
+         self.popup_removed(surface.wl_surface());
+     }
+-    // No maximize/fullscreen capability is advertised. Refuse requests by responding
+-    // with the unchanged configure, never claiming that a mode was entered.
++    // A client's maximize and full screen requests go to the policy (wm-core) as the Linux
++    // backend sends them (`wm-wayland` protocols.rs): the same NetState request a frame button
++    // or a key makes. The reply the protocol owes is one configure with the policy's answer.
+     fn maximize_request(&mut self, s: ToplevelSurface) {
+-        s.send_configure();
++        self.client_state_request(&s, wm_core::NetStateAction::Add, wm_core::NetState::MaximizedHorz, Some(wm_core::NetState::MaximizedVert));
+     }
+     fn unmaximize_request(&mut self, s: ToplevelSurface) {
+-        s.send_configure();
++        self.client_state_request(&s, wm_core::NetStateAction::Remove, wm_core::NetState::MaximizedHorz, Some(wm_core::NetState::MaximizedVert));
+     }
++    // The output hint is dropped: there is one output.
+     fn fullscreen_request(&mut self, s: ToplevelSurface, _: Option<wl_output::WlOutput>) {
+-        s.send_configure();
++        self.client_state_request(&s, wm_core::NetStateAction::Add, wm_core::NetState::Fullscreen, None);
+     }
+     fn unfullscreen_request(&mut self, s: ToplevelSurface) {
++        self.client_state_request(&s, wm_core::NetStateAction::Remove, wm_core::NetState::Fullscreen, None);
++    }
++    // A client that draws its own minimize button (an AppKit window's yellow button,
++    // Command-M) asks for the same miniaturize the frame's button does.
++    fn minimize_request(&mut self, s: ToplevelSurface) {
++        if let Some(id) = self.wm.backend().window_for_surface(s.wl_surface()) {
++            if self.wm.backend().windows[&id].committed {
++                self.wm.dispatch(BackendEvent::MinimizeRequest(id));
++            }
++        }
++    }
++}
++
++impl Server {
++    /// A client's set/unset_maximized or set/unset_fullscreen. Before the window maps the request
++    /// is kept and carried out when it maps; after, the policy decides and every window it
++    /// touched gets one configure, the requester one in any case (a refusal is an answer too).
++    fn client_state_request(&mut self, s: &ToplevelSurface, action: wm_core::NetStateAction, first: wm_core::NetState, second: Option<wm_core::NetState>) {
++        let Some(id) = self.wm.backend().window_for_surface(s.wl_surface()) else {
++            return;
++        };
++        eprintln!("WMSTATE request window={id} action={action:?} state={first:?}{}", second.map(|s| format!("+{s:?}")).unwrap_or_default());
++        if !self.wm.backend().windows[&id].committed {
++            self.wm.backend_mut().windows.get_mut(&id).unwrap().early_states.push((action, first, second));
++            if s.is_initial_configure_sent() {
++                s.send_configure();
++            }
++            return;
++        }
++        self.decide_client_state(id, action, first, second);
+         s.send_configure();
+     }
+-    fn minimize_request(&mut self, _: ToplevelSurface) {
+-        eprintln!("unsupported: Darwin minimize without restore UI");
++    fn decide_client_state(&mut self, id: u64, action: wm_core::NetStateAction, first: wm_core::NetState, second: Option<wm_core::NetState>) {
++        self.wm.backend_mut().hold_configures = true;
++        self.wm.dispatch(BackendEvent::NetStateRequested { window: id, action, first, second });
++        self.wm.backend_mut().hold_configures = false;
++        for (other, w) in &self.wm.backend().windows {
++            if *other != id && w.surface.is_initial_configure_sent() {
++                w.surface.send_pending_configure();
++            }
++        }
++        let states = self.wm.backend().windows[&id].surface.with_pending_state(|p| (p.states.contains(xdg_state::Fullscreen), p.states.contains(xdg_state::Maximized), p.size));
++        eprintln!("WMSTATE decided window={id} fullscreen={} maximized={} size={:?}", states.0, states.1, states.2.map(|s| (s.w, s.h)));
++    }
++    /// Requests kept from before the window mapped (see `client_state_request`).
++    pub(crate) fn apply_early_states(&mut self, id: u64) {
++        let early = std::mem::take(&mut self.wm.backend_mut().windows.get_mut(&id).unwrap().early_states);
++        if early.is_empty() {
++            return;
++        }
++        for (action, first, second) in early {
++            self.decide_client_state(id, action, first, second);
++        }
++        self.wm.backend().windows[&id].surface.send_configure();
+     }
+ }
+ impl XdgDecorationHandler for Server {

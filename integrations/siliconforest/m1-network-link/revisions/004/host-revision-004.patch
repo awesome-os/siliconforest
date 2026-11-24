@@ -1,0 +1,201 @@
+--- a/integrations/puredarwin/m1-bringup/host_progress.py
++++ b/integrations/puredarwin/m1-bringup/host_progress.py
+@@ -41,7 +41,7 @@
+ from terminal_input_progress import TerminalInput
+ 
+ LINK_HELPER = 'integrations/puredarwin/m1-network-link/host/line_bridge.py'
+-LINK_HELPER_SHA = 'a65e3c1cc085336696d6e4bb134df2794417ed8cd528280849ceaf40afc3a23a'
++LINK_HELPER_SHA = '3213bd2f8e5e6f2c3f875ce90e8a6de006c5cc69473e0dbb6cd9aee3a16fe376'
+ image.require(image.sha(image.bounded_file(LAB/LINK_HELPER)) == LINK_HELPER_SHA,
+               'Network-link helper source changed')
+ link_spec = importlib.util.spec_from_file_location('darwin_link_bridge', LAB/LINK_HELPER)
+@@ -670,7 +670,7 @@
+     image.require(type(profile) is dict and set(profile) == keys,
+                   'Unknown network link profile fields')
+     image.require(type(profile['version']) is int and profile['version'] == 1 and
+-                  profile['transport'] == 'dlnet001_space_lf_v1' and
++                  profile['transport'] == 'dlnet001_space_lf_ack_v2' and
+                   type(profile['seconds']) is int and profile['seconds'] == 45 and
+                   type(profile['mtu']) is int and profile['mtu'] == 1500 and
+                   profile['host_alias'] == '10.0.2.2' and
+--- a/tools/m1_bringup_cycle.py
++++ b/tools/m1_bringup_cycle.py
+@@ -30,7 +30,7 @@
+ TERMINAL_HELPER_SHA = '2b8901e7c29357a3440c40e1db14f5e2416f38beb71af0fee7674cb05233568c'
+ CONTINUING_SOURCES = {'integrations/puredarwin/m1-bringup/bootstrap_progress.py': '52fdd9045d0f2d14d08b38577cd3bfca512b9eb6e083afc82fa7c081350c56d8', 'integrations/puredarwin/m1-bringup/bootargs_progress.py': '8b131bd35dcfcd4097676c4d61f05c69b7115e609cdf07f49774a2f7846bb489'}
+ LINK_HELPER = 'integrations/puredarwin/m1-network-link/host/line_bridge.py'
+-LINK_HELPER_SHA = 'a65e3c1cc085336696d6e4bb134df2794417ed8cd528280849ceaf40afc3a23a'
++LINK_HELPER_SHA = '3213bd2f8e5e6f2c3f875ce90e8a6de006c5cc69473e0dbb6cd9aee3a16fe376'
+ BASE_SHA = '3d274d1b699c0adfa1e38361d8348c3ee7567b854c5361ea80cbe23a18b7e3e6'
+ 
+ 
+--- a/integrations/puredarwin/m1-network-link/host/line_bridge.py
++++ b/integrations/puredarwin/m1-network-link/host/line_bridge.py
+@@ -17,6 +17,10 @@
+ MAX_LINE = 4096
+ MAX_QUEUE = 8
+ MAX_DATA_BYTES = 131072
++MAX_CHUNK_BYTES = 192
++MAX_CHUNKS = 1024
++MAX_ACKS = 4096
++ACK_SECONDS = 3
+ 
+ 
+ def crc32c(raw):
+@@ -124,10 +128,15 @@
+         self.to_relay = bytearray()
+         self.relay_queue_since = None
+         self.pending = deque()
++        self.pending_offset = 0
+         self.issued = []
+         self.guest_frames = []
+         self.guest_result = None
+         self.data_bytes = 0
++        self.acked_bytes = 0
++        self.outstanding_since = None
++        self.chunk_ledger = []
++        self.ack_ledger = []
+         self.trailing_cr_lines = self.trailing_cr_max = 0
+ 
+     def _close_socket(self):
+@@ -142,7 +151,9 @@
+     def fail(self, error):
+         self.error = self.error or str(error)
+         self.cancelled = True
++        self.transport_complete = False
+         self.pending.clear()
++        self.pending_offset = 0
+         self._close_socket()
+ 
+     def _ready(self, line):
+@@ -187,17 +198,43 @@
+             self.to_relay.extend(raw)
+             self.guest_frames.append({'sequence': frames[0][1], 'type': frames[0][0],
+                                       'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()})
++        elif line.startswith(b'DL26_LINK_ACK_'):
++            match = re.fullmatch(rb'DL26_LINK_ACK_' + self.nonce.encode() + rb' bytes=([1-9][0-9]{0,5})', line)
++            if not match or not self.ready or self.outstanding_since is None:
++                raise ValueError('unexpected guest ACK')
++            now = self.clock()
++            if now - self.outstanding_since > ACK_SECONDS:
++                raise TimeoutError('outstanding guest ACK deadline')
++            count = int(match[1])
++            if not self.acked_bytes < count <= self.data_bytes:
++                raise ValueError('guest ACK cumulative credit')
++            if len(self.ack_ledger) >= MAX_ACKS:
++                raise ValueError('guest ACK ledger cap')
++            self.acked_bytes = count
++            self.ack_ledger.append({'cumulativebytes': count})
++            # Partial ACKs do not reset the outstanding chunk's deadline.
++            if count == self.data_bytes:
++                self.outstanding_since = None
+         elif line.startswith(b'DL26_LINK_RESULT_'):
+-            match = re.fullmatch(rb'DL26_LINK_RESULT_' + self.nonce.encode() + rb' status=(PASS|FAILED) tcp_echo=([01]) udp_echo=([01]) frames_out=([0-9]+) frames_in=([0-9]+) packets_out=([0-9]+) packets_in=([0-9]+) error=([a-z0-9_]+) errno=([0-9]+)', line)
++            match = re.fullmatch(rb'DL26_LINK_RESULT_' + self.nonce.encode() + rb' status=(PASS|FAILED) tcp_echo=([01]) udp_echo=([01]) frames_out=([0-9]+) frames_in=([0-9]+) packets_out=([0-9]+) packets_in=([0-9]+) error=([a-z0-9_]+) errno=([0-9]+) console_bytes_in=([0-9]{1,6}) partial_line=([0-2]) partial_bits=([0-7])', line)
+             if not match or not self.ready or self.guest_result is not None:
+                 raise ValueError('guest result marker')
+             self.guest_result = {'status': match[1].decode(), 'tcp_echo': int(match[2]),
+                                  'udp_echo': int(match[3]), 'frames_out': int(match[4]),
+                                  'frames_in': int(match[5]), 'packets_out': int(match[6]),
+                                  'packets_in': int(match[7]), 'error': match[8].decode(),
+-                                 'errno': int(match[9])}
+-            if match[1] != b'PASS' or (match[2] != b'1' or match[3] != b'1') or match[8] != b'none':
++                                 'errno': int(match[9]),
++                                 'console_bytes_in': int(match[10]),
++                                 'partial_line': int(match[11]),
++                                 'partial_bits': int(match[12])}
++            if int(match[10]) > MAX_DATA_BYTES:
++                raise ValueError('guest console byte cap')
++            if match[1] != b'PASS' or (match[2] != b'1' or match[3] != b'1') or match[8] != b'none' or int(match[9]) != 0:
+                 raise ValueError('guest link failed')
++            if (int(match[10]) != self.data_bytes or self.acked_bytes != self.data_bytes or
++                    self.pending or self.pending_offset or self.outstanding_since is not None or
++                    int(match[11]) != 0 or int(match[12]) != 0):
++                raise ValueError('guest result credit/partial mismatch')
+ 
+     def feed_console(self, data):
+         if self.cancelled:
+@@ -230,6 +267,8 @@
+                 return None
+             if now - self.started > 60:
+                 raise TimeoutError('whole link deadline')
++            if self.outstanding_since is not None and now - self.outstanding_since > ACK_SECONDS:
++                raise TimeoutError('outstanding guest ACK deadline')
+             if not self.connected:
+                 error = self.socket.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                 if error not in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY):
+@@ -268,7 +307,9 @@
+                     break
+                 if not data:
+                     self.host.end()
+-                    if not self.guest.closed or self.to_relay or self.pending or not self.write_shutdown:
++                    if (not self.guest.closed or self.to_relay or self.pending or self.pending_offset or
++                            not self.write_shutdown or self.acked_bytes != self.data_bytes or
++                            self.outstanding_since is not None):
+                         raise ValueError('premature relay EOF')
+                     self.transport_complete = True
+                     self._close_socket()
+@@ -280,34 +321,55 @@
+                     self.pending.append((encoded, {'sequence': sequence, 'type': kind,
+                         'frame_bytes': len(frame), 'frame_sha256': hashlib.sha256(frame).hexdigest(),
+                         'wire_bytes': len(encoded), 'wire_sha256': hashlib.sha256(encoded).hexdigest()}))
+-            if self.guest.closed and self.host.closed and not self.to_relay and not self.pending and not self.write_shutdown:
++            if (self.guest.closed and self.host.closed and not self.to_relay and not self.pending and
++                    not self.pending_offset and self.acked_bytes == self.data_bytes and
++                    self.outstanding_since is None and not self.write_shutdown):
+                 self.socket.shutdown(socket.SHUT_WR)
+                 self.write_shutdown = True
+-            return self.pending[0][0] if self.pending else None
++            if self.pending and self.acked_bytes == self.data_bytes and self.outstanding_since is None:
++                return self.pending[0][0][self.pending_offset:self.pending_offset + MAX_CHUNK_BYTES]
++            return None
+         except Exception as error:
+             self.fail(error)
+             return None
+ 
+     def authorize(self, data):
+         # Called by the one recorded console writer, immediately before its write.
+-        if self.cancelled or not self.ready or not self.pending or data != self.pending[0][0]:
++        if (self.cancelled or not self.ready or not self.pending or
++                self.acked_bytes != self.data_bytes or self.outstanding_since is not None or
++                type(data) is not bytes or
++                data != self.pending[0][0][self.pending_offset:self.pending_offset + MAX_CHUNK_BYTES]):
+             raise ValueError('unissued network data')
+-        if not data or any(byte not in (32, 10) for byte in data) or self.data_bytes + len(data) > MAX_DATA_BYTES:
++        if (not data or len(data) > MAX_CHUNK_BYTES or any(byte not in (32, 10) for byte in data) or
++                self.data_bytes + len(data) > MAX_DATA_BYTES or len(self.chunk_ledger) >= MAX_CHUNKS):
+             raise ValueError('network data alphabet/cap')
+-        _, receipt = self.pending.popleft()
+-        self.issued.append(receipt)
+         self.data_bytes += len(data)
++        self.outstanding_since = self.clock()
++        self.chunk_ledger.append({'length': len(data), 'sha256': hashlib.sha256(data).hexdigest(),
++                                  'cumulativebytes': self.data_bytes})
++        self.pending_offset += len(data)
++        if self.pending_offset == len(self.pending[0][0]):
++            _, receipt = self.pending.popleft()
++            self.issued.append(receipt)
++            self.pending_offset = 0
+ 
+     def cancel(self):
+         self.cancelled = True
+         self._close_socket()
+ 
+     def report(self):
+-        return {'version': 1, 'nonce': self.nonce, 'ready': self.ready,
+-                'transport_complete': self.transport_complete, 'error': self.error,
++        credit_complete = (self.acked_bytes == self.data_bytes and self.outstanding_since is None and
++                           not self.pending and not self.pending_offset)
++        return {'version': 2, 'nonce': self.nonce, 'ready': self.ready,
++                'transport_complete': self.transport_complete and credit_complete, 'error': self.error,
+                 'close_error': self.close_error,
+                 'guest_result': self.guest_result, 'host_frames_issued': self.issued,
+                 'guest_frames': self.guest_frames, 'data_bytes': self.data_bytes,
++                'acked_bytes': self.acked_bytes, 'credit_complete': credit_complete,
++                'chunk_ledger': self.chunk_ledger, 'ack_ledger': self.ack_ledger,
++                'max_chunk_bytes': MAX_CHUNK_BYTES, 'max_chunks': MAX_CHUNKS, 'max_acks': MAX_ACKS,
++                'ack_deadline_seconds': ACK_SECONDS,
++                'pending_frames': len(self.pending), 'pending_offset': self.pending_offset,
+                 'trailing_cr_lines': self.trailing_cr_lines,
+                 'trailing_cr_max': self.trailing_cr_max,
+                 'ingress_alphabet': 'SPACE_LF_ONLY_ALL_SUFFIXES_WHITESPACE',

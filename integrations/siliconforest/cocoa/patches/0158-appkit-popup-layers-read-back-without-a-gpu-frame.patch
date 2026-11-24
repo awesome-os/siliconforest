@@ -1,0 +1,27 @@
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -123,6 +123,15 @@
+  return set&&window?set((int)[window windowNumber],(uintptr_t)view,(void *)surface,sx,sy,sw,sh,dx,dy,dw,dh):0;
+ }
+ static void sfSFFXClearGPULayer(NSView *view,NSWindow *window){sfSFFXSetGPULayer(view,window,NULL,0,0,0,0,0,0,0,0);}
++// (TERM10, FX-022) a window the window server shows as a popup or layer surface takes no GPU layers: its layers are
++// read back without copying a frame first (a frame copied and then refused left the read-back empty: Firefox's menu
++// panel showed as a transparent window)
++static int sfSFFXWindowTakesGPULayers(NSWindow *window){
++ static int (*takes)(int);
++ static int known;
++ if(!known){takes=(int (*)(int))dlsym(RTLD_DEFAULT,"_windowServerSFFXTakesGPULayers");known=1;}
++ return takes==NULL||(window!=nil&&takes((int)[window windowNumber]));
++}
+ 
+ @implementation NSView
+ 
+@@ -1943,7 +1952,7 @@
+    if([_layerContext respondsToSelector:@selector(setBackingScale:)])
+     [_layerContext setBackingScale:[[self window] backingScaleFactor]];
+    [_layerContext render];
+-   if(sfSFFXGPUPresenter()!=NULL&&[_layerContext respondsToSelector:@selector(copySFFXRenderedSurface)]){
++   if(sfSFFXGPUPresenter()!=NULL&&sfSFFXWindowTakesGPULayers(_window)&&[_layerContext respondsToSelector:@selector(copySFFXRenderedSurface)]){
+     CGAffineTransform transform=[self transformToWindow];
+     if(fabs(transform.b)<.0001&&fabs(transform.c)<.0001&&fabs(fabs(transform.a)-1)<.0001&&fabs(fabs(transform.d)-1)<.0001){
+      CFTypeRef surface=[_layerContext copySFFXRenderedSurface];

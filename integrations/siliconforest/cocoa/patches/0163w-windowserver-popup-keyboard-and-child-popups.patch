@@ -1,0 +1,184 @@
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -106,6 +106,8 @@
+     int popupParentID;
+     // set by AppKit before the popup is shown (kWSWindowSetPopupAnchor)
+     int popupKind, popupParentHint;
++    // (TERM11) it was shown as a popup: shown again without a frame of its own, it is a popup again
++    int wasPopup;
+     // the window number of the toplevel this one belongs to (a sheet's), 0 for none
+     int parentID;
+     double anchorX, anchorY, anchorW, anchorH;
+@@ -180,6 +182,13 @@
+     /* Panels, the dock and the desktop take pointer focus too, so the window
+      * reported as active is only ever an xdg toplevel. */
+     int activeAppWindowID;
++    /* (TERM11, FX-022) the window AppKit was last told has the keyboard, and a keyboard leave not told yet: a
++     * leave followed by an enter on one of our own popups (a menu or panel holding the keyboard while it is
++     * open) is not a loss of key for AppKit, as on macOS, where a menu or panel never takes key from the window
++     * it was opened from */
++    int keyHolderID;
++    int pendingKeyLossID;
++    double pendingKeyLossAt;
+     uint32_t pointerButtonSerial;
+     // the newest key, button or focus serial, what wl_data_device.set_selection must quote
+     uint32_t inputSerial;
+@@ -2573,6 +2582,35 @@
+     close(fd);
+ }
+ 
++static void keyFocusPush(int windowID, int code) {
++    struct mach_event event = {0};
++
++    event.windowID = windowID;
++    event.code = code;
++    queuePush(&event);
++    if (getenv("SF_WS_TRACE") != NULL)
++        fprintf(stderr, "WindowServer: AppKit told window %d %s the keyboard\n", windowID,
++                code == WS_EVENT_FOCUS_GAINED ? "has" : "lost");
++}
++
++// a keyboard leave that no enter on a window of ours answered in time is a loss of key
++static void keyFocusSettle(int force) {
++    if (ws.pendingKeyLossID == 0 || (!force && wsNowMs() - ws.pendingKeyLossAt < 40.0))
++        return;
++    keyFocusPush(ws.pendingKeyLossID, WS_EVENT_FOCUS_LOST);
++    if (ws.keyHolderID == ws.pendingKeyLossID)
++        ws.keyHolderID = 0;
++    ws.pendingKeyLossID = 0;
++}
++
++// milliseconds until a pending keyboard leave is told, -1 when none is pending
++static int keyFocusTimeout(void) {
++    if (ws.pendingKeyLossID == 0)
++        return -1;
++    double left = 40.0 - (wsNowMs() - ws.pendingKeyLossAt);
++    return left < 0 ? 0 : (int)left + 1;
++}
++
+ static void keyboardEnter(void *data, struct wl_keyboard *keyboard, uint32_t serial,
+                           struct wl_surface *surface, struct wl_array *keys) {
+     ws.inputSerial = serial;
+@@ -2585,17 +2623,26 @@
+     }
+     for (struct wsWindow *w = ws.windows; w != NULL; w = w->next) {
+         if (w->surface == surface) {
+-            struct mach_event event = {0};
+-
++            // keys go where the compositor sends them; AppKit hands those of a popup to its key window
+             ws.focusWindowID = w->windowID;
++            /* (TERM11, FX-022) one of our popups took the keyboard (its grab): the window it was opened from
++             * stays key for AppKit (macOS never makes a menu or panel key). Firefox closed its menu panel the
++             * moment its window resigned key. */
++            if (w->popup != NULL) {
++                if (ws.pendingKeyLossID != 0 && ws.pendingKeyLossID == ws.keyHolderID)
++                    ws.pendingKeyLossID = 0;
++                break;
++            }
++            if (ws.pendingKeyLossID != 0 && ws.pendingKeyLossID != w->windowID)
++                keyFocusSettle(1);
++            ws.pendingKeyLossID = 0;
+             if (w->toplevel != NULL) {
+                 ws.activeAppWindowID = w->windowID;
+             }
+             /* Recording the focus is not enough: AppKit has to be told, or no
+              * window ever becomes key and keystrokes have nowhere to go. */
+-            event.windowID = w->windowID;
+-            event.code = WS_EVENT_FOCUS_GAINED;
+-            queuePush(&event);
++            ws.keyHolderID = w->windowID;
++            keyFocusPush(w->windowID, WS_EVENT_FOCUS_GAINED);
+             break;
+         }
+     }
+@@ -2608,11 +2655,12 @@
+     keyRepeat.key = 0;
+     for (struct wsWindow *w = ws.windows; w != NULL; w = w->next) {
+         if (w->surface == surface) {
+-            struct mach_event event = {0};
+-
+-            event.windowID = w->windowID;
+-            event.code = WS_EVENT_FOCUS_LOST;
+-            queuePush(&event);
++            /* told after the dispatch, unless an enter on a window of ours follows (TERM11): a popup's leave is
++             * the loss of the key window it belongs to when the keyboard goes elsewhere */
++            if (ws.pendingKeyLossID != 0)
++                keyFocusSettle(1);
++            ws.pendingKeyLossID = w->popup != NULL ? ws.keyHolderID : w->windowID;
++            ws.pendingKeyLossAt = wsNowMs();
+             break;
+         }
+     }
+@@ -2878,7 +2926,11 @@
+             break;
+         wl_display_flush(ws.display);
+ 
+-        int ready = poll(&pfd, 1, keyRepeatTimeout());
++        int timeout = keyRepeatTimeout(), focusTimeout = keyFocusTimeout();
++
++        if (focusTimeout >= 0 && (timeout < 0 || focusTimeout < timeout))
++            timeout = focusTimeout;
++        int ready = poll(&pfd, 1, timeout);
+         if (ready > 0) {
+             if (wl_display_read_events(ws.display) < 0) {
+                 lost = 1;
+@@ -2893,6 +2945,7 @@
+             break;
+         }
+         keyRepeatFire();
++        keyFocusSettle(0);
+     }
+     ws.dispatchRunning = 0;
+ 
+@@ -3121,10 +3174,23 @@
+  * relative to a parent surface. The parent is the popup opened last (a submenu), else the window
+  * under the pointer, else the one with the keyboard; the place is the difference of the two
+  * frames as AppKit has them, which is right wherever the compositor really put the parent. */
++/* (TERM11, FX-022) Which windows are popups: a window without a frame of its own at the pop-up menu level (a
++ * menu, a list, a tool tip), a child window without a frame (-addChildWindow:ordered:: Firefox's menu panel and
++ * its other doorhangers, at whatever level it gives them), or a window without a frame that was one before and is
++ * shown again (Firefox lowers a closing panel to the modal-panel level; shown again it is still a panel). On macOS
++ * these are windows at a level above their parent; here a toplevel would be placed, framed and focused by the desk
++ * as a window of its own. */
++static int windowIsPopupKind(struct wsWindow *window) {
++    if (wsStyleWantsServerFrame(window->style))
++        return 0;
++    return window->level == kWSPopUpMenuLevel || (window->popupParentHint != 0 && window->level >= 0) ||
++           (window->wasPopup && window->level >= 3);
++}
++
+ static struct wsWindow *popupParentFor(struct wsWindow *window) {
+     struct wsWindow *candidate, *best = NULL;
+ 
+-    if (window->level != kWSPopUpMenuLevel || wsStyleWantsServerFrame(window->style))
++    if (!windowIsPopupKind(window))
+         return NULL;
+     // the parent AppKit named: the window a menu was opened from, the menu a submenu belongs to
+     best = windowForID(window->popupParentHint);
+@@ -3298,6 +3364,7 @@
+     xdg_popup_add_listener(window->popup, &popupListener, window);
+     xdg_positioner_destroy(positioner);
+     window->popupParentID = parent->windowID;
++    window->wasPopup = 1;
+     window->popupTokenSent = window->popupTokenSeen = 0;
+     /* A menu holds the pointer until it is closed: the compositor then dismisses it when the
+      * pointer is pressed outside the application. A window that takes no mouse events (a tool
+@@ -3801,8 +3868,7 @@
+                 windowUnmap(window);
+                 /* (TERM10) a menu-level window that had to be a toplevel (no window of ours was up) does not keep
+                  * that role: its next showing is a popup again if it can be */
+-                if (window->popup != NULL || (window->toplevel != NULL && window->level == kWSPopUpMenuLevel &&
+-                                              !wsStyleWantsServerFrame(window->style))) {
++                if (window->popup != NULL || (window->toplevel != NULL && windowIsPopupKind(window))) {
+                     windowDestroyRole(window);
+                     window->configured = 0;
+                     // what it shows next has to be drawn and flushed after this
+@@ -4083,7 +4149,7 @@
+ 
+             // only a popup that has none yet (a menu, a list, a tool tip about to be drawn)
+             if (window == NULL || window->layerSurface != NULL || window->toplevel != NULL || window->popup != NULL ||
+-                window->level < kWSPopUpMenuLevel || getenv("SF_WS_NO_PREPARE") != NULL)
++                !windowIsPopupKind(window) || getenv("SF_WS_NO_PREPARE") != NULL)
+                 return KERN_SUCCESS;
+             // as -windowCreateRole would make it: a popup where the compositor places popups, else nothing now
+             uint32_t layer;

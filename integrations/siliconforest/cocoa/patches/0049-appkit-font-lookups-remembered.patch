@@ -1,0 +1,61 @@
+--- a/src/Frameworks/AppKit/O2Font_FT.m
++++ b/src/Frameworks/AppKit/O2Font_FT.m
+@@ -292,13 +292,31 @@
+    if(name==nil)
+     return name;
+ 
++   // remembered: each answer is a fontconfig listing of every installed face (with the CJK
++   // collection installed, a menu's fallback for its shortcut glyphs took 170 ms per menu)
++   static NSMutableDictionary *answers=nil;
++   NSString *known;
++
++   @synchronized([O2Font class]) {
++    if(answers==nil)
++     answers=[[NSMutableDictionary alloc] init];
++    known=[[[answers objectForKey:name] retain] autorelease];
++   }
++   if(known!=nil)
++    return known;
++
+    // fontconfig compares names ignoring case and blanks, so take its spelling
+    NSString *result=postscriptNameMatching(FC_POSTSCRIPT_NAME, name);
+    if(result==nil)
+     result=postscriptNameMatching(FC_FULLNAME, name);
+    if(result==nil)
+     result=postscriptNameMatching(FC_FAMILY, name);
+-   return result!=nil ? result : name;
++   if(result==nil)
++    result=name;
++   @synchronized([O2Font class]) {
++    [answers setObject:result forKey:name];
++   }
++   return result;
+ }
+ 
+ @end
+--- a/src/Frameworks/AppKit/NSMutableAttributedString.m
++++ b/src/Frameworks/AppKit/NSMutableAttributedString.m
+@@ -50,6 +50,23 @@
+ }
+ 
+ -(NSFont *)_bestFontForCharacter:(unichar)c userFont:(NSFont *)font {
++    // remembered per font and character: a menu draws its shortcut glyphs (Command, Shift), which
++    // the system face lacks, at every opening (a quarter of its time went to finding them again)
++    static NSMutableDictionary *found = nil;
++    NSString *key = [NSString stringWithFormat:@"%@/%g/%u", [font fontName], (double)[font pointSize], (unsigned)c];
++    id known;
++
++    if (found == nil)
++        found = [[NSMutableDictionary alloc] init];
++    known = [found objectForKey:key];
++    if (known != nil)
++        return known == [NSNull null] ? nil : known;
++    known = [self _sfSearchBestFontForCharacter:c userFont:font];
++    [found setObject:known != nil ? known : (id)[NSNull null] forKey:key];
++    return known;
++}
++
++-(NSFont *)_sfSearchBestFontForCharacter:(unichar)c userFont:(NSFont *)font {
+     // We first try a limited list of good known candidates - if that fails, then we'll try all of
+     // the other fonts
+     NSArray *list = [NSFont preferredFontNames];

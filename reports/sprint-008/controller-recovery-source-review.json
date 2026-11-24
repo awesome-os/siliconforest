@@ -1,0 +1,99 @@
+{
+  "status": "SOURCE_REVIEW_ONLY",
+  "claim_class": "macvdmtool_source_facts",
+  "inspected": {
+    "ssh_host": "chriskearney@10.1.1.93",
+    "path": "/Users/chriskearney/maclab/macvdmtool",
+    "head": "b22ae51eb43a0e1daa21d41616ac899f28e7bf8a",
+    "tracked_tree": "clean at that commit",
+    "untracked_not_reviewed": ["main.o"],
+    "files_read": ["README.md", "Makefile", "main.cpp", "AppleHPMLib.h", "ssops.h"]
+  },
+  "macvdmtool_executed": false,
+  "modes_reboots_or_storage_writes_performed": false,
+  "hardware_boot_observed": false,
+  "commands": {
+    "invocation": "sudo ./macvdmtool <command> [argument]",
+    "root_check_in_source": false,
+    "readme_says_run_as_root": true,
+    "no_argument": "prints usage and returns 1 before any IOKit call",
+    "recognized": [
+      "serial",
+      "debugusb",
+      "reboot",
+      "reboot serial",
+      "reboot debugusb",
+      "dfu",
+      "nop"
+    ],
+    "unknown": "prints Unknown command and returns 1 after the common ACE prelude"
+  },
+  "common_prelude_for_every_recognized_command_including_nop": [
+    "GetUnlockKey reads the local IOPlatformExpertDevice registry name and uses its first four characters as the ACE unlock key. The name is printed. This inspection did not run the program and did not record that name.",
+    "FindDevice matches IOService class AppleHPM and keeps only entries whose RID is 0. A source comment says RID 0 seems to always be the right port. If several RID 0 services exist, the last one is kept. Chip address passed to later calls is 0.",
+    "Register 0x3f bit 0 must be set or the program throws No connection detected and sends no VDM. Bit 1 is printed as Source versus Sink and is not used again.",
+    "Register 0x03 is read as a status string. If it is not DBMa, UnlockAce sends LOCK with the four-byte key. If LOCK fails, it sends Gaid, prints Trying to reset, and retries LOCK once. Then it sends DBMa with argument 0x01 and requires the status string to become DBMa.",
+    "On destruction of a created plugin, including failure paths that unwind main2, the program sends DBMa with argument 0x00. There is no signal handler, so a killed process is not shown exiting DBMa."
+  ],
+  "capabilities": {
+    "reboot": {
+      "command": "reboot",
+      "action": "One VDM whose words are 0x5ac8012, 0x105, 0x80000000. The printf says Rebooting target into normal mode. No second argument means return after that VDM with no wait."
+    },
+    "reboot_then_serial": {
+      "command": "reboot serial",
+      "action": "DoReboot, then WaitConnected, then DoSerial."
+    },
+    "reboot_then_debugusb": {
+      "command": "reboot debugusb",
+      "action": "DoReboot, then WaitConnected, then DoDebugUSB."
+    },
+    "serial_without_reboot": {
+      "command": "serial",
+      "action": "VDM words 0x5ac8012, 0x1840306, then local ACE command DVEn with uint32 0x1840306. This is a mode switch, not a reset."
+    },
+    "debugusb_without_reboot": {
+      "command": "debugusb",
+      "action": "VDM words 0x5ac8012, 0x1824606. No DVEn call. This is a mode switch, not a reset."
+    },
+    "dfu": {
+      "command": "dfu",
+      "action": "VDM words 0x5ac8012, 0x106, 0x80010000. The printf says Rebooting target into DFU mode. No serial or debugusb follow-up and no wait."
+    },
+    "ace_reset_inside_unlock_only": {
+      "command": "not a user command",
+      "action": "Gaid is sent only after LOCK fails. It is not a target-SoC reboot command and is not reachable as an argv."
+    },
+    "power": "No power-off, power-on, shutdown, halt, or power-button command exists in main.cpp.",
+    "serial_or_debug_device_nodes": "main.cpp does not open a serial device and does not contain /dev/cu.debug-console, /dev/cu.debug_console, or /dev/cu.kis-100000-ch-0. README names /dev/cu.debug_console for serial and M1N1DEVICE=/dev/cu.debug-console, and names /dev/cu.kis-100000-ch-0 for debugusb. Those node names were not checked on the machine.",
+    "nop": "Returns 0 only after the common prelude and the destructor's DBMa exit. It is not a read-only query."
+  },
+  "timeouts_in_source": {
+    "wait_connected": "Used only by reboot serial and reboot debugusb. sleep(1), then up to 30 reads of register 0x3f bit 0 with usleep(100000) after a miss. Timeout prints Timed out and returns 1. Success sleeps one more second. Plain reboot and dfu do not call it.",
+    "vdm_reply": "DoVDM polls register 0x4d up to 16 times with no delay. No status change throws Did not get a reply to VDM. A header other than the first VDM word OR 0x40 throws VDM failed. No reboot retry."
+  },
+  "blindspots": [
+    "No read of the target OS, boot volume, recovery mode, or startup-disk selection. The reboot printf's normal mode is not a boot-selector argument.",
+    "No branch that detects Linux or any other running system. Current target software is outside this source.",
+    "No target-CPU or kernel liveness check. The only link test is local AppleHPM register 0x3f bit 0.",
+    "If that bit is clear, reboot and dfu are not sent. The source does not define whether a hard hang clears the bit, and it has no other reset path when the bit is clear.",
+    "If that bit stays set during a hang, the tool still sends the same reboot or dfu VDM. The source does not show that the SoC accepts it or comes back.",
+    "Nothing in this program reads a console, matches a prompt, or decides that a boot finished. Exit 0 means the ACE/VDM calls it attempted returned success.",
+    "No automatic retry of a failed reboot. Unlock has one Gaid retry. VDM has 16 status polls.",
+    "No command sequence for an unattended hang loop. A caller would have to choose among the argv forms above.",
+    "DFU is a separate VDM from reboot. The source does not chain DFU back to serial or debugusb."
+  ],
+  "one_time_physical_setup_stated_by_readme_not_observed_here": [
+    "Connect the controller and target on their DFU ports. README lists the rear port on MacBook Air and 13-inch MacBook Pro, the port next to MagSafe on 14-inch and 16-inch MacBook Pro, and the port nearest the power plug on Mac mini.",
+    "README says debugusb can use a USB 2.0-only cable, and serial needs a USB 3 SuperSpeed Type-C cable or a Thunderbolt cable. Charging-only USB 2 cables are stated not to work for serial.",
+    "README says macOS 12 and 13 block the serial device through AppleSerialShim, and tells the reader to use a later macOS or a kernelcache without that extension.",
+    "This inspection did not trace a cable, did not list /dev nodes, and did not confirm those README statements on this M5 or the target."
+  ],
+  "recovery_control_assessment": "At this commit the whole software control surface is serial, debugusb, reboot, reboot serial, reboot debugusb, dfu, and nop. Every one of those except a no-argument usage print takes the ACE through unlock and DBMa when status is not already DBMa, and the destructor sends DBMa exit. The only target-reset requests are the reboot VDM and the distinct DFU VDM. serial and debugusb alone switch link mode. reboot serial and reboot debugusb add a short register 0x3f wait and then the mode switch. There is no power control, no boot selection, no OS detection, and no proof of life after the VDM. A link that does not show connected cannot be reset by this program. A link that stays connected is sent the VDM with no evidence in this source that a hard-hung target will recover. Exit 0 is not a boot result.",
+  "limits": [
+    "Facts are from the named source files and git status. They are not a run of macvdmtool and not a target recovery test.",
+    "The untracked main.o was not disassembled and is not evidence that a built binary matches this commit.",
+    "No serial number, ECID, or platform-expert device name was collected.",
+    "No inference is made about what the installed target OS or boot policy will do with VDM words 0x105 or 0x106."
+  ]
+}

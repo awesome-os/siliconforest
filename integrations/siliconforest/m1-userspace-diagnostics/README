@@ -1,0 +1,62 @@
+# page-probe
+
+Observation-only Darwin userspace program. Root's `build-page-probe.nix` is the libSystem-only recipe. Nothing in this directory was compiled or run here. A later desktop boot of the built binary is still required before any page-size value is known. The JSON record is not a pass or fail result, and it is not a guard-page fix.
+
+`page-probe` prints one line of JSON to stdout. The record name is `OBSERVATION_ONLY`. Return codes, errnos, sizes, and widths are numbers.
+
+## What it records
+
+From the headers included by the program (`unistd.h`, `mach/mach.h`, `sys/mman.h`):
+
+- `sizeof(vm_address_t)`, `sizeof(vm_size_t)`, and `sizeof(void *)`, as `sizeof_vm_address_t`, `sizeof_vm_size_t`, and `sizeof_void_star`. The program does not compare these with 4 or 8. `vm_address_t` is the header typedef `vm_offset_t`; the arm header selects `uintptr_t` or `natural_t` according to its own configuration. This file does not assume which one the included headers picked.
+- `getpagesize()` and `sysconf(_SC_PAGESIZE)`
+- `host_page_size()`
+- `vm_page_size`, `vm_page_mask`, `vm_page_shift`
+- `vm_kernel_page_size`, `vm_kernel_page_mask`, `vm_kernel_page_shift`
+
+There is no handwritten `extern`. `mach/mach_interface.h` declares `vm_protect`. `mach_vm_protect` is not called.
+
+It maps one private anonymous region of 65536 bytes (`MAP_PRIVATE|MAP_ANON`). `_DARWIN_C_SOURCE` is set so that public `MAP_ANON` declaration is visible. Inside that region it takes a 16384-byte-aligned address and, for offsets 0, 4096, and 8192, length 16384, records:
+
+- `vm_protect` with `VM_PROT_NONE` and `set_maximum` false
+- `mprotect` with `PROT_NONE`
+
+After every one of those attempts, and once more before `munmap`, the whole 65536-byte mapping is set back to read/write through both calls. `set_maximum` stays false. The program never loads or stores through the mapping.
+
+## Guard on every `vm_protect`
+
+`checked_vm_protect` is the only function that calls `vm_protect`. It checks the real pointer first. The span must be non-empty and entirely inside the one anonymous region. An address that would wrap when the 16384-byte base is formed is not used.
+
+If the span is inside, the helper then requires both round trips:
+
+- `(uintptr_t)(vm_address_t)address == address`
+- `(size_t)(vm_size_t)length == length`
+
+The Mach call uses the values that passed. If either comparison fails, the record has `called` 0 and `abi_truncation` 1, and `vm_protect` is not called. `ret` and `errno` are omitted on that record so a skip cannot be read as `KERN_SUCCESS`. `mprotect` of that same in-range span still runs, with the original `void *` and `size_t`.
+
+A span outside the anonymous region produces `called` 0 and `outside_region` 1 for that attempt. Neither `vm_protect` nor `mprotect` is invoked for it. The truncation check is not applied to an outside span.
+
+## Probe `kind`
+
+| kind | call |
+| --- | --- |
+| 1 | `vm_protect` of one subspan to `VM_PROT_NONE` |
+| 2 | `mprotect` of one subspan to `PROT_NONE` |
+| 3 | `vm_protect` of the whole mapping back to read/write |
+| 4 | `mprotect` of the whole mapping back to read/write |
+
+`whole` is 1 for a full-mapping restore and 0 for a subspan. `called` 1 means that call was made, and `ret` and `errno` are present. `called` 0 means it was not made. `errno` is sampled only immediately after a call that ran.
+
+`base_inside` is present when `mmap` succeeds. The offset probes run only when that aligned base lies inside the mapping. A failed `mmap` leaves `probes` empty and omits the base fields. The process still exits 0.
+
+`commpage_read` is 0. The probe does not dereference a commpage byte. The page-size globals above are the values libSystem already published.
+
+## What it does not do
+
+It does not set `MallocGuardEdges`, `MallocDoNotProtectPostlude`, or any other malloc policy. It does not hide the existing `mvm_protect` warning. Libmalloc may still print that warning on the console before this JSON line. That line is not part of the JSON object.
+
+It does not patch the kernel, change guard pages, or read protected memory.
+
+## Build and run
+
+`build-page-probe.nix` is root's source-only recipe. It links libSystem and allows the `getpagesize` deprecation warning to remain a warning under `-Werror`. This agent did not run that recipe, and this directory's source is not a boot result.

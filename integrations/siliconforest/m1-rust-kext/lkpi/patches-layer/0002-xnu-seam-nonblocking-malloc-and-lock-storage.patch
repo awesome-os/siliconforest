@@ -1,0 +1,538 @@
+fbsdkpi: xnu seam: non-blocking sfos_malloc, locks in caller storage, counters
+
+sfos_malloc ignored `canwait` (IOMalloc always may block). It now uses kalloc_data, the kpi
+that takes Z_NOWAIT. sfos_mtx_setup/sfos_rw_setup make an unlocked xnu lock in 16 bytes of
+caller storage, so the Haiku locks above no longer allocate (next patch). Counters for tests.
+UPSTREAM: yes.
+
+--- a/src/Kernel/fbsdkpi/sf_fbsd_os.h
++++ b/src/Kernel/fbsdkpi/sf_fbsd_os.h
+@@ -26,7 +26,26 @@
+ void sfos_sleep_us(uint64_t us);
+ 
+ // memory, sizes are remembered by the backend
++// canwait 0 never blocks (xnu Z_NOWAIT): it may be called with locks held and with
++// preemption disabled, and fails rather than wait. It can only be served from the kalloc
++// zones, so a request above their limit (32 KiB on 16 KiB-page kernels, less the headers)
++// fails when it may not wait.
+ void *sfos_malloc(size_t size, int zero, int canwait);
++// allocations that were made with canwait 0 and succeeded, for tests
++uint64_t sfos_malloc_nowait_count(void);
++// bytes handed out by sfos_malloc and not yet freed
++int64_t sfos_malloc_live(void);
++// the kernel's page size
++size_t sfos_page_size(void);
++uint64_t sfos_physmem(void);
++int64_t sfos_malloc_nowait_retried(void);
++void *sfos_pages_alloc(size_t count, uint64_t *phys, void **cookie);
++void sfos_pages_free(void *cookie);
++uint64_t sfos_thread_tid(void *thread);
++int sfos_pressure_start(void (*fn)(void));
++int64_t sfos_pressure_events(void);
++void *sfos_map_owned_pages(void *const *cookies, const uint32_t *index, size_t count, int uncached);
++void sfos_map_owned_stats(int64_t *maps, int64_t *failures);
+ void sfos_free(void *ptr);
+ size_t sfos_malloc_size(void *ptr);
+ void *sfos_malloc_contig(size_t size, size_t align, uint64_t maxaddr, uint64_t *phys);
+@@ -50,6 +69,16 @@
+ int sfos_dma_has_mapper(void *pcidev);
+ 
+ // sleepable mutexes, kernel thread context only
++// sfos_mtx_setup and sfos_rw_setup make an unlocked xnu lock in two words of caller storage
++// (SF_LOCK_STORAGE); such a lock needs no teardown. The alloc/free pairs remain for callers
++// that want a separately allocated lock.
++#define SF_LOCK_STORAGE	16
++void sfos_mtx_setup(void *storage);
++void sfos_rw_setup(void *storage);
++// xnu locks currently allocated through sfos_mtx_alloc, sfos_rw_alloc and sfos_spin_alloc,
++// and embedded locks set up so far
++int64_t sfos_lock_allocated(void);
++uint64_t sfos_lock_setups(void);
+ void *sfos_mtx_alloc(const char *name);
+ void sfos_mtx_free(void *m);
+ void sfos_mtx_lock(void *m);
+@@ -89,6 +118,11 @@
+ 
+ // kernel threads
+ void *sfos_thread_start(void (*fn)(void *), void *arg);
++// the same for a thread that must not wait behind ordinary kernel threads (a linux
++// WQ_HIGHPRI work queue): started above them, unless the boot-arg sflkpi_wq_highpri=0
++void *sfos_thread_start_highpri(void (*fn)(void *), void *arg);
++// spawn_kernel_thread() priority that asks for sfos_thread_start_highpri()
++#define SF_THREAD_PRI_HIGH	(-0x5048)
+ void *sfos_thread_current(void);
+ void sfos_thread_exit(void) __attribute__((noreturn));
+ void sfos_thread_set_priority(void *thread, int prio);
+--- a/src/Kernel/fbsdkpi/xnu/sf_fbsd_os.cpp
++++ b/src/Kernel/fbsdkpi/xnu/sf_fbsd_os.cpp
+@@ -6,6 +6,7 @@
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IOSubMemoryDescriptor.h>
++#include <IOKit/IOMultiMemoryDescriptor.h>
+ #include <IOKit/IODMACommand.h>
+ #include <IOKit/IOMapper.h>
+ #include <IOKit/IOFilterInterruptEventSource.h>
+@@ -15,6 +16,7 @@
+ #include <IOKit/acpi/IOACPIPlatformExpert.h>
+ #define SFOS_HAVE_ACPI 1
+ #endif
++#include <kern/kalloc.h>
+ #include <kern/locks.h>
+ #include <kern/thread.h>
+ #include <kern/thread_call.h>
+@@ -33,18 +35,49 @@
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern boolean_t ml_set_interrupts_enabled(boolean_t enable);
+ extern boolean_t ml_get_interrupts_enabled(void);
++extern boolean_t ml_at_interrupt_context(void);
++extern boolean_t preemption_enabled(void);
+ }
+ 
+ static lck_grp_t *sGroup;
+ static lck_spin_t *sWaitLock;
+ static lck_mtx_t *sListLock;
+ 
++// Embedded locks (sfos_mtx_setup, sfos_rw_setup) are copies of these two. lck_mtx_init and
++// lck_rw_init only fill the lock's own words (type, group id, flags) and count it in the
++// group; a copy is the same unlocked lock without the count, so it needs no lck_*_destroy,
++// and creating locks without ever destroying them cannot run the group's reference count
++// up. That an initialised lock does not depend on its address is checked on the running
++// kernel in sfos_xnu_init; if it ever did, each embedded lock is initialised in place.
++_Static_assert(sizeof(lck_mtx_t) <= SF_LOCK_STORAGE, "lck_mtx_t does not fit the embedded lock storage");
++_Static_assert(sizeof(lck_rw_t) <= SF_LOCK_STORAGE, "lck_rw_t does not fit the embedded lock storage");
++static lck_mtx_t sMtxTemplate;
++static lck_rw_t sRwTemplate;
++static bool sLockTemplates;
++static int64_t sLocksAllocated;
++static uint64_t sLockSetups;
++static uint64_t sNowaitAllocs;
++static int64_t sLiveBytes;
++
+ void
+ sfos_xnu_init(void)
+ {
+ 	if (sGroup != NULL)
+ 		return;
+-	sGroup = lck_grp_alloc_init("fbsdkpi", LCK_GRP_ATTR_NULL);
++	lck_grp_t *group = lck_grp_alloc_init("fbsdkpi", LCK_GRP_ATTR_NULL);
++	lck_mtx_t mtx;
++	lck_rw_t rw;
++	lck_mtx_init(&sMtxTemplate, group, LCK_ATTR_NULL);
++	lck_mtx_init(&mtx, group, LCK_ATTR_NULL);
++	lck_rw_init(&sRwTemplate, group, LCK_ATTR_NULL);
++	lck_rw_init(&rw, group, LCK_ATTR_NULL);
++	sLockTemplates = memcmp(&mtx, &sMtxTemplate, sizeof(mtx)) == 0
++		&& memcmp(&rw, &sRwTemplate, sizeof(rw)) == 0;
++	lck_mtx_destroy(&mtx, group);
++	lck_rw_destroy(&rw, group);
++	if (!sLockTemplates)
++		IOLog("fbsdkpi: xnu locks depend on their address, embedded locks are initialised in place\n");
++	sGroup = group;
+ 	sWaitLock = lck_spin_alloc_init(sGroup, LCK_ATTR_NULL);
+ 	sListLock = lck_mtx_alloc_init(sGroup, LCK_ATTR_NULL);
+ }
+@@ -136,15 +169,40 @@
+ 	size_t		pad;
+ };
+ 
++// kalloc_data rather than IOMalloc: it is the kpi that takes Z_NOWAIT. A Z_NOWAIT request
++// is served from a kalloc zone without blocking or not at all (kalloc_large returns NULL for
++// it), so it is safe under locks and with preemption disabled.
++static volatile int64_t sNowaitRetried;
++int64_t
++sfos_malloc_nowait_retried(void)
++{
++	return sNowaitRetried;
++}
++
+ void *
+ sfos_malloc(size_t size, int zero, int canwait)
+ {
+-	sf_block *block = (sf_block *)IOMalloc(size + sizeof(sf_block));
++	if (size + sizeof(sf_block) < size)
++		return NULL;
++	int flags = (canwait ? Z_WAITOK : Z_NOWAIT) | (zero ? Z_ZERO : 0);
++	sf_block *block = (sf_block *)kalloc_data(size + sizeof(sf_block), (zalloc_flags_t)flags);
++	// Z_NOWAIT fails whenever the zone has to grow, which is routine, while Linux's
++	// GFP_ATOMIC/GFP_NOWAIT and FreeBSD's M_NOWAIT rarely fail (reserves). Nearly every
++	// "atomic" caller in this layer is a thread that may block (its spinlocks are mutexes,
++	// its interrupt handlers run on threads), so when the thread really can block, wait.
++	if (block == NULL && !canwait && !ml_at_interrupt_context() && ml_get_interrupts_enabled() &&
++	    preemption_enabled()) {
++		block = (sf_block *)kalloc_data(size + sizeof(sf_block),
++		    (zalloc_flags_t)(Z_WAITOK | (zero ? Z_ZERO : 0)));
++		if (block != NULL)
++			OSAddAtomic64(1, (SInt64 *)&sNowaitRetried);
++	}
+ 	if (block == NULL)
+ 		return NULL;
+ 	block->size = size;
+-	if (zero)
+-		bzero(block + 1, size);
++	if (!canwait)
++		OSAddAtomic64(1, (SInt64 *)&sNowaitAllocs);
++	OSAddAtomic64((SInt64)size, (SInt64 *)&sLiveBytes);
+ 	return block + 1;
+ }
+ 
+@@ -154,7 +212,39 @@
+ 	if (ptr == NULL)
+ 		return;
+ 	sf_block *block = (sf_block *)ptr - 1;
+-	IOFree(block, block->size + sizeof(sf_block));
++	OSAddAtomic64(-(SInt64)block->size, (SInt64 *)&sLiveBytes);
++	kfree_data(block, block->size + sizeof(sf_block));
++}
++
++int64_t
++sfos_malloc_live(void)
++{
++	return sLiveBytes;
++}
++
++uint64_t
++sfos_malloc_nowait_count(void)
++{
++	return sNowaitAllocs;
++}
++
++size_t
++sfos_page_size(void)
++{
++	return PAGE_SIZE;
++}
++
++// the machine's memory in bytes (hw.memsize), 0 when the kernel does not say
++extern "C" int sysctlbyname(const char *, void *, size_t *, void *, size_t);
++uint64_t
++sfos_physmem(void)
++{
++	uint64_t bytes = 0;
++	size_t len = sizeof(bytes);
++
++	if (sysctlbyname("hw.memsize", &bytes, &len, NULL, 0) != 0 || len != sizeof(bytes))
++		return 0;
++	return bytes;
+ }
+ 
+ size_t
+@@ -234,6 +324,117 @@
+ 	return m->va;
+ }
+ 
++// `count` wired pages in one xnu allocation, not physically contiguous: the bulk primitive
++// under linuxkpi's page allocator. phys[] gets each page's address; the kernel address of
++// the whole range is returned, *cookie frees it. No physical mask and no contiguity, so
++// this is an ordinary wired kernel allocation that scales to the gigabytes a gpu wants.
++void *
++sfos_pages_alloc(size_t count, uint64_t *phys, void **cookie)
++{
++	// kIOMemoryKernelUserShared: the pages get mapped a second time (vmap, sfos_map_owned_pages)
++	IOBufferMemoryDescriptor *buffer = IOBufferMemoryDescriptor::inTaskWithOptions(
++		kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, count * PAGE_SIZE, PAGE_SIZE);
++	if (buffer == NULL)
++		return NULL;
++	if (buffer->prepare() != kIOReturnSuccess) {
++		buffer->release();
++		return NULL;
++	}
++	for (size_t i = 0; i < count; i++) {
++		phys[i] = buffer->getPhysicalSegment(i * PAGE_SIZE, NULL, kIOMemoryMapperNone);
++		if (phys[i] == 0) {
++			buffer->complete();
++			buffer->release();
++			return NULL;
++		}
++	}
++	*cookie = buffer;
++	return buffer->getBytesNoCopy();
++}
++
++// One contiguous kernel mapping of pages that came from sfos_pages_alloc(): page i is page
++// index[i] of the allocation cookies[i]. The mapping is made from sub-ranges of the buffer
++// descriptors that own the pages, not from physical addresses: a physical descriptor over
++// xnu-managed pages does not hold them (DEBUG kernels report "IOMemoryDescriptor physical
++// with managed page"). NULL when xnu refuses; the caller may fall back. sfos_unmap_pages()
++// takes the mapping down.
++static volatile int64_t sOwnedMaps, sOwnedMapFailures;
++void *
++sfos_map_owned_pages(void *const *cookies, const uint32_t *index, size_t count, int uncached)
++{
++	IOMemoryDescriptor **subs = (IOMemoryDescriptor **)IOMalloc(count * sizeof(IOMemoryDescriptor *));
++	IOMemoryDescriptor *desc = NULL;
++	IOMemoryMap *map = NULL;
++	sf_mapping *m = NULL;
++	UInt32 n = 0;
++	bool ok = subs != NULL;
++
++	// adjacent pages of one allocation become one sub-range
++	for (size_t i = 0; ok && i < count;) {
++		size_t run = 1;
++		while (i + run < count && cookies[i + run] == cookies[i] && index[i + run] == index[i] + run)
++			run++;
++		IOSubMemoryDescriptor *s = IOSubMemoryDescriptor::withSubRange(
++			(IOMemoryDescriptor *)cookies[i], (IOByteCount)index[i] * PAGE_SIZE,
++			(IOByteCount)run * PAGE_SIZE, kIODirectionInOut);
++		if (s == NULL)
++			ok = false;
++		else
++			subs[n++] = s;
++		i += run;
++	}
++	if (ok) {
++		if (n == 1) {
++			desc = subs[0];
++			desc->retain();
++		} else {
++			desc = IOMultiMemoryDescriptor::withDescriptors(subs, n, kIODirectionInOut, false);
++		}
++	}
++	for (UInt32 i = 0; i < n; i++)
++		subs[i]->release();
++	if (subs != NULL)
++		IOFree(subs, count * sizeof(IOMemoryDescriptor *));
++	if (desc != NULL)
++		map = desc->createMappingInTask(kernel_task, 0,
++			kIOMapAnywhere | kIOMapUnique | (uncached ? kIOMapWriteCombineCache : 0));
++	if (map != NULL && map->getVirtualAddress() != 0)
++		m = (sf_mapping *)IOMalloc(sizeof(sf_mapping));
++	if (m == NULL) {
++		if (map != NULL)
++			map->release();
++		if (desc != NULL)
++			desc->release();
++		if (OSAddAtomic64(1, (SInt64 *)&sOwnedMapFailures) == 0)
++			IOLog("sfos: mapping pool pages through their own descriptors failed (%zu pages, %u ranges)\n",
++			    count, (unsigned)n);
++		return NULL;
++	}
++	bzero(m, sizeof(*m));
++	m->va = (void *)map->getVirtualAddress();
++	m->desc = desc;
++	m->map = map;
++	mapping_add(m);
++	OSAddAtomic64(1, (SInt64 *)&sOwnedMaps);
++	return m->va;
++}
++
++void
++sfos_map_owned_stats(int64_t *maps, int64_t *failures)
++{
++	*maps = sOwnedMaps;
++	*failures = sOwnedMapFailures;
++}
++
++void
++sfos_pages_free(void *cookie)
++{
++	IOBufferMemoryDescriptor *buffer = (IOBufferMemoryDescriptor *)cookie;
++
++	buffer->complete();
++	buffer->release();
++}
++
+ void
+ sfos_free_contig(void *ptr, size_t size)
+ {
+@@ -785,16 +986,52 @@
+ 
+ // locks
+ 
++void
++sfos_mtx_setup(void *storage)
++{
++	sfos_xnu_init();
++	if (sLockTemplates)
++		memcpy(storage, &sMtxTemplate, sizeof(sMtxTemplate));
++	else
++		lck_mtx_init((lck_mtx_t *)storage, sGroup, LCK_ATTR_NULL);
++	OSAddAtomic64(1, (SInt64 *)&sLockSetups);
++}
++
++void
++sfos_rw_setup(void *storage)
++{
++	sfos_xnu_init();
++	if (sLockTemplates)
++		memcpy(storage, &sRwTemplate, sizeof(sRwTemplate));
++	else
++		lck_rw_init((lck_rw_t *)storage, sGroup, LCK_ATTR_NULL);
++	OSAddAtomic64(1, (SInt64 *)&sLockSetups);
++}
++
++int64_t
++sfos_lock_allocated(void)
++{
++	return sLocksAllocated;
++}
++
++uint64_t
++sfos_lock_setups(void)
++{
++	return sLockSetups;
++}
++
+ void *
+ sfos_mtx_alloc(const char *name)
+ {
+ 	sfos_xnu_init();
++	OSAddAtomic64(1, (SInt64 *)&sLocksAllocated);
+ 	return lck_mtx_alloc_init(sGroup, LCK_ATTR_NULL);
+ }
+ 
+ void
+ sfos_mtx_free(void *m)
+ {
++	OSAddAtomic64(-1, (SInt64 *)&sLocksAllocated);
+ 	lck_mtx_free((lck_mtx_t *)m, sGroup);
+ }
+ 
+@@ -820,12 +1057,14 @@
+ sfos_spin_alloc(void)
+ {
+ 	sfos_xnu_init();
++	OSAddAtomic64(1, (SInt64 *)&sLocksAllocated);
+ 	return lck_spin_alloc_init(sGroup, LCK_ATTR_NULL);
+ }
+ 
+ void
+ sfos_spin_free(void *s)
+ {
++	OSAddAtomic64(-1, (SInt64 *)&sLocksAllocated);
+ 	lck_spin_free((lck_spin_t *)s, sGroup);
+ }
+ 
+@@ -857,12 +1096,14 @@
+ sfos_rw_alloc(void)
+ {
+ 	sfos_xnu_init();
++	OSAddAtomic64(1, (SInt64 *)&sLocksAllocated);
+ 	return lck_rw_alloc_init(sGroup, LCK_ATTR_NULL);
+ }
+ 
+ void
+ sfos_rw_free(void *rw)
+ {
++	OSAddAtomic64(-1, (SInt64 *)&sLocksAllocated);
+ 	lck_rw_free((lck_rw_t *)rw, sGroup);
+ }
+ 
+@@ -974,8 +1215,31 @@
+ 	sfos_thread_exit();
+ }
+ 
+-void *
+-sfos_thread_start(void (*fn)(void *), void *arg)
++// linux runs WQ_HIGHPRI work (the RTKit receive queue) on high-priority workers. Here
++// every layer thread was a kernel thread at the default priority (81), so such work waited
++// its turn behind any other kernel thread, a scheduler quantum at worst. Precedence +8 puts
++// it at 89: above ordinary kernel threads, below the preemption band (92 and up).
++// sflkpi_wq_highpri=0 keeps the default priority, for comparison.
++#define SF_HIGHPRI_IMPORTANCE	8
++
++static bool
++sfos_highpri_enabled(void)
++{
++	static int enabled = -1;
++
++	if (enabled < 0) {
++		uint32_t value = 1;
++
++		PE_parse_boot_argn("sflkpi_wq_highpri", &value, sizeof(value));
++		enabled = value != 0;
++		kprintf("fbsdkpi: WQ_HIGHPRI work queue threads run at %s (sflkpi_wq_highpri=%u)\n",
++		    enabled ? "precedence +8" : "the default kernel priority", value);
++	}
++	return enabled != 0;
++}
++
++static void *
++sfos_thread_start_common(void (*fn)(void *), void *arg, bool highpri)
+ {
+ 	sf_start *start = (sf_start *)IOMalloc(sizeof(sf_start));
+ 	if (start == NULL)
+@@ -987,11 +1251,83 @@
+ 		IOFree(start, sizeof(sf_start));
+ 		return NULL;
+ 	}
++	if (highpri && sfos_highpri_enabled()) {
++		thread_precedence_policy_data_t precedence = { SF_HIGHPRI_IMPORTANCE };
++		kern_return_t kr = thread_policy_set(thread, THREAD_PRECEDENCE_POLICY,
++		    (thread_policy_t)&precedence, THREAD_PRECEDENCE_POLICY_COUNT);
++
++		if (kr != KERN_SUCCESS)
++			kprintf("fbsdkpi: thread_policy_set(precedence +%d) failed: 0x%x\n",
++			    SF_HIGHPRI_IMPORTANCE, kr);
++	}
+ 	thread_deallocate(thread);
+ 	return thread;
+ }
+ 
+ void *
++sfos_thread_start(void (*fn)(void *), void *arg)
++{
++	return sfos_thread_start_common(fn, arg, false);
++}
++
++void *
++sfos_thread_start_highpri(void (*fn)(void *), void *arg)
++{
++	return sfos_thread_start_common(fn, arg, true);
++}
++
++// xnu's unique thread id: differs when a thread_t address is reused by a new thread
++uint64_t
++sfos_thread_tid(void *thread)
++{
++	return thread_tid((thread_t)thread);
++}
++
++// Memory pressure: one kernel thread per kext waits in mach_vm_pressure_monitor() (exported
++// to kexts, com.apple.kpi.mach) and calls `fn` each time the pageout daemon is working, at
++// most once a second. The callback runs the Linux shrinkers and trims the page pool.
++extern "C" kern_return_t mach_vm_pressure_monitor(boolean_t wait_for_pressure,
++	unsigned int nsecs_monitored, unsigned int *pages_reclaimed_p, unsigned int *pages_wanted_p);
++static void (*sPressureFn)(void);
++static volatile int64_t sPressureEvents;
++
++static void
++pressure_thread(void *arg, wait_result_t wr)
++{
++	for (;;) {
++		unsigned int reclaimed = 0, wanted = 0;
++		kern_return_t kr = mach_vm_pressure_monitor(TRUE, 1, &reclaimed, &wanted);
++		if (kr == KERN_SUCCESS && wanted != 0) {
++			OSAddAtomic64(1, (SInt64 *)&sPressureEvents);
++			sPressureFn();
++		}
++		IOSleep(1000);
++	}
++}
++
++int
++sfos_pressure_start(void (*fn)(void))
++{
++	thread_t thread;
++
++	if (sPressureFn != NULL)
++		return 0;
++	sPressureFn = fn;
++	if (kernel_thread_start(pressure_thread, NULL, &thread) != KERN_SUCCESS) {
++		sPressureFn = NULL;
++		return -1;
++	}
++	thread_deallocate(thread);
++	return 0;
++}
++
++int64_t
++sfos_pressure_events(void)
++{
++	return sPressureEvents;
++}
++
++void *
+ sfos_thread_current(void)
+ {
+ 	return current_thread();

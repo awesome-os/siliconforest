@@ -1,0 +1,138 @@
+--- a/src/Frameworks/WindowServer/rpc_wayland.c
++++ b/src/Frameworks/WindowServer/rpc_wayland.c
+@@ -35,6 +35,7 @@
+ #include <fcntl.h>
+ #include <errno.h>
+ #include <sys/mman.h>
++#include <sys/stat.h>
+ #include <pthread.h>
+ #include <poll.h>
+ #include <time.h>
+@@ -2170,12 +2171,15 @@
+     queuePush(&event);
+ }
+ 
++static void sfMomentumButton(void);
+ static void pointerButton(void *data, struct wl_pointer *pointer, uint32_t serial,
+                           uint32_t time, uint32_t button, uint32_t state) {
+     noteInput();
+     struct mach_event event = {0};
+     struct wsWindow *window = windowForID(ws.pointerWindowID);
+     int pressed = (state == WL_POINTER_BUTTON_STATE_PRESSED);
++    if (pressed)
++        sfMomentumButton();
+ 
+     ws.inputSerial = serial;
+     if (pressed) {
+@@ -2221,26 +2225,108 @@
+     event.y=window?window->h-lastPointerY:lastPointerY;event.mods=currentModifiers|7u;
+     sfFingerActive=0;sfFingerAxes=0;queuePush(&event);
+ }
++/* (TERM10) Trackpad scrolling as on a Mac, by the desk's contract (DESK10, desk10-001): the built-in trackpad's
++ * two-finger scroll arrives as wl_pointer axis frames with source "finger", the travel already in points with the
++ * desk's acceleration and scroll speed applied, and axis_stop when the fingers are taken as lifted. Every application
++ * gets them as precise deltas (hasPreciseScrollingDeltas, scrollingDelta in points) in a gesture: began, changed,
++ * ended at axis_stop (it was only so for Firefox, SFFX_PRECISE_SCROLL; the others took points/10 as lines). After the
++ * gesture a momentum phase follows as macOS's does: the release speed from the frames of the last 100 ms before the
++ * last moving frame (three frames at least, above 300 points/s), one event a refresh, 0.95 a refresh, ending below
++ * 25 points/s; fingers back down (a new finger frame) or a button ends it at once. No acceleration here: the desk
++ * applied it. A mouse wheel stays a wheel: line deltas, no momentum. SF_WS_FINGER_LINES=1: finger frames as lines
++ * (before). Mods bits for AppKit: 1 precise, 2 began, 4 ended, 8 momentum. */
++static struct {
++    pthread_mutex_t lock;
++    pthread_cond_t wake;
++    int started, window, axis, momentum;
++    double x, y, velocity;
++    double pts[16]; uint64_t ns[16]; unsigned count;   // the gesture's last moving frames
++} sfMomentum = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER };
++
++static uint64_t sfMonoNs(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return (uint64_t)t.tv_sec*1000000000ull+(uint64_t)t.tv_nsec;}
++static int sfFingerLines(void){static int on=-1;if(on<0){const char *e=getenv("SF_WS_FINGER_LINES");on=e&&!strcmp(e,"1");}return on;}
++
++// (lock held) a momentum event at the place of the gesture's last frame
++static void sfMomentumPush(double points,unsigned bits){
++    struct mach_event event={0};
++    event.windowID=sfMomentum.window;event.code=WS_SCROLL_WHEEL;event.x=sfMomentum.x;event.y=sfMomentum.y;
++    event.mods=currentModifiers|1u|8u|bits;
++    if(sfMomentum.axis==WL_POINTER_AXIS_VERTICAL_SCROLL)event.dy=points;else event.dx=points;
++    queuePush(&event);
++}
++
++// (lock held) fingers down again, a button, another source: the momentum ends where it is
++static void sfMomentumStop(void){
++    if(sfMomentum.momentum){sfMomentum.momentum=0;sfMomentumPush(0,4u);}
++}
++
++static void *sfMomentumThread(void *unused){
++    pthread_mutex_lock(&sfMomentum.lock);
++    for(;;){
++        if(!sfMomentum.momentum){pthread_cond_wait(&sfMomentum.wake,&sfMomentum.lock);continue;}
++        sfMomentum.velocity*=0.95;
++        if(fabs(sfMomentum.velocity)<25)sfMomentumStop();
++        else sfMomentumPush(sfMomentum.velocity/60,0);
++        struct timespec until;clock_gettime(CLOCK_REALTIME,&until);
++        uint64_t n=(uint64_t)until.tv_nsec+16666667ull;until.tv_sec+=n/1000000000ull;until.tv_nsec=n%1000000000ull;
++        pthread_cond_timedwait(&sfMomentum.wake,&sfMomentum.lock,&until);
++    }
++    return NULL;
++}
++
++// a finger frame of the gesture (points, the value AppKit gets) or its end
++static void sfMomentumNote(int window,int axis,double points,double x,double y,int ended){
++    pthread_mutex_lock(&sfMomentum.lock);
++    if(!sfMomentum.started){pthread_t t;sfMomentum.started=1;pthread_create(&t,NULL,sfMomentumThread,NULL);pthread_detach(t);}
++    if(!ended){
++        sfMomentumStop();
++        if(sfMomentum.window!=window||sfMomentum.axis!=axis)sfMomentum.count=0;
++        sfMomentum.window=window;sfMomentum.axis=axis;sfMomentum.x=x;sfMomentum.y=y;
++        if(points!=0){unsigned k=sfMomentum.count++%16;sfMomentum.pts[k]=points;sfMomentum.ns[k]=sfMonoNs();}
++    }else{
++        // the speed over the last 100 ms of moving frames, before axis_stop (which comes 40-300 ms late)
++        double sum=0;uint64_t last=0,first=0;unsigned n=0;
++        for(unsigned i=0;i<16&&i<sfMomentum.count;i++){unsigned k=(sfMomentum.count-1-i)%16;
++            if(!last)last=sfMomentum.ns[k];
++            if(last-sfMomentum.ns[k]>100000000ull)break;
++            if(first)sum+=sfMomentum.pts[(k+1)%16];first=sfMomentum.ns[k];n++;}
++        double span=n>=3?(double)(last-first)/1e9:0;
++        sfMomentum.velocity=span>0.004?sum/span:0;
++        sfMomentum.count=0;
++        if(getenv("SF_WS_SCROLL_TRACE"))fprintf(stderr,"WSSCROLL end frames=%u velocity=%.0f momentum=%d\n",n,sfMomentum.velocity,fabs(sfMomentum.velocity)>300);
++        if(fabs(sfMomentum.velocity)>300){sfMomentum.momentum=1;sfMomentumPush(sfMomentum.velocity/60,2u);pthread_cond_signal(&sfMomentum.wake);}
++    }
++    pthread_mutex_unlock(&sfMomentum.lock);
++}
++
++// a pointer button ends a momentum (as touching the trackpad does)
++static void sfMomentumButton(void){
++    pthread_mutex_lock(&sfMomentum.lock);sfMomentumStop();pthread_mutex_unlock(&sfMomentum.lock);
++}
++
+ static void pointerAxis(void *data,struct wl_pointer *pointer,uint32_t time,uint32_t axis,wl_fixed_t value){
+     if(axis>WL_POINTER_AXIS_HORIZONTAL_SCROLL)return;
+     noteInput();struct mach_event event={0};struct wsWindow *window=windowForID(ws.pointerWindowID);
+-    int precise=sfPreciseScroll()&&sfAxisSource==WL_POINTER_AXIS_SOURCE_FINGER;
++    int precise=sfAxisSource==WL_POINTER_AXIS_SOURCE_FINGER&&(sfPreciseScroll()||!sfFingerLines());
+     double delta=-wl_fixed_to_double(value)/(precise?1.0:10.0);
+     event.windowID=ws.pointerWindowID;event.code=WS_SCROLL_WHEEL;event.x=lastPointerX;
+     event.y=window?window->h-lastPointerY:lastPointerY;event.mods=currentModifiers;
+-    if(precise){if(sfFingerActive&&sfFingerWindowID!=ws.pointerWindowID)sfFingerCancel();event.mods|=1u;if(!sfFingerActive)event.mods|=2u;sfFingerActive=1;sfFingerWindowID=ws.pointerWindowID;sfFingerAxes|=1u<<axis;}
++    if(precise){if(sfFingerActive&&sfFingerWindowID!=ws.pointerWindowID)sfFingerCancel();event.mods|=1u;if(!sfFingerActive)event.mods|=2u;sfFingerActive=1;sfFingerWindowID=ws.pointerWindowID;sfFingerAxes|=1u<<axis;
++        sfMomentumNote(ws.pointerWindowID,axis,delta,event.x,event.y,0);}
+     if(axis==WL_POINTER_AXIS_VERTICAL_SCROLL)event.dy=delta;else event.dx=delta;
++    if(getenv("SF_WS_SCROLL_TRACE"))fprintf(stderr,"WSSCROLL axis=%u source=%u value=%.2f -> %s %.2f bits=%u\n",axis,sfAxisSource,wl_fixed_to_double(value),precise?"points":"lines",delta,event.mods&15u);
+     queuePush(&event);
+ }
+ static void pointerFrame(void *data,struct wl_pointer *pointer){}
+ static void pointerAxisSource(void *data,struct wl_pointer *pointer,uint32_t source){if(source!=WL_POINTER_AXIS_SOURCE_FINGER)sfFingerCancel();sfAxisSource=source;}
+ static void pointerAxisStop(void *data,struct wl_pointer *pointer,uint32_t time,uint32_t axis){
+-    if(axis>WL_POINTER_AXIS_HORIZONTAL_SCROLL||!sfPreciseScroll()||!sfFingerActive)return;
++    if(axis>WL_POINTER_AXIS_HORIZONTAL_SCROLL||!(sfPreciseScroll()||!sfFingerLines())||!sfFingerActive)return;
+     sfFingerAxes&=~(1u<<axis);if(sfFingerAxes)return;
+     struct mach_event event={0};struct wsWindow *window=windowForID(ws.pointerWindowID);
+     event.windowID=ws.pointerWindowID;event.code=WS_SCROLL_WHEEL;event.x=lastPointerX;
+     event.y=window?window->h-lastPointerY:lastPointerY;event.mods=currentModifiers|1u|4u;
+     sfFingerActive=0;sfAxisSource=WL_POINTER_AXIS_SOURCE_WHEEL;queuePush(&event);
++    sfMomentumNote(ws.pointerWindowID,axis,0,event.x,event.y,1);
+ }
+ static void pointerAxisDiscrete(void *data,struct wl_pointer *pointer,uint32_t axis,int32_t discrete){}
+ 

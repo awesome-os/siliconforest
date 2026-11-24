@@ -1,0 +1,25 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# SFAppleAVD, one boot without the desktop: the decoder is brought up at the first open of
+# /dev/sfavd and every recording staged under /private/var/avd is decoded by it
+# (sfavd-replay prints one hash per picture; tools/avd_summary.sh compares them with a
+# software decode made on the workstation). (@SSID@/@PSK@ are unused; the assembler fills
+# templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nAVD_BEGIN_%s\n' "$nonce"
+get() { sysctl -n "kern.sf_avd.$1" 2>/dev/null; }
+printf 'AVD_STATE start %s\n' "$(get state)"
+ls -l /dev/sfavd /Library/Firmware/apple/ 2>&1 | sed 's/^/AVD_LS /'
+for rec in /private/var/avd/*.pdaj; do
+    [ -f "$rec" ] || continue
+    name=$(basename "$rec" .pdaj)
+    printf 'AVD_CLIP_BEGIN %s\n' "$name"
+    sfavd-replay @REPLAY_ARGS@ "$rec" 2>&1
+    printf 'AVD_CLIP_END %s rc=%s\n' "$name" "$?"
+    printf 'AVD_STATS %s %s\n' "$name" "$(get stats)"
+done
+printf 'AVD_STATE end %s\n' "$(get state)"
+@EXTRA@
+printf 'AVD_END_%s\n' "$nonce"
+printf '\nPD_BENCH_DONE\n'

@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "reviewer": "Grok",
+  "status": "READ_ONLY_PROPOSAL_NO_NATIVE_INPUT",
+  "edits": false,
+  "hardware_accessed": false,
+  "native_input_claimed": false,
+  "frozen_chonkstep_source_set_sha256": "36788d2155131f9875b251c6d2b0038f7d152c8372c8c4a5b02e4d973f66c99e",
+  "files_sha256": {
+    "sources/chonkstep-darwin/crates/wm-darwin/src/main.rs": "99ffbeaa82375db72bfc27f2a64694664216ceec76d0aa5955004692b3e9977e",
+    "sources/chonkstep-darwin/crates/wm-darwin/src/hid.rs": "eace58887c692cef0f160960eb52c9888f71e50d9e909f609b8c344a8a024bd9",
+    "sources/chonkstep-darwin/crates/wm-darwin/src/input.rs": "26bbb8637e0f8902069128f144347c3d6ca8aa4fea5dde3f712053abc0cb0431",
+    "integrations/puredarwin/m1-bringup/host_progress.py": "d23923163b75360ca207c01fd0dbb1fcb89d3fd281500728e4a639bc0ba70e3c",
+    "PDHIDEventQueue.cpp": "c7a2f35bd86bc2da17c766d39728d930fe80aedf1526935b739e74e74204a602",
+    "PDM1SPIHID.cpp": "b38f00879e8505de17c02ef59c6c6d22e1b818fd7dba27e2411ab76740101389"
+  },
+  "findings": [
+    "main.rs accepts only --input pdhid and NativeHid::open opens both /dev/usb_hid_kbd and /dev/usb_hid_mouse. Either open failure returns before a seat exists. drain reads both fds.",
+    "enable_pdhid_seat always calls add_keyboard and add_pointer. Smithay compute_caps advertises Pointer only when the pointer handle is Some, so a keyboard-only seat is add_keyboard alone.",
+    "PDHIDPushKeyboardEvent publishes /dev/usb_hid_kbd on first use when gKbdLock is missing (PDHIDEventQueue.cpp:544). The mouse node is published from pd_hid_mouse_enqueue (line 570), not with the keyboard. A keyboard-only driver therefore does not create the mouse node.",
+    "pd_hid_kbd_open sets gKbdGrabbed until the last close. The mouse open path does not. A later compositor open of the keyboard node takes console delivery for as long as that fd lives.",
+    "PDM1SPIHID::poll calls handleReport only for m1kbd_keyboard_input (device 1, flags 0x20, command 0x10). Other reports increment otherMessages and are not relabeled as keyboard or trackpad. This file does not call PDHIDPushMouseEvent. IOHIDEventService pushes keyboard-page usages <= 0xE7 into PDHIDPushKeyboardEvent. Astra's response-id fix is separate and was not reviewed here.",
+    "host_progress appends pdm1kbd=1 only when keyboard_enabled is true. keyboard_enabled requires the exact keyboard_experiment record, a ramdisk, fileset kind 12, exactly one org.puredarwin.driver.PDM1SPIHID member, and not desktop_enabled. ConsoleSession rejects desktop and keyboard together and sends darwin-keyboard-test only for the keyboard flag. desktop_experiment alone does not append the bootarg."
+  ],
+  "later_wm_darwin": {
+    "leave_frozen": "36788d2155131f9875b251c6d2b0038f7d152c8372c8c4a5b02e4d973f66c99e",
+    "keep": "--input pdhid still means both character devices",
+    "add": "--input pdhid-kbd opens only /dev/usb_hid_kbd with the existing O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC and character-device check, drains that queue only, and does not open /dev/usb_hid_mouse",
+    "seat": "add_keyboard always for this token. Call add_pointer only when a mouse fd was opened. deliver_hid rejects pointer events when no pointer was added. Missing keyboard node is a hard error. Missing mouse node is not an error on pdhid-kbd.",
+    "not_success": "A created seat, an advertised capability, or a later queue read is not native input. The existing stderr line that qualification is still required stays."
+  },
+  "later_host_record": {
+    "key": "native_keyboard_driver",
+    "exact": {"version": 1, "bootarg": "pdm1kbd=1", "kext": "org.puredarwin.driver.PDM1SPIHID"},
+    "accept_when": [
+      "build_record desktop_experiment equals {\"version\": 1, \"command\": \"/usr/bin/darwin-desktop-test\"}",
+      "ramdisk is present in the bound contents",
+      "keyboard_experiment is absent",
+      "kernel filetype is 12 and exactly one fileset member is named org.puredarwin.driver.PDM1SPIHID"
+    ],
+    "reject": "any other object, a non-int version, keyboard_experiment present, desktop_experiment absent, missing ramdisk, or a member count other than 1",
+    "effect": "Append the single token pdm1kbd=1 to the existing BOOTARGS. Leave ConsoleSession keyboard false. Do not send /usr/bin/darwin-keyboard-test. The desktop command string stays /usr/bin/darwin-desktop-test plus the validated nonce.",
+    "tests_to_add": [
+      "desktop record plus this exact object appends pdm1kbd=1 and does not write keyboard-input.bin",
+      "this object without desktop_experiment is refused",
+      "this object plus keyboard_experiment is refused",
+      "a second or missing PDM1SPIHID member is refused"
+    ]
+  },
+  "limits": "Source reading only. No compositor edit, no host_progress edit, no build, no boot. Node publication and a seat capability do not show that a key arrived or that a person typed."
+}

@@ -1,0 +1,61 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Unattended check of the default output following the jack, one boot (tools/sa_boot.sh sd<NN>
+# guest/darwin-sysaudio-jack.in). The speakers device does not exist yet and the jack is empty,
+# so both are stood in for: coreaudiod takes /dev/null as the speakers' node
+# (COREAUDIOD_SPEAKER_DEVICE) and reads the jack from a file (COREAUDIOD_JACK_FILE). The
+# headphones are the real /dev/sfaudio. One client plays throughout:
+#   speakers    jack 0: the default is Speakers, the driver of the headphones stays idle
+#   headphones  jack 1: the default becomes Headphones within a poll, the driver plays
+#   speakers    jack 0 again: back, the driver stops some seconds later
+#   volume      sfvolume on Speakers (software volume) must not move kern.sf_sound.volume_db
+# Quiet: codec attenuation @VOLUME@ dB, tone @TONEDB@ dB below full scale.
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+@COMMON@
+printf '\nSA_BEGIN_%s\n' "$nonce"
+bringup
+
+phase server
+jack=/var/run/sfjack
+mkdir -p /var/run
+echo 0 > "$jack"
+COREAUDIOD_SPEAKER_DEVICE=/dev/null; COREAUDIOD_JACK_FILE=$jack
+export COREAUDIOD_SPEAKER_DEVICE COREAUDIOD_JACK_FILE
+start_server
+sleep 1
+showlog
+bounded 10 sfvolume get
+mon server
+
+phase speakers
+sftone -r 44100 -f 440 -s 16 -d @TONEDB@ -n route 2>&1 &
+tone=$!
+sleep 3
+mon on-speakers
+bounded 10 sfvolume set 30
+printf 'SA_VOL on Speakers: kern.sf_sound.volume_db=%s\n' "$(get kern.sf_sound.volume_db)"
+
+phase headphones
+echo 1 > "$jack"
+sleep 1
+bounded 10 sfvolume get
+sleep 3
+mon on-headphones
+f0=$(get kern.sf_sound.frames); sleep 2
+printf 'SA_FRAMES headphones-2s %s\n' $(( $(get kern.sf_sound.frames) - f0 ))
+showlog
+
+phase speakers-again
+echo 0 > "$jack"
+sleep 1
+bounded 10 sfvolume get
+wait_pids 25 "$tone"
+idle 15 after-switch
+mon after-switch
+showlog
+
+phase end
+mon end
+kill "$server" 2>/dev/null
+printf 'SA_END_%s\n' "$nonce"
+printf '\nPD_BENCH_DONE\n'

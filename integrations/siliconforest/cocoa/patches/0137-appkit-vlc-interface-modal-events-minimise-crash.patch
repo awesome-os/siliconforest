@@ -1,0 +1,630 @@
+--- a/src/Frameworks/AppKit/NSColor.subproj/NSColor.h
++++ b/src/Frameworks/AppKit/NSColor.subproj/NSColor.h
+@@ -27,6 +27,8 @@
+ 
+ + (NSColor *)alternateSelectedControlColor;
+ + (NSColor *)controlAccentColor;
+++ (NSUInteger)currentControlTint; // an NSControlTint (NSCell.h)
+++ (NSColor *)colorForControlTint:(NSUInteger)controlTint;
+ // resolves through the provider against the appearance being drawn
+ + (NSColor *)colorWithName:(NSString *)name dynamicProvider:(NSColor *(^)(NSAppearance *appearance))provider;
+ + (NSColor *)labelColor;
+--- a/src/Frameworks/AppKit/NSColor.subproj/NSColor.m
++++ b/src/Frameworks/AppKit/NSColor.subproj/NSColor.m
+@@ -18,6 +18,7 @@
+ #import <AppKit/NSRaise.h>
+ #import <AppKit/NSImage.h>
+ #import <AppKit/NSBezierPath.h>
++#import <AppKit/NSCell.h>
+ 
+ #import <AppKit/NSGraphics.h>
+ #import <AppKit/NSGraphicsContext.h>
+@@ -267,6 +268,57 @@
+     return cached;
+ }
+ 
++// (TERM8) +currentControlTint (VLC's interface asks it): macOS's AppleAquaColorVariant in the global domain, 6 graphite and
++// anything else blue; an accent colour of graphite (AppleAccentColor -1) is graphite too. Read again only when a global
++// preferences file changed, as for controlAccentColor.
+++(NSControlTint)currentControlTint {
++    static NSControlTint tint = NSBlueControlTint;
++    static struct timespec seen[2];
++    static BOOL read;
++    static char paths[2][1024];
++    struct timespec now[2] = { { 0, 0 }, { 0, 0 } };
++    struct stat st;
++    CFPropertyListRef v;
++
++    if (paths[0][0] == 0) {
++        const char *home = getenv("CFFIXED_USER_HOME") ?: getenv("HOME") ?: "/var/root";
++
++        snprintf(paths[0], sizeof(paths[0]), "%s/Library/Preferences/.GlobalPreferences.plist", home);
++        snprintf(paths[1], sizeof(paths[1]), "/Library/Preferences/.GlobalPreferences.plist");
++    }
++    for (int i = 0; i < 2; i++)
++        if (stat(paths[i], &st) == 0)
++            now[i] = st.st_mtimespec;
++    if (read && memcmp(now, seen, sizeof(now)) == 0)
++        return tint;
++    memcpy(seen, now, sizeof(now));
++    read = YES;
++    CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
++    tint = NSBlueControlTint;
++    if ((v = CFPreferencesCopyAppValue(CFSTR("AppleAquaColorVariant"), kCFPreferencesAnyApplication)) != NULL) {
++        if ([(id)v respondsToSelector:@selector(intValue)] && [(id)v intValue] == NSGraphiteControlTint)
++            tint = NSGraphiteControlTint;
++        CFRelease(v);
++    }
++    if ((v = CFPreferencesCopyAppValue(CFSTR("AppleAccentColor"), kCFPreferencesAnyApplication)) != NULL) {
++        if ([(id)v respondsToSelector:@selector(intValue)] && [(id)v intValue] == -1)
++            tint = NSGraphiteControlTint;
++        CFRelease(v);
++    }
++    return tint;
++}
++
++// the colour of a tint: the accent colour for blue (and the default), graphite grey, clear
+++(NSColor *)colorForControlTint:(NSControlTint)controlTint {
++    if (controlTint == NSDefaultControlTint)
++        controlTint = [self currentControlTint];
++    if (controlTint == NSGraphiteControlTint)
++        return [NSColor colorWithCalibratedRed:0x8c / 255.0 green:0x8c / 255.0 blue:0x8c / 255.0 alpha:1];
++    if (controlTint == NSClearControlTint)
++        return [NSColor clearColor];
++    return [self controlAccentColor];
++}
++
+ +(NSColor *)alternateSelectedControlColor {
+     return [NSColor colorWithCatalogName:@"System" colorName:@"alternateSelectedControlColor"];
+ }
+--- a/src/Frameworks/AppKit/NSCell.h
++++ b/src/Frameworks/AppKit/NSCell.h
+@@ -80,6 +80,14 @@
+ 
+ typedef NSUInteger NSControlTint;
+ 
++// (TERM8) macOS's values
++enum {
++    NSDefaultControlTint = 0,
++    NSBlueControlTint = 1,
++    NSGraphiteControlTint = 6,
++    NSClearControlTint = 7
++};
++
+ enum {
+     NSBackgroundStyleLight = 0,
+     NSBackgroundStyleDark = 1,
+--- a/src/Frameworks/AppKit/NSImage.m
++++ b/src/Frameworks/AppKit/NSImage.m
+@@ -162,6 +162,34 @@
+     [image setName:name];
+    }
+ 
++   // (TERM8) macOS's standard template images (NSImageNameActionTemplate ...: VLC's interface, toolbars): AppKit's own
++   // drawings of the symbol each stands for (SFSymbolGlyphs.m); a name without a drawing here answers nil, as before
++   if(image==nil && [name hasPrefix:@"NS"] && [name hasSuffix:@"Template"]){
++    static NSDictionary *symbols;
++
++    if(symbols==nil)
++     symbols=[[NSDictionary alloc] initWithObjectsAndKeys:
++      @"gearshape",@"NSActionTemplate", @"plus",@"NSAddTemplate", @"minus",@"NSRemoveTemplate",
++      @"chevron.forward",@"NSGoForwardTemplate", @"chevron.backward",@"NSGoBackTemplate",
++      @"chevron.right",@"NSGoRightTemplate", @"chevron.left",@"NSGoLeftTemplate",
++      @"arrowtriangle.right.fill",@"NSRightFacingTriangleTemplate", @"arrowtriangle.left.fill",@"NSLeftFacingTriangleTemplate",
++      @"arrow.clockwise",@"NSRefreshTemplate", @"arrow.clockwise.circle.fill",@"NSRefreshFreestandingTemplate",
++      @"xmark",@"NSStopProgressTemplate", @"xmark.circle.fill",@"NSStopProgressFreestandingTemplate",
++      @"eye",@"NSQuickLookTemplate", @"house",@"NSHomeTemplate", @"book",@"NSBookmarksTemplate",
++      @"square.and.arrow.up",@"NSShareTemplate", @"lock.fill",@"NSLockLockedTemplate", @"lock.open.fill",@"NSLockUnlockedTemplate",
++      @"square.grid.2x2",@"NSIconViewTemplate", @"list.bullet",@"NSListViewTemplate", @"play.fill",@"NSSlideshowTemplate",
++      @"minus",@"NSMenuMixedStateTemplate", @"exclamationmark.circle.fill",@"NSInvalidDataFreestandingTemplate",
++      @"magnifyingglass.circle.fill",@"NSRevealFreestandingTemplate", @"arrow.right.circle.fill",@"NSFollowLinkFreestandingTemplate",
++      @"checkmark",@"NSMenuOnStateTemplate", @"pause.fill",@"NSTouchBarPauseTemplate", @"play.fill",@"NSTouchBarPlayTemplate",
++      nil];
++    NSString *symbol=[symbols objectForKey:name];
++
++    if(symbol!=nil && (image=[self imageWithSystemSymbolName:symbol accessibilityDescription:nil])!=nil){
++     [image setTemplate:YES];
++     [image setName:name];
++    }
++   }
++
+    // the application icon comes from NSApplication, which loads it from the bundle or a default
+    if(image==nil && [name isEqualToString:NSImageNameApplicationIcon])
+     image=[NSApp applicationIconImage];
+@@ -929,6 +957,20 @@
+ 
+         context=NSCurrentGraphicsPort();
+ 
++        // (TERM8) no current context (an application drawing outside any focus: Terminal does when its window is
++        // miniaturised): nothing to draw into, as on macOS, where CoreGraphics logs an invalid context. 0133's alpha
++        // read below dereferenced it: Terminal ended with SIGSEGV at every minimise
++        if(context==NULL){
++         static BOOL said;
++
++         if(!said){
++          said=YES;
++          NSLog(@"-[NSImage drawInRect:fromRect:operation:fraction:] with no current graphics context: nothing drawn");
++         }
++         [pool release];
++         return;
++        }
++
+         CGContextSaveGState(context);
+ 
+         // Onyx2D fades images by the state's alpha, the old 1x1 clip mask was never applied. (TERM7) The fraction
+--- a/src/Frameworks/AppKit/NSStatusItem.m
++++ b/src/Frameworks/AppKit/NSStatusItem.m
+@@ -8,6 +8,7 @@
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+ 
+ #import <AppKit/NSStatusItem.h>
++#include <stdio.h>
+ #import <AppKit/NSStatusBar.h>
+ #import <AppKit/NSRaise.h>
+ #import <AppKit/NSImage.h>
+@@ -235,6 +236,20 @@
+ 
+ #endif
+ 
++#ifndef WIN32
++// (TERM8) the status bar on this desktop: there is no menu bar process and the compositor shows no status items, so
++// an item keeps what the application sets (image, title, menu, target) and is shown nowhere. -setImage: and
++// -setAlternateImage: called this, which nothing implemented (VLC's status icon ended on it). Said once per process.
++-(void)_update {
++    static BOOL said;
++
++    if(!said){
++     said=YES;
++     fprintf(stderr,"NSStatusItem: this desktop has no status bar; status items are kept and not shown\n");
++    }
++}
++#endif
++
+ #pragma mark Public Methods
+ 
+ - (id)init {
+--- a/src/Frameworks/AppKit/NSSegmentedControl/NSSegmentedCell.m
++++ b/src/Frameworks/AppKit/NSSegmentedControl/NSSegmentedCell.m
+@@ -384,6 +384,20 @@
+    }
+ }
+ 
++// (TERM8) the frame -drawWithFrame:inView: gives a segment (VLC's segmented cells draw their own segments in it)
++-(NSRect)rectForSegment:(NSInteger)segment inFrame:(NSRect)frame {
++   NSInteger i,count=[self segmentCount];
++   CGFloat x=NSMinX(frame);
++
++   if(segment<0 || segment>=count)
++    return NSZeroRect;
++   [self _layoutSegmentsInWidth:frame.size.width];
++   for(i=0;i<segment;i++)
++    x+=[[_segmentComputedWidths objectAtIndex:i] doubleValue];
++   CGFloat w=[[_segmentComputedWidths objectAtIndex:segment] doubleValue];
++   return NSMakeRect(round(x*2)/2,NSMinY(frame),round((x+w)*2)/2-round(x*2)/2,frame.size.height);
++}
++
+ -(NSSize)cellSize
+ {
+     CGFloat width=0;
+--- a/src/Frameworks/AppKit/NSVLCAdditions.m
++++ b/src/Frameworks/AppKit/NSVLCAdditions.m
+@@ -0,0 +1,123 @@
++/* SPDX-License-Identifier: MIT */
++/* (TERM8) What VLC 3's interface (libmacosx_plugin) sends that this AppKit did not answer (a scan of the selectors it
++   sends against the M1's installed frameworks, docs/roadmap/issues/SF-Y-terminal-app.md, "TERM8 round"):
++     -[NSCell/NSTextField allowsEditingTextAttributes], -setAllowsEditingTextAttributes:, -importsGraphics,
++       -setImportsGraphics: (kept with the cell; this field editor takes plain text either way, as a field without the
++       flag does on macOS);
++     -[NSMutableAttributedString setAlignment:range:] (AppKit's addition on macOS: the paragraph style of each
++       paragraph the range touches gets the alignment) and -[NSTextView setAlignment:range:];
++   (NSSegmentedCell.m has -rectForSegment:inFrame:, where -drawWithFrame:inView: puts that segment.) */
++#import <AppKit/AppKit.h>
++#import <objc/runtime.h>
++
++@interface NSTextView (SFAlignment)
++- (void)_setAlignment:(NSTextAlignment)alignment range:(NSRange)range;
++@end
++
++static char kAllowsEditingTextAttributes, kImportsGraphics;
++
++static BOOL flag(id self, const void *key) {
++    return [objc_getAssociatedObject(self, key) boolValue];
++}
++
++static void setFlag(id self, const void *key, BOOL value) {
++    objc_setAssociatedObject(self, key, value ? [NSNumber numberWithBool:YES] : nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
++}
++
++@implementation NSCell (SFTextAttributesFlags)
++
++- (BOOL)allowsEditingTextAttributes {
++    return flag(self, &kAllowsEditingTextAttributes);
++}
++
++- (void)setAllowsEditingTextAttributes:(BOOL)value {
++    setFlag(self, &kAllowsEditingTextAttributes, value);
++    if (!value)
++        setFlag(self, &kImportsGraphics, NO);   // macOS: importing graphics needs editable attributes
++}
++
++- (BOOL)importsGraphics {
++    return flag(self, &kImportsGraphics);
++}
++
++- (void)setImportsGraphics:(BOOL)value {
++    setFlag(self, &kImportsGraphics, value);
++    if (value)
++        setFlag(self, &kAllowsEditingTextAttributes, YES);
++}
++
++@end
++
++@implementation NSTextField (SFTextAttributesFlags)
++
++- (BOOL)allowsEditingTextAttributes {
++    return [[self cell] allowsEditingTextAttributes];
++}
++
++- (void)setAllowsEditingTextAttributes:(BOOL)value {
++    [[self cell] setAllowsEditingTextAttributes:value];
++}
++
++- (BOOL)importsGraphics {
++    return [[self cell] importsGraphics];
++}
++
++- (void)setImportsGraphics:(BOOL)value {
++    [[self cell] setImportsGraphics:value];
++}
++
++@end
++
++@implementation NSMutableAttributedString (SFAlignmentRange)
++
++- (void)setAlignment:(NSTextAlignment)alignment range:(NSRange)range {
++    NSString *string = [self string];
++    NSUInteger length = [string length];
++
++    if (NSMaxRange(range) > length)
++        [NSException raise:NSRangeException format:@"-[%@ %s]: range %@ beyond length %lu", [self class],
++                                                   sel_getName(_cmd), NSStringFromRange(range), (unsigned long)length];
++    if (length == 0)
++        return;
++    range = [string paragraphRangeForRange:range];
++    [self beginEditing];
++    for (NSUInteger at = range.location; at < NSMaxRange(range);) {
++        NSRange paragraph = [string paragraphRangeForRange:NSMakeRange(at, 0)];
++        NSRange effective;
++        NSParagraphStyle *style = [self attribute:NSParagraphStyleAttributeName atIndex:paragraph.location
++                                   effectiveRange:&effective];
++        NSMutableParagraphStyle *changed = [[(style ?: [NSParagraphStyle defaultParagraphStyle]) mutableCopy] autorelease];
++
++        [changed setAlignment:alignment];
++        [self addAttribute:NSParagraphStyleAttributeName value:changed range:paragraph];
++        if (NSMaxRange(paragraph) <= at)
++            break;
++        at = NSMaxRange(paragraph);
++    }
++    [self endEditing];
++}
++
++@end
++
++@implementation NSTextView (SFAlignmentRange)
++
++- (void)setAlignment:(NSTextAlignment)alignment range:(NSRange)range {
++    [self _setAlignment:alignment range:range];
++}
++
++@end
++
++/* -[NSView wantsExtendedDynamicRangeOpenGLSurface] (VLC's video output asks for it): kept with the view; this
++   display path has no extended dynamic range, so the surface is the standard range either way, as on a macOS
++   display without EDR */
++@implementation NSView (SFExtendedDynamicRange)
++
++- (BOOL)wantsExtendedDynamicRangeOpenGLSurface {
++    return flag(self, @selector(wantsExtendedDynamicRangeOpenGLSurface));
++}
++
++- (void)setWantsExtendedDynamicRangeOpenGLSurface:(BOOL)value {
++    setFlag(self, @selector(wantsExtendedDynamicRangeOpenGLSurface), value);
++}
++
++@end
+--- a/src/Frameworks/AppKit/NSOutlineView.m
++++ b/src/Frameworks/AppKit/NSOutlineView.m
+@@ -8,6 +8,7 @@
+ 
+ #import <sys/param.h>
+ #import <AppKit/NSOutlineView.h>
++#import <objc/runtime.h>
+ #import <AppKit/NSInterfaceStyle.h>
+ #import <AppKit/NSGraphicsStyle.h>
+ #import <AppKit/NSImage.h>
+@@ -432,8 +433,11 @@
+     [self reloadItem:item reloadChildren:NO];
+ }
+ 
++// (TERM8) the drop's target as the data source retargets it in its validation (VLC's playlist): kept for
++// -acceptDrop:; this outline view draws no drop highlight of its own
+ -(void)setDropItem:(id)item dropChildIndex:(int)index {
+-    NSUnimplementedMethod();
++    objc_setAssociatedObject(self, @selector(setDropItem:dropChildIndex:), item, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
++    objc_setAssociatedObject(self, @selector(dropChildIndex), [NSNumber numberWithInt:index], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+ }
+ 
+ -(BOOL)shouldCollapseAutoExpandedItemsForDeposited:(BOOL)collapse {
+--- a/src/Frameworks/AppKit/NSSliderCell.m
++++ b/src/Frameworks/AppKit/NSSliderCell.m
+@@ -24,6 +24,10 @@
+ 
+ #define ABS(x) ((x)>=0 ? (x) : -(x))
+ 
++@interface NSSliderCell(SFTrack)
++-(NSRect)_sliderRect;
++@end
++
+ @implementation NSSliderCell
+ 
+ -(void)encodeWithCoder:(NSCoder *)coder {
+@@ -195,9 +199,9 @@
+    return closestValue;
+ }
+ 
++// (TERM8) where the knob travels: the bar's rect of the last drawing (VLC's slider cells draw in it)
+ -(NSRect)trackRect {
+-   NSUnimplementedMethod();
+-   return NSZeroRect;
++   return [self _sliderRect];
+ }
+ 
+ -(NSRect)rectOfTickMarkAtIndex:(NSInteger)index {
+--- a/src/Frameworks/AppKit/NSClipView.m
++++ b/src/Frameworks/AppKit/NSClipView.m
+@@ -137,9 +137,16 @@
+    }
+ }
+ 
++// (TERM8) the document view's frame, at least as large as the clip view (macOS's definition)
+ -(NSRect)documentRect {
+-   NSUnimplementedMethod();
+-   return NSMakeRect(0,0,0,0);
++   NSRect result=(_docView!=nil)?[_docView frame]:NSZeroRect;
++   NSRect bounds=[self bounds];
++
++   if(result.size.width<bounds.size.width)
++    result.size.width=bounds.size.width;
++   if(result.size.height<bounds.size.height)
++    result.size.height=bounds.size.height;
++   return result;
+ }
+ 
+ -(NSRect)documentVisibleRect {
+--- a/src/Frameworks/AppKit/NSBox.m
++++ b/src/Frameworks/AppKit/NSBox.m
+@@ -266,8 +266,29 @@
+    [self setFrame:content];
+ }
+ 
++// (TERM8) macOS: the content view is made to just enclose its subviews, and the box wraps the content view
+ -(void)sizeToFit {
+-   NSUnimplementedMethod();
++   NSView *content=[self contentView];
++   NSArray *subviews=[content subviews];
++   NSRect   all=NSZeroRect;
++   NSUInteger i;
++
++   if([subviews count]==0)
++    return;
++   for(i=0;i<[subviews count];i++)
++    all=(i==0)?[[subviews objectAtIndex:i] frame]:NSUnionRect(all,[[subviews objectAtIndex:i] frame]);
++   for(i=0;i<[subviews count];i++){
++    NSView *view=[subviews objectAtIndex:i];
++    NSRect  frame=[view frame];
++
++    [view setFrameOrigin:NSMakePoint(frame.origin.x-all.origin.x,frame.origin.y-all.origin.y)];
++   }
++   NSRect frame=[self frame];
++   NSSize contentSize=[content frame].size;
++
++   frame.size.width+=ceil(all.size.width)-contentSize.width;
++   frame.size.height+=ceil(all.size.height)-contentSize.height;
++   [self setFrame:frame];
+ }
+ 
+ // the rounded well macOS 15 draws, three points in from the sides and fourteen below a top title
+--- a/src/Frameworks/AppKit/NSButtonCell.m
++++ b/src/Frameworks/AppKit/NSButtonCell.m
+@@ -1479,12 +1479,15 @@
+     [_controlView performSelector:@selector(performClick:) withObject:sender];
+ }
+ 
++// (TERM8) the pointer over a button: a button that shows its border only while the pointer is inside is drawn again
+ -(void)mouseEntered:(NSEvent *)event {
+-   NSUnimplementedMethod();
++   if([self showsBorderOnlyWhileMouseInside])
++    [(NSControl *)[self controlView] updateCell:self];
+ }
+ 
+ -(void)mouseExited:(NSEvent *)event {
+-   NSUnimplementedMethod();
++   if([self showsBorderOnlyWhileMouseInside])
++    [(NSControl *)[self controlView] updateCell:self];
+ }
+ 
+ @end
+--- a/src/Frameworks/AppKit/NSAnimation/NSAnimation.m
++++ b/src/Frameworks/AppKit/NSAnimation/NSAnimation.m
+@@ -8,6 +8,7 @@
+ 
+ #import <sys/param.h>
+ #import <AppKit/NSAnimation.h>
++#import <AppKit/NSApplication.h>
+ #import <Foundation/NSString.h>
+ #import <AppKit/NSRaise.h>
+ #import <Foundation/NSArray.h>
+@@ -198,7 +199,10 @@
+       break;
+ 
+      case NSAnimationNonblockingThreaded:
+-      NSUnimplementedMethod();
++      // (TERM8) no animation thread here: the frames are timed on the main run loop, as a nonblocking animation
++      _timer=[NSTimer timerWithTimeInterval:1.0/_frameRate target:self selector:@selector(timer:) userInfo:nil repeats:YES];
++      [[NSRunLoop mainRunLoop] addTimer:_timer forMode:NSDefaultRunLoopMode];
++      [[NSRunLoop mainRunLoop] addTimer:_timer forMode:NSEventTrackingRunLoopMode];
+       break;
+    }
+ 
+--- a/src/Frameworks/AppKit/NSBrowserCell.m
++++ b/src/Frameworks/AppKit/NSBrowserCell.m
+@@ -63,8 +63,9 @@
+    _isLoaded=value;
+ }
+ 
++// (TERM8) the cell's image as NSCell keeps it (it was raised on)
+ -(void)setImage:(NSImage *)value {
+-   NSUnimplementedMethod();
++   [super setImage:value];
+ }
+ 
+ -(void)setAlternateImage:(NSImage *)value {
+--- a/src/Frameworks/AppKit/NSApplication.m
++++ b/src/Frameworks/AppKit/NSApplication.m
+@@ -1727,6 +1727,7 @@
+ -(void)_openUntitledFile:(NSDocumentController *)controller {
+    BOOL needsUntitled=YES;
+ 
++
+    if(needsUntitled && _delegate &&
+       [_delegate respondsToSelector: @selector(applicationShouldOpenUntitledFile:)]) {
+        needsUntitled = [_delegate applicationShouldOpenUntitledFile: self];
+@@ -2320,8 +2321,15 @@
+    int result;
+ 
+    while((result=[NSApp runModalSession:session])==NSRunContinuesResponse){
+-    //NSDate *date = [NSDate dateWithTimeIntervalSinceNow:0.1];
+-    [[NSRunLoop currentRunLoop] runMode:NSModalPanelRunLoopMode beforeDate:[NSDate distantFuture]];
++    // (TERM8) wait for the next event or anything else of the modal mode (a timer, work sent from another thread).
++    // The window server's event pipe is a source of a mode only while an event is asked for, so this wait had none:
++    // a click or key woke the panel only when some timer happened to fire, and never in an application without
++    // one (VLC's first-run alert, shown before -run, waited for ever)
++    NSRunLoop *loop=[NSRunLoop currentRunLoop];
++
++    [loop addInputSource:[self inputSource] forMode:NSModalPanelRunLoopMode];
++    [loop runMode:NSModalPanelRunLoopMode beforeDate:[NSDate distantFuture]];
++    [loop removeInputSource:[self inputSource] forMode:NSModalPanelRunLoopMode];
+    }
+ 
+    [self endModalSession:session];
+--- a/src/Frameworks/AppKit/NSDocumentController.m
++++ b/src/Frameworks/AppKit/NSDocumentController.m
+@@ -34,7 +34,7 @@
+ 
+ +sharedDocumentController {
+    if(shared==nil){
+-    shared = [[NSDocumentController alloc] init];
++    [[NSDocumentController alloc] init];   // -init makes it the shared one and keeps it
+     [shared _updateRecentDocumentsMenu];
+    }
+ 
+@@ -42,8 +42,11 @@
+ }
+ 
+ -init {
++   // (TERM8) the first document controller made is the shared one for the rest of the program, as on macOS; it is
++   // kept: one made by a nib or an application and released later left the shared pointer to freed memory (VLC
++   // ended in -[NSApplication _openUntitledFile:])
+    if(shared==nil)
+-    shared=self;
++    shared=[self retain];
+ 
+    _documents=[NSMutableArray new];
+    _fileTypes=[[[[NSBundle mainBundle] infoDictionary] objectForKey:@"CFBundleDocumentTypes"] retain];
+--- a/src/Frameworks/AppKit/NSStringDrawing.h
++++ b/src/Frameworks/AppKit/NSStringDrawing.h
+@@ -25,6 +25,9 @@
+ 
+ - (NSSize)sizeWithAttributes:(NSDictionary *)attributes;
+ - (NSRect)boundingRectWithSize:(NSSize)size options:(NSStringDrawingOptions)options attributes:(NSDictionary *)attributes;
++- (void)drawWithRect:(NSRect)rect options:(NSStringDrawingOptions)options attributes:(NSDictionary *)attributes;
++- (void)drawWithRect:(NSRect)rect options:(NSStringDrawingOptions)options attributes:(NSDictionary *)attributes context:(id)context;
++- (NSRect)boundingRectWithSize:(NSSize)size options:(NSStringDrawingOptions)options attributes:(NSDictionary *)attributes context:(id)context;
+ 
+ @end
+ 
+--- a/src/Frameworks/AppKit/NSStringDrawing.m
++++ b/src/Frameworks/AppKit/NSStringDrawing.m
+@@ -13,10 +13,15 @@
+ #import <AppKit/NSRaise.h>
+ #import <AppKit/NSParagraphStyle.h>
+ #import <AppKit/NSAttributedString.h>
++#import <AppKit/NSGraphics.h>
++#import <AppKit/NSGraphicsContext.h>
++#import <AppKit/NSGraphicsContextFunctions.h>
+ 
+ @implementation NSString(NSStringDrawing)
+ 
+ -(void)drawAtPoint:(NSPoint)point withAttributes:(NSDictionary *)attributes {
++   if(NSCurrentGraphicsPort()==NULL)
++    return;
+    [[NSStringDrawer sharedStringDrawer] drawString:self withAttributes:attributes atPoint:point inSize:NSZeroSize];
+ }
+ 
+@@ -56,6 +61,8 @@
+ }
+ 
+ -(void)drawInRect:(NSRect)rect withAttributes:(NSDictionary *)attributes {
++   if(NSCurrentGraphicsPort()==NULL)
++    return;
+    NSParagraphStyle *style=[attributes objectForKey:NSParagraphStyleAttributeName];
+    NSLineBreakMode mode=style!=nil ? [style lineBreakMode] : NSLineBreakByWordWrapping;
+ 
+@@ -106,7 +113,46 @@
+ }
+ 
+ -(void)drawWithRect:(NSRect)rect options:(NSStringDrawingOptions)options {
+-   NSUnimplementedMethod();
++   if(NSCurrentGraphicsPort()==NULL)
++    return;
++   if(options&NSStringDrawingUsesLineFragmentOrigin)
++    [self drawInRect:rect];
++   else
++    [self drawAtPoint:rect.origin];
++}
++
++// (TERM8) the macOS 10.11 forms; the context argument (an NSStringDrawingContext for scaling) is not used
++-(void)drawWithRect:(NSRect)rect options:(NSStringDrawingOptions)options context:(id)context {
++   [self drawWithRect:rect options:options];
++}
++
++-(NSRect)boundingRectWithSize:(NSSize)size options:(NSStringDrawingOptions)options context:(id)context {
++   return [self boundingRectWithSize:size options:options];
++}
++
++@end
++
++/* (TERM8) NSString's -drawWithRect:options:attributes: (macOS 10.0) and its 10.11 form with a context: what Terminal draws
++ * its miniaturised window's title with. With NSStringDrawingUsesLineFragmentOrigin the rect is the text's box, as for
++ * -drawInRect:withAttributes:; without it the string is one line from the rect's origin. Without a current graphics
++ * context nothing is drawn (CoreGraphics on macOS logs an invalid context): Terminal draws so while miniaturising. */
++@implementation NSString(NSStringDrawingWithRect)
++
++-(void)drawWithRect:(NSRect)rect options:(NSStringDrawingOptions)options attributes:(NSDictionary *)attributes {
++   if(NSCurrentGraphicsPort()==NULL)
++    return;
++   if(options&NSStringDrawingUsesLineFragmentOrigin)
++    [self drawInRect:rect withAttributes:attributes];
++   else
++    [self drawAtPoint:rect.origin withAttributes:attributes];
++}
++
++-(void)drawWithRect:(NSRect)rect options:(NSStringDrawingOptions)options attributes:(NSDictionary *)attributes context:(id)context {
++   [self drawWithRect:rect options:options attributes:attributes];
++}
++
++-(NSRect)boundingRectWithSize:(NSSize)size options:(NSStringDrawingOptions)options attributes:(NSDictionary *)attributes context:(id)context {
++   return [self boundingRectWithSize:size options:options attributes:attributes];
+ }
+ 
+ @end

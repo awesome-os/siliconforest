@@ -1,0 +1,47 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# /sbin/sf-boot: what a SiliconForest disk root does once at every boot, before a session:
+#   1. the time from the hardware clock (sf-clock; this kernel starts at 1970 otherwise);
+#   2. what the previous boot left in /private/var/run and /private/tmp is removed (on a RAM
+#      root these were empty at every boot; on a disk they hold the last boot's sockets, locks
+#      and process-id files, which a new session must not find);
+#   3. of /var/run (another directory on this root, the launchd jobs' own) only two leftovers
+#      of the network, see below.
+# It runs once a boot whoever calls it (the session's launchd job, the bench's typed command,
+# a person): the boot is recognised by kern.bootsessionuuid, kept in /private/var/run.
+# SF_CLOCK_WAIT: seconds to wait for the hardware clock (default 30; the SMC session that
+# reads it opens `sfthermal_delay` seconds into the boot).
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+id=$(sysctl -n kern.bootsessionuuid 2>/dev/null)
+stamp=/private/var/run/sf-boot.done
+if [ -n "$id" ] && [ "$(cat "$stamp" 2>/dev/null)" = "$id" ]; then exit 0; fi
+# The network's files are below /var/run, which on this root is a directory of its own (not /private/var/run)
+# and is shared with launchd's other jobs, already running: only what must not outlive a boot goes, and at
+# once (before the wait for the clock, long before a network can be up): the mark of a network left on
+# purpose ("until the next join or restart", wifiutil), and a status of the last boot that says online.
+# The directory of the remembered networks is made if it is missing (wifiutil does not make it).
+rm -f /var/run/org.siliconforest.wifi.left < /dev/null 2> /dev/null
+for f in /var/run/sf-netd.*.status; do
+    if [ -f "$f" ] && grep -q '^state=online' "$f" 2> /dev/null; then rm -f "$f" < /dev/null 2> /dev/null; fi
+done
+[ -d /Library/Preferences/SystemConfiguration ] || mkdir -p /Library/Preferences/SystemConfiguration 2> /dev/null
+/usr/sbin/sf-clock set "${SF_CLOCK_WAIT:-30}"; clock=$?
+if [ -z "$id" ]; then echo "SF_BOOT clock_rc=$clock; no kern.bootsessionuuid: this boot cannot be told from the last, /private/var/run and /private/tmp are left as they are"; exit 1; fi
+removed=0; state=skipped
+if ! mount | grep -q '^root_device on / (.*read-only'; then
+    if mount | grep -q ' on /private/\(tmp\|var/run\)/'; then
+        state="left alone: something is mounted below them"
+    else
+        state=cleaned
+        for d in /private/var/run /private/tmp; do
+            mkdir -p "$d"
+            for f in "$d"/* "$d"/.[!.]* "$d"/..?*; do
+                if [ -e "$f" ] || [ -L "$f" ]; then rm -rf "$f" < /dev/null && removed=$((removed + 1)); fi
+            done
+        done
+        chmod 755 /private/var/run; chmod 1777 /private/tmp
+        echo "$id" > "$stamp"
+    fi
+fi
+echo "SF_BOOT clock_rc=$clock run_and_tmp=$state removed=$removed date=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+exit 0

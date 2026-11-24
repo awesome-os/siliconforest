@@ -1,0 +1,584 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-11-08T01:39:18.399309+00:00",
+  "status": "READ_ONLY_DESIGN_AND_OFFLINE_BYTE_ANALYSIS_NOT_LIVE_QUALIFICATION",
+  "source_pin": "121fcbf35d4501814b58ca5347926a4173b6a512",
+  "scope": {
+    "files_written": [
+      "reports/sprint-008/unattended-design-review.json"
+    ],
+    "device_contacted": false,
+    "ssh_used": false,
+    "hardware_modes_changed": false,
+    "reboot_requested": false,
+    "boot_storage_changed": false,
+    "build_run": false,
+    "server_or_api_contacted": false,
+    "frozen_host_files_changed": false
+  },
+  "constraints": [
+    "Independent direct-SSH and M5 USB/UART controller only. No Maclab server, API, enrollment, job submission, imported agent configuration, or runtime service dependency.",
+    "Past Linux tests supply design references only. No original Maclab CLI/controller is executed even for status.",
+    "User reports four M1 services stopped/disabled and M5 builder/builder-https/oobd disabled/booted out, with no remaining processes. This reviewer did not verify that live.",
+    "Only this report is writable. Source changes and any boot-default change need a concrete separate review before action."
+  ],
+  "latest_root_supplied_observations": {
+    "claim_class": "user_relayed_not_independently_observed_here",
+    "m5_serial_endpoint": "/dev/cu.debug-console only",
+    "m1_console": "tty0 / chosen framebuffer",
+    "installed_stage2": {
+      "path": "/boot/efi/m1n1/boot.bin",
+      "bytes": 10107602,
+      "sha256": "54fa07e4f5cbeecd90e67e335657c40b33c25aede7015a84afb1427333b4f923"
+    },
+    "boot_storage_change_reported": false
+  },
+  "recommendation": {
+    "preferred": "Use an existing installed stage1 intercept window, if source/config and live checks confirm it, to RAM-chainload the exact pinned plain m1n1 through UART. Reconnect to its native USB CDC proxy and use the frozen 007 worker. Preserve existing Linux boot default.",
+    "why": "This retains the already reviewed USB/HV worker and avoids per-attempt boot storage changes. UART is only the bootstrap transport; native USB carries the large kernel transfer.",
+    "when_no_intercept_window": "Prepare a separately reviewed temporary native-USB proxy stage2 boot.bin plan only after identifying an independent path back to the saved Linux loader. A backup file and reset command alone do not provide that path.",
+    "critical_fallback_rule": "The experiment selection must be consumed or bypassable before entering the experimental proxy. Replacing the only stage2 with a proxy and relying on a later Linux service to restore it creates a reset loop when Linux never starts.",
+    "defer": "KIS is not the first choice. It adds carrier, host-driver and reconnect qualification and does not solve boot selection. Do not change enrolled stage1, boot policy, or add a generic hardware framework as an initial step.",
+    "evidence": [
+      "startup",
+      "window_config",
+      "early_window",
+      "boot_options",
+      "ram_chainloader",
+      "proxy_build"
+    ]
+  },
+  "concrete_findings": [
+    {
+      "id": "F1",
+      "classification": "source_and_saved_inventory",
+      "finding": "The existing UKI/Limine Linux cycle cannot directly substitute the XNU Mach-O or raw m1n1 as its test kernel. Apple BootArgs/ADT and an EL2 proxy/HV path must be retained before normal Linux boot.",
+      "action": "Reuse direct reset/health-check mechanics, but add a distinct pre-U-Boot proxy bootstrap phase; do not treat Linux kexec or EFI/UKI loading as equivalent.",
+      "evidence": [
+        "historical_linux_artifacts",
+        "entry_abi",
+        "payload_types"
+      ]
+    },
+    {
+      "id": "F2",
+      "classification": "source_plus_unknown_installed_configuration",
+      "finding": "Pinned bare proxy build has no configured stage1 intercept window and cannot file-chainload an ESP loader. The older enrolled stage1 may differ; neither its actual window nor a one-shot selector is established by saved version strings.",
+      "action": "Read enrolled stage1/config and current boot selection before choosing bootstrap. CHAINLOADING=0 does not prevent receiving a RAM-loaded image over the proxy; it prevents relying on chainload= to restore Linux from this build.",
+      "evidence": [
+        "proxy_build",
+        "window_config",
+        "early_window",
+        "file_chainload_guard"
+      ]
+    },
+    {
+      "id": "F3",
+      "classification": "source_and_saved_inventory",
+      "finding": "Installed dirty stage tags are not the pinned proxy ABI. Shipped chainload.py imports setup and indirectly resets the panic counter, and its legacy/baud fallbacks are too broad for an unattended fixed-target bootstrap.",
+      "action": "Use a narrowly reviewed local bootstrap adapter with explicit endpoint and known minimal old-proxy ABI. Preserve original metadata and RAM ranges; RAM-load/hash-check exact new image, then freshly verify full live BUILD_TAG, CPUFeatures=20, board and registers before HV. No setup/PMU import.",
+      "evidence": [
+        "inventory",
+        "ram_chainloader",
+        "setup_side_effects",
+        "proxy_abi",
+        "baud_bootstrap"
+      ]
+    },
+    {
+      "id": "F4",
+      "classification": "source_finding",
+      "finding": "Host worker timeout is not a target reset. The frozen worker disables its software watchdog CPU; primary hardware WDT is disabled at m1n1 startup; timed WDT arm rejects T8103. Software HV watchdog/tick and p.reboot require target execution.",
+      "action": "Qualify an exact independent M5 physical reset control with a genuinely unresponsive target before unattended trials. Never count SIGKILL, !, closed serial, or enabled watchdog names as recovery proof.",
+      "evidence": [
+        "worker_bounds",
+        "watchdogs",
+        "hv_watchdog",
+        "tick"
+      ]
+    },
+    {
+      "id": "F5",
+      "classification": "source_finding_runtime_limit",
+      "finding": "Closing a captured exception connection may autonomously reboot the target, but UART can also remain in a polling read and no disconnect path is guaranteed. A hard EL2 hang cannot be recovered by issuing another proxy command.",
+      "action": "Observe whether normal Linux already returned; otherwise use the separately qualified reset. After reset require an actual new Linux boot and baseline artifact selection, not command exit or disappearance of a port.",
+      "evidence": [
+        "disconnect",
+        "disconnect_reboot",
+        "tick"
+      ]
+    },
+    {
+      "id": "F6",
+      "classification": "source_finding_and_offline_calculation",
+      "finding": "UART/KIS control is present in pinned HV, but frozen 007 intentionally rejects those transports. Merely broadening device names would also leave a provably inadequate default-UART transfer budget.",
+      "action": "Prefer native USB after bootstrap; if UART is chosen for HV, make a separate explicit transport/baud profile with exact live iodev check and measured total deadline. Keep all identity, entry, RAM and capture gates.",
+      "evidence": [
+        "hv_transport",
+        "hv_start_transport",
+        "vuart_marker",
+        "worker_bounds",
+        "gzip_upload"
+      ]
+    }
+  ],
+  "transport_assessment": {
+    "source_verdict": "Pinned HV control and the bounded HVLOG marker have UART/DockChannel paths; live cable, carrier, baud, throughput, FIQ break-in and reset are unqualified.",
+    "uart": {
+      "proposed_pair": "explicit /dev/cu.debug-console plus live IODEV.UART (0), subject to actual port-to-target binding",
+      "hv_path": "HV.init records actual whoami; HV.start disables other iodevs; hv_tick polls uartproxy_iodev and exception callbacks retain that iodev.",
+      "console_path": "hv_map_vuart still traps guest uart0. USB side-channel setup returns for UART, and null DWC3 availability is safely zero. handle_vuart_passthrough forwards HVLOG-prefixed text through printf to retained console iodev. This is sufficient in source for the existing marker, not a general interactive guest UART.",
+      "limits": "Host debug-console node existence does not identify the target or prove proxy mode. UART checksums remain enabled. Do not bypass VUART mapping and let the guest directly share physical UART protocol bytes."
+    },
+    "kis": {
+      "proposed_pair": "only a positively identified macOS KIS serial endpoint plus live IODEV.DOCKCHANNEL_UART (1)",
+      "source_support": "UartInterface recognizes cu.kis-/tty.kis- and splits writes into 1024-byte transactions and large reads into 256KiB transactions. HV retains DockChannel just like UART.",
+      "limits": "No KIS endpoint is currently observed. USB debug mode is a hardware/carrier change, not a device-path alias. Correct pinned boot arguments must preserve debug carrier through chainload/HV init. No generic allowance for all serial nodes."
+    },
+    "native_usb": {
+      "proposed_pair": "explicit enumerated CDC endpoint and matching live USB0/USB1, as frozen worker requires",
+      "bootstrap": "RAM-chainload exact plain pinned image with no m1n1-debug token; use deliberate transport handoff after P_VECTOR, not a same-path reconnect assumption. Native USB initialization and endpoint enumeration must be observed on this board."
+    },
+    "minimal_future_allowance_if_uart_selected": [
+      "A new reviewed launcher revision, leaving frozen 007 unchanged: explicit transport=uart, exact debug-console path, explicit qualified baud and whoami=UART; no M1N1 environment overrides.",
+      "Positive baud handshake at every fresh proxy session. Pinned _request drops pre_reply, so stock set_baud/bootstrap_port timeout recovery is not a verified transition. If needed, a narrowly scoped adapter may use iface.proxyreq with the real post-command callback and validate reply plus NOP; do not silently patch pinned host source hashes.",
+      "Choose finite upload and guest deadlines from measured profile. At verified 1.5Mbaud, existing 300-second ceiling may suffice but default 60 cannot even contain ideal compressed upload plus capture. At 115200, a separate explicit longer bounded transfer policy would be required.",
+      "Keep one reader, guarded break-in, private evidence, no post-capture continuation, exact-pin validation and independent reset. UART/KIS profile applies only to bounded pre-VM experiment; it does not establish full-kernel device isolation."
+    ],
+    "evidence": [
+      "port_baud",
+      "baud_callback",
+      "baud_bootstrap",
+      "baud_target",
+      "hv_transport",
+      "hv_vuart_selection",
+      "hv_start_transport",
+      "tick",
+      "callback_transport",
+      "vuart_marker",
+      "usb_vuart_guard",
+      "null_usb_operations",
+      "console_fanout"
+    ]
+  },
+  "offline_uart_budget": {
+    "claim_class": "local_byte_calculation_not_serial_measurement",
+    "prepared_bytes": 78308440,
+    "prepared_sha256": "e7a9ffbc6c80296caab1c057be2cdfe314c141e8d02a9a3bdba1bfca46cac0b4",
+    "gzip_level1_bytes": 9486792,
+    "gzip_level1_sha256": "97178970c01b7928ab73f002068f34df2839fb5408e89db66f9dc5e19da693c8",
+    "method": "Read built kernel and inspected segment map; reconstruct zero-filled load image in memory; assert exact recorded prepared hash; gzip level 1 with mtime=0; no image execution or output file.",
+    "ideal_8N1_payload_seconds": {
+      "115200": 823.50625,
+      "1500000": 63.24528
+    },
+    "limits": "Excludes bootstrap, ADT transfer, framing/checksums, host computation, decompression and 10-second capture delay. Host gzip/zlib output size may vary slightly. 115200 violates frozen 300-second cap even ideally."
+  },
+  "state_machine": [
+    {
+      "state": "IDLE_LINUX",
+      "gate": "Independent M5 process owns per-target local lock; target identity/SSH host key and fresh Linux health observed; no existing service or reader can race it. Verify saved boot.bin/selector hashes and exact packet locally.",
+      "next": "ARM_ONE_ATTEMPT",
+      "failure": "Stop without boot or mode changes."
+    },
+    {
+      "state": "ARM_ONE_ATTEMPT",
+      "gate": "A reviewed nonpersistent intercept route or consumed-before-experiment one-shot selection exists, plus proven independent reset and Linux fallback. Persist local attempt intent and deadlines before leaving Linux.",
+      "next": "BOOTSTRAP_PROXY",
+      "failure": "Refuse trial; never replace the only recovery loader merely because a backup exists."
+    },
+    {
+      "state": "BOOTSTRAP_PROXY",
+      "gate": "Direct authorized Linux reboot or independent M5 reset/serial action; capture selected stage1 proxy through one reader; exact old ABI compatibility; bounded RAM-chainload of pinned image if needed.",
+      "next": "VERIFY_NEW_PROXY",
+      "failure": "Release reader and recover using independent reset/fallback; no blind mode or baud retries."
+    },
+    {
+      "state": "VERIFY_NEW_PROXY",
+      "gate": "Rebind endpoint after transport handoff, single reader, full BUILD_TAG and CPUFeatures20 plus J293/T8103/UART0 identity, firmware/BootArgs ranges and guest-register checks.",
+      "next": "RUN_BOUNDED_TEST",
+      "failure": "Recover; no HV init or kernel load after failed qualification."
+    },
+    {
+      "state": "RUN_BOUNDED_TEST",
+      "gate": "Run frozen USB worker, or separately reviewed explicit transport revision, under independent M5 supervisor. Parent owns finite deadline and kills only its worker; SSH-client loss does not orphan supervisor.",
+      "next": "RETAIN_EVIDENCE",
+      "failure": "Timeout/error is an inconclusive or failed attempt, never recovery success or permission to continue the guest."
+    },
+    {
+      "state": "RETAIN_EVIDENCE",
+      "gate": "Keep private original metadata, packet/code hashes, logs/context and exact terminal reason. Worker nonzero exit is expected even with useful capture; do not map it directly to boot verdict.",
+      "next": "RECOVER_LINUX",
+      "failure": "Retain partial data and still execute the prequalified recovery path."
+    },
+    {
+      "state": "RECOVER_LINUX",
+      "gate": "If a fresh healthy Linux boot is already observed, avoid redundant reset. Otherwise release host reader, use the qualified out-of-band reset, and deliberately do not intercept the normal Linux fallback. No proxy resume, DFU restore or server jobs.",
+      "next": "VERIFY_RECOVERY",
+      "failure": "Bounded recovery retry budget exhausted -> STOP_RECOVERY_FAILED; no new experiments."
+    },
+    {
+      "state": "VERIFY_RECOVERY",
+      "gate": "Observe changed boot identity through pinned direct SSH, correct board, expected Linux kernel/boot selection, baseline boot.bin/config hashes, and old services remaining isolated. Do not infer restoration from a reset command exit.",
+      "next": "IDLE_LINUX for next budgeted attempt, otherwise DONE",
+      "failure": "Stop; do not let automatic restoration overwrite an unrecognized changed configuration."
+    }
+  ],
+  "recovery_controls": [
+    {
+      "control": "Direct Linux SSH reboot",
+      "works_when": "Linux and authenticated SSH are responsive",
+      "does_not_cover": "Parked XNU, kernel hang, dead network or EL2 hang."
+    },
+    {
+      "control": "Pinned HV break-in byte",
+      "works_when": "Selected transport and EL2 tick run and safe host frame boundary holds",
+      "does_not_cover": "Hard EL2/controller hang; it is capture, not reset."
+    },
+    {
+      "control": "P_REBOOT",
+      "works_when": "A positively identified proxy command loop can process commands",
+      "does_not_cover": "Wedged target; do not invoke stock reboot.py because it imports setup and resets panic counter."
+    },
+    {
+      "control": "M5 out-of-band physical reset",
+      "works_when": "Exact locally built tool/action, controller-port/target-port pair and power state have been live qualified",
+      "does_not_cover": "Unqualified cable routes, wrong target, physical failure or unavailable independent boot fallback. Grok/root own exact action qualification."
+    },
+    {
+      "control": "Disconnect/autonomous reboot",
+      "works_when": "Pinned exception-proxy read actually fails",
+      "does_not_cover": "UART polling or any hang where the target cannot reach that failure branch. Never the guaranteed recovery control."
+    },
+    {
+      "control": "Parent process timeout",
+      "works_when": "M5 supervisor remains alive",
+      "does_not_cover": "Target reset; kills host worker only."
+    }
+  ],
+  "minimum_live_qualification_order": [
+    "Confirm direct SSH and endpoint ownership after reported service isolation; identify exact installed stage1 intercept/one-shot behavior and independent default Linux return path. Read and hash real boot configuration; no assumption from historical logs.",
+    "Using known-good Linux only, prove the selected M5 physical reset plus automatic normal Linux return with a changed boot identity. Bind the exact physical path and command to this target; do not confuse entering debugusb/DFU with normal reset.",
+    "Prove bootstrap proxy entry and RAM-only pinned handoff, then return to unchanged Linux without XNU. Record before/after boot artifacts and endpoint identity. On failure, prove fallback without target SSH.",
+    "Qualify selected transport: framed NOP/replies, live tag/ABI, checksummed bounded read/write, baud where relevant, compressed-transfer timing and reconnect. Native USB is preferred; UART/KIS require their separate explicit profiles.",
+    "Run one reviewed bounded XNU marker/context experiment and recover. Then explicitly test failure paths: no context callback, stalled worker, nonresponsive guest/EL2 or equivalent proven OOB fault case, and loss of controlling SSH client.",
+    "Repeat several bounded cycles with a local attempt journal and finite recovery budget before claiming no routine intervention. Capture outcome and recovery outcome remain separate; absent evidence is not PASS."
+  ],
+  "smallest_implementation_scope_after_review": [
+    "One independent M5-local supervisor using direct SSH, per-target lock, local JSON journal, absolute deadlines and locally qualified reset subprocess. No daemon enrollment, HTTP service, remote job queue or imported Maclab configuration.",
+    "One narrow bootstrap adapter only if an existing safe stage1 interception route is confirmed. Reuse pinned RAM-chainload mechanics with explicit endpoint, verified ABI and preserved metadata; omit setup, PMU resets, generic legacy guessing and storage writes.",
+    "Invoke frozen 007 worker unchanged for native USB. If UART is necessary, review a separate transport/baud/deadline revision with focused host tests; no XNU rebuild or platform changes are required by this source analysis.",
+    "A boot-default change, if unavoidable, is a separate concrete packet: installed file hash/backup, candidate bytes, exact selected path, atomic update/restore mechanics, and independent tested fallback. Do not arm it based on this design report."
+  ],
+  "next_steps_for_root": [
+    "Choose UART-intercept -> RAM pinned native-USB handoff if the existing stage1 supports it; otherwise keep boot storage unchanged until an independently recoverable native-USB stage2 plan is reviewable.",
+    "Complete Grok/root physical reset/carrier qualification without any Maclab service/API dependency.",
+    "Implement only the local supervisor/bootstrap pieces selected by those facts; preserve frozen 007 and current boot artifact hashes.",
+    "Qualify the failure cases and multiple recovery cycles before enabling unattended batches."
+  ],
+  "evidence": {
+    "inventory": {
+      "path": "reports/sprint-007/ssh-target-inventory.json",
+      "lines": [
+        5,
+        51
+      ],
+      "sha256": "9e8f8903537ed29d5b6e389e05cd032f370bbc1c4126a48761db014bfc8b2431",
+      "finding": "Saved SSH inventory observes J293/T8103 running Asahi Linux; historical stage tags differ from the pinned proxy. No live proxy or recovery qualification."
+    },
+    "historical_linux_artifacts": {
+      "path": "runs/m1-bringup-007/m5-selected-harness-files.txt",
+      "lines": [
+        1,
+        16
+      ],
+      "sha256": "0c525e6bb874ed63e360dc68039604a8fc278afaa7b1ea52e4775ad36bb9afc3",
+      "finding": "Historical file listing includes M1 run journals and retained UKI, Limine configuration and boot.bin. Listing only; no claim that those runs recovered this present target or that services may be reused."
+    },
+    "proxy_build": {
+      "path": "reports/sprint-007/m1n1-build-002.json",
+      "lines": [
+        3,
+        81
+      ],
+      "sha256": "6478404a0abb829ee243ba33f9494ca31d2a7cc77afa70317f629d69d9fcbd7f",
+      "finding": "Pinned built image is non-release, CHAINLOADING disabled, hardware untested."
+    },
+    "startup": {
+      "path": "sources/m1n1-baseline/src/main.c",
+      "lines": [
+        77,
+        227
+      ],
+      "sha256": "2fd371e122fdd0128989831d637f681cb15bfeadf5be3de4d4441afe37f47f95",
+      "finding": "Configured stage1 window precedes payload; missing payload enters proxy and initializes native USB unless debug mode selected."
+    },
+    "window_config": {
+      "path": "sources/m1n1-baseline/src/stage1_config.c",
+      "lines": [
+        81,
+        138
+      ],
+      "sha256": "97ea7b70860bc53b0b1502f7a1b9a8914798192cef2f7e7d9f3333e1101f1380",
+      "finding": "Window/config is compiled for CHAINLOADING stage1; this non-chainloading build returns zero window/no configured target."
+    },
+    "early_window": {
+      "path": "sources/m1n1-baseline/config.h",
+      "lines": [
+        10,
+        11
+      ],
+      "sha256": "275930ca7949a04970bcedec6b92ee59b951530a856c23301c93986aef83b35d",
+      "finding": "EARLY_PROXY_TIMEOUT is commented out in the pinned source, not evidence about the older enrolled stage1."
+    },
+    "boot_options": {
+      "path": "sources/m1n1-baseline/src/boot_options.c",
+      "lines": [
+        40,
+        59
+      ],
+      "sha256": "32d43cd244265819672551c7f985d2aa4fa6ac9b7b6f32759f575680edbaa092",
+      "finding": "m1n1-proxy is a stage1-only boot argument; debug and proxy are distinct switches."
+    },
+    "entry_abi": {
+      "path": "sources/m1n1-baseline/src/startup.c",
+      "lines": [
+        180,
+        197
+      ],
+      "sha256": "492f8961bba0846ebea79415b83b73d7dbb80feccf61202d2ec75fe8179fe8aa",
+      "finding": "m1n1 expects Apple boot_args and resolves ADT through those fields, not a Linux FDT entry contract."
+    },
+    "payload_types": {
+      "path": "sources/m1n1-baseline/src/payload.c",
+      "lines": [
+        285,
+        334
+      ],
+      "sha256": "88c7e2055d3e59daab57eb00dd107f645a088cfe013ecbe9367bd7b3ebac1797",
+      "finding": "Payload scanner supports compressed blobs, FDT, CPIO and Linux ARM64 kernel magic, not arbitrary raw XNU Mach-O."
+    },
+    "file_chainload_guard": {
+      "path": "sources/m1n1-baseline/src/chainload.c",
+      "lines": [
+        257,
+        311
+      ],
+      "sha256": "62da6ad7e9e2de736cb29a67ae39bdbe97446d040ecaa37dd2d3688917206e93",
+      "finding": "Filesystem chainload requires CHAINLOADING; compiled-out branch explicitly fails."
+    },
+    "ram_chainloader": {
+      "path": "sources/m1n1-baseline/proxyclient/tools/chainload.py",
+      "lines": [
+        26,
+        254
+      ],
+      "sha256": "502c8a96a780c9551474fc35cb111007d0e07144c645bd31cceb25b5037ec996",
+      "finding": "RAM loader uses Apple BootArgs/boot blobs, ADT/RVBAR adjustment, cache maintenance and P_VECTOR; vector-only avoids probing next stage. Imports setup as shipped."
+    },
+    "setup_side_effects": {
+      "path": "sources/m1n1-baseline/proxyclient/m1n1/setup.py",
+      "lines": [
+        12,
+        31
+      ],
+      "sha256": "e2f29154c378153b7a557c0a1206e347c9ab49e6c9c32b98bb9fa9c5de2e42ce",
+      "finding": "Import opens a default device, bootstraps port, creates utility/HV and resets panic counter. Not acceptable as an unattended bootstrap import."
+    },
+    "proxy_abi": {
+      "path": "sources/m1n1-baseline/proxyclient/m1n1/proxy.py",
+      "lines": [
+        790,
+        818
+      ],
+      "sha256": "a3051c5b45a3d66bcb877bc89067dd36887bc1f5346f5b874dfa866d40ad31c2",
+      "finding": "Reload has legacy fallbacks; CPUFeatures query requires matching structure size. Old installed source object was not available locally."
+    },
+    "port_baud": {
+      "path": "sources/m1n1-baseline/proxyclient/m1n1/proxy.py",
+      "lines": [
+        135,
+        169
+      ],
+      "sha256": "a3051c5b45a3d66bcb877bc89067dd36887bc1f5346f5b874dfa866d40ad31c2",
+      "finding": "Host supports explicit serial paths; default 115200; cu.kis-/tty.kis- names select bounded KIS transfers."
+    },
+    "baud_callback": {
+      "path": "sources/m1n1-baseline/proxyclient/m1n1/proxy.py",
+      "lines": [
+        732,
+        739
+      ],
+      "sha256": "a3051c5b45a3d66bcb877bc89067dd36887bc1f5346f5b874dfa866d40ad31c2",
+      "finding": "_request discards pre_reply by passing None; stock set_baud depends on that callback and cannot be treated as a clean handshake."
+    },
+    "baud_bootstrap": {
+      "path": "sources/m1n1-baseline/proxyclient/m1n1/proxyutils.py",
+      "lines": [
+        565,
+        595
+      ],
+      "sha256": "7c923b1b6c25efcbf895662e01c6a233bbf6d9f231c42c8a8ab49a5b226325f5",
+      "finding": "Stock bootstrap attempts 1.5Mbaud with timeout-based assumptions. New controller needs positively verified bounded transition, not blind fallback."
+    },
+    "baud_target": {
+      "path": "sources/m1n1-baseline/src/proxy.c",
+      "lines": [
+        77,
+        87
+      ],
+      "sha256": "a48648c82f4637c2a27acdbf77395939c1cff06d366d0524dad2c99daece9a75",
+      "finding": "P_SET_BAUD changes actual UART baud and sends sync words before reply."
+    },
+    "gzip_upload": {
+      "path": "sources/m1n1-baseline/proxyclient/m1n1/proxyutils.py",
+      "lines": [
+        248,
+        264
+      ],
+      "sha256": "7c923b1b6c25efcbf895662e01c6a233bbf6d9f231c42c8a8ab49a5b226325f5",
+      "finding": "Prepared kernel is gzip level 1 compressed before transport write, followed by target decompression."
+    },
+    "hv_transport": {
+      "path": "sources/m1n1-baseline/proxyclient/m1n1/hv/__init__.py",
+      "lines": [
+        1364,
+        1383
+      ],
+      "sha256": "18da80e496122233cbd3d69a287e5737ca78da083e8e36c8a33b01b35744c4a6",
+      "finding": "HV records actual iodev_whoami and disables other USB iodevs; no USB-only restriction in HV.init."
+    },
+    "hv_vuart_selection": {
+      "path": "sources/m1n1-baseline/proxyclient/m1n1/hv/__init__.py",
+      "lines": [
+        1453,
+        1472
+      ],
+      "sha256": "18da80e496122233cbd3d69a287e5737ca78da083e8e36c8a33b01b35744c4a6",
+      "finding": "HV maps guest uart0 to VUART with selected iodev."
+    },
+    "hv_start_transport": {
+      "path": "sources/m1n1-baseline/proxyclient/m1n1/hv/__init__.py",
+      "lines": [
+        1956,
+        2007
+      ],
+      "sha256": "18da80e496122233cbd3d69a287e5737ca78da083e8e36c8a33b01b35744c4a6",
+      "finding": "HV.start disables other iodevs and starts guest over retained selected proxy."
+    },
+    "tick": {
+      "path": "sources/m1n1-baseline/src/hv/hv.c",
+      "lines": [
+        529,
+        555
+      ],
+      "sha256": "6b92efaea66a4d50aac19f5bd4e98edebaeb262471c018dd57f7716cf942590f",
+      "finding": "HV tick polls uartproxy_iodev and enters USER_INTERRUPT callback on incoming bytes; runtime tick delivery still required."
+    },
+    "callback_transport": {
+      "path": "sources/m1n1-baseline/src/uartproxy.c",
+      "lines": [
+        239,
+        327
+      ],
+      "sha256": "ceac8d453e83ae98f066f318272ca68facb9db050739f3e3b99af88a6cf179d7",
+      "finding": "Startup goes to UART/DockChannel; exceptions retain current iodev. UART/DockChannel keep data checksums enabled."
+    },
+    "vuart_marker": {
+      "path": "sources/m1n1-baseline/src/hv/hv_vuart.c",
+      "lines": [
+        18,
+        149
+      ],
+      "sha256": "9abd77d4bb270f43289f89f43462857c1a03a3533bfbb04df3785bb7958d2c8d",
+      "finding": "USB VUART side channel is separate. HVLOG-prefixed guest output is passed through printf; UTRSTAT is emulated TX ready/empty."
+    },
+    "usb_vuart_guard": {
+      "path": "sources/m1n1-baseline/src/usb.c",
+      "lines": [
+        397,
+        445
+      ],
+      "sha256": "657cce2d9ac4fc5f50896b711a2f594b2e81c6281bb6b1cde66168917778141f",
+      "finding": "usb_iodev_vuart_setup returns for UART/DockChannel; fresh VUART opaque remains null. Debug mode avoids native USB setup."
+    },
+    "null_usb_operations": {
+      "path": "sources/m1n1-baseline/src/usb_dwc3.c",
+      "lines": [
+        74,
+        131
+      ],
+      "sha256": "2061cf5c66547274bb115af4a4fa4cef469ab65cf95c11f275d66189a817ee38",
+      "finding": "Null USB side channel safely has no events/read/write availability, allowing HVLOG passthrough without that side channel."
+    },
+    "console_fanout": {
+      "path": "sources/m1n1-baseline/src/iodev.c",
+      "lines": [
+        185,
+        267
+      ],
+      "sha256": "100c0956894eed913fecc3168045008d082a3afa80f236860af956138d4ef031",
+      "finding": "printf console output goes to iodevs still carrying console usage; HV.start retains selected proxy iodev."
+    },
+    "watchdogs": {
+      "path": "sources/m1n1-baseline/src/wdt.c",
+      "lines": [
+        14,
+        83
+      ],
+      "sha256": "98275e7765736a018e4561181176a98f8c2ade5f89f8b40dc6eb9b52f7ab0db6",
+      "finding": "Startup watchdog disable and synchronous reboot exist; timed arm API is explicitly gated to T8140, not T8103."
+    },
+    "hv_watchdog": {
+      "path": "sources/m1n1-baseline/src/hv/hv_wdt.c",
+      "lines": [
+        52,
+        172
+      ],
+      "sha256": "b6e0de1d557a1090e0dcdb353dbb38568cddd4289823c07fb0565016d708944f",
+      "finding": "Software watchdog uses another CPU, is suspendable and enters proxy on bark; not independent hung-EL2 recovery."
+    },
+    "disconnect": {
+      "path": "sources/m1n1-baseline/src/uartproxy.c",
+      "lines": [
+        283,
+        290
+      ],
+      "sha256": "ceac8d453e83ae98f066f318272ca68facb9db050739f3e3b99af88a6cf179d7",
+      "finding": "Exception-proxy read failure returns -1."
+    },
+    "disconnect_reboot": {
+      "path": "sources/m1n1-baseline/src/hv/hv_exc.c",
+      "lines": [
+        69,
+        88
+      ],
+      "sha256": "865213c5725878615ca857d86998113a093e379265596ad4394b4569ea9592fe",
+      "finding": "Unexpected proxy return invokes flush_and_reboot; not proof every close triggers this path."
+    },
+    "worker_bounds": {
+      "path": "integrations/puredarwin/m1-firstboot/host_console.py",
+      "lines": [
+        574,
+        641
+      ],
+      "sha256": "a9f68695c6465bc5a3c1a9df04f67da6a72f99265e899cf3b89ba671ab6d4417",
+      "finding": "Frozen worker allows USB modem paths, caps total timeout at 300 seconds, defaults 60, and kills only host worker."
+    },
+    "prepared_image": {
+      "path": "reports/sprint-007/kernel-loader-preparation.json",
+      "lines": [
+        1,
+        12
+      ],
+      "sha256": "5cff37cb003be7af24102629c624dd7f5af749083f0ba65342478ee4a4496825",
+      "finding": "Offline preparation record binds the 78,308,440-byte image hash used for transfer calculation."
+    }
+  },
+  "frozen_host_sha256": {
+    "host_console.py": "a9f68695c6465bc5a3c1a9df04f67da6a72f99265e899cf3b89ba671ab6d4417",
+    "test_host_console.py": "6a24c2c9996ee6f5229854f2a3fb529bc35f14b809b16480c18f8c2e0cac259b",
+    "HOST_CONSOLE.md": "b6824f1de005b20905087e03f513cbf8740e01c397924eb7e11c5661e13a8bd5",
+    "host-console-validation.json": "92d69f2f7f55cbd08b2fd0ed3eaf59d09c3367e1de47ffd242e3f8df9fc9dd60"
+  }
+}

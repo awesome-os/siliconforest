@@ -1,0 +1,257 @@
+--- a/integrations/puredarwin/m1-bringup/host_progress.py
++++ b/integrations/puredarwin/m1-bringup/host_progress.py
+@@ -50,6 +50,144 @@
+ spec.loader.exec_module(old)
+ 
+ 
++NATIVE_BOOTARGS_PROFILE = 'darwin-xnu-e7-arm64-bootargs1152-r2v2-v1'
++NATIVE_BOOTARGS_SOURCES = {'integrations/puredarwin/m1-apcie-bridge/native_bootargs/native_bootargs.py': 'f168d523eacf1c8fe1228ca48e467fb98fea47b4675bb942ca945aae63233fae', 'integrations/puredarwin/m1-apcie-bridge/native_bootargs_abi/verify_kernel.py': '03df91f4e0edc48fe69a661305e2f4d7dab874799ab97f5fe0cb33dc64308e3f', 'integrations/puredarwin/m1-apcie-bridge/native_bootargs_abi/PROFILE.json': 'c4abef6755105ce1b221ee90f2cdc3b5408746b286eb845715ff3ce1f902d990'}
++NATIVE_BOOTARGS_HV_SHA = '18da80e496122233cbd3d69a287e5737ca78da083e8e36c8a33b01b35744c4a6'
++NATIVE_BOOTARGS_EXPERIMENT = {'version': 1, 'wire_profile': NATIVE_BOOTARGS_PROFILE,
++                             'source_revision': 2, 'source_version': 2}
++
++
++def _native_bootargs_module(path, name):
++    raw = image.bounded_file(LAB / path, 128 << 10)
++    image.require(image.sha(raw) == NATIVE_BOOTARGS_SOURCES[path], 'Native BootArgs source changed: ' + path)
++    spec = importlib.util.spec_from_loader(name, loader=None, origin=str(LAB / path))
++    module = importlib.util.module_from_spec(spec)
++    module.__file__ = str(LAB / path)
++    sys.modules[name] = module
++    # Execute precisely the bytes just hashed, never re-read via exec_module.
++    exec(compile(raw, module.__file__, 'exec'), module.__dict__)
++    return module
++
++
++def _native_bootargs_helpers():
++    for name, expected in NATIVE_BOOTARGS_SOURCES.items():
++        image.require(image.sha(image.bounded_file(LAB / name, 128 << 10)) == expected,
++                      'Native BootArgs dependency changed: ' + name)
++    codec = _native_bootargs_module('integrations/puredarwin/m1-apcie-bridge/native_bootargs/native_bootargs.py',
++                                   'bound_native_bootargs_codec')
++    verifier = _native_bootargs_module('integrations/puredarwin/m1-apcie-bridge/native_bootargs_abi/verify_kernel.py',
++                                      'bound_native_bootargs_abi')
++    return codec, verifier
++
++
++def native_bootargs_enabled(inputs):
++    record = json.loads(inputs.contents['build_record'], object_pairs_hook=image.unique)
++    if 'native_bootargs_wire_experiment' not in record:
++        return None
++    experiment = record['native_bootargs_wire_experiment']
++    image.require(type(experiment) is dict and experiment.keys() == NATIVE_BOOTARGS_EXPERIMENT.keys() and
++                  all(type(experiment[k]) is type(v) and experiment[k] == v
++                      for k, v in NATIVE_BOOTARGS_EXPERIMENT.items()), 'Invalid native BootArgs wire experiment')
++    hv_source = inputs.host_files.get('proxyclient/m1n1/hv/__init__.py')
++    image.require(type(hv_source) is bytes and image.sha(hv_source) == NATIVE_BOOTARGS_HV_SHA,
++                  'Native BootArgs requires the exact reviewed HV last-writer path')
++    command = guest_bootargs(inputs).encode('ascii')
++    # Pinned load_raw still performs its initial legacy r2 write before our final rewrite.
++    image.require(len(command) <= 607 and b'\0' not in command, 'Initial r2 BootArgs command exceeds607 bytes')
++    codec, verifier = _native_bootargs_helpers()
++    proof = verifier.verify_kernel(inputs.contents['kernel'])
++    image.require(codec.WIRE_PROFILE == proof['wire_profile'] == NATIVE_BOOTARGS_PROFILE and
++                  proof['status'] == 'COMPILED_KERNEL_ABI_MATCH_ONLY' and
++                  proof['image_sha256'] == image.sha(inputs.contents['kernel']) and
++                  proof['runtime_or_boot_admitted'] is False, 'Selected kernel native BootArgs ABI mismatch')
++    return dict(abi=proof, command_bytes=len(command), command_sha256=image.sha(command),
++                sources_sha256=dict(NATIVE_BOOTARGS_SOURCES), initial_legacy_cmdline_capacity=607)
++
++
++def _native_integer(value, bits, label):
++    image.require(isinstance(value, int) and not isinstance(value, bool), 'Invalid native field: ' + label)
++    # Bypass a hypothetical subclass __int__/comparison override; Construct Hex values are integers.
++    result = int.__int__(value)
++    image.require(type(result) is int and 0 <= result < (1 << bits), 'Invalid native field width: ' + label)
++    return result
++
++
++def _native_values(tba):
++    values = {k: _native_integer(getattr(tba, k), 16 if k in ('revision', 'version') else
++                                32 if k in ('machine_type', 'devtree_size') else 64, k)
++              for k in ('revision', 'version', 'virt_base', 'phys_base', 'mem_size', 'top_of_kernel_data',
++                        'machine_type', 'devtree', 'devtree_size', 'boot_flags', 'mem_size_actual')}
++    values['video'] = {k: _native_integer(getattr(tba.video, k), 64, 'video.' + k)
++                       for k in ('base', 'display', 'stride', 'width', 'height', 'depth')}
++    image.require(type(tba.cmdline) is str, 'Invalid native cmdline type')
++    values['cmdline'] = tba.cmdline
++    return values
++
++
++def _write_native_bootargs(hv, backend, inputs, directory, reservation, carveouts, adt_address):
++    image.require(directory is not None and type(reservation) is dict and type(carveouts) is list,
++                  'Native BootArgs requires private evidence and checked reservation')
++    proof = native_bootargs_enabled(inputs)
++    image.require(proof is not None, 'Native BootArgs opt-in missing at final writer')
++    codec, _ = _native_bootargs_helpers()
++    values = _native_values(hv.tba)
++    command = values['cmdline'].encode('ascii')
++    image.require(len(command) <= 607 and image.sha(command) == proof['command_sha256'], 'Changed native cmdline')
++    image.require((values['revision'], values['version']) == (2, 2), 'Native source ABI is not R2/V2')
++    address = _native_integer(hv.guest_base, 64, 'guest_base') + _native_integer(hv.bootargs_off, 64, 'bootargs_off')
++    pair = hv.adt['chosen']['memory-map'].BootArgs
++    image.require(isinstance(pair, (tuple, list)) and len(pair) == 2, 'Missing exact BootArgs allocation')
++    base = _native_integer(pair[0], 64, 'BootArgs.base')
++    capacity = _native_integer(pair[1], 64, 'BootArgs.bytes')
++    image.require(base == address and capacity == old.PAGE and base % old.PAGE == 0 and
++                  address + capacity <= adt_address, 'Wrong existing BootArgs allocation')
++    high = _native_integer(backend.ba.phys_base, 64, 'original.phys_base') + _native_integer(backend.ba.mem_size, 64, 'original.mem_size')
++    image.require(values['phys_base'] + values['mem_size'] == high and values['top_of_kernel_data'] <= high,
++                  'Changed guest envelope/top')
++    old.inside(base, capacity, values['phys_base'], high, 'Native BootArgs guest envelope')
++    reserved = (_native_integer(reservation['start'], 64, 'reservation.start'),
++                _native_integer(reservation['end'], 64, 'reservation.end'))
++    exclusions = tuple(tuple(pair) for pair in carveouts)
++    old.inside(base, capacity, reserved[0], reserved[1], 'Native BootArgs reviewed reservation')
++    for start, size in carveouts:
++        image.require(type(start) is int and type(size) is int and start > 0 and size > 0 and
++                      start + size < 1 << 64 and max(base, start) >= min(base + capacity, start + size),
++                      'Native BootArgs allocation intersects MCC or invalid exclusion')
++    contract = dict(version=1, scope='source-contract binding, NOT hardware authorization',
++                    baseline_launcher_sha256='0cf9ccc9bbb966dbf43d707488956baede0cd917ffce08ce3260ff94cc9a946f',
++                    source_sha256=NATIVE_BOOTARGS_SOURCES, HV_sha256=NATIVE_BOOTARGS_HV_SHA,
++                    rule='existing chosen BootArgs exactly one16KiB allocation; same predicted address; inside guest/payload reservation; MCC disjoint')
++    contract_sha = image.sha(json.dumps(contract, sort_keys=True, separators=(',', ':')).encode())
++    plan = codec.plan_write(values, wire_profile=NATIVE_BOOTARGS_PROFILE, address=address,
++                            allocation=dict(base=base, bytes=capacity, review_sha256=contract_sha))
++    backend.iface.writemem(plan.address, plan.payload)  # Exactly one opted-in final BA write.
++    actual = backend.iface.readmem(plan.address, len(plan.payload))  # Exact bounded readback.
++    if type(actual) is bytes and 0 < len(actual) <= codec.WIRE_SIZE:
++        old.write_private(directory, 'guest-bootargs-readback.bin', actual)
++    image.require(type(actual) is bytes and actual == plan.payload, 'Native BootArgs short/corrupt readback')
++    final_pair = hv.adt['chosen']['memory-map'].BootArgs
++    image.require(_native_values(hv.tba) == values and isinstance(final_pair, (tuple, list)) and
++                  len(final_pair) == 2 and
++                  tuple(_native_integer(v, 64, 'final BootArgs allocation') for v in final_pair) == (base, capacity) and
++                  (reservation['start'], reservation['end']) == reserved and
++                  tuple(tuple(pair) for pair in carveouts) == exclusions and
++                  image.sha(inputs.contents['kernel']) == proof['abi']['image_sha256'],
++                  'Native BootArgs fields/allocation/provenance changed during write/readback')
++    old.write_private(directory, 'guest-bootargs.bin', actual)
++    metadata = dict(plan.metadata(), abi=proof['abi'], source_contract=contract,
++                    checked_allocation=dict(base=base, bytes=capacity, expected_address=address,
++                                            guest_low=values['phys_base'], guest_high=high,
++                                            reservation_start=reserved[0], reservation_end=reserved[1],
++                                            MCC_exclusion_count=len(exclusions),
++                                            MCC_exclusions_sha256=image.sha(json.dumps(exclusions, separators=(',', ':')).encode()),
++                                            MCC_scope='existing bounded four-TZ list, not global completeness'),
++                    readback_sha256=image.sha(actual), readback_exact=True,
++                    source_fields_sha256=image.sha(json.dumps(values, sort_keys=True, separators=(',', ':')).encode()),
++                    initial_legacy_write_preserved=True, runtime_or_boot_admitted=False)
++    old.write_private(directory, 'guest-bootargs-record.json', metadata)
++    return metadata
++
++
+ class ContinuingBackend(old.PinnedBackend):
+     """Frozen collection method, with bounded uint64 BootArgs translation."""
+     def collect(self, inputs):
+@@ -194,6 +332,9 @@
+     dart_survey_enabled(inputs)
+     trackpad_enumeration_enabled(inputs)
+     native_trackpad_child_enabled(inputs)
++    native_wire = native_bootargs_enabled(inputs)
++    if native_wire is not None:
++        report['native_bootargs_wire_abi'] = native_wire
+     return inputs
+ 
+ 
+@@ -947,7 +1088,7 @@
+     return outer, prepared
+ 
+ 
+-def load_payloads(hv, backend, ramdisk=None, directory=None):
++def load_payloads(hv, backend, ramdisk=None, directory=None, native_wire=None, inputs=None, reservation=None, carveouts=None):
+     # Without CTRR/PPL lockdown, arm_vm_prot_finalize frees below segLOWEST.
+     # Stock HV.load_raw places ADT and TrustCache there. Retain both in the
+     # post-kernel region reserved through topOfKernelData (arm_vm_init:1664).
+@@ -988,17 +1129,24 @@
+     # hv.start uploads the final rebuilt ADT at hv.adt_base. Upload once now as
+     # well, so the saved pre-start metadata describes initialized guest bytes.
+     backend.iface.writemem(adt_address, blob)
+-    fmt = getattr(backend.types, 'BootArgs_r' + str(int(hv.tba.revision)))
+-    backend.iface.writemem(hv.guest_base + hv.bootargs_off, fmt.build(hv.tba))
+-    return dict(adt=dict(address=adt_address, bytes=len(blob), capacity=capacity, sha256=image.sha(blob)),
++    if native_wire is not None:
++        native_metadata = _write_native_bootargs(hv, backend, inputs, directory, reservation, carveouts, adt_address)
++    else:
++        fmt = getattr(backend.types, 'BootArgs_r' + str(int(hv.tba.revision)))
++        backend.iface.writemem(hv.guest_base + hv.bootargs_off, fmt.build(hv.tba))
++    result = dict(adt=dict(address=adt_address, bytes=len(blob), capacity=capacity, sha256=image.sha(blob)),
+                 trust_cache=dict(source=tc_source, address=tc_address, bytes=tc_bytes,
+                                  copied_on_target=True, read_by_host=False),
+                 ramdisk=(dict(address=ramdisk_address, bytes=len(ramdisk), sha256=image.sha(ramdisk))
+                          if ramdisk is not None else None), end=end)
++    if native_wire is not None:
++        result['native_bootargs'] = native_metadata
++    return result
+ 
+ 
+ def run_worker(args, inputs):
+     old.authorize(args)
++    native_wire = native_bootargs_enabled(inputs)  # Refuse malformed/drifted opt-in before USB enumeration.
+     directory = args.private_directory.resolve(strict=True)
+     image.require(directory.stat().st_uid == os.getuid() and directory.stat().st_mode & 0o077 == 0,
+                   'Private directory ownership/mode mismatch')
+@@ -1018,6 +1166,10 @@
+     try:
+         backend.open(args.device)
+         snapshot, ba, adt, layout = backend.collect(inputs)
++        if native_wire is not None:
++            image.require((_native_integer(backend.ba.revision, 16, 'source.revision'),
++                           _native_integer(backend.ba.version, 16, 'source.version')) == (2, 2),
++                          'Observed native BootArgs source is not R2/V2')
+         old.preflight.observe(snapshot)
+         old.write_private(directory, 'original-bootargs.bin', ba)
+         old.write_private(directory, 'original-adt.bin', adt)
+@@ -1053,7 +1205,8 @@
+             image.require(getattr(hv, key) == layout[key], 'Loader prediction mismatch: ' + key)
+         # arm_init owns MH_FILESET fixups. No patchfinder, header slide or host
+         # relocation is applied. Kernel-mach_header remains stock loader policy.
+-        payloads = load_payloads(hv, backend, inputs.contents.get('ramdisk'), directory=directory)
++        payloads = load_payloads(hv, backend, inputs.contents.get('ramdisk'), directory=directory,
++                                 native_wire=native_wire, inputs=inputs, reservation=reservation, carveouts=carveouts)
+         old.write_private(directory, 'before-start.json',
+                           dict(layout=layout, bootargs=bootargs, payloads=payloads,
+                                boot_entropy=entropy,
+--- a/tools/m1_bringup_cycle.py
++++ b/tools/m1_bringup_cycle.py
+@@ -29,6 +29,7 @@
+ TERMINAL_HELPER = 'integrations/puredarwin/m1-bringup/terminal_input_progress.py'
+ TERMINAL_HELPER_SHA = '2b8901e7c29357a3440c40e1db14f5e2416f38beb71af0fee7674cb05233568c'
+ CONTINUING_SOURCES = {'integrations/puredarwin/m1-bringup/bootstrap_progress.py': '52fdd9045d0f2d14d08b38577cd3bfca512b9eb6e083afc82fa7c081350c56d8', 'integrations/puredarwin/m1-bringup/bootargs_progress.py': '8b131bd35dcfcd4097676c4d61f05c69b7115e609cdf07f49774a2f7846bb489'}
++NATIVE_BOOTARGS_SOURCES = {'integrations/puredarwin/m1-apcie-bridge/native_bootargs/native_bootargs.py': 'f168d523eacf1c8fe1228ca48e467fb98fea47b4675bb942ca945aae63233fae', 'integrations/puredarwin/m1-apcie-bridge/native_bootargs_abi/verify_kernel.py': '03df91f4e0edc48fe69a661305e2f4d7dab874799ab97f5fe0cb33dc64308e3f', 'integrations/puredarwin/m1-apcie-bridge/native_bootargs_abi/PROFILE.json': 'c4abef6755105ce1b221ee90f2cdc3b5408746b286eb845715ff3ce1f902d990'}
+ BASE_SHA = '3d274d1b699c0adfa1e38361d8348c3ee7567b854c5361ea80cbe23a18b7e3e6'
+ 
+ 
+@@ -61,6 +62,12 @@
+     values = argparse.Namespace(manifest=args.candidate, bootstrap_manifest=args.manifest,
+                                 host_source=args.host_source, inventory=args.inventory)
+     candidate = module.verify_inputs(values)
++    if 'native_bootargs_wire_abi' in candidate.report:
++        base.require(module.NATIVE_BOOTARGS_SOURCES == NATIVE_BOOTARGS_SOURCES,
++                     'Native BootArgs source set differs between controller/worker')
++        for name, expected in NATIVE_BOOTARGS_SOURCES.items():
++            base.require(base.sha(base.read_file(LAB/name, 128 << 10)) == expected,
++                         'Native BootArgs helper changed: ' + name)
+     return bootstrap, candidate.report, module
+ 
+ 
+@@ -169,13 +176,16 @@
+                   launcher_sha256=ops.args.launcher_sha256, inspector_sha256=ops.args.inspector_sha256,
+                   continuing_source_sha256=CONTINUING_SOURCES, virtual_input_source_sha256=INPUT_HELPER_SHA,
+                   terminal_input_source_sha256=TERMINAL_HELPER_SHA))
++        native_sources = NATIVE_BOOTARGS_SOURCES if 'native_bootargs_wire_abi' in candidate else {}
++        if native_sources:
++            ops.save('native-bootargs-sources.json', native_sources)
+         # Keep exact helper bytes per attempt as well as hashes. Later loader
+         # revisions must not erase the source needed to review an older run.
+         for name in sorted(set(base.SOURCE_SHA) | {LAUNCHER, INSPECTOR,
+                                                   'tools/m1_kernel_cycle.py', 'tools/m1_bringup_cycle.py',
+-                                                  PROGRESS_BOOTSTRAP, BOOTARGS_HELPER, INPUT_HELPER, TERMINAL_HELPER}):
++                                                  PROGRESS_BOOTSTRAP, BOOTARGS_HELPER, INPUT_HELPER, TERMINAL_HELPER} | set(native_sources)):
+             raw_source = base.read_file(LAB/name)
+-            helper_sha = {INPUT_HELPER: INPUT_HELPER_SHA, TERMINAL_HELPER: TERMINAL_HELPER_SHA}.get(name)
++            helper_sha = {INPUT_HELPER: INPUT_HELPER_SHA, TERMINAL_HELPER: TERMINAL_HELPER_SHA, **native_sources}.get(name)
+             if helper_sha is not None:
+                 base.require(base.sha(raw_source) == helper_sha, 'Input helper changed before source snapshot: ' + name)
+             ops.save('source-' + name.replace('/', '__'), raw_source)

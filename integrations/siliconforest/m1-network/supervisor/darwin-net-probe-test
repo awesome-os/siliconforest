@@ -1,0 +1,30 @@
+#!/bin/sh
+# First guest networking step: in-kernel stack, loopback, feth pair and utun.
+# No NIC, firmware, Wi-Fi or macOS kext. Creates only virtual interfaces and
+# destroys them before exit. Optional second argument "skywalk" adds the same
+# feth checks with the pair attached as native Skywalk netif interfaces.
+set -eu
+[ "$#" -eq 1 ] || [ "$#" -eq 2 ] || exit 2
+nonce=$1
+case "$nonce" in ''|*[!0-9a-f]*) exit 2 ;; esac
+[ "${#nonce}" -eq 48 ] || exit 2
+mode=base
+if [ "$#" -eq 2 ]; then
+    [ "$2" = skywalk ] || exit 2
+    mode=skywalk
+fi
+printf '\nDL25_NET_BEGIN_%s mode=%s\n' "$nonce" "$mode"
+rc=0
+if [ "$mode" = skywalk ]; then
+    if /usr/bin/darwin-net-probe --nonce "$nonce" --skywalk; then :; else rc=$?; fi
+else
+    if /usr/bin/darwin-net-probe --nonce "$nonce"; then :; else rc=$?; fi
+fi
+printf 'DL25_NET_STATUS_%s mode=%s rc=%s\n' "$nonce" "$mode" "$rc"
+[ "$rc" -eq 0 ] || exit 1
+printf '\nDARWIN NETWORK PROBE RETURNED\n'
+printf 'DL25_NET_RETURN_%s\n' "$nonce"
+/bin/uname -s
+/bin/uname -m
+/bin/uname -r
+printf 'DL25_NET_END_%s\n' "$nonce"

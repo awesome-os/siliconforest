@@ -1,0 +1,56 @@
+Launcher: give the fan back to the SMC before a guest starts (PROPOSAL, not applied, not run)
+
+Why: SFCpuPower runs the fan in manual mode (SMC key F0Md = 1) while the die is warm, and
+every session ends with the guest stopped from outside. The reset that returns the M1 to
+Linux clears manual mode (boots thf01, thf02: fan 0 rpm, target 0 in Linux seconds after
+its boot). A chained boot (PCIE_CHAIN=1) has no such reset: the next guest takes the M1
+over from the m1n1 proxy with F0Md still 1 and the last target. A guest with SFCpuPower
+and sffan=1 simply carries on; any other guest would run with the fan stuck at that speed.
+
+What: one SMC session over the proxy before the guest is loaded, in the step that already
+exists for the radio (launcher_step), using the same m1n1 client as smc_radio_enable():
+read F0Md and write 0 if it is not 0. It cannot be skipped by a guest hang, because it
+runs before the next guest, not after the last one. Cost: one SMC start/stop per boot
+(the radio step does the same in "kext" and "launcher" link modes).
+
+Not applied because tools/pcie_iterate.sh and the launcher delivery are being changed by
+another stream; proxy_linkup.py is copied into the launcher tree by tools/pcie_iterate.sh
+on every boot, so this is the only file to change.
+
+--- a/integrations/siliconforest/m1-apcie-bridge/proxy_linkup.py
++++ b/integrations/siliconforest/m1-apcie-bridge/proxy_linkup.py
+@@ -263,6 +263,26 @@
+         smc.stop()
+ 
+ 
++def smc_fan_auto(u):
++    """Leave the fan to the SMC: F0Md = 0 (hwmon-fan.dtsi apple,fan-mode; Linux
++    macsmc_hwmon_write_fan writes the same to end manual control). Returns the mode found."""
++    from m1n1.fw.smc import SMCClient
++    smc = SMCClient(u, u.adt["arm-io/smc"].get_reg(0)[0], None)
++    smc.start()
++    smc.start_ep(0x20)
++    try:
++        mode = smc.smcep.read8("F0Md")
++        if mode != 0:
++            smc.smcep.write8("F0Md", 0)
++        return mode
++    finally:
++        smc.stop()
++
++
+ def adt_facts(u):
+     facts = {}
+     for path in ("/arm-io/apcie", "/arm-io/apcie/pci-bridge0", "/arm-io/dart-apcie0",
+@@ -543,6 +563,12 @@
+     mode = mode_file.read_text().strip() if mode_file.exists() else "none"
+     gpu_probe(p, u, out)
+     dcp_probe(p, u, out)
++    try:
++        found = smc_fan_auto(u)
++        log(f"fan: F0Md was {found}" + (", set to 0 (the SMC's own control)" if found else ""))
++    except Exception:
++        log("fan: could not read or reset F0Md:\n" + traceback.format_exc())
+     if mode == "launcher":
+         result = bring_up(p, u, out)
+         result["mode"] = "launcher"

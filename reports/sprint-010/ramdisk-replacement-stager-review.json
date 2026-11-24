@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "reviewer": "Claude",
+  "status": "READ_ONLY_SOURCE_REVIEW_NO_HARDWARE",
+  "reviewed": {
+    "integrations/puredarwin/chonkstep-darwin/stage_ramdisk.py": "c2d2557ec69bbfcfa2d7dad6d4fa47503fb11f0956452a6715eb940604ec6704 (the hash in ramdisk-replacement-host-validation.json)",
+    "evidence": "artifacts/m1-desktop-010/staging-validation/ (same-runtime-checked-dirs.{img,record.json,filesystem.log}, same-runtime-diagnostic.failed-filesystem.log)"
+  },
+  "verdict": "APPROVE the replacement mechanism for host-side staging, with S1 and S2 recommended before it replaces a real new libSystem. This does not approve any new library: a different libSystem needs its own review, a clean e2fsck and a runtime qualification.",
+  "verified": [
+    "Inputs: the baseline image must hash to b1154b28. The output must be new and under artifacts/. replaces_sha256 must be exactly 64 lowercase hex. Destinations are absolute, contain no '..', are not '/', and are unique. Sources are resolved strictly and must be regular files.",
+    "Work happens on a private copy inside a TemporaryDirectory; the baseline is never opened for write. Before any mutation each replacement target is debugfs-dumped to a private file and must hash to replaces_sha256, otherwise the run aborts before the write batch. Root's wrong-old-hash case refused with no output.",
+    "Parents (the fix): each parent directory is stat'ed. An existing directory is skipped, a missing one gets mkdir, and anything else is refused, including a symlinked parent such as /var. mkdir is no longer issued for existing directories, the trigger of the earlier corruption.",
+    "Batch: optional rm, then write, then set_inode_field mode, then dump-back of every payload, then sha256 compare. A final e2fsck -fn must exit 0 (run() uses check=True). Publication is os.link exclusive, the image is 0444, and the record lists replaces_sha256 per file.",
+    "Positive evidence: rm and write of identical libSystem bytes reused inode 8039. The result is regular, mode 0755, uid/gid 0 and 4202062 bytes, the same as the baseline inode in candidate-004. e2fsck was clean with the inode count unchanged (9694). Record: sha 432c7369 replaces 432c7369.",
+    "Failure evidence: the earlier run's final e2fsck found a multiply-claimed block (a directory inode left by failed EEXIST mkdirs shared block 68 with the new file) and refused publication. The backstop worked; no image was published."
+  ],
+  "findings": [
+    {"id": "S1", "severity": "medium for general use (not hit by the libSystem case)", "text": "The replacement target's type, link count and attributes are not enforced. If a target had nlink > 1, 'rm' would leave the other hard links with the old bytes: a silent partial replacement. If it were a symlink, the dump would return the link text and fail the hash (safe). The new inode gets mode from the mapping's executable flag and uid/gid from debugfs, not from the replaced inode. Suggest stat'ing each target before rm: require Type regular and Links 1, record the old mode/uid/gid, and after the batch require the new inode to match them (and flags), refusing otherwise."},
+    {"id": "S2", "severity": "low (defence in depth)", "text": "debugfs -f carries on after per-command errors and still exits 0. The earlier corruption came from exactly such tolerated errors, caught only by the final e2fsck. Suggest also failing on any error text in the batch output (for example lines that follow a 'debugfs: <cmd>' echo and are not the expected 'Allocated inode' line), so a future partial command cannot rely on e2fsck alone."}
+  ],
+  "not_claimed": ["any new libSystem", "runtime", "boot"],
+  "scope": "Read-only. No builds, hardware or image writes; debugfs stat reads only."
+}

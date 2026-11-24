@@ -1,0 +1,98 @@
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -2197,7 +2197,8 @@
+ -(BOOL)needsToDrawRect:(NSRect)rect {
+     BOOL needsToDrawRect = NO;
+ 
+-    if (NSIntersectsRect(rect, _visibleRect)) {
++    // a view outside any window (drawn into an image) has no visible rect: all of it is drawn
++    if (NSIntersectsRect(rect, _window != nil ? _visibleRect : [self bounds])) {
+         const NSRect *rects;
+         NSUInteger count;
+         [self getRectsBeingDrawn:&rects count:&count];
+@@ -2211,73 +2212,20 @@
+ }
+ 
+ -(void)getRectsBeingDrawn:(const NSRect **)rects count:(NSInteger *)count {
+-    // This method returns all the rects being drawn concerning the view
+-    // That's all of the dirty rects from the view, but also all the ones
+-    // from the superview that might have caused the redraw.
+-    // Since invalidating a rect also invalidates the first opaque superview,
+-    // only the opaque views need to be checked
+-    *rects = _rectsBeingRedrawn;
+-    *count = _rectsBeingRedrawnCount;
++    /* While the view is displayed (-displayRectIgnoringOpacity:) this is the rect being drawn. Asked
++     * at any other time (an application that calls -drawRect: itself to draw the view into an image,
++     * as Terminal does for the profile thumbnails of its preferences) it is the whole view: before,
++     * that came from the opaque ancestor's last drawing or was left unset, and the image stayed
++     * the grey it started as. */
++    if (_rectsBeingRedrawn == NULL) {
++        NSRect whole = (_window != nil && !NSIsEmptyRect(_visibleRect)) ? _visibleRect : [self bounds];
+ 
+-    if  (_rectsBeingRedrawn == NULL) {
+-        NSView *opaqueAncestor = [self opaqueAncestor];
+-        if (opaqueAncestor != self) {
+-            // Ask our opaque ancestor what to draw
+-            const NSRect *ancestorRects;
+-            [opaqueAncestor getRectsBeingDrawn:&ancestorRects count:&_rectsBeingRedrawnCount];
+-            if (_rectsBeingRedrawnCount) {
+-                _rectsBeingRedrawn = NSZoneCalloc(NULL, _rectsBeingRedrawnCount, sizeof(NSRect));
+-                int rectsCount = 0;
+-                for (int i = 0; i < _rectsBeingRedrawnCount; ++i) {
+-                    NSRect r = [opaqueAncestor convertRect:ancestorRects[i] toView:self];
+-                    // No need for the rects that are outside of the visibleRect
+-                    if (NSIntersectsRect(r, _visibleRect)) {
+-                        _rectsBeingRedrawn[rectsCount++] = r;
+-                    }
+-                }
+-                *rects = _rectsBeingRedrawn;
+-                *count = rectsCount;
+-            }
+-        } else {
+-            // We're opaque - concatenate our invalid rect with the one from the previous opaque view
+-            NSView *view = [self superview];
+-            if (view) {
+-                NSView *opaqueAncestor = [view opaqueAncestor];
+-                const NSRect *ancestorRects;
+-                NSUInteger ancestorRectsCount;
+-                [opaqueAncestor getRectsBeingDrawn:&ancestorRects count:&ancestorRectsCount];
+-                if (ancestorRectsCount || _invalidRectCount) {
+-                    _rectsBeingRedrawn = NSZoneCalloc(NULL, _invalidRectCount + ancestorRectsCount, sizeof(NSRect));
+-                    int rectsCount = 0;
+-                    for (int i = 0; i < ancestorRectsCount; ++i) {
+-                        NSRect r = [opaqueAncestor convertRect:ancestorRects[i] toView:self];
+-                        // No need for the rects that are outside of the visibleRect
+-                        if (NSIntersectsRect(r, _visibleRect)) {
+-                            _rectsBeingRedrawn[rectsCount++] = r;
+-                        }
+-                    }
+-                    for (int i = 0; i < _invalidRectCount; ++i) {
+-                        _rectsBeingRedrawn[rectsCount++] = _invalidRects[i];
+-                    }
+-                    _rectsBeingRedrawnCount = rectsCount;
+-                    *rects = _rectsBeingRedrawn;
+-                    *count = _rectsBeingRedrawnCount;
+-                }
+-            }
+-        }
+-    }
+-    // We had no info and no opaque ancestor gave us any useful rect - just use our invalid rects
+-    if (*rects == NULL) {
+-        if (_invalidRects == NULL) {
+-            if (_needsDisplay) {
+-                *rects = &_visibleRect;
+-                *count = 1;
+-            }
+-        } else {
+-            *rects = _invalidRects;
+-            *count = _invalidRectCount;
+-        }
++        _rectsBeingRedrawn = NSZoneCalloc(NULL, 1, sizeof(NSRect));
++        _rectsBeingRedrawn[0] = whole;
++        _rectsBeingRedrawnCount = 1;
+     }
++    *rects = _rectsBeingRedrawn;
++    *count = _rectsBeingRedrawnCount;
+ }
+ 
+ -(void)getRectsExposedDuringLiveResize:(NSRect)rects count:(NSInteger *)count {

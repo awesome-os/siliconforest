@@ -1,0 +1,58 @@
+--- a/src/Frameworks/AppKit/NSView.m
++++ b/src/Frameworks/AppKit/NSView.m
+@@ -145,6 +145,29 @@
+  return takes==NULL||(window!=nil&&takes((int)[window windowNumber]));
+ }
+ 
++// (FXPERF2) whether anything was drawn into a window's own backing store since its last layer-only flush: when not,
++// that flush tells the window server so (it skips comparing the whole backing store with what it uploaded last)
++static char sfSFFXBaseDrawnKey;
++static void sfSFFXNoteBaseDrawn(NSWindow *window){
++ if(window!=nil&&objc_getAssociatedObject(window,&sfSFFXBaseDrawnKey)==nil)
++  objc_setAssociatedObject(window,&sfSFFXBaseDrawnKey,(id)kCFBooleanTrue,OBJC_ASSOCIATION_ASSIGN);
++}
++static void sfSFFXFlushLayersOnly(NSWindow *window){
++ static void (*unchanged)(int);
++ static int looked;
++ if(!looked){
++  const char *gpu=getenv("SFFX_GPU_DAMAGE");
++  unchanged=(gpu&&!strcmp(gpu,"1"))?(void (*)(int))dlsym(RTLD_DEFAULT,"_windowServerSFFXBaseUnchanged"):NULL;
++  looked=1;
++ }
++ BOOL drawn=objc_getAssociatedObject(window,&sfSFFXBaseDrawnKey)!=nil;
++ if(drawn)
++  objc_setAssociatedObject(window,&sfSFFXBaseDrawnKey,nil,OBJC_ASSOCIATION_ASSIGN);
++ if(unchanged!=NULL&&!drawn&&![window isFlushWindowDisabled])
++  unchanged((int)[window windowNumber]);
++ [window flushWindow];
++}
++
+ @implementation NSView
+ 
+ static BOOL NSViewLayersEnabled=NO;
+@@ -1953,7 +1976,7 @@
+    if(_layerContext!=nil && [_layerContext respondsToSelector:@selector(_sfcaTakeNewFrame)] &&
+       ![(id)_layerContext _sfcaTakeNewFrame] && ![[self window] viewsNeedDisplay])
+     return;
+-   [[self window] flushWindow];
++   sfSFFXFlushLayersOnly([self window]);
+ }
+ 
+ // the layer tree renders offscreen, its pixels go into the window over what the views drew
+@@ -1992,6 +2015,7 @@
+     return;
+    // a view with a layer draws into a bitmap of its own, so this goes to the window's context directly
+    NSGraphicsContext *windowContext=[[self window] graphicsContext];
++   sfSFFXNoteBaseDrawn([self window]);
+    CGContextRef port=[windowContext graphicsPort];
+    NSRect bounds=[self bounds];
+ 
+@@ -2426,6 +2450,8 @@
+ 
+ -(void)_lockFocusInContext:(NSGraphicsContext *)context {
+     CGContextRef graphicsPort=[context graphicsPort];
++    if(_window!=nil && context==[_window graphicsContext])
++     sfSFFXNoteBaseDrawn(_window);
+     [NSGraphicsContext saveGraphicsState];
+     [NSGraphicsContext setCurrentContext:context];
+     [[context focusStack] addObject:self];

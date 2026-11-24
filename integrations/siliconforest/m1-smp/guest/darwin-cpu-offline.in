@@ -1,0 +1,125 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Guest test of CPU offline/online and idle (kernel-patches/0003, platform-patches/0003).
+# Uses the system's own interface: cpuctl (processor_exit / processor_start on the host's
+# processor ports) and sysctl. Lines are prefixed CPUOFF_; a step that can hang or panic is
+# announced before it is taken.
+#   1  idle: machdep.sfcpu.stats before and after 10 idle seconds
+#   2  one core offline and back, with hw.activecpu and cpuctl list at each step
+#   3  under a load on four workers: every secondary offline and online @CYCLES@ times
+#   4  a whole cluster offline at once (the performance cores, then the efficiency
+#      secondaries), a short load on what is left, back
+#   5  deep idle on (machdep.sfcpu.deep_wfi=1): 10 idle seconds, a load, ten more cycles
+#      on one core, deep idle off
+# (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+cycles=@CYCLES@
+printf '\nCPUOFF_BEGIN_%s\n' "$nonce"
+sysctl hw.ncpu hw.activecpu hw.physicalcpu hw.logicalcpu machdep.sfcpu.park machdep.sfcpu.deep_wfi 2>&1
+ncpu=$(sysctl -n hw.ncpu 2>/dev/null); ncpu=${ncpu:-1}
+stats() { sysctl -n machdep.sfcpu.stats 2>&1 | sed "s/^/CPUOFF_STATS tag=$1 /"; }
+active() { sysctl -n hw.activecpu 2>/dev/null; }
+# hw.activecpu reaches $1 within two seconds: prints the value it settled on
+settle() {
+    n=0
+    while [ "$(active)" != "$1" ] && [ "$n" -lt 20 ]; do sleep 0.1; n=$((n+1)); done
+    active
+}
+flag=/private/tmp/cpuoff-load.$$
+spin() { while [ -e "$flag" ]; do j=0; while [ "$j" -lt 20000 ]; do j=$((j+1)); done; done; }
+load_start() { : > "$flag"; w=0; while [ "$w" -lt "$1" ]; do spin & w=$((w+1)); done; }
+load_stop() { rm -f "$flag"; wait; }
+# kiloiterations a single shell loop makes in $1 seconds on whatever is online
+work() {
+    n=0; end=$(( $(date +%s) + $1 ))
+    while [ "$(date +%s)" -lt "$end" ]; do j=0; while [ "$j" -lt 20000 ]; do j=$((j+1)); done; n=$((n+1)); done
+    echo $((n*20))
+}
+
+# ---- 1: idle ----
+stats idle-before
+sleep 10
+stats idle-after
+
+# ---- 2: one core, step by step ----
+last=$((ncpu - 1))
+cpuctl list 2>&1 | sed 's/^/CPUOFF_LIST before /'
+printf 'CPUOFF_STEP offline cpu=%s\n' "$last"
+cpuctl offline "$last"; rc=$?
+printf 'CPUOFF_STEP offline cpu=%s rc=%s activecpu=%s\n' "$last" "$rc" "$(settle $((ncpu - 1)))"
+cpuctl list 2>&1 | sed 's/^/CPUOFF_LIST offline /'
+stats one-offline
+sleep 2
+stats one-offline-2s
+printf 'CPUOFF_STEP online cpu=%s\n' "$last"
+cpuctl online "$last"; rc=$?
+printf 'CPUOFF_STEP online cpu=%s rc=%s activecpu=%s\n' "$last" "$rc" "$(settle "$ncpu")"
+cpuctl list 2>&1 | sed 's/^/CPUOFF_LIST online /'
+
+# ---- 3: every secondary, $cycles times, under load ----
+load_start 4
+total_fail=0
+cpu=1
+while [ "$cpu" -lt "$ncpu" ]; do
+    printf 'CPUOFF_CYCLES_START cpu=%s cycles=%s\n' "$cpu" "$cycles"
+    start=$(date +%s); i=0; fail=0; low_bad=0; back_bad=0
+    while [ "$i" -lt "$cycles" ]; do
+        i=$((i+1))
+        cpuctl offline "$cpu" || fail=$((fail+1))
+        # every tenth cycle: the count must follow, down and up
+        if [ $((i % 10)) -eq 0 ]; then [ "$(settle $((ncpu - 1)))" = "$((ncpu - 1))" ] || low_bad=$((low_bad+1)); fi
+        cpuctl online "$cpu" || fail=$((fail+1))
+        if [ $((i % 10)) -eq 0 ]; then [ "$(settle "$ncpu")" = "$ncpu" ] || back_bad=$((back_bad+1)); fi
+    done
+    total_fail=$((total_fail + fail + low_bad + back_bad))
+    printf 'CPUOFF_CYCLES cpu=%s cycles=%s command_failures=%s activecpu_not_down=%s activecpu_not_back=%s activecpu=%s seconds=%s\n' \
+        "$cpu" "$i" "$fail" "$low_bad" "$back_bad" "$(settle "$ncpu")" "$(( $(date +%s) - start ))"
+    cpu=$((cpu+1))
+done
+load_stop
+stats after-cycles
+printf 'CPUOFF_CYCLES_RESULT %s secondaries=%s cycles_each=%s failures=%s activecpu=%s\n' \
+    "$([ "$total_fail" -eq 0 ] && [ "$(active)" = "$ncpu" ] && echo PASS || echo FAIL)" "$((ncpu - 1))" "$cycles" "$total_fail" "$(active)"
+
+# ---- 4: clusters ----
+if [ "$ncpu" -eq 8 ]; then
+    printf 'CPUOFF_STEP cluster offline cpus=4-7\n'
+    cpuctl offline 4 5 6 7; rc=$?
+    printf 'CPUOFF_CLUSTER offline=4-7 rc=%s activecpu=%s work_kiloiterations_5s=%s\n' "$rc" "$(settle 4)" "$(work 5)"
+    cpuctl online 4 5 6 7; rc=$?
+    printf 'CPUOFF_CLUSTER online=4-7 rc=%s activecpu=%s work_kiloiterations_5s=%s\n' "$rc" "$(settle 8)" "$(work 5)"
+    printf 'CPUOFF_STEP cluster offline cpus=1-3\n'
+    cpuctl offline 1 2 3; rc=$?
+    printf 'CPUOFF_CLUSTER offline=1-3 rc=%s activecpu=%s\n' "$rc" "$(settle 5)"
+    cpuctl online 1 2 3; rc=$?
+    printf 'CPUOFF_CLUSTER online=1-3 rc=%s activecpu=%s\n' "$rc" "$(settle 8)"
+    printf 'CPUOFF_STEP all secondaries offline\n'
+    cpuctl offline 1 2 3 4 5 6 7; rc=$?
+    printf 'CPUOFF_CLUSTER offline=1-7 rc=%s activecpu=%s work_kiloiterations_5s=%s\n' "$rc" "$(settle 1)" "$(work 5)"
+    stats seven-offline
+    sleep 5
+    stats seven-offline-5s
+    cpuctl online 1 2 3 4 5 6 7; rc=$?
+    printf 'CPUOFF_CLUSTER online=1-7 rc=%s activecpu=%s\n' "$rc" "$(settle 8)"
+fi
+
+# ---- 5: deep idle ----
+printf 'CPUOFF_STEP deep idle on\n'
+sysctl -w machdep.sfcpu.deep_wfi=1 2>&1 | sed 's/^/CPUOFF_DEEP /'
+stats deep-before
+sleep 10
+stats deep-idle-10s
+printf 'CPUOFF_DEEP work_kiloiterations_5s=%s\n' "$(work 5)"
+load_start 8; sleep 5; load_stop
+i=0; fail=0
+while [ "$i" -lt 10 ]; do i=$((i+1)); cpuctl offline "$last" || fail=$((fail+1)); cpuctl online "$last" || fail=$((fail+1)); done
+printf 'CPUOFF_DEEP cycles=10 cpu=%s failures=%s activecpu=%s\n' "$last" "$fail" "$(settle "$ncpu")"
+stats deep-after
+sysctl -w machdep.sfcpu.deep_wfi=0 2>&1 | sed 's/^/CPUOFF_DEEP /'
+sleep 3
+stats final
+sysctl hw.ncpu hw.activecpu 2>&1
+printf 'CPUOFF_END_%s\n' "$nonce"
+# tools/pcie_iterate.sh ends the capture at this line (PCIE_DONE=marker)
+printf 'SF_BENCH_DONE\n'

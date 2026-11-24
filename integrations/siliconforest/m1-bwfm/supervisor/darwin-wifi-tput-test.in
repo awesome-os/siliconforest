@@ -1,0 +1,45 @@
+#!/bin/sh
+# Guest side of a Wi-Fi throughput boot. @SSID@/@PSK@ come from private/wifi.env and
+# @TPUT_HOST@ from the PCIE_TPUT_HOST environment variable at assembly (a LAN machine running
+# the throughput server: port 8099 sends 64 MiB, port 8098 receives). The server logs the rates.
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nDL36_TPUT_BEGIN_%s\n' "$nonce"
+sleep 4
+sf-dhcp --up en0 2>&1
+sleep 2
+wifiutil on 2>&1
+sleep 8
+wifiutil join '@SSID@' '@PSK@' 2>&1
+printf 'DL36_JOIN_RC=%s\n' "$?"
+sleep 3
+sf-dhcp en0 2>&1
+printf 'DL36_DHCP_RC=%s\n' "$?"
+sleep 1
+ping -c 3 @TPUT_HOST@ 2>&1 | tail -3
+# Each transfer runs in the background with a deadline, then a ping shows whether the
+# interface is still alive: a stalled data path must not hang the whole test.
+bounded() {   # bounded SECONDS LABEL COMMAND...
+    limit=$1; label=$2; shift 2
+    printf 'DL36_%s start %s\n' "$label" "$(date +%s)"
+    ( "$@" ) &
+    pid=$!
+    t=0
+    while kill -0 $pid 2>/dev/null && [ $t -lt $limit ]; do sleep 1; t=$((t+1)); done
+    if kill -0 $pid 2>/dev/null; then
+        printf 'DL36_%s STALLED after %ss\n' "$label" "$t"
+        kill -9 $pid 2>/dev/null
+    else
+        printf 'DL36_%s done in about %ss\n' "$label" "$t"
+    fi
+    ping -c 2 @TPUT_HOST@ 2>&1 | tail -2
+}
+down() { printf 'x\n' | netcat @TPUT_HOST@ 8099 2>&1 | head -c "$1" | wc -c; }
+up() { dd if=/dev/zero bs=65536 count="$1" 2>/dev/null | netcat @TPUT_HOST@ 8098 2>&1; }
+bounded 15 DOWN_1MB down 1000000
+bounded 20 DOWN_8MB down 8000000
+bounded 30 DOWN_32MB down 32000000
+bounded 20 UP_4MB up 64
+bounded 30 UP_32MB up 512
+wifiutil info 2>&1
+printf 'DL36_TPUT_END_%s\n' "$nonce"

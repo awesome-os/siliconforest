@@ -1,0 +1,338 @@
+--- a/crates/wm-darwin/src/applications.rs
++++ b/crates/wm-darwin/src/applications.rs
+@@ -233,10 +233,51 @@
+         }
+     }
+ }
++/// csops(pid, CS_OPS_STATUS) code-signing flags. Diagnostic only.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum CsStatus {
++    /// Non-Apple host build: no csops.
++    Unsupported,
++    Flags(u32),
++    QueryFailed(i32),
++}
++impl std::fmt::Display for CsStatus {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::Unsupported => write!(f, "unsupported"),
++            Self::Flags(flags) => write!(f, "flags={flags:#010x}"),
++            Self::QueryFailed(errno) => write!(f, "query_failed errno={errno}"),
++        }
++    }
++}
++/// CS_OPS_STATUS (0) is unrestricted for any pid in pinned XNU csops_internal.
++pub fn query_cs_status(pid: i32) -> CsStatus {
++    #[cfg(target_vendor = "apple")]
++    {
++        unsafe extern "C" {
++            fn csops(pid: libc::pid_t, ops: u32, useraddr: *mut libc::c_void, usersize: libc::size_t) -> libc::c_int;
++        }
++        let mut flags: u32 = 0;
++        let returned = unsafe {
++            csops(pid, 0, (&mut flags as *mut u32).cast(), std::mem::size_of::<u32>())
++        };
++        if returned == 0 {
++            CsStatus::Flags(flags)
++        } else {
++            CsStatus::QueryFailed(io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
++        }
++    }
++    #[cfg(not(target_vendor = "apple"))]
++    {
++        let _ = pid;
++        CsStatus::Unsupported
++    }
++}
+ pub struct OwnedChild {
+     pid: NonZeroI32,
+     state: WaitState,
+     exit_reason: Option<ExitReason>,
++    exit_cs_status: Option<CsStatus>,
+ }
+ impl OwnedChild {
+     fn new(pid: i32) -> Option<Self> {
+@@ -244,6 +285,7 @@
+             pid: NonZeroI32::new(pid).unwrap(),
+             state: WaitState::Running,
+             exit_reason: None,
++            exit_cs_status: None,
+         })
+     }
+     pub fn pid(&self) -> i32 {
+@@ -255,6 +297,9 @@
+     pub fn exit_reason(&self) -> Option<&ExitReason> {
+         self.exit_reason.as_ref()
+     }
++    pub fn exit_cs_status(&self) -> Option<CsStatus> {
++        self.exit_cs_status
++    }
+     pub fn poll(&mut self) -> WaitState {
+         self.poll_using(&mut UnixWait)
+     }
+@@ -264,6 +309,11 @@
+             // this owner. The reap below stays the only ownership decision.
+             if self.exit_reason.is_none() {
+                 self.exit_reason = ops.exit_reason(self.pid());
++                if self.exit_reason.is_some() {
++                    // Still unreaped: record its code-signing flags if the
++                    // kernel still answers for the zombie (ESRCH otherwise).
++                    self.exit_cs_status = ops.cs_status(self.pid());
++                }
+             }
+             self.state = match ops.wait(self.pid()) {
+                 Ok(Some(status)) => WaitState::Reaped(status),
+@@ -294,6 +344,9 @@
+     fn exit_reason(&mut self, _pid: i32) -> Option<ExitReason> {
+         None
+     }
++    fn cs_status(&mut self, _pid: i32) -> Option<CsStatus> {
++        None
++    }
+ }
+ /// Non-reaping exit check: WEXITED|WNOHANG|WNOWAIT leaves the zombie waitable.
+ /// si_pid is zeroed first because XNU leaves siginfo untouched when nothing
+@@ -385,6 +438,9 @@
+ }
+ struct UnixWait;
+ impl WaitApi for UnixWait {
++    fn cs_status(&mut self, pid: i32) -> Option<CsStatus> {
++        Some(query_cs_status(pid))
++    }
+     fn exit_reason(&mut self, pid: i32) -> Option<ExitReason> {
+         match exited_without_reaping(pid) {
+             Ok(false) | Err(libc::EINTR) => None,
+@@ -721,6 +777,9 @@
+         if let Some(reason) = self.child.exit_reason() {
+             audit.exit_reason(self.audit_sequence, reason);
+         }
++        if let Some(cs) = self.child.exit_cs_status() {
++            audit.cs_status(self.audit_sequence, crate::launch_audit::CsPhase::Exit, cs);
++        }
+         audit.observe(self.audit_sequence, &self.status, self.child.state());
+         // Late reaps are still recorded after an incomplete deadline, but no
+         // new signals or attempted success reclassification follow that result.
+@@ -820,6 +879,15 @@
+                 .values()
+                 .all(|a| a.completion() == Completion::Complete)
+     }
++    /// True while an owned application has been launched but has neither
++    /// reported READY nor reached a terminal state. New launches wait for it.
++    pub fn launch_in_progress(&self) -> bool {
++        self.applications.values().any(|a| {
++            a.child.state() == WaitState::Running
++                && !a.status.ready_observed()
++                && a.completion() == Completion::Pending
++        })
++    }
+     /// True while any owned application has not reached a terminal outcome.
+     pub fn shutdown_pending(&self) -> bool {
+         self.applications
+@@ -970,6 +1038,15 @@
+             attempt.child.as_ref().map(OwnedChild::pid),
+             attempt.native,
+         );
++        if let Some(child) = attempt.child.as_ref() {
++            // Exec-time code-signing flags of the owned child, read right after
++            // posix_spawn returned. Diagnostic only; never an admission input.
++            self.audit.cs_status(
++                sequence,
++                crate::launch_audit::CsPhase::Spawn,
++                query_cs_status(child.pid()),
++            );
++        }
+         if let Some(failure) = &attempt.failure {
+             self.audit.fail(
+                 sequence,
+@@ -1705,4 +1782,82 @@
+         assert!(manager.shutdown_incomplete(), "the first failure stays a failure");
+         assert!(!manager.shutdown_complete());
+     }
++
++    #[test]
++    fn launch_waits_while_an_owned_app_is_neither_ready_nor_terminal() {
++        let now = Instant::now();
++        let (app, mut peer, audit) = fake_application(now);
++        let mut manager = OwnedApplications {
++            audit,
++            ..Default::default()
++        };
++        manager.applications.insert(id(), app);
++        assert!(manager.launch_in_progress(), "running without READY blocks the next launch");
++        peer.write_all(format!("CHONKTERM/1 READY {} 123\n", id().as_str()).as_bytes())
++            .unwrap();
++        let mut ops = FakeWait {
++            result: Ok(None),
++            signals: vec![],
++        };
++        let app = manager.applications.get_mut(&id()).unwrap();
++        app.service(now, false, &mut manager.audit, &mut ops);
++        assert!(manager.applications()[&id()].status.ready_observed());
++        assert!(!manager.launch_in_progress(), "READY releases the next launch");
++        let (mut dead, _dead_peer, _dead_audit) = fake_application(now);
++        dead.child.state = WaitState::Reaped(9);
++        dead.lifecycle.completion = Completion::Incomplete("application reaped without complete sealed cleanup");
++        let other = Instance::parse(&"c".repeat(48)).unwrap();
++        manager.applications.insert(other, dead);
++        assert!(!manager.launch_in_progress(), "a terminal app does not block launches");
++    }
++    #[test]
++    fn cs_status_is_recorded_once_per_phase_and_in_the_snapshot() {
++        let now = Instant::now();
++        let (_app, _peer, mut audit) = fake_application(now);
++        audit.cs_status(0, crate::launch_audit::CsPhase::Spawn, CsStatus::Flags(0x2002_0003));
++        audit.cs_status(0, crate::launch_audit::CsPhase::Spawn, CsStatus::Flags(0x1));
++        audit.cs_status(0, crate::launch_audit::CsPhase::Exit, CsStatus::QueryFailed(libc::ESRCH));
++        let attempt = &audit.attempts()[0];
++        assert_eq!(attempt.cs_at_spawn, Some(CsStatus::Flags(0x2002_0003)), "first value kept");
++        assert_eq!(attempt.cs_at_exit, Some(CsStatus::QueryFailed(libc::ESRCH)));
++        let mut out = Vec::new();
++        audit.snapshot(&mut out).unwrap();
++        let text = String::from_utf8(out).unwrap();
++        assert!(text.contains(&format!(
++            "attempt=0 cs_at_spawn=flags=0x20020003 cs_at_exit=query_failed errno={}",
++            libc::ESRCH
++        )), "{text}");
++        #[cfg(not(target_vendor = "apple"))]
++        assert_eq!(query_cs_status(1), CsStatus::Unsupported);
++    }
++    #[test]
++    fn exit_time_cs_status_is_read_with_the_reason_before_the_reap() {
++        struct CsWait {
++            cs_calls: usize,
++        }
++        impl WaitApi for CsWait {
++            fn wait(&mut self, _: i32) -> Result<Option<i32>, i32> {
++                assert_eq!(self.cs_calls, 1, "flags read before the reap");
++                Ok(Some(9))
++            }
++            fn signal(&mut self, _: i32, _: i32) -> Result<(), i32> {
++                Ok(())
++            }
++            fn exit_reason(&mut self, _: i32) -> Option<ExitReason> {
++                Some(ExitReason::QueryFailed(libc::ENOENT))
++            }
++            fn cs_status(&mut self, _: i32) -> Option<CsStatus> {
++                self.cs_calls += 1;
++                Some(CsStatus::Flags(0x0100_0201))
++            }
++        }
++        let now = Instant::now();
++        let (mut app, _peer, mut audit) = fake_application(now);
++        let mut ops = CsWait { cs_calls: 0 };
++        app.service(now, false, &mut audit, &mut ops);
++        app.service(now, false, &mut audit, &mut ops);
++        assert_eq!(ops.cs_calls, 1);
++        assert_eq!(audit.attempts()[0].cs_at_exit, Some(CsStatus::Flags(0x0100_0201)));
++        assert_eq!(audit.attempts()[0].raw_app_wait_status, Some(9));
++    }
+ }
+--- a/crates/wm-darwin/src/desktop.rs
++++ b/crates/wm-darwin/src/desktop.rs
+@@ -289,7 +289,17 @@
+             self.shell.on_notification(wm, n);
+         }
+         self.shell.tick(wm);
+-        while let Some(request) = self.shell.managed().and_then(|b| b.take_request()) {
++        loop {
++            // Serialize launches: take the next request only after every
++            // previously launched app has reported READY or become terminal.
++            // Diagnostic behaviour for the attempt-002 first-app SIGKILL; the
++            // queued request stays owned by the Shell bridge meanwhile.
++            if self.applications.launch_in_progress() {
++                break;
++            }
++            let Some(request) = self.shell.managed().and_then(|b| b.take_request()) else {
++                break;
++            };
+             let source = match request.source {
+                 chonk_shell::managed::RequestSource::Input => {
+                     crate::launch_audit::RequestSource::Input
+--- a/crates/wm-darwin/src/launch_audit.rs
++++ b/crates/wm-darwin/src/launch_audit.rs
+@@ -26,6 +26,11 @@
+     }
+ }
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum CsPhase {
++    Spawn,
++    Exit,
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ #[repr(usize)]
+ pub enum Gate {
+     Admission,
+@@ -71,6 +76,9 @@
+     pub native_result: Option<crate::applications::SpawnResultV1>,
+     /// Kernel exit reason read before reap; diagnostic, never an outcome.
+     pub exit_reason: Option<crate::applications::ExitReason>,
++    /// csops CS_OPS_STATUS right after spawn and at exit (before reap).
++    pub cs_at_spawn: Option<crate::applications::CsStatus>,
++    pub cs_at_exit: Option<crate::applications::CsStatus>,
+ }
+ pub struct LaunchAudit {
+     origin: Instant,
+@@ -176,6 +184,8 @@
+             native_return: None,
+             native_result: None,
+             exit_reason: None,
++            cs_at_spawn: None,
++            cs_at_exit: None,
+         });
+         self.append(format!("CHONKLAUNCH/1 attempt={sequence} ms={now} request={shell_request:?} instance={instance:?} source={} event=requested\n",source.name()));
+         Ok(sequence)
+@@ -233,6 +243,25 @@
+             "CHONKLAUNCH/1 attempt={sequence} ms={now} event=ExitReason exit_reason={reason}\n"
+         ));
+     }
++    /// Recorded once per phase. Diagnostic only.
++    pub fn cs_status(&mut self, sequence: usize, phase: CsPhase, status: crate::applications::CsStatus) {
++        let slot = match phase {
++            CsPhase::Spawn => &mut self.attempts[sequence].cs_at_spawn,
++            CsPhase::Exit => &mut self.attempts[sequence].cs_at_exit,
++        };
++        if slot.is_some() {
++            return;
++        }
++        *slot = Some(status);
++        let now = self.now_ms();
++        self.append(format!(
++            "CHONKLAUNCH/1 attempt={sequence} ms={now} event=CsStatus phase={phase:?} cs_status={status}\n"
++        ));
++    }
++    /// The frontend's own code-signing flags, journaled once at adoption.
++    pub fn manager_cs_status(&mut self, status: crate::applications::CsStatus) {
++        self.append(format!("CHONKLAUNCH/1 scope=manager self_cs_status={status}\n"));
++    }
+     pub fn observe(
+         &mut self,
+         sequence: usize,
+@@ -298,6 +327,16 @@
+                 Some(reason) => writeln!(out, "attempt={} exit_reason={reason}", a.sequence)?,
+                 None => writeln!(out, "attempt={} exit_reason=not_observed", a.sequence)?,
+             }
++            let cs = |s: &Option<crate::applications::CsStatus>| {
++                s.map_or_else(|| "not_observed".to_string(), |v| v.to_string())
++            };
++            writeln!(
++                out,
++                "attempt={} cs_at_spawn={} cs_at_exit={}",
++                a.sequence,
++                cs(&a.cs_at_spawn),
++                cs(&a.cs_at_exit)
++            )?;
+             for gate in GATES {
+                 writeln!(
+                     out,
+--- a/crates/wm-darwin/src/terminal_launch.rs
++++ b/crates/wm-darwin/src/terminal_launch.rs
+@@ -156,6 +156,9 @@
+         let records = PrivateDirectory::open(records)?;
+         let journal = records.file("manager-status.log")?;
+         manager.audit.attach_private_journal(journal)?;
++        manager.audit.manager_cs_status(crate::applications::query_cs_status(
++            i32::try_from(std::process::id()).unwrap_or(0),
++        ));
+         Ok(Self {
+             binary,
+             socket,

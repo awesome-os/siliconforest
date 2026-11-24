@@ -1,0 +1,104 @@
+--- a/src/Frameworks/OpenGL/CGL.c
++++ b/src/Frameworks/OpenGL/CGL.c
+@@ -464,6 +464,7 @@
+ #ifdef SF_CGL_USE_EGL
+ static void sf_cgl_stop_presenting(CGLContextObj ctx);
+ static void sf_cgl_clear_export_cache(CGLContextObj ctx);
++static void sf_cgl_purge_unused_images(void);
+ #endif
+ 
+ CGLError
+@@ -667,6 +668,7 @@
+ #ifdef SF_CGL_USE_EGL
+ 	EGLDisplay dpy = sf_cgl_get_display();
+     sf_cgl_clear_export_cache(ctx);
++    sf_cgl_purge_unused_images();
+ 
+ 	if (sf_cgl_current == ctx) {
+ 		if (dpy != EGL_NO_DISPLAY) {
+@@ -1356,12 +1358,16 @@
+ // alternate between a few surfaces; Firefox's parent looks a tile's surface up again at every swap, a new
+ // IOSurfaceRef for the same surface) only re-targets that image instead of importing and binding the dma-buf again.
+ // Each entry retains the surface it was made from, so the storage and its ID stay that surface's; an entry no
+-// texture uses is let go after 3 s unused, or when the cache is full. Called with sf_cgl_track_lock held.
++// texture uses is eligible for collection after 3 s on later cache activity.
++// Unused entries are also collected at context teardown. The cache is bounded
++// by both entry count and retained pixel layout bytes. Track lock held below.
+ #define SF_CGL_IMAGES 96
++#define SF_CGL_IMAGE_BYTES_MAX (128ull * 1024 * 1024)
+ static struct sf_cgl_image {
+     IOSurfaceRef surface;uint32_t id;size_t offset,row;GLsizei width,height;EGLint fourcc;EGLImage image;int users;double used;
+ } sf_cgl_images[SF_CGL_IMAGES];
+ static int sf_cgl_image_count;
++static uint64_t sf_cgl_image_bytes;
+ static uint64_t sf_cgl_image_clock,sf_cgl_image_stats[3]; // hits, imports, let go
+ static double sf_cgl_image_now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1000.0+t.tv_nsec/1e6;}
+ // a global ID (iosurfaced's; a process-local one has the top bit set and may come round again): 0 when not global
+@@ -1374,12 +1380,36 @@
+     if(on<0){const char *v=getenv("SFFX_GPU_IMAGE_CACHE");on=v&&!strcmp(v,"1");}
+     return on;
+ }
+-void CGLSFFXImageCacheStats(uint64_t values[3]){if(values)memcpy(values,sf_cgl_image_stats,sizeof(sf_cgl_image_stats));}
++void CGLSFFXImageCacheStats(uint64_t values[3]){
++    if(!values)return;
++    pthread_mutex_lock(&sf_cgl_track_lock);
++    memcpy(values,sf_cgl_image_stats,sizeof(sf_cgl_image_stats));
++    pthread_mutex_unlock(&sf_cgl_track_lock);
++}
++// Diagnostic snapshot: entry count, layout bytes, unused layout bytes, limit.
++// Layout bytes are not a measurement of total physical GPU memory.
++void CGLSFFXImageCacheFootprint(uint64_t values[4]){
++    if(!values)return;
++    pthread_mutex_lock(&sf_cgl_track_lock);
++    uint64_t unused=0;
++    for(int i=0;i<sf_cgl_image_count;i++)if(sf_cgl_images[i].users<=0)
++        unused+=(uint64_t)sf_cgl_images[i].row*sf_cgl_images[i].height;
++    values[0]=sf_cgl_image_count;values[1]=sf_cgl_image_bytes;
++    values[2]=unused;values[3]=SF_CGL_IMAGE_BYTES_MAX;
++    pthread_mutex_unlock(&sf_cgl_track_lock);
++}
+ static void sf_cgl_image_forget(int i){
++    sf_cgl_image_bytes-=(uint64_t)sf_cgl_images[i].row*sf_cgl_images[i].height;
+     if(sf_present.destroyImage)sf_present.destroyImage(sf_cgl_get_display(),sf_cgl_images[i].image);
+     if(sf_cf_release)sf_cf_release(sf_cgl_images[i].surface);
+     sf_cgl_images[i]=sf_cgl_images[--sf_cgl_image_count];
+     sf_cgl_image_stats[2]++;
++}
++static void sf_cgl_purge_unused_images(void){
++    pthread_mutex_lock(&sf_cgl_track_lock);
++    for(int i=0;i<sf_cgl_image_count;)
++        if(sf_cgl_images[i].users<=0)sf_cgl_image_forget(i);else i++;
++    pthread_mutex_unlock(&sf_cgl_track_lock);
+ }
+ static void sf_cgl_image_sweep(void){
+     double now=sf_cgl_image_now();
+@@ -1401,15 +1431,17 @@
+ }
+ static void sf_cgl_image_keep(IOSurfaceRef surface,size_t offset,size_t row,GLsizei w,GLsizei h,EGLint fourcc,EGLImage image){
+     sf_cgl_image_stats[1]++;
+-    if(!sf_cf_retain)return;
++    if(!sf_cf_retain||h<=0||!row||(uint64_t)row>SF_CGL_IMAGE_BYTES_MAX/(uint64_t)h)return;
++    uint64_t bytes=(uint64_t)row*(uint64_t)h;
+     sf_cgl_image_sweep();
+-    if(sf_cgl_image_count==SF_CGL_IMAGES){
++    while(sf_cgl_image_count==SF_CGL_IMAGES||sf_cgl_image_bytes>SF_CGL_IMAGE_BYTES_MAX-bytes){
+         int oldest=-1;
+         for(int i=0;i<sf_cgl_image_count;i++)
+             if(sf_cgl_images[i].users<=0&&(oldest<0||sf_cgl_images[i].used<sf_cgl_images[oldest].used))oldest=i;
+         if(oldest<0)return; // all in use: this image stays the texture's own
+         sf_cgl_image_forget(oldest);
+     }
++    sf_cgl_image_bytes+=bytes;
+     sf_cgl_images[sf_cgl_image_count++]=(struct sf_cgl_image){(IOSurfaceRef)sf_cf_retain(surface),sf_cgl_image_id(surface),offset,row,w,h,fourcc,image,1,sf_cgl_image_now()};
+ }
+ // a texture no longer uses its image: 1 when the cache owns it (it stays), 0 when the caller destroys it
+@@ -2357,7 +2389,8 @@
+ // whose other pixels are current already (QuartzCore's damage frames)
+ int CGLSFFXCopyFramebufferRect(IOSurfaceRef surface,int flip,int x,int y,int w,int h) {
+     CGLContextObj ctx=sf_cgl_current;
+-    if(!ctx||w<=0||h<=0||x<0||y<0||x+w>ctx->width||y+h>ctx->height)return 0;
++    if(!ctx||w<=0||h<=0||x<0||y<0||x>ctx->width||y>ctx->height||
++       w>ctx->width-x||h>ctx->height-y)return 0;
+     return sf_sffx_copy_framebuffer(surface,flip,x,y,w,h);
+ }
+ static int sf_sffx_copy_framebuffer(IOSurfaceRef surface,int flip,int rx,int ry,int rw,int rh) {

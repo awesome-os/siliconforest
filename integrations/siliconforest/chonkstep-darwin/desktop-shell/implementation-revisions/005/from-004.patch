@@ -1,0 +1,484 @@
+--- a/crates/wm-darwin/src/applications.rs
++++ b/crates/wm-darwin/src/applications.rs
+@@ -197,15 +197,53 @@
+     Reaped(i32),
+     Unknown(i32),
+ }
++/// Kernel exit reason read from the owned zombie before it is reaped.
++/// Diagnostic only: it never changes the wait status, ownership or outcome.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub enum ExitReason {
++    /// This host has no proc_pidinfo exit-reason query (non-Apple builds).
++    Unsupported,
++    /// The non-reaping exit check or the reason query failed with this errno.
++    /// ENOENT from the query means the kernel recorded no reason for an exit.
++    QueryFailed(i32),
++    /// PROC_PIDEXITREASONBASICINFO, used when the reason payload did not fit.
++    Basic { namespace: u32, code: u64, flags: u64, payload_bytes: u32 },
++    /// PROC_PIDEXITREASONINFO with the kernel's kcdata payload, at most
++    /// EXIT_REASON_PAYLOAD_LIMIT bytes, copied verbatim for host decoding.
++    Full { namespace: u32, code: u64, flags: u64, payload: Vec<u8> },
++}
++pub const EXIT_REASON_PAYLOAD_LIMIT: usize = 320;
++impl std::fmt::Display for ExitReason {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::Unsupported => write!(f, "unsupported"),
++            Self::QueryFailed(errno) => write!(f, "query_failed errno={errno}"),
++            Self::Basic { namespace, code, flags, payload_bytes } => write!(
++                f,
++                "basic namespace={namespace} code={code:#x} flags={flags:#x} payload_bytes={payload_bytes}"
++            ),
++            Self::Full { namespace, code, flags, payload } => {
++                write!(
++                    f,
++                    "full namespace={namespace} code={code:#x} flags={flags:#x} payload_bytes={} payload_hex=",
++                    payload.len()
++                )?;
++                payload.iter().try_for_each(|b| write!(f, "{b:02x}"))
++            }
++        }
++    }
++}
+ pub struct OwnedChild {
+     pid: NonZeroI32,
+     state: WaitState,
++    exit_reason: Option<ExitReason>,
+ }
+ impl OwnedChild {
+     fn new(pid: i32) -> Option<Self> {
+         (pid > 0).then(|| Self {
+             pid: NonZeroI32::new(pid).unwrap(),
+             state: WaitState::Running,
++            exit_reason: None,
+         })
+     }
+     pub fn pid(&self) -> i32 {
+@@ -214,11 +252,19 @@
+     pub fn state(&self) -> WaitState {
+         self.state
+     }
++    pub fn exit_reason(&self) -> Option<&ExitReason> {
++        self.exit_reason.as_ref()
++    }
+     pub fn poll(&mut self) -> WaitState {
+         self.poll_using(&mut UnixWait)
+     }
+     fn poll_using(&mut self, ops: &mut impl WaitApi) -> WaitState {
+         if self.state == WaitState::Running {
++            // Read the reason while the child is still an unreaped zombie of
++            // this owner. The reap below stays the only ownership decision.
++            if self.exit_reason.is_none() {
++                self.exit_reason = ops.exit_reason(self.pid());
++            }
+             self.state = match ops.wait(self.pid()) {
+                 Ok(Some(status)) => WaitState::Reaped(status),
+                 Ok(None) | Err(libc::EINTR) => WaitState::Running,
+@@ -244,9 +290,112 @@
+ trait WaitApi {
+     fn wait(&mut self, pid: i32) -> Result<Option<i32>, i32>;
+     fn signal(&mut self, pid: i32, signal: i32) -> Result<(), i32>;
++    /// Some(reason) only once the child has exited and is still unreaped.
++    fn exit_reason(&mut self, _pid: i32) -> Option<ExitReason> {
++        None
++    }
++}
++/// Non-reaping exit check: WEXITED|WNOHANG|WNOWAIT leaves the zombie waitable.
++/// si_pid is zeroed first because XNU leaves siginfo untouched when nothing
++/// has exited (kern_exit.c waitid WNOHANG path).
++fn exited_without_reaping(pid: i32) -> Result<bool, i32> {
++    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
++    let returned = unsafe {
++        libc::waitid(
++            libc::P_PID,
++            pid as libc::id_t,
++            &mut info,
++            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
++        )
++    };
++    if returned != 0 {
++        return Err(io::Error::last_os_error()
++            .raw_os_error()
++            .unwrap_or(libc::EIO));
++    }
++    #[cfg(target_vendor = "apple")]
++    let reported = info.si_pid;
++    #[cfg(not(target_vendor = "apple"))]
++    let reported = unsafe { info.si_pid() };
++    Ok(reported == pid)
++}
++#[cfg(target_vendor = "apple")]
++fn query_exit_reason(pid: i32) -> ExitReason {
++    // Pinned XNU sys/proc_info_private.h flavors and packed layouts.
++    const PROC_PIDEXITREASONINFO: libc::c_int = 24;
++    const PROC_PIDEXITREASONBASICINFO: libc::c_int = 25;
++    #[repr(C, packed)]
++    #[derive(Default)]
++    struct Info {
++        namespace: u32,
++        code: u64,
++        flags: u64,
++        buf_size: u32,
++        kcd_buf: u64,
++    }
++    #[repr(C, packed)]
++    #[derive(Default)]
++    struct Basic {
++        namespace: u32,
++        code: u64,
++        flags: u64,
++        buf_size: u32,
++    }
++    const _: () = assert!(std::mem::size_of::<Info>() == 32 && std::mem::size_of::<Basic>() == 24);
++    let errno = || io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO);
++    let mut payload = [0u8; EXIT_REASON_PAYLOAD_LIMIT];
++    let mut info = Info {
++        buf_size: EXIT_REASON_PAYLOAD_LIMIT as u32,
++        kcd_buf: payload.as_mut_ptr() as u64,
++        ..Default::default()
++    };
++    let size = std::mem::size_of::<Info>() as libc::c_int;
++    let returned = unsafe {
++        libc::proc_pidinfo(pid, PROC_PIDEXITREASONINFO, 0, (&mut info as *mut Info).cast(), size)
++    };
++    if returned == size {
++        let used = (info.buf_size as usize).min(EXIT_REASON_PAYLOAD_LIMIT);
++        return ExitReason::Full {
++            namespace: info.namespace,
++            code: info.code,
++            flags: info.flags,
++            payload: payload[..used].to_vec(),
++        };
++    }
++    let first = errno();
++    if first != libc::ENOMEM {
++        return ExitReason::QueryFailed(first);
++    }
++    // The payload exceeded the bound; keep the namespace/code/flags facts.
++    let mut basic = Basic::default();
++    let size = std::mem::size_of::<Basic>() as libc::c_int;
++    let returned = unsafe {
++        libc::proc_pidinfo(pid, PROC_PIDEXITREASONBASICINFO, 0, (&mut basic as *mut Basic).cast(), size)
++    };
++    if returned == size {
++        ExitReason::Basic {
++            namespace: basic.namespace,
++            code: basic.code,
++            flags: basic.flags,
++            payload_bytes: basic.buf_size,
++        }
++    } else {
++        ExitReason::QueryFailed(errno())
++    }
+ }
+ struct UnixWait;
+ impl WaitApi for UnixWait {
++    fn exit_reason(&mut self, pid: i32) -> Option<ExitReason> {
++        match exited_without_reaping(pid) {
++            Ok(false) | Err(libc::EINTR) => None,
++            // ECHILD or another error: the reap below reports ownership facts.
++            Err(errno) => Some(ExitReason::QueryFailed(errno)),
++            #[cfg(target_vendor = "apple")]
++            Ok(true) => Some(query_exit_reason(pid)),
++            #[cfg(not(target_vendor = "apple"))]
++            Ok(true) => Some(ExitReason::Unsupported),
++        }
++    }
+     fn wait(&mut self, pid: i32) -> Result<Option<i32>, i32> {
+         let mut status = 0;
+         // Only this positive, directly returned child PID is ever waited on.
+@@ -569,6 +718,9 @@
+     ) {
+         let _ = self.status.drain(&mut self.stream);
+         self.child.poll_using(ops);
++        if let Some(reason) = self.child.exit_reason() {
++            audit.exit_reason(self.audit_sequence, reason);
++        }
+         audit.observe(self.audit_sequence, &self.status, self.child.state());
+         // Late reaps are still recorded after an incomplete deadline, but no
+         // new signals or attempted success reclassification follow that result.
+@@ -668,6 +820,12 @@
+                 .values()
+                 .all(|a| a.completion() == Completion::Complete)
+     }
++    /// True while any owned application has not reached a terminal outcome.
++    pub fn shutdown_pending(&self) -> bool {
++        self.applications
++            .values()
++            .any(|a| a.completion() == Completion::Pending)
++    }
+     pub fn shutdown_incomplete(&self) -> bool {
+         self.applications
+             .values()
+@@ -1394,4 +1552,157 @@
+         // Guard only cleans up an exclusively owned still-running child if an
+         // assertion fails before retirement; it never performs a second reap.
+     }
++
++    #[test]
++    fn exit_reason_is_read_once_before_the_reap_and_never_changes_the_outcome() {
++        struct ReasonWait {
++            reason_calls: usize,
++        }
++        impl WaitApi for ReasonWait {
++            fn wait(&mut self, _: i32) -> Result<Option<i32>, i32> {
++                assert!(self.reason_calls > 0, "reason must be read before the reap");
++                Ok(Some(9))
++            }
++            fn signal(&mut self, _: i32, _: i32) -> Result<(), i32> {
++                Ok(())
++            }
++            fn exit_reason(&mut self, _: i32) -> Option<ExitReason> {
++                self.reason_calls += 1;
++                Some(ExitReason::Full {
++                    namespace: 3,
++                    code: 1,
++                    flags: 6,
++                    payload: vec![0x36, 0, 0, 0],
++                })
++            }
++        }
++        let now = Instant::now();
++        let (mut app, _peer, mut audit) = fake_application(now);
++        let mut ops = ReasonWait { reason_calls: 0 };
++        app.service(now, false, &mut audit, &mut ops);
++        app.service(now, false, &mut audit, &mut ops);
++        assert_eq!(ops.reason_calls, 1, "no query after the reap");
++        let attempt = &audit.attempts()[0];
++        assert_eq!(attempt.raw_app_wait_status, Some(9));
++        assert!(attempt.failure.is_some(), "SIGKILL stays a failure");
++        assert!(matches!(attempt.exit_reason, Some(ExitReason::Full { namespace: 3, .. })));
++        let mut out = Vec::new();
++        audit.snapshot(&mut out).unwrap();
++        let text = String::from_utf8(out).unwrap();
++        assert!(text.contains(
++            "attempt=0 exit_reason=full namespace=3 code=0x1 flags=0x6 payload_bytes=4 payload_hex=36000000"
++        ), "{text}");
++    }
++    #[test]
++    fn missing_exit_reason_is_reported_as_not_observed() {
++        let now = Instant::now();
++        let (mut app, _peer, mut audit) = fake_application(now);
++        let mut ops = FakeWait {
++            result: Ok(Some(0)),
++            signals: vec![],
++        };
++        app.service(now, false, &mut audit, &mut ops);
++        assert!(audit.attempts()[0].exit_reason.is_none());
++        let mut out = Vec::new();
++        audit.snapshot(&mut out).unwrap();
++        assert!(String::from_utf8(out).unwrap().contains("attempt=0 exit_reason=not_observed"));
++    }
++    #[test]
++    fn largest_exit_reason_journal_line_fits_the_journal_bound() {
++        let reason = ExitReason::Full {
++            namespace: u32::MAX,
++            code: u64::MAX,
++            flags: u64::MAX,
++            payload: vec![0xff; EXIT_REASON_PAYLOAD_LIMIT],
++        };
++        let line = format!(
++            "CHONKLAUNCH/1 attempt={} ms={} event=ExitReason exit_reason={reason}\n",
++            crate::launch_audit::MAX_ATTEMPTS - 1,
++            u64::MAX
++        );
++        assert!(line.len() <= 1024, "{}", line.len());
++        let basic = ExitReason::Basic {
++            namespace: u32::MAX,
++            code: u64::MAX,
++            flags: u64::MAX,
++            payload_bytes: u32::MAX,
++        };
++        assert!(basic.to_string().len() < 200);
++    }
++    #[cfg(target_os = "linux")]
++    #[test]
++    #[allow(
++        clippy::zombie_processes,
++        reason = "the non-reaping check and actual UnixWait are the sole wait owners exercised; std::Child must not compete"
++    )]
++    fn real_host_exit_check_leaves_the_zombie_for_the_owner_to_reap() {
++        // Linux waitid/WNOWAIT syscall exercise only. Darwin's proc_pidinfo
++        // exit-reason query is not executed on this host.
++        let running = std::process::Command::new("/bin/sleep")
++            .arg("30")
++            .stdin(std::process::Stdio::null())
++            .stdout(std::process::Stdio::null())
++            .stderr(std::process::Stdio::null())
++            .spawn()
++            .unwrap();
++        let running_pid = i32::try_from(running.id()).unwrap();
++        assert_eq!(exited_without_reaping(running_pid), Ok(false));
++        let mut owned_running = OwnedChild::new(running_pid).unwrap();
++        owned_running.terminate().unwrap();
++        let child = std::process::Command::new("/bin/sh")
++            .args(["-c", "exit 3"])
++            .stdin(std::process::Stdio::null())
++            .stdout(std::process::Stdio::null())
++            .stderr(std::process::Stdio::null())
++            .spawn()
++            .unwrap();
++        let pid = i32::try_from(child.id()).unwrap();
++        let deadline = Instant::now() + Duration::from_secs(3);
++        let mut exited = false;
++        while Instant::now() < deadline {
++            match exited_without_reaping(pid) {
++                Ok(true) => {
++                    exited = true;
++                    break;
++                }
++                Ok(false) => std::thread::sleep(Duration::from_millis(1)),
++                Err(e) => panic!("waitid failed: {e}"),
++            }
++        }
++        assert!(exited);
++        assert_eq!(exited_without_reaping(pid), Ok(true), "still unreaped");
++        let mut owned = OwnedChild::new(pid).unwrap();
++        assert!(matches!(owned.poll(), WaitState::Reaped(s) if libc::WIFEXITED(s) && libc::WEXITSTATUS(s) == 3));
++        #[cfg(not(target_vendor = "apple"))]
++        assert_eq!(owned.exit_reason(), Some(&ExitReason::Unsupported));
++        let deadline = Instant::now() + Duration::from_secs(3);
++        while owned_running.poll() == WaitState::Running && Instant::now() < deadline {
++            std::thread::sleep(Duration::from_millis(1));
++        }
++        assert!(matches!(owned_running.state(), WaitState::Reaped(s) if libc::WIFSIGNALED(s) && libc::WTERMSIG(s) == libc::SIGTERM));
++        // std::process::Child has no Drop wait or kill, so no second reap.
++    }
++    #[test]
++    fn one_incomplete_application_does_not_end_the_wait_for_another() {
++        let now = Instant::now();
++        let (mut first, _first_peer, audit) = fake_application(now);
++        let (second, _second_peer, _second_audit) = fake_application(now);
++        first.lifecycle.completion =
++            Completion::Incomplete("application reaped without complete sealed cleanup");
++        let other = Instance::parse(&"b".repeat(48)).unwrap();
++        let mut manager = OwnedApplications {
++            audit,
++            ..Default::default()
++        };
++        manager.applications.insert(id(), first);
++        manager.applications.insert(other.clone(), second);
++        manager.begin_shutdown();
++        assert!(manager.shutdown_pending());
++        assert!(manager.shutdown_incomplete());
++        assert!(!manager.shutdown_complete());
++        manager.applications.get_mut(&other).unwrap().lifecycle.completion = Completion::Complete;
++        assert!(!manager.shutdown_pending());
++        assert!(manager.shutdown_incomplete(), "the first failure stays a failure");
++        assert!(!manager.shutdown_complete());
++    }
+ }
+--- a/crates/wm-darwin/src/desktop.rs
++++ b/crates/wm-darwin/src/desktop.rs
+@@ -20,6 +20,26 @@
+     startup_requested: bool,
+ }
+ 
++/// Pending wins: no owned application is abandoned while another is still
++/// moving through TERM/KILL/reap/CLEANUP. Incomplete is reported only after
++/// every application is terminal, and it is never turned into Complete.
++fn cleanup_state(
++    pending: bool,
++    incomplete: bool,
++    complete: bool,
++) -> crate::session_entry::CleanupState {
++    use crate::session_entry::CleanupState;
++    if pending {
++        CleanupState::Pending
++    } else if incomplete {
++        CleanupState::Incomplete
++    } else if complete {
++        CleanupState::Complete
++    } else {
++        CleanupState::Pending
++    }
++}
++
+ impl crate::server::Server {
+     /// One explicit packaged request, before normal dispatch. Zero is the
+     /// default; it does not synthesize HID/Wayland input or create a process.
+@@ -69,13 +89,14 @@
+             return crate::session_entry::CleanupState::Incomplete;
+         };
+         desktop.applications.poll();
+-        if desktop.applications.shutdown_incomplete() {
+-            crate::session_entry::CleanupState::Incomplete
+-        } else if desktop.applications.shutdown_complete() {
+-            crate::session_entry::CleanupState::Complete
+-        } else {
+-            crate::session_entry::CleanupState::Pending
+-        }
++        // One incomplete application must not end the wait for the others:
++        // every owned app keeps its TERM/KILL/reap/CLEANUP path until it is
++        // terminal, within the coordinator's bounded cleanup window.
++        cleanup_state(
++            desktop.applications.shutdown_pending(),
++            desktop.applications.shutdown_incomplete(),
++            desktop.applications.shutdown_complete(),
++        )
+     }
+     pub fn desktop_closing(&self) -> bool {
+         self.desktop.as_ref().is_some_and(|d| d.closing)
+@@ -543,4 +564,13 @@
+         );
+         assert!(d.applications.has_failures());
+     }
++    #[test]
++    fn cleanup_waits_for_every_owned_application_before_reporting() {
++        use crate::session_entry::CleanupState::*;
++        assert_eq!(super::cleanup_state(true, true, false), Pending);
++        assert_eq!(super::cleanup_state(true, false, false), Pending);
++        assert_eq!(super::cleanup_state(false, true, false), Incomplete);
++        assert_eq!(super::cleanup_state(false, false, true), Complete);
++        assert_eq!(super::cleanup_state(false, false, false), Pending);
++    }
+ }
+--- a/crates/wm-darwin/src/launch_audit.rs
++++ b/crates/wm-darwin/src/launch_audit.rs
+@@ -69,6 +69,8 @@
+     pub cleanup: Option<crate::applications::Cleanup>,
+     pub native_return: Option<i32>,
+     pub native_result: Option<crate::applications::SpawnResultV1>,
++    /// Kernel exit reason read before reap; diagnostic, never an outcome.
++    pub exit_reason: Option<crate::applications::ExitReason>,
+ }
+ pub struct LaunchAudit {
+     origin: Instant,
+@@ -173,6 +175,7 @@
+             cleanup: None,
+             native_return: None,
+             native_result: None,
++            exit_reason: None,
+         });
+         self.append(format!("CHONKLAUNCH/1 attempt={sequence} ms={now} request={shell_request:?} instance={instance:?} source={} event=requested\n",source.name()));
+         Ok(sequence)
+@@ -218,6 +221,18 @@
+             self.mark(sequence, Gate::PidOwned);
+         }
+     }
++    /// Recorded once per attempt, before the reap is observed. A journal
++    /// line stays under the 1024-byte bound because the payload is capped.
++    pub fn exit_reason(&mut self, sequence: usize, reason: &crate::applications::ExitReason) {
++        if self.attempts[sequence].exit_reason.is_some() {
++            return;
++        }
++        let now = self.now_ms();
++        self.attempts[sequence].exit_reason = Some(reason.clone());
++        self.append(format!(
++            "CHONKLAUNCH/1 attempt={sequence} ms={now} event=ExitReason exit_reason={reason}\n"
++        ));
++    }
+     pub fn observe(
+         &mut self,
+         sequence: usize,
+@@ -279,6 +294,10 @@
+         writeln!(out, "CHONKLAUNCH/1 snapshot attempts={} journal_error={:?} app_internal_gates=unknown_until_final_app_record", self.attempts.len(), self.failure)?;
+         for a in &self.attempts {
+             writeln!(out, "attempt={} source={} request={:?} instance={:?} pid={:?} created_ms={} failure={:?} failure_ms={:?} status_bytes={} wait={:?} wait_error={:?} cleanup={:?} native_return={:?} native={:?}", a.sequence, a.source.name(), a.shell_request, a.instance, a.pid, a.created_ms, a.failure, a.failure_ms, a.status_bytes, a.raw_app_wait_status, a.wait_error, a.cleanup, a.native_return, a.native_result)?;
++            match &a.exit_reason {
++                Some(reason) => writeln!(out, "attempt={} exit_reason={reason}", a.sequence)?,
++                None => writeln!(out, "attempt={} exit_reason=not_observed", a.sequence)?,
++            }
+             for gate in GATES {
+                 writeln!(
+                     out,

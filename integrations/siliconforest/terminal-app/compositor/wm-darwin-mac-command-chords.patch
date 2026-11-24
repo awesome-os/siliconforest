@@ -1,0 +1,41 @@
+diff --git a/crates/wm-darwin/src/input.rs b/crates/wm-darwin/src/input.rs
+index 91485e9..b29a5fc 100644
+--- a/crates/wm-darwin/src/input.rs
++++ b/crates/wm-darwin/src/input.rs
+@@ -30,6 +30,18 @@ impl Server {
+     }
+ }
+ 
++/// The Command chords the desk keeps even when a Mac application has the keyboard: the desktop
++/// menu (Command-Space), Spaces by Tab (Command-Tab, -Shift-Tab, -Control-Tab), carrying and sending
++/// a window to a Space (Command-Shift-<digit>, Command-Option-Shift-<digit>) and the screenshots
++/// (Command-Control-Shift-3/4/5).
++fn desktop_chord(combo:KeyCombo)->bool{
++    let m=combo.modifiers;let k=combo.keysym;
++    let digit=(0x30..=0x39).contains(&k);
++    (m==Modifiers::SUPER && k==0x20)
++        || (k==0xff09 && (m==Modifiers::SUPER || m==Modifiers::SUPER|Modifiers::SHIFT || m==Modifiers::SUPER|Modifiers::CONTROL))
++        || (digit && (m==Modifiers::SUPER|Modifiers::SHIFT || m==Modifiers::SUPER|Modifiers::SHIFT|Modifiers::ALT))
++        || (matches!(k,0x33|0x34|0x35) && m==Modifiers::SUPER|Modifiers::CONTROL|Modifiers::SHIFT)
++}
+ fn modifiers(m:&ModifiersState)->Modifiers {
+     let mut out=Modifiers::empty();out.set(Modifiers::SHIFT,m.shift);out.set(Modifiers::CONTROL,m.ctrl);
+     out.set(Modifiers::ALT,m.alt);out.set(Modifiers::SUPER,m.logo);out
+@@ -188,11 +200,12 @@ impl Server {
+                         // asks about running processes and ends every window), as on macOS: the key
+                         // goes to it, not to the desktop's "quit application" (which asked each
+                         // window to close).
+-                        // The same for the other application commands of a Mac application: Command-W
+-                        // (its Close, with its questions), Command-M (Miniaturize) and Command-H (Hide)
+-                        // are AppKit's; on native windows they stay the desktop's.
+-                        if (mods==Modifiers::SUPER || mods==Modifiers::SUPER|Modifiers::ALT)
+-                            && matches!(combo.keysym,0x71|0x51|0x77|0x57|0x6d|0x4d|0x68|0x48) && s.focused_is_mac_application(){
++                        // A Mac application owns its Command chords, as on macOS (Command-W its Close,
++                        // Command-F Find, Command-T a tab, Command-S Save, Command-1..9 its windows,
++                        // Command-=/- its text size, ...): with one focused they go to it, except the
++                        // few the desk keeps for itself (desktop_chord). On native windows the
++                        // owner's Linux table applies unchanged.
++                        if mods.contains(Modifiers::SUPER) && !desktop_chord(combo) && s.focused_is_mac_application(){
+                             return FilterResult::Forward;
+                         }
+                         // While an area is selected for a screenshot, Escape cancels it.

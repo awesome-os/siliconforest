@@ -1,0 +1,52 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# The long thermal run: one worker per processor for @SOAK@ s (megabytes of zeros hashed,
+# 8 MB a pipeline, in one-minute groups), a TH_MON line every 30 s, the kernel's own
+# "SFCpuPower: thermal: minute" line every minute. tools/th_summary.py --soak gives the
+# PASS/FAIL lines. (@SSID@/@PSK@ are unused; the assembler fills templates.)
+nonce=${1:-none}
+PATH=/bin:/sbin:/usr/bin:/usr/sbin; export PATH
+printf '\nTH_BEGIN_%s\n' "$nonce"
+ncpu=$(sysctl -n hw.ncpu 2>/dev/null); ncpu=${ncpu:-1}
+t0=$(date +%s)
+now() { echo $(( $(date +%s) - t0 )); }
+get() { sysctl -n "$1" 2>/dev/null; }
+mon() {
+    printf 'TH_MON t=%s die_mc=%s status=%s cap=E%s/P%s pstate=E%s/P%s util=E%s/P%s fan=%s target=%s asked=%s mode=%s mw=%s tr=%s\n' \
+        "$(now)" "$(get kern.sf_thermal.die_mc)" "$(get kern.sf_thermal.status)" \
+        "$(get kern.sf_cpufreq.e_cap)" "$(get kern.sf_cpufreq.p_cap)" \
+        "$(get kern.sf_cpufreq.e_pstate)" "$(get kern.sf_cpufreq.p_pstate)" \
+        "$(get kern.sf_cpufreq.e_util)" "$(get kern.sf_cpufreq.p_util)" \
+        "$(get kern.sf_thermal.fan_rpm)" "$(get kern.sf_thermal.fan_target_rpm)" \
+        "$(get kern.sf_thermal.fan_asked_rpm)" "$(get kern.sf_thermal.fan_mode)" \
+        "$(get kern.sf_thermal.system_mw)" "$(get kern.sf_cpufreq.transitions)"
+}
+worker() {      # tag id seconds
+    i=0; start=$(date +%s); end=$(( start + $3 ))
+    while [ "$(date +%s)" -lt "$end" ]; do
+        dd if=/dev/zero bs=1048576 count=8 2>/dev/null | sha256sum > /dev/null
+        i=$((i+1))
+    done
+    printf 'TH_WORKER tag=%s id=%s megabytes=%s seconds=%s elapsed=%s\n' "$1" "$2" "$((i*8))" "$3" "$(( $(date +%s) - start ))"
+}
+n=0
+while [ "$(get kern.sf_thermal.valid)" != 1 ] && [ "$n" -lt 60 ]; do sleep 1; n=$((n+1)); done
+printf 'TH_SENSOR_WAIT seconds=%s valid=%s\n' "$n" "$(get kern.sf_thermal.valid)"
+sysctl kern.sf_thermal kern.sf_cpufreq 2>&1
+( while :; do mon; sleep 30; done ) &
+monitor=$!
+printf 'TH_PHASE soak t=%s seconds=%s workers=%s\n' "$(now)" @SOAK@ "$ncpu"
+minute=0
+while [ $((minute * 60)) -lt @SOAK@ ]; do
+    minute=$((minute+1))
+    pids=; w=0
+    while [ "$w" -lt "$ncpu" ]; do worker "soak$minute" "$w" 60 & pids="$pids $!"; w=$((w+1)); done
+    wait $pids
+    printf 'TH_GROUP_DONE tag=soak%s workers=%s\n' "$minute" "$ncpu"
+done
+kill "$monitor" 2>/dev/null
+printf 'TH_PHASE end t=%s\n' "$(now)"
+sysctl kern.sf_thermal kern.sf_cpufreq 2>&1
+printf 'TH_END_%s\n' "$nonce"
+# ends the capture at once (tools/pcie_iterate.sh PCIE_DONE)
+printf '\nPD_BENCH_DONE\n'

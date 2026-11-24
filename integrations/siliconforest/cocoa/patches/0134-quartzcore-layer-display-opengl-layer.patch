@@ -1,0 +1,352 @@
+--- a/src/Frameworks/QuartzCore/CALayer.m
++++ b/src/Frameworks/QuartzCore/CALayer.m
+@@ -7,6 +7,7 @@
+ #include <os/lock.h>
+ #include <dlfcn.h>
+ #include <string.h>
++#include <math.h>
+ #import <objc/runtime.h>
+ #include <stdlib.h>
+ 
+@@ -582,23 +583,47 @@
+    [self _setNeedsRender];
+ }
+ 
++// (TERM7) as CoreAnimation: the delegate's -displayLayer:, or a bitmap at the layer's pixel size that
++// -drawInContext: (the subclass's, or the delegate's -drawLayer:inContext:) draws, made the contents. A layer
++// nothing draws keeps its contents (no empty bitmap is made for it)
+ -(void)display {
+-   if([_delegate respondsToSelector:@selector(displayLayer:)])
++   if([_delegate respondsToSelector:@selector(displayLayer:)]){
+     [_delegate displayLayer:self];
+-   else {
+-#if 0
++    return;
++   }
++   if([self methodForSelector:@selector(drawInContext:)]==[CALayer instanceMethodForSelector:@selector(drawInContext:)] &&
++      ![_delegate respondsToSelector:@selector(drawLayer:inContext:)])
++    return;
+ 
++   CGFloat scale=_contentsScale>0 ? _contentsScale : 1;
++   size_t  width=(size_t)ceil(_bounds.size.width*scale),height=(size_t)ceil(_bounds.size.height*scale);
+ 
+-#warning create bitmap context
++   if(width==0 || height==0){
++    [self setContents:nil];
++    return;
++   }
++   CGColorSpaceRef space=CGColorSpaceCreateDeviceRGB();
++   CGContextRef    context=CGBitmapContextCreate(NULL,width,height,8,0,space,kCGImageAlphaPremultipliedFirst|kCGBitmapByteOrder32Little);
+ 
+-    [self drawInContext:context];
+-    _contents=image;
+-    [self setContents:image];
+-#endif
+-}
++   CGColorSpaceRelease(space);
++   if(context==NULL)
++    return;
++   CGContextScaleCTM(context,scale,scale);
++   CGContextTranslateCTM(context,-_bounds.origin.x,-_bounds.origin.y);
++   [self drawInContext:context];
++
++   CGImageRef image=CGBitmapContextCreateImage(context);
++
++   CGContextRelease(context);
++   [self setContents:(id)image];
++   CGImageRelease(image);
+ }
+ 
+ -(void)displayIfNeeded {
++   if(_needsDisplay){
++    _needsDisplay=NO;
++    [self display];
++   }
+ }
+ 
+ -(void)drawInContext:(CGContextRef)context {
+@@ -678,10 +703,12 @@
+ 
+ -(void)setNeedsDisplay {
+    _needsDisplay=YES;
++   [self _setNeedsRender];
+ }
+ 
+ -(void)setNeedsDisplayInRect:(CGRect)rect {
+    _needsDisplay=YES;
++   [self _setNeedsRender];
+ }
+ 
+ -(void)addAnimation:(CAAnimation *)animation forKey:(NSString *)key {
+--- a/src/Frameworks/QuartzCore/CALayerContext.m
++++ b/src/Frameworks/QuartzCore/CALayerContext.m
+@@ -190,7 +190,16 @@
+    }
+ }
+ 
++// (TERM7) what CoreAnimation does before it draws a tree: each layer marked with -setNeedsDisplay fills its contents
++static void displayLayersIfNeeded(CALayer *layer,int depth) {
++   [layer displayIfNeeded];
++   if(depth<32)
++    for(CALayer *sub in [layer sublayers])
++     displayLayersIfNeeded(sub,depth+1);
++}
++
+ -(void)render {
++   displayLayersIfNeeded(_layer,0);
+    [self renderLayer:_layer];
+ }
+ 
+--- a/src/Frameworks/QuartzCore/CAOpenGLLayer.h
++++ b/src/Frameworks/QuartzCore/CAOpenGLLayer.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: MIT */
++#import <QuartzCore/CALayer.h>
++#import <QuartzCore/CoreVideo.h>
++#import <OpenGL/OpenGL.h>
++
++/* A layer an application draws with OpenGL (CGL). The layer's -display makes (once) a CGL context of the
++   layer's pixel format through the overridable methods below, renders into that context's offscreen surface at
++   the layer's pixel size, and reads the pixels back as the layer's contents: what draws the layer tree (AppKit
++   on the CPU, CALayerContext with OpenGL) shows them like any other contents. */
++@interface CAOpenGLLayer : CALayer {
++    BOOL _asynchronous;
++    CGLPixelFormatObj _sfPixelFormat;
++    CGLContextObj _sfContext;
++    GLint _sfSurfaceSize[2];
++    id _sfTimer;
++    BOOL _sfFailed;
++}
++
++@property(getter=isAsynchronous) BOOL asynchronous;
++
++- (BOOL)canDrawInCGLContext:(CGLContextObj)ctx pixelFormat:(CGLPixelFormatObj)pf forLayerTime:(CFTimeInterval)t displayTime:(const CVTimeStamp *)ts;
++- (void)drawInCGLContext:(CGLContextObj)ctx pixelFormat:(CGLPixelFormatObj)pf forLayerTime:(CFTimeInterval)t displayTime:(const CVTimeStamp *)ts;
++- (CGLPixelFormatObj)copyCGLPixelFormatForDisplayMask:(uint32_t)mask;
++- (void)releaseCGLPixelFormat:(CGLPixelFormatObj)pf;
++- (CGLContextObj)copyCGLContextForPixelFormat:(CGLPixelFormatObj)pf;
++- (void)releaseCGLContext:(CGLContextObj)ctx;
++
++@end
+--- a/src/Frameworks/QuartzCore/CAOpenGLLayer.m
++++ b/src/Frameworks/QuartzCore/CAOpenGLLayer.m
+@@ -0,0 +1,212 @@
++/* SPDX-License-Identifier: MIT */
++/* (TERM7) CAOpenGLLayer: see CAOpenGLLayer.h. One OpenGL path: CGL, as CALayerContext uses it. The installed CGL
++   reaches the GPU through the EGL library at /usr/lib/libEGL.1.dylib and cannot run without it; AppKit decides
++   whether layers render through OpenGL by the same test (NSView.m, sfLayerRenderingAvailable). Where it fails,
++   the layer makes no context, says so once and has no contents (the application's
++   -canDrawInCGLContext:... and -drawInCGLContext:... are not called): no drawing is claimed that did not happen. */
++#import <QuartzCore/CAOpenGLLayer.h>
++#import <OpenGL/gl.h>
++#import <CoreGraphics/CoreGraphics.h>
++#include <dlfcn.h>
++#include <math.h>
++#include <stdlib.h>
++#include <string.h>
++
++@interface CALayer (CAOpenGLLayerPrivate)
++- (void)_setNeedsRender;
++@end
++
++static BOOL sfOpenGLAvailable(void) {
++    static int available = -1;
++
++    if (available < 0) {
++        const char *env = getenv("SFLayerRendering");
++
++        if (env != NULL && (env[0] == 'N' || env[0] == 'n' || env[0] == '0'))
++            available = 0;
++        else
++            available = dlopen("/usr/lib/libEGL.1.dylib", RTLD_LAZY | RTLD_LOCAL) != NULL;
++    }
++    return available;
++}
++
++static void releasePixels(void *info, const void *data, size_t size) {
++    free((void *)data);
++}
++
++// the asynchronous layer's display-refresh tick: a timer target that does not keep the layer
++@interface SFOpenGLLayerTick : NSObject {
++@public
++    CAOpenGLLayer *_layer;
++}
++@end
++
++@interface CAOpenGLLayer (SFPrivate)
++- (void)_sfTick;
++@end
++
++@implementation SFOpenGLLayerTick
++- (void)tick:(NSTimer *)timer {
++    [_layer _sfTick];
++}
++@end
++
++@implementation CAOpenGLLayer
++
++- (BOOL)isAsynchronous {
++    return _asynchronous;
++}
++
++- (void)setAsynchronous:(BOOL)value {
++    _asynchronous = value;
++    if (value && _sfTimer == nil) {
++        SFOpenGLLayerTick *tick = [[SFOpenGLLayerTick alloc] init];
++
++        tick->_layer = self;
++        _sfTimer = [[NSTimer timerWithTimeInterval:1.0 / 60 target:tick selector:@selector(tick:) userInfo:nil repeats:YES] retain];
++        [tick release];
++        [[NSRunLoop mainRunLoop] addTimer:_sfTimer forMode:NSRunLoopCommonModes];
++    }
++    else if (!value && _sfTimer != nil) {
++        [_sfTimer invalidate];
++        [_sfTimer release];
++        _sfTimer = nil;
++    }
++}
++
++- (void)dealloc {
++    [_sfTimer invalidate];
++    [_sfTimer release];
++    if (_sfContext != NULL)
++        [self releaseCGLContext:_sfContext];
++    if (_sfPixelFormat != NULL)
++        [self releaseCGLPixelFormat:_sfPixelFormat];
++    [super dealloc];
++}
++
++- (CGLPixelFormatObj)copyCGLPixelFormatForDisplayMask:(uint32_t)mask {
++    CGLPixelFormatAttribute attributes[] = {
++        kCGLPFADisplayMask, (CGLPixelFormatAttribute)mask,
++        kCGLPFAAccelerated,
++        kCGLPFAColorSize, (CGLPixelFormatAttribute)24,
++        kCGLPFAAlphaSize, (CGLPixelFormatAttribute)8,
++        (CGLPixelFormatAttribute)0
++    };
++    CGLPixelFormatObj pf = NULL;
++    GLint count = 0;
++
++    if (CGLChoosePixelFormat(attributes, &pf, &count) != kCGLNoError)
++        return NULL;
++    return pf;
++}
++
++- (void)releaseCGLPixelFormat:(CGLPixelFormatObj)pf {
++    CGLReleasePixelFormat(pf);
++}
++
++- (CGLContextObj)copyCGLContextForPixelFormat:(CGLPixelFormatObj)pf {
++    CGLContextObj ctx = NULL;
++
++    if (CGLCreateContext(pf, NULL, &ctx) != kCGLNoError)
++        return NULL;
++    return ctx;
++}
++
++- (void)releaseCGLContext:(CGLContextObj)ctx {
++    CGLReleaseContext(ctx);
++}
++
++- (BOOL)canDrawInCGLContext:(CGLContextObj)ctx pixelFormat:(CGLPixelFormatObj)pf forLayerTime:(CFTimeInterval)t displayTime:(const CVTimeStamp *)ts {
++    return YES;
++}
++
++- (void)drawInCGLContext:(CGLContextObj)ctx pixelFormat:(CGLPixelFormatObj)pf forLayerTime:(CFTimeInterval)t displayTime:(const CVTimeStamp *)ts {
++    glFlush();
++}
++
++// a context of the layer's own, made the first time the layer is displayed
++- (BOOL)_sfPrepareContext {
++    if (_sfContext != NULL)
++        return YES;
++    if (_sfFailed)
++        return NO;
++    if (!sfOpenGLAvailable()) {
++        NSLog(@"CAOpenGLLayer %p: no OpenGL (libEGL) on this system: the layer is not drawn", self);
++        _sfFailed = YES;
++        return NO;
++    }
++    _sfPixelFormat = [self copyCGLPixelFormatForDisplayMask:0xffffffff];
++    if (_sfPixelFormat != NULL)
++        _sfContext = [self copyCGLContextForPixelFormat:_sfPixelFormat];
++    if (_sfContext == NULL) {
++        NSLog(@"CAOpenGLLayer %p: no CGL %s: the layer is not drawn", self, _sfPixelFormat == NULL ? "pixel format" : "context");
++        _sfFailed = YES;
++        return NO;
++    }
++    return YES;
++}
++
++// renders and reads the pixels back as the contents; NO when nothing was drawn
++- (BOOL)_sfRenderForced:(BOOL)forced {
++    CGFloat scale = [self contentsScale] > 0 ? [self contentsScale] : 1;
++    CGRect b = [self bounds];
++    GLint width = (GLint)ceil(b.size.width * scale), height = (GLint)ceil(b.size.height * scale);
++
++    if (width <= 0 || height <= 0 || ![self _sfPrepareContext])
++        return NO;
++
++    CGLContextObj previous = CGLGetCurrentContext();
++    CFTimeInterval now = CFAbsoluteTimeGetCurrent();
++    BOOL drew = NO;
++
++    CGLLockContext(_sfContext);
++    if (_sfSurfaceSize[0] != width || _sfSurfaceSize[1] != height) {
++        _sfSurfaceSize[0] = width;
++        _sfSurfaceSize[1] = height;
++        CGLSetParameter(_sfContext, kCGLCPSurfaceBackingSize, _sfSurfaceSize);
++    }
++    CGLSetCurrentContext(_sfContext);
++    if (forced || [self canDrawInCGLContext:_sfContext pixelFormat:_sfPixelFormat forLayerTime:now displayTime:NULL]) {
++        size_t row = (size_t)width * 4;
++        uint8_t *pixels = malloc(row * height), *flipped = malloc(row * height);
++
++        glViewport(0, 0, width, height);
++        [self drawInCGLContext:_sfContext pixelFormat:_sfPixelFormat forLayerTime:now displayTime:NULL];
++        if (pixels != NULL && flipped != NULL) {
++            glPixelStorei(GL_PACK_ALIGNMENT, 1);
++            glReadPixels(0, 0, width, height, GL_BGRA, GL_UNSIGNED_BYTE, pixels);
++            for (GLint y = 0; y < height; y++)
++                memcpy(flipped + y * row, pixels + (height - 1 - y) * row, row);
++            free(pixels);
++
++            CGDataProviderRef provider = CGDataProviderCreateWithData(NULL, flipped, row * height, releasePixels);
++            CGColorSpaceRef space = CGColorSpaceCreateDeviceRGB();
++            CGImageRef image = CGImageCreate(width, height, 8, 32, row, space, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little,
++                                             provider, NULL, NO, kCGRenderingIntentDefault);
++
++            CGColorSpaceRelease(space);
++            CGDataProviderRelease(provider);
++            [self setContents:(id)image];
++            CGImageRelease(image);
++            drew = YES;
++        }
++        else {
++            free(pixels);
++            free(flipped);
++        }
++    }
++    CGLSetCurrentContext(previous);
++    CGLUnlockContext(_sfContext);
++    return drew;
++}
++
++- (void)display {
++    [self _sfRenderForced:NO];   // -canDrawInCGLContext:... is asked first, as on macOS
++}
++
++- (void)_sfTick {
++    if (_asynchronous && ![self isHidden])
++        [self _sfRenderForced:NO];
++}
++
++@end
+--- a/src/Frameworks/QuartzCore/CoreAnimation.h
++++ b/src/Frameworks/QuartzCore/CoreAnimation.h
+@@ -8,3 +8,4 @@
+ #import <QuartzCore/CAMetalLayer.h>
+ #import <QuartzCore/CAMetalDisplayLink.h>
+ #import <QuartzCore/CAEDRMetadata.h>
++#import <QuartzCore/CAOpenGLLayer.h>
