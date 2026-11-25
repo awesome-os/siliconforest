@@ -286,3 +286,13 @@ is kept as [`docs/history/README-2026-11-09.md`](docs/history/README-2026-11-09.
 # Clone & enter repository (all platforms)
 git clone https://github.com/awesome-os/siliconforest.git && cd siliconforest
 ```
+
+## Quick Install & Run (Windows / Linux / macOS)
+
+```sh
+# Install / hydrate from v11 CAS via holo-pm
+holo-pm install repository://github.com/awesome-os/siliconforest@main
+
+# Or project & run directly via holo-project (0-byte hardlink)
+holo-project "project://cpp/siliconforest?from=repository://github.com/awesome-os/siliconforest@main"
+```
